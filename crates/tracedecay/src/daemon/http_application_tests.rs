@@ -10,6 +10,7 @@ use axum::routing::post;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
+use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, RetainedSurfaceRequestV1};
 use tracedecay_contracts::{
     APPLICATION_REQUEST_ID_HEADER, CancellationContext, CancellationObservation, CancellationStage,
     CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass, OperationBudgetUsage,
@@ -23,6 +24,7 @@ use tracedecay_domain::{
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
 use super::http_application::{DaemonHttpApplicationRegistry, DaemonHttpApplicationService};
+use crate::application_surface::RegisteredHttpOperation;
 use tracedecay_application::operation_stream::{
     OperationEventAuthority, OperationId, OperationKind, OperationStreamConfig,
 };
@@ -1270,3 +1272,337 @@ async fn local_remote_status_reads_the_mounted_runtime() {
 }
 
 mod remote_tls;
+
+struct RequestIdentityExecutor {
+    captured:
+        tokio::sync::mpsc::UnboundedSender<tracedecay_daemon_protocol::DaemonInvocationRequest>,
+    release: Arc<Semaphore>,
+}
+
+impl tracedecay_contracts::ApplicationInvocationExecutor for RequestIdentityExecutor {
+    fn invoke(
+        &self,
+        _invocation: tracedecay_contracts::ApplicationInvocation,
+    ) -> tracedecay_contracts::ApplicationInvocationFuture<
+        '_,
+        Result<tracedecay_contracts::ApplicationResponse, tracedecay_contracts::InvocationError>,
+    > {
+        Box::pin(async { Err(tracedecay_contracts::InvocationError::Unavailable) })
+    }
+}
+
+impl tracedecay_daemon_protocol::DaemonInvocationExecutor for RequestIdentityExecutor {
+    fn invoke_controlled(
+        &self,
+        request: tracedecay_daemon_protocol::DaemonInvocationRequest,
+        deadline: Deadline,
+        cancellation: tracedecay_contracts::CancellationSignal,
+        policy: tracedecay_daemon_protocol::InvocationCancellationPolicy,
+    ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
+        '_,
+        Result<
+            tracedecay_daemon_protocol::DaemonInvocationResponse,
+            tracedecay_daemon_protocol::DaemonInvocationError,
+        >,
+    > {
+        let tracedecay_daemon_protocol::DaemonInvocationPayload::RetainedApplication {
+            deadline: invocation_deadline,
+            cancellation: invocation_cancellation,
+            ..
+        } = &request.payload
+        else {
+            panic!("expected retained application invocation")
+        };
+        assert_eq!(invocation_deadline, &deadline);
+        assert_eq!(invocation_cancellation, &cancellation.context());
+        assert_eq!(
+            policy,
+            tracedecay_daemon_protocol::InvocationCancellationPolicy::AuthoritativeEffect
+        );
+        self.captured.send(request).expect("capture invocation");
+        Box::pin(async move {
+            self.release
+                .acquire()
+                .await
+                .expect("release invocation")
+                .forget();
+            Err(tracedecay_daemon_protocol::DaemonInvocationError::Unavailable)
+        })
+    }
+
+    fn observe_feedback(
+        &self,
+        _subject_digest: ManifestDigest,
+        _observed_at: UtcMicros,
+        _event: tracedecay_contracts::feedback::observations::FeedbackSourceEventV1,
+    ) -> tracedecay_daemon_protocol::DaemonInvocationExecutorFuture<
+        '_,
+        tracedecay_domain::errors::Result<()>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn provider_mutation_bodies() -> [(RetainedSurfaceOperation, serde_json::Value); 6] {
+    use serde_json::json;
+    let source =
+        json!({"trace_ref":"trace.http.1","item_ref":"item.1","observation_id":"observation.1"});
+    let state = json!({"kind":"canonical_session","provider_id":"native","registration_revision":7,"canonical_provider_id":"codex","session_id":"session.1"});
+    [
+        (
+            RetainedSurfaceOperation::ProviderFeedback,
+            json!({"source":source,"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1}),
+        ),
+        (
+            RetainedSurfaceOperation::ProviderCorrection,
+            json!({"source":source,"expected_source_revision":"revision.1","correction":{"kind":"mark_incorrect","revoked_at":1},"reason":"canonical correction","evidence_refs":[]}),
+        ),
+        (
+            RetainedSurfaceOperation::ProviderDeleteBySource,
+            json!({"source":source,"mode":"remove_influence","expected_fence_revision":0,"include_snapshots":true}),
+        ),
+        (
+            RetainedSurfaceOperation::ProviderMaintenance,
+            json!({"state":state,"task":"validate_state","maximum_items":1,"maximum_bytes":4096,"maximum_duration_millis":1000,"dry_run":true}),
+        ),
+        (
+            RetainedSurfaceOperation::ProviderSnapshotRestore,
+            json!({"state":state,"snapshot_ref":"snapshot.host.1","expected_state_generation":3}),
+        ),
+        (
+            RetainedSurfaceOperation::ProviderReplay,
+            json!({"state":state,"observation_batch_refs":["batch.host.1"],"first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":3,"expected_previous_acknowledged_sequence":0}),
+        ),
+    ]
+}
+
+async fn service_with_request_identity_executor() -> (
+    DaemonHttpApplicationService,
+    tokio::sync::mpsc::UnboundedReceiver<tracedecay_daemon_protocol::DaemonInvocationRequest>,
+    Arc<Semaphore>,
+) {
+    let (captured, received) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let executor = Arc::new(RequestIdentityExecutor {
+        captured,
+        release: Arc::clone(&release),
+    });
+    let events = OperationEventAuthority::new(OperationStreamConfig {
+        retained_event_capacity: 4,
+        max_operations: 4,
+        max_subscribers_per_operation: 2,
+    })
+    .expect("operation authority");
+    let router = crate::application_surface::assemble_http_application_router(
+        executor,
+        events,
+        ProjectId::new(PROJECT_ID).expect("project"),
+    )
+    .expect("actual application router");
+    let registry = DaemonHttpApplicationRegistry::default();
+    registry
+        .mount(PROJECT_ID, router)
+        .await
+        .expect("mount application router");
+    let service = DaemonHttpApplicationService::bind(registry, AUTH_TOKEN)
+        .await
+        .expect("HTTP service");
+    (service, received, release)
+}
+
+#[tokio::test]
+async fn daemon_http_provider_mutations_preserve_supplied_identity_and_sequential_retries() {
+    let (service, mut captured, release) = service_with_request_identity_executor().await;
+    let authorization = format!("Bearer {AUTH_TOKEN}");
+    for (operation, body) in provider_mutation_bodies() {
+        let supplied = format!("request.sdk.{}", operation.as_str());
+        let path = format!(
+            "/projects/{PROJECT_ID}/application{}",
+            tracedecay_api::retained_route_path(operation)
+        );
+        let bytes = serde_json::to_vec(&body).expect("request body");
+        for _ in 0..2 {
+            release.add_permits(1);
+            let response = request_path_with_headers(
+                &service,
+                "POST",
+                &path,
+                Some(&authorization),
+                Some(service.origin()),
+                Some("application/json"),
+                &[(APPLICATION_REQUEST_ID_HEADER, &supplied)],
+                &bytes,
+            )
+            .await;
+            assert_eq!(
+                status(&response),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{operation:?}: {response}"
+            );
+            assert_eq!(json_body(&response)["value"]["request_id"], supplied);
+            let request = captured
+                .try_recv()
+                .expect("forwarded through both middleware gates");
+            assert_eq!(request.request_id, supplied);
+            let tracedecay_daemon_protocol::DaemonInvocationPayload::RetainedApplication {
+                request,
+                ..
+            } = request.payload
+            else {
+                panic!("expected retained invocation")
+            };
+            assert_eq!(request.operation(), operation);
+            let RetainedSurfaceRequestV1::ProviderControl(control) = request else {
+                panic!("expected unified provider request")
+            };
+            assert_eq!(
+                serde_json::to_value(control).expect("provider body")["request"],
+                body
+            );
+            assert!(matches!(
+                captured.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+    for tail in [
+        "retained/provider_health",
+        "retained/provider_inspection",
+        "retained/provider_snapshot_export",
+        "retained/provider_unknown",
+        "retained/provider_feedback/extra",
+        "retained/provider_feedback/",
+        "retained/fact_store_add",
+        "tests/results",
+    ] {
+        let response = request_path_with_headers(
+            &service,
+            "POST",
+            &format!("/projects/{PROJECT_ID}/application/{tail}"),
+            Some(&authorization),
+            Some(service.origin()),
+            Some("application/json"),
+            &[(
+                APPLICATION_REQUEST_ID_HEADER,
+                "request.sdk.provider.disallowed",
+            )],
+            b"{}",
+        )
+        .await;
+        assert_eq!(status(&response), StatusCode::BAD_REQUEST, "{tail}");
+        let body = json_body(&response);
+        assert_eq!(body["value"]["problem"]["kind"], "invalid_request");
+        assert_ne!(
+            body["value"]["request_id"],
+            "request.sdk.provider.disallowed"
+        );
+        assert!(matches!(
+            captured.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+    service.shutdown().await.expect("shutdown HTTP service");
+}
+
+#[tokio::test]
+async fn daemon_http_active_identity_conflicts_use_the_selected_provider_or_fact_contract() {
+    let (service, mut captured, release) = service_with_request_identity_executor().await;
+    let supplied = "request.sdk.provider.overlap";
+    let endpoint = service.endpoint();
+    let origin = service.origin().to_owned();
+    let first = tokio::spawn(async move {
+        let (operation, body) = provider_mutation_bodies()
+            .into_iter()
+            .next()
+            .expect("feedback request");
+        request_path_with_headers_at(
+            endpoint,
+            "POST",
+            &format!(
+                "/projects/{PROJECT_ID}/application{}",
+                tracedecay_api::retained_route_path(operation)
+            ),
+            Some(&format!("Bearer {AUTH_TOKEN}")),
+            Some(&origin),
+            Some("application/json"),
+            &[(APPLICATION_REQUEST_ID_HEADER, supplied)],
+            &serde_json::to_vec(&body).expect("body"),
+        )
+        .await
+    });
+    let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), captured.recv())
+        .await
+        .expect("first request reaches daemon")
+        .expect("captured invocation");
+    assert_eq!(admitted.request_id, supplied);
+    let authorization = format!("Bearer {AUTH_TOKEN}");
+    for operation in provider_mutation_bodies()
+        .into_iter()
+        .map(|(operation, _)| operation)
+        .chain(std::iter::once(RetainedSurfaceOperation::FactStoreCurate))
+    {
+        let response = request_path_with_headers(
+            &service,
+            "POST",
+            &format!(
+                "/projects/{PROJECT_ID}/application{}",
+                tracedecay_api::retained_route_path(operation)
+            ),
+            Some(&authorization),
+            Some(service.origin()),
+            Some("application/json"),
+            &[(APPLICATION_REQUEST_ID_HEADER, supplied)],
+            b"null",
+        )
+        .await;
+        assert_eq!(
+            status(&response),
+            StatusCode::CONFLICT,
+            "{operation:?}: {response}"
+        );
+        let envelope = json_body(&response);
+        let registry = operation.registry().expect("operation registry");
+        let operation_id = tracedecay_tool_catalog::OperationId::new(operation.operation_id())
+            .expect("operation id");
+        let binding = registry
+            .get(&operation_id)
+            .and_then(|entry| entry.binding())
+            .expect("operation binding");
+        let tracedecay_tool_catalog::RouteExposureV1::Public { binding_id, .. } =
+            binding.exposure()
+        else {
+            panic!("public retained route")
+        };
+        assert_eq!(
+            envelope["value"]["binding_id"],
+            serde_json::to_value(binding_id).expect("binding id")
+        );
+        assert_eq!(
+            envelope["value"]["contract"]["schema_id"],
+            serde_json::to_value(binding.result_schema().schema_ref().schema_id())
+                .expect("schema id")
+        );
+        assert_eq!(
+            envelope["value"]["contract"]["schema_revision"],
+            binding.result_schema().schema_ref().revision()
+        );
+        assert_eq!(envelope["value"]["request_id"], supplied);
+        assert_eq!(envelope["value"]["problem"]["kind"], "conflict");
+        assert_eq!(envelope["value"]["problem"]["retry"], "same_request");
+        assert_eq!(envelope["value"]["problem"]["retry_scope"], "same_request");
+        assert_eq!(
+            envelope["value"]["problem"]["legal_actions"],
+            serde_json::json!(["retry"])
+        );
+        assert!(matches!(
+            captured.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+    release.add_permits(1);
+    assert_eq!(
+        status(&first.await.expect("first request")),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    service.shutdown().await.expect("shutdown HTTP service");
+}

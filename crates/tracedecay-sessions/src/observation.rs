@@ -91,6 +91,8 @@ pub struct CaptureObservationRequest {
     retention_class: RetentionClass,
     cancellation: ObservationCancellation,
     repository_provenance: Option<RepositoryProvenanceAdmissionContext>,
+    original_repository_provenance:
+        Option<crate::repository_provenance::OriginalObservationProvenanceV1>,
     identity_collision_disposition: ObservationIdentityCollisionDispositionV1,
 }
 
@@ -117,6 +119,7 @@ impl CaptureObservationRequest {
             retention_class,
             cancellation,
             repository_provenance: None,
+            original_repository_provenance: None,
             identity_collision_disposition:
                 ObservationIdentityCollisionDispositionV1::SettleTerminal,
         })
@@ -141,6 +144,16 @@ impl CaptureObservationRequest {
         repository_provenance: Option<RepositoryProvenanceAdmissionContext>,
     ) -> Self {
         self.repository_provenance = repository_provenance;
+        self
+    }
+
+    /// Carries a frozen proof for this exact live source identity. Generic
+    /// transcript catch-up must use ingestion-only repository provenance.
+    pub fn with_original_repository_provenance(
+        mut self,
+        original: crate::repository_provenance::OriginalObservationProvenanceV1,
+    ) -> Self {
+        self.original_repository_provenance = Some(original);
         self
     }
 
@@ -499,6 +512,7 @@ where
             retention_class,
             cancellation,
             repository_provenance,
+            original_repository_provenance,
             identity_collision_disposition,
         } = request;
         if cancellation.is_cancelled() {
@@ -534,6 +548,11 @@ where
                     &observation,
                     tracedecay_store::OBSERVATION_CAPTURE_AUTHORITY_V1,
                 )?;
+                let original_repository_provenance = original_repository_provenance.or_else(|| {
+                    repository_provenance
+                        .as_ref()?
+                        .resolve_original_observation(observation.identity(), resume_checkpoint)
+                });
                 let repository_provenance = repository_provenance.map_or_else(
                     crate::repository_provenance::PreparedRepositoryProvenanceV1::unavailable,
                     |context| {
@@ -545,6 +564,16 @@ where
                         )
                     },
                 );
+                let original_attachment = original_repository_provenance
+                    .map(|original| {
+                        original.bind_after_sanitization(
+                            &observation,
+                            &projection_generation,
+                            ingested_at,
+                            authorization.clone(),
+                        )
+                    })
+                    .transpose()?;
                 let retrieval_anchor = build_observation_retrieval_anchor_v2(
                     &observation,
                     projection_generation.clone(),
@@ -561,6 +590,12 @@ where
                     repository_provenance.availability().clone(),
                     repository_provenance.anchor().cloned(),
                 )?;
+                let write = match original_attachment {
+                    Some(original) => {
+                        write.with_original_repository_provenance_attachment(original)?
+                    }
+                    None => write,
+                };
                 if cancellation.is_cancelled() {
                     return Err(ObservationApplicationError::Cancelled);
                 }

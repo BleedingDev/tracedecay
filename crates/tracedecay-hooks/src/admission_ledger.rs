@@ -29,7 +29,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracedecay_domain::{UtcMicros, canonical_json_bytes, framed_log::checksum as frame_checksum};
+use tracedecay_domain::{
+    BrainId, CommitId, EvidenceAvailabilityV1, ObservationSourceIdentityV1, RefId,
+    RepositoryProvenanceV1, UserProfileId, UtcMicros, canonical_json_bytes,
+    framed_log::checksum as frame_checksum,
+};
 use tracedecay_private_fs::framed_log::{
     DirectorySyncPolicy, append_durable, atomic_write as shared_atomic_write,
     read_bounded as shared_read_bounded, sync_directory as shared_sync_directory,
@@ -48,6 +52,11 @@ const RECORD_BODY_BYTES: usize = IDENTITY_BYTES + DIGEST_BYTES + 8;
 const RECORD_BYTES: usize = RECORD_BODY_BYTES + CHECKSUM_PREFIX_BYTES;
 const RECORDS_FILE: &str = "admissions.v1.bin";
 const COMPLETIONS_FILE: &str = "admission-work-completions.v1.json";
+const LIVE_ORIGINS_FILE: &str = "admission-live-origins.json";
+const MAX_LIVE_ORIGIN_BYTES: usize = 1024 * 1024;
+const MAX_LIVE_ORIGIN_BOUNDARIES: usize = 64;
+const MAX_LIVE_ORIGIN_PROOFS: usize = 64;
+pub const MAX_LIVE_ORIGIN_FRAMES: usize = 256;
 const LOCK_FILE: &str = "admissions.v1.lock";
 const DIRECTORY_POLICY: DirectorySyncPolicy = DirectorySyncPolicy::Strict;
 
@@ -103,7 +112,130 @@ pub struct HookAdmissionLedgerReceiptV1 {
     pub work_completed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+/// A live boundary remains authoritative only while its exact admission is
+/// retained. The origin metadata never substitutes for the admission ledger.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginAdmissionV1 {
+    pub event_id: [u8; 16],
+    pub digest: [u8; 32],
+    pub order: u64,
+    pub admitted_at: UtcMicros,
+    pub host: HookHostV1,
+    pub protected_session_id: [u8; 32],
+    pub project_id: [u8; 16],
+    pub repository_id: [u8; 16],
+    pub worktree_id: [u8; 16],
+    pub worktree_epoch: u64,
+}
+
+/// Exact per-worktree HEAD reflog watermark. Equality of HEAD alone cannot
+/// detect a checkout away and back between two live events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginBranchEvidenceV1 {
+    pub attached_ref: RefId,
+    pub head_commit: CommitId,
+    pub canonical_path: PathBuf,
+    pub file_identity: [u64; 2],
+    pub frontier: u64,
+    pub fingerprint: [u8; 32],
+    pub change_token: [i64; 4],
+    pub head_file_identity: [u64; 2],
+    pub head_change_token: [i64; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginScopeV1 {
+    pub brain_id: BrainId,
+    pub profile_id: UserProfileId,
+    pub repository: RepositoryProvenanceV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginCheckpointV1 {
+    pub generation: u64,
+    pub file_identity: u64,
+    pub complete_frontier: u64,
+    pub complete_prefix_fingerprint: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginFrameV1 {
+    pub start: u64,
+    pub end: u64,
+    pub resume_fingerprint: u64,
+}
+
+/// Content-free result of a bounded live read. `validated_checkpoint` is set
+/// only when the shared source scanner verified that exact previous prefix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginObservationV1 {
+    pub scope: HookLiveOriginScopeV1,
+    pub source: ObservationSourceIdentityV1,
+    pub canonical_source_path: PathBuf,
+    pub branch_evidence: HookLiveOriginBranchEvidenceV1,
+    pub checkpoint: HookLiveOriginCheckpointV1,
+    /// Actual extent seen at this live checkpoint. The initial exclusion
+    /// floor lives on `HookLiveOriginBoundaryV1::start` and never advances
+    /// across a continuously verified interval.
+    pub physical_eof: u64,
+    pub validated_checkpoint: Option<HookLiveOriginCheckpointV1>,
+    pub frames: Vec<HookLiveOriginFrameV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginStartV1 {
+    pub admission: HookLiveOriginAdmissionV1,
+    pub checkpoint: HookLiveOriginCheckpointV1,
+    pub physical_eof: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginBoundaryV1 {
+    /// First live admission after a discontinuity, including its initial
+    /// complete prefix and physical EOF. Only a real rebaseline replaces it.
+    pub start: HookLiveOriginStartV1,
+    /// Most recent continuously verified live checkpoint admission.
+    pub admission: HookLiveOriginAdmissionV1,
+    pub observation: HookLiveOriginObservationV1,
+}
+
+/// One interval sealed by a later live event. Frames before `baseline.start`'s
+/// physical EOF, including extensions of an old partial frame, are absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookLiveOriginProofV1 {
+    pub proof_ref: String,
+    pub baseline: HookLiveOriginBoundaryV1,
+    pub seal: HookLiveOriginAdmissionV1,
+    pub frames: Vec<HookLiveOriginFrameV1>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveOriginMetadata {
+    baselines: Vec<HookLiveOriginBoundaryV1>,
+    proofs: Vec<HookLiveOriginProofV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookLiveOriginOutcomeV1 {
+    Baseline,
+    Checkpoint,
+    Sealed,
+    Unavailable,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HookAdmissionLedgerError {
     #[error("hook admission ledger filesystem operation failed")]
     Io,
@@ -129,6 +261,7 @@ pub struct HookAdmissionLedgerOpenReportV1 {
     pub dropped_expired_records: u32,
     pub dropped_overflow_records: u32,
     pub truncated_tail_bytes: u64,
+    pub live_origin_metadata_error: Option<HookAdmissionLedgerError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +290,7 @@ pub struct HookAdmissionLedgerV1 {
     limits: HookAdmissionLedgerLimitsV1,
     entries: BTreeMap<[u8; IDENTITY_BYTES], LedgerEntry>,
     completed_work: BTreeSet<[u8; IDENTITY_BYTES]>,
+    live_origins: LiveOriginMetadata,
     next_order: u64,
 }
 
@@ -184,6 +318,13 @@ impl HookAdmissionLedgerV1 {
         let bytes = read_bounded(&path, limits.max_file_bytes())?.unwrap_or_default();
         let (scanned, truncated_tail_bytes) = scan_records(&bytes);
         let completions_existed = completions_path(&root).is_file();
+        // Optional origin evidence cannot make canonical event admission
+        // unavailable. An unreadable origin file starts with no baseline;
+        // the report preserves the failure and later live capture rebaselines.
+        let (live_origins, live_origin_metadata_error) = match read_live_origin_metadata(&root) {
+            Ok(origins) => (origins, None),
+            Err(error) => (LiveOriginMetadata::default(), Some(error)),
+        };
         let mut ledger = Self {
             root,
             _writer_lock: writer_lock,
@@ -191,6 +332,7 @@ impl HookAdmissionLedgerV1 {
             limits,
             entries: BTreeMap::new(),
             completed_work: BTreeSet::new(),
+            live_origins,
             next_order: 0,
         };
         let mut dropped_expired_records = 0u32;
@@ -246,6 +388,7 @@ impl HookAdmissionLedgerV1 {
             dropped_expired_records,
             dropped_overflow_records,
             truncated_tail_bytes,
+            live_origin_metadata_error,
         };
         hotpath::gauge!("hooks.admission.live_records").set(report.live_records);
         hotpath::gauge!("hooks.admission.open.dropped_expired").set(report.dropped_expired_records);
@@ -260,6 +403,151 @@ impl HookAdmissionLedgerV1 {
 
     pub fn live_records(&self) -> u32 {
         self.entries.len() as u32
+    }
+
+    pub fn live_origin_baseline(
+        &self,
+        protected_session_id: [u8; 32],
+        now: UtcMicros,
+    ) -> Option<HookLiveOriginBoundaryV1> {
+        self.live_origins
+            .baselines
+            .iter()
+            .find(|boundary| {
+                boundary.admission.protected_session_id == protected_session_id
+                    && self.origin_admission_retained(&boundary.start.admission, now)
+                    && self.origin_admission_retained(&boundary.admission, now)
+            })
+            .cloned()
+    }
+
+    fn origin_admission_retained(
+        &self,
+        admission: &HookLiveOriginAdmissionV1,
+        now: UtcMicros,
+    ) -> bool {
+        admission.host == self.host
+            && self.entries.get(&admission.event_id).is_some_and(|entry| {
+                entry.digest == admission.digest
+                    && entry.order == admission.order
+                    && entry.admitted_at == admission.admitted_at
+                    && admission.admitted_at.0 <= now.0
+                    && !is_expired(entry.admitted_at, now, self.limits.max_age_micros)
+            })
+    }
+
+    /// Called only by live admission, after binding validation and durable
+    /// canonical admission. Replay and ordinary transcript ingestion cannot
+    /// establish a baseline. Missing evidence drops the open interval.
+    pub fn record_live_origin(
+        &mut self,
+        envelope: &HookEventEnvelopeV2,
+        receipt: HookAdmissionLedgerReceiptV1,
+        observation: Option<HookLiveOriginObservationV1>,
+        now: UtcMicros,
+    ) -> Result<HookLiveOriginOutcomeV1, HookAdmissionLedgerError> {
+        if receipt.decision != HookAdmissionDecisionV1::Admitted {
+            return Ok(HookLiveOriginOutcomeV1::Duplicate);
+        }
+        let entry = self
+            .entries
+            .get(&envelope.event_id)
+            .ok_or(HookAdmissionLedgerError::InvalidIdentity)?;
+        let admission = HookLiveOriginAdmissionV1 {
+            event_id: envelope.event_id,
+            digest: hook_admission_digest(envelope)?,
+            order: receipt.order,
+            admitted_at: entry.admitted_at,
+            host: envelope.producer,
+            protected_session_id: envelope.protected_session_id,
+            project_id: envelope.project_id,
+            repository_id: envelope.repository_id,
+            worktree_id: envelope.worktree_id,
+            worktree_epoch: envelope.worktree_epoch,
+        };
+        if !self.origin_admission_retained(&admission, now) {
+            return Err(HookAdmissionLedgerError::InvalidIdentity);
+        }
+        let previous = self.live_origin_baseline(envelope.protected_session_id, now);
+        // A concurrently completed older live read cannot replace a newer
+        // baseline, nor can retrying the same admitted receipt seal new bytes.
+        if previous
+            .as_ref()
+            .is_some_and(|old| old.admission.order >= admission.order)
+        {
+            return Ok(HookLiveOriginOutcomeV1::Duplicate);
+        }
+        let mut next = self.live_origins.clone();
+        next.baselines.retain(|boundary| {
+            boundary.admission.protected_session_id != envelope.protected_session_id
+                && self.origin_admission_retained(&boundary.start.admission, now)
+                && self.origin_admission_retained(&boundary.admission, now)
+        });
+        next.proofs.retain(|proof| {
+            self.origin_admission_retained(&proof.baseline.admission, now)
+                && self.origin_admission_retained(&proof.baseline.start.admission, now)
+                && self.origin_admission_retained(&proof.seal, now)
+        });
+        let mut outcome = HookLiveOriginOutcomeV1::Unavailable;
+        if let Some(mut observation) = observation.filter(valid_origin_observation) {
+            let continuous = previous
+                .as_ref()
+                .filter(|baseline| continuous_origin_interval(baseline, &admission, &observation))
+                .cloned();
+            let start = continuous.as_ref().map_or_else(
+                || HookLiveOriginStartV1 {
+                    admission: admission.clone(),
+                    checkpoint: observation.checkpoint,
+                    physical_eof: observation.physical_eof,
+                },
+                |baseline| baseline.start.clone(),
+            );
+            if let Some(baseline) = continuous {
+                outcome = HookLiveOriginOutcomeV1::Checkpoint;
+                // Freeze the original repository capture while source
+                // checkpoints advance within that same proved exact scope.
+                observation.scope = baseline.observation.scope.clone();
+                let frames = observation
+                    .frames
+                    .iter()
+                    .copied()
+                    .filter(|frame| frame.start >= baseline.start.physical_eof)
+                    .collect::<Vec<_>>();
+                if !frames.is_empty() {
+                    let proof_ref = live_origin_proof_ref(&baseline, &admission, &frames)?;
+                    next.proofs.push(HookLiveOriginProofV1 {
+                        proof_ref,
+                        baseline,
+                        seal: admission.clone(),
+                        frames,
+                    });
+                    outcome = HookLiveOriginOutcomeV1::Sealed;
+                }
+            }
+            // A boundary needs only its checkpoint. Retained frame receipts
+            // live on the sealed interval and never contain transcript text.
+            observation.frames.clear();
+            observation.validated_checkpoint = None;
+            next.baselines.push(HookLiveOriginBoundaryV1 {
+                start,
+                admission,
+                observation,
+            });
+            if outcome == HookLiveOriginOutcomeV1::Unavailable {
+                outcome = HookLiveOriginOutcomeV1::Baseline;
+            }
+        }
+        if next.baselines.len() > MAX_LIVE_ORIGIN_BOUNDARIES {
+            next.baselines
+                .drain(..next.baselines.len() - MAX_LIVE_ORIGIN_BOUNDARIES);
+        }
+        if next.proofs.len() > MAX_LIVE_ORIGIN_PROOFS {
+            next.proofs
+                .drain(..next.proofs.len() - MAX_LIVE_ORIGIN_PROOFS);
+        }
+        write_live_origin_metadata(&self.root, &mut next)?;
+        self.live_origins = next;
+        Ok(outcome)
     }
 
     /// Record one admission attempt. `Admitted` is returned only after the
@@ -448,6 +736,232 @@ impl HookAdmissionLedgerV1 {
             .map_err(|_| HookAdmissionLedgerError::Io)
         })
     }
+}
+
+fn valid_origin_observation(value: &HookLiveOriginObservationV1) -> bool {
+    let repository = &value.scope.repository;
+    value.source.validate().is_ok()
+        && repository.validate().is_ok()
+        && repository.project_id().is_some()
+        && repository.worktree_id().is_some()
+        && matches!(
+            repository.evidence().attached_ref(),
+            EvidenceAvailabilityV1::Known(reference) if reference == &value.branch_evidence.attached_ref
+        )
+        && matches!(
+            repository.evidence().head_commit(),
+            EvidenceAvailabilityV1::Known(commit) if commit == &value.branch_evidence.head_commit
+        )
+        && value.canonical_source_path.is_absolute()
+        && value.canonical_source_path.as_os_str().len() <= 4096
+        && value.branch_evidence.canonical_path.is_absolute()
+        && value.branch_evidence.canonical_path.as_os_str().len() <= 4096
+        && value.branch_evidence.frontier > 0
+        && value.checkpoint.generation != 0
+        && value.checkpoint.file_identity != 0
+        && value.checkpoint.complete_frontier <= value.physical_eof
+        && value.frames.len() <= MAX_LIVE_ORIGIN_FRAMES
+        && value
+            .frames
+            .iter()
+            .all(|frame| frame.start < frame.end && frame.end <= value.checkpoint.complete_frontier)
+        && value
+            .frames
+            .windows(2)
+            .all(|pair| pair[0].end == pair[1].start)
+        && value.frames.last().is_none_or(|last| {
+            last.end == value.checkpoint.complete_frontier
+                && last.resume_fingerprint == value.checkpoint.complete_prefix_fingerprint
+        })
+}
+
+fn same_origin_scope(left: &HookLiveOriginScopeV1, right: &HookLiveOriginScopeV1) -> bool {
+    left.brain_id == right.brain_id
+        && left.profile_id == right.profile_id
+        && left.repository.project_id() == right.repository.project_id()
+        && left.repository.repository_id() == right.repository.repository_id()
+        && left.repository.worktree_id() == right.repository.worktree_id()
+        && left.repository.canonical_root_digest() == right.repository.canonical_root_digest()
+        && left.repository.evidence().attached_ref() == right.repository.evidence().attached_ref()
+        && left.repository.evidence().head_commit() == right.repository.evidence().head_commit()
+}
+
+fn continuous_origin_interval(
+    baseline: &HookLiveOriginBoundaryV1,
+    seal: &HookLiveOriginAdmissionV1,
+    next: &HookLiveOriginObservationV1,
+) -> bool {
+    let previous = &baseline.observation;
+    same_live_origin_authority(&baseline.admission, seal)
+        && baseline.admission.order < seal.order
+        && baseline.admission.admitted_at.0 <= seal.admitted_at.0
+        && same_origin_scope(&previous.scope, &next.scope)
+        && previous.source == next.source
+        && previous.canonical_source_path == next.canonical_source_path
+        && previous.branch_evidence == next.branch_evidence
+        && next.validated_checkpoint == Some(previous.checkpoint)
+        && previous.checkpoint.generation == next.checkpoint.generation
+        && previous.checkpoint.file_identity == next.checkpoint.file_identity
+        && previous.physical_eof <= next.physical_eof
+        && next.frames.first().map_or_else(
+            || next.checkpoint == previous.checkpoint,
+            |first| first.start == previous.checkpoint.complete_frontier,
+        )
+}
+
+fn same_live_origin_authority(
+    left: &HookLiveOriginAdmissionV1,
+    right: &HookLiveOriginAdmissionV1,
+) -> bool {
+    left.host == right.host
+        && left.protected_session_id == right.protected_session_id
+        && left.project_id == right.project_id
+        && left.repository_id == right.repository_id
+        && left.worktree_id == right.worktree_id
+        && left.worktree_epoch == right.worktree_epoch
+}
+
+fn valid_origin_boundary(boundary: &HookLiveOriginBoundaryV1) -> bool {
+    valid_origin_observation(&boundary.observation)
+        && same_live_origin_authority(&boundary.start.admission, &boundary.admission)
+        && boundary.start.admission.order <= boundary.admission.order
+        && boundary.start.admission.admitted_at.0 <= boundary.admission.admitted_at.0
+        && boundary.start.physical_eof <= boundary.observation.physical_eof
+        && boundary.start.checkpoint.complete_frontier <= boundary.start.physical_eof
+        && boundary.start.checkpoint.complete_frontier
+            <= boundary.observation.checkpoint.complete_frontier
+        && boundary.start.checkpoint.file_identity == boundary.observation.checkpoint.file_identity
+        && boundary.start.checkpoint.generation == boundary.observation.checkpoint.generation
+}
+
+fn live_origin_proof_ref(
+    baseline: &HookLiveOriginBoundaryV1,
+    seal: &HookLiveOriginAdmissionV1,
+    frames: &[HookLiveOriginFrameV1],
+) -> Result<String, HookAdmissionLedgerError> {
+    let bytes = canonical_json_bytes(&(baseline, seal, frames))
+        .map_err(|_| HookAdmissionLedgerError::RecordUnencodable)?;
+    Ok(format!(
+        "hook-live-origin:{}",
+        tracedecay_domain::canonical_text::encode_lowercase_hex(&frame_checksum(&bytes))
+    ))
+}
+
+fn read_live_origin_metadata(root: &Path) -> Result<LiveOriginMetadata, HookAdmissionLedgerError> {
+    let Some(bytes) = read_bounded(&root.join(LIVE_ORIGINS_FILE), MAX_LIVE_ORIGIN_BYTES)? else {
+        return Ok(LiveOriginMetadata::default());
+    };
+    let metadata: LiveOriginMetadata =
+        serde_json::from_slice(&bytes).map_err(|_| HookAdmissionLedgerError::RecordUndecodable)?;
+    if metadata.baselines.len() > MAX_LIVE_ORIGIN_BOUNDARIES
+        || metadata.proofs.len() > MAX_LIVE_ORIGIN_PROOFS
+        || metadata
+            .baselines
+            .iter()
+            .any(|boundary| !valid_origin_boundary(boundary))
+        || metadata.proofs.iter().any(|proof| {
+            !valid_origin_boundary(&proof.baseline)
+                || !same_live_origin_authority(&proof.baseline.admission, &proof.seal)
+                || proof.baseline.admission.order >= proof.seal.order
+                || proof.frames.is_empty()
+                || proof.frames.len() > MAX_LIVE_ORIGIN_FRAMES
+                || proof.frames.iter().any(|frame| {
+                    frame.start < proof.baseline.start.physical_eof || frame.start >= frame.end
+                })
+                || proof
+                    .frames
+                    .windows(2)
+                    .any(|pair| pair[0].end != pair[1].start)
+                || !live_origin_proof_ref(&proof.baseline, &proof.seal, &proof.frames)
+                    .is_ok_and(|expected| expected == proof.proof_ref)
+        })
+    {
+        return Err(HookAdmissionLedgerError::RecordUndecodable);
+    }
+    Ok(metadata)
+}
+
+fn write_live_origin_metadata(
+    root: &Path,
+    metadata: &mut LiveOriginMetadata,
+) -> Result<(), HookAdmissionLedgerError> {
+    let bytes = loop {
+        let bytes = canonical_json_bytes(metadata)
+            .map_err(|_| HookAdmissionLedgerError::RecordUnencodable)?;
+        if bytes.len() <= MAX_LIVE_ORIGIN_BYTES {
+            break bytes;
+        }
+        if !metadata.proofs.is_empty() {
+            metadata.proofs.remove(0);
+        } else if metadata.baselines.len() > 1 {
+            metadata.baselines.remove(0);
+        } else {
+            return Err(HookAdmissionLedgerError::InvalidLimits);
+        }
+    };
+    shared_atomic_write(
+        &root.join(LIVE_ORIGINS_FILE),
+        "hook-admission-live-origins",
+        &bytes,
+        DIRECTORY_POLICY,
+    )
+    .map_err(|_| HookAdmissionLedgerError::Io)
+}
+
+/// Read-only bounded proof lookup while the daemon retains its writer lock.
+/// Missing or pruned admissions cannot be reconstructed from origin metadata.
+pub fn read_hook_live_origin_proofs(
+    root: &Path,
+    host: HookHostV1,
+    now: UtcMicros,
+) -> Result<Vec<HookLiveOriginProofV1>, HookAdmissionLedgerError> {
+    read_validated_live_origin_metadata(root, host, now).map(|metadata| metadata.proofs)
+}
+
+/// A live destination may have established its baseline before it has emitted
+/// any complete new source frames. Its exact retained receipt still matters.
+pub fn read_hook_live_origin_boundaries(
+    root: &Path,
+    host: HookHostV1,
+    now: UtcMicros,
+) -> Result<Vec<HookLiveOriginBoundaryV1>, HookAdmissionLedgerError> {
+    read_validated_live_origin_metadata(root, host, now).map(|metadata| metadata.baselines)
+}
+
+fn read_validated_live_origin_metadata(
+    root: &Path,
+    host: HookHostV1,
+    now: UtcMicros,
+) -> Result<LiveOriginMetadata, HookAdmissionLedgerError> {
+    let mut metadata = read_live_origin_metadata(root)?;
+    let limits = HookAdmissionLedgerLimitsV1::stock();
+    let Some(bytes) = read_bounded(&records_path(root), limits.max_file_bytes())? else {
+        return Ok(LiveOriginMetadata::default());
+    };
+    let (records, _) = scan_records(&bytes);
+    let retained = |receipt: &HookLiveOriginAdmissionV1| {
+        receipt.host == host
+            && receipt.admitted_at.0 <= now.0
+            && !is_expired(receipt.admitted_at, now, limits.max_age_micros)
+            && records
+                .iter()
+                .enumerate()
+                .any(|(order, (event_id, digest, admitted_at))| {
+                    *event_id == receipt.event_id
+                        && *digest == receipt.digest
+                        && *admitted_at == receipt.admitted_at
+                        && order as u64 == receipt.order
+                })
+    };
+    metadata.proofs.retain(|proof| {
+        retained(&proof.baseline.start.admission)
+            && retained(&proof.baseline.admission)
+            && retained(&proof.seal)
+    });
+    metadata
+        .baselines
+        .retain(|boundary| retained(&boundary.start.admission) && retained(&boundary.admission));
+    Ok(metadata)
 }
 
 fn completions_path(root: &Path) -> PathBuf {
@@ -659,6 +1173,441 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    fn origin_observation(frontier: u64, eof: u64) -> HookLiveOriginObservationV1 {
+        use tracedecay_domain::{
+            CommitId, PrivacyDomainBoundLocatorDigest, ProjectId, ProviderId, RefId,
+            RepositoryEvidenceV1, RepositoryId, RepositoryRemoteIdentityV1, SessionId, WorktreeId,
+        };
+        let evidence = RepositoryEvidenceV1::new(
+            EvidenceAvailabilityV1::Known(RefId::new("refs/heads/main").unwrap()),
+            EvidenceAvailabilityV1::Known(CommitId::new("a".repeat(40)).unwrap()),
+            EvidenceAvailabilityV1::Unknown,
+            EvidenceAvailabilityV1::Unknown,
+            RepositoryRemoteIdentityV1::Unknown,
+            EvidenceAvailabilityV1::Unknown,
+        )
+        .unwrap();
+        HookLiveOriginObservationV1 {
+            scope: HookLiveOriginScopeV1 {
+                brain_id: BrainId::new("brain.fixture").unwrap(),
+                profile_id: UserProfileId::new("profile.fixture").unwrap(),
+                repository: RepositoryProvenanceV1::new(
+                    RepositoryId::new("repository.fixture").unwrap(),
+                    Some(ProjectId::new("project.fixture").unwrap()),
+                    Some(WorktreeId::new("worktree.fixture").unwrap()),
+                    PrivacyDomainBoundLocatorDigest::new(format!("sha256:{}", "b".repeat(64)))
+                        .unwrap(),
+                    evidence,
+                    UtcMicros(1),
+                )
+                .unwrap(),
+            },
+            source: ObservationSourceIdentityV1::for_provider_source(
+                ProviderId::new("claude").unwrap(),
+                SessionId::new("session.fixture").unwrap(),
+                SessionId::new("source.fixture").unwrap(),
+            )
+            .unwrap(),
+            canonical_source_path: std::env::temp_dir().join("origin-session.fixture.jsonl"),
+            branch_evidence: HookLiveOriginBranchEvidenceV1 {
+                attached_ref: RefId::new("refs/heads/main").unwrap(),
+                head_commit: CommitId::new("a".repeat(40)).unwrap(),
+                canonical_path: std::env::temp_dir().join("origin-repo/logs/HEAD"),
+                file_identity: [1, 2],
+                frontier: 100,
+                fingerprint: [3; 32],
+                change_token: [4; 4],
+                head_file_identity: [5, 6],
+                head_change_token: [7; 4],
+            },
+            checkpoint: HookLiveOriginCheckpointV1 {
+                generation: 10,
+                file_identity: 10,
+                complete_frontier: frontier,
+                complete_prefix_fingerprint: frontier + 1000,
+            },
+            physical_eof: eof,
+            validated_checkpoint: None,
+            frames: Vec::new(),
+        }
+    }
+
+    fn origin_append(
+        previous: &HookLiveOriginObservationV1,
+        ends: &[u64],
+    ) -> HookLiveOriginObservationV1 {
+        let frontier = *ends.last().unwrap();
+        let mut next = previous.clone();
+        next.validated_checkpoint = Some(previous.checkpoint);
+        next.checkpoint.complete_frontier = frontier;
+        next.checkpoint.complete_prefix_fingerprint = frontier + 1000;
+        next.physical_eof = frontier;
+        let mut start = previous.checkpoint.complete_frontier;
+        next.frames = ends
+            .iter()
+            .map(|end| {
+                let frame = HookLiveOriginFrameV1 {
+                    start,
+                    end: *end,
+                    resume_fingerprint: *end + 1000,
+                };
+                start = *end;
+                frame
+            })
+            .collect();
+        next
+    }
+
+    fn record_origin(
+        ledger: &mut HookAdmissionLedgerV1,
+        event_id: u8,
+        observation: Option<HookLiveOriginObservationV1>,
+    ) -> HookLiveOriginOutcomeV1 {
+        let envelope = envelope(event_id, 5);
+        let now = UtcMicros(i64::from(event_id));
+        let receipt = ledger.admit_with_receipt(&envelope, now).unwrap();
+        ledger
+            .record_live_origin(&envelope, receipt, observation, now)
+            .unwrap()
+    }
+
+    #[test]
+    fn live_origin_baseline_excludes_legacy_cursor_content_and_partial_frame_extension() {
+        let root = TestDir::new("origin-partial");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        // Ordinary admission/catch-up has no authority to establish origin.
+        ledger.admit(&envelope(8, 5), UtcMicros(8)).unwrap();
+        assert!(ledger.live_origin_baseline([7; 32], UtcMicros(8)).is_none());
+        let baseline = origin_observation(100, 110);
+        assert_eq!(
+            record_origin(&mut ledger, 9, Some(baseline.clone())),
+            HookLiveOriginOutcomeV1::Baseline
+        );
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(9))
+                .unwrap()
+                .is_empty()
+        );
+        // 100..130 completes a frame already begun at physical EOF 110.
+        assert_eq!(
+            record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[130, 150]))),
+            HookLiveOriginOutcomeV1::Sealed
+        );
+        let proofs =
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                .unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(
+            proofs[0].frames,
+            vec![HookLiveOriginFrameV1 {
+                start: 130,
+                end: 150,
+                resume_fingerprint: 1150
+            }]
+        );
+        assert_eq!(proofs[0].baseline.observation.physical_eof, 110);
+    }
+
+    #[test]
+    fn stable_live_origin_and_exact_frame_fingerprints_survive_reopen() {
+        let root = TestDir::new("origin-reopen");
+        let baseline = origin_observation(100, 100);
+        let expected;
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            record_origin(&mut ledger, 9, Some(baseline.clone()));
+            record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[125, 150])));
+            expected =
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                    .unwrap();
+            assert_eq!(expected.len(), 1);
+            assert_eq!(expected[0].frames.len(), 2);
+            assert_ne!(
+                expected[0].baseline.admission.event_id,
+                expected[0].seal.event_id
+            );
+            assert_ne!(
+                expected[0].baseline.admission.digest,
+                expected[0].seal.digest
+            );
+        }
+        let mut ledger = open(root.path(), UtcMicros(11));
+        assert_eq!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap()[0]
+                .observation
+                .checkpoint
+                .complete_frontier,
+            150
+        );
+        assert_eq!(
+            record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[175]))),
+            HookLiveOriginOutcomeV1::Duplicate
+        );
+        assert_eq!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn new_partial_frame_keeps_origin_across_an_intermediate_hook_and_restart() {
+        for initial_eof in [100, 110] {
+            let root = TestDir::new("origin-partial-across-hooks");
+            let baseline = origin_observation(100, initial_eof);
+            let mut partial = baseline.clone();
+            partial.physical_eof = 120;
+            partial.validated_checkpoint = Some(baseline.checkpoint);
+            {
+                let mut ledger = open(root.path(), UtcMicros(1));
+                record_origin(&mut ledger, 9, Some(baseline));
+                record_origin(&mut ledger, 10, Some(partial.clone()));
+                let retained = ledger.live_origin_baseline([7; 32], UtcMicros(10)).unwrap();
+                assert_eq!(retained.start.physical_eof, initial_eof);
+                assert_eq!(retained.observation.physical_eof, 120);
+                assert_eq!(retained.start.admission.event_id, [9; 16]);
+                assert_eq!(retained.admission.event_id, [10; 16]);
+            }
+            let mut ledger = open(root.path(), UtcMicros(11));
+            assert_eq!(
+                record_origin(&mut ledger, 11, Some(origin_append(&partial, &[150, 170]))),
+                HookLiveOriginOutcomeV1::Sealed
+            );
+            let proofs =
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                    .unwrap();
+            assert_eq!(proofs.len(), 1);
+            let starts = proofs[0]
+                .frames
+                .iter()
+                .map(|frame| frame.start)
+                .collect::<Vec<_>>();
+            if initial_eof == 100 {
+                assert_eq!(
+                    starts,
+                    [100, 150],
+                    "new partial content retains original live origin"
+                );
+            } else {
+                assert_eq!(
+                    starts,
+                    [150],
+                    "pre-baseline partial content remains excluded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advancing_complete_checkpoints_do_not_raise_the_initial_exclusion_floor() {
+        let root = TestDir::new("origin-advancing-checkpoints");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        let baseline = origin_observation(100, 100);
+        record_origin(&mut ledger, 9, Some(baseline.clone()));
+        let mut first = origin_append(&baseline, &[125]);
+        first.physical_eof = 140;
+        record_origin(&mut ledger, 10, Some(first.clone()));
+        let mut partial = first.clone();
+        partial.frames.clear();
+        partial.validated_checkpoint = Some(first.checkpoint);
+        partial.physical_eof = 145;
+        record_origin(&mut ledger, 11, Some(partial.clone()));
+        record_origin(&mut ledger, 12, Some(origin_append(&partial, &[160])));
+        let proofs =
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(12))
+                .unwrap();
+        assert_eq!(proofs.len(), 2);
+        assert_eq!(proofs[1].baseline.start.physical_eof, 100);
+        assert_eq!(proofs[1].baseline.observation.physical_eof, 145);
+        assert_eq!(
+            proofs[1].frames,
+            [HookLiveOriginFrameV1 {
+                start: 125,
+                end: 160,
+                resume_fingerprint: 1160
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_aba_source_replacement_truncation_and_prefix_changes_rebaseline() {
+        for change in [
+            "branch_aba",
+            "source_replaced",
+            "source_truncated",
+            "prefix_changed",
+            "other_profile",
+        ] {
+            let root = TestDir::new(change);
+            let mut ledger = open(root.path(), UtcMicros(1));
+            let baseline = origin_observation(100, 100);
+            record_origin(&mut ledger, 9, Some(baseline.clone()));
+            let mut next = origin_append(&baseline, &[150]);
+            match change {
+                "branch_aba" => {
+                    // Same current branch and HEAD; a changed reflog frontier
+                    // records the intervening checkout transitions.
+                    next.branch_evidence.frontier += 1;
+                    next.branch_evidence.fingerprint = [9; 32];
+                }
+                "source_replaced" => {
+                    next.checkpoint.file_identity += 1;
+                    next.checkpoint.generation += 1;
+                }
+                "source_truncated" => {
+                    next = origin_observation(50, 50);
+                }
+                "prefix_changed" => {
+                    next.validated_checkpoint = None;
+                    next.checkpoint.generation += 1;
+                }
+                "other_profile" => {
+                    next.scope.profile_id = UserProfileId::new("profile.other").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let cutoff = next.physical_eof;
+            assert_eq!(
+                record_origin(&mut ledger, 10, Some(next)),
+                HookLiveOriginOutcomeV1::Baseline,
+                "{change}"
+            );
+            assert!(
+                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                    .unwrap()
+                    .is_empty(),
+                "{change}"
+            );
+            assert_eq!(
+                ledger
+                    .live_origin_baseline([7; 32], UtcMicros(10))
+                    .unwrap()
+                    .observation
+                    .physical_eof,
+                cutoff
+            );
+        }
+    }
+
+    #[test]
+    fn missing_origin_evidence_discards_interval_before_a_new_live_baseline() {
+        let root = TestDir::new("origin-unavailable");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        let baseline = origin_observation(100, 100);
+        record_origin(&mut ledger, 9, Some(baseline.clone()));
+        assert_eq!(
+            record_origin(&mut ledger, 10, None),
+            HookLiveOriginOutcomeV1::Unavailable
+        );
+        assert!(
+            ledger
+                .live_origin_baseline([7; 32], UtcMicros(10))
+                .is_none()
+        );
+        assert_eq!(
+            record_origin(&mut ledger, 11, Some(origin_append(&baseline, &[150]))),
+            HookLiveOriginOutcomeV1::Baseline
+        );
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn live_origin_proof_requires_both_retained_unexpired_admission_receipts() {
+        let root = TestDir::new("origin-retained-receipts");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        let baseline = origin_observation(100, 100);
+        record_origin(&mut ledger, 9, Some(baseline.clone()));
+        record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[150])));
+        assert_eq!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                .unwrap()
+                .len(),
+            1
+        );
+        let expired = UtcMicros(10 + HookAdmissionLedgerLimitsV1::stock().max_age_micros);
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, expired)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::Codex, UtcMicros(10))
+                .unwrap()
+                .is_empty()
+        );
+        // Retaining only the seal is insufficient; the original baseline
+        // receipt may never be reconstructed from the metadata sidecar.
+        let mut bytes = ledger_header().to_vec();
+        let seal = &ledger.entries[&[10; 16]];
+        bytes.extend_from_slice(&encode_record([10; 16], seal.digest, seal.admitted_at));
+        fs::write(records_path(root.path()), bytes).unwrap();
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_file(records_path(root.path())).unwrap();
+        assert!(
+            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn corrupt_origin_metadata_preserves_admission_but_requires_a_fresh_baseline() {
+        let root = TestDir::new("origin-corrupt");
+        let baseline = origin_observation(100, 100);
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            record_origin(&mut ledger, 9, Some(baseline.clone()));
+        }
+        fs::write(
+            root.path().join(LIVE_ORIGINS_FILE),
+            b"incomplete origin metadata",
+        )
+        .unwrap();
+        let (mut ledger, report) = HookAdmissionLedgerV1::open(
+            root.path(),
+            HookHostV1::ClaudeCode,
+            HookAdmissionLedgerLimitsV1::stock(),
+            UtcMicros(10),
+        )
+        .unwrap();
+        assert_eq!(
+            report.live_origin_metadata_error,
+            Some(HookAdmissionLedgerError::RecordUndecodable)
+        );
+        assert_eq!(
+            ledger.admit(&envelope(9, 5), UtcMicros(10)).unwrap(),
+            HookAdmissionDecisionV1::ExactDuplicate
+        );
+        assert!(
+            ledger
+                .live_origin_baseline([7; 32], UtcMicros(10))
+                .is_none()
+        );
+        assert_eq!(
+            record_origin(&mut ledger, 11, Some(origin_append(&baseline, &[150]))),
+            HookLiveOriginOutcomeV1::Baseline
+        );
+        assert!(
+            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -318,6 +318,7 @@ impl RetainedSurfaceResultV1 {
             Self::FactStoreList(value) => {
                 fact_list_collection(value.facts.len(), value.next_after_fact_id.as_ref())
             }
+            Self::ProviderControl(value) => provider_control_facts(value),
             Self::MemoryStatus(_) => {
                 RetainedSurfaceEvidenceFactsV1::unknown_singleton(EvidenceDomain::Operational, true)
             }
@@ -417,6 +418,62 @@ impl RetainedSurfaceResultV1 {
             | Self::SessionRefreshBegin(_) => Err(RetainedSurfaceEvidenceTerminalV1::Effect),
         }
     }
+}
+
+/// These facts describe returned provider evidence. The unchanged typed payload
+/// retains provider terminal, diagnostic and warnings; an error reply with no
+/// operation data stays zero returned with unknown coverage and freshness.
+fn provider_control_facts(
+    value: &super::ProviderControlResultV1,
+) -> Result<RetainedSurfaceEvidenceFactsV1, RetainedSurfaceEvidenceTerminalV1> {
+    use super::{
+        ProviderControlInspectionCoverageV1, ProviderControlOperationResultV1,
+        ProviderControlTerminalV1,
+    };
+    let mut facts = match &value.result {
+        ProviderControlOperationResultV1::Health(data) => {
+            RetainedSurfaceEvidenceFactsV1::unknown_singleton(
+                EvidenceDomain::Diagnostic,
+                data.is_some(),
+            )?
+        }
+        ProviderControlOperationResultV1::Inspection(data) => {
+            let mut facts = RetainedSurfaceEvidenceFactsV1::unknown(
+                EvidenceDomain::Operational,
+                data.as_ref().map_or(0, |data| data.items.len()),
+            )?;
+            if let Some(data) = data {
+                facts.next_cursor = opaque_page_cursor(data.next_cursor.as_deref())?;
+                facts.completeness = match data.coverage {
+                    ProviderControlInspectionCoverageV1::Complete => CoverageCompleteness::Complete,
+                    ProviderControlInspectionCoverageV1::Partial => CoverageCompleteness::Partial,
+                };
+                facts.settle_complete_coverage();
+            }
+            facts
+        }
+        ProviderControlOperationResultV1::SnapshotExport(data) => {
+            RetainedSurfaceEvidenceFactsV1::unknown_singleton(
+                EvidenceDomain::Operational,
+                data.is_some(),
+            )?
+        }
+        ProviderControlOperationResultV1::Feedback(_)
+        | ProviderControlOperationResultV1::Correction(_)
+        | ProviderControlOperationResultV1::DeleteBySource(_)
+        | ProviderControlOperationResultV1::Maintenance(_)
+        | ProviderControlOperationResultV1::SnapshotRestore(_)
+        | ProviderControlOperationResultV1::Replay(_) => {
+            return Err(RetainedSurfaceEvidenceTerminalV1::Effect);
+        }
+    };
+    value
+        .validate()
+        .map_err(|_| RetainedSurfaceEvidenceTerminalV1::InvalidOutput)?;
+    if value.terminal == ProviderControlTerminalV1::Partial {
+        facts.completeness = CoverageCompleteness::Partial;
+    }
+    Ok(facts)
 }
 
 fn fact_collection(

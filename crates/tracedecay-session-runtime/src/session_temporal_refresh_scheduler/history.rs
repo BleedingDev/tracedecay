@@ -68,6 +68,11 @@ pub struct ProjectSessionHistoricalIngestor {
     cancellation: ObservationCancellation,
     codex_discovery: Arc<tracedecay_sessions::runtime::codex::CodexDiscoveryHub>,
     background_cpu: Arc<ProcessBackgroundCpuV1>,
+    original_provenance_resolver: Option<
+        Arc<
+            dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
+        >,
+    >,
     codex_consumer: String,
     codex_registered: AtomicBool,
 }
@@ -102,9 +107,20 @@ impl ProjectSessionHistoricalIngestor {
             cancellation: ObservationCancellation::default(),
             codex_discovery,
             background_cpu,
+            original_provenance_resolver: None,
             codex_consumer,
             codex_registered: AtomicBool::new(true),
         }
+    }
+
+    /// Shares the root's bounded live-event reader with background catch-up.
+    #[must_use]
+    pub fn with_original_provenance_resolver(
+        mut self,
+        resolver: Option<Arc<dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1>>,
+    ) -> Self {
+        self.original_provenance_resolver = resolver;
+        self
     }
 
     fn deregister_codex_once(&self) {
@@ -120,6 +136,10 @@ impl SessionHistoricalIngestor for ProjectSessionHistoricalIngestor {
             let authority =
                 tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(self.database.clone())
                     .with_background_cpu(Arc::clone(&self.background_cpu));
+            let authority = match &self.original_provenance_resolver {
+                Some(resolver) => authority.with_original_provenance_resolver(Arc::clone(resolver)),
+                None => authority,
+            };
             let pass = Box::pin(
                 tracedecay_sessions::runtime::ingest_project_sources_for_provider_with_cancellation_and_codex_state(
                     self.profile_identity.brain_id(),

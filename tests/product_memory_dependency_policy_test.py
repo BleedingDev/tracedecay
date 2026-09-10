@@ -7,6 +7,7 @@ import copy
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,15 +70,27 @@ def policy_fixture() -> dict[str, Any]:
     }
 
 
-def write_package(root: Path, name: str, dependencies: list[str]) -> None:
+def write_package(
+    root: Path,
+    name: str,
+    dependencies: list[str],
+    *,
+    section: str = "dependencies",
+    target: bool = False,
+    renamed: bool = False,
+) -> None:
     path = root / "crates" / name / "Cargo.toml"
     path.parent.mkdir(parents=True, exist_ok=True)
     dependency_lines = "\n".join(
-        f'{dependency} = {{ path = "../{dependency}" }}' for dependency in dependencies
+        (f'alias = {{ package = "{dependency}", path = "../{dependency}" }}' if renamed
+         else f'{dependency} = {{ path = "../{dependency}" }}')
+        for dependency in dependencies
     )
+    if target:
+        section = f'target.\'cfg(unix)\'.{section}'
     path.write_text(
         f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n\n'
-        f"[dependencies]\n{dependency_lines}\n",
+        f"[{section}]\n{dependency_lines}\n",
         encoding="utf-8",
     )
 
@@ -161,6 +174,44 @@ class MemoryDependencyPolicyTest(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(stats["used_exceptions"], 1)
 
+    def test_production_rule_keeps_kinds_for_target_and_renamed_edges(self) -> None:
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for target, renamed in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(section=section, target=target, renamed=renamed):
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        root = Path(temp_dir)
+                        write_package(
+                            root, "tracedecay-memory-provider-ncm", ["tracedecay-memory-provider-registry"],
+                            section=section, target=target, renamed=renamed,
+                        )
+                        policy = policy_fixture()
+                        rule = policy["dependency_direction_rules"][1]
+                        rule["forbidden_dependencies"].append("tracedecay-memory-provider-registry")
+                        rule["dependency_kinds"] = ["normal", "build"]
+                        errors, stats = self.validate(root, policy)
+                        if section == "dev-dependencies":
+                            self.assertEqual(errors, [])
+                            self.assertEqual(stats["forbidden_edges_observed"], 0)
+                        else:
+                            self.assertIn("tracedecay-memory-provider-ncm -> tracedecay-memory-provider-registry", "\n".join(errors))
+                            self.assertEqual(stats["forbidden_edges_observed"], 1)
+
+    def test_rule_without_dependency_kinds_still_checks_all_kinds(self) -> None:
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                write_package(root, "tracedecay-memory-provider-ncm", ["tracedecay-store"], section=section)
+                errors, _ = self.validate(root, policy_fixture())
+                self.assertIn("tracedecay-memory-provider-ncm -> tracedecay-store", "\n".join(errors))
+
+    def test_invalid_dependency_kinds_fail_closed(self) -> None:
+        for kinds in (None, "normal", [], ["normal", "normal"], ["test"], ["normal", {}]):
+            with self.subTest(kinds=kinds), tempfile.TemporaryDirectory() as temp_dir:
+                policy = policy_fixture()
+                policy["dependency_direction_rules"][1]["dependency_kinds"] = kinds
+                errors, _ = self.validate(Path(temp_dir), policy)
+                self.assertIn("dependency_kinds must be a non-empty array of distinct", "\n".join(errors))
+
     def test_exception_requires_rationale_and_existing_adr(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -208,7 +259,8 @@ class MemoryDependencyPolicyTest(unittest.TestCase):
     def test_real_repository_policy_passes(self) -> None:
         result = subprocess.run(
             [
-                "python3",
+                sys.executable,
+                "-S",
                 str(CHECKER),
                 "--repo",
                 str(REPO),

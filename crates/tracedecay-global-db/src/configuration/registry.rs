@@ -1205,3 +1205,44 @@ mod semantic_runtime_payload_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod memory_provider_registration_tests {
+    use super::*;
+
+    #[test]
+    fn provider_participation_and_selection_keep_project_scope_defaults_and_restart_policy() {
+        let registry = ConfigurationRegistry::core().unwrap();
+        for key in [
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+        ] {
+            let definition = registry.definition(&SettingKey::new(key).unwrap()).unwrap();
+            assert_eq!(definition.scope, SettingScopeV1::Project);
+            assert_eq!(
+                definition.restart_requirement,
+                RestartRequirementV1::DaemonRestart
+            );
+            match key {
+                MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY => assert_eq!(
+                    definition.default_value,
+                    ConfigurationValueV1::Boolean(false)
+                ),
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY => assert_eq!(
+                    definition.default_value,
+                    ConfigurationValueV1::Text(r#"{"mode":"disabled"}"#.to_owned())
+                ),
+                _ => {
+                    let ConfigurationValueV1::Text(value) = &definition.default_value else {
+                        panic!("routing must remain canonical JSON text")
+                    };
+                    let routing: tracedecay_domain::configuration::MemoryProviderRecallRoutingV1 =
+                        serde_json::from_str(value).unwrap();
+                    assert_eq!(routing.active_provider, None);
+                    assert_eq!(routing.fallback, None);
+                }
+            }
+        }
+    }
+}

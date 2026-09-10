@@ -10,9 +10,13 @@ use tracedecay_contracts::retained_surfaces::{
     FactStoreRemoveRequestV1, FactStoreSearchRequestV1, FactStoreSupersedeRequestV1,
     FactStoreUpdateRequestV1, LcmDescribeRequestV1, LcmDoctorRequestV1, LcmExpandQueryRequestV1,
     LcmExpandRequestV1, LcmGrepRequestV1, LcmLoadSessionRequestV1, LcmStatusRequestV1,
-    MemoryStatusRequestV1, MessageSearchRequestV1, RetainedSurfaceOperation,
-    RetainedSurfaceRequestV1, RetainedSurfaceResultV1, SessionRefreshActionRequestV1,
-    SessionRefreshActionV1, SessionRefreshRequestV1, SessionsForRequestV1, WorkflowsRequestV1,
+    MemoryStatusRequestV1, MessageSearchRequestV1, ProviderControlRequestV1,
+    ProviderCorrectionRequestV1, ProviderDeleteBySourceRequestV1, ProviderFeedbackRequestV1,
+    ProviderHealthRequestV1, ProviderInspectionRequestV1, ProviderMaintenanceRequestV1,
+    ProviderReplayRequestV1, ProviderSnapshotExportRequestV1, ProviderSnapshotRestoreRequestV1,
+    RetainedSurfaceOperation, RetainedSurfaceRequestV1, RetainedSurfaceResultV1,
+    SessionRefreshActionRequestV1, SessionRefreshActionV1, SessionRefreshRequestV1,
+    SessionsForRequestV1, WorkflowsRequestV1,
 };
 use tracedecay_tool_catalog::RouteExposureV1;
 
@@ -54,21 +58,22 @@ fn validate_catalog_bindings() -> Result<(), ApplicationSurfaceAdapterError> {
 }
 
 pub(super) fn active_request_conflict_response(
+    operation: RetainedSurfaceOperation,
     request_id: tracedecay_contracts::RequestId,
 ) -> Response {
-    match active_request_conflict(request_id) {
+    match active_request_conflict(operation, request_id) {
         Ok(result) => result.into_http_response(),
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
 fn active_request_conflict(
+    operation: RetainedSurfaceOperation,
     request_id: tracedecay_contracts::RequestId,
 ) -> Result<
     tracedecay_api::CanonicalInvocationResult<serde_json::Value>,
     ApplicationSurfaceAdapterError,
 > {
-    let operation = RetainedSurfaceOperation::FactStoreCurate;
     let registry = operation.registry()?;
     let operation_id = tracedecay_tool_catalog::OperationId::new(operation.operation_id())
         .map_err(ApplicationSurfaceAdapterError::Identifier)?;
@@ -111,7 +116,7 @@ mod conflict_tests {
         let request_id =
             tracedecay_contracts::RequestId::new("request.sdk.curate").expect("request id");
         let envelope = serde_json::to_value(
-            active_request_conflict(request_id)
+            active_request_conflict(super::RetainedSurfaceOperation::FactStoreCurate, request_id)
                 .expect("conflict")
                 .into_http_json(),
         )
@@ -241,7 +246,42 @@ pub(crate) fn decode_request(
                 .map_err(named_argument_error)
         };
     }
+    macro_rules! decode_provider_control {
+        ($request:ty, $variant:ident) => {
+            serde_path_to_error::deserialize::<_, $request>(body)
+                .map(ProviderControlRequestV1::$variant)
+                .map(RetainedSurfaceRequestV1::ProviderControl)
+                .map_err(named_argument_error)
+        };
+    }
     match operation {
+        RetainedSurfaceOperation::ProviderFeedback => {
+            decode_provider_control!(ProviderFeedbackRequestV1, Feedback)
+        }
+        RetainedSurfaceOperation::ProviderCorrection => {
+            decode_provider_control!(ProviderCorrectionRequestV1, Correction)
+        }
+        RetainedSurfaceOperation::ProviderDeleteBySource => {
+            decode_provider_control!(ProviderDeleteBySourceRequestV1, DeleteBySource)
+        }
+        RetainedSurfaceOperation::ProviderHealth => {
+            decode_provider_control!(ProviderHealthRequestV1, Health)
+        }
+        RetainedSurfaceOperation::ProviderInspection => {
+            decode_provider_control!(ProviderInspectionRequestV1, Inspection)
+        }
+        RetainedSurfaceOperation::ProviderMaintenance => {
+            decode_provider_control!(ProviderMaintenanceRequestV1, Maintenance)
+        }
+        RetainedSurfaceOperation::ProviderSnapshotExport => {
+            decode_provider_control!(ProviderSnapshotExportRequestV1, SnapshotExport)
+        }
+        RetainedSurfaceOperation::ProviderSnapshotRestore => {
+            decode_provider_control!(ProviderSnapshotRestoreRequestV1, SnapshotRestore)
+        }
+        RetainedSurfaceOperation::ProviderReplay => {
+            decode_provider_control!(ProviderReplayRequestV1, Replay)
+        }
         RetainedSurfaceOperation::FactStoreCurate => {
             decode!(FactStoreCurateRequestV1, FactStoreCurate)
         }
@@ -414,6 +454,70 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn all_provider_bodies_enter_the_unified_typed_control_request() {
+        let source = json!({"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":"observation.1"});
+        let state = json!({"kind":"canonical_session","provider_id":"native","registration_revision":7,"canonical_provider_id":"codex","session_id":"session.1"});
+        let cases = [
+            (
+                RetainedSurfaceOperation::ProviderFeedback,
+                json!({"source":source,"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderCorrection,
+                json!({"source":source,"expected_source_revision":"revision.1","correction":{"kind":"mark_incorrect","revoked_at":1},"reason":"canonical correction","evidence_refs":[]}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderDeleteBySource,
+                json!({"source":source,"mode":"remove_influence","expected_fence_revision":0,"include_snapshots":true}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderHealth,
+                json!({"state":state,"requested_checks":["state"]}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderInspection,
+                json!({"state":state,"selection":{"view":"state_summary"},"maximum_items":1,"maximum_bytes":4096}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderMaintenance,
+                json!({"state":state,"task":"validate_state","maximum_items":1,"maximum_bytes":4096,"maximum_duration_millis":1000,"dry_run":true}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderSnapshotExport,
+                json!({"state":state,"maximum_bytes":4096}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderSnapshotRestore,
+                json!({"state":state,"snapshot_ref":"snapshot.host.1","expected_state_generation":3}),
+            ),
+            (
+                RetainedSurfaceOperation::ProviderReplay,
+                json!({"state":state,"observation_batch_refs":["batch.host.1"],"first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":3,"expected_previous_acknowledged_sequence":0}),
+            ),
+        ];
+        for (operation, body) in cases {
+            let decoded = decode_request(operation, body.clone()).expect("actual operation body");
+            assert_eq!(decoded.operation(), operation);
+            let RetainedSurfaceRequestV1::ProviderControl(control) = decoded else {
+                panic!("provider control must use the unified execution port")
+            };
+            assert_eq!(control.operation(), operation);
+            assert_eq!(
+                serde_json::to_value(control).expect("typed control")["request"],
+                body
+            );
+            let mut injected = body;
+            injected["caller_authority"] = json!("untrusted");
+            let error = decode_request(operation, injected).expect_err("closed concrete body");
+            assert!(error.to_string().contains("caller_authority"));
+        }
+        let invalid_source = json!({"source":{"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":42},"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1});
+        let error = decode_request(RetainedSurfaceOperation::ProviderFeedback, invalid_source)
+            .expect_err("wrong nested field type");
+        assert!(error.to_string().contains("source.observation_id"));
+    }
 
     #[test]
     fn route_selected_session_refresh_rejects_embedded_action() {

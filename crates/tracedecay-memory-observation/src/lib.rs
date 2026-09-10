@@ -81,6 +81,7 @@ mod refusal;
 mod retention;
 mod runtime;
 mod settlement;
+mod source_delivery;
 mod sqlite;
 mod state;
 
@@ -137,7 +138,10 @@ pub use runtime::{
     SourceRecordV1, TerminalIdentityMismatchV1, UTILIZATION_SCALE_PPM, WakeOutcomeV1,
 };
 pub use settlement::{CanonicalSettlementReceiptV1, SourceAuthorityV1, SourceStreamKeyV1};
+pub use source_delivery::{ExpectedSourceDeliveryV1, SourceDeliveryEvidenceV1};
 pub use sqlite::{
-    OPEN_WITHHELD_AUDIT_ROWS, SCHEMA_VERSION, SqliteObservationJournal, WithheldAuditProgressV1,
+    OPEN_WITHHELD_AUDIT_ROWS, ProviderSourceDeletionIntentV1, ProviderSourceFenceV1,
+    ProviderSourceIntentReceiptV1, ProviderSourceRevisionAdmissionV1, SCHEMA_VERSION,
+    SqliteObservationJournal, WithheldAuditProgressV1,
 };
 pub use state::DeliveryStateV1;

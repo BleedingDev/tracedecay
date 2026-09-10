@@ -464,6 +464,164 @@ fn admission_capture_cache_reuses_exact_watermark_and_invalidates_on_index_chang
 }
 
 #[test]
+fn original_receipt_capture_stays_on_source_branch_during_later_ingestion() {
+    use tracedecay_domain::{
+        ComponentVersion, ObservationIdentityMaterialV1, ObservationScopeV1,
+        ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
+        PayloadReferenceV1, ProviderId, RetentionClass, SanitizationReceiptId,
+        SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
+        SessionId,
+    };
+    use tracedecay_store::observation::ObservationOriginV1;
+    struct ExactReceipt {
+        identity: ObservationIdentityMaterialV1,
+        evidence: OriginalObservationEvidenceV1,
+    }
+    impl OriginalObservationProvenanceResolverV1 for ExactReceipt {
+        fn resolve(
+            &self,
+            identity: &ObservationIdentityMaterialV1,
+            checkpoint: Option<(u64, u64)>,
+        ) -> Option<OriginalObservationEvidenceV1> {
+            (identity == &self.identity && checkpoint == Some((7, 11)))
+                .then(|| self.evidence.clone())
+        }
+    }
+    let fixture = GitFixture::new();
+    fixture.commit("origin");
+    let context = RepositoryProvenanceAdmissionContext::new(
+        fixture.path().to_path_buf(),
+        ProjectId::new("project.origin-test").unwrap(),
+        RepositoryId::new("repository.origin-test").unwrap(),
+        Some(WorktreeId::new("worktree.origin-test").unwrap()),
+        PRIVACY_DOMAIN_SALT,
+    );
+    let identity = ObservationIdentityMaterialV1::new(
+        ObservationSourceIdentityV1::for_provider(
+            ProviderId::new("claude").unwrap(),
+            SessionId::new("session.source").unwrap(),
+        )
+        .unwrap(),
+        ObservationScopeV1::Project {
+            project_id: context.project_id.clone(),
+        },
+        ObservationSourceGenerationV1::new(7).unwrap(),
+        ObservationSourceRangeV1::new(10, 20).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        context
+            .resolve_original_observation(&identity, Some((7, 11)))
+            .is_none()
+    );
+    let original = context
+        .capture_snapshot(UtcMicros(100))
+        .availability()
+        .value()
+        .unwrap()
+        .clone();
+    let context = context.with_original_provenance_resolver(Arc::new(ExactReceipt {
+        identity: identity.clone(),
+        evidence: OriginalObservationEvidenceV1 {
+            repository: original.clone(),
+            authority_ref: "hook-live-origin:test-proof".to_owned(),
+        },
+    }));
+    fixture.git(&["checkout", "-q", "-b", "ingestion"]);
+    let current = context.capture_snapshot(UtcMicros(200));
+    assert_eq!(
+        current
+            .availability()
+            .value()
+            .unwrap()
+            .evidence()
+            .attached_ref()
+            .value()
+            .unwrap()
+            .as_str(),
+        "refs/heads/ingestion"
+    );
+    assert!(
+        context
+            .resolve_original_observation(&identity, None)
+            .is_none()
+    );
+    assert!(
+        context
+            .resolve_original_observation(&identity, Some((7, 12)))
+            .is_none()
+    );
+    let token = context
+        .resolve_original_observation(&identity, Some((7, 11)))
+        .unwrap();
+    let payload = serde_json::json!({"message":"captured on main"});
+    let receipt = SanitizationReceiptV1::new(
+        SanitizationReceiptRefV1::new(
+            SanitizationReceiptId::new("receipt.origin-test").unwrap(),
+            ComponentVersion::new("sanitizer.origin-test.v1").unwrap(),
+        )
+        .unwrap(),
+        SanitizerDispositionV1::Accepted,
+        SensitivityV1::NonSensitive,
+        Some(PayloadReferenceV1::for_payload(&payload).unwrap()),
+    )
+    .unwrap();
+    let observation = DurableObservationV1::new(
+        identity.clone(),
+        receipt.clone(),
+        RetentionClass::new("retention.origin-test").unwrap(),
+        payload.clone(),
+    )
+    .unwrap();
+    let projection = ProjectionGenerationId::new("projection.origin-test.v1").unwrap();
+    let authorization = tracedecay_store::build_observation_resolution_authorization_v1(
+        &observation,
+        "origin-test",
+    )
+    .unwrap();
+    let attachment = token
+        .bind_after_sanitization(&observation, &projection, UtcMicros(300), authorization)
+        .unwrap();
+    assert!(matches!(
+        attachment.origin(),
+        ObservationOriginV1::Recorded { .. }
+    ));
+    let frozen = attachment.availability().value().unwrap().capture();
+    assert_eq!(frozen, &original);
+    assert_eq!(
+        frozen.evidence().attached_ref().value().unwrap().as_str(),
+        "refs/heads/main"
+    );
+    let adjacent = ObservationIdentityMaterialV1::new(
+        identity.source().clone(),
+        identity.scope().clone(),
+        identity.generation(),
+        ObservationSourceRangeV1::new(20, 30).unwrap(),
+    )
+    .unwrap();
+    let adjacent = DurableObservationV1::new(
+        adjacent,
+        receipt,
+        RetentionClass::new("retention.origin-test").unwrap(),
+        payload,
+    )
+    .unwrap();
+    let authorization =
+        tracedecay_store::build_observation_resolution_authorization_v1(&adjacent, "origin-test")
+            .unwrap();
+    assert!(
+        token
+            .bind_after_sanitization(&adjacent, &projection, UtcMicros(300), authorization)
+            .is_err()
+    );
+    let mut legacy = serde_json::to_value(&attachment).unwrap();
+    legacy.as_object_mut().unwrap().remove("origin");
+    let legacy: tracedecay_store::observation::RepositoryProvenanceAttachmentV1 =
+        serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.origin(), &ObservationOriginV1::Unavailable);
+}
+
+#[test]
 fn non_repository_is_typed_unavailable() {
     let root = TempDir::new().unwrap();
     let repository_id = RepositoryId::new("repository.fixture").unwrap();

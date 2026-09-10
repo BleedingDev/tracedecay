@@ -1609,6 +1609,20 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
             ScenarioStep::DeleteBySource {
                 forget_source_key, ..
             } => self.delete_by_source(forget_source_key, number, &mut calls, timings)?,
+            ScenarioStep::Feedback { .. }
+            | ScenarioStep::Correction { .. }
+            | ScenarioStep::SnapshotExport { .. }
+            | ScenarioStep::SnapshotRestore { .. }
+            | ScenarioStep::InstallLegacyState { .. }
+            | ScenarioStep::CorruptPersistedState { .. }
+            | ScenarioStep::SetProviderMode { .. }
+            | ScenarioStep::CancelBeforeDispatch { .. }
+            | ScenarioStep::LoseReplyAfterCommit { .. } => StepOutcome::Terminal {
+                // These actions require the owned physical-fixture adapter. The
+                // legacy baseline must expose missing execution, never no-op success.
+                terminal_code: TerminalCode::CapabilityUnsupported.as_wire().into(),
+                committed_effect_state: CommittedEffectState::None.as_wire().into(),
+            },
         };
         Ok(BaselineStepRecord {
             step: number,
@@ -1893,12 +1907,12 @@ impl<'run, 'corpus, 'provider> ScenarioExecution<'run, 'corpus, 'provider> {
             "temporal_query": {
                 "mode": request.temporal_query.mode,
                 "evaluation_time": request.temporal_query.evaluation_time,
-                "as_of": Value::Null,
-                "interval_start": Value::Null,
-                "interval_end": Value::Null,
-                "include_superseded": false,
-                "include_revoked": false,
-                "unknown_validity_policy": "exclude",
+                "as_of": request.temporal_query.as_of,
+                "interval_start": request.temporal_query.interval_start,
+                "interval_end": request.temporal_query.interval_end,
+                "include_superseded": request.temporal_query.include_superseded,
+                "include_revoked": request.temporal_query.include_revoked,
+                "unknown_validity_policy": request.temporal_query.unknown_validity_policy,
             },
             "budgets": budgets,
             "exclusions": exclusions,

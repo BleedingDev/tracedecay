@@ -64,10 +64,19 @@ impl NcmEngine {
             if handle.fenced {
                 return unavailable_recovery(handle.commit_seq);
             }
-            match lookup_replay(handle, &request.idempotency_key, &request.payload_sha256) {
+            match lookup_observe_replay(handle, &request) {
                 Ok(Some(reply)) => return reply,
                 Ok(None) => {}
                 Err(reply) => return reply,
+            }
+            if let Err(error) = handle
+                .store
+                .ensure_source_provenance_not_revoked(&request.source, &request.provenance)
+            {
+                return store_reply(error, handle.commit_seq);
+            }
+            if let Err(reply) = reject_reused_source(handle, &request, started) {
+                return reply;
             }
         }
 
@@ -105,10 +114,19 @@ impl NcmEngine {
         if handle.fenced {
             return unavailable_recovery(handle.commit_seq);
         }
-        match lookup_replay(handle, &request.idempotency_key, &request.payload_sha256) {
+        match lookup_observe_replay(handle, &request) {
             Ok(Some(reply)) => return reply,
             Ok(None) => {}
             Err(reply) => return reply,
+        }
+        if let Err(error) = handle
+            .store
+            .ensure_source_provenance_not_revoked(&request.source, &request.provenance)
+        {
+            return store_reply(error, handle.commit_seq);
+        }
+        if let Err(reply) = reject_reused_source(handle, &request, started) {
+            return reply;
         }
         let live = match read_live(handle) {
             Ok(live) => live,
@@ -138,7 +156,7 @@ impl NcmEngine {
             Some(seq) => seq,
             None => return EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null),
         };
-        let reply = EngineReply::new(
+        let mut reply = EngineReply::new(
             Outcome::Success,
             pending_seq,
             json!({
@@ -261,6 +279,187 @@ impl NcmEngine {
                 json!({"commit_seq": committed}),
             );
         }
+        if let Err(reply) = super::util::attach_observation_delivery(handle, &mut reply) {
+            return reply;
+        }
         reply
     }
+}
+
+fn reject_reused_source(
+    handle: &NamespaceHandle,
+    request: &ObserveRequest,
+    started: Instant,
+) -> Result<(), EngineReply> {
+    let Some(identity) = request
+        .provenance
+        .pointer("/selection/observation_identity")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let binding = crate::source_binding::read(
+        handle.store.namespace(),
+        &request.source,
+        &request.provenance,
+    )
+    .map_err(|reason| {
+        EngineReply::rejected(RejectReason::InvalidRequest(reason), handle.commit_seq)
+    })?;
+    let filter = binding
+        .as_ref()
+        .map_or(&request.source, |binding| &binding.legacy_source_id);
+    let mut after = 0;
+    let mut scanned = 0_u64;
+    loop {
+        if remaining_deadline(request.deadline, started).remaining_ms == 0 {
+            return Err(EngineReply::new(
+                Outcome::Cancelled,
+                handle.commit_seq,
+                Value::Null,
+            ));
+        }
+        let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
+        let capsules = handle
+            .store
+            .capsule_page(Some(&filter.0), after, limit)
+            .map_err(|error| store_reply(error, handle.commit_seq))?;
+        let complete = capsules.len() < limit as usize;
+        for capsule in capsules {
+            if remaining_deadline(request.deadline, started).remaining_ms == 0 {
+                return Err(EngineReply::new(
+                    Outcome::Cancelled,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            if scanned == 1_000_000 {
+                return Err(EngineReply::new(
+                    Outcome::BudgetExceeded,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            if capsule.record_id.0 <= after {
+                return Err(EngineReply::new(
+                    Outcome::Corrupt,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            after = capsule.record_id.0;
+            scanned += 1;
+            let provenance: Value = serde_json::from_str(&capsule.provenance)
+                .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
+            let retained = crate::source_binding::read(
+                handle.store.namespace(),
+                &capsule.source_id,
+                &provenance,
+            )
+            .map_err(|reason| {
+                EngineReply::new(
+                    Outcome::Corrupt,
+                    handle.commit_seq,
+                    json!({"reason":reason}),
+                )
+            })?;
+            if binding.as_ref().is_some_and(|request| {
+                !request.is_legacy
+                    && retained
+                        .as_ref()
+                        .and_then(|binding| binding.full_source_id.as_ref())
+                        != request.full_source_id.as_ref()
+            }) {
+                continue;
+            }
+            if provenance
+                .pointer("/selection/observation_identity")
+                .and_then(Value::as_str)
+                == Some(identity)
+            {
+                return Err(EngineReply::rejected(
+                    RejectReason::IdempotencyConflict,
+                    handle.commit_seq,
+                ));
+            }
+        }
+        if complete {
+            return Ok(());
+        }
+    }
+}
+
+/// Upgraded common requests can reconcile only the exact retained legacy body.
+/// All fresh keys and all other digest differences retain ordinary semantics.
+pub(super) fn lookup_observe_replay(
+    handle: &mut NamespaceHandle,
+    request: &ObserveRequest,
+) -> Result<Option<EngineReply>, EngineReply> {
+    let event = handle
+        .store
+        .event_for_key(&request.idempotency_key)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    if event.payload_sha256 == request.payload_sha256 {
+        return lookup_replay(handle, &request.idempotency_key, &request.payload_sha256);
+    }
+    let binding = crate::source_binding::read(
+        handle.store.namespace(),
+        &request.source,
+        &request.provenance,
+    )
+    .map_err(|reason| {
+        EngineReply::rejected(RejectReason::InvalidRequest(reason), handle.commit_seq)
+    })?;
+    if let Some(binding) = binding.filter(|binding| !binding.is_legacy) {
+        let mut legacy = request.clone();
+        legacy.source = binding.legacy_source_id.clone();
+        if let Some(provenance) = legacy.provenance.as_object_mut() {
+            provenance.remove("source_binding");
+        }
+        let digest = legacy.canonical_payload_sha256().map_err(|reason| {
+            EngineReply::rejected(RejectReason::InvalidRequest(reason), handle.commit_seq)
+        })?;
+        if digest == event.payload_sha256 {
+            let durable: DurableReceipt = serde_json::from_str(&event.receipt)
+                .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
+            if let DurableOperation::Observe { record_id } = durable.operation {
+                let capsule = handle
+                    .store
+                    .capsule(record_id)
+                    .map_err(|error| store_reply(error, handle.commit_seq))?;
+                if let Some(capsule) =
+                    capsule.filter(|capsule| capsule.status != crate::store::CapsuleStatus::Revoked)
+                {
+                    let provenance: Value =
+                        serde_json::from_str(&capsule.provenance).map_err(|_| {
+                            EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null)
+                        })?;
+                    let retained = crate::source_binding::read(
+                        handle.store.namespace(),
+                        &capsule.source_id,
+                        &provenance,
+                    )
+                    .map_err(|reason| {
+                        EngineReply::new(
+                            Outcome::Corrupt,
+                            handle.commit_seq,
+                            json!({"reason":reason}),
+                        )
+                    })?;
+                    if retained.is_some_and(|retained| {
+                        retained.is_legacy
+                            && retained.full_source_id == binding.full_source_id
+                            && retained.legacy_source_id == binding.legacy_source_id
+                    }) && provenance["common_capsule"] == request.provenance["common_capsule"]
+                    {
+                        return lookup_replay(handle, &request.idempotency_key, &digest);
+                    }
+                }
+            }
+        }
+    }
+    lookup_replay(handle, &request.idempotency_key, &request.payload_sha256)
 }

@@ -46,6 +46,10 @@ Inspection provides bounded, redacted views of state summary, source influence, 
 
 It cannot expose raw credentials, unadmitted secret material, provider-internal secret state, or hidden canonical authority. Cursors are scope-bound. Inspection is read-only and may report partial coverage explicitly.
 
+The common profile pins `delivery_receipt` to selector `{ "idempotency_key": "<original key>" }` and items with `operation_id`, `idempotency_key`, `provider_receipt_digest`, and `stable_memory_ref`. All four values come from the retained original effect. A new replay or inspection cannot replace them; missing evidence is reported without fabrication.
+
+The common `trace` selector is `{ "stable_memory_ref": "<retained target>" }`. Its items contain `stable_memory_ref`, bounded emitted `content`, the SHA-256 of those exact UTF-8 bytes in `content_sha256`, and retained `original_source` attribution or `null` when absent. Privacy withholding sets content, digest, and attribution to `null` together. Legacy unknown metadata stays unknown. The existing outer inspection limits and redaction controls apply; truncation reports partial coverage. Exact item schemas and source semantics are pinned in the [common advisory profile](common-advisory-profile.md).
+
 ## Correction
 
 Correction targets exactly one stable memory reference, recall trace, or source reference. It may supersede, restrict scope, change validity, replace provider-local content, or mark provider-local material incorrect.

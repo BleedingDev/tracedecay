@@ -16,15 +16,16 @@
 //! comes up cannot tell a working hook from a broken one — startup would have
 //! ingested the same rows. Here the daemon is already up and has already
 //! mounted the project (the baseline `tracedecay_context` call below forces
-//! that). The fixture waits for startup import and projection completion before
-//! writing the transcript, then proves the journal stays empty across a bounded
-//! settling window before the hook runs. Background history reconciliation
-//! remains enabled; this is a bounded causal control, not global hook exclusivity.
+//! that). After startup import and projection complete, the fixture opens an
+//! empty Claude transcript or metadata-only Codex rollout and runs SessionStart
+//! to establish the live baseline. It then appends the first turn and proves
+//! the journal stays empty across a bounded settling window before Stop.
+//! Background history reconciliation remains enabled.
 //!
-//! The ignored real-NCM variants also enable the canonical NCM observer setting
-//! before restart, then require independent applied receipts in both journals.
-//! They share only the installed model artifacts; mutable NCM state belongs to
-//! the same isolated HOME as the daemon. Native remains the active recall route.
+//! The ignored real-NCM variants select NCM independently with Native advisory
+//! disabled, or retain Native as active with NCM observing. Observer variants
+//! require independent applied receipts in both journals. They share only the
+//! installed model artifacts; mutable NCM state belongs to the isolated HOME.
 //!
 //! # What this proves about the product
 //!
@@ -38,12 +39,17 @@
 //!   provider-memory lane, bounded and de-duplicated, naming the provider the
 //!   project's own routing policy pinned.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+#[path = "product_memory_provider_claude_host_journey/comparison_fixture.rs"]
+mod comparison_fixture;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -53,7 +59,7 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
 };
 use tracedecay_memory_observation::{
-    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+    AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
     ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
     RetentionPolicyV1, SqliteObservationJournal,
 };
@@ -86,6 +92,25 @@ const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 /// This CLI target deliberately has no direct dependency on the adapter.
 const NCM_OBSERVER_PROVIDER_ID: &str = "ncm";
 const NCM_JOURNAL_FILE_NAME: &str = "memory-observation-ncm-journal-v1.sqlite3";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveProvider {
+    Native,
+    RustNcm,
+}
+
+impl ActiveProvider {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Native => CONFIGURED_PROVIDER_ID,
+            Self::RustNcm => NCM_OBSERVER_PROVIDER_ID,
+        }
+    }
+
+    fn is_ncm(self) -> bool {
+        self == Self::RustNcm
+    }
+}
 
 /// Observation kind the journey admits for host session messages.
 const SESSION_MESSAGE_OBSERVATION_KIND: &str = "session.message_committed.v1";
@@ -137,6 +162,7 @@ const GLOBAL_DB_ENV: &str = "TRACEDECAY_GLOBAL_DB";
 
 struct ClaudeHostJourney {
     codex: bool,
+    active_provider: ActiveProvider,
     ncm_observer: bool,
     daemon: Option<Child>,
     home: TempDir,
@@ -154,16 +180,33 @@ struct ClaudeHostJourney {
 }
 
 impl ClaudeHostJourney {
-    /// A registered git project under a throwaway profile, with the daemon
-    /// running and both memory-provider gates committed. Both settings are
-    /// `DaemonRestart`, so the daemon is restarted before the journey begins:
-    /// a composition that is already open keeps the mounts it opened with.
-    fn start(codex: bool) -> Self {
-        Self::start_with_observer(codex, false)
+    /// A registered project with the selected advisory provider configured.
+    /// Provider settings are `DaemonRestart`, so restart publishes the chosen
+    /// composition before the journey begins.
+    fn start(codex: bool, active_provider: ActiveProvider, ncm_observer: bool) -> Self {
+        let home = TempDir::new().expect("isolated home");
+        let mut journey = Self::allocate(home, codex, active_provider, ncm_observer);
+        journey.start_daemon();
+        journey.initialize_registered_project();
+        let project_id = journey.project_id();
+        journey.commit_provider_gates(&project_id);
+        if active_provider.is_ncm() || ncm_observer {
+            journey.commit_real_ncm(&project_id);
+        }
+        // All provider gates are DaemonRestart settings: restart is what makes the
+        // provider host mount.
+        journey.stop_daemon();
+        journey.start_daemon();
+        journey
     }
 
-    fn start_with_observer(codex: bool, ncm_observer: bool) -> Self {
-        let home = TempDir::new().expect("isolated home");
+    /// Allocate paths before choosing any provider or starting a daemon.
+    fn allocate(
+        home: TempDir,
+        codex: bool,
+        active_provider: ActiveProvider,
+        ncm_observer: bool,
+    ) -> Self {
         let root = home.path().to_path_buf();
         let profile = root.join(".tracedecay");
         let project = root.join("project");
@@ -173,8 +216,9 @@ impl ClaudeHostJourney {
         install_binary_shim(&bin_dir);
         initialize_project(&project);
 
-        let mut journey = Self {
+        Self {
             codex,
+            active_provider,
             ncm_observer,
             daemon: None,
             home,
@@ -183,19 +227,7 @@ impl ClaudeHostJourney {
             bin_dir,
             journal: OnceLock::new(),
             ncm_journal: OnceLock::new(),
-        };
-        journey.start_daemon();
-        journey.initialize_registered_project();
-        let project_id = journey.project_id();
-        journey.commit_provider_gates(&project_id);
-        if ncm_observer {
-            journey.commit_real_ncm_observer(&project_id);
         }
-        // All provider gates are DaemonRestart settings: restart is what makes the
-        // provider host mount.
-        journey.stop_daemon();
-        journey.start_daemon();
-        journey
     }
 
     fn cli(&self, args: &[&str]) -> Command {
@@ -227,12 +259,47 @@ impl ClaudeHostJourney {
             .expect("isolated daemon log");
         let mut daemon = self
             .cli(&["daemon", "run"])
+            .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()
             .expect("daemon should start");
         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
         self.daemon = Some(daemon);
+    }
+
+    /// Invoked only while formatting a failed populated-recall assertion.
+    /// Reads opt-in host counters, never ledger tables or raw log content.
+    fn native_recall_failure_diagnostics(&self) -> Value {
+        if self.active_provider != ActiveProvider::Native {
+            return Value::Null;
+        }
+        let missing = || json!({"availability":"no_readable_opt_in_diagnostics"});
+        let Ok(mut log) = fs::File::open(self.home.path().join("daemon.stderr.log")) else {
+            return missing();
+        };
+        let Ok(metadata) = log.metadata() else {
+            return missing();
+        };
+        let offset = metadata.len().saturating_sub(64 * 1024);
+        if std::io::Seek::seek(&mut log, std::io::SeekFrom::Start(offset)).is_err() {
+            return missing();
+        }
+        let mut tail = Vec::new();
+        if log.take(64 * 1024).read_to_end(&mut tail).is_err() {
+            return missing();
+        }
+        let summaries = String::from_utf8_lossy(&tail)
+            .lines()
+            .rev()
+            .filter_map(recall_diagnostic_summary)
+            .take(12)
+            .collect::<Vec<_>>();
+        if summaries.is_empty() {
+            missing()
+        } else {
+            json!({"order":"newest_first", "events":summaries})
+        }
     }
 
     fn stop_daemon(&mut self) {
@@ -297,6 +364,22 @@ impl ClaudeHostJourney {
         key: &str,
         deadline: Instant,
     ) -> Value {
+        self.startup_sync_status_for_daemon(
+            runtime,
+            key,
+            deadline,
+            self.daemon.as_ref().expect("owned journey daemon").id(),
+        )
+    }
+
+    /// Read the existing startup status when a caller already owns the Child.
+    fn startup_sync_status_for_daemon(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        key: &str,
+        deadline: Instant,
+        daemon_pid: u32,
+    ) -> Value {
         use tokio::io::AsyncWriteExt;
         use tracedecay_daemon_protocol::{
             DaemonClientIdentity, DaemonConnection, DaemonHandshake, MovedStoreAdoption,
@@ -307,8 +390,7 @@ impl ClaudeHostJourney {
         )
         .expect("canonical daemon authority");
         assert_eq!(
-            Some(authority.pid),
-            self.daemon.as_ref().map(Child::id),
+            authority.pid, daemon_pid,
             "status authority must name the fixture daemon"
         );
         assert_eq!(
@@ -503,6 +585,10 @@ impl ClaudeHostJourney {
     /// The process exits nonzero whenever the daemon marked the call failed,
     /// so [`run_ok`] is the refusal check and nothing here has to re-derive it.
     fn tool_result(&self, name: &str, arguments: &Value) -> Value {
+        self.tool_result_with_bytes(name, arguments).0
+    }
+
+    fn tool_result_with_bytes(&self, name: &str, arguments: &Value) -> (Value, Vec<u8>) {
         let project = self.project.to_string_lossy().to_string();
         let payload = arguments.to_string();
         let stage = match arguments
@@ -525,26 +611,32 @@ impl ClaudeHostJourney {
             ]),
             &format!("tracedecay tool {name} ({stage})"),
         );
-        let text = String::from_utf8(stdout).expect("tool output is UTF-8");
-        serde_json::from_str(&text)
-            .unwrap_or_else(|error| panic!("tool {name} answered non-JSON `{text}`: {error}"))
+        let text = std::str::from_utf8(&stdout).expect("tool output is UTF-8");
+        let result = serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("tool {name} answered non-JSON `{text}`: {error}"));
+        (result, stdout)
     }
 
     /// The tool's own JSON payload: compatibility MCP results carry it inside
     /// `content[*].text`, and typed application-surface results are already the
     /// object itself.
     fn tool(&self, name: &str, arguments: &Value) -> Value {
-        let result = self.tool_result(name, arguments);
+        self.tool_with_bytes(name, arguments).0
+    }
+
+    fn tool_with_bytes(&self, name: &str, arguments: &Value) -> (Value, Vec<u8>) {
+        let (result, stdout) = self.tool_result_with_bytes(name, arguments);
         assert_ne!(
             result["isError"], true,
             "tool {name} reported an application failure: {result}"
         );
         let Some(text) = join_content_text(&result) else {
-            return result;
+            return (result, stdout);
         };
-        serde_json::from_str(&text).unwrap_or_else(|error| {
+        let decoded = serde_json::from_str(&text).unwrap_or_else(|error| {
             panic!("tool {name} produced non-JSON content text `{text}`: {error}")
-        })
+        });
+        (decoded, stdout)
     }
 
     /// The configuration revision every component agrees on, which the
@@ -593,7 +685,7 @@ impl ClaudeHostJourney {
         self.configuration_set(
             project_id,
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-            json!({ "kind": "boolean", "value": true }),
+            json!({ "kind": "boolean", "value": self.active_provider == ActiveProvider::Native }),
             "configuration.idempotency.claude-cli-journey-host",
         );
         self.configuration_set(
@@ -601,7 +693,14 @@ impl ClaudeHostJourney {
             MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
             json!({
                 "kind": "text",
-                "value": json!({ "active_provider": CONFIGURED_PROVIDER_ID }).to_string(),
+                "value": json!({
+                    "active_provider": self.active_provider.id(),
+                    "degradation": {
+                        "policy_id": "policy.host-cli-journey.history.v1",
+                        "policy_revision": 1,
+                        "allowed_causes": ["partial", "stale"],
+                    },
+                }).to_string(),
             }),
             "configuration.idempotency.claude-cli-journey-routing",
         );
@@ -610,7 +709,7 @@ impl ClaudeHostJourney {
     /// Only the opt-in real-worker tests call this. The existing TempDir owns
     /// every mutable NCM namespace; only installed model artifacts are shared.
     #[cfg(unix)]
-    fn commit_real_ncm_observer(&self, project_id: &str) {
+    fn commit_real_ncm(&self, project_id: &str) {
         let worker = PathBuf::from(
             std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
         );
@@ -648,7 +747,7 @@ impl ClaudeHostJourney {
     }
 
     #[cfg(not(unix))]
-    fn commit_real_ncm_observer(&self, _project_id: &str) {
+    fn commit_real_ncm(&self, _project_id: &str) {
         panic!("the opt-in real NCM model fixture requires Unix");
     }
 
@@ -670,19 +769,13 @@ impl ClaudeHostJourney {
         child.wait_with_output().expect("hook completes")
     }
 
-    /// Initial native lifecycle: Claude ingests at SessionStart; Codex registers
-    /// its route there and captures the first completed turn at Stop.
-    fn run_session_start_hook(&self) -> Output {
-        let started = self.run_session_start_event(self.session_id(), &self.transcript_path());
+    /// Captures the first completed turn after the live SessionStart baseline.
+    fn run_first_stop_hook(&self) -> Output {
         if self.codex {
-            assert!(
-                started.status.success(),
-                "Codex SessionStart must publish its route: {}",
-                String::from_utf8_lossy(&started.stderr)
-            );
-            return self.run_codex_stop_hook(1);
+            self.run_codex_stop_hook(1)
+        } else {
+            self.run_stop_hook()
         }
-        started
     }
 
     /// The shipped SessionStart route binding, independent of turn capture.
@@ -770,13 +863,29 @@ impl ClaudeHostJourney {
             .join(format!("{session_id}.jsonl"))
     }
 
-    /// Writes the first turn of the transcript Claude Code itself writes. Every
-    /// row carries the project `cwd`, which is what binds these frames to this
-    /// project — the directory name never decides membership.
-    fn write_claude_transcript(&self) {
-        let path = self.transcript_path();
+    /// Opens a real host transcript before its live SessionStart baseline.
+    fn initialize_session_transcript(&self, session_id: &str) {
+        let path = self.transcript_path_for_session(session_id);
         fs::create_dir_all(path.parent().expect("transcript directory"))
             .expect("transcript directory");
+        let initial = if self.codex {
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": "2026-02-01T00:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id, "cwd": self.project },
+                })
+            )
+        } else {
+            String::new()
+        };
+        fs::write(path, initial).expect("initialize host transcript");
+    }
+
+    /// Appends the unchanged first turn after the live SessionStart baseline.
+    fn write_claude_transcript(&self) {
+        let path = self.transcript_path();
         let turn = self.claude_turn(
             1,
             "2026-02-01T00:00:00.000Z",
@@ -787,21 +896,9 @@ impl ClaudeHostJourney {
                  deadline"
             ),
         );
-        let turn = if self.codex {
-            // The native thread identity and cwd bind this rollout to the
-            // registered project; write only after the baseline mount/import.
-            format!(
-                "{}\n{turn}",
-                json!({
-                    "timestamp": "2026-02-01T00:00:00.000Z",
-                    "type": "session_meta",
-                    "payload": { "id": CODEX_SESSION, "cwd": self.project },
-                })
-            )
-        } else {
-            turn
-        };
-        fs::write(&path, turn).expect("write host transcript");
+        let mut existing = fs::read_to_string(&path).expect("read host transcript baseline");
+        existing.push_str(&turn);
+        fs::write(&path, existing).expect("write host transcript");
     }
 
     /// Appends the second turn: the exchange the session has *while it is
@@ -907,7 +1004,14 @@ impl ClaudeHostJourney {
     /// The durable observation journal the mounted journey owns, located under
     /// this profile's own store layout rather than guessed at.
     fn journal_path(&self) -> Option<PathBuf> {
-        find_file(&self.profile, JOURNAL_FILE_NAME)
+        find_file(
+            &self.profile,
+            if self.active_provider.is_ncm() {
+                NCM_JOURNAL_FILE_NAME
+            } else {
+                JOURNAL_FILE_NAME
+            },
+        )
     }
 
     /// The read handle on the durable journal, opened the first time the store
@@ -925,21 +1029,16 @@ impl ClaudeHostJourney {
         if let Some(journal) = slot.get() {
             return Some(journal);
         }
-        let native_path = self.journal_path()?;
-        // The observer must be mounted beside Native in the canonical store,
-        // never discovered under its own provider state or another project.
-        let path = if ncm {
-            let path = native_path
-                .parent()
-                .expect("canonical store root")
-                .join(NCM_JOURNAL_FILE_NAME);
-            if !path.is_file() {
-                return None;
-            }
-            path
-        } else {
-            native_path
-        };
+        // Both are host-owned journals under this isolated canonical profile.
+        // An independently active NCM mount does not require a Native journal.
+        let path = find_file(
+            &self.profile,
+            if ncm {
+                NCM_JOURNAL_FILE_NAME
+            } else {
+                JOURNAL_FILE_NAME
+            },
+        )?;
         let journal = SqliteObservationJournal::open(&path, inspection_retention_policy())
             .expect("the durable observation journal must open through its own store API");
         let _ = slot.set(journal);
@@ -956,10 +1055,28 @@ impl ClaudeHostJourney {
     /// rows"; every other failure — the store will not open, the inspection is
     /// refused, the page did not fit — fails the test loudly.
     fn journal_rows(&self) -> Vec<JournalInspectionRowV1> {
-        self.journal_rows_for(false)
+        self.journal_rows_for(self.active_provider.is_ncm())
     }
 
     fn journal_rows_for(&self, ncm: bool) -> Vec<JournalInspectionRowV1> {
+        self.all_journal_rows_for(ncm)
+            .into_iter()
+            .filter(|row| {
+                if row.source_stream == "session_observation_store" {
+                    return true;
+                }
+                let journal = self.journal_for(ncm).expect("mounted journal");
+                let admitted = journal
+                    .read_admitted_observation_by_idempotency(&row.idempotency_key)
+                    .expect("retained history admission read")
+                    .expect("history content remains retained");
+                assert_history_stream(row, &admitted);
+                false
+            })
+            .collect()
+    }
+
+    fn all_journal_rows_for(&self, ncm: bool) -> Vec<JournalInspectionRowV1> {
         let Some(journal) = self.journal_for(ncm) else {
             return Vec::new();
         };
@@ -983,7 +1100,7 @@ impl ClaudeHostJourney {
     /// moment it does. A deadline is a failure that reports what it last saw,
     /// never a half-settled journal handed back to be asserted against.
     fn await_settled_journal(&self, minimum_rows: usize) -> Vec<JournalInspectionRowV1> {
-        self.await_settled_journal_for(false, minimum_rows)
+        self.await_settled_journal_for(self.active_provider.is_ncm(), minimum_rows)
     }
 
     fn await_settled_journal_for(
@@ -1474,6 +1591,74 @@ fn advisory_lane(answer: &Value) -> Option<Value> {
         .cloned()
 }
 
+/// Reconstruct only bounded counter fields from the dedicated host marker.
+fn recall_diagnostic_summary(line: &str) -> Option<Value> {
+    let encoded = line.strip_prefix("[tracedecay] event=host_history_recall_test_diagnostic ")?;
+    if encoded.len() > 4096 {
+        return None;
+    }
+    let value: Value = serde_json::from_str(encoded).ok()?;
+    let phase = value["phase"].as_str()?;
+    let (numbers, flags, maps): (&[&str], &[&str], &[&str]) = match phase {
+        "admission" => (
+            &["received", "admitted", "denied"],
+            &["degraded"],
+            &["denial_reasons"],
+        ),
+        "trace" => (
+            &["received", "items"],
+            &["degraded"],
+            &["stage_counts", "reason_counts"],
+        ),
+        "history_selection" => (
+            &["scanned", "withheld", "unknown_revision"],
+            &["has_older", "has_more", "partial_coverage"],
+            &[],
+        ),
+        _ => return None,
+    };
+    let mut summary = serde_json::Map::new();
+    summary.insert("phase".into(), json!(phase));
+    for field in numbers {
+        summary.insert((*field).into(), json!(value[*field].as_u64()?));
+    }
+    for field in flags {
+        summary.insert((*field).into(), json!(value[*field].as_bool()?));
+    }
+    for field in maps {
+        let counters = value[*field].as_object()?;
+        if counters.len() > 32 {
+            return None;
+        }
+        let mut bounded = serde_json::Map::new();
+        for (label, count) in counters {
+            if label.is_empty()
+                || label.len() > 64
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            {
+                return None;
+            }
+            bounded.insert(label.clone(), json!(count.as_u64()?));
+        }
+        summary.insert((*field).into(), Value::Object(bounded));
+    }
+    Some(Value::Object(summary))
+}
+
+/// The pinned history policy allows useful Partial/Stale evidence. Keep the
+/// actual returned label; an accepted degraded answer is not a complete answer.
+fn assert_history_degradation(lane: &Value) {
+    let degradation = lane
+        .get("degradation")
+        .expect("an answered lane must retain its actual degradation metadata");
+    assert!(
+        degradation.is_null() || matches!(degradation.as_str(), Some("partial" | "stale")),
+        "the history journey only permits its pinned Partial/Stale degradations: {lane}"
+    );
+}
+
 fn journey_task() -> String {
     format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?")
 }
@@ -1482,27 +1667,14 @@ fn journey_task() -> String {
 // The journey
 // ---------------------------------------------------------------------------
 
-/// Real `tracedecay hook-claude-session-start` and `tracedecay hook-stop`
-/// processes are the only things that run between an empty journal and a
-/// settled one — at session start *and* again mid-session — and a later
-/// ordinary `tracedecay_context` call carries the advisory lane those
-/// observations made possible, whole.
+/// The shipped SessionStart establishes a live baseline before source messages
+/// are written. The first Stop commits the first turn; a later Stop commits the
+/// second. Each Stop is replayed to prove delivery idempotency, and ordinary
+/// `tracedecay_context` calls must recall the complete messages.
 ///
-/// The two hooks are the shipped Claude lifecycle pair that carry a session's
-/// own evidence: `SessionStart` ingests the transcript the session opens with,
-/// and `Stop` ingests what the turn just added. Both are proved the same way —
-/// a journal that is required to *stay* unchanged for a window derived from the
-/// journey's own live-replay park, then one hook process, then exactly the
-/// deliveries that hook caused.
-///
-/// Real defect this catches: a Claude host integration whose lifecycle hooks
-/// reach the daemon but never commit the session's own evidence, so provider
-/// memory only ever contains what a daemon restart happened to sweep up. Under
-/// that defect the journal below stays empty after the hook and this test
-/// fails at the settlement wait — while an administrative import, or a
-/// transcript written before the daemon started, would have hidden it. The
-/// mid-session half catches its narrower sibling: an integration that commits
-/// only at startup, so everything an agent says during a live session is lost.
+/// The unchanged-journal windows before capture distinguish these live hook
+/// deliveries from startup import. After a daemon restart, a different session
+/// runs its own SessionStart before recalling the same original evidence.
 #[test]
 fn the_shipped_claude_session_start_and_stop_hooks_commit_observations_and_a_later_context_call_carries_the_advisory_lane()
  {
@@ -1535,16 +1707,36 @@ fn real_ncm_observer_receives_shipped_codex_hooks_while_native_answers_context()
     assert_host_memory_journey_with_observer(true, true);
 }
 
+/// NCM must independently answer the same real host journey with Native
+/// advisory disabled; the canonical history and host admission remain shared.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_active_recalls_shipped_claude_session_history_with_native_disabled() {
+    assert_host_memory_journey_with_provider(false, ActiveProvider::RustNcm, false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_active_recalls_shipped_codex_session_history_with_native_disabled() {
+    assert_host_memory_journey_with_provider(true, ActiveProvider::RustNcm, false);
+}
+
 fn assert_host_memory_journey(codex: bool) {
-    assert_host_memory_journey_with_observer(codex, false);
+    assert_host_memory_journey_with_provider(codex, ActiveProvider::Native, false);
 }
 
 fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
-    let mut journey = if ncm_observer {
-        ClaudeHostJourney::start_with_observer(codex, true)
-    } else {
-        ClaudeHostJourney::start(codex)
-    };
+    assert_host_memory_journey_with_provider(codex, ActiveProvider::Native, ncm_observer);
+}
+
+fn assert_host_memory_journey_with_provider(
+    codex: bool,
+    active_provider: ActiveProvider,
+    ncm_observer: bool,
+) {
+    let mut journey = ClaudeHostJourney::start(codex, active_provider, ncm_observer);
 
     // 1. The project is mounted and the provider host is live *before* the
     //    transcript exists. Baseline context forces project open; the explicit
@@ -1555,10 +1747,11 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
         &json!({ "task": task, "format": "json" }),
     );
     let baseline_lane = advisory_lane(&baseline).unwrap_or_else(|| {
-        panic!("a composition with both gates committed must mount the advisory lane: {baseline}")
+        panic!("the selected provider must mount the advisory lane: {baseline}")
     });
     assert_eq!(
-        baseline_lane["provider_id"], CONFIGURED_PROVIDER_ID,
+        baseline_lane["provider_id"],
+        active_provider.id(),
         "the lane must name the provider this project's routing policy pinned: {baseline_lane}"
     );
     let _journal = journey
@@ -1583,18 +1776,25 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
 
     journey.await_startup_history();
 
-    // 2. Claude Code writes its transcript. Nothing else happens: the journal
-    //    must stay unchanged for a window several live-replay passes long,
-    //    providing a bounded negative control for step 3's hook transition.
+    // 2. Establish the live baseline before either host writes source messages.
+    journey.initialize_session_transcript(journey.session_id());
+    let started = journey.run_session_start_event(journey.session_id(), &journey.transcript_path());
+    assert!(
+        started.status.success(),
+        "SessionStart must establish the live source baseline: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    // The first turn is new live evidence; the existing negative control
+    // proves its deliveries wait for the first Stop hook.
     journey.write_claude_transcript();
     journey.assert_journal_unchanged_without_a_hook(&[]);
 
-    // 3. The shipped SessionStart hook process runs, exactly as Claude Code
-    //    spawns it.
-    let hook = journey.run_session_start_hook();
+    // 3. The shipped Stop hook captures the first completed live turn.
+    let hook = journey.run_first_stop_hook();
     assert!(
         hook.status.success(),
-        "the shipped Claude SessionStart hook must succeed\nstdout:\n{}\nstderr:\n{}",
+        "the shipped first Stop hook must succeed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&hook.stdout),
         String::from_utf8_lossy(&hook.stderr)
     );
@@ -1610,7 +1810,7 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
     //    the observation, because the idempotency key is content-derived. The
     //    comparison is by row identity, not by row count.
     let settled = journal_row_identities(&rows);
-    let replay = journey.run_session_start_hook();
+    let replay = journey.run_first_stop_hook();
     assert!(
         replay.status.success(),
         "a replayed hook must still succeed"
@@ -1687,8 +1887,13 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
         journey.assert_observer_settled(&journey.journal_rows(), &observer_final);
     }
 
+    // Capture canonical source identities and the actual A scope before any
+    // recall can add provider-addressed history deliveries to this journal.
+    let original_sources = capture_original_hook_sources(&journey, &mid_session_replayed);
+
     // 9. The originating session can recall exactly what its hooks observed.
-    let original = assert_recalled_session_messages(&journey, journey.session_id());
+    let original =
+        assert_recalled_session_messages(&journey, journey.session_id(), &original_sources);
 
     // 10. A fresh daemon and a different agent session must recall those same
     //     durable messages. B starts through the shipped lifecycle with an
@@ -1701,7 +1906,7 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
         "b93546e4-5ca5-4e9a-a94c-d4867f679ee2"
     };
     let next_transcript = journey.transcript_path_for_session(next_session);
-    fs::write(&next_transcript, "").expect("new session has an empty transcript");
+    journey.initialize_session_transcript(next_session);
     let started = journey.run_session_start_event(next_session, &next_transcript);
     assert!(
         started.status.success(),
@@ -1715,28 +1920,117 @@ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
         "starting an empty session must preserve the original deliveries"
     );
     assert_settled_session_messages(&after_start, 2 * ROWS_PER_TURN);
-    let native_journal = journey
-        .journal_for(false)
-        .expect("Native journal after bootstrap");
+    let selected_journal = journey
+        .journal_for(active_provider.is_ncm())
+        .expect("selected provider journal after bootstrap");
     for row in &after_start {
         assert_eq!(
-            native_journal
+            selected_journal
                 .receipts_for(&row.observation_id)
-                .expect("Native receipts")
+                .expect("selected provider receipts")
                 .len(),
             1,
             "empty SessionStart must not add another delivery receipt"
         );
     }
     journey.assert_observer_settled(&after_start, &observer_final);
-    let recalled = assert_recalled_session_messages(&journey, next_session);
+    let recalled = assert_recalled_session_messages(&journey, next_session, &original_sources);
     assert_eq!(
-        recalled, original,
+        recalled.0, original.0,
         "restart and session change must preserve the same four messages and their provenance"
     );
-    if !ncm_observer {
+    if active_provider == ActiveProvider::Native && !ncm_observer {
         assert_canonical_fact_feedback_journey(&mut journey, next_session);
     }
+    record_demo_output(&journey, next_session, &original.1, &recalled.1);
+}
+
+/// Optional fixture artifacts are emitted only after the complete journey passes.
+fn record_demo_output(
+    journey: &ClaudeHostJourney,
+    next_session: &str,
+    source_result: &[u8],
+    destination_result: &[u8],
+) {
+    let Some(output) = std::env::var_os("TRACEDECAY_DEMO_OUTPUT_DIR") else {
+        return;
+    };
+    if journey.ncm_observer {
+        return;
+    }
+    let case = match (journey.codex, journey.active_provider) {
+        (false, ActiveProvider::Native) => "claude-native",
+        (true, ActiveProvider::Native) => "codex-native",
+        (false, ActiveProvider::RustNcm) => "claude-ncm-active",
+        (true, ActiveProvider::RustNcm) => "codex-ncm-active",
+    };
+    let output = PathBuf::from(output);
+    let allowed = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("checkout root")
+        .join("target/task-scratch");
+    assert!(
+        output.is_absolute(),
+        "demo output directory must be absolute"
+    );
+    let relative = output
+        .strip_prefix(&allowed)
+        .expect("demo output must be under target/task-scratch");
+    assert!(
+        relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "demo output path must not contain parent components"
+    );
+    for ancestor in output.ancestors() {
+        assert!(
+            !fs::symlink_metadata(ancestor)
+                .expect("pre-created demo output directory")
+                .file_type()
+                .is_symlink(),
+            "demo output path must not traverse symlinks"
+        );
+    }
+    assert!(
+        output
+            .canonicalize()
+            .expect("demo output directory")
+            .starts_with(allowed.canonicalize().expect("task-scratch directory")),
+        "demo output must remain inside target/task-scratch"
+    );
+    let artifacts = [
+        ("source-a.tool-result.json", source_result),
+        ("destination-b.tool-result.json", destination_result),
+    ];
+    for (_, bytes) in artifacts {
+        assert!(
+            bytes.len() <= 8 * 1024 * 1024,
+            "demo artifact exceeds 8 MiB"
+        );
+        serde_json::from_slice::<Value>(bytes).expect("demo artifact retains actual JSON");
+    }
+    let directory = output.join(case);
+    fs::create_dir(&directory).expect("fresh demo case directory; refusing overwrite");
+    for (name, bytes) in artifacts {
+        let mut file = fs::File::create_new(directory.join(name)).expect("fresh demo artifact");
+        file.write_all(bytes).expect("write actual response bytes");
+        file.sync_all().expect("sync actual response bytes");
+    }
+    let identity = json!({
+        "fixture_case": case,
+        "host": if journey.codex { "codex" } else { "claude" },
+        "provider_id": journey.active_provider.id(),
+        "ncm_observer": journey.ncm_observer,
+        "source_session_id": journey.session_id(),
+        "destination_session_id": next_session,
+        "assertions_passed": true,
+    });
+    let mut file =
+        fs::File::create_new(directory.join("identity.json")).expect("fresh demo identity");
+    file.write_all(&serde_json::to_vec_pretty(&identity).expect("fixture identity JSON"))
+        .expect("write fixture identity");
+    file.sync_all().expect("sync fixture identity");
 }
 
 /// Canonical fact feedback has its own public host authority. This separate
@@ -1783,7 +2077,7 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
         let lane = advisory_lane(&answer).expect("Native canonical fact recall lane");
         assert_eq!(lane["state"], "answered", "{lane}");
         assert_eq!(lane["provider_id"], CONFIGURED_PROVIDER_ID);
-        assert_eq!(lane["degradation"], Value::Null, "{lane}");
+        assert_history_degradation(&lane);
         let expected = format!("cited source record:{fact_id}");
         let selected = lane["candidates"]
             .as_array()
@@ -1794,7 +2088,8 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
         assert_eq!(
             selected.len(),
             1,
-            "the host must confirm this exact fact once: {lane}"
+            "the host must confirm this exact fact once: {lane}; bounded Native diagnostics: {}",
+            journey.native_recall_failure_diagnostics()
         );
         assert!(
             selected[0]["content"]
@@ -1913,13 +2208,279 @@ fn assert_canonical_fact_feedback_journey(journey: &mut ClaudeHostJourney, sessi
     assert_eq!(recalled_provenance(journey), selected_provenance);
 }
 
+/// Exact scope read from an admitted host envelope; session encoding belongs
+/// to the host and is never reconstructed from a canonical session string.
+fn admitted_scope(admitted: &AdmittedObservationV1) -> Value {
+    let scope = &admitted.exact_scope;
+    json!({
+        "profile_id": scope.profile_id, "project_id": scope.project_id,
+        "repository_identity": scope.repository_identity, "worktree_identity": scope.worktree_identity,
+        "branch_identity": scope.branch_identity, "agent_session_id": scope.agent_session_id,
+        "resolved_scope_digest": scope.resolved_scope_digest,
+    })
+}
+
+fn capture_original_hook_sources(
+    journey: &ClaudeHostJourney,
+    rows: &[JournalInspectionRowV1],
+) -> BTreeMap<String, Value> {
+    let journal = journey
+        .journal_for(journey.active_provider.is_ncm())
+        .expect("selected host journal");
+    let mut originals = BTreeMap::new();
+    for row in rows {
+        assert_eq!(row.source_stream, "session_observation_store");
+        let admitted = journal
+            .read_admitted_observation_by_idempotency(&row.idempotency_key)
+            .expect("read original admitted hook evidence")
+            .expect("original content retained");
+        let payload: Value =
+            serde_json::from_slice(&admitted.payload.bytes).expect("canonical admitted payload");
+        let canonical: tracedecay_domain::observation::CanonicalObservationEnvelopeV1 =
+            serde_json::from_value(payload["canonical_payload"].clone())
+                .expect("canonical source envelope");
+        canonical
+            .validate()
+            .expect("valid canonical source envelope");
+        assert_eq!(
+            canonical.provider().as_str(),
+            if journey.codex { "codex" } else { "claude" }
+        );
+        assert_eq!(
+            canonical.relations().session_id().as_str(),
+            journey.session_id()
+        );
+        assert!(
+            payload.get("history_grant").is_none(),
+            "capture must precede provider history replay"
+        );
+        let captured = json!({
+            "canonical_provider_id": canonical.provider().as_str(),
+            "canonical_session_id": canonical.relations().session_id().as_str(),
+            "stable_record_id": canonical.stable_record_id().as_str(),
+            "source_revision": canonical.evidence().revision(),
+            "source_sequence": admitted.source.source_sequence.0,
+            "original_scope": admitted_scope(&admitted),
+        });
+        assert!(
+            originals
+                .insert(admitted.source.source_event_id.clone(), captured)
+                .is_none(),
+            "hook source identities are unique"
+        );
+    }
+    assert_eq!(originals.len(), 2 * ROWS_PER_TURN);
+    originals
+}
+
+/// Only explicitly identified history rows are excluded from hook counts.
+/// The complete source and receipt assertions run immediately after recall.
+fn assert_history_stream(row: &JournalInspectionRowV1, admitted: &AdmittedObservationV1) -> Value {
+    admitted
+        .validate()
+        .expect("valid retained history admission");
+    assert_eq!(admitted.observation_id, row.observation_id);
+    assert_eq!(admitted.idempotency_key, row.idempotency_key);
+    assert_eq!(admitted.payload.sha256, row.payload_sha256);
+    assert_eq!(admitted.extensions_digest, row.extensions_digest);
+    let payload: Value =
+        serde_json::from_slice(&admitted.payload.bytes).expect("retained history payload");
+    let grant = &payload["history_grant"];
+    let revision = grant["policy_revision"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .expect("history policy revision");
+    assert_eq!(
+        row.source_stream,
+        format!(
+            "host-history.{revision}.{}",
+            admitted.exact_scope.exact_scope_sha256()
+        ),
+        "no unrelated source stream may be hidden by hook counting"
+    );
+    assert_eq!(grant["destination_scope"], admitted_scope(admitted));
+    assert!(
+        payload
+            .pointer("/source_identity/original_source")
+            .is_some(),
+        "history row must retain original evidence"
+    );
+    payload
+}
+
+fn assert_original_source(source: &Value, captured: &Value) {
+    for field in [
+        "canonical_provider_id",
+        "canonical_session_id",
+        "source_revision",
+    ] {
+        assert_eq!(
+            source["source"][field], captured[field],
+            "original {field} must match pre-recall A evidence"
+        );
+    }
+    if !source["source"]["stable_record_id"].is_null() {
+        assert_eq!(
+            source["source"]["stable_record_id"],
+            captured["stable_record_id"]
+        );
+    }
+    assert_eq!(source["source_sequence"], captured["source_sequence"]);
+    assert_eq!(source["origin_scope"]["state"], "recorded");
+    assert_eq!(
+        source["origin_scope"]["exact_scope_identity"], captured["original_scope"],
+        "delivery in B must retain the actual host-authorized A scope"
+    );
+    assert!(
+        source["origin_scope"]["authority_ref"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+}
+
+fn assert_recalled_history_deliveries(
+    journey: &ClaudeHostJourney,
+    originals: &BTreeMap<String, Value>,
+    previous: &BTreeSet<String>,
+    origin_session: bool,
+) -> BTreeMap<String, Value> {
+    let journal = journey
+        .journal_for(journey.active_provider.is_ncm())
+        .expect("selected host journal");
+    let original_scope = &originals.values().next().expect("captured A sources")["original_scope"];
+    let mut delivered = BTreeMap::new();
+    let mut current_scope = None;
+    for row in journey.all_journal_rows_for(journey.active_provider.is_ncm()) {
+        if row.source_stream == "session_observation_store" {
+            continue;
+        }
+        let admitted = journal
+            .read_admitted_observation_by_idempotency(&row.idempotency_key)
+            .expect("read history admission")
+            .expect("retained history evidence");
+        let payload = assert_history_stream(&row, &admitted);
+        let source = &payload["source_identity"]["original_source"];
+        let id = source["source"]["observation_id"]
+            .as_str()
+            .expect("canonical source identity");
+        assert_original_source(
+            source,
+            originals.get(id).expect("no unrelated canonical sources"),
+        );
+        let grant_sources = payload["history_grant"]["sources"]
+            .as_array()
+            .expect("granted sources");
+        assert_eq!(grant_sources.len(), 1);
+        assert_eq!(grant_sources[0]["attribution"], *source);
+        assert_eq!(row.provider_id, journey.active_provider.id());
+        let receipts = journal
+            .receipts_for(&row.observation_id)
+            .expect("history receipts");
+        let current: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| receipt.attempt_number == row.attempt_number)
+            .collect();
+        assert_eq!(
+            current.len(),
+            1,
+            "history must have one validated current-attempt receipt"
+        );
+        let receipt = current[0];
+        receipt.validate().expect("valid history receipt identity");
+        assert_eq!(receipt.provider_id.as_str(), journey.active_provider.id());
+        assert_eq!(receipt.observation_id, row.observation_id);
+        assert_eq!(receipt.idempotency_key, row.idempotency_key);
+        assert_eq!(receipt.payload_sha256, row.payload_sha256);
+        assert_eq!(receipt.extensions_digest, row.extensions_digest);
+        assert_eq!(receipt.registration_revision, row.registration_revision);
+        assert_eq!(
+            receipt.provider_instance_id.as_ref(),
+            Some(&row.provider_instance_id)
+        );
+        assert_eq!(receipt.attempt_number, row.attempt_number);
+        assert!(
+            receipt
+                .provider_receipt_digest
+                .as_ref()
+                .is_some_and(|digest| digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            "applied history must carry a real provider acknowledgement digest"
+        );
+        let applied = row.state == DeliveryStateV1::Acknowledged
+            && receipt.outcome == ObservationOutcomeV1::Applied
+            && receipt.committed_effect == ObservationCommittedEffectV1::Applied;
+        let duplicate = row.state == DeliveryStateV1::DuplicateAcknowledged
+            && receipt.outcome == ObservationOutcomeV1::DuplicateAcknowledged
+            && receipt.committed_effect == ObservationCommittedEffectV1::Duplicate;
+        assert!(
+            applied || duplicate,
+            "history requires a settled applied or duplicate effect"
+        );
+        let destination = admitted_scope(&admitted);
+        if previous.contains(row.idempotency_key.as_str()) {
+            assert!(!origin_session, "A begins without earlier history delivery");
+            assert_eq!(
+                &destination, original_scope,
+                "only original A history may precede B recall"
+            );
+            continue;
+        }
+        for field in [
+            "profile_id",
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+            "resolved_scope_digest",
+        ] {
+            assert_eq!(
+                destination[field], original_scope[field],
+                "history must stay in the authorized checkout"
+            );
+        }
+        if origin_session {
+            assert_eq!(&destination, original_scope);
+        } else {
+            assert_ne!(
+                destination["agent_session_id"], original_scope["agent_session_id"],
+                "B gets a distinct delivery scope without relabeling A evidence"
+            );
+        }
+        if let Some(expected) = &current_scope {
+            assert_eq!(
+                &destination, expected,
+                "one requesting session owns this recall"
+            );
+        } else {
+            current_scope = Some(destination);
+        }
+        assert!(
+            delivered.insert(id.to_owned(), source.clone()).is_none(),
+            "one history delivery per original source and destination"
+        );
+    }
+    assert_eq!(
+        delivered.keys().collect::<Vec<_>>(),
+        originals.keys().collect::<Vec<_>>(),
+        "the real selected provider must settle every original source for this session"
+    );
+    delivered
+}
+
 /// The existing complete recall assertions, shared by origin and next session.
 /// Returns content/provenance identities; request-bound candidate IDs may differ.
 fn assert_recalled_session_messages(
     journey: &ClaudeHostJourney,
     recalled_session_id: &str,
-) -> Vec<(String, String)> {
-    let answer = journey.tool(
+    original_sources: &BTreeMap<String, Value>,
+) -> (Vec<(String, String)>, Vec<u8>) {
+    let previous_history: BTreeSet<_> = journey
+        .all_journal_rows_for(journey.active_provider.is_ncm())
+        .into_iter()
+        .filter(|row| row.source_stream != "session_observation_store")
+        .map(|row| row.idempotency_key.as_str().to_owned())
+        .collect();
+    let (answer, result_bytes) = journey.tool_with_bytes(
         "tracedecay_context",
         &json!({
             "task": format!(
@@ -1936,20 +2497,61 @@ fn assert_recalled_session_messages(
         lane["state"], "answered",
         "the advisory lane must answer rather than report a refusal: {lane}"
     );
+    assert_history_degradation(&lane);
     assert_eq!(
-        lane["degradation"],
-        Value::Null,
-        "a healthy route reports no degradation: {lane}"
-    );
-    assert_eq!(
-        lane["provider_id"], CONFIGURED_PROVIDER_ID,
+        lane["provider_id"],
+        journey.active_provider.id(),
         "the lane must name the provider the routing policy pinned: {lane}"
     );
     let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
     assert_eq!(
         candidates.len(),
         2 * ROWS_PER_TURN,
-        "the healthy journey must recall every admitted Claude message exactly once: {lane}"
+        "the healthy journey must recall every admitted Claude message exactly once: {lane}; bounded Native diagnostics: {}",
+        journey.native_recall_failure_diagnostics()
+    );
+    let retained_sources = assert_recalled_history_deliveries(
+        journey,
+        original_sources,
+        &previous_history,
+        recalled_session_id == journey.session_id(),
+    );
+    let mut recalled_originals = BTreeSet::new();
+    for candidate in &candidates {
+        let evidence = &candidate["provenance_evidence"];
+        assert_eq!(
+            evidence["kind"], "canonical_observations",
+            "final candidates require host-confirmed original evidence"
+        );
+        let sources = evidence["sources"]
+            .as_array()
+            .expect("typed original sources");
+        assert!(
+            !sources.is_empty(),
+            "admitted content must have original source evidence"
+        );
+        for source in sources {
+            let id = source["source"]["observation_id"]
+                .as_str()
+                .expect("canonical observation id");
+            let expected = retained_sources
+                .get(id)
+                .expect("candidate source was delivered from captured A history");
+            assert_eq!(
+                source, expected,
+                "public evidence must preserve every retained attribution field"
+            );
+            assert_original_source(
+                source,
+                original_sources.get(id).expect("original hook source"),
+            );
+            recalled_originals.insert(id.to_owned());
+        }
+    }
+    assert_eq!(
+        recalled_originals,
+        original_sources.keys().cloned().collect(),
+        "recall must cover the actual original hook sources"
     );
     let mut provenance = candidates
         .iter()
@@ -1992,10 +2594,31 @@ fn assert_recalled_session_messages(
                     .as_str()
                     .expect("verified message content")
                     .to_owned(),
-                candidate["provenance"].to_string(),
+                json!({
+                    "label": candidate["provenance"],
+                    "evidence": candidate["provenance_evidence"],
+                })
+                .to_string(),
             )
         })
         .collect::<Vec<_>>();
     identities.sort();
-    identities
+    (identities, result_bytes)
+}
+
+#[test]
+fn recall_failure_diagnostics_keep_only_bounded_counter_metadata() {
+    let marker = "[tracedecay] event=host_history_recall_test_diagnostic ";
+    let line = format!(
+        "{marker}{}",
+        json!({"phase":"admission", "received":4, "admitted":0,
+        "denied":4, "degraded":true, "denial_reasons":{"unknown_validity":4},
+        "request_id":"private-request", "content":"private-content"})
+    );
+    let summary = recall_diagnostic_summary(&line).expect("bounded host counters");
+    assert_eq!(summary["received"], 4);
+    assert_eq!(summary["denial_reasons"]["unknown_validity"], 4);
+    assert!(!summary.to_string().contains("private"));
+    assert!(recall_diagnostic_summary("unrelated private daemon line").is_none());
+    assert!(recall_diagnostic_summary(&format!("{marker}{}", "x".repeat(4097))).is_none());
 }

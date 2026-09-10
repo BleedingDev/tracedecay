@@ -656,3 +656,132 @@ async fn fresh_stores_resolve_without_the_retired_default_collection_setting() {
         "a canonically initialized revision-4 store must not carry the retired setting"
     );
 }
+
+#[tokio::test]
+async fn selected_ncm_configuration_persists_with_native_disabled_and_pinned_revisions() {
+    use tracedecay_domain::configuration::{
+        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderKindV1,
+        MemoryProviderNcmObserverV1, MemoryProviderRecallRoutingV1, MemoryProviderSelectionV1,
+    };
+
+    let (directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
+    store
+        .record_component_activation(
+            "gateway".to_owned(),
+            Some(root.revision_id.clone()),
+            None,
+            UtcMicros(11),
+        )
+        .await
+        .unwrap();
+    let ncm = MemoryProviderNcmObserverV1::Enabled {
+        worker_binary: directory.path().join("unstarted-worker"),
+        state_root: directory.path().join("unopened-ncm-state"),
+    };
+    let routing = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("ncm".to_owned()),
+        ..Default::default()
+    };
+    let mut current_revision = root.revision_id.clone();
+    for (index, (raw_key, value)) in [
+        (
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            serde_json::to_string(&ncm).unwrap(),
+        ),
+        (
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            serde_json::to_string(&routing).unwrap(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let authority = control_authority_with_key_for_layer(
+            ConfigurationMutationOperationV1::DirectMutation,
+            &current_revision,
+            Some(
+                ConfigurationIdempotencyKey::new(format!(
+                    "configuration.idempotency.ncm-selection-{index}"
+                ))
+                .unwrap(),
+            ),
+            direct_project_layer(),
+        );
+        let receipt = store
+            .commit_direct(
+                &authority,
+                &DirectConfigurationMutation::Set {
+                    layer: direct_project_layer(),
+                    key: SettingKey::new(raw_key).unwrap(),
+                    value: Box::new(ConfigurationValueV1::Text(value)),
+                },
+                &current_revision,
+            )
+            .await
+            .unwrap();
+        assert_ne!(receipt.result_revision_id, current_revision);
+        current_revision = receipt.result_revision_id;
+    }
+    let current = ConfigurationControlStore::current(&store).await.unwrap();
+    assert_eq!(current.revision_id, current_revision);
+    assert_eq!(
+        current.snapshot.effective_values
+            [&SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY).unwrap()],
+        ConfigurationValueV1::Boolean(false)
+    );
+    let text = |key| match &current.snapshot.effective_values[&SettingKey::new(key).unwrap()] {
+        ConfigurationValueV1::Text(value) => value.clone(),
+        _ => panic!("provider document must remain text"),
+    };
+    let ncm: MemoryProviderNcmObserverV1 =
+        serde_json::from_str(&text(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)).unwrap();
+    let routing: MemoryProviderRecallRoutingV1 =
+        serde_json::from_str(&text(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)).unwrap();
+    assert_eq!(
+        MemoryProviderSelectionV1::resolve(false, &ncm, &routing)
+            .unwrap()
+            .active_provider(),
+        Some(MemoryProviderKindV1::Ncm)
+    );
+    assert_eq!(
+        store.read_revision(&root.revision_id).await.unwrap(),
+        Some(root.clone())
+    );
+    let restarted_store = GlobalDbConfigurationControlStore::new_registered(db);
+    assert_eq!(
+        ConfigurationControlStore::current(&restarted_store)
+            .await
+            .unwrap()
+            .snapshot,
+        current.snapshot
+    );
+    let converged = restarted_store
+        .converge_registered_additive_defaults(&current_revision, UtcMicros(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        converged.revision_id, current_revision,
+        "existing keys require no invented migration revision"
+    );
+    let state = store
+        .observed_state(&AuthorizedActor {
+            actor_id: id("actor.configuration.fixture"),
+        })
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(state.restart_required);
+    assert_eq!(state.observed_revision_id, Some(root.revision_id));
+    assert_eq!(state.desired_revision_id, current_revision);
+    assert_eq!(state.drift, ActivationDriftV1::PendingRestart);
+    assert!(
+        !directory.path().join("unopened-ncm-state").exists(),
+        "persisting configuration never starts a worker"
+    );
+}

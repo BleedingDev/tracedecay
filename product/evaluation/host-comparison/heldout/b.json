@@ -1,0 +1,1911 @@
+{
+  "schema_version": 1,
+  "case_batch": "b",
+  "cases": [
+    {
+      "id": "hc-b-01",
+      "family": "scope_isolation",
+      "description": "Recall a committed decoder decision from session A in session B of the same checkout while rejecting a semantically close sibling-worktree experiment and an expired same-lineage policy.",
+      "sources": [
+        {
+          "id": "hc-b-01-decoder-r1",
+          "lineage_id": "hc-b-01-decoder",
+          "revision": "1",
+          "origin": {
+            "project": "lantern-reader",
+            "repository": "lantern-repository",
+            "worktree": "lantern-primary",
+            "branch": "main",
+            "session": "hc-b-01-session-a"
+          },
+          "observed_at": "2025-02-03T08:20:00Z",
+          "valid_from": "2025-02-03T08:00:00Z",
+          "valid_until": "2025-02-03T09:00:00Z",
+          "content": "Superseded transport decoder policy: each data frame ends a text record, and an empty frame closes the pending record. This policy was valid only before the framed-record protocol cutover at 09:00 UTC."
+        },
+        {
+          "id": "hc-b-01-decoder-r2",
+          "lineage_id": "hc-b-01-decoder",
+          "revision": "2",
+          "origin": {
+            "project": "lantern-reader",
+            "repository": "lantern-repository",
+            "worktree": "lantern-primary",
+            "branch": "main",
+            "session": "hc-b-01-session-a"
+          },
+          "observed_at": "2025-02-03T09:05:00Z",
+          "valid_from": "2025-02-03T09:00:00Z",
+          "valid_until": null,
+          "content": "The framed log reader carries up to three unfinished UTF-8 bytes between data frames belonging to one record. An empty heartbeat frame neither flushes those bytes nor ends the record. Only the explicit record_end flag closes the text record; an incomplete character at that flag is a decoding error. Fixture evidence: the three bytes of the euro character split across two data frames with an intervening heartbeat decode to one character."
+        },
+        {
+          "id": "hc-b-01-frame-experiment-r1",
+          "lineage_id": "hc-b-01-frame-experiment",
+          "revision": "1",
+          "origin": {
+            "project": "lantern-reader",
+            "repository": "lantern-repository",
+            "worktree": "lantern-experiment",
+            "branch": "experiment/frame-records",
+            "session": "hc-b-01-session-x"
+          },
+          "observed_at": "2025-02-03T09:20:00Z",
+          "valid_from": "2025-02-03T09:00:00Z",
+          "valid_until": null,
+          "content": "In the frame-records experiment, every transport frame is a complete record. Reject a character split across frames and treat an empty frame as an empty completed record. This experiment is confined to the lantern-experiment worktree and experiment/frame-records branch."
+        },
+        {
+          "id": "hc-b-01-metric-r1",
+          "lineage_id": "hc-b-01-metric",
+          "revision": "1",
+          "origin": {
+            "project": "lantern-reader",
+            "repository": "lantern-repository",
+            "worktree": "lantern-primary",
+            "branch": "main",
+            "session": "hc-b-01-session-a"
+          },
+          "observed_at": "2025-02-03T09:22:00Z",
+          "valid_from": "2025-02-03T09:00:00Z",
+          "valid_until": null,
+          "content": "The operations dashboard subtracts heartbeat frame headers from the payload-byte chart and samples that chart every thirty seconds. This display accounting does not define decoder boundaries."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-01-decoder-r1",
+          "source_revision": "1",
+          "session": "hc-b-01-session-a",
+          "at": "2025-02-03T08:20:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-01-decoder-r2",
+          "source_revision": "2",
+          "session": "hc-b-01-session-a",
+          "at": "2025-02-03T09:05:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-01-q-positive",
+          "session": "hc-b-01-session-a",
+          "at": "2025-02-03T09:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "lantern-reader",
+              "repository": "lantern-repository",
+              "worktree": "lantern-primary",
+              "branch": "main",
+              "session": "hc-b-01-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-01-frame-experiment-r1",
+          "source_revision": "1",
+          "session": "hc-b-01-session-x",
+          "at": "2025-02-03T09:20:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-01-metric-r1",
+          "source_revision": "1",
+          "session": "hc-b-01-session-a",
+          "at": "2025-02-03T09:22:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-01-q-foreign-positive",
+          "session": "hc-b-01-session-x",
+          "at": "2025-02-03T09:25:00Z",
+          "details": {
+            "request_origin": {
+              "project": "lantern-reader",
+              "repository": "lantern-repository",
+              "worktree": "lantern-experiment",
+              "branch": "experiment/frame-records",
+              "session": "hc-b-01-session-x"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-01-q-reuse",
+          "session": "hc-b-01-session-b",
+          "at": "2025-02-03T09:40:00Z",
+          "details": {
+            "request_origin": {
+              "project": "lantern-reader",
+              "repository": "lantern-repository",
+              "worktree": "lantern-primary",
+              "branch": "main",
+              "session": "hc-b-01-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-01-q-positive",
+          "text": "Before wiring the reader into the UI, what decides when a fragmented text record is finished?",
+          "at": "2025-02-03T09:10:00Z",
+          "session": "hc-b-01-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-03T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-01-decoder-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-01-decoder-r1"
+          ],
+          "required_facts": [
+            "Keep unfinished UTF-8 bytes across data frames of the same record.",
+            "An intervening heartbeat does not flush the pending character or complete a record.",
+            "The explicit record_end flag completes the record and makes an unfinished character an error."
+          ],
+          "prohibited_claims": [
+            "A transport frame always completes a text record in lantern-primary.",
+            "A heartbeat flushes pending UTF-8 bytes.",
+            "The experiment branch authorizes discarding split characters in the main checkout."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-01-q-foreign-positive",
+          "text": "For the frame-records experiment, may one character straddle two network frames?",
+          "at": "2025-02-03T09:25:00Z",
+          "session": "hc-b-01-session-x",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-03T09:25:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-01-frame-experiment-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-01-decoder-r1",
+            "hc-b-01-decoder-r2",
+            "hc-b-01-metric-r1"
+          ],
+          "required_facts": [
+            "The experiment treats each transport frame as a complete record.",
+            "The experiment rejects a character split across frames."
+          ],
+          "prohibited_claims": [
+            "The experiment carries an unfinished character to the next frame."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-01-q-reuse",
+          "text": "The socket gives us two pieces of one character, with a keepalive in between. What must the reader remember, and when can it finally emit the line?",
+          "at": "2025-02-03T09:40:00Z",
+          "session": "hc-b-01-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-03T09:40:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-01-decoder-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-01-decoder-r1",
+            "hc-b-01-frame-experiment-r1"
+          ],
+          "required_facts": [
+            "Keep unfinished UTF-8 bytes across data frames of the same record.",
+            "An intervening heartbeat does not flush the pending character or complete a record.",
+            "The explicit record_end flag completes the record and makes an unfinished character an error."
+          ],
+          "prohibited_claims": [
+            "A transport frame always completes a text record in lantern-primary.",
+            "A heartbeat flushes pending UTF-8 bytes.",
+            "The experiment branch authorizes discarding split characters in the main checkout."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-01-q-positive",
+          "hc-b-01-q-foreign-positive",
+          "hc-b-01-q-reuse"
+        ],
+        "expected_source_ids": [
+          "hc-b-01-decoder-r2",
+          "hc-b-01-frame-experiment-r1"
+        ],
+        "description": "The main decision and the forbidden experiment are each useful in their own scopes. The later main-checkout recall must remain useful while preserving session A provenance."
+      },
+      "rubric": [
+        "Deliver the required decoder facts from decoder revision 2 in both main-checkout requests.",
+        "The sibling experiment must be demonstrably committed and useful in its own scope before the main-checkout denial is scored.",
+        "Reject the expired revision and sibling origin from the later main context; content resemblance grants no scope.",
+        "The payload-byte chart is true but irrelevant and earns no usefulness credit.",
+        "A refusal or empty answer to the authorized A-to-B request fails positive recall."
+      ],
+      "rationale": "The question describes byte fragmentation and keepalives without repeating the source wording. The valid main rule, valid foreign rule and formerly valid main rule lead to different decoder behavior, so indiscriminate retrieval and blanket isolation are both detectable."
+    },
+    {
+      "id": "hc-b-02",
+      "family": "scope_isolation",
+      "description": "Keep feature-branch binding-aware rename facts reusable across sessions without inheriting another branch from the same working tree or an unrelated teaching project.",
+      "sources": [
+        {
+          "id": "hc-b-02-main-policy-r1",
+          "lineage_id": "hc-b-02-main-policy",
+          "revision": "1",
+          "origin": {
+            "project": "quill-refactor",
+            "repository": "quill-repository",
+            "worktree": "quill-working-tree",
+            "branch": "main",
+            "session": "hc-b-02-session-main"
+          },
+          "observed_at": "2025-02-04T08:10:00Z",
+          "valid_from": "2025-02-04T08:00:00Z",
+          "valid_until": null,
+          "content": "The main-branch prototype renamer replaces every token with the selected spelling and rejects a target spelling if it appears anywhere in the file. This remains the main-branch behavior; it is not the binding-aware feature branch behavior."
+        },
+        {
+          "id": "hc-b-02-binding-rule-r1",
+          "lineage_id": "hc-b-02-binding-rule",
+          "revision": "1",
+          "origin": {
+            "project": "quill-refactor",
+            "repository": "quill-repository",
+            "worktree": "quill-working-tree",
+            "branch": "fix/rename-bindings",
+            "session": "hc-b-02-session-a"
+          },
+          "observed_at": "2025-02-04T09:05:00Z",
+          "valid_from": "2025-02-04T09:00:00Z",
+          "valid_until": null,
+          "content": "In fix/rename-bindings, rename edits are selected by resolved binding ID, not token spelling. A new local variable name conflicts only with a visible declaration in the value namespace at the affected references. A type alias or statement label with that spelling is not a value-namespace collision. A shadowed variable with the old spelling keeps its own binding ID and is not edited."
+        },
+        {
+          "id": "hc-b-02-transaction-r1",
+          "lineage_id": "hc-b-02-transaction",
+          "revision": "1",
+          "origin": {
+            "project": "quill-refactor",
+            "repository": "quill-repository",
+            "worktree": "quill-working-tree",
+            "branch": "fix/rename-bindings",
+            "session": "hc-b-02-session-a"
+          },
+          "observed_at": "2025-02-04T09:06:00Z",
+          "valid_from": "2025-02-04T09:00:00Z",
+          "valid_until": null,
+          "content": "The feature branch computes all binding-aware rename edits and validates collisions before applying any edit. On a value-namespace collision, return the colliding declaration location and apply zero edits across the transaction."
+        },
+        {
+          "id": "hc-b-02-demo-policy-r1",
+          "lineage_id": "hc-b-02-demo-policy",
+          "revision": "1",
+          "origin": {
+            "project": "quill-demo",
+            "repository": "quill-demo-repository",
+            "worktree": "quill-demo-working-tree",
+            "branch": "main",
+            "session": "hc-b-02-session-demo"
+          },
+          "observed_at": "2025-02-04T09:15:00Z",
+          "valid_from": "2025-02-04T09:00:00Z",
+          "valid_until": null,
+          "content": "The unrelated quill-demo is a teaching text editor: rename is literal whole-file replacement, including strings and comments. It accepts any destination spelling and has no binding resolver."
+        },
+        {
+          "id": "hc-b-02-import-format-r1",
+          "lineage_id": "hc-b-02-import-format",
+          "revision": "1",
+          "origin": {
+            "project": "quill-refactor",
+            "repository": "quill-repository",
+            "worktree": "quill-working-tree",
+            "branch": "fix/rename-bindings",
+            "session": "hc-b-02-session-a"
+          },
+          "observed_at": "2025-02-04T09:16:00Z",
+          "valid_from": "2025-02-04T09:00:00Z",
+          "valid_until": null,
+          "content": "The feature branch import formatter keeps relative imports after package imports and preserves comments attached to each group. Import formatting has no effect on rename collision lookup."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-02-main-policy-r1",
+          "source_revision": "1",
+          "session": "hc-b-02-session-main",
+          "at": "2025-02-04T08:10:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-02-q-main-positive",
+          "session": "hc-b-02-session-main",
+          "at": "2025-02-04T08:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "quill-refactor",
+              "repository": "quill-repository",
+              "worktree": "quill-working-tree",
+              "branch": "main",
+              "session": "hc-b-02-session-main"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-02-binding-rule-r1",
+          "source_revision": "1",
+          "session": "hc-b-02-session-a",
+          "at": "2025-02-04T09:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-02-transaction-r1",
+          "source_revision": "1",
+          "session": "hc-b-02-session-a",
+          "at": "2025-02-04T09:06:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-02-q-positive",
+          "session": "hc-b-02-session-a",
+          "at": "2025-02-04T09:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "quill-refactor",
+              "repository": "quill-repository",
+              "worktree": "quill-working-tree",
+              "branch": "fix/rename-bindings",
+              "session": "hc-b-02-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-02-demo-policy-r1",
+          "source_revision": "1",
+          "session": "hc-b-02-session-demo",
+          "at": "2025-02-04T09:15:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-02-import-format-r1",
+          "source_revision": "1",
+          "session": "hc-b-02-session-a",
+          "at": "2025-02-04T09:16:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-02-q-demo-positive",
+          "session": "hc-b-02-session-demo",
+          "at": "2025-02-04T09:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "quill-demo",
+              "repository": "quill-demo-repository",
+              "worktree": "quill-demo-working-tree",
+              "branch": "main",
+              "session": "hc-b-02-session-demo"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-02-q-isolation",
+          "session": "hc-b-02-session-b",
+          "at": "2025-02-04T09:35:00Z",
+          "details": {
+            "request_origin": {
+              "project": "quill-refactor",
+              "repository": "quill-repository",
+              "worktree": "quill-working-tree",
+              "branch": "fix/rename-bindings",
+              "session": "hc-b-02-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-02-q-main-positive",
+          "text": "How broad is the prototype rename operation on main, and what makes it reject a destination spelling?",
+          "at": "2025-02-04T08:20:00Z",
+          "session": "hc-b-02-session-main",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-04T08:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-02-main-policy-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "The main prototype replaces every token with the selected spelling.",
+            "The main prototype rejects a destination spelling appearing anywhere in the file."
+          ],
+          "prohibited_claims": [
+            "Main already selects edits using resolved binding IDs."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-02-q-positive",
+          "text": "What keeps the binding-aware rename from touching a shadowed local, and what happens if a replacement really collides?",
+          "at": "2025-02-04T09:10:00Z",
+          "session": "hc-b-02-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-04T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-02-binding-rule-r1",
+            "hc-b-02-transaction-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-02-main-policy-r1"
+          ],
+          "required_facts": [
+            "Select references by resolved binding ID and leave shadowed bindings unchanged.",
+            "Check visible value-namespace declarations; type aliases and statement labels do not by themselves block a local-variable rename.",
+            "Validate all edits before mutation; a real value collision returns its declaration location and applies zero edits."
+          ],
+          "prohibited_claims": [
+            "Rename replaces every matching token, string or comment in the feature branch.",
+            "Any matching type alias or label anywhere in the file forbids the rename.",
+            "A real value collision may leave some edits applied.",
+            "The same working-tree identity makes another branch eligible.",
+            "An unrelated demo project supplies authoritative rename behavior."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-02-q-demo-positive",
+          "text": "In the teaching editor, does a rename also touch words inside a comment?",
+          "at": "2025-02-04T09:20:00Z",
+          "session": "hc-b-02-session-demo",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-04T09:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-02-demo-policy-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-02-main-policy-r1",
+            "hc-b-02-binding-rule-r1",
+            "hc-b-02-transaction-r1",
+            "hc-b-02-import-format-r1"
+          ],
+          "required_facts": [
+            "The teaching editor performs literal whole-file replacement including comments.",
+            "The teaching editor has no binding resolver."
+          ],
+          "prohibited_claims": [
+            "The demo skips comments using binding IDs."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-02-q-isolation",
+          "text": "I want to give a local the same spelling as a type alias and a jump label. Should that block the change, which occurrences move, and can a rejected attempt leave half the file edited?",
+          "at": "2025-02-04T09:35:00Z",
+          "session": "hc-b-02-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-04T09:35:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-02-binding-rule-r1",
+            "hc-b-02-transaction-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-02-main-policy-r1",
+            "hc-b-02-demo-policy-r1"
+          ],
+          "required_facts": [
+            "Select references by resolved binding ID and leave shadowed bindings unchanged.",
+            "Check visible value-namespace declarations; type aliases and statement labels do not by themselves block a local-variable rename.",
+            "Validate all edits before mutation; a real value collision returns its declaration location and applies zero edits."
+          ],
+          "prohibited_claims": [
+            "Rename replaces every matching token, string or comment in the feature branch.",
+            "Any matching type alias or label anywhere in the file forbids the rename.",
+            "A real value collision may leave some edits applied.",
+            "The same working-tree identity makes another branch eligible.",
+            "An unrelated demo project supplies authoritative rename behavior."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-02-q-main-positive",
+          "hc-b-02-q-positive",
+          "hc-b-02-q-demo-positive",
+          "hc-b-02-q-isolation"
+        ],
+        "expected_source_ids": [
+          "hc-b-02-main-policy-r1",
+          "hc-b-02-binding-rule-r1",
+          "hc-b-02-transaction-r1",
+          "hc-b-02-demo-policy-r1"
+        ],
+        "description": "Each foreign policy is positively recalled only in its own branch/project; the unchanged feature-branch transaction source remains useful during the final denial challenge."
+      },
+      "rubric": [
+        "Preserve project, repository, worktree, branch and source-session attribution for every delivered fact.",
+        "The final feature-branch answer must contain both binding selection and all-or-nothing collision handling.",
+        "Deny main-branch sources even though their worktree string equals the requesting worktree.",
+        "Deny unrelated-project sources even when the same rename vocabulary is used.",
+        "The import formatter is true but irrelevant; it cannot satisfy any required fact.",
+        "No current-source decision authorizes global text replacement or a partial rename transaction."
+      ],
+      "rationale": "The old branch and unrelated editor are genuinely different algorithms, each still true in its own scope. The positive request after branch binding makes scope denial discriminating without treating every older observation as stale."
+    },
+    {
+      "id": "hc-b-03",
+      "family": "contradiction",
+      "description": "An explicit correction changes how nonexistent local times are resolved; later current recall and an earlier as-of recall must produce different answers with exact revision provenance.",
+      "sources": [
+        {
+          "id": "hc-b-03-gap-r1",
+          "lineage_id": "hc-b-03-gap-rule",
+          "revision": "1",
+          "origin": {
+            "project": "daybridge-scheduler",
+            "repository": "daybridge-repository",
+            "worktree": "daybridge-primary",
+            "branch": "main",
+            "session": "hc-b-03-session-a"
+          },
+          "observed_at": "2025-03-09T08:05:00Z",
+          "valid_from": "2025-03-09T08:00:00Z",
+          "valid_until": "2025-03-09T10:00:00Z",
+          "content": "Daybridge gap rule revision 1: when a requested local time does not exist, scan forward to the first representable local minute. In the synthetic zone where 02:00 through 02:59:59 is missing, a 02:17 request resolves to 03:00. For an overlap, choose the occurrence with the earlier UTC instant."
+        },
+        {
+          "id": "hc-b-03-gap-r2",
+          "lineage_id": "hc-b-03-gap-rule",
+          "revision": "2",
+          "origin": {
+            "project": "daybridge-scheduler",
+            "repository": "daybridge-repository",
+            "worktree": "daybridge-primary",
+            "branch": "main",
+            "session": "hc-b-03-session-a"
+          },
+          "observed_at": "2025-03-09T10:00:00Z",
+          "valid_from": "2025-03-09T10:00:00Z",
+          "valid_until": null,
+          "content": "Correction to Daybridge gap rule, effective 10:00 UTC: shift a nonexistent wall time forward by the exact width of the offset gap, preserving its displacement into the gap. In the synthetic one-hour jump from 02:00 to 03:00, 02:17 resolves to 03:17, not 03:00. Overlap resolution is unchanged: choose the occurrence with the earlier UTC instant. This is provider-local decision lineage gap-rule revision 2; it supersedes revision 1 for current use."
+        },
+        {
+          "id": "hc-b-03-calendar-label-r1",
+          "lineage_id": "hc-b-03-calendar-label",
+          "revision": "1",
+          "origin": {
+            "project": "daybridge-scheduler",
+            "repository": "daybridge-repository",
+            "worktree": "daybridge-primary",
+            "branch": "main",
+            "session": "hc-b-03-session-a"
+          },
+          "observed_at": "2025-03-09T08:06:00Z",
+          "valid_from": "2025-03-09T08:00:00Z",
+          "valid_until": null,
+          "content": "The schedule preview localizes weekday abbreviations using the selected UI locale and falls back to numeric month/day labels when a translation is absent. Label fallback never chooses a schedule instant."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-03-gap-r1",
+          "source_revision": "1",
+          "session": "hc-b-03-session-a",
+          "at": "2025-03-09T08:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-03-calendar-label-r1",
+          "source_revision": "1",
+          "session": "hc-b-03-session-a",
+          "at": "2025-03-09T08:06:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-03-q-before",
+          "session": "hc-b-03-session-a",
+          "at": "2025-03-09T08:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "daybridge-scheduler",
+              "repository": "daybridge-repository",
+              "worktree": "daybridge-primary",
+              "branch": "main",
+              "session": "hc-b-03-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-b-03-gap-r2",
+          "source_revision": "2",
+          "session": "hc-b-03-session-a",
+          "at": "2025-03-09T10:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-b-03-gap-r1",
+            "replacement_source_id": "hc-b-03-gap-r2",
+            "lineage_id": "hc-b-03-gap-rule",
+            "effect": "Retain the prior revision with its closed validity interval. Publish the replacement as the current provider-local source without changing canonical fact trust. Wait for durable acknowledgement before recall."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-03-q-current",
+          "session": "hc-b-03-session-b",
+          "at": "2025-03-09T10:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "daybridge-scheduler",
+              "repository": "daybridge-repository",
+              "worktree": "daybridge-primary",
+              "branch": "main",
+              "session": "hc-b-03-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-03-q-history",
+          "session": "hc-b-03-session-b",
+          "at": "2025-03-09T10:25:00Z",
+          "details": {
+            "request_origin": {
+              "project": "daybridge-scheduler",
+              "repository": "daybridge-repository",
+              "worktree": "daybridge-primary",
+              "branch": "main",
+              "session": "hc-b-03-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-03-q-before",
+          "text": "At this revision, what does the scheduler do with 02:17 on the artificial clock-jump day, and how does it settle an ambiguous repeated time?",
+          "at": "2025-03-09T08:20:00Z",
+          "session": "hc-b-03-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-09T08:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-03-gap-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-03-gap-r2"
+          ],
+          "required_facts": [
+            "Before the correction, scan to the first representable local minute.",
+            "Under revision 1 in the declared gap, 02:17 resolves to 03:00.",
+            "For an overlap, choose the occurrence with the earlier UTC instant."
+          ],
+          "prohibited_claims": [
+            "Revision 1 preserves seventeen minutes of displacement and schedules 03:17.",
+            "Choose the later UTC occurrence of an overlapping time."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-03-q-current",
+          "text": "After the clock skips an hour, should a reminder seventeen minutes into the missing stretch snap to the edge or retain that offset? Also, which copy of a repeated time wins?",
+          "at": "2025-03-09T10:20:00Z",
+          "session": "hc-b-03-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-09T10:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-03-gap-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-03-gap-r1"
+          ],
+          "required_facts": [
+            "For a missing wall time, add the exact offset-gap width while preserving displacement into the gap.",
+            "In the declared one-hour gap, a 02:17 request resolves to 03:17.",
+            "For an overlap, choose the occurrence with the earlier UTC instant."
+          ],
+          "prohibited_claims": [
+            "The current gap rule snaps every missing time to 03:00.",
+            "The correction changed overlaps to choose the later UTC occurrence."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-03-q-history",
+          "text": "Reconstruct the rule in force at 08:30 UTC: where did a requested 02:17 land in the synthetic gap, and which repeated-time occurrence did it use?",
+          "at": "2025-03-09T10:25:00Z",
+          "session": "hc-b-03-session-b",
+          "temporal": {
+            "mode": "as_of",
+            "evaluation_time": "2025-03-09T10:25:00Z",
+            "as_of": "2025-03-09T08:30:00Z",
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-03-gap-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-03-gap-r2"
+          ],
+          "required_facts": [
+            "Before the correction, scan to the first representable local minute.",
+            "Under revision 1 in the declared gap, 02:17 resolves to 03:00.",
+            "For an overlap, choose the occurrence with the earlier UTC instant."
+          ],
+          "prohibited_claims": [
+            "The rule in force at 08:30 scheduled 03:17.",
+            "The newer rule can be presented as historical evidence for 08:30."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-03-q-before",
+          "hc-b-03-q-current",
+          "hc-b-03-q-history"
+        ],
+        "expected_source_ids": [
+          "hc-b-03-gap-r1",
+          "hc-b-03-gap-r2"
+        ],
+        "description": "The old policy is useful before correction and for the earlier as-of request. The corrected policy is useful for current recall after durable correction, with the same overlap rule intact."
+      },
+      "rubric": [
+        "Use closed-open validity intervals: revision 1 ends exactly when revision 2 begins at 10:00 UTC.",
+        "Current recall must deliver revision 2 and exclude revision 1 as current guidance.",
+        "As-of recall at 08:30 must deliver revision 1 and exclude revision 2, even though evaluation occurs after correction.",
+        "Do not conflate a correction to gap resolution with a change to overlap resolution.",
+        "Locale label behavior is true but irrelevant.",
+        "The historical recall is a historical retrieval assessment; it does not endorse applying the retired rule now."
+      ],
+      "rationale": "The two gap algorithms agree for the first missing minute but disagree for a request inside the gap. The chosen seventeen-minute displacement exposes that distinction, while the unchanged overlap rule catches an overbroad correction."
+    },
+    {
+      "id": "hc-b-04",
+      "family": "contradiction",
+      "description": "A column-unit correction must survive delayed duplicate delivery of its predecessor; current and historical requests remain distinct and a byte-offset prototype remains out of scope.",
+      "sources": [
+        {
+          "id": "hc-b-04-column-r1",
+          "lineage_id": "hc-b-04-column-rule",
+          "revision": "1",
+          "origin": {
+            "project": "prism-diagnostics",
+            "repository": "prism-repository",
+            "worktree": "prism-primary",
+            "branch": "main",
+            "session": "hc-b-04-session-a"
+          },
+          "observed_at": "2025-03-10T08:05:00Z",
+          "valid_from": "2025-03-10T08:00:00Z",
+          "valid_until": "2025-03-10T10:00:00Z",
+          "content": "Prism inline diagnostic protocol revision 1 measures zero-based columns in Unicode scalar values. In the exact line A🧭Z, the Z starts at column 2. A literal tab counts as one scalar; these are protocol offsets, not visual cells."
+        },
+        {
+          "id": "hc-b-04-column-r2",
+          "lineage_id": "hc-b-04-column-rule",
+          "revision": "2",
+          "origin": {
+            "project": "prism-diagnostics",
+            "repository": "prism-repository",
+            "worktree": "prism-primary",
+            "branch": "main",
+            "session": "hc-b-04-session-a"
+          },
+          "observed_at": "2025-03-10T10:00:00Z",
+          "valid_from": "2025-03-10T10:00:00Z",
+          "valid_until": null,
+          "content": "Correction effective 10:00 UTC: Prism inline diagnostic columns are zero-based UTF-16 code-unit offsets. In A🧭Z, A consumes one unit and the compass character consumes two, so Z starts at column 3. A literal tab consumes one code unit regardless of editor tab width. Scalar counts and UTF-8 byte offsets are not this protocol."
+        },
+        {
+          "id": "hc-b-04-byte-prototype-r1",
+          "lineage_id": "hc-b-04-byte-prototype",
+          "revision": "1",
+          "origin": {
+            "project": "prism-diagnostics",
+            "repository": "prism-repository",
+            "worktree": "prism-byte-prototype",
+            "branch": "experiment/byte-columns",
+            "session": "hc-b-04-session-x"
+          },
+          "observed_at": "2025-03-10T10:10:00Z",
+          "valid_from": "2025-03-10T10:00:00Z",
+          "valid_until": null,
+          "content": "The isolated byte-columns prototype addresses UTF-8 bytes. In A🧭Z, Z starts at byte 5. This wire format belongs only to the prism-byte-prototype worktree and is not a revision of the primary diagnostic protocol."
+        },
+        {
+          "id": "hc-b-04-severity-r1",
+          "lineage_id": "hc-b-04-severity",
+          "revision": "1",
+          "origin": {
+            "project": "prism-diagnostics",
+            "repository": "prism-repository",
+            "worktree": "prism-primary",
+            "branch": "main",
+            "session": "hc-b-04-session-a"
+          },
+          "observed_at": "2025-03-10T08:06:00Z",
+          "valid_from": "2025-03-10T08:00:00Z",
+          "valid_until": null,
+          "content": "The diagnostic panel sorts severity groups as error, warning, note and keeps arrival order within a group. This sorting does not alter protocol positions."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-04-column-r1",
+          "source_revision": "1",
+          "session": "hc-b-04-session-a",
+          "at": "2025-03-10T08:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-04-severity-r1",
+          "source_revision": "1",
+          "session": "hc-b-04-session-a",
+          "at": "2025-03-10T08:06:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-04-q-before",
+          "session": "hc-b-04-session-a",
+          "at": "2025-03-10T08:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "prism-diagnostics",
+              "repository": "prism-repository",
+              "worktree": "prism-primary",
+              "branch": "main",
+              "session": "hc-b-04-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-b-04-column-r2",
+          "source_revision": "2",
+          "session": "hc-b-04-session-a",
+          "at": "2025-03-10T10:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-b-04-column-r1",
+            "replacement_source_id": "hc-b-04-column-r2",
+            "lineage_id": "hc-b-04-column-rule",
+            "effect": "Retain the prior revision with its closed validity interval. Publish the replacement as the current provider-local source without changing canonical fact trust. Wait for durable acknowledgement before recall."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-04-byte-prototype-r1",
+          "source_revision": "1",
+          "session": "hc-b-04-session-x",
+          "at": "2025-03-10T10:10:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-04-q-corrected",
+          "session": "hc-b-04-session-b",
+          "at": "2025-03-10T10:20:00Z",
+          "details": {
+            "request_origin": {
+              "project": "prism-diagnostics",
+              "repository": "prism-repository",
+              "worktree": "prism-primary",
+              "branch": "main",
+              "session": "hc-b-04-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-04-column-r1",
+          "source_revision": "1",
+          "session": "hc-b-04-session-a",
+          "at": "2025-03-10T11:00:00Z",
+          "details": {
+            "delivery": "Delayed duplicate of the original observation with its original source ID, revision, observed_at, validity interval and idempotency key. Its new arrival time grants no new validity or authority."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-04-q-after-redelivery",
+          "session": "hc-b-04-session-b",
+          "at": "2025-03-10T11:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "prism-diagnostics",
+              "repository": "prism-repository",
+              "worktree": "prism-primary",
+              "branch": "main",
+              "session": "hc-b-04-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-04-q-history",
+          "session": "hc-b-04-session-b",
+          "at": "2025-03-10T11:15:00Z",
+          "details": {
+            "request_origin": {
+              "project": "prism-diagnostics",
+              "repository": "prism-repository",
+              "worktree": "prism-primary",
+              "branch": "main",
+              "session": "hc-b-04-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-04-q-before",
+          "text": "For A🧭Z, what column does the inline protocol attach to Z, and does tab expansion affect offsets?",
+          "at": "2025-03-10T08:20:00Z",
+          "session": "hc-b-04-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-10T08:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-04-column-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-04-column-r2",
+            "hc-b-04-byte-prototype-r1"
+          ],
+          "required_facts": [
+            "Revision 1 counts zero-based Unicode scalar values.",
+            "In A🧭Z, Z is at column 2 under revision 1.",
+            "A tab counts as one protocol unit rather than its displayed width."
+          ],
+          "prohibited_claims": [
+            "Revision 1 puts Z at column 3 or byte 5.",
+            "An eight-cell displayed tab consumes eight protocol units."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-04-q-corrected",
+          "text": "The editor underlines the letter after an astral symbol one place too early. Which counting system should the bridge use now, and how should a tab contribute?",
+          "at": "2025-03-10T10:20:00Z",
+          "session": "hc-b-04-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-10T10:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-04-column-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-04-column-r1",
+            "hc-b-04-byte-prototype-r1"
+          ],
+          "required_facts": [
+            "Current protocol columns count zero-based UTF-16 code units.",
+            "In A🧭Z, Z is at column 3 because the compass character occupies two UTF-16 units.",
+            "A tab counts as one protocol unit rather than its displayed width."
+          ],
+          "prohibited_claims": [
+            "Current offsets count Unicode scalars.",
+            "Use UTF-8 byte 5 for Z in the primary protocol.",
+            "A tab width preference changes protocol offsets."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-04-q-after-redelivery",
+          "text": "An older transcript arrived again. For the line A🧭Z, where should the current diagnostic bridge point at the final letter, and what does one tab add?",
+          "at": "2025-03-10T11:10:00Z",
+          "session": "hc-b-04-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-10T11:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-04-column-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-04-column-r1",
+            "hc-b-04-byte-prototype-r1"
+          ],
+          "required_facts": [
+            "Current protocol columns count zero-based UTF-16 code units.",
+            "In A🧭Z, Z is at column 3 because the compass character occupies two UTF-16 units.",
+            "A tab counts as one protocol unit rather than its displayed width."
+          ],
+          "prohibited_claims": [
+            "Latest delivery time makes the scalar-count rule current again.",
+            "Z is currently at column 2 or byte 5.",
+            "A visual tab consumes multiple protocol units."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-04-q-history",
+          "text": "Using only the protocol valid at 09:00 UTC, where was Z in A🧭Z and how were tabs counted?",
+          "at": "2025-03-10T11:15:00Z",
+          "session": "hc-b-04-session-b",
+          "temporal": {
+            "mode": "as_of",
+            "evaluation_time": "2025-03-10T11:15:00Z",
+            "as_of": "2025-03-10T09:00:00Z",
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-04-column-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-04-column-r2",
+            "hc-b-04-byte-prototype-r1"
+          ],
+          "required_facts": [
+            "Revision 1 counts zero-based Unicode scalar values.",
+            "In A🧭Z, Z is at column 2 under revision 1.",
+            "A tab counts as one protocol unit rather than its displayed width."
+          ],
+          "prohibited_claims": [
+            "The 09:00 protocol used UTF-16 column 3.",
+            "A different worktree supplies the 09:00 primary protocol."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-04-q-before",
+          "hc-b-04-q-corrected",
+          "hc-b-04-q-after-redelivery",
+          "hc-b-04-q-history"
+        ],
+        "expected_source_ids": [
+          "hc-b-04-column-r1",
+          "hc-b-04-column-r2"
+        ],
+        "description": "Verify useful old and corrected revisions before the duplicate challenge; then require corrected current recall and authentic earlier historical recall."
+      },
+      "rubric": [
+        "The correction links column revision 1 to revision 2 without silently rewriting the original source.",
+        "Late redelivery of revision 1 must neither duplicate the source contribution nor reverse the durable correction.",
+        "Current useful content must distinguish UTF-16 units from both scalars and bytes on the supplied non-BMP character.",
+        "As-of 09:00 admits only revision 1 of the primary protocol.",
+        "The sibling prototype stays forbidden even if it appears more recent.",
+        "Severity ordering is true but irrelevant and cannot support any positional answer."
+      ],
+      "rationale": "An astral character makes three plausible counting systems yield three different offsets. Re-delivery after correction challenges arrival-order precedence, and the historical probe prevents solving the case by destructively erasing every old revision."
+    },
+    {
+      "id": "hc-b-05",
+      "family": "restart_replay",
+      "description": "A useful crash-safe download decision must survive actual host/provider process replacement and duplicate canonical replay without reviving the retired resume rule or leaking an experiment.",
+      "sources": [
+        {
+          "id": "hc-b-05-resume-r1",
+          "lineage_id": "hc-b-05-resume-rule",
+          "revision": "1",
+          "origin": {
+            "project": "harbor-mirror",
+            "repository": "harbor-repository",
+            "worktree": "harbor-primary",
+            "branch": "main",
+            "session": "hc-b-05-session-a"
+          },
+          "observed_at": "2025-04-07T08:05:00Z",
+          "valid_from": "2025-04-07T08:00:00Z",
+          "valid_until": "2025-04-07T09:00:00Z",
+          "content": "Retired mirror resume policy: use the current partial-file length as the next Range offset and keep those bytes when the server changes its ETag. This policy expired when durable sidecar checkpoints were introduced at 09:00 UTC."
+        },
+        {
+          "id": "hc-b-05-resume-r2",
+          "lineage_id": "hc-b-05-resume-rule",
+          "revision": "2",
+          "origin": {
+            "project": "harbor-mirror",
+            "repository": "harbor-repository",
+            "worktree": "harbor-primary",
+            "branch": "main",
+            "session": "hc-b-05-session-a"
+          },
+          "observed_at": "2025-04-07T09:05:00Z",
+          "valid_from": "2025-04-07T09:00:00Z",
+          "valid_until": null,
+          "content": "The current mirror commits a checkpoint by syncing appended data before atomically replacing the sidecar containing committed_length and the object ETag. On reopen, truncate any data beyond committed_length before issuing a Range request at that committed length. If the response ETag differs from the checkpoint ETag, discard both partial bytes and the sidecar and start at offset zero. Fixture evidence: a file with 8192 bytes and a sidecar committing 6144 resumes at 6144 after truncation, not at 8192."
+        },
+        {
+          "id": "hc-b-05-direct-stream-r1",
+          "lineage_id": "hc-b-05-direct-stream",
+          "revision": "1",
+          "origin": {
+            "project": "harbor-mirror",
+            "repository": "harbor-repository",
+            "worktree": "harbor-direct-stream",
+            "branch": "experiment/no-sidecar",
+            "session": "hc-b-05-session-x"
+          },
+          "observed_at": "2025-04-07T09:06:00Z",
+          "valid_from": "2025-04-07T09:00:00Z",
+          "valid_until": null,
+          "content": "The no-sidecar experiment always streams from byte zero into a fresh temporary file and never attempts a Range request. It is confined to the harbor-direct-stream worktree."
+        },
+        {
+          "id": "hc-b-05-progress-r1",
+          "lineage_id": "hc-b-05-progress",
+          "revision": "1",
+          "origin": {
+            "project": "harbor-mirror",
+            "repository": "harbor-repository",
+            "worktree": "harbor-primary",
+            "branch": "main",
+            "session": "hc-b-05-session-a"
+          },
+          "observed_at": "2025-04-07T09:07:00Z",
+          "valid_from": "2025-04-07T09:00:00Z",
+          "valid_until": null,
+          "content": "The download progress display refreshes after each 256 KiB of received network data. The display counter includes bytes that are not yet in a committed checkpoint and cannot choose a resume offset."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-05-resume-r1",
+          "source_revision": "1",
+          "session": "hc-b-05-session-a",
+          "at": "2025-04-07T08:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-05-resume-r2",
+          "source_revision": "2",
+          "session": "hc-b-05-session-a",
+          "at": "2025-04-07T09:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-05-direct-stream-r1",
+          "source_revision": "1",
+          "session": "hc-b-05-session-x",
+          "at": "2025-04-07T09:06:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-05-progress-r1",
+          "source_revision": "1",
+          "session": "hc-b-05-session-a",
+          "at": "2025-04-07T09:07:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-05-q-positive",
+          "session": "hc-b-05-session-a",
+          "at": "2025-04-07T09:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "harbor-mirror",
+              "repository": "harbor-repository",
+              "worktree": "harbor-primary",
+              "branch": "main",
+              "session": "hc-b-05-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2025-04-07T09:20:00Z",
+          "session": "hc-b-05-session-b",
+          "details": {
+            "operation": "Terminate and reap the isolated host daemon and all selected-provider child processes; reopen the same durable fixture profile in a newly spawned process group. Record old and new process start identities and wait for readiness.",
+            "retain": "Canonical history, provider-local durable state and source validity metadata.",
+            "completion": "A logical readiness reset or reused live process does not satisfy this step."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-05-q-reopened",
+          "session": "hc-b-05-session-b",
+          "at": "2025-04-07T09:30:00Z",
+          "details": {
+            "request_origin": {
+              "project": "harbor-mirror",
+              "repository": "harbor-repository",
+              "worktree": "harbor-primary",
+              "branch": "main",
+              "session": "hc-b-05-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "replay",
+          "at": "2025-04-07T10:00:00Z",
+          "session": "hc-b-05-session-c",
+          "details": {
+            "source_ids_in_order": [
+              "hc-b-05-resume-r1",
+              "hc-b-05-resume-r2",
+              "hc-b-05-direct-stream-r1",
+              "hc-b-05-progress-r1",
+              "hc-b-05-resume-r1",
+              "hc-b-05-resume-r2",
+              "hc-b-05-direct-stream-r1",
+              "hc-b-05-progress-r1"
+            ],
+            "preserve": "Original source IDs, string revisions, lineage IDs, origins, observation timestamps, validity intervals and idempotency keys. Redelivery time is not source validity time.",
+            "completion": "Use canonical-history replay through the shared host lifecycle surface and wait for durable completion. Repeated IDs must not create duplicate source contributions or promote a superseded revision."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-05-q-replayed",
+          "session": "hc-b-05-session-c",
+          "at": "2025-04-07T10:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "harbor-mirror",
+              "repository": "harbor-repository",
+              "worktree": "harbor-primary",
+              "branch": "main",
+              "session": "hc-b-05-session-c"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-05-q-positive",
+          "text": "What is the durable checkpoint rule for this mirror, including a file tail beyond the sidecar and an object identity change?",
+          "at": "2025-04-07T09:10:00Z",
+          "session": "hc-b-05-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-07T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-05-resume-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-05-resume-r1",
+            "hc-b-05-direct-stream-r1"
+          ],
+          "required_facts": [
+            "Sync appended data before atomically publishing the sidecar checkpoint.",
+            "After reopening an 8192-byte partial file whose sidecar commits 6144 bytes, truncate to 6144 and request from offset 6144.",
+            "If the ETag changed, discard the partial bytes and sidecar and restart at offset zero."
+          ],
+          "prohibited_claims": [
+            "Resume at the raw partial-file length of 8192.",
+            "Keep old partial bytes when the object ETag changes.",
+            "Publish the sidecar checkpoint before syncing its data.",
+            "The main checkout must always download from zero even when its checkpoint and ETag are valid."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-05-q-reopened",
+          "text": "After a power cut the partial file is 8 KiB, but the little checkpoint file certifies only 6 KiB. Where should the next request begin, and what if the remote object is different?",
+          "at": "2025-04-07T09:30:00Z",
+          "session": "hc-b-05-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-07T09:30:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-05-resume-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-05-resume-r1",
+            "hc-b-05-direct-stream-r1"
+          ],
+          "required_facts": [
+            "Sync appended data before atomically publishing the sidecar checkpoint.",
+            "After reopening an 8192-byte partial file whose sidecar commits 6144 bytes, truncate to 6144 and request from offset 6144.",
+            "If the ETag changed, discard the partial bytes and sidecar and restart at offset zero."
+          ],
+          "prohibited_claims": [
+            "Resume at the raw partial-file length of 8192.",
+            "Keep old partial bytes when the object ETag changes.",
+            "Publish the sidecar checkpoint before syncing its data.",
+            "The main checkout must always download from zero even when its checkpoint and ETag are valid."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-05-q-replayed",
+          "text": "The old session history was delivered twice after reopening. Which bytes may the mirror trust before asking the server for the remainder, and which identity check can invalidate all of them?",
+          "at": "2025-04-07T10:10:00Z",
+          "session": "hc-b-05-session-c",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-07T10:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-05-resume-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-05-resume-r1",
+            "hc-b-05-direct-stream-r1"
+          ],
+          "required_facts": [
+            "Sync appended data before atomically publishing the sidecar checkpoint.",
+            "After reopening an 8192-byte partial file whose sidecar commits 6144 bytes, truncate to 6144 and request from offset 6144.",
+            "If the ETag changed, discard the partial bytes and sidecar and restart at offset zero."
+          ],
+          "prohibited_claims": [
+            "Resume at the raw partial-file length of 8192.",
+            "Keep old partial bytes when the object ETag changes.",
+            "Publish the sidecar checkpoint before syncing its data.",
+            "The main checkout must always download from zero even when its checkpoint and ETag are valid."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-05-q-positive",
+          "hc-b-05-q-reopened",
+          "hc-b-05-q-replayed"
+        ],
+        "expected_source_ids": [
+          "hc-b-05-resume-r2"
+        ],
+        "description": "The current resume rule must be delivered before termination, after a new process group reopens the same durable profile, and after repeated canonical history. Each phase has a live useful source."
+      },
+      "rubric": [
+        "Record real old/new process start identities and reaped selected-provider children; a descriptor refresh does not establish restart.",
+        "Require durable positive admission before terminating the fixture processes.",
+        "After restart and replay, deliver the same current rule with the original session A attribution.",
+        "Replay must retain original revision validity and exclude retired revision 1 from current context.",
+        "Repeated history must not produce duplicate logical source contributions in final context.",
+        "The experiment origin is forbidden and progress-display cadence is true but irrelevant.",
+        "Missing restart or replay evidence leaves the corresponding behavior incomplete even if the answer text matches."
+      ],
+      "rationale": "The file-length/checkpoint discrepancy makes a stale implementation appear plausible after a crash. Repeated history exercises idempotence separately from process durability, and a later session can succeed only if original checkout authority survives both."
+    },
+    {
+      "id": "hc-b-06",
+      "family": "restart_replay",
+      "description": "Persist a corrected release-publication decision and an unchanged cache-key decision through a real process restart and out-of-order duplicate replay while preserving authentic earlier history.",
+      "sources": [
+        {
+          "id": "hc-b-06-publication-r1",
+          "lineage_id": "hc-b-06-publication-rule",
+          "revision": "1",
+          "origin": {
+            "project": "mosaic-bundler",
+            "repository": "mosaic-repository",
+            "worktree": "mosaic-primary",
+            "branch": "main",
+            "session": "hc-b-06-session-a"
+          },
+          "observed_at": "2025-04-08T08:05:00Z",
+          "valid_from": "2025-04-08T08:00:00Z",
+          "valid_until": "2025-04-08T10:00:00Z",
+          "content": "Mosaic publication rule revision 1: publish the next index first, then rename the generated chunk files into place. A reader may retry an index-listed chunk that is temporarily absent. This rule applied only before the atomic-release correction at 10:00 UTC."
+        },
+        {
+          "id": "hc-b-06-publication-r2",
+          "lineage_id": "hc-b-06-publication-rule",
+          "revision": "2",
+          "origin": {
+            "project": "mosaic-bundler",
+            "repository": "mosaic-repository",
+            "worktree": "mosaic-primary",
+            "branch": "main",
+            "session": "hc-b-06-session-a"
+          },
+          "observed_at": "2025-04-08T10:00:00Z",
+          "valid_from": "2025-04-08T10:00:00Z",
+          "valid_until": null,
+          "content": "Corrected Mosaic atomic-release rule: finish and sync each temporary chunk, rename all chunks to their immutable final names, and sync their parent directory before atomically replacing the published index. Keep the previous published index usable until the replacement index is durable. An interrupted build must leave readers on the old complete release, never on an index naming missing chunks."
+        },
+        {
+          "id": "hc-b-06-cache-key-r1",
+          "lineage_id": "hc-b-06-cache-key",
+          "revision": "1",
+          "origin": {
+            "project": "mosaic-bundler",
+            "repository": "mosaic-repository",
+            "worktree": "mosaic-primary",
+            "branch": "main",
+            "session": "hc-b-06-session-a"
+          },
+          "observed_at": "2025-04-08T08:06:00Z",
+          "valid_from": "2025-04-08T08:00:00Z",
+          "valid_until": null,
+          "content": "Mosaic intermediate-cache entries are identified by normalized source path plus transform version. Changing the transform version invalidates the cached result even when source bytes and modification time are unchanged. Publication-order corrections do not change this key rule."
+        },
+        {
+          "id": "hc-b-06-preview-r1",
+          "lineage_id": "hc-b-06-preview",
+          "revision": "1",
+          "origin": {
+            "project": "mosaic-bundler",
+            "repository": "mosaic-repository",
+            "worktree": "mosaic-preview",
+            "branch": "experiment/live-index",
+            "session": "hc-b-06-session-x"
+          },
+          "observed_at": "2025-04-08T10:05:00Z",
+          "valid_from": "2025-04-08T10:00:00Z",
+          "valid_until": null,
+          "content": "The live-index preview branch publishes each generated asset immediately and intentionally exposes a partially updated preview. That behavior belongs only to the mosaic-preview worktree and does not define production release publication."
+        },
+        {
+          "id": "hc-b-06-banner-r1",
+          "lineage_id": "hc-b-06-banner",
+          "revision": "1",
+          "origin": {
+            "project": "mosaic-bundler",
+            "repository": "mosaic-repository",
+            "worktree": "mosaic-primary",
+            "branch": "main",
+            "session": "hc-b-06-session-a"
+          },
+          "observed_at": "2025-04-08T08:07:00Z",
+          "valid_from": "2025-04-08T08:00:00Z",
+          "valid_until": null,
+          "content": "The development banner prints the source-file count with a thin-space thousands separator. This count is presentation metadata and neither a release generation nor a cache key."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-b-06-publication-r1",
+          "source_revision": "1",
+          "session": "hc-b-06-session-a",
+          "at": "2025-04-08T08:05:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-06-cache-key-r1",
+          "source_revision": "1",
+          "session": "hc-b-06-session-a",
+          "at": "2025-04-08T08:06:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-06-banner-r1",
+          "source_revision": "1",
+          "session": "hc-b-06-session-a",
+          "at": "2025-04-08T08:07:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-b-06-publication-r2",
+          "source_revision": "2",
+          "session": "hc-b-06-session-a",
+          "at": "2025-04-08T10:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-b-06-publication-r1",
+            "replacement_source_id": "hc-b-06-publication-r2",
+            "lineage_id": "hc-b-06-publication-rule",
+            "effect": "Retain the prior revision with its closed validity interval. Publish the replacement as the current provider-local source without changing canonical fact trust. Wait for durable acknowledgement before recall."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-b-06-preview-r1",
+          "source_revision": "1",
+          "session": "hc-b-06-session-x",
+          "at": "2025-04-08T10:05:00Z"
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-06-q-corrected",
+          "session": "hc-b-06-session-a",
+          "at": "2025-04-08T10:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "mosaic-bundler",
+              "repository": "mosaic-repository",
+              "worktree": "mosaic-primary",
+              "branch": "main",
+              "session": "hc-b-06-session-a"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2025-04-08T10:20:00Z",
+          "session": "hc-b-06-session-b",
+          "details": {
+            "operation": "Terminate and reap the isolated host daemon and all selected-provider child processes; reopen the same durable fixture profile in a newly spawned process group. Record old and new process start identities and wait for readiness.",
+            "retain": "Canonical history, provider-local durable state and source validity metadata.",
+            "completion": "A logical readiness reset or reused live process does not satisfy this step."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-06-q-restart",
+          "session": "hc-b-06-session-b",
+          "at": "2025-04-08T10:30:00Z",
+          "details": {
+            "request_origin": {
+              "project": "mosaic-bundler",
+              "repository": "mosaic-repository",
+              "worktree": "mosaic-primary",
+              "branch": "main",
+              "session": "hc-b-06-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "replay",
+          "at": "2025-04-08T11:00:00Z",
+          "session": "hc-b-06-session-b",
+          "details": {
+            "source_ids_in_order": [
+              "hc-b-06-publication-r2",
+              "hc-b-06-cache-key-r1",
+              "hc-b-06-publication-r1",
+              "hc-b-06-banner-r1",
+              "hc-b-06-preview-r1",
+              "hc-b-06-publication-r2",
+              "hc-b-06-publication-r1"
+            ],
+            "preserve": "Original source IDs, string revisions, lineage IDs, origins, observation timestamps, validity intervals and idempotency keys. Redelivery time is not source validity time.",
+            "completion": "Use canonical-history replay through the shared host lifecycle surface and wait for durable completion. Repeated IDs must not create duplicate source contributions or promote a superseded revision."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-06-q-replay",
+          "session": "hc-b-06-session-b",
+          "at": "2025-04-08T11:10:00Z",
+          "details": {
+            "request_origin": {
+              "project": "mosaic-bundler",
+              "repository": "mosaic-repository",
+              "worktree": "mosaic-primary",
+              "branch": "main",
+              "session": "hc-b-06-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        },
+        {
+          "action": "recall",
+          "query_id": "hc-b-06-q-history",
+          "session": "hc-b-06-session-b",
+          "at": "2025-04-08T11:15:00Z",
+          "details": {
+            "request_origin": {
+              "project": "mosaic-bundler",
+              "repository": "mosaic-repository",
+              "worktree": "mosaic-primary",
+              "branch": "main",
+              "session": "hc-b-06-session-b"
+            },
+            "authorized_reuse": "Only originating sessions with this exact project, repository, worktree and branch are eligible. Preserve the original source session; the requesting session may differ."
+          }
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-b-06-q-corrected",
+          "text": "Before testing interruption, what is the release publication order, and does bumping the transform version invalidate intermediate cache entries?",
+          "at": "2025-04-08T10:10:00Z",
+          "session": "hc-b-06-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-08T10:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-06-publication-r2",
+            "hc-b-06-cache-key-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-06-publication-r1",
+            "hc-b-06-preview-r1"
+          ],
+          "required_facts": [
+            "Sync and finalize all immutable chunks and sync their parent directory before atomically replacing the published index.",
+            "Keep the old complete release usable until the new index is durable; interruption must not expose an index naming missing chunks.",
+            "The intermediate-cache key is normalized source path plus transform version, so a transform-version change invalidates an entry even with identical bytes and modification time."
+          ],
+          "prohibited_claims": [
+            "Publish the new index before its chunks exist.",
+            "Production readers are expected to tolerate a partially updated release.",
+            "The cache remains valid solely because file bytes and modification time are unchanged.",
+            "A stale replayed observation reverses the publication correction.",
+            "Use the preview worktree policy in the production checkout."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-06-q-restart",
+          "text": "A build dies between producing the assets and announcing the next release. What may readers see, and may we reuse an intermediate made by an older transform if its input file is untouched?",
+          "at": "2025-04-08T10:30:00Z",
+          "session": "hc-b-06-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-08T10:30:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-06-publication-r2",
+            "hc-b-06-cache-key-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-06-publication-r1",
+            "hc-b-06-preview-r1"
+          ],
+          "required_facts": [
+            "Sync and finalize all immutable chunks and sync their parent directory before atomically replacing the published index.",
+            "Keep the old complete release usable until the new index is durable; interruption must not expose an index naming missing chunks.",
+            "The intermediate-cache key is normalized source path plus transform version, so a transform-version change invalidates an entry even with identical bytes and modification time."
+          ],
+          "prohibited_claims": [
+            "Publish the new index before its chunks exist.",
+            "Production readers are expected to tolerate a partially updated release.",
+            "The cache remains valid solely because file bytes and modification time are unchanged.",
+            "A stale replayed observation reverses the publication correction.",
+            "Use the preview worktree policy in the production checkout."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-06-q-replay",
+          "text": "The publication discussion was replayed newest first and then again out of order. What now prevents a reader seeing missing chunks, and what still distinguishes intermediate cache entries?",
+          "at": "2025-04-08T11:10:00Z",
+          "session": "hc-b-06-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-08T11:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-06-publication-r2",
+            "hc-b-06-cache-key-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-06-publication-r1",
+            "hc-b-06-preview-r1"
+          ],
+          "required_facts": [
+            "Sync and finalize all immutable chunks and sync their parent directory before atomically replacing the published index.",
+            "Keep the old complete release usable until the new index is durable; interruption must not expose an index naming missing chunks.",
+            "The intermediate-cache key is normalized source path plus transform version, so a transform-version change invalidates an entry even with identical bytes and modification time."
+          ],
+          "prohibited_claims": [
+            "Publish the new index before its chunks exist.",
+            "Production readers are expected to tolerate a partially updated release.",
+            "The cache remains valid solely because file bytes and modification time are unchanged.",
+            "A stale replayed observation reverses the publication correction.",
+            "Use the preview worktree policy in the production checkout."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-b-06-q-history",
+          "text": "Reconstruct the rules at 09:00 UTC: which came first, index publication or chunk renames, and what identified intermediate cache entries?",
+          "at": "2025-04-08T11:15:00Z",
+          "session": "hc-b-06-session-b",
+          "temporal": {
+            "mode": "as_of",
+            "evaluation_time": "2025-04-08T11:15:00Z",
+            "as_of": "2025-04-08T09:00:00Z",
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-b-06-publication-r1",
+            "hc-b-06-cache-key-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-b-06-publication-r2",
+            "hc-b-06-preview-r1"
+          ],
+          "required_facts": [
+            "At 09:00, revision 1 published the index before renaming chunks and allowed readers to retry temporarily absent chunks.",
+            "The intermediate-cache key was normalized source path plus transform version."
+          ],
+          "prohibited_claims": [
+            "The atomic-release correction was already in force at 09:00.",
+            "The cache key was only file modification time.",
+            "The preview branch is historical authority for the main checkout."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-b-06-q-corrected",
+          "hc-b-06-q-restart",
+          "hc-b-06-q-replay"
+        ],
+        "expected_source_ids": [
+          "hc-b-06-publication-r2",
+          "hc-b-06-cache-key-r1"
+        ],
+        "description": "The corrected publication source and independent cache-key source are both useful before termination and must remain useful after process replacement and replay."
+      },
+      "rubric": [
+        "A real process restart must reopen settled durable state; retain process exit/start evidence.",
+        "Retain correction lineage and original validity boundaries even when the retired revision is the last replayed publication observation.",
+        "Current recalls must deliver corrected publication order and the unaffected cache-key fact.",
+        "Final delivered context may contain each source revision at most once despite duplicate canonical replay.",
+        "As-of 09:00 must recover revision 1 and the unchanged cache-key source, without using revision 2 as historical evidence.",
+        "The current preview policy is wrong scope; the banner formatting source is true but irrelevant.",
+        "Do not erase all earlier history merely to keep the current corrected answer safe."
+      ],
+      "rationale": "The corrected rule changes a transactional publication invariant while a separate cache decision must remain intact. Reverse-order replay ending with the old revision distinguishes durable correction precedence from last-arrival overwrite, and the historical query detects destructive suppression of prior truth."
+    }
+  ]
+}

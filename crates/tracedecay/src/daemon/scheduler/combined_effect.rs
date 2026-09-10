@@ -1220,6 +1220,8 @@ mod tests {
                     project_retrieval: None,
                     project_workflow_index: None,
                     project_lcm: None,
+                    #[cfg(feature = "memory-provider-host")]
+                    provider_control: None,
                     configuration_digest: access.configuration_digest.clone(),
                     invocation_service: Some(invocation_service),
                 },

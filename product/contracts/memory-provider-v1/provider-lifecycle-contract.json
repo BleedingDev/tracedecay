@@ -458,6 +458,15 @@
       "partial",
       "provider_receipt_digest",
       "warnings"
+    ],
+    "common_profile_required_fields": [
+      "history_grant",
+      "resolved_observations"
+    ],
+    "common_profile_response_fields": [
+      "sources_already_applied",
+      "rejected_observations",
+      "effect_unknown_observations"
     ]
   },
   "provider_local_projection": {
@@ -526,5 +535,137 @@
     "tdmem-0805",
     "tdmem-0806",
     "tdmem-1106"
-  ]
+  ],
+  "common_advisory_semantics": {
+    "required_profile": "memory.advisory_common.v1",
+    "target_fields": [
+      "provider_id",
+      "registration_revision",
+      "original_scope",
+      "delivery_scope",
+      "source",
+      "reference"
+    ],
+    "candidate_id_alone_is_target": false,
+    "source_revision_required_for_correction": true,
+    "replacement_preserves_original_observation_and_receipt": true,
+    "replacement_closes_previous_validity_interval": true,
+    "feedback_effect_is_provider_local_and_inspectable": true,
+    "neutral_ignored_may_report_no_change": true,
+    "deletion_fence_precedes_dispatch": true,
+    "offline_deletion_intent_proves_erasure": false,
+    "new_bytes_or_new_key_authorize_resurrection": false,
+    "source_revision_transition_requires_explicit_admission_and_deletion_policy": true,
+    "same_delivery_reports_original_commit_receipt": true,
+    "replay_item_states": [
+      "applied",
+      "delivery_duplicate",
+      "source_already_applied",
+      "rejected",
+      "effect_unknown"
+    ],
+    "restore_live_generation_monotone": true,
+    "restore_may_alias_discarded_public_targets": false,
+    "restore_requires_current_host_disposition_revalidation": true,
+    "unchanged_authoritative_disposition_checkpoint_is_valid": true,
+    "disposition_revision_is_provider_generation": false,
+    "provider_switch_uses_canonical_replay": true,
+    "health_inspection_export_recall_are_reads": true,
+    "pending_privacy_recovery_requires_lifecycle_transition": true,
+    "target_carried_in": "feedback.target_and_correction.target",
+    "source_revision_type": "opaque_string_or_null",
+    "expected_target_revision_type": "nonempty_opaque_string",
+    "target_origin_may_be_unknown_for_retained_provider_control": true,
+    "restore_checkpoint_carried_in": "snapshot_restore.disposition_checkpoint",
+    "replacement_carried_in": "correction.replacement",
+    "content_correction_kinds": [
+      "supersede",
+      "replace_content"
+    ],
+    "content_replacement_shape": "full_admitted_canonical_observation_envelope",
+    "replacement_revision_must_differ_from_target": true,
+    "replacement_transition_time": "replacement.source_identity.original_source.validity.valid_from",
+    "metadata_correction_shapes": {
+      "change_validity": [
+        "valid_from",
+        "valid_until"
+      ],
+      "mark_incorrect": [
+        "revoked_at"
+      ],
+      "restrict_scope": [
+        "exact_scope_identity"
+      ]
+    },
+    "metadata_correction_unadmitted_or_nonrestricting_policy": "reject_invalid_request",
+    "replay_resolved_observations_fields": [
+      "receipt_ref",
+      "observation"
+    ],
+    "replay_receipt_ref_must_belong_to_observation_batch_refs": true,
+    "replay_resolved_observations_host_owned": true,
+    "replay_history_grant_must_cover_every_source": true,
+    "replay_source_order_and_bounds_required": true,
+    "snapshot_payload_fields": [
+      "identity",
+      "bytes",
+      "sources"
+    ],
+    "restore_source_dispositions_fields": [
+      "source",
+      "current_disposition"
+    ],
+    "snapshot_inventory_must_equal_actual_internal_sources": true,
+    "restore_current_effective_disposition_includes_provider_fence": true,
+    "restore_missing_duplicate_or_unknown_disposition_prevents_ready": true,
+    "snapshot_identity_digest_and_length_bind_actual_bytes": true,
+    "snapshot_bytes_and_response_limits_both_apply": true,
+    "source_influence_item_fields": [
+      "target",
+      "source",
+      "active",
+      "disposition",
+      "settled_feedback",
+      "last_feedback_receipt",
+      "provider_local_effect_summary"
+    ],
+    "feedback_effect_summary_cross_provider_comparable": false,
+    "replay_response_counter_fields": [
+      "applied_observations",
+      "duplicate_observations",
+      "sources_already_applied",
+      "rejected_observations",
+      "effect_unknown_observations"
+    ],
+    "replay_response_partition_total": "resolved_observations.length",
+    "delivery_receipt_selector_fields": [
+      "idempotency_key"
+    ],
+    "delivery_receipt_item_fields": [
+      "operation_id",
+      "idempotency_key",
+      "provider_receipt_digest",
+      "stable_memory_ref"
+    ],
+    "delivery_receipt_items_preserve_original_effect_identity": true,
+    "delivery_receipt_missing_original_evidence_policy": "omit_item_report_partial_or_warning",
+    "trace_selector_fields": [
+      "stable_memory_ref"
+    ],
+    "trace_item_fields": [
+      "stable_memory_ref",
+      "content",
+      "content_sha256",
+      "original_source"
+    ],
+    "trace_content_digest": "sha256_exact_emitted_utf8_content",
+    "trace_missing_original_source": "null_without_synthesis",
+    "trace_privacy_withheld_fields": [
+      "content",
+      "content_sha256",
+      "original_source"
+    ],
+    "inspection_existing_outer_limits_apply": true,
+    "inspection_read_projection_may_grant_source_authority": false
+  }
 }

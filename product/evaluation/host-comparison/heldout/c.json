@@ -1,0 +1,2215 @@
+{
+  "schema_version": 1,
+  "case_batch": "c",
+  "cases": [
+    {
+      "id": "hc-c-01",
+      "family": "cancellation",
+      "description": "Cancel a useful debugger-memory recall before provider dispatch, then prove the populated provider remains usable after a real restart.",
+      "sources": [
+        {
+          "id": "hc-c-01-s-columns-r1",
+          "lineage_id": "hc-c-01-lineage-columns",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-01-project",
+            "repository": "hc-c-01-repository",
+            "worktree": "hc-c-01-worktree",
+            "branch": "refs/heads/hc-c-01-fixture",
+            "session": "hc-c-01-session-author"
+          },
+          "observed_at": "2031-05-01T09:00:00Z",
+          "valid_from": "2031-05-01T09:00:00Z",
+          "valid_until": "2031-05-01T09:04:00Z",
+          "content": "The early Ribbon compiler sourcemap prototype counted displayed grapheme clusters for generated columns. That prototype convention applies only before the astral-character compatibility fix at 09:04 UTC."
+        },
+        {
+          "id": "hc-c-01-s-columns-r2",
+          "lineage_id": "hc-c-01-lineage-columns",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-01-project",
+            "repository": "hc-c-01-repository",
+            "worktree": "hc-c-01-worktree",
+            "branch": "refs/heads/hc-c-01-fixture",
+            "session": "hc-c-01-session-author"
+          },
+          "observed_at": "2031-05-01T09:04:00Z",
+          "valid_from": "2031-05-01T09:04:00Z",
+          "valid_until": null,
+          "content": "Ribbon sourcemap generated columns count UTF-16 code units from the start of each generated line. An astral character advances the column by two, and a line break resets it to zero. Counting user-perceived characters places later breakpoints incorrectly."
+        },
+        {
+          "id": "hc-c-01-s-origin-path-r1",
+          "lineage_id": "hc-c-01-lineage-origin-path",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-01-project",
+            "repository": "hc-c-01-repository",
+            "worktree": "hc-c-01-worktree",
+            "branch": "refs/heads/hc-c-01-fixture",
+            "session": "hc-c-01-session-author"
+          },
+          "observed_at": "2031-05-01T09:05:00Z",
+          "valid_from": "2031-05-01T09:05:00Z",
+          "valid_until": null,
+          "content": "Ribbon resolves a relative sourceRoot against the map file URL before resolving a source entry. An absolute source entry bypasses sourceRoot; the process working directory is never the base."
+        },
+        {
+          "id": "hc-c-01-s-progress-r1",
+          "lineage_id": "hc-c-01-lineage-progress",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-01-project",
+            "repository": "hc-c-01-repository",
+            "worktree": "hc-c-01-worktree",
+            "branch": "refs/heads/hc-c-01-fixture",
+            "session": "hc-c-01-session-author"
+          },
+          "observed_at": "2031-05-01T09:06:00Z",
+          "valid_from": "2031-05-01T09:06:00Z",
+          "valid_until": null,
+          "content": "Ribbon compile-progress percentages count completed modules. A module with more generated lines still contributes one unit to that display."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-01T09:00:00Z",
+          "source_id": "hc-c-01-s-columns-r1",
+          "source_revision": "1",
+          "session": "hc-c-01-session-author",
+          "details": {
+            "observation_id": "hc-c-01-s-columns-r1-observation",
+            "idempotency_key": "hc-c-01-s-columns-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-01-session-reader",
+              "hc-c-01-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-01T09:04:00Z",
+          "source_id": "hc-c-01-s-columns-r2",
+          "source_revision": "2",
+          "session": "hc-c-01-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-01-s-columns-r1",
+            "replacement_source_id": "hc-c-01-s-columns-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-01T09:04:00Z",
+            "operation_id": "hc-c-01-correct-2",
+            "idempotency_key": "hc-c-01-correct-2-original",
+            "wait_for": "durable correction settlement"
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-01T09:05:00Z",
+          "source_id": "hc-c-01-s-origin-path-r1",
+          "source_revision": "1",
+          "session": "hc-c-01-session-author",
+          "details": {
+            "observation_id": "hc-c-01-s-origin-path-r1-observation",
+            "idempotency_key": "hc-c-01-s-origin-path-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-01-session-reader",
+              "hc-c-01-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-01T09:06:00Z",
+          "source_id": "hc-c-01-s-progress-r1",
+          "source_revision": "1",
+          "session": "hc-c-01-session-author",
+          "details": {
+            "observation_id": "hc-c-01-s-progress-r1-observation",
+            "idempotency_key": "hc-c-01-s-progress-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-01-session-reader",
+              "hc-c-01-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-01T09:10:00Z",
+          "query_id": "hc-c-01-q-positive",
+          "session": "hc-c-01-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-01-s-columns-r2",
+              "hc-c-01-s-origin-path-r1"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-01T09:11:00Z",
+          "query_id": "hc-c-01-q-cancelled",
+          "session": "hc-c-01-session-reader",
+          "details": {
+            "operation_id": "hc-c-01-recall-pending",
+            "execution": "start without awaiting terminal; return control only when the shared host pre-dispatch barrier is acknowledged",
+            "barrier": "request admitted and queued; selected-provider invocation has not begun",
+            "release": "only after cancellation is observed",
+            "fixed_sleep_ms": null
+          }
+        },
+        {
+          "action": "cancel",
+          "at": "2031-05-01T09:11:01Z",
+          "query_id": "hc-c-01-q-cancelled",
+          "session": "hc-c-01-session-reader",
+          "details": {
+            "target_operation_id": "hc-c-01-recall-pending",
+            "trigger": "observed pre-dispatch barrier before any provider call",
+            "expected_terminal": "cancelled",
+            "expected_provider_contacted": false,
+            "expected_durable_effects": 0,
+            "require": [
+              "retain caller cancellation terminal",
+              "release queued request and owned permits within the existing cancellation envelope",
+              "deliver no advisory bytes from this operation"
+            ],
+            "if_boundary_unavailable": "incomplete; do not substitute a fixed delay"
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-01T09:12:00Z",
+          "session": "hc-c-01-session-recovery",
+          "details": {
+            "mode": "actual selected-provider process or owner close and reopen",
+            "wait_for": "owned children reaped and same durable provider state ready"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-01T09:13:00Z",
+          "query_id": "hc-c-01-q-recovered",
+          "session": "hc-c-01-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-01-q-positive",
+          "text": "A breakpoint drifts after an emoji, and opening a relative source depends on where the build command ran. Which two coordinate rules should the debugger integration use?",
+          "at": "2031-05-01T09:10:00Z",
+          "session": "hc-c-01-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-01T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-01-s-columns-r2",
+            "hc-c-01-s-origin-path-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-01-s-columns-r1"
+          ],
+          "required_facts": [
+            "Generated columns use UTF-16 code units: an astral character occupies two units, and a line break resets the column.",
+            "Resolve sourceRoot relative to the map URL, then the source entry; absolute entries bypass sourceRoot."
+          ],
+          "prohibited_claims": [
+            "Current columns count grapheme clusters.",
+            "Relative sources are anchored to the launch directory."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-01-q-cancelled",
+          "text": "Before changing the debugger adapter, recover the rule for positions after a supplementary-plane character and for locating originals from a portable build artifact.",
+          "at": "2031-05-01T09:11:00Z",
+          "session": "hc-c-01-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-01T09:11:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [],
+          "forbidden_source_ids": [
+            "hc-c-01-s-columns-r1",
+            "hc-c-01-s-columns-r2",
+            "hc-c-01-s-origin-path-r1",
+            "hc-c-01-s-progress-r1"
+          ],
+          "required_facts": [],
+          "prohibited_claims": [
+            "The cancelled recall completed successfully.",
+            "The cancelled recall delivered sourcemap guidance."
+          ],
+          "expected_terminal": "cancelled"
+        },
+        {
+          "id": "hc-c-01-q-recovered",
+          "text": "The interrupted request is gone. What makes generated offsets and original-file lookup independent of visual character width and launch directory?",
+          "at": "2031-05-01T09:13:00Z",
+          "session": "hc-c-01-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-01T09:13:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-01-s-columns-r2",
+            "hc-c-01-s-origin-path-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-01-s-columns-r1"
+          ],
+          "required_facts": [
+            "Generated columns count UTF-16 code units with two for an astral character and reset on each line.",
+            "The map URL anchors relative sourceRoot resolution; absolute source entries bypass sourceRoot."
+          ],
+          "prohibited_claims": [
+            "The cancelled request supplied this answer.",
+            "Use displayed character count or the launch directory as the coordinate base."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-01-q-positive",
+          "hc-c-01-q-recovered"
+        ],
+        "expected_source_ids": [
+          "hc-c-01-s-columns-r2",
+          "hc-c-01-s-origin-path-r1"
+        ],
+        "description": "Deliver both rules before cancellation and after real reopening. The untouched origin-path source is the live recovery control."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "Arm cancellation only after the positive query is verified. The cancelled request must have no provider dispatch, no delivered advisory candidates and an explicit cancelled terminal.",
+        "Retain evidence for the acknowledged barrier, signal, terminal and released resources. A fast success or a deadline expiry is not the requested cancellation.",
+        "The recovery recall is a new operation against the reopened provider; prior successful context cannot be reused as its result."
+      ],
+      "rationale": "This cancels a known useful populated debugger recall at an exact host boundary. UTF-16 positions and map-relative URL resolution require distinct facts; module progress is a true distraction, and grapheme counting is a plausible superseded answer."
+    },
+    {
+      "id": "hc-c-02",
+      "family": "cancellation",
+      "description": "Cancel an OBJ corner-welding correction after durable commit but before acknowledgement, reconcile the exact operation, and retain its single effect across restart.",
+      "sources": [
+        {
+          "id": "hc-c-02-s-weld-r1",
+          "lineage_id": "hc-c-02-lineage-weld",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-02-project",
+            "repository": "hc-c-02-repository",
+            "worktree": "hc-c-02-worktree",
+            "branch": "refs/heads/hc-c-02-fixture",
+            "session": "hc-c-02-session-author"
+          },
+          "observed_at": "2031-05-02T09:00:00Z",
+          "valid_from": "2031-05-02T09:00:00Z",
+          "valid_until": "2031-05-02T09:20:00Z",
+          "content": "The first Facet OBJ exporter welds corners using only the position index. This is the accepted prototype rule before the seam-preservation correction at 09:20 UTC."
+        },
+        {
+          "id": "hc-c-02-s-weld-r2",
+          "lineage_id": "hc-c-02-lineage-weld",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-02-project",
+            "repository": "hc-c-02-repository",
+            "worktree": "hc-c-02-worktree",
+            "branch": "refs/heads/hc-c-02-fixture",
+            "session": "hc-c-02-session-author"
+          },
+          "observed_at": "2031-05-02T09:20:00Z",
+          "valid_from": "2031-05-02T09:20:00Z",
+          "valid_until": null,
+          "content": "Facet now keys a welded corner by the tuple of position index, texture-coordinate index and smoothing group. Equal positions with different texture coordinates or smoothing groups remain separate, preserving texture seams and hard edges."
+        },
+        {
+          "id": "hc-c-02-s-relative-index-r1",
+          "lineage_id": "hc-c-02-lineage-relative-index",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-02-project",
+            "repository": "hc-c-02-repository",
+            "worktree": "hc-c-02-worktree",
+            "branch": "refs/heads/hc-c-02-fixture",
+            "session": "hc-c-02-session-author"
+          },
+          "observed_at": "2031-05-02T09:02:00Z",
+          "valid_from": "2031-05-02T09:02:00Z",
+          "valid_until": null,
+          "content": "Facet resolves a negative OBJ index against the corresponding attribute array length at the face statement. A vertex appended later in the file cannot change the meaning of an earlier negative index."
+        },
+        {
+          "id": "hc-c-02-s-meter-r1",
+          "lineage_id": "hc-c-02-lineage-meter",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-02-project",
+            "repository": "hc-c-02-repository",
+            "worktree": "hc-c-02-worktree",
+            "branch": "refs/heads/hc-c-02-fixture",
+            "session": "hc-c-02-session-author"
+          },
+          "observed_at": "2031-05-02T09:03:00Z",
+          "valid_from": "2031-05-02T09:03:00Z",
+          "valid_until": null,
+          "content": "Facet export progress counts faces written. The number of resulting welded corners does not affect its progress denominator."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-02T09:00:00Z",
+          "source_id": "hc-c-02-s-weld-r1",
+          "source_revision": "1",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "observation_id": "hc-c-02-s-weld-r1-observation",
+            "idempotency_key": "hc-c-02-s-weld-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-02-session-reader",
+              "hc-c-02-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-02T09:02:00Z",
+          "source_id": "hc-c-02-s-relative-index-r1",
+          "source_revision": "1",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "observation_id": "hc-c-02-s-relative-index-r1-observation",
+            "idempotency_key": "hc-c-02-s-relative-index-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-02-session-reader",
+              "hc-c-02-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-02T09:03:00Z",
+          "source_id": "hc-c-02-s-meter-r1",
+          "source_revision": "1",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "observation_id": "hc-c-02-s-meter-r1-observation",
+            "idempotency_key": "hc-c-02-s-meter-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-02-session-reader",
+              "hc-c-02-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-02T09:10:00Z",
+          "query_id": "hc-c-02-q-positive",
+          "session": "hc-c-02-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-02-s-weld-r1",
+              "hc-c-02-s-relative-index-r1"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-02T09:20:00Z",
+          "source_id": "hc-c-02-s-weld-r2",
+          "source_revision": "2",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-02-s-weld-r1",
+            "replacement_source_id": "hc-c-02-s-weld-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-02T09:20:00Z",
+            "operation_id": "hc-c-02-correct-2",
+            "idempotency_key": "hc-c-02-correct-2-original",
+            "wait_for": "acknowledged barrier after durable correction transaction and before any caller response bytes",
+            "execution": "start without awaiting terminal and park at the durable-commit boundary",
+            "barrier_id": "hc-c-02-commit-before-ack",
+            "fixed_sleep_ms": null
+          }
+        },
+        {
+          "action": "cancel",
+          "at": "2031-05-02T09:20:01Z",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "target_operation_id": "hc-c-02-correct-2",
+            "trigger": "hc-c-02-commit-before-ack observed while the response is withheld",
+            "expected_terminal": "cancelled",
+            "caller_effect_status": "unknown until reconciliation",
+            "boundary_observer_expectation": "revision 2 committed exactly once",
+            "require": [
+              "do not convert the cancelled caller operation to success",
+              "do not assert rollback from a lost acknowledgement",
+              "retain original operation id and request payload",
+              "release resources within the existing cancellation envelope"
+            ],
+            "if_boundary_unavailable": "incomplete; no fixed-delay substitution"
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-02T09:22:00Z",
+          "session": "hc-c-02-session-recovery",
+          "details": {
+            "mode": "real selected-provider close and reopen using the same durable state",
+            "wait_for": "owned work stopped and provider ready; no blind mutation retry"
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-02T09:23:00Z",
+          "source_id": "hc-c-02-s-weld-r2",
+          "source_revision": "2",
+          "session": "hc-c-02-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-02-s-weld-r1",
+            "replacement_source_id": "hc-c-02-s-weld-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-02T09:20:00Z",
+            "operation_id": "hc-c-02-correct-2",
+            "idempotency_key": "hc-c-02-correct-2-original",
+            "wait_for": "verified original commit identity and exactly one current revision",
+            "reconcile_operation_id": "hc-c-02-correct-2",
+            "same_request_payload_as": "hc-c-02-correct-2",
+            "original_operation_at": "2031-05-02T09:20:00Z",
+            "expected_effect": "return the original durable correction receipt without a second mutation",
+            "expected_new_effects": 0
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-02T09:24:00Z",
+          "query_id": "hc-c-02-q-reconciled",
+          "session": "hc-c-02-session-recovery"
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-02T09:25:00Z",
+          "session": "hc-c-02-session-recovery",
+          "details": {
+            "mode": "real reopen of reconciled provider state",
+            "wait_for": "provider ready"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-02T09:26:00Z",
+          "query_id": "hc-c-02-q-stable",
+          "session": "hc-c-02-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-02-q-positive",
+          "text": "Before the planned seam fix, what does the exporter use to merge corners, and when is a backwards-looking face reference anchored?",
+          "at": "2031-05-02T09:10:00Z",
+          "session": "hc-c-02-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-02T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-02-s-weld-r1",
+            "hc-c-02-s-relative-index-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "Before the correction, corner welding uses only position index.",
+            "Resolve a negative face index against the attribute array length at that face statement."
+          ],
+          "prohibited_claims": [
+            "Negative indices are resolved after reading the entire file."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-02-q-reconciled",
+          "text": "The caller lost the seam-fix acknowledgement. After resolving that uncertain write, how should coincident corners stay distinct, and can later vertices alter an earlier relative face reference?",
+          "at": "2031-05-02T09:24:00Z",
+          "session": "hc-c-02-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-02T09:24:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-02-s-weld-r2",
+            "hc-c-02-s-relative-index-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-02-s-weld-r1"
+          ],
+          "required_facts": [
+            "Corner identity is the tuple of position index, texture-coordinate index and smoothing group.",
+            "Negative indices use the array length at their face statement; later vertices do not change them."
+          ],
+          "prohibited_claims": [
+            "Cancellation rolled back the committed seam correction.",
+            "Welding still uses position index alone.",
+            "The same correction committed twice."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-02-q-stable",
+          "text": "After reopening once more, recover the seam-preserving corner identity and the anchor for negative face references.",
+          "at": "2031-05-02T09:26:00Z",
+          "session": "hc-c-02-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-02T09:26:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-02-s-weld-r2",
+            "hc-c-02-s-relative-index-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-02-s-weld-r1"
+          ],
+          "required_facts": [
+            "Keep corners separate if texture-coordinate index or smoothing group differs despite matching position.",
+            "Negative indices are relative to the array length when the face appears."
+          ],
+          "prohibited_claims": [
+            "The position-only rule became current again after restart.",
+            "A cancelled acknowledgement proves the correction had no durable effect."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-02-q-positive",
+          "hc-c-02-q-reconciled",
+          "hc-c-02-q-stable"
+        ],
+        "expected_source_ids": [
+          "hc-c-02-s-weld-r1",
+          "hc-c-02-s-weld-r2",
+          "hc-c-02-s-relative-index-r1"
+        ],
+        "description": "Verify the original welding rule and the unaffected negative-index rule before correction. After reconciliation and another reopen, deliver the replacement and that same independent control."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "Cancel after durable correction commit and before acknowledgement. The caller terminal is cancelled with unresolved effect until reconciliation; the observer and retained receipt must prove what actually committed.",
+        "Reconcile using the original operation identity, idempotency key and unchanged request payload. A fresh correction key, assumed rollback or automatic fresh retry fails effect accounting.",
+        "Revision 1 remains historical with closed validity. Current recall must deliver revision 2 for that lineage, with no duplicate current revision or second derived mutation."
+      ],
+      "rationale": "This is loss of a committed correction acknowledgement, not cancellation between observation-batch items. Useful truth changes at a known durable boundary, while an independent parser rule proves recovery without relying on the uncertain write."
+    },
+    {
+      "id": "hc-c-03",
+      "family": "corruption",
+      "description": "Damage persisted provider-state framing after proving useful migration guidance, require visible quarantine on reopen, and recover from unchanged canonical observations.",
+      "sources": [
+        {
+          "id": "hc-c-03-s-migration-order-r1",
+          "lineage_id": "hc-c-03-lineage-migration-order",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-03-project",
+            "repository": "hc-c-03-repository",
+            "worktree": "hc-c-03-worktree",
+            "branch": "refs/heads/hc-c-03-fixture",
+            "session": "hc-c-03-session-author"
+          },
+          "observed_at": "2031-05-03T09:00:00Z",
+          "valid_from": "2031-05-03T09:00:00Z",
+          "valid_until": "2031-05-03T09:05:00Z",
+          "content": "The first Cairn schema migration planner sorted all migrations by file modification time. That prototype ordering is superseded at 09:05 UTC."
+        },
+        {
+          "id": "hc-c-03-s-migration-order-r2",
+          "lineage_id": "hc-c-03-lineage-migration-order",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-03-project",
+            "repository": "hc-c-03-repository",
+            "worktree": "hc-c-03-worktree",
+            "branch": "refs/heads/hc-c-03-fixture",
+            "session": "hc-c-03-session-author"
+          },
+          "observed_at": "2031-05-03T09:05:00Z",
+          "valid_from": "2031-05-03T09:05:00Z",
+          "valid_until": null,
+          "content": "Cairn orders migrations by prerequisite edges. Only migrations with satisfied prerequisites enter the ready frontier; ascending migration slug breaks ties within that frontier. Rollback reverses this dependency order, never file modification time."
+        },
+        {
+          "id": "hc-c-03-s-quoted-name-r1",
+          "lineage_id": "hc-c-03-lineage-quoted-name",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-03-project",
+            "repository": "hc-c-03-repository",
+            "worktree": "hc-c-03-worktree",
+            "branch": "refs/heads/hc-c-03-fixture",
+            "session": "hc-c-03-session-author"
+          },
+          "observed_at": "2031-05-03T09:06:00Z",
+          "valid_from": "2031-05-03T09:06:00Z",
+          "valid_until": null,
+          "content": "Cairn statement splitting ignores semicolons inside quoted SQL identifiers. A doubled double quote remains part of the same quoted identifier instead of ending it."
+        },
+        {
+          "id": "hc-c-03-s-list-layout-r1",
+          "lineage_id": "hc-c-03-lineage-list-layout",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-03-project",
+            "repository": "hc-c-03-repository",
+            "worktree": "hc-c-03-worktree",
+            "branch": "refs/heads/hc-c-03-fixture",
+            "session": "hc-c-03-session-author"
+          },
+          "observed_at": "2031-05-03T09:07:00Z",
+          "valid_from": "2031-05-03T09:07:00Z",
+          "valid_until": null,
+          "content": "Cairn lists applied migrations newest-first in its terminal history display. Display ordering is independent of the execution planner."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-03T09:00:00Z",
+          "source_id": "hc-c-03-s-migration-order-r1",
+          "source_revision": "1",
+          "session": "hc-c-03-session-author",
+          "details": {
+            "observation_id": "hc-c-03-s-migration-order-r1-observation",
+            "idempotency_key": "hc-c-03-s-migration-order-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-03-session-reader",
+              "hc-c-03-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-03T09:05:00Z",
+          "source_id": "hc-c-03-s-migration-order-r2",
+          "source_revision": "2",
+          "session": "hc-c-03-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-03-s-migration-order-r1",
+            "replacement_source_id": "hc-c-03-s-migration-order-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-03T09:05:00Z",
+            "operation_id": "hc-c-03-correct-2",
+            "idempotency_key": "hc-c-03-correct-2-original",
+            "wait_for": "durable correction settlement"
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-03T09:06:00Z",
+          "source_id": "hc-c-03-s-quoted-name-r1",
+          "source_revision": "1",
+          "session": "hc-c-03-session-author",
+          "details": {
+            "observation_id": "hc-c-03-s-quoted-name-r1-observation",
+            "idempotency_key": "hc-c-03-s-quoted-name-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-03-session-reader",
+              "hc-c-03-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-03T09:07:00Z",
+          "source_id": "hc-c-03-s-list-layout-r1",
+          "source_revision": "1",
+          "session": "hc-c-03-session-author",
+          "details": {
+            "observation_id": "hc-c-03-s-list-layout-r1-observation",
+            "idempotency_key": "hc-c-03-s-list-layout-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-03-session-reader",
+              "hc-c-03-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-03T09:10:00Z",
+          "query_id": "hc-c-03-q-positive",
+          "session": "hc-c-03-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-03-s-migration-order-r2",
+              "hc-c-03-s-quoted-name-r1"
+            ]
+          }
+        },
+        {
+          "action": "corrupt_state",
+          "at": "2031-05-03T09:15:00Z",
+          "source_id": "hc-c-03-s-migration-order-r2",
+          "source_revision": "2",
+          "session": "hc-c-03-session-author",
+          "details": {
+            "fault_id": "hc-c-03-truncated-state-header",
+            "target": "isolated selected-provider durable state after a clean owned-process stop",
+            "mutation": "truncate mandatory persisted state framing or catalog header so reopening cannot validate previously committed state",
+            "logical_fault": "previously readable committed state becomes structurally invalid",
+            "require_evidence": [
+              "target state contained the positively recalled lineage",
+              "actual pre-fault and post-fault artifact digests and truncation boundary",
+              "canonical source bytes and deletion authority remain unchanged"
+            ],
+            "provider_specific_mapping": "review and freeze the shared fault-control mapping for each format before execution; preserve identical logical fault",
+            "automatic_repair": false
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-03T09:16:00Z",
+          "session": "hc-c-03-session-recovery",
+          "details": {
+            "mode": "real reopen of the deliberately damaged state",
+            "expected_readiness": "unavailable or quarantined with typed integrity cause",
+            "repair_permitted": false
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-03T09:17:00Z",
+          "query_id": "hc-c-03-q-quarantined",
+          "session": "hc-c-03-session-recovery"
+        },
+        {
+          "action": "replay",
+          "at": "2031-05-03T09:19:00Z",
+          "session": "hc-c-03-session-recovery",
+          "details": {
+            "mode": "explicit recovery: quarantine damaged provider-local artifact, create clean isolated state and replay authoritative canonical history into the same provider",
+            "source_ids": [
+              "hc-c-03-s-migration-order-r1",
+              "hc-c-03-s-migration-order-r2",
+              "hc-c-03-s-quoted-name-r1",
+              "hc-c-03-s-list-layout-r1"
+            ],
+            "preserve": [
+              "observation identities and original keys",
+              "correction lineage and validity intervals",
+              "origin scope and session",
+              "deletion fences"
+            ],
+            "wait_for": "durable replay completion and validated readiness",
+            "require": "retain actual quarantined-artifact and recovery evidence; no synthetic successful reset"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-03T09:20:00Z",
+          "query_id": "hc-c-03-q-rebuilt",
+          "session": "hc-c-03-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-03-q-positive",
+          "text": "Restored files have misleading dates and a quoted table name contains a separator. How should the runner choose its next schema change and avoid splitting that identifier?",
+          "at": "2031-05-03T09:10:00Z",
+          "session": "hc-c-03-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-03T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-03-s-migration-order-r2",
+            "hc-c-03-s-quoted-name-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-03-s-migration-order-r1"
+          ],
+          "required_facts": [
+            "Choose only migrations with satisfied prerequisites; break ready-frontier ties by ascending slug.",
+            "Ignore semicolons inside quoted identifiers and keep a doubled quote within the identifier."
+          ],
+          "prohibited_claims": [
+            "File modification time determines execution order.",
+            "Terminal history display order determines execution order."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-03-q-quarantined",
+          "text": "Recover the rules for scheduling dependent schema changes and parsing a delimiter inside a quoted table name.",
+          "at": "2031-05-03T09:17:00Z",
+          "session": "hc-c-03-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-03T09:17:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [],
+          "forbidden_source_ids": [
+            "hc-c-03-s-migration-order-r1",
+            "hc-c-03-s-migration-order-r2",
+            "hc-c-03-s-quoted-name-r1",
+            "hc-c-03-s-list-layout-r1"
+          ],
+          "required_facts": [],
+          "prohibited_claims": [
+            "The damaged provider state is healthy.",
+            "A normal empty success proves no matching memory exists.",
+            "Guidance from the damaged state is safe to deliver."
+          ],
+          "expected_terminal": "provider_unavailable"
+        },
+        {
+          "id": "hc-c-03-q-rebuilt",
+          "text": "After the explicit rebuild, what stops a dependent migration running too early, and what keeps punctuation inside a quoted identifier from ending a statement?",
+          "at": "2031-05-03T09:20:00Z",
+          "session": "hc-c-03-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-03T09:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-03-s-migration-order-r2",
+            "hc-c-03-s-quoted-name-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-03-s-migration-order-r1"
+          ],
+          "required_facts": [
+            "Prerequisite satisfaction controls eligibility; ascending slug orders only the ready frontier.",
+            "Quoted-identifier semicolons do not split statements, and doubled double quotes do not close the identifier."
+          ],
+          "prohibited_claims": [
+            "Repaired file timestamps determine dependency ordering.",
+            "An empty provider reset is successful recovery."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-03-q-positive",
+          "hc-c-03-q-rebuilt"
+        ],
+        "expected_source_ids": [
+          "hc-c-03-s-migration-order-r2",
+          "hc-c-03-s-quoted-name-r1"
+        ],
+        "description": "Deliver migration ordering and the independent SQL parser rule before damage and after canonical recovery. No source may be delivered from the invalid reopened provider state."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "The unavailable terminal must expose integrity or quarantine cause in retained provider/admission evidence. A silently empty success, implicit reset or hidden provider switch fails.",
+        "Forbid every source from the damaged provider state even if its canonical text is still true. Independently available canonical content remains separate and unchanged.",
+        "Recovery requires an explicit bounded lifecycle action followed by new nonempty recall. The untouched canonical SQL parser source must become useful again."
+      ],
+      "rationale": "This pairs dependency-frontier scheduling with quoted-identifier parsing, using display order and file timestamps as distinct distractors. A demonstrated populated store is damaged and rebuilt with exact correction history, making detection and substantive recovery independently observable."
+    },
+    {
+      "id": "hc-c-04",
+      "family": "corruption",
+      "description": "Introduce a readable but false binding between a linker-memory payload and its retained source identity, then require quarantine and verified provenance after recovery.",
+      "sources": [
+        {
+          "id": "hc-c-04-s-section-identity-r1",
+          "lineage_id": "hc-c-04-lineage-section-identity",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-04-project",
+            "repository": "hc-c-04-repository",
+            "worktree": "hc-c-04-worktree",
+            "branch": "refs/heads/hc-c-04-fixture",
+            "session": "hc-c-04-session-author"
+          },
+          "observed_at": "2031-05-04T09:00:00Z",
+          "valid_from": "2031-05-04T09:00:00Z",
+          "valid_until": "2031-05-04T09:05:00Z",
+          "content": "The early Quarry incremental linker treated section name as section identity across object files. That shortcut is superseded at 09:05 UTC."
+        },
+        {
+          "id": "hc-c-04-s-section-identity-r2",
+          "lineage_id": "hc-c-04-lineage-section-identity",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-04-project",
+            "repository": "hc-c-04-repository",
+            "worktree": "hc-c-04-worktree",
+            "branch": "refs/heads/hc-c-04-fixture",
+            "session": "hc-c-04-session-author"
+          },
+          "observed_at": "2031-05-04T09:05:00Z",
+          "valid_from": "2031-05-04T09:05:00Z",
+          "valid_until": null,
+          "content": "Quarry identifies an input section by object build identity together with section ordinal. Two sections named .rodata in different objects remain distinct; matching names do not authorize merging relocation owners."
+        },
+        {
+          "id": "hc-c-04-s-addends-r1",
+          "lineage_id": "hc-c-04-lineage-addends",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-04-project",
+            "repository": "hc-c-04-repository",
+            "worktree": "hc-c-04-worktree",
+            "branch": "refs/heads/hc-c-04-fixture",
+            "session": "hc-c-04-session-author"
+          },
+          "observed_at": "2031-05-04T09:06:00Z",
+          "valid_from": "2031-05-04T09:06:00Z",
+          "valid_until": null,
+          "content": "Quarry preserves each relocation addend until final section placement. The output address is formed from the final symbol address plus that retained addend, not from an earlier provisional layout."
+        },
+        {
+          "id": "hc-c-04-s-report-r1",
+          "lineage_id": "hc-c-04-lineage-report",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-04-project",
+            "repository": "hc-c-04-repository",
+            "worktree": "hc-c-04-worktree",
+            "branch": "refs/heads/hc-c-04-fixture",
+            "session": "hc-c-04-session-author"
+          },
+          "observed_at": "2031-05-04T09:07:00Z",
+          "valid_from": "2031-05-04T09:07:00Z",
+          "valid_until": null,
+          "content": "Quarry groups section names alphabetically in its size report. Report grouping does not define section identity or relocation ownership."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-04T09:00:00Z",
+          "source_id": "hc-c-04-s-section-identity-r1",
+          "source_revision": "1",
+          "session": "hc-c-04-session-author",
+          "details": {
+            "observation_id": "hc-c-04-s-section-identity-r1-observation",
+            "idempotency_key": "hc-c-04-s-section-identity-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-04-session-reader",
+              "hc-c-04-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-04T09:05:00Z",
+          "source_id": "hc-c-04-s-section-identity-r2",
+          "source_revision": "2",
+          "session": "hc-c-04-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-04-s-section-identity-r1",
+            "replacement_source_id": "hc-c-04-s-section-identity-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-04T09:05:00Z",
+            "operation_id": "hc-c-04-correct-2",
+            "idempotency_key": "hc-c-04-correct-2-original",
+            "wait_for": "durable correction settlement"
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-04T09:06:00Z",
+          "source_id": "hc-c-04-s-addends-r1",
+          "source_revision": "1",
+          "session": "hc-c-04-session-author",
+          "details": {
+            "observation_id": "hc-c-04-s-addends-r1-observation",
+            "idempotency_key": "hc-c-04-s-addends-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-04-session-reader",
+              "hc-c-04-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-04T09:07:00Z",
+          "source_id": "hc-c-04-s-report-r1",
+          "source_revision": "1",
+          "session": "hc-c-04-session-author",
+          "details": {
+            "observation_id": "hc-c-04-s-report-r1-observation",
+            "idempotency_key": "hc-c-04-s-report-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-04-session-reader",
+              "hc-c-04-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-04T09:10:00Z",
+          "query_id": "hc-c-04-q-positive",
+          "session": "hc-c-04-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-04-s-section-identity-r2",
+              "hc-c-04-s-addends-r1"
+            ]
+          }
+        },
+        {
+          "action": "corrupt_state",
+          "at": "2031-05-04T09:15:00Z",
+          "source_id": "hc-c-04-s-section-identity-r2",
+          "source_revision": "2",
+          "session": "hc-c-04-session-author",
+          "details": {
+            "fault_id": "hc-c-04-readable-binding-mismatch",
+            "target": "isolated durable payload/source association for the positively recalled section-identity revision",
+            "mutation": "after clean owned-process stop replace provider-retained payload body with the forged body while retaining original canonical source id, revision and payload digest; keep storage framing valid",
+            "forged_body": "Quarry can merge relocation ownership for all input sections sharing a name. A provisional layout is sufficient to consume and discard relocation addends.",
+            "logical_fault": "retained body contradicts the unchanged canonical payload digest and evidence binding",
+            "require_evidence": [
+              "canonical source retains original exact bytes",
+              "provider really reopens the mutated artifact",
+              "body-to-source binding mismatch is visible to integrity or admission checks"
+            ],
+            "provider_specific_mapping": "review each storage-format mapping before execution; never fabricate a provider reply or edit canonical truth",
+            "automatic_repair": false
+          }
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-04T09:16:00Z",
+          "session": "hc-c-04-session-recovery",
+          "details": {
+            "mode": "real reopen of structurally readable but semantically corrupt state",
+            "expected_readiness": "quarantine on invalid source binding before usable advisory delivery",
+            "repair_permitted": false
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-04T09:17:00Z",
+          "query_id": "hc-c-04-q-binding-fault",
+          "session": "hc-c-04-session-recovery"
+        },
+        {
+          "action": "replay",
+          "at": "2031-05-04T09:19:00Z",
+          "session": "hc-c-04-session-recovery",
+          "details": {
+            "mode": "explicit quarantine and same-provider reconstruction from canonical observations",
+            "source_ids": [
+              "hc-c-04-s-section-identity-r1",
+              "hc-c-04-s-section-identity-r2",
+              "hc-c-04-s-addends-r1",
+              "hc-c-04-s-report-r1"
+            ],
+            "exclude": "all forged provider-local bytes and derived state influenced by them",
+            "preserve": [
+              "canonical observation identities",
+              "source revision and correction lineage",
+              "validity evidence",
+              "deletion authority"
+            ],
+            "wait_for": "verified bindings and durable ready state"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-04T09:20:00Z",
+          "query_id": "hc-c-04-q-rebound",
+          "session": "hc-c-04-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-04-q-positive",
+          "text": "Two object files each contribute a read-only data section. What keeps their fixups attached to the right input, and which offset must survive layout changes?",
+          "at": "2031-05-04T09:10:00Z",
+          "session": "hc-c-04-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-04T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-04-s-section-identity-r2",
+            "hc-c-04-s-addends-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-04-s-section-identity-r1"
+          ],
+          "required_facts": [
+            "Input section identity combines object build identity and section ordinal; matching names from different objects remain distinct.",
+            "Retain relocation addends until final placement and combine them with final symbol addresses."
+          ],
+          "prohibited_claims": [
+            "Matching names authorize merging relocation owners.",
+            "Resolve addends permanently against provisional placement."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-04-q-binding-fault",
+          "text": "What prevents equal section labels from confusing patch locations after the binary layout moves?",
+          "at": "2031-05-04T09:17:00Z",
+          "session": "hc-c-04-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-04T09:17:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [],
+          "forbidden_source_ids": [
+            "hc-c-04-s-section-identity-r1",
+            "hc-c-04-s-section-identity-r2",
+            "hc-c-04-s-addends-r1",
+            "hc-c-04-s-report-r1"
+          ],
+          "required_facts": [],
+          "prohibited_claims": [
+            "Matching section names across objects imply shared relocation ownership.",
+            "Discarding addends after provisional layout is safe.",
+            "Readable provider storage proves its source bindings are valid."
+          ],
+          "expected_terminal": "provider_unavailable"
+        },
+        {
+          "id": "hc-c-04-q-rebound",
+          "text": "After rebuilding trustworthy bindings, how do we distinguish input sections and compute final fixup values?",
+          "at": "2031-05-04T09:20:00Z",
+          "session": "hc-c-04-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-04T09:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-04-s-section-identity-r2",
+            "hc-c-04-s-addends-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-04-s-section-identity-r1"
+          ],
+          "required_facts": [
+            "Identify input sections by object build identity and section ordinal.",
+            "Use final symbol address plus the preserved relocation addend."
+          ],
+          "prohibited_claims": [
+            "Section name alone identifies an input section.",
+            "The corrupt binding was canonically approved."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-04-q-positive",
+          "hc-c-04-q-rebound"
+        ],
+        "expected_source_ids": [
+          "hc-c-04-s-section-identity-r2",
+          "hc-c-04-s-addends-r1"
+        ],
+        "description": "Deliver section identity and the independent addend rule before damage and after recovery, with exact original provenance. The addend source itself is never edited."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "Readable storage does not establish evidence integrity. A body/digest/source binding mismatch must make the selected provider unavailable or quarantined before corrupt-state candidates reach final advisory context.",
+        "The forged body is fault-injection material, never a canonically observed source or an asserted provider result. Missing evidence of actual injection and rejection makes the safety check indeterminate.",
+        "Recovery must eliminate forged payloads and their derived influence, then resolve original source digests and revisions for delivered guidance. The independently preserved addend source supplies the live control."
+      ],
+      "rationale": "Unlike a truncated store, this state parses but falsely attributes a payload to a valid linker source. The paraphrase asks about fixup ownership; the forged answer combines a plausible superseded identity rule with destruction of an independent retained addend."
+    },
+    {
+      "id": "hc-c-05",
+      "family": "privacy_deletion",
+      "description": "Delete both revisions of invented paired-read calibration, restore a pre-deletion provider snapshot, and challenge the lineage fence with fresh-key replay.",
+      "sources": [
+        {
+          "id": "hc-c-05-s-calibration-r1",
+          "lineage_id": "hc-c-05-lineage-calibration",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-05-project",
+            "repository": "hc-c-05-repository",
+            "worktree": "hc-c-05-worktree",
+            "branch": "refs/heads/hc-c-05-fixture",
+            "session": "hc-c-05-session-author"
+          },
+          "observed_at": "2031-05-05T09:00:00Z",
+          "valid_from": "2031-05-05T09:00:00Z",
+          "valid_until": "2031-05-05T09:05:00Z",
+          "content": "Synthetic paired-read fixture HAZEL-47 initially maps to specimen seed 377 and uses mirrored base order for the second mate. This calibration is superseded at 09:05 UTC. HAZEL-47 is invented test data, not a real specimen."
+        },
+        {
+          "id": "hc-c-05-s-calibration-r2",
+          "lineage_id": "hc-c-05-lineage-calibration",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-05-project",
+            "repository": "hc-c-05-repository",
+            "worktree": "hc-c-05-worktree",
+            "branch": "refs/heads/hc-c-05-fixture",
+            "session": "hc-c-05-session-author"
+          },
+          "observed_at": "2031-05-05T09:05:00Z",
+          "valid_from": "2031-05-05T09:05:00Z",
+          "valid_until": null,
+          "content": "The corrected synthetic HAZEL-47 fixture maps to specimen seed 733. Its second mate is generated by reverse complementation, not mirrored base order. This is fixture-specific calibration, not a default for new specimens."
+        },
+        {
+          "id": "hc-c-05-s-pair-id-r1",
+          "lineage_id": "hc-c-05-lineage-pair-id",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-05-project",
+            "repository": "hc-c-05-repository",
+            "worktree": "hc-c-05-worktree",
+            "branch": "refs/heads/hc-c-05-fixture",
+            "session": "hc-c-05-session-author"
+          },
+          "observed_at": "2031-05-05T09:02:00Z",
+          "valid_from": "2031-05-05T09:02:00Z",
+          "valid_until": null,
+          "content": "The paired-read importer removes exactly one final /1 or /2 suffix to form a pair key. Underscores elsewhere in the identifier remain significant and must not be split or discarded."
+        },
+        {
+          "id": "hc-c-05-s-line-wrap-r1",
+          "lineage_id": "hc-c-05-lineage-line-wrap",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-05-project",
+            "repository": "hc-c-05-repository",
+            "worktree": "hc-c-05-worktree",
+            "branch": "refs/heads/hc-c-05-fixture",
+            "session": "hc-c-05-session-author"
+          },
+          "observed_at": "2031-05-05T09:03:00Z",
+          "valid_from": "2031-05-05T09:03:00Z",
+          "valid_until": null,
+          "content": "The paired-read preview wraps sequence text at sixty columns. Wrapping does not change stored sequence content or pair identity."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-05T09:00:00Z",
+          "source_id": "hc-c-05-s-calibration-r1",
+          "source_revision": "1",
+          "session": "hc-c-05-session-author",
+          "details": {
+            "observation_id": "hc-c-05-s-calibration-r1-observation",
+            "idempotency_key": "hc-c-05-s-calibration-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-05-session-reader",
+              "hc-c-05-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-05T09:02:00Z",
+          "source_id": "hc-c-05-s-pair-id-r1",
+          "source_revision": "1",
+          "session": "hc-c-05-session-author",
+          "details": {
+            "observation_id": "hc-c-05-s-pair-id-r1-observation",
+            "idempotency_key": "hc-c-05-s-pair-id-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-05-session-reader",
+              "hc-c-05-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-05T09:03:00Z",
+          "source_id": "hc-c-05-s-line-wrap-r1",
+          "source_revision": "1",
+          "session": "hc-c-05-session-author",
+          "details": {
+            "observation_id": "hc-c-05-s-line-wrap-r1-observation",
+            "idempotency_key": "hc-c-05-s-line-wrap-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-05-session-reader",
+              "hc-c-05-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-05T09:04:00Z",
+          "query_id": "hc-c-05-q-positive-original",
+          "session": "hc-c-05-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-05-s-calibration-r1",
+              "hc-c-05-s-pair-id-r1"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-05T09:05:00Z",
+          "source_id": "hc-c-05-s-calibration-r2",
+          "source_revision": "2",
+          "session": "hc-c-05-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-05-s-calibration-r1",
+            "replacement_source_id": "hc-c-05-s-calibration-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-05T09:05:00Z",
+            "operation_id": "hc-c-05-correct-2",
+            "idempotency_key": "hc-c-05-correct-2-original",
+            "wait_for": "durable correction settlement"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-05T09:10:00Z",
+          "query_id": "hc-c-05-q-positive-corrected",
+          "session": "hc-c-05-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-05-s-calibration-r2",
+              "hc-c-05-s-pair-id-r1"
+            ]
+          }
+        },
+        {
+          "action": "delete_source",
+          "at": "2031-05-05T09:12:00Z",
+          "source_id": "hc-c-05-s-calibration-r2",
+          "source_revision": "2",
+          "session": "hc-c-05-session-author",
+          "details": {
+            "selector": {
+              "lineage_id": "hc-c-05-lineage-calibration",
+              "all_revisions": true
+            },
+            "operation_id": "hc-c-05-delete-calibration",
+            "pre_delete_snapshot": {
+              "id": "hc-c-05-snapshot-before-delete",
+              "capture_boundary": "after both verified positive queries and before submitting deletion",
+              "scope": "currently selected provider only",
+              "require": "valid export within unchanged negotiated size limits; retain actual bytes and demonstrated source membership"
+            },
+            "wait_for": "durable tombstone, source and derived payload removal, and host deletion-fanout settlement",
+            "require": [
+              "delete original and corrected payloads plus derived state and sensitive provenance copies if present",
+              "retain only minimal opaque receipt and fence evidence",
+              "preserve independent pair-id source"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-05T09:13:00Z",
+          "query_id": "hc-c-05-q-after-delete",
+          "session": "hc-c-05-session-reader"
+        },
+        {
+          "action": "restart",
+          "at": "2031-05-05T09:15:00Z",
+          "session": "hc-c-05-session-recovery",
+          "details": {
+            "mode": "real selected-provider close and reopen",
+            "restore_snapshot": {
+              "id": "hc-c-05-snapshot-before-delete",
+              "same_provider_format_only": true,
+              "live_deletion_fences_must_win": true,
+              "expected_effect": "restore sanitized state without either deleted revision or derived influence"
+            },
+            "wait_for": "durable restore and validated readiness"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-05T09:17:00Z",
+          "query_id": "hc-c-05-q-history-after-restore",
+          "session": "hc-c-05-session-recovery"
+        },
+        {
+          "action": "replay",
+          "at": "2031-05-05T09:19:00Z",
+          "session": "hc-c-05-session-recovery",
+          "details": {
+            "source_ids": [
+              "hc-c-05-s-calibration-r1",
+              "hc-c-05-s-calibration-r2",
+              "hc-c-05-s-pair-id-r1"
+            ],
+            "deleted_lineage_id": "hc-c-05-lineage-calibration",
+            "attempts": [
+              {
+                "source_id": "hc-c-05-s-calibration-r1",
+                "idempotency_key": "hc-c-05-calibration-r1-fresh-replay"
+              },
+              {
+                "source_id": "hc-c-05-s-calibration-r2",
+                "idempotency_key": "hc-c-05-calibration-r2-fresh-replay"
+              },
+              {
+                "source_id": "hc-c-05-s-pair-id-r1",
+                "idempotency_key": "hc-c-05-pair-id-fresh-replay"
+              }
+            ],
+            "payload_policy": "exact original source, revision, origin, timestamps and content; no newly authorized revision",
+            "expected_effect": "deleted lineage stays fenced; live control replay is idempotent",
+            "require": "inspect retained source and derived-state evidence, not only text absence"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-05T09:20:00Z",
+          "query_id": "hc-c-05-q-after-fresh-replay",
+          "session": "hc-c-05-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-05-q-positive-original",
+          "text": "For the current invented specimen fixture, which seed and second-mate construction are recorded, and how should a name containing underscores be paired?",
+          "at": "2031-05-05T09:04:00Z",
+          "session": "hc-c-05-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-05T09:04:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-05-s-calibration-r1",
+            "hc-c-05-s-pair-id-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "The then-current HAZEL-47 fixture uses seed 377 and mirrored base order for its second mate.",
+            "Pair keys remove only a final /1 or /2; interior underscores remain part of the identifier."
+          ],
+          "prohibited_claims": [
+            "All underscores are separators in a pair key."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-05-q-positive-corrected",
+          "text": "The lab fixture was corrected. Recover its current generator calibration and the independent rule for grouping read names with embedded underscores.",
+          "at": "2031-05-05T09:10:00Z",
+          "session": "hc-c-05-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-05T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-05-s-calibration-r2",
+            "hc-c-05-s-pair-id-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-05-s-calibration-r1"
+          ],
+          "required_facts": [
+            "Corrected HAZEL-47 uses seed 733 and a reverse-complemented second mate.",
+            "Only one final /1 or /2 is stripped from a pair key."
+          ],
+          "prohibited_claims": [
+            "The current fixture uses seed 377 or merely mirrors base order."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-05-q-after-delete",
+          "text": "Recover any still-permitted calibration and explain how paired names containing underscores should be grouped.",
+          "at": "2031-05-05T09:13:00Z",
+          "session": "hc-c-05-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-05T09:13:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-05-s-pair-id-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-05-s-calibration-r1",
+            "hc-c-05-s-calibration-r2"
+          ],
+          "required_facts": [
+            "Strip exactly one final /1 or /2 for pair matching and retain interior underscores."
+          ],
+          "prohibited_claims": [
+            "The deleted fixture is called HAZEL-47.",
+            "The deleted calibration uses seed 377 or 733.",
+            "The deleted mate construction is mirrored order or reverse complementation.",
+            "Deleting calibration removes the independent pair-key rule."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-05-q-history-after-restore",
+          "text": "After restoring earlier memory, list any retained calibration history and the rule that still governs mate-name matching.",
+          "at": "2031-05-05T09:17:00Z",
+          "session": "hc-c-05-session-recovery",
+          "temporal": {
+            "mode": "history",
+            "evaluation_time": "2031-05-05T09:17:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": true,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-05-s-pair-id-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-05-s-calibration-r1",
+            "hc-c-05-s-calibration-r2"
+          ],
+          "required_facts": [
+            "Pair keys strip exactly one trailing /1 or /2 while preserving other identifier characters."
+          ],
+          "prohibited_claims": [
+            "History makes deleted HAZEL-47 or either calibration revision admissible.",
+            "An old snapshot reauthorizes seed 377, seed 733 or the deleted mate construction."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-05-q-after-fresh-replay",
+          "text": "After redelivering old observations under new delivery keys, which pairing behavior remains authorized, and is the forgotten calibration available again?",
+          "at": "2031-05-05T09:20:00Z",
+          "session": "hc-c-05-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-05T09:20:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-05-s-pair-id-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-05-s-calibration-r1",
+            "hc-c-05-s-calibration-r2"
+          ],
+          "required_facts": [
+            "Only a final /1 or /2 is removed for pair matching; underscores remain significant."
+          ],
+          "prohibited_claims": [
+            "A new delivery key makes the deleted calibration a new source.",
+            "HAZEL-47 or either seed and mate-construction record is available again."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-05-q-positive-original",
+          "hc-c-05-q-positive-corrected",
+          "hc-c-05-q-after-delete",
+          "hc-c-05-q-history-after-restore",
+          "hc-c-05-q-after-fresh-replay"
+        ],
+        "expected_source_ids": [
+          "hc-c-05-s-calibration-r1",
+          "hc-c-05-s-calibration-r2",
+          "hc-c-05-s-pair-id-r1"
+        ],
+        "description": "Each calibration revision must be separately delivered while valid before deletion. The independent pair-id source must be useful before deletion and in every subsequent query."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "Delete the entire stable calibration lineage: original and corrected revisions, observations and derived state. Changes to delivery key cannot erase the source fence.",
+        "The pre-deletion snapshot must really contain the demonstrated lineage. Restore it into the same provider with live tombstones preserved and deleted payloads and metadata sanitized; no cross-provider internal snapshot import.",
+        "The history query requests superseded and revoked records deliberately. Privacy deletion still takes precedence over both flags and historical validity.",
+        "Fresh-key replay preserves exact source identity and grants no new revision authorization. Neither deleted revision may reappear or influence derived recall; independent pairing guidance must remain useful.",
+        "Check stable lineage, source and observation identities, payload digests, derived-state evidence and final delivery. Searching only for the invented alias cannot establish deletion."
+      ],
+      "rationale": "This spans two demonstrated revisions of a fixture-specific scientific calibration while retaining an unrelated identifier-parser rule. It challenges source revocation through both an old internal snapshot and new replay delivery keys."
+    },
+    {
+      "id": "hc-c-06",
+      "family": "privacy_deletion",
+      "description": "Delete one diagnostic source while preserving useful same-session notes, then challenge its tombstone through canonical provider replay and rollback.",
+      "sources": [
+        {
+          "id": "hc-c-06-s-reproduction-r1",
+          "lineage_id": "hc-c-06-lineage-reproduction",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-06-project",
+            "repository": "hc-c-06-repository",
+            "worktree": "hc-c-06-worktree",
+            "branch": "refs/heads/hc-c-06-fixture",
+            "session": "hc-c-06-session-author"
+          },
+          "observed_at": "2031-05-06T09:00:00Z",
+          "valid_from": "2031-05-06T09:00:00Z",
+          "valid_until": null,
+          "content": "The invented LANTERN-22 bytecode-debugger reproduction reaches its private checkpoint at instruction ordinal 37 and inserts hidden symbol amber_gate only with allocator flavor pebble. This is a one-fixture diagnostic note, not a product default or a real customer record."
+        },
+        {
+          "id": "hc-c-06-s-byte-offset-r1",
+          "lineage_id": "hc-c-06-lineage-byte-offset",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-06-project",
+            "repository": "hc-c-06-repository",
+            "worktree": "hc-c-06-worktree",
+            "branch": "refs/heads/hc-c-06-fixture",
+            "session": "hc-c-06-session-author"
+          },
+          "observed_at": "2031-05-06T09:01:00Z",
+          "valid_from": "2031-05-06T09:01:00Z",
+          "valid_until": null,
+          "content": "The bytecode debugger breakpoint table stores offsets in serialized bytes, not instruction ordinals. Variable-width operands mean advancing one instruction can advance the byte offset by different amounts."
+        },
+        {
+          "id": "hc-c-06-s-stepping-r1",
+          "lineage_id": "hc-c-06-lineage-stepping",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-06-project",
+            "repository": "hc-c-06-repository",
+            "worktree": "hc-c-06-worktree",
+            "branch": "refs/heads/hc-c-06-fixture",
+            "session": "hc-c-06-session-author"
+          },
+          "observed_at": "2031-05-06T09:02:00Z",
+          "valid_from": "2031-05-06T09:02:00Z",
+          "valid_until": "2031-05-06T09:05:00Z",
+          "content": "The early bytecode debugger assumed every instruction occupied one serialized byte and advanced a breakpoint offset by one on every step. This assumption is superseded at 09:05 UTC."
+        },
+        {
+          "id": "hc-c-06-s-stepping-r2",
+          "lineage_id": "hc-c-06-lineage-stepping",
+          "revision": "2",
+          "origin": {
+            "project": "hc-c-06-project",
+            "repository": "hc-c-06-repository",
+            "worktree": "hc-c-06-worktree",
+            "branch": "refs/heads/hc-c-06-fixture",
+            "session": "hc-c-06-session-author"
+          },
+          "observed_at": "2031-05-06T09:05:00Z",
+          "valid_from": "2031-05-06T09:05:00Z",
+          "valid_until": null,
+          "content": "The bytecode debugger advances a breakpoint offset by the decoded serialized length of the current instruction, including variable-width operands. It must not increment that offset by a fixed one byte."
+        },
+        {
+          "id": "hc-c-06-s-panel-r1",
+          "lineage_id": "hc-c-06-lineage-panel",
+          "revision": "1",
+          "origin": {
+            "project": "hc-c-06-project",
+            "repository": "hc-c-06-repository",
+            "worktree": "hc-c-06-worktree",
+            "branch": "refs/heads/hc-c-06-fixture",
+            "session": "hc-c-06-session-author"
+          },
+          "observed_at": "2031-05-06T09:06:00Z",
+          "valid_from": "2031-05-06T09:06:00Z",
+          "valid_until": null,
+          "content": "The debugger symbol panel sorts visible names alphabetically. Panel sort position is not a bytecode address."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "at": "2031-05-06T09:00:00Z",
+          "source_id": "hc-c-06-s-reproduction-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "observation_id": "hc-c-06-s-reproduction-r1-observation",
+            "idempotency_key": "hc-c-06-s-reproduction-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-06-session-reader",
+              "hc-c-06-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-06T09:01:00Z",
+          "source_id": "hc-c-06-s-byte-offset-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "observation_id": "hc-c-06-s-byte-offset-r1-observation",
+            "idempotency_key": "hc-c-06-s-byte-offset-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-06-session-reader",
+              "hc-c-06-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-06T09:02:00Z",
+          "source_id": "hc-c-06-s-stepping-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "observation_id": "hc-c-06-s-stepping-r1-observation",
+            "idempotency_key": "hc-c-06-s-stepping-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-06-session-reader",
+              "hc-c-06-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "correct",
+          "at": "2031-05-06T09:05:00Z",
+          "source_id": "hc-c-06-s-stepping-r2",
+          "source_revision": "2",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "replaces_source_id": "hc-c-06-s-stepping-r1",
+            "replacement_source_id": "hc-c-06-s-stepping-r2",
+            "expected_source_revision": "1",
+            "close_replaced_validity_at": "2031-05-06T09:05:00Z",
+            "operation_id": "hc-c-06-correct-2",
+            "idempotency_key": "hc-c-06-correct-2-original",
+            "wait_for": "durable correction settlement"
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-06T09:06:00Z",
+          "source_id": "hc-c-06-s-panel-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "observation_id": "hc-c-06-s-panel-r1-observation",
+            "idempotency_key": "hc-c-06-s-panel-r1-delivery-original",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-06-session-reader",
+              "hc-c-06-session-recovery"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-06T09:10:00Z",
+          "query_id": "hc-c-06-q-positive",
+          "session": "hc-c-06-session-reader",
+          "details": {
+            "must_verify_before_next_step": [
+              "hc-c-06-s-reproduction-r1",
+              "hc-c-06-s-byte-offset-r1",
+              "hc-c-06-s-stepping-r2"
+            ]
+          }
+        },
+        {
+          "action": "delete_source",
+          "at": "2031-05-06T09:12:00Z",
+          "source_id": "hc-c-06-s-reproduction-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "selector": {
+              "lineage_id": "hc-c-06-lineage-reproduction",
+              "all_revisions": true
+            },
+            "operation_id": "hc-c-06-delete-reproduction",
+            "wait_for": "durable deletion and host fanout fence settlement",
+            "scope": "reproduction lineage only; every source deliberately shares the same originating session",
+            "require": [
+              "erase diagnostic payload and derived influence",
+              "preserve byte-offset and stepping lineages",
+              "retain source fences for inactive and active provider selection"
+            ]
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-06T09:13:00Z",
+          "query_id": "hc-c-06-q-after-delete",
+          "session": "hc-c-06-session-reader"
+        },
+        {
+          "action": "switch_provider",
+          "at": "2031-05-06T09:15:00Z",
+          "session": "hc-c-06-session-recovery",
+          "details": {
+            "target_role": "alternate_provider",
+            "role_binding": "other implementation relative to the trial initial selection; identical logical trace and assertions in either direction",
+            "initial_state": "fresh isolated provider-local state",
+            "transfer_mode": "canonical history replay with source deletion fences applied before activation",
+            "source_ids": [
+              "hc-c-06-s-reproduction-r1",
+              "hc-c-06-s-byte-offset-r1",
+              "hc-c-06-s-stepping-r1",
+              "hc-c-06-s-stepping-r2",
+              "hc-c-06-s-panel-r1"
+            ],
+            "require": [
+              "original source and session attribution",
+              "correction validity retained",
+              "no provider-internal snapshot crosses implementations"
+            ],
+            "wait_for": "replay and deletion settlement before activation"
+          }
+        },
+        {
+          "action": "replay",
+          "at": "2031-05-06T09:16:00Z",
+          "source_id": "hc-c-06-s-reproduction-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "target_role": "current_selected_provider",
+            "idempotency_key": "hc-c-06-reproduction-fresh-canonical-replay",
+            "payload_policy": "same deleted source, revision, origin, validity and exact content; no new canonical authorization",
+            "expected_effect": "source stays revoked with zero new source or derived payloads"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-06T09:17:00Z",
+          "query_id": "hc-c-06-q-after-switch",
+          "session": "hc-c-06-session-recovery"
+        },
+        {
+          "action": "switch_provider",
+          "at": "2031-05-06T09:19:00Z",
+          "session": "hc-c-06-session-recovery",
+          "details": {
+            "target_role": "initial_provider",
+            "mode": "rollback to its existing durable state, not a newly empty store",
+            "require": "reconcile live host deletion fences before recall; preserve useful same-session neighbors",
+            "wait_for": "deletion settlement and validated readiness"
+          }
+        },
+        {
+          "action": "observe",
+          "at": "2031-05-06T09:20:00Z",
+          "source_id": "hc-c-06-s-reproduction-r1",
+          "source_revision": "1",
+          "session": "hc-c-06-session-author",
+          "details": {
+            "observation_id": "hc-c-06-s-reproduction-r1-observation",
+            "idempotency_key": "hc-c-06-reproduction-fresh-observe",
+            "wait_for": "canonical commit and selected-provider durable observation settlement",
+            "authorized_reader_sessions": [
+              "hc-c-06-session-reader",
+              "hc-c-06-session-recovery"
+            ],
+            "redelivery": true,
+            "expected_effect": "reject or deduplicate as deleted without source or derived payloads",
+            "canonical_revision_authorization": "none; old committed source delivered again"
+          }
+        },
+        {
+          "action": "recall",
+          "at": "2031-05-06T09:21:00Z",
+          "query_id": "hc-c-06-q-after-rollback",
+          "session": "hc-c-06-session-recovery"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-c-06-q-positive",
+          "text": "Recover the invented reproduction checkpoint and its conditional hidden symbol, then explain why stepping one instruction is not always moving one address unit.",
+          "at": "2031-05-06T09:10:00Z",
+          "session": "hc-c-06-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-06T09:10:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-06-s-reproduction-r1",
+            "hc-c-06-s-byte-offset-r1",
+            "hc-c-06-s-stepping-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-06-s-stepping-r1"
+          ],
+          "required_facts": [
+            "LANTERN-22 reaches instruction ordinal 37 and inserts amber_gate only with allocator flavor pebble.",
+            "Breakpoint addresses count serialized bytes, and stepping advances by decoded instruction length including operands."
+          ],
+          "prohibited_claims": [
+            "Every instruction occupies one byte.",
+            "Alphabetical symbol position supplies a bytecode address."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-06-q-after-delete",
+          "text": "After forgetting the private reproduction, what remains available about its setup and address calculation for a variable-width instruction?",
+          "at": "2031-05-06T09:13:00Z",
+          "session": "hc-c-06-session-reader",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-06T09:13:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-06-s-byte-offset-r1",
+            "hc-c-06-s-stepping-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-06-s-reproduction-r1",
+            "hc-c-06-s-stepping-r1"
+          ],
+          "required_facts": [
+            "Breakpoint offsets count serialized bytes.",
+            "Advance by decoded instruction length including operands."
+          ],
+          "prohibited_claims": [
+            "The forgotten reproduction is LANTERN-22 with checkpoint 37, symbol amber_gate or allocator pebble.",
+            "Deleting one note deletes all unrelated notes from its session.",
+            "Increment the byte offset by one for every instruction."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-06-q-after-switch",
+          "text": "With the newly selected memory provider, recover permitted stepping guidance and any still-authorized reproduction setup.",
+          "at": "2031-05-06T09:17:00Z",
+          "session": "hc-c-06-session-recovery",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2031-05-06T09:17:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-06-s-byte-offset-r1",
+            "hc-c-06-s-stepping-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-06-s-reproduction-r1",
+            "hc-c-06-s-stepping-r1"
+          ],
+          "required_facts": [
+            "The breakpoint table uses serialized byte offsets; stepping adds the complete decoded instruction length."
+          ],
+          "prohibited_claims": [
+            "Canonical replay restored LANTERN-22, checkpoint 37, amber_gate or allocator pebble.",
+            "Another provider can ignore existing source deletion.",
+            "One-byte increments are the current stepping rule."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-c-06-q-after-rollback",
+          "text": "After returning to the original provider state, which address rule remains, and can old-session redelivery recover the forgotten diagnostic?",
+          "at": "2031-05-06T09:21:00Z",
+          "session": "hc-c-06-session-recovery",
+          "temporal": {
+            "mode": "interval",
+            "evaluation_time": "2031-05-06T09:21:00Z",
+            "as_of": null,
+            "interval_start": "2031-05-06T09:08:00Z",
+            "interval_end": "2031-05-06T09:11:00Z",
+            "include_superseded": true,
+            "include_revoked": true,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-c-06-s-byte-offset-r1",
+            "hc-c-06-s-stepping-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-c-06-s-reproduction-r1",
+            "hc-c-06-s-stepping-r1"
+          ],
+          "required_facts": [
+            "Advance byte offsets by decoded serialized instruction length."
+          ],
+          "prohibited_claims": [
+            "Returning to the earlier provider revives LANTERN-22 or its checkpoint, symbol or allocator fact.",
+            "A fresh observation key reauthorizes the forgotten source.",
+            "The fixed one-byte stepping rule is current."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-c-06-q-positive",
+          "hc-c-06-q-after-delete",
+          "hc-c-06-q-after-switch",
+          "hc-c-06-q-after-rollback"
+        ],
+        "expected_source_ids": [
+          "hc-c-06-s-reproduction-r1",
+          "hc-c-06-s-byte-offset-r1",
+          "hc-c-06-s-stepping-r2"
+        ],
+        "description": "Deliver the private reproduction and both independent stepping facts before deletion. Every later query must retain byte-offset and decoded-length sources from that same original session while excluding the diagnostic."
+      },
+      "rubric": [
+        "These are frozen synthetic expectations, not execution results. Score only actual final advisory delivery through the shared host. Keep canonical content and no-memory/documentation controls separately attributed.",
+        "Both selections receive identical logical sources, revisions, validity, actions, queries and fixed protocol limits. Fixture time is UTC; operation deadlines and cancellation use runtime boundaries and existing elapsed-time budgets.",
+        "Authorize reader and recovery sessions only for the exact source project, repository, worktree and branch. Preserve original session, stable source lineage, revision, observation identity and payload digest throughout every lifecycle action.",
+        "A useful candidate supplies a required fact supported by its expected source revision. True distractors are irrelevant, not useful. Match meaning rather than word overlap and retain missing or ambiguous source evidence as indeterminate.",
+        "Verify each positive query from nonempty final delivery before exercising its challenge. Verify useful unaffected control delivery after recovery. Empty, unsupported and unexecuted lanes cannot establish non-vacuous safety.",
+        "This artifact defines retrieval acceptance only. Task benefit, model success, timings, resource use and actual run verdicts remain unmeasured.",
+        "Delete by stable source lineage, not by broad session. Live controls share origin.session with the deleted source, so a session-wide purge fails useful recovery.",
+        "Switching is declared and symmetric. Attribute each query to its actually selected provider; retain switch-phase records separately from ordinary initial-provider recall timing. Alternate-provider delivery is never an initial-provider result.",
+        "The alternate provider receives canonical observations plus durable deletion authority before activation. Fresh-key canonical replay and ordinary fresh-key observe on rollback must both respect the same source fence.",
+        "The final interval is before deletion, when the diagnostic was valid, and requests superseded and revoked history. Deletion still forbids it. Current stepping revision was valid throughout that interval; the old fixed-width revision was not.",
+        "Verify deletion of source-derived payloads and metadata while retaining minimal opaque fences and original source/observation/digest evidence. No new source revision is authorized in this trace."
+      ],
+      "rationale": "The ambiguity is source granularity: one private debugger reproduction and general addressing rules came from the same session. Deletion must survive another provider activation and return to old local state without purging useful neighbors or allowing history flags and new keys to revive the diagnostic."
+    }
+  ]
+}

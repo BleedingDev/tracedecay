@@ -40,6 +40,15 @@ pub(super) fn hook_v2_native_session_id(
         .then_some(session)
 }
 
+pub(super) fn hook_v2_native_start_locator(
+    args: &Value,
+    envelope: &tracedecay_hooks::HookEventEnvelopeV2,
+) -> Option<tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1> {
+    let locator: tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1 =
+        serde_json::from_value(args.get("native_start_locator")?.clone()).ok()?;
+    locator.matches_envelope(envelope).then_some(locator)
+}
+
 pub(super) fn hook_v2_requires_producer_work(
     envelope: &tracedecay_hooks::HookEventEnvelopeV2,
 ) -> bool {

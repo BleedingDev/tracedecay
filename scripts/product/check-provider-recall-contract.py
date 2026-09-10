@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 TOP_LEVEL = {
+    "common_advisory_semantics",
     "schema_version",
     "contract_id",
     "bead_id",
@@ -428,6 +429,7 @@ def validate_request_scope_temporal(
         "query_maximum_bytes",
         "required_capabilities",
         "unknown_field_policy",
+        "common_profile_optional_fields",
         "empty_query_allowed",
         "provider_may_widen_scope",
         "provider_may_extend_deadline",
@@ -985,6 +987,7 @@ def validate_validity_provenance_explanation(
         "states",
         "maximum_refs_per_class",
         "maximum_transform_steps",
+        "common_profile_required_fields",
         "missing_provenance_is_explicit",
         "provider_may_fabricate_provenance",
         "provider_may_drop_known_provenance",
@@ -1286,6 +1289,9 @@ def validate(
     validate_validity_provenance_explanation(contract, errors)
     validate_response_coverage_ordering(contract, errors)
     validate_invariants_beads(contract, ids, errors)
+    common = contract.get("common_advisory_semantics")
+    if not isinstance(common, dict) or schema.get("properties", {}).get("common_advisory_semantics", {}).get("const") != common:
+        errors.append("common_advisory_semantics must match its canonical schema semantics")
     validate_schema(schema, errors)
     validate_doc(doc, errors)
     validate_dependencies(repo, errors)

@@ -556,6 +556,12 @@ impl SessionSyncProjectContext {
         let pass = async {
             let project_authority = GlobalDbSessionIngestAuthority::new(project_sessions.clone())
                 .with_background_cpu(Arc::clone(&self.background_cpu));
+            let project_authority = match &self.original_provenance_resolver {
+                Some(resolver) => {
+                    project_authority.with_original_provenance_resolver(Arc::clone(resolver))
+                }
+                None => project_authority,
+            };
             let project = self
                 .ingest_project_transcripts(&project_authority, &pass_cancellation)
                 .await;

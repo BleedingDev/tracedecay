@@ -32,7 +32,21 @@ use sha2::{Digest, Sha256};
 /// Generated dependency-free values from the canonical Memory Provider V1 contracts.
 pub mod contract;
 
+mod advisory;
+mod advisory_admission;
 mod hygiene;
+
+pub use advisory::{
+    AdvisoryContractError, CurrentSourceDisposition, GrantedHistorySource, HistoryGrant,
+    LifecycleTarget, LifecycleTargetReference, OriginScopeEvidence, OriginalSourceIdentity,
+    OwnedRecallExclusions, OwnedTemporalQuery, RecordedValidity, ReplayAccounting,
+    RestoreDispositionCheckpoint, SourceAttribution, TemporalEligibility,
+};
+
+pub use advisory_admission::{
+    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, AdvisoryCallBinding,
+    CurrentAdvisoryAdmission, CurrentRestoreAdmission, MAX_ADVISORY_ADMISSION_SOURCES,
+};
 
 pub use hygiene::{
     OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX, OBSERVATION_HYGIENE_WITHHELD_ID_PREFIX,
@@ -975,6 +989,9 @@ impl ProviderDescriptor {
                 return Err(ApiError::MandatoryCapabilityMissing(mandatory));
             }
         }
+        if self.supports(contract::COMMON_ADVISORY_PROFILE_ID) {
+            self.validate_common_advisory_profile()?;
+        }
         self.limits.validate()?;
         Ok(())
     }
@@ -985,6 +1002,19 @@ impl ProviderDescriptor {
         self.capabilities
             .iter()
             .any(|capability| capability.as_str() == capability_id)
+    }
+
+    /// Requires the explicitly declared complete advisory profile. Legacy
+    /// descriptors remain valid without opting in to this profile.
+    pub fn validate_common_advisory_profile(&self) -> Result<(), ApiError> {
+        for capability in std::iter::once(&contract::COMMON_ADVISORY_PROFILE_ID)
+            .chain(contract::COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter())
+        {
+            if !self.supports(capability) {
+                return Err(ApiError::MandatoryCapabilityMissing(capability));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1223,6 +1253,8 @@ pub struct ProviderCall {
     /// [`ProviderCall::with_sanitization`], and the only way to read one is
     /// [`ProviderCall::sanitization`].
     sanitization: Option<PayloadSanitizationReceipt>,
+    /// Untrusted in-process history claim, never part of the canonical wire payload.
+    history_grant: Option<HistoryGrant>,
 }
 
 impl ProviderCall {
@@ -1257,6 +1289,7 @@ impl ProviderCall {
             required_capabilities,
             extensions: parts.extensions,
             sanitization: None,
+            history_grant: None,
         };
         call.validate_envelope()?;
         Ok(call)
@@ -1277,6 +1310,23 @@ impl ProviderCall {
     #[must_use]
     pub fn sanitization(&self) -> Option<&PayloadSanitizationReceipt> {
         self.sanitization.as_ref()
+    }
+
+    /// Attaches an untrusted history claim for the installed host authority.
+    ///
+    /// This does not authorize history or change the canonical wire payload.
+    /// The authority must independently validate the claim immediately before
+    /// use; [`AdvisoryCallBinding`] binds it against subsequent replacement.
+    #[must_use]
+    pub fn with_history_grant(mut self, grant: HistoryGrant) -> Self {
+        self.history_grant = Some(grant);
+        self
+    }
+
+    /// Returns the in-process history claim, which is not source authorization.
+    #[must_use]
+    pub fn history_grant(&self) -> Option<&HistoryGrant> {
+        self.history_grant.as_ref()
     }
 
     /// Revalidates the complete public call envelope after mutation, and — for

@@ -323,7 +323,9 @@ fn denial_reason_detail(reason: &RecallDenialReason) -> Option<String> {
         RecallDenialReason::ScopeMismatch { field }
         | RecallDenialReason::UnknownIdentity { field }
         | RecallDenialReason::ForbiddenIdentity { field } => Some(format!("field={field:?}")),
-        RecallDenialReason::InvalidValidityRecord { detail } => Some(detail.clone()),
+        RecallDenialReason::InvalidValidityRecord { detail }
+        | RecallDenialReason::InvalidSourceAttribution { detail } => Some(detail.clone()),
+        RecallDenialReason::RequestExcluded { field } => Some(format!("field={field}")),
         RecallDenialReason::NativeScoreMalformed { defect } => Some(format!("{defect:?}")),
         RecallDenialReason::ConfidenceMalformed { defect } => Some(format!("{defect:?}")),
         RecallDenialReason::StaleIdentity

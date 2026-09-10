@@ -10,10 +10,11 @@ use serde_json::{Value, json};
 use std::fs;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
+use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
-    MaintenanceKind, MaintenanceRequest, NcmEngine, ObserveRequest, Outcome, RecallRequest,
+    CorrectionRequest, FeedbackRequest, MaintenanceKind, MaintenanceRequest, NcmEngine,
+    ObserveRequest, Outcome, RecallRequest, RejectReason,
 };
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
 use tracedecay_memory_ncm_runtime::snapshot::{self, RestoreRequest};
@@ -55,7 +56,7 @@ fn observe(
     key: &str,
     value: &str,
     idempotency_key: &str,
-) {
+) -> RecordId {
     let mut request = ObserveRequest {
         idempotency_key: idempotency_key.to_owned(),
         payload_sha256: String::new(),
@@ -73,6 +74,11 @@ fn observe(
         .expect("observe payload serializes");
     let reply = engine.observe(namespace, request);
     assert_eq!(reply.outcome, Outcome::Success);
+    RecordId(
+        reply.payload["record_id"]
+            .as_u64()
+            .expect("observed record ID"),
+    )
 }
 
 fn inspect(engine: &NcmEngine, namespace: &str) -> Value {
@@ -127,7 +133,7 @@ fn export_wipe_restore_round_trip_survives_restart_and_next_mutation() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
     let original = engine(&tempdir);
-    observe(
+    let source_a_id = observe(
         &original,
         &namespace,
         "source-a",
@@ -167,6 +173,34 @@ fn export_wipe_restore_round_trip_survives_restart_and_next_mutation() {
     let restarted = engine(&tempdir);
     let reopened = inspect(&restarted, &namespace);
     assert_kernel_state_equal(&before, &reopened);
+    let redelivered = observe(
+        &restarted,
+        &namespace,
+        "source-a",
+        "alpha key",
+        "alpha value",
+        "observe-a",
+    );
+    assert_eq!(
+        redelivered, source_a_id,
+        "restore retains the original observation receipt"
+    );
+    assert_eq!(
+        inspect(&restarted, &namespace)["commit_seq"],
+        reopened["commit_seq"],
+        "receipt replay must not allocate another commit"
+    );
+    let old_snapshot: Value = serde_json::from_slice(&bytes).unwrap();
+    let restored_snapshot: Value = serde_json::from_slice(&export(&restarted, &namespace)).unwrap();
+    for event in old_snapshot["events"].as_array().unwrap() {
+        assert!(
+            restored_snapshot["events"]
+                .as_array()
+                .unwrap()
+                .contains(event),
+            "restore preserves retained event and receipt identity"
+        );
+    }
     observe(
         &restarted,
         &namespace,
@@ -192,6 +226,122 @@ fn export_wipe_restore_round_trip_survives_restart_and_next_mutation() {
     );
     assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
     assert_eq!(inspect(&restarted, &namespace)["records"], 2);
+}
+
+#[test]
+fn rollback_never_reuses_discarded_record_targets() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let live = engine(&tempdir);
+    let retained = observe(&live, &namespace, "source-a", "alpha", "retained", "a");
+    let bytes = export(&live, &namespace);
+    let discarded = observe(&live, &namespace, "source-b", "bravo", "discarded", "b");
+    let before_restore = inspect(&live, &namespace);
+
+    let restored = restore(&live, &namespace, "rollback", &bytes);
+    assert!(
+        restored["commit_seq"].as_u64().expect("restored sequence")
+            > before_restore["commit_seq"]
+                .as_u64()
+                .expect("prior sequence")
+    );
+    assert!(
+        restored["epoch"].as_u64().expect("restored epoch")
+            > before_restore["epoch"].as_u64().expect("prior epoch")
+    );
+    let replacement = observe(&live, &namespace, "source-c", "charlie", "new value", "c");
+    assert!(
+        replacement.0 > discarded.0,
+        "rollback reused a discarded target"
+    );
+    let before_stale_target = inspect(&live, &namespace);
+
+    let stale_feedback = live.feedback(
+        &namespace,
+        FeedbackRequest {
+            idempotency_key: "stale-feedback".to_owned(),
+            record_ids: vec![discarded],
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(
+        stale_feedback.outcome,
+        Outcome::Rejected(RejectReason::UnknownRecord(discarded))
+    );
+    let stale_correction = live.correction(
+        &namespace,
+        CorrectionRequest {
+            idempotency_key: "stale-correction".to_owned(),
+            superseded: discarded,
+            superseding: replacement,
+            evidence: "ab".repeat(32),
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(
+        stale_correction.outcome,
+        Outcome::Rejected(RejectReason::UnknownRecord(discarded))
+    );
+    assert_eq!(inspect(&live, &namespace), before_stale_target);
+
+    let replayed = restore(&live, &namespace, "rollback", &bytes);
+    assert_eq!(replayed["replayed"], true);
+    assert_eq!(replayed["commit_seq"], restored["commit_seq"]);
+    assert_eq!(inspect(&live, &namespace), before_stale_target);
+
+    let second_restore = restore(&live, &namespace, "rollback-again", &bytes);
+    assert!(
+        second_restore["commit_seq"]
+            .as_u64()
+            .expect("restored sequence")
+            > before_stale_target["commit_seq"]
+                .as_u64()
+                .expect("prior sequence")
+    );
+    drop(live);
+
+    let restarted = engine(&tempdir);
+    let newest = observe(
+        &restarted,
+        &namespace,
+        "source-d",
+        "delta",
+        "after restart",
+        "d",
+    );
+    assert!(
+        newest.0 > replacement.0,
+        "restart lost the allocation floor"
+    );
+    let before_stale_target = inspect(&restarted, &namespace);
+    let stale = restarted.feedback(
+        &namespace,
+        FeedbackRequest {
+            idempotency_key: "stale-after-restart".to_owned(),
+            record_ids: vec![replacement],
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(
+        stale.outcome,
+        Outcome::Rejected(RejectReason::UnknownRecord(replacement))
+    );
+    assert_eq!(inspect(&restarted, &namespace), before_stale_target);
+    let retained_feedback = restarted.feedback(
+        &namespace,
+        FeedbackRequest {
+            idempotency_key: "retained-after-restart".to_owned(),
+            record_ids: vec![retained],
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(retained_feedback.outcome, Outcome::Success);
+    assert!(
+        retained_feedback.payload["centers_updated"]
+            .as_u64()
+            .expect("updated centers")
+            > 0
+    );
 }
 
 #[test]
@@ -225,6 +375,14 @@ fn old_snapshot_cannot_resurrect_a_source_deleted_after_export() {
         "c",
     );
     let old_snapshot = export(&live, &namespace);
+    let discarded = observe(
+        &live,
+        &namespace,
+        "source-d",
+        "discarded delta",
+        "discarded after export",
+        "d",
+    );
     let deleted = live.delete_by_source(
         &namespace,
         &SourceId("source-b".to_owned()),
@@ -300,6 +458,46 @@ fn old_snapshot_cannot_resurrect_a_source_deleted_after_export() {
             .windows(b"source-b".len())
             .any(|window| window == b"source-b")
     );
+
+    let deleted_survivor = live.delete_by_source(
+        &namespace,
+        &SourceId("source-c".to_owned()),
+        "delete-after-sanitized-restore",
+        DEADLINE,
+    );
+    assert_eq!(
+        deleted_survivor.outcome,
+        Outcome::Success,
+        "{deleted_survivor:?}"
+    );
+    drop(live);
+    let restarted = engine(&live_dir);
+    let replacement = observe(
+        &restarted,
+        &namespace,
+        "source-e",
+        "echo after restart",
+        "retained after rebuild",
+        "e",
+    );
+    assert!(
+        replacement.0 > discarded.0,
+        "sanitized restore or later deletion reused a discarded target"
+    );
+    let before_stale_target = inspect(&restarted, &namespace);
+    let stale_feedback = restarted.feedback(
+        &namespace,
+        FeedbackRequest {
+            idempotency_key: "stale-after-sanitized-restore".to_owned(),
+            record_ids: vec![discarded],
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(
+        stale_feedback.outcome,
+        Outcome::Rejected(RejectReason::UnknownRecord(discarded))
+    );
+    assert_eq!(inspect(&restarted, &namespace), before_stale_target);
 }
 
 #[test]

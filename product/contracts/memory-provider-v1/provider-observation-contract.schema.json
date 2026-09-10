@@ -29,16 +29,32 @@
     "delivery_receipt",
     "observer_non_interference",
     "invariants",
-    "verification_beads"
+    "verification_beads",
+    "common_source_attribution"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "contract_id": { "const": "tracedecay.memory.provider.observation.v1" },
-    "bead_id": { "const": "tdmem-0203" },
-    "title": { "type": "string", "minLength": 1 },
-    "status": { "const": "accepted" },
-    "authority": { "const": "TraceDecay observation admission and dispatch fabric" },
-    "scope": { "const": "coding_agents_only" },
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "const": "tracedecay.memory.provider.observation.v1"
+    },
+    "bead_id": {
+      "const": "tdmem-0203"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "const": "accepted"
+    },
+    "authority": {
+      "const": "TraceDecay observation admission and dispatch fabric"
+    },
+    "scope": {
+      "const": "coding_agents_only"
+    },
     "depends_on_contracts": {
       "type": "array",
       "const": [
@@ -46,50 +62,203 @@
         "tracedecay.memory.provider.handshake.v1"
       ]
     },
-    "observation_envelope": { "$ref": "#/$defs/object" },
-    "source_identity": { "$ref": "#/$defs/object" },
+    "observation_envelope": {
+      "$ref": "#/$defs/object"
+    },
+    "source_identity": {
+      "$ref": "#/$defs/object"
+    },
     "observation_kinds": {
       "type": "array",
       "minItems": 9,
       "maxItems": 9,
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/observationKind" }
+      "items": {
+        "$ref": "#/$defs/observationKind"
+      }
     },
-    "extension_contract": { "$ref": "#/$defs/object" },
-    "memory_effect_semantics": { "$ref": "#/$defs/object" },
-    "normalization": { "$ref": "#/$defs/object" },
-    "idempotency": { "$ref": "#/$defs/object" },
-    "provenance": { "$ref": "#/$defs/object" },
-    "privacy": { "$ref": "#/$defs/object" },
-    "ordering": { "$ref": "#/$defs/object" },
-    "batch_contract": { "$ref": "#/$defs/object" },
+    "extension_contract": {
+      "$ref": "#/$defs/object"
+    },
+    "memory_effect_semantics": {
+      "$ref": "#/$defs/object"
+    },
+    "normalization": {
+      "$ref": "#/$defs/object"
+    },
+    "idempotency": {
+      "$ref": "#/$defs/object"
+    },
+    "provenance": {
+      "$ref": "#/$defs/object"
+    },
+    "privacy": {
+      "$ref": "#/$defs/object"
+    },
+    "ordering": {
+      "$ref": "#/$defs/object"
+    },
+    "batch_contract": {
+      "$ref": "#/$defs/object"
+    },
     "admission_order": {
       "type": "array",
       "minItems": 10,
       "maxItems": 10,
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 20 }
+      "items": {
+        "type": "string",
+        "minLength": 20
+      }
     },
     "provider_acceptance_outcomes": {
       "type": "array",
       "minItems": 14,
       "maxItems": 14,
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
     },
-    "delivery_receipt": { "$ref": "#/$defs/object" },
-    "observer_non_interference": { "$ref": "#/$defs/object" },
+    "delivery_receipt": {
+      "$ref": "#/$defs/object"
+    },
+    "observer_non_interference": {
+      "$ref": "#/$defs/object"
+    },
     "invariants": {
       "type": "array",
       "minItems": 16,
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 20 }
+      "items": {
+        "type": "string",
+        "minLength": 20
+      }
     },
     "verification_beads": {
       "type": "array",
       "minItems": 8,
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/beadId" }
+      "items": {
+        "$ref": "#/$defs/beadId"
+      }
+    },
+    "common_source_attribution": {
+      "const": {
+        "carried_in": "source_identity.original_source",
+        "required_for_profile": "memory.advisory_common.v1",
+        "required_fields": [
+          "source",
+          "origin_scope",
+          "source_sequence",
+          "occurred_at",
+          "ingested_at",
+          "validity"
+        ],
+        "nullable_fields": [
+          "source.stable_record_id",
+          "source.source_revision",
+          "occurred_at"
+        ],
+        "source_revision_semantics": "actual_source_content_revision_never_envelope_schema_version",
+        "unknown_revision_semantics": "null_never_fabricated_zero_or_envelope_version",
+        "origin_scope_states": [
+          "recorded",
+          "ingestion_only",
+          "unavailable"
+        ],
+        "history_requires_recorded_origin_scope": true,
+        "occurrence_proves_validity": false,
+        "source_sequence_is_time": false,
+        "ingestion_scope_proves_original_scope": false,
+        "history_grant_fields": [
+          "authorization_ref",
+          "policy_revision",
+          "destination_scope",
+          "relation",
+          "sources",
+          "disposition_checkpoint"
+        ],
+        "history_relations": [
+          "exact_scope",
+          "same_checkout"
+        ],
+        "history_source_fields": [
+          "attribution",
+          "current_disposition"
+        ],
+        "source_disposition_states": [
+          "available",
+          "superseded",
+          "revoked",
+          "deleted",
+          "redacted",
+          "expired",
+          "unknown"
+        ],
+        "grant_construction_proves_authorization": false,
+        "identity_bridge_authority": "existing_host_project_marker_and_observation_provenance_ports",
+        "privacy_authority": "current_canonical_source_disposition_and_provider_specific_host_journal_fence",
+        "privacy_dominates_all_temporal_modes": true,
+        "source_identity_fields": [
+          "canonical_provider_id",
+          "canonical_session_id",
+          "source_key",
+          "stable_record_id",
+          "observation_id",
+          "source_revision",
+          "content_sha256"
+        ],
+        "source_revision_type": "opaque_string_or_null",
+        "history_grant_carried_in": [
+          "observation_envelope.history_grant",
+          "recall_request.history_grant",
+          "replay.history_grant"
+        ],
+        "history_grant_absent_semantics": "no_cross_session_authorization",
+        "candidate_attribution_carried_in": "provider_candidate.provenance.original_sources",
+        "structured_evidence_projection": {
+          "session.message_committed.v1": {
+            "policy": "existing_canonical_session_message_projection"
+          },
+          "source.edit_settled.v1": {
+            "fields_in_order": [
+              "claim",
+              "status",
+              "assertion",
+              "reason"
+            ]
+          },
+          "test.execution_settled.v1": {
+            "fields_in_order": [
+              "assertion",
+              "status",
+              "approach",
+              "outcome",
+              "reason"
+            ]
+          },
+          "feedback.outcome_settled.v1": {
+            "fields_in_order": [
+              "approach",
+              "outcome",
+              "signal",
+              "reason",
+              "claim",
+              "status"
+            ]
+          },
+          "maximum_field_bytes": 8192,
+          "maximum_projected_content_bytes": 32768,
+          "field_value_type": "nonempty_string",
+          "projection": "field_name_colon_space_value_joined_with_newline",
+          "non_string_selected_field_policy": "reject_invalid_payload",
+          "no_supported_evidence_policy": "reject_invalid_payload",
+          "unknown_fields": "retained_in_canonical_payload_but_never_projected_as_message",
+          "canonical_payload_is_immutable": true
+        }
+      }
     }
   },
   "$defs": {
@@ -104,7 +273,11 @@
     "observationKind": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "source_authority", "payload_contract"],
+      "required": [
+        "id",
+        "source_authority",
+        "payload_contract"
+      ],
       "properties": {
         "id": {
           "type": "string",
@@ -117,6 +290,513 @@
         "payload_contract": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.v[1-9][0-9]*$"
+        }
+      }
+    },
+    "commonExactScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "project_id",
+        "repository_identity",
+        "worktree_identity",
+        "branch_identity",
+        "agent_session_id",
+        "resolved_scope_digest"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "project_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "repository_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "worktree_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "branch_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "agent_session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "resolved_scope_digest": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      }
+    },
+    "originalSourceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_provider_id",
+        "canonical_session_id",
+        "source_key",
+        "stable_record_id",
+        "observation_id",
+        "source_revision",
+        "content_sha256"
+      ],
+      "properties": {
+        "canonical_provider_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "maxLength": 128
+        },
+        "canonical_session_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "source_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "stable_record_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "source_revision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "originScopeEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "exact_scope_identity",
+            "authority_ref"
+          ],
+          "properties": {
+            "state": {
+              "const": "recorded"
+            },
+            "exact_scope_identity": {
+              "$ref": "#/$defs/commonExactScope"
+            },
+            "authority_ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "ingestion_only",
+                "unavailable"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "recordedSourceValidity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valid_from",
+        "valid_until",
+        "superseded_at",
+        "superseded_by",
+        "revoked_at"
+      ],
+      "properties": {
+        "valid_from": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "valid_until": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "superseded_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "superseded_by": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revoked_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "sourceAttribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "origin_scope",
+        "source_sequence",
+        "occurred_at",
+        "ingested_at",
+        "validity"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/originalSourceIdentity"
+        },
+        "origin_scope": {
+          "$ref": "#/$defs/originScopeEvidence"
+        },
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "occurred_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ingested_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "validity": {
+          "$ref": "#/$defs/recordedSourceValidity"
+        }
+      }
+    },
+    "currentSourceDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "authority_ref",
+        "authority_revision",
+        "checked_at"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "available",
+            "superseded",
+            "revoked",
+            "deleted",
+            "redacted",
+            "expired",
+            "unknown"
+          ]
+        },
+        "authority_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "authority_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "checked_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        }
+      }
+    },
+    "restoreDispositionCheckpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exact_scope",
+        "authority_ref",
+        "authority_revision",
+        "checked_at"
+      ],
+      "properties": {
+        "exact_scope": {
+          "$ref": "#/$defs/commonExactScope"
+        },
+        "authority_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "authority_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "checked_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        }
+      }
+    },
+    "grantedHistorySource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attribution",
+        "current_disposition"
+      ],
+      "properties": {
+        "attribution": {
+          "$ref": "#/$defs/sourceAttribution"
+        },
+        "current_disposition": {
+          "$ref": "#/$defs/currentSourceDisposition"
+        }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "attribution": {
+              "properties": {
+                "origin_scope": {
+                  "properties": {
+                    "state": {
+                      "const": "recorded"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "historyGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorization_ref",
+        "policy_revision",
+        "destination_scope",
+        "relation",
+        "sources",
+        "disposition_checkpoint"
+      ],
+      "properties": {
+        "authorization_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "policy_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "destination_scope": {
+          "$ref": "#/$defs/commonExactScope"
+        },
+        "relation": {
+          "enum": [
+            "exact_scope",
+            "same_checkout"
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/grantedHistorySource"
+          }
+        },
+        "disposition_checkpoint": {
+          "$ref": "#/$defs/restoreDispositionCheckpoint"
+        }
+      }
+    },
+    "commonAdvisoryObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_id",
+        "idempotency_key",
+        "provider_id",
+        "registration_revision",
+        "ready_receipt_digest",
+        "exact_scope_identity",
+        "source_identity",
+        "observation_kind",
+        "payload_contract",
+        "canonical_payload",
+        "payload_sha256",
+        "extensions",
+        "provenance",
+        "privacy",
+        "occurred_at",
+        "admitted_at",
+        "source_sequence",
+        "request_identity",
+        "deadline",
+        "cancellation"
+      ],
+      "properties": {
+        "observation_id": {},
+        "idempotency_key": {},
+        "provider_id": {},
+        "registration_revision": {},
+        "ready_receipt_digest": {},
+        "exact_scope_identity": {},
+        "source_identity": {
+          "type": "object",
+          "required": [
+            "original_source"
+          ],
+          "properties": {
+            "original_source": {
+              "$ref": "#/$defs/sourceAttribution"
+            }
+          }
+        },
+        "observation_kind": {
+          "enum": [
+            "session.message_committed.v1",
+            "source.edit_settled.v1",
+            "test.execution_settled.v1",
+            "feedback.outcome_settled.v1"
+          ]
+        },
+        "payload_contract": {},
+        "canonical_payload": {
+          "type": "object"
+        },
+        "payload_sha256": {},
+        "extensions": {},
+        "provenance": {},
+        "privacy": {},
+        "occurred_at": {},
+        "admitted_at": {},
+        "source_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "request_identity": {},
+        "deadline": {},
+        "cancellation": {},
+        "history_grant": {
+          "$ref": "#/$defs/historyGrant"
         }
       }
     }

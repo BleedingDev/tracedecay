@@ -22,7 +22,7 @@ use tracedecay_domain::{
 
 use crate::{
     ConfigurationRevisionRecordV1, EvidenceAssemblyReadOperationV1, EvidenceAssemblyReadResultV1,
-    FactCurrentQuery, FactLineageQuery, GitIndexTransactionRecordV1,
+    FactCurrentQuery, FactLineageQuery, GitIndexTransactionRecordV1, ObservationRecentWindowV1,
     RepositoryProvenanceAttachmentV1, RetrievalAnchorDerivativeV1,
     RetrievalAnchorDispositionRecordV1, RetrievalAnchorOwnerV1, RetrievalAnchorTombstoneV1,
     SourceAcquisitionQueueStateV1, SourceCommitReceiptV1, SourcePendingProjectionV1,
@@ -133,6 +133,7 @@ fn observation_read_matches_shard(
         }
         ObservationReadOperationV1::Observation { .. }
         | ObservationReadOperationV1::Replay { .. }
+        | ObservationReadOperationV1::RecentWindow { .. }
         | ObservationReadOperationV1::NextQueuedProjection { .. }
         | ObservationReadOperationV1::ProjectionCheckpoint
         | ObservationReadOperationV1::ProjectionRebuildProgress => matches!(
@@ -436,6 +437,9 @@ pub enum ObservationReadOperationV1 {
         after_sequence: u64,
         limit: u16,
     },
+    RecentWindow {
+        limit: u16,
+    },
     NextQueuedProjection {
         now_micros: i64,
     },
@@ -483,6 +487,7 @@ pub enum ObservationReadResultV1 {
     Observation(Box<Option<StoredObservationRowV1>>),
     RetrievalAnchorByAlias(Option<RetrievalAnchorId>),
     Replay(Vec<StoredObservationRowV1>),
+    RecentWindow(Option<ObservationRecentWindowV1>),
     NextQueuedProjection(Option<CanonicalObservationIdV1>),
     ProjectionCheckpoint(u64),
     ProjectionRebuildProgress(Option<ProjectionRebuildProgressV1>),
@@ -690,6 +695,37 @@ mod tests {
             },
             scope_digest: ManifestDigest::new(format!("sha256:{}", "aa".repeat(32))).unwrap(),
             key_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn recent_observation_window_read_requires_a_registered_session_shard() {
+        let operation = RepositoryReadOperationV1::Project(ProjectReadOperationV1::Observation(
+            ObservationReadOperationV1::RecentWindow { limit: 256 },
+        ));
+        for scope in [
+            StoreShardScopeV1::ProfileSessions,
+            StoreShardScopeV1::ProjectSessions {
+                project_id: project("project.a"),
+            },
+        ] {
+            assert!(
+                operation
+                    .validate_for_binding(&binding("profile.a", scope))
+                    .is_ok()
+            );
+        }
+        for scope in [
+            StoreShardScopeV1::ProfileMemory,
+            StoreShardScopeV1::Project {
+                project_id: project("project.a"),
+            },
+        ] {
+            assert!(
+                operation
+                    .validate_for_binding(&binding("profile.a", scope))
+                    .is_err()
+            );
         }
     }
 

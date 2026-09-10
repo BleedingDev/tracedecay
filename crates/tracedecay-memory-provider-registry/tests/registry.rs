@@ -506,7 +506,20 @@ fn enabled_mode_injects_native_with_configured_revision_mode_and_limits()
         assert_eq!(statuses[0].provider_id.as_str(), NATIVE_PROVIDER_ID);
         assert_eq!(statuses[0].registration_revision, registration_revision);
         assert_eq!(statuses[0].mode, expected_mode);
+        assert!(
+            !registry
+                .selected_registration()
+                .expect("legacy Native registration")
+                .requires_common_advisory_profile,
+            "legacy Native composition preserves extension recall semantics"
+        );
         assert_eq!(statuses[0].descriptor.limits, native_limits);
+        assert_eq!(
+            registry
+                .recall_scope_bindings(&statuses[0].provider_id)
+                .is_some(),
+            mode == EnabledProviderMode::Active
+        );
         assert!(port.descriptor_calls.load(Ordering::Relaxed) >= 2);
     }
     Ok(())

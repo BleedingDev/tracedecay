@@ -1139,3 +1139,90 @@ fn cline_stream_alias_refuses_changed_usage_or_wrong_native_stream() {
         assert_eq!(alias, old.retrieval_anchor_id().as_str());
     }
 }
+
+#[test]
+fn recent_sequence_window_is_empty_or_newest_bounded_rows_with_gaps() {
+    use tracedecay_store::ObservationRecentWindowV1;
+    let mut connection = connection();
+    assert_eq!(
+        read(
+            &mut connection,
+            &ObservationReadOperationV1::RecentWindow { limit: 2 }
+        )
+        .unwrap(),
+        ObservationReadResultV1::RecentWindow(None)
+    );
+    // The read must inspect sequence metadata only. These payload fields are
+    // deliberately not decodable observations; a later replay must validate them.
+    for sequence in [7_i64, 90, 300] {
+        connection.execute("INSERT INTO observations (sequence, observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json) VALUES (?1, ?2, 'unread', 'unread', 'unread', 'unread')", rusqlite::params![sequence, format!("row.{sequence}")]).unwrap();
+    }
+    for (limit, first_sequence, has_older) in [
+        (1, 300, true),
+        (2, 90, true),
+        (3, 7, false),
+        (4096, 7, false),
+    ] {
+        assert_eq!(
+            read(
+                &mut connection,
+                &ObservationReadOperationV1::RecentWindow { limit }
+            )
+            .unwrap(),
+            ObservationReadResultV1::RecentWindow(Some(ObservationRecentWindowV1 {
+                first_sequence,
+                last_sequence: 300,
+                has_older
+            }))
+        );
+    }
+    for limit in [0, 4097, u16::MAX] {
+        assert!(
+            read(
+                &mut connection,
+                &ObservationReadOperationV1::RecentWindow { limit }
+            )
+            .is_err()
+        );
+    }
+    connection
+        .execute(
+            "UPDATE observations SET sequence = 0 WHERE sequence = 7",
+            [],
+        )
+        .unwrap();
+    assert!(
+        read(
+            &mut connection,
+            &ObservationReadOperationV1::RecentWindow { limit: 3 }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn recent_sequence_window_reads_at_most_the_requested_newest_rows_plus_one() {
+    use tracedecay_store::ObservationRecentWindowV1;
+    let mut connection = connection();
+    connection.execute_batch("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5000) INSERT INTO observations (sequence, observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json) SELECT n, 'row.' || n, 'unread', 'unread', 'unread', 'unread' FROM seq;").unwrap();
+    // The invalid old row is beyond LIMIT 4097 and therefore cannot be read
+    // by this request. This catches widening the sequence lookup to all rows.
+    connection
+        .execute(
+            "UPDATE observations SET sequence = 0 WHERE sequence = 1",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        read(
+            &mut connection,
+            &ObservationReadOperationV1::RecentWindow { limit: 4096 }
+        )
+        .unwrap(),
+        ObservationReadResultV1::RecentWindow(Some(ObservationRecentWindowV1 {
+            first_sequence: 905,
+            last_sequence: 5000,
+            has_older: true
+        }))
+    );
+}

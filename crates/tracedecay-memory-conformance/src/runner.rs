@@ -207,7 +207,7 @@ fn host_handshake_control_response(
     })
 }
 
-fn host_control_reply(
+pub(crate) fn host_control_reply(
     call: &ProviderCall,
     terminal_code: TerminalCode,
     state_generation: u64,
@@ -230,7 +230,9 @@ fn host_control_reply(
     })
 }
 
-fn materialize_handshake(fixture: &ScenarioFixture) -> Result<HandshakeRequest, EvaluationError> {
+pub(crate) fn materialize_handshake(
+    fixture: &ScenarioFixture,
+) -> Result<HandshakeRequest, EvaluationError> {
     let handshake = fixture.handshake();
     Ok(HandshakeRequest::new(HandshakeRequestParts {
         provider_id: fixture.identity().provider().provider_id().clone(),
@@ -270,7 +272,7 @@ pub(crate) fn admitted(call: ProviderCall) -> Result<ProviderCall, ApiError> {
     Ok(call.with_sanitization(receipt))
 }
 
-fn materialize_operation(
+pub(crate) fn materialize_operation(
     fixture: &ScenarioFixture,
     operation: &OperationFixture,
     ready_receipt_sha256: &str,
@@ -293,7 +295,7 @@ fn materialize_operation(
     })?)?)
 }
 
-fn evaluate_handshake(
+pub(crate) fn evaluate_handshake(
     fixture: &HandshakeFixture,
     request: &HandshakeRequest,
     response: &HandshakeResponse,
@@ -503,7 +505,7 @@ fn evaluate_handshake(
     violations
 }
 
-fn evaluate_operation(
+pub(crate) fn evaluate_operation(
     fixture: &OperationFixture,
     call: &ProviderCall,
     reply: &ProviderReply,
@@ -963,6 +965,16 @@ fn evaluate_generation(
 ) {
     let expected = match expectation {
         GenerationExpectation::Any => return,
+        GenerationExpectation::Increased if actual > before => return,
+        GenerationExpectation::Increased => {
+            violations.push(ConformanceViolation::new(
+                step_id,
+                "state_generation",
+                format!("greater than {before}"),
+                actual.to_string(),
+            ));
+            return;
+        }
         GenerationExpectation::Unchanged => Some(before),
         GenerationExpectation::IncreasedBy(delta) => before.checked_add(delta),
     };

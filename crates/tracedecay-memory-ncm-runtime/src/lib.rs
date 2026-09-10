@@ -12,6 +12,7 @@ pub mod maintenance;
 pub mod ports;
 pub mod privacy;
 pub mod snapshot;
+mod source_binding;
 pub mod store;
 pub mod wire;
 pub mod worker;

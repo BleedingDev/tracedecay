@@ -11,6 +11,7 @@ mod recovery;
 mod retention;
 pub(crate) mod row;
 mod schema;
+mod source_delivery;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -24,6 +25,10 @@ use crate::recovery::RecoveryTimeBudgetV1;
 use crate::retention::RetentionPolicyV1;
 use crate::settlement::SourceAuthorityV1;
 
+pub use retention::{
+    ProviderSourceDeletionIntentV1, ProviderSourceFenceV1, ProviderSourceIntentReceiptV1,
+    ProviderSourceRevisionAdmissionV1,
+};
 pub use row::WithheldAuditProgressV1;
 pub use schema::{OPEN_WITHHELD_AUDIT_ROWS, SCHEMA_VERSION};
 
@@ -125,14 +130,37 @@ impl SqliteObservationJournal {
         path: impl AsRef<Path>,
         policy: RetentionPolicyV1,
     ) -> Result<Self, ObservationJournalError> {
-        policy.validate()?;
-        let mut connection = Connection::open_with_flags(
+        Self::open_with_flags(
             path,
+            policy,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        )
+    }
+
+    /// Opens and migrates an existing host journal without creating a missing file.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        policy: RetentionPolicyV1,
+    ) -> Result<Self, ObservationJournalError> {
+        Self::open_with_flags(
+            path,
+            policy,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+    }
+
+    fn open_with_flags(
+        path: impl AsRef<Path>,
+        policy: RetentionPolicyV1,
+        flags: OpenFlags,
+    ) -> Result<Self, ObservationJournalError> {
+        policy.validate()?;
+        let mut connection = Connection::open_with_flags(path, flags)?;
         let resume_after = schema::initialize(&mut connection)?;
         Ok(Self::mounted(connection, policy, resume_after))
     }
@@ -310,12 +338,24 @@ impl SqliteObservationJournal {
         operation: &'static str,
         budget: RecoveryTimeBudgetV1,
     ) -> Result<MutexGuard<'_, Connection>, ObservationJournalError> {
+        self.lock_within_cancellable(operation, budget, None)
+    }
+
+    fn lock_within_cancellable(
+        &self,
+        operation: &'static str,
+        budget: RecoveryTimeBudgetV1,
+        cancellation: Option<&tracedecay_memory_provider_api::CancellationToken>,
+    ) -> Result<MutexGuard<'_, Connection>, ObservationJournalError> {
         if budget.is_spent() {
             return Err(ObservationJournalError::BudgetExhausted { operation });
         }
         let remaining = u64::try_from(budget.remaining_micros).unwrap_or(0);
         let deadline = Instant::now() + Duration::from_micros(remaining);
         loop {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                return Err(ObservationJournalError::OperationCancelled { operation });
+            }
             match self.connection.try_lock() {
                 Ok(guard) => return Ok(guard),
                 Err(TryLockError::Poisoned(_)) => {
@@ -332,6 +372,24 @@ impl SqliteObservationJournal {
                 }
             }
         }
+    }
+
+    /// The cancellable variant uses the same mutex polling and SQLite budget.
+    fn with_cancellable_bounded_connection<T, F>(
+        &self,
+        operation: &'static str,
+        budget: RecoveryTimeBudgetV1,
+        cancellation: &tracedecay_memory_provider_api::CancellationToken,
+        action: F,
+    ) -> Result<T, ObservationJournalError>
+    where
+        F: FnOnce(&Connection) -> Result<T, ObservationJournalError>,
+    {
+        let started = Instant::now();
+        let mut guard = self.lock_within_cancellable(operation, budget, Some(cancellation))?;
+        with_busy_budget(&mut guard, operation, budget, started, |connection| {
+            action(connection)
+        })
     }
 
     /// Runs one read inside the caller's remaining budget.

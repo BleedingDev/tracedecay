@@ -8,6 +8,11 @@ A provider uses stable `MemoryProviderIdV1` identity. Display names, process IDs
 
 ## Mandatory versus optional
 
+The [common advisory profile](common-advisory-profile.md) is an explicit opt-in
+completion profile layered on the legacy minimum below. Its canonical marker is
+`memory.advisory_common.v1`; claiming it requires every shared lifecycle operation
+and all temporal modes. It does not activate a provider or change legacy defaults.
+
 The authoritative registry has two non-overlapping sets:
 
 - Mandatory: `provider.health.v1`, `observation.accept.v1`, and `recall.query.v1`. A registered provider cannot become ready without all three.

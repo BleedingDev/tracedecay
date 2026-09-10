@@ -76,6 +76,80 @@ pub(super) fn session_meta(path: &Path) -> Option<CodexMeta> {
     session_meta_with_provenance(path).map(|parsed| parsed.meta)
 }
 
+struct LiveCodexHeaderReader<'a> {
+    file: &'a std::fs::File,
+    deadline: std::time::Instant,
+}
+
+impl std::io::Read for LiveCodexHeaderReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        std::io::Read::read(&mut self.file, buffer)
+    }
+}
+
+/// Strict live bootstrap reads one complete native header. Historical ingest's
+/// four-frame search and filename-derived identity are deliberately unavailable.
+pub(super) fn live_session_meta_cwd(
+    file: &std::fs::File,
+    native_session: &str,
+    deadline: std::time::Instant,
+) -> crate::runtime::source::TranscriptIngestResult<Option<PathBuf>> {
+    use std::io::Read;
+
+    const MAX_LIVE_HEADER_BYTES: usize = 64 * 1024;
+    super::check_live_codex_deadline(deadline)?;
+    let reader = BufReader::with_capacity(
+        4096,
+        LiveCodexHeaderReader { file, deadline }.take((MAX_LIVE_HEADER_BYTES + 1) as u64),
+    );
+    let mut frames = RawJsonlFrameReader::new(reader, MAX_LIVE_HEADER_BYTES);
+    let frame = frames
+        .next_frame_with_budget((MAX_LIVE_HEADER_BYTES + 1) as u64)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                crate::runtime::source::TranscriptIngestError::Cancelled { provider: "codex" }
+            } else {
+                crate::runtime::source::TranscriptIngestError::InvalidFrameState {
+                    provider: "codex",
+                }
+            }
+        })?;
+    super::check_live_codex_deadline(deadline)?;
+    if !matches!(frame, RawJsonlFrame::Complete { .. }) {
+        return Ok(None);
+    }
+    let Ok(record) = serde_json::from_slice::<Value>(frames.record()) else {
+        return Ok(None);
+    };
+    super::check_live_codex_deadline(deadline)?;
+    if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(None);
+    }
+    let Some(payload) = record.get("payload").filter(|payload| payload.is_object()) else {
+        return Ok(None);
+    };
+    // If both native fields are present they must agree. A missing, empty or
+    // wrongly typed id must never fall back to a matching rollout filename.
+    let id = payload.get("id");
+    let session_id = payload.get("session_id");
+    if id.is_none() && session_id.is_none()
+        || [id, session_id]
+            .into_iter()
+            .flatten()
+            .any(|value| value.as_str() != Some(native_session))
+    {
+        return Ok(None);
+    }
+    Ok(payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from))
+}
+
 pub(super) fn session_meta_with_provenance(path: &Path) -> Option<CodexMetaWithProvenance> {
     #[cfg(test)]
     {

@@ -25,18 +25,19 @@ use tracedecay_store::{
     CursorAdvanceLedgerIdentityV1, DurabilityClassV1, IdempotencyIdentityV1,
     ObservationBatchFallbackCause, ObservationBatchPersistOutcome, ObservationCommitReceipt,
     ObservationPersistOutcome, ObservationProjectionStatus, ObservationProjectionStore,
-    ObservationReadOperationV1, ObservationReadResultV1, ObservationReplayRequest,
-    ObservationStore, ObservationStoreError, ObservationStoreResult, OperationPriorityV1,
-    ProjectReadOperationV1, ProjectReadResultV1, ProjectionCheckpoint, ProjectionPersistOutcome,
-    ProjectionPredecessorConvergence, ProjectionRebuildOutcome, ProjectionStoreResult,
-    RepositoryOperationEnvelopeV1, RepositoryProvenanceAttachmentV1, RepositoryReadOperationV1,
-    RepositoryReadResultV1, RepositoryWritePayloadV1, RuntimeBatchCompatibilityV1,
-    RuntimeCancellationIdV1, RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1,
-    RuntimeInterruptionV1, RuntimeReadCoverageV1, RuntimeReadOperationV1, RuntimeReadRequestV1,
-    RuntimeReadResultV1, RuntimeRequestControlV1, RuntimeRequestProbeV1, RuntimeSubmitOutcomeV1,
-    RuntimeSubmitRequestV1, RuntimeTransactionIdV1, RuntimeTransactionScopeV1,
-    StorageRuntimeErrorV1, StoreClientIdV1, StoreIdempotencyKeyV1, StoreOperationIdV1,
-    StoreOperationMetadataV1, StoredObservation, StoredObservationRowV1,
+    ObservationReadOperationV1, ObservationReadResultV1, ObservationRecentWindowRequest,
+    ObservationRecentWindowV1, ObservationReplayRequest, ObservationStore, ObservationStoreError,
+    ObservationStoreResult, OperationPriorityV1, ProjectReadOperationV1, ProjectReadResultV1,
+    ProjectionCheckpoint, ProjectionPersistOutcome, ProjectionPredecessorConvergence,
+    ProjectionRebuildOutcome, ProjectionStoreResult, RepositoryOperationEnvelopeV1,
+    RepositoryProvenanceAttachmentV1, RepositoryReadOperationV1, RepositoryReadResultV1,
+    RepositoryWritePayloadV1, RuntimeBatchCompatibilityV1, RuntimeCancellationIdV1,
+    RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeInterruptionV1,
+    RuntimeReadCoverageV1, RuntimeReadOperationV1, RuntimeReadRequestV1, RuntimeReadResultV1,
+    RuntimeRequestControlV1, RuntimeRequestProbeV1, RuntimeSubmitOutcomeV1, RuntimeSubmitRequestV1,
+    RuntimeTransactionIdV1, RuntimeTransactionScopeV1, StorageRuntimeErrorV1, StoreClientIdV1,
+    StoreIdempotencyKeyV1, StoreOperationIdV1, StoreOperationMetadataV1, StoredObservation,
+    StoredObservationRowV1,
 };
 
 use tracedecay_runtime_core::db::{Database, DatabaseEngineReadSnapshot, DatabaseRuntimeClientV1};
@@ -1541,6 +1542,34 @@ impl ObservationStore for GlobalDbObservationStore {
         observation_id: &CanonicalObservationIdV1,
     ) -> ObservationStoreResult<Option<StoredObservation>> {
         read_runtime_stored_observation(&self.runtime, observation_id)
+    }
+
+    #[hotpath::skip]
+    async fn recent_observation_window(
+        &self,
+        request: ObservationRecentWindowRequest,
+    ) -> ObservationStoreResult<Option<ObservationRecentWindowV1>> {
+        let limit = u16::try_from(request.limit()).map_err(|_| {
+            runtime_storage_error(
+                "recent observation window",
+                "window limit exceeds runtime contract",
+            )
+        })?;
+        match dispatch_runtime_observation_read(
+            &self.runtime,
+            ObservationReadOperationV1::RecentWindow { limit },
+        )? {
+            ObservationReadResultV1::RecentWindow(window) => {
+                if let Some(window) = &window {
+                    window.validate()?;
+                }
+                Ok(window)
+            }
+            _ => Err(runtime_storage_error(
+                "recent observation window",
+                "runtime returned a mismatched observation read result",
+            )),
+        }
     }
 
     #[hotpath::skip]

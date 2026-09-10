@@ -702,6 +702,48 @@
         "detailed_contract_bead": "tdmem-0205",
         "advisory_only": true,
         "may_mutate_tracedecay_authority": false
+      },
+      {
+        "id": "memory.advisory_common.v1",
+        "requirement": "optional",
+        "purpose": "Explicit opt-in to the complete common advisory profile; all required behaviors must be implemented.",
+        "operation_class": "provider_local_read",
+        "inputs": [
+          {
+            "name": "request",
+            "contract_id": "tracedecay.memory.provider.health.request.v1",
+            "required": true,
+            "description": "Canonical provider-neutral request envelope admitted by TraceDecay."
+          }
+        ],
+        "outputs": [
+          {
+            "name": "outcome",
+            "contract_id": "tracedecay.memory.provider.health.outcome.v1",
+            "required": true,
+            "description": "Canonical typed outcome; success never hides degradation or terminal failure."
+          }
+        ],
+        "failure_modes": [
+          "invalid_request",
+          "scope_unavailable",
+          "capability_unsupported",
+          "deadline_exceeded",
+          "cancelled",
+          "provider_unavailable",
+          "contract_violation"
+        ],
+        "compatibility_rules": {
+          "capability_major": 1,
+          "major_version_rule": "exact_match",
+          "minor_extension_rule": "preserve_unknown_optional_fields",
+          "unknown_extension_rule": "preserve_opaque_or_reject_explicitly",
+          "activation_rule": "known_catalog_entry_and_explicit_registration_revision_and_explicit_selection",
+          "downgrade_rule": "no_implicit_downgrade"
+        },
+        "detailed_contract_bead": "tdmem-0201",
+        "advisory_only": true,
+        "may_mutate_tracedecay_authority": false
       }
     ]
   },
@@ -750,6 +792,9 @@
     },
     {
       "id": "inspection.read.v1"
+    },
+    {
+      "id": "memory.advisory_common.v1"
     }
   ],
   "unknown_capability_contract": {
@@ -939,5 +984,46 @@
     "tdmem-0403",
     "tdmem-0701",
     "tdmem-0702"
-  ]
+  ],
+  "common_advisory_profile": {
+    "profile_id": "memory.advisory_common.v1",
+    "required_capabilities": [
+      "provider.health.v1",
+      "observation.accept.v1",
+      "recall.query.v1",
+      "recall.temporal.v1",
+      "feedback.record.v1",
+      "maintenance.run.v1",
+      "inspection.read.v1",
+      "correction.apply.v1",
+      "deletion.by_source.v1",
+      "snapshot.export.v1",
+      "snapshot.restore.v1",
+      "replay.apply.v1"
+    ],
+    "required_observation_kinds": [
+      "session.message_committed.v1",
+      "source.edit_settled.v1",
+      "test.execution_settled.v1",
+      "feedback.outcome_settled.v1"
+    ],
+    "optional_capabilities": [
+      "recall.associative.v1",
+      "facts.explicit.v1",
+      "explain.trace.v1"
+    ],
+    "optional_observation_kinds": [
+      "tool.execution_settled.v1",
+      "diagnostic.observed.v1",
+      "git.evidence_observed.v1",
+      "native.fact_promoted.v1",
+      "automation.outcome_settled.v1"
+    ],
+    "legacy_mandatory_capabilities_unchanged": true,
+    "activation_requires_explicit_registration_and_selection": true,
+    "required_unsupported_is_compatibility_failure": true,
+    "canonical_fact_projection_in_common_profile": false,
+    "structured_evidence_projection": "bounded_supported_evidence_fields_never_arbitrary_json_as_message",
+    "provider_name_implies_profile": false
+  }
 }

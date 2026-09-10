@@ -35,6 +35,11 @@ pub struct GlobalDbSessionIngestAuthority<D> {
     /// authority the daemon worker plan installed; read-only callers that only
     /// resolve registered roots leave it unset.
     background_cpu: Option<Arc<ProcessBackgroundCpuV1>>,
+    original_provenance_resolver: Option<
+        Arc<
+            dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
+        >,
+    >,
 }
 
 impl<D> GlobalDbSessionIngestAuthority<D>
@@ -45,6 +50,7 @@ where
         Self {
             db,
             background_cpu: None,
+            original_provenance_resolver: None,
         }
     }
 
@@ -53,6 +59,18 @@ where
     #[must_use]
     pub fn with_background_cpu(mut self, background_cpu: Arc<ProcessBackgroundCpuV1>) -> Self {
         self.background_cpu = Some(background_cpu);
+        self
+    }
+
+    /// Supplies the root's existing live-event reader to every project capture.
+    #[must_use]
+    pub fn with_original_provenance_resolver(
+        mut self,
+        resolver: Arc<
+            dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
+        >,
+    ) -> Self {
+        self.original_provenance_resolver = Some(resolver);
         self
     }
 
@@ -103,7 +121,15 @@ where
                     self.db(),
                 );
                 match repository_provenance {
-                    Some(provenance) => authorities.with_repository_provenance(provenance),
+                    Some(provenance) => {
+                        let provenance = match &self.original_provenance_resolver {
+                            Some(resolver) => {
+                                provenance.with_original_provenance_resolver(Arc::clone(resolver))
+                            }
+                            None => provenance,
+                        };
+                        authorities.with_repository_provenance(provenance)
+                    }
                     None => authorities,
                 }
             }

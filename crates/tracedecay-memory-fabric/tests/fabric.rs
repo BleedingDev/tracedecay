@@ -3044,3 +3044,259 @@ fn observer_cannot_reach_the_canonical_state_write_port() -> Result<(), Box<dyn 
     assert_ne!(active_authority.state_digest(), quiescent_digest);
     Ok(())
 }
+
+#[test]
+fn lifecycle_controls_admit_active_and_observer_without_admitting_observer_recall()
+-> Result<(), Box<dyn Error>> {
+    const CONTROLS: [ProviderOperation; 9] = [
+        ProviderOperation::Feedback,
+        ProviderOperation::Correction,
+        ProviderOperation::DeleteBySource,
+        ProviderOperation::Health,
+        ProviderOperation::Inspection,
+        ProviderOperation::Maintenance,
+        ProviderOperation::SnapshotExport,
+        ProviderOperation::SnapshotRestore,
+        ProviderOperation::Replay,
+    ];
+    let extra: Vec<_> = CONTROLS
+        .iter()
+        .filter(|operation| **operation != ProviderOperation::Health)
+        .map(|operation| operation.capability_id())
+        .collect();
+    for mode in [ProviderMode::Active, ProviderMode::Observer] {
+        let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+        let provider = Arc::new(TestProvider::new("provider.lifecycle", &extra)?);
+        fabric.register(
+            provider_id("provider.lifecycle")?,
+            1,
+            mode,
+            provider.clone(),
+        )?;
+        fabric.handshake(&handshake_request("provider.lifecycle")?)?;
+        for operation in CONTROLS {
+            let request = call(
+                "provider.lifecycle",
+                operation,
+                operation.mutates_provider_state().then_some(DIGEST),
+                &[operation.capability_id()],
+                OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+            )?;
+            let reply = fabric.invoke_control(&request)?;
+            assert_eq!(reply.terminal.operation(), operation);
+            assert_eq!(reply.terminal.provider_id(), &request.provider_id);
+            assert_eq!(reply.terminal.operation_id(), request.operation_id);
+        }
+        assert_eq!(provider.invocation_count(), CONTROLS.len());
+        let recall = call(
+            "provider.lifecycle",
+            ProviderOperation::Recall,
+            None,
+            &["recall.query.v1"],
+            OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        )?;
+        assert_eq!(
+            fabric.invoke_control(&recall),
+            Err(FabricError::OperationNotControl)
+        );
+        if mode == ProviderMode::Observer {
+            assert_eq!(
+                fabric.invoke_active(&recall),
+                Err(FabricError::ProviderObserverOnly(
+                    "provider.lifecycle".to_owned()
+                ))
+            );
+            assert_eq!(provider.invocation_count(), CONTROLS.len());
+        } else {
+            fabric.invoke_active(&recall)?;
+            assert_eq!(provider.invocation_count(), CONTROLS.len() + 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn control_refusals_never_contact_the_original_or_another_provider() -> Result<(), Box<dyn Error>> {
+    let fabric = MemoryFabric::new(FabricConfig::new(2, 2)?)?;
+    let original = Arc::new(TestProvider::new("provider.original", &[])?);
+    let other = Arc::new(TestProvider::new("provider.other", &[])?);
+    fabric.register(
+        provider_id("provider.original")?,
+        1,
+        ProviderMode::Observer,
+        original.clone(),
+    )?;
+    fabric.register(
+        provider_id("provider.other")?,
+        1,
+        ProviderMode::Active,
+        other.clone(),
+    )?;
+    let request = call(
+        "provider.original",
+        ProviderOperation::Health,
+        None,
+        &["provider.health.v1"],
+        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+    )?;
+    assert_eq!(
+        fabric.invoke_control(&request),
+        Err(FabricError::ProviderNotReady(
+            "provider.original".to_owned()
+        ))
+    );
+    fabric.handshake(&handshake_request("provider.original")?)?;
+    fabric.handshake(&handshake_request("provider.other")?)?;
+
+    let mut stale_revision = request.clone();
+    stale_revision.registration_revision = 2;
+    assert_eq!(
+        fabric.invoke_control(&stale_revision),
+        Err(FabricError::RegistrationRevisionMismatch {
+            accepted: 1,
+            requested: 2
+        })
+    );
+    let mut unknown = request.clone();
+    unknown.provider_id = provider_id("provider.absent")?;
+    assert_eq!(
+        fabric.invoke_control(&unknown),
+        Err(FabricError::ProviderUnknown("provider.absent".to_owned()))
+    );
+    let mut stale_receipt = request.clone();
+    stale_receipt.ready_receipt_sha256 = SECOND_DIGEST.to_owned();
+    assert_eq!(
+        fabric.invoke_control(&stale_receipt),
+        Err(FabricError::ReadyReceiptMismatch)
+    );
+    let mut wrong_scope = request.clone();
+    wrong_scope.exact_scope.worktree_identity = "other-worktree".to_owned();
+    assert_eq!(
+        fabric.invoke_control(&wrong_scope),
+        Err(FabricError::ReadyScopeMismatch)
+    );
+    let mut wrong_generation = request.clone();
+    wrong_generation.expected_state_generation = 1;
+    assert_eq!(
+        fabric.invoke_control(&wrong_generation),
+        Err(FabricError::ReadyStateGenerationMismatch {
+            ready: 0,
+            requested: 1
+        })
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let mut cancelled = request.clone();
+    cancelled.control = OperationControl::new(i64::MAX, 1_000, cancellation);
+    assert_eq!(
+        fabric.invoke_control(&cancelled),
+        Err(FabricError::Cancelled)
+    );
+    let mut expired = request.clone();
+    expired.control = OperationControl::new(i64::MAX, 0, CancellationToken::new());
+    assert_eq!(
+        fabric.invoke_control(&expired),
+        Err(FabricError::DeadlineExceeded)
+    );
+    let correction = call(
+        "provider.original",
+        ProviderOperation::Correction,
+        Some(DIGEST),
+        &["correction.apply.v1"],
+        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+    )?;
+    assert_eq!(
+        fabric.invoke_control(&correction),
+        Err(FabricError::MissingCapability(
+            "correction.apply.v1".to_owned()
+        ))
+    );
+    let mut missing_key = correction;
+    missing_key.idempotency_key = None;
+    assert_eq!(
+        fabric.invoke_control(&missing_key),
+        Err(FabricError::Api(ApiError::MissingIdempotencyKey))
+    );
+
+    for operation in [
+        ProviderOperation::Recall,
+        ProviderOperation::Observe,
+        ProviderOperation::Handshake,
+    ] {
+        let forbidden = call(
+            "provider.original",
+            operation,
+            operation.mutates_provider_state().then_some(DIGEST),
+            &[operation.capability_id()],
+            OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        )?;
+        assert_eq!(
+            fabric.invoke_control(&forbidden),
+            Err(FabricError::OperationNotControl)
+        );
+    }
+    let mut bounded_handshake = handshake_request("provider.original")?;
+    bounded_handshake.host_limits.request_bytes = 128;
+    fabric.handshake(&bounded_handshake)?;
+    assert_eq!(
+        fabric.invoke_control(&request),
+        Err(FabricError::Api(ApiError::BoundaryBytesExceeded {
+            field: "request",
+            maximum: 128
+        }))
+    );
+    fabric.set_mode(
+        &provider_id("provider.original")?,
+        1,
+        ProviderMode::Disabled,
+    )?;
+    assert_eq!(
+        fabric.invoke_control(&request),
+        Err(FabricError::ProviderDisabled(
+            "provider.original".to_owned()
+        ))
+    );
+    assert_eq!(original.invocation_count(), 0);
+    assert_eq!(other.invocation_count(), 0);
+    assert_eq!(original.handshake_count(), 2);
+    assert_eq!(other.handshake_count(), 1);
+    Ok(())
+}
+
+#[test]
+fn control_terminal_mismatch_invalidates_readiness_before_another_dispatch()
+-> Result<(), Box<dyn Error>> {
+    let provider_name = "provider.control-terminal";
+    let reply = TestProvider::new(provider_name, &[])?
+        .default_recall_reply
+        .clone();
+    let provider = Arc::new(TestProvider::scripted(provider_name, reply)?);
+    let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+    fabric.register(
+        provider_id(provider_name)?,
+        1,
+        ProviderMode::Observer,
+        provider.clone(),
+    )?;
+    fabric.handshake(&handshake_request(provider_name)?)?;
+    let request = call(
+        provider_name,
+        ProviderOperation::Health,
+        None,
+        &["provider.health.v1"],
+        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+    )?;
+    assert_eq!(
+        fabric.invoke_control(&request),
+        Err(FabricError::ResponseOperationKindMismatch {
+            expected: ProviderOperation::Health,
+            returned: ProviderOperation::Recall
+        })
+    );
+    assert_eq!(
+        fabric.invoke_control(&request),
+        Err(FabricError::ProviderNotReady(provider_name.to_owned()))
+    );
+    assert_eq!(provider.invocation_count(), 1);
+    Ok(())
+}

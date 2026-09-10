@@ -6,7 +6,7 @@
 
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, MaintenanceKind,
-    NamespaceHandle, NcmEngine, Outcome, RejectReason,
+    NamespaceHandle, NcmEngine, Outcome, RejectReason, portable_common_maintenance_event,
 };
 use crate::ports::{Deadline, StateRoot};
 use crate::store::{
@@ -164,13 +164,27 @@ pub fn export(
         .store
         .capsules_in_commit_order(false)
         .map_err(|error| store_reply(error, handle.commit_seq))?;
-    let events = handle
+    let retained_events = handle
         .store
         .events_after(0)
-        .map_err(|error| store_reply(error, handle.commit_seq))?
-        .into_iter()
-        .filter(|event| matches!(event.kind.as_str(), "feedback" | "correction"))
-        .collect::<Vec<_>>();
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let mut events = Vec::new();
+    for event in retained_events {
+        let common_maintenance = portable_common_maintenance_event(namespace, &event)
+            .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
+        if common_maintenance
+            || matches!(
+                event.kind.as_str(),
+                "feedback" | "correction" | "common_control"
+            )
+            || (event.kind == "observe"
+                && capsules
+                    .iter()
+                    .any(|capsule| capsule.commit_seq == event.seq))
+        {
+            events.push(event);
+        }
+    }
     let meta = handle
         .store
         .meta()
@@ -347,7 +361,7 @@ fn atomic_write(temporary_file: &Path, destination: &Path, bytes: &[u8]) -> Resu
     result
 }
 
-fn read_transport_file(
+pub(crate) fn read_transport_file(
     root: &StateRoot,
     namespace: &str,
     snapshot_file: &Path,
@@ -421,6 +435,17 @@ pub fn restore(
     request: RestoreRequest,
     deadline: Deadline,
 ) -> EngineReply {
+    restore_with_revocations(engine, namespace, request, deadline, &[], None)
+}
+
+pub(crate) fn restore_with_revocations(
+    engine: &NcmEngine,
+    namespace: &str,
+    request: RestoreRequest,
+    deadline: Deadline,
+    blocked_sources: &[SourceId],
+    expected_generation: Option<u64>,
+) -> EngineReply {
     if deadline.remaining_ms == 0 {
         return EngineReply::new(Outcome::Cancelled, 0, Value::Null);
     }
@@ -428,10 +453,15 @@ pub fn restore(
         return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
     }
     let snapshot_digest = sha256_hex(&request.bytes);
-    let validated = match validate_snapshot(engine, namespace, &request.bytes) {
+    let mut validated = match validate_snapshot(engine, namespace, &request.bytes) {
         Ok(snapshot) => snapshot,
         Err(reply) => return reply,
     };
+    if blocked_sources.iter().any(|source| source.0.is_empty())
+        || blocked_sources.iter().collect::<BTreeSet<_>>().len() != blocked_sources.len()
+    {
+        return rejected("invalid blocked restore inventory");
+    }
     if validated
         .content
         .events
@@ -461,38 +491,101 @@ pub fn restore(
         Ok(current) => current,
         Err(reply) => return reply,
     };
-    let (current_seq, current_epoch, revocations) = if let Some(handle) = current {
-        if handle.fenced {
-            return EngineReply::new(Outcome::Busy, handle.commit_seq, Value::Null);
-        }
-        match lookup_restore_replay(handle, &request.idempotency_key, &snapshot_digest) {
-            Ok(Some(reply)) => return reply,
-            Ok(None) => {}
-            Err(reply) => return reply,
-        }
-        let revocations = match handle.store.revocations() {
-            Ok(revocations) => revocations,
-            Err(error) => return store_reply(error, handle.commit_seq),
+    let (current_seq, current_epoch, next_record_id, mut revocations) =
+        if let Some(handle) = current {
+            if handle.fenced {
+                return EngineReply::new(Outcome::Busy, handle.commit_seq, Value::Null);
+            }
+            let revocations = match handle.store.revocations() {
+                Ok(revocations) => revocations,
+                Err(error) => return store_reply(error, handle.commit_seq),
+            };
+            match lookup_restore_replay(handle, &request.idempotency_key, &snapshot_digest) {
+                Ok(Some(reply)) => {
+                    return if blocked_sources
+                        .iter()
+                        .any(|source| !revocations.iter().any(|row| &row.source_id == source))
+                    {
+                        EngineReply::rejected(RejectReason::IdempotencyConflict, handle.commit_seq)
+                    } else {
+                        reply
+                    };
+                }
+                Ok(None) => {}
+                Err(reply) => return reply,
+            }
+            let next_record_id = match handle.store.next_record_id() {
+                Ok(next_record_id) => next_record_id,
+                Err(error) => return store_reply(error, handle.commit_seq),
+            };
+            (handle.commit_seq, handle.epoch, next_record_id, revocations)
+        } else {
+            (0, 0, 1, Vec::new())
         };
-        (handle.commit_seq, handle.epoch, revocations)
-    } else {
-        (0, 0, Vec::new())
-    };
-    let revoked = revocations
-        .iter()
-        .map(|row| row.source_id.clone())
-        .collect::<BTreeSet<_>>();
-    let stripped = validated
-        .content
-        .capsules
-        .iter()
-        .filter(|capsule| revoked.contains(&capsule.source_id))
-        .map(|capsule| capsule.source_id.clone())
-        .collect::<BTreeSet<_>>();
+    if expected_generation.is_some_and(|expected| expected != current_seq) {
+        return EngineReply::rejected(RejectReason::IdempotencyConflict, current_seq);
+    }
+    // Rollback discards records, but their saved numeric targets must never
+    // identify a later observation. Stage the destination's allocation floor
+    // with the imported kernel so the store, checkpoint, and live state agree.
+    if let Err(reply) = preserve_record_identity_floor(&mut validated.kernel, next_record_id) {
+        return reply;
+    }
     let target_epoch = match current_epoch.max(validated.content.epoch).checked_add(1) {
         Some(epoch) => epoch,
         None => return corrupt_reply(current_seq, "snapshot restore epoch overflow"),
     };
+    let new_revocation_seq = match current_seq.max(validated.content.commit_seq).checked_add(1) {
+        Some(seq) => seq,
+        None => return corrupt_reply(current_seq, "snapshot restore sequence overflow"),
+    };
+    for source in blocked_sources {
+        if !revocations.iter().any(|row| &row.source_id == source) {
+            revocations.push(Revocation {
+                source_id: source.clone(),
+                epoch: target_epoch,
+                seq: new_revocation_seq,
+            });
+        }
+    }
+    let revoked = revocations
+        .iter()
+        .map(|row| row.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut stripped = BTreeSet::new();
+    for capsule in &validated.content.capsules {
+        let binding = match crate::source_binding::read_text(
+            namespace,
+            &capsule.source_id,
+            &capsule.provenance,
+        ) {
+            Ok(binding) => binding,
+            Err(reason) => return corrupt_reply(current_seq, &reason),
+        };
+        if let Some(binding) = &binding {
+            if binding.is_legacy
+                && match &binding.full_source_id {
+                    Some(full) => revoked.contains(full),
+                    None => !revoked.is_empty(),
+                }
+            {
+                return EngineReply::rejected(
+                    RejectReason::InvalidRequest(
+                        "legacy snapshot source cannot cross current full-source revocation"
+                            .to_owned(),
+                    ),
+                    current_seq,
+                );
+            }
+        }
+        if revoked.contains(&capsule.source_id)
+            || binding
+                .as_ref()
+                .is_some_and(|binding| revoked.contains(&binding.legacy_source_id))
+        {
+            stripped.insert(capsule.source_id.clone());
+        }
+    }
     let base_seq = current_seq.max(validated.content.commit_seq);
     let target_seq = match base_seq.checked_add(if stripped.is_empty() { 1 } else { 2 }) {
         Some(seq) => seq,
@@ -886,11 +979,7 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
     let mut sequences = BTreeSet::new();
     let mut keys = BTreeSet::new();
     for event in &content.events {
-        if event.seq == 0
-            || event.seq > content.commit_seq
-            || capsule_sequences.contains(&event.seq)
-            || !sequences.insert(event.seq)
-        {
+        if event.seq == 0 || event.seq > content.commit_seq || !sequences.insert(event.seq) {
             return Err(rejected("snapshot event sequence is invalid"));
         }
         if let Some(key) = &event.idempotency_key
@@ -902,11 +991,42 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         }
         let receipt: DurableReceipt = serde_json::from_str(&event.receipt)
             .map_err(|error| rejected(&format!("decode snapshot event receipt: {error}")))?;
-        if !matches!(
-            (event.kind.as_str(), &receipt.operation),
-            ("feedback", DurableOperation::Feedback { .. })
-                | ("correction", DurableOperation::Correction { .. })
-        ) {
+        let portable_maintenance = portable_common_maintenance_event(&content.namespace, event)
+            .map_err(|reason| rejected(&reason))?;
+        let portable_control = match &receipt.operation {
+            DurableOperation::CommonControl { operations } => {
+                event.kind == "common_control"
+                    && operations.iter().all(|operation| match operation {
+                        DurableOperation::Observe { record_id } => {
+                            content.capsules.iter().any(|capsule| {
+                                capsule.record_id == *record_id && capsule.commit_seq == event.seq
+                            })
+                        }
+                        DurableOperation::Feedback { .. } | DurableOperation::Correction { .. } => {
+                            true
+                        }
+                        _ => false,
+                    })
+            }
+            _ => false,
+        };
+        let owns_capsule = match &receipt.operation {
+            DurableOperation::Observe { record_id } => content.capsules.iter().filter(|capsule| capsule.commit_seq == event.seq).count() == 1 && content.capsules.iter().any(|capsule| capsule.commit_seq == event.seq && capsule.record_id == *record_id),
+            DurableOperation::CommonControl { operations } => content.capsules.iter().filter(|capsule| capsule.commit_seq == event.seq).all(|capsule| operations.iter().filter(|operation| matches!(operation, DurableOperation::Observe { record_id } if *record_id == capsule.record_id)).count() == 1),
+            _ => false,
+        };
+        if capsule_sequences.contains(&event.seq) && !owns_capsule {
+            return Err(rejected("snapshot event overlaps a capsule sequence"));
+        }
+        if !portable_control
+            && !portable_maintenance
+            && !matches!(
+                (event.kind.as_str(), &receipt.operation),
+                ("feedback", DurableOperation::Feedback { .. })
+                    | ("correction", DurableOperation::Correction { .. })
+                    | ("observe", DurableOperation::Observe { .. })
+            )
+        {
             return Err(rejected("snapshot contains a non-portable event"));
         }
     }
@@ -1143,6 +1263,9 @@ fn populate_stage(
     }
 
     for capsule in capsules {
+        if events.iter().any(|event| event.seq == capsule.commit_seq) {
+            continue;
+        }
         let receipt = serde_json::to_string(&DurableReceipt {
             reply: EngineReply::new(Outcome::Success, capsule.commit_seq, Value::Null),
             operation: DurableOperation::Observe {
@@ -1368,6 +1491,24 @@ fn kernel_next_record_id(kernel: &NcmKernel) -> Result<u64, EngineReply> {
         .ok_or_else(|| rejected("snapshot record table next identity is missing"))
 }
 
+fn preserve_record_identity_floor(kernel: &mut NcmKernel, minimum: u64) -> Result<(), EngineReply> {
+    let mut records = serde_json::to_value(&kernel.records)
+        .map_err(|error| corrupt_reply(0, &format!("serialize record table: {error}")))?;
+    let next_id = records
+        .get_mut("next_id")
+        .ok_or_else(|| rejected("snapshot record table next identity is missing"))?;
+    let imported_next_id = next_id
+        .as_u64()
+        .ok_or_else(|| rejected("snapshot record table next identity is invalid"))?;
+    if imported_next_id < minimum {
+        *next_id = Value::from(minimum);
+        kernel.records = serde_json::from_value(records).map_err(|error| {
+            corrupt_reply(0, &format!("restore record identity floor: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn create_stage(root: &Path, namespace: &str, digest: &str) -> Result<StageGuard, String> {
     for attempt in 0_u32..100 {
         let name = format!(
@@ -1525,6 +1666,9 @@ fn store_reply(error: crate::store::StoreError, commit_seq: u64) -> EngineReply 
         }
         crate::store::StoreError::IdempotencyConflict => {
             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
+        }
+        crate::store::StoreError::SourceRevoked => {
+            EngineReply::rejected(RejectReason::SourceRevoked, commit_seq)
         }
         crate::store::StoreError::InvalidInput(reason)
         | crate::store::StoreError::InvalidNamespace(reason) => {

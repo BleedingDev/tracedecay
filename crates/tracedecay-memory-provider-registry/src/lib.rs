@@ -11,9 +11,9 @@
 #![deny(clippy::unwrap_used)]
 //! Product-owned composition for configured memory providers.
 //!
-//! This crate is the narrow layer allowed to construct concrete adapters. It
-//! accepts an existing Native application port explicitly, derives the stable
-//! Native identity internally, and registers the adapter in a bounded fabric.
+//! Composition injects concrete adapters and their admitted registration metadata.
+//! The legacy Native constructor remains a compatibility wrapper. All adapters
+//! register in the existing bounded fabric under their validated identities.
 //! The resulting registry exposes only provider-neutral status and call
 //! operations; registration and mode mutation remain inside composition.
 //! Handshake and active-call replies preserve the complete provider-neutral
@@ -155,15 +155,24 @@ pub use tracedecay_memory_fabric::{
 // to implement an application port. The product crate deliberately depends on
 // this registry crate only; concrete provider crates stay behind this boundary.
 pub use tracedecay_memory_provider_api::contract::{
-    CommittedEffectState, TemporalMode, TerminalCode,
+    COMMON_ADVISORY_OBSERVATION_KINDS, COMMON_ADVISORY_OPTIONAL_CAPABILITIES,
+    COMMON_ADVISORY_OPTIONAL_OBSERVATION_KINDS, COMMON_ADVISORY_PROFILE_ID,
+    COMMON_ADVISORY_REQUIRED_CAPABILITIES, CommittedEffectState, DeletionMode, HistoryRelation,
+    SourceDisposition, TemporalMode, TerminalCode,
+    UnknownValidityPolicy as CommonUnknownValidityPolicy,
 };
 pub use tracedecay_memory_provider_api::{
-    ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
-    HandshakeRequest, HandshakeRequestParts, HandshakeResponse, MemoryProvider as MemoryProviderV1,
-    OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, ApiError, CancellationToken,
+    CanonicalPayload, CommittedEffectEvidence, CurrentAdvisoryAdmission, CurrentRestoreAdmission,
+    CurrentSourceDisposition, FallbackDirective, GrantedHistorySource, HandshakeRequest,
+    HandshakeRequestParts, HandshakeResponse, HistoryGrant, LifecycleTarget,
+    LifecycleTargetReference, MAX_ADVISORY_ADMISSION_SOURCES, MemoryProvider as MemoryProviderV1,
+    OperationControl, OriginScopeEvidence, OriginalSourceIdentity, OwnedExactScope,
+    OwnedProviderId, OwnedRecallExclusions, OwnedTemporalQuery, OwnedVersionedId,
     PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, PinnedFallbackPolicy,
     ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderLimits, ProviderOperation,
-    ProviderReply, SanitizationDisposition, TerminalRecord, WithheldReason,
+    ProviderReply, RecordedValidity, RestoreDispositionCheckpoint, SanitizationDisposition,
+    SourceAttribution, TemporalEligibility, TerminalRecord, WithheldReason,
 };
 pub use tracedecay_memory_provider_native::{
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
@@ -172,15 +181,9 @@ pub use tracedecay_memory_provider_native::{
     NativeObservation, NativeObservationEnvelope, NativeProvider, OBSERVATION_CONTRACT_ID,
 };
 
-/// The adapter this registry mounts for a configured active-provider name.
-///
-/// This is a *typed kind*, not a name. Provider-identity recognition lives
-/// here, in the registry/adapter layer, and nowhere else: a composition root
-/// that compared a configured provider name against a hard-coded identity
-/// would have to be edited every time an adapter is added or renamed, which
-/// is exactly the provider-name branching the provider boundary exists to
-/// prevent. Callers ask [`mountable_active_provider`] and then branch on this
-/// enum, so adding an adapter changes this file and nothing in the daemon.
+/// Legacy Native-constructor kind retained for callers of the compatibility API.
+/// New composition resolves installed adapters at its own boundary and injects
+/// [`ProviderRegistrationV1`]; this enum does not decide common-profile compatibility.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MountableProviderKindV1 {
     /// The TraceDecay Native adapter over the host's own memory authority.
@@ -240,7 +243,7 @@ pub fn is_mountable_active_provider(provider: &str) -> bool {
     mountable_active_provider(provider).is_some()
 }
 
-/// A non-disabled Native participation mode.
+/// A non-disabled provider participation mode.
 ///
 /// Keeping `Disabled` out of this type prevents an enabled adapter from being
 /// constructed only to receive a disabled fabric registration.
@@ -278,17 +281,23 @@ pub enum NativeProviderActivation {
     },
 }
 
-/// Explicit selection of the one provider a composition may register in a
-/// non-observer role.
-///
-/// The composition root chooses a variant from the typed
-/// [`MountableProviderKindV1`] the registry returned for the configured
-/// active-provider name, so no layer above this one compares provider names.
-/// Each enabled variant carries the authority that adapter needs and cannot
-/// be constructed without it.
+/// Explicit selection of an injected adapter, observer-only participation, or
+/// disabled composition. The Native variant preserves the legacy constructor.
 pub enum SelectedProviderActivationV1 {
     /// Construct no provider, no fabric, and no state.
     Disabled,
+    /// Mount an independently configured injected adapter.
+    Injected {
+        /// Finite fabric limits.
+        fabric_config: FabricConfig,
+        /// Selected adapter and its actual registration authority.
+        registration: ProviderRegistrationV1,
+    },
+    /// Mount only independently enabled observers, with no active provider.
+    ObserversOnly {
+        /// Finite fabric limits.
+        fabric_config: FabricConfig,
+    },
     /// Register the TraceDecay Native adapter over the host's memory port.
     Native {
         /// Finite fabric limits used only by enabled composition.
@@ -321,27 +330,121 @@ impl From<NativeProviderActivation> for SelectedProviderActivationV1 {
     }
 }
 
-/// The concrete adapter one composition registers in a non-observer role.
-enum SelectedRegistration {
-    Native(Arc<dyn NativeMemoryApplicationPort>),
+/// A configured adapter and the authority composition admits for it.
+///
+/// Identity recognition belongs to composition. The registry validates the
+/// injected descriptor and common profile rather than granting compatibility
+/// to a recognized provider name. Construction must remain lazy: registration
+/// never starts a provider or invokes its lifecycle owner.
+pub struct ProviderRegistrationV1 {
+    /// Configured identity, checked against the injected descriptor.
+    pub provider_id: OwnedProviderId,
+    /// Concrete adapter constructed at the composition boundary.
+    pub provider: Arc<dyn MemoryProvider>,
+    /// Positive product-owned registration revision.
+    pub registration_revision: u64,
+    /// Independently admitted participation.
+    pub mode: EnabledProviderMode,
+    /// Actual code execution shape at the host invocation boundary.
+    pub execution_shape: ProviderExecutionShapeV1,
+    /// Host-admitted bindings declared by this adapter, never read from replies.
+    pub recall_scope_bindings: RecallScopeBindingsV1,
+    /// Existing runtime owner, shared with the adapter rather than duplicated.
+    pub lifecycle: ProviderLifecycleOwnershipV1,
 }
 
-impl SelectedRegistration {
-    /// Resolves the typed kind this registration registers under.
-    ///
-    /// The kind is derived from the registration itself, so the registry
-    /// never branches on a provider name supplied by the caller.
-    const fn kind(&self) -> MountableProviderKindV1 {
-        match self {
-            Self::Native(_) => MountableProviderKindV1::Native,
-        }
-    }
+/// Lifecycle authority admitted for one provider registration.
+#[derive(Clone)]
+pub enum ProviderLifecycleOwnershipV1 {
+    /// The adapter has no runtime incarnation separate from composition.
+    /// Retiring readiness does not terminate its host invocation threads;
+    /// the invocation boundary independently accounts for stranded work.
+    CompositionBound,
+    /// A bounded owner controls the existing adapter runtime. Its methods must
+    /// serialize with that runtime's own cancellation/restart authority.
+    Owned(Arc<dyn ProviderLifecycleOwnerV1>),
+}
 
-    fn into_provider(self) -> Result<Arc<dyn MemoryProvider>, RegistryError> {
-        match self {
-            Self::Native(port) => Ok(Arc::new(NativeProvider::new(port)?)),
-        }
-    }
+/// Lifecycle control over an already admitted runtime owner.
+///
+/// Implementations must use the adapter's existing owner and respect every
+/// deadline. A cooperative wrapper thread is not proof of process termination.
+/// Shared owners must serialize termination and replacement; creating another
+/// worker owner for an exact-scope supervisor is forbidden.
+pub trait ProviderLifecycleOwnerV1: Send + Sync {
+    /// Requests startup without claiming readiness or replacing a live owner.
+    fn start(&self, deadline_unix_micros: i64) -> Result<(), ProviderLifecycleOwnerErrorV1>;
+    /// Returns true only after the existing runtime has confirmed termination.
+    fn request_stop(
+        &self,
+        deadline_unix_micros: i64,
+    ) -> Result<bool, ProviderLifecycleOwnerErrorV1>;
+    /// Confirms termination before replacement is permitted.
+    fn kill(&self, deadline_unix_micros: i64) -> Result<(), ProviderLifecycleOwnerErrorV1>;
+}
+
+/// A bounded runtime owner could not establish a lifecycle transition.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ProviderLifecycleOwnerErrorV1 {
+    /// The requested transition has no remaining time.
+    #[error("provider lifecycle deadline elapsed")]
+    DeadlineElapsed,
+    /// Runtime termination has not been proved; no replacement is authorized.
+    #[error("provider runtime termination is unconfirmed")]
+    TerminationUnconfirmed,
+    /// The admitted owner is unavailable.
+    #[error("provider lifecycle owner unavailable: {0}")]
+    Unavailable(String),
+}
+
+/// Immutable registration evidence retained alongside the fabric route.
+/// The fabric remains the sole mode, revision, health and dispatch authority.
+pub struct ProviderRegistrationMetadataV1 {
+    /// Registered configured identity.
+    pub provider_id: OwnedProviderId,
+    /// Product-owned registration revision.
+    pub registration_revision: u64,
+    /// Admitted participation mode.
+    pub mode: EnabledProviderMode,
+    /// Host composition's common-profile requirement, independent of provider
+    /// identity, descriptor claims and payload-carried history grants.
+    pub requires_common_advisory_profile: bool,
+    /// Actual validated descriptor limits.
+    pub limits: ProviderLimits,
+    /// Execution shape admitted by composition.
+    pub execution_shape: ProviderExecutionShapeV1,
+    lifecycle: ProviderLifecycleOwnershipV1,
+}
+
+/// Required delivery is explicit and independent of mount ordering or identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationMountRequirementV1 {
+    /// Failure prevents the selected provider from becoming usable.
+    Required,
+    /// Failure is visible but cannot disable the independently selected provider.
+    Optional,
+}
+
+/// When the already-owned observation journey may start delivery and replay.
+/// This is independent of whether a mount or activation failure is required.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationMountActivationV1 {
+    /// Bootstrap before publishing the full server, preserving an existing
+    /// required startup path that does not depend on full host ingestion.
+    BeforePublication,
+    /// Construct a dormant journey first, then activate that same owner only
+    /// after the full server can answer registered host ingestion.
+    AfterPublication,
+}
+
+/// Observation mount with independent requirement and activation timing.
+pub struct ConfiguredObservationProviderMountV1 {
+    /// Existing observation namespace, limits and readiness proof.
+    pub mount: ObservationProviderMountV1,
+    /// Whether admission/replay failure fails this composition.
+    pub requirement: ObservationMountRequirementV1,
+    /// When delivery/replay may begin, independently of the failure policy.
+    pub activation: ObservationMountActivationV1,
 }
 
 /// One Observer registration in a composed provider set.
@@ -405,49 +508,92 @@ impl ProjectMemoryProviderComposition {
         Self::compose_selected(native.into(), observers)
     }
 
-    /// Applies an explicit provider-neutral selection as a bounded provider
-    /// set: one selected adapter in its configured mode, plus zero or more
-    /// injected Observer registrations.
-    ///
-    /// This is the general form [`Self::compose`] and
-    /// [`Self::compose_with_observers`] delegate to. The selected adapter is
-    /// resolved to a typed
-    /// [`MountableProviderKindV1`] from its own descriptor, never from a
-    /// provider string supplied by the caller, and it is registered under
-    /// that identity with the recall scope bindings the kind authorizes.
+    /// Applies a selection with legacy observer registrations.
+    /// New composition should use [`Self::compose_registered`] to supply each
+    /// observer's actual execution and lifecycle ownership metadata.
     pub fn compose_selected(
         selection: SelectedProviderActivationV1,
         observers: Vec<ObserverProviderRegistration>,
     ) -> Result<Self, RegistryError> {
-        // Refused before the activation match so the disabled arm stays the
-        // single, unconditional `Ok(Self::Disabled)` that constructs no
-        // provider, no fabric, and no state.
         if !observers.is_empty() && matches!(selection, SelectedProviderActivationV1::Disabled) {
             return Err(RegistryError::ObserverWithoutEnabledComposition {
                 observers: observers.len(),
             });
         }
-        let (fabric_config, selected, registration_revision, mode) = match selection {
+        let observers = observers
+            .into_iter()
+            .map(|observer| {
+                Ok(ProviderRegistrationV1 {
+                    provider_id: observer.provider.descriptor().provider_id,
+                    provider: observer.provider,
+                    registration_revision: observer.registration_revision,
+                    mode: EnabledProviderMode::Observer,
+                    execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(["exact_coding_scope"])
+                        .map_err(RegistryError::RecallScopeBindings)?,
+                    lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                })
+            })
+            .collect::<Result<Vec<_>, RegistryError>>()?;
+        Self::compose_registered(selection, observers)
+    }
+
+    /// Registers one selected adapter and independent observers in the existing
+    /// fabric. Injected active providers must declare the common advisory profile.
+    /// Observer-only composition needs no selected or Native adapter.
+    pub fn compose_registered(
+        selection: SelectedProviderActivationV1,
+        observers: Vec<ProviderRegistrationV1>,
+    ) -> Result<Self, RegistryError> {
+        if matches!(selection, SelectedProviderActivationV1::Disabled) {
+            return if observers.is_empty() {
+                Ok(Self::Disabled)
+            } else {
+                Err(RegistryError::ObserverWithoutEnabledComposition {
+                    observers: observers.len(),
+                })
+            };
+        }
+        let (fabric_config, selected, require_common_profile) = match selection {
             SelectedProviderActivationV1::Disabled => return Ok(Self::Disabled),
+            SelectedProviderActivationV1::ObserversOnly { fabric_config } => {
+                if observers.is_empty() {
+                    return Ok(Self::Disabled);
+                }
+                (fabric_config, None, true)
+            }
+            SelectedProviderActivationV1::Injected {
+                fabric_config,
+                registration,
+            } => (fabric_config, Some(registration), true),
             SelectedProviderActivationV1::Native {
                 fabric_config,
                 port,
                 registration_revision,
                 mode,
-            } => (
-                fabric_config,
-                SelectedRegistration::Native(port),
-                registration_revision,
-                mode,
-            ),
+            } => {
+                let provider = Arc::new(NativeProvider::new(port)?);
+                let registration = ProviderRegistrationV1 {
+                    provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID)?,
+                    provider,
+                    registration_revision,
+                    mode,
+                    execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(
+                        NATIVE_RECALL_SCOPE_BINDINGS.iter().copied(),
+                    )
+                    .map_err(RegistryError::RecallScopeBindings)?,
+                    lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                };
+                (fabric_config, Some(registration), false)
+            }
         };
         Ok(Self::Enabled(
             ProjectMemoryProviderRegistry::compose_provider_set(
                 fabric_config,
                 selected,
-                registration_revision,
-                mode,
                 observers,
+                require_common_profile,
             )?,
         ))
     }
@@ -586,13 +732,19 @@ pub enum RegistryError {
     /// An observer registration declared the separately selected provider's
     /// own identity, which would make one identity both active and observer.
     ObserverDuplicatesSelectedProvider(String),
+    /// Active recall needs at least one admitted scope binding.
+    ActiveRecallScopeBindingsMissing(String),
+    /// A declared observer tried to enter the active registration role.
+    ObserverModeRequired(String),
+    /// Foreign code needs an admitted runtime owner; composition lifetime is insufficient.
+    LifecycleOwnerRequired(String),
     /// Two observer registrations declared the same provider identity.
     DuplicateObserverProvider(String),
     /// The constructed adapter declared an identity other than the selected
     /// kind's own, so it was never registered.
     SelectedProviderIdentityMismatch {
         /// Identity the selected kind declares.
-        expected: &'static str,
+        expected: String,
         /// Identity the constructed adapter's descriptor declared.
         declared: String,
     },
@@ -622,6 +774,17 @@ impl fmt::Display for RegistryError {
                 formatter,
                 "observer registration declares the selected provider identity {provider}"
             ),
+            Self::ActiveRecallScopeBindingsMissing(provider) => write!(
+                formatter,
+                "active provider {provider} has no admitted recall scope binding"
+            ),
+            Self::ObserverModeRequired(provider) => {
+                write!(formatter, "observer {provider} must use observer mode")
+            }
+            Self::LifecycleOwnerRequired(provider) => write!(
+                formatter,
+                "provider {provider} requires an admitted runtime lifecycle owner"
+            ),
             Self::DuplicateObserverProvider(provider) => write!(
                 formatter,
                 "observer provider {provider} is registered more than once"
@@ -644,6 +807,9 @@ impl Error for RegistryError {
             Self::ObserverWithoutEnabledComposition { .. }
             | Self::ProviderSetExceedsRegistryCapacity { .. }
             | Self::ObserverDuplicatesSelectedProvider(_)
+            | Self::ActiveRecallScopeBindingsMissing(_)
+            | Self::ObserverModeRequired(_)
+            | Self::LifecycleOwnerRequired(_)
             | Self::DuplicateObserverProvider(_)
             | Self::SelectedProviderIdentityMismatch { .. } => None,
         }
@@ -701,9 +867,8 @@ impl From<FabricError> for RegistryError {
 /// ```
 pub struct ProjectMemoryProviderRegistry {
     fabric: Arc<MemoryFabric>,
-    /// The execution shape of the one selected active registration, taken
-    /// from that registration's own typed kind at composition.
-    selected_execution_shape: ProviderExecutionShapeV1,
+    selected_provider_id: Option<OwnedProviderId>,
+    registrations: BTreeMap<OwnedProviderId, ProviderRegistrationMetadataV1>,
     /// Recall scope bindings the host recorded per provider at registration,
     /// from the provider's declared `recall_scope_bindings` manifest attribute.
     /// Admission reads this record through the admitted call; a provider
@@ -714,84 +879,84 @@ pub struct ProjectMemoryProviderRegistry {
 impl ProjectMemoryProviderRegistry {
     fn compose_provider_set(
         fabric_config: FabricConfig,
-        selected: SelectedRegistration,
-        registration_revision: u64,
-        mode: EnabledProviderMode,
-        observers: Vec<ObserverProviderRegistration>,
+        selected: Option<ProviderRegistrationV1>,
+        observers: Vec<ProviderRegistrationV1>,
+        require_common_profile: bool,
     ) -> Result<Self, RegistryError> {
-        let selected_kind = selected.kind();
-        let selected_provider_id = OwnedProviderId::new(selected_kind.provider_id())?;
-        // The fabric owns finite-configuration validation, so it is
-        // constructed first and its typed `InvalidConfig` reaches the caller
-        // unchanged. Constructing a fabric registers nothing, so the whole
-        // provider set is still validated before any registration happens and
-        // a refused configuration never leaves a half-composed registry
-        // behind.
         let fabric = Arc::new(MemoryFabric::new(fabric_config)?);
-        let providers = observers.len().saturating_add(1);
+        let providers = observers
+            .len()
+            .saturating_add(usize::from(selected.is_some()));
         if providers > fabric_config.max_registered_providers {
             return Err(RegistryError::ProviderSetExceedsRegistryCapacity {
                 providers,
                 maximum: fabric_config.max_registered_providers,
             });
         }
-        let mut declared: BTreeMap<OwnedProviderId, ()> = BTreeMap::new();
+        let selected_provider_id = selected.as_ref().map(|item| item.provider_id.clone());
+        let mut declared = BTreeMap::new();
         for observer in &observers {
-            let declared_id = observer.provider.descriptor().provider_id;
-            if declared_id == selected_provider_id {
-                return Err(RegistryError::ObserverDuplicatesSelectedProvider(
-                    declared_id.as_str().to_owned(),
+            if observer.mode != EnabledProviderMode::Observer {
+                return Err(RegistryError::ObserverModeRequired(
+                    observer.provider_id.as_str().to_owned(),
                 ));
             }
-            if declared.insert(declared_id.clone(), ()).is_some() {
+            if Some(&observer.provider_id) == selected_provider_id.as_ref() {
+                return Err(RegistryError::ObserverDuplicatesSelectedProvider(
+                    observer.provider_id.as_str().to_owned(),
+                ));
+            }
+            if declared.insert(observer.provider_id.clone(), ()).is_some() {
                 return Err(RegistryError::DuplicateObserverProvider(
-                    declared_id.as_str().to_owned(),
+                    observer.provider_id.as_str().to_owned(),
                 ));
             }
         }
         let mut registry = Self {
             fabric,
-            selected_execution_shape: selected_kind.declared_execution_shape(),
+            selected_provider_id,
+            registrations: BTreeMap::new(),
             recall_scope_bindings: BTreeMap::new(),
         };
-        registry.register_selected(selected, registration_revision, mode)?;
+        if let Some(selected) = selected {
+            registry.register_selected(selected, require_common_profile)?;
+        }
         for observer in observers {
             registry.register_observer(observer)?;
         }
         Ok(registry)
     }
 
-    /// Registers one injected adapter in observer mode under the identity its
-    /// own descriptor declares. No recall scope binding is recorded, so the
-    /// observer is unauthorized for recall admission independently of the
-    /// fabric mode gate.
-    fn register_observer(
-        &mut self,
-        observer: ObserverProviderRegistration,
-    ) -> Result<(), RegistryError> {
-        let provider_id = observer.provider.descriptor().provider_id;
-        self.fabric.register(
-            provider_id,
-            observer.registration_revision,
-            ProviderMode::Observer,
-            observer.provider,
-        )?;
-        Ok(())
+    fn register_observer(&mut self, observer: ProviderRegistrationV1) -> Result<(), RegistryError> {
+        self.register_selected(observer, false)
     }
 
-    /// Returns the execution shape of the only adapter a recall route can
-    /// enter through this registry.
-    ///
-    /// Exactly one registration is selected as active; observers are refused
-    /// by [`Self::route_active`] before contact and an identity this registry
-    /// never registered has no code here to enter at all. So the shape of the
-    /// selected registration -- read from its own typed kind, never from a
-    /// configured provider name -- is the whole answer to "what could this
-    /// host end up executing on a recall worker", which is what the host
-    /// execution boundary must decide it can isolate before it starts one.
+    /// Returns selected registration metadata, or none for an observer-only set.
     #[must_use]
-    pub const fn selected_execution_shape(&self) -> ProviderExecutionShapeV1 {
-        self.selected_execution_shape
+    pub fn selected_registration(&self) -> Option<&ProviderRegistrationMetadataV1> {
+        self.selected_provider_id
+            .as_ref()
+            .and_then(|id| self.registrations.get(id))
+    }
+
+    /// Returns the immutable registration metadata for the bound provider.
+    #[must_use]
+    pub fn registration(
+        &self,
+        provider_id: &OwnedProviderId,
+    ) -> Option<&ProviderRegistrationMetadataV1> {
+        self.registrations.get(provider_id)
+    }
+
+    /// Returns the selected adapter's admitted execution shape.
+    /// An observer-only set has no active route; its unused compatibility shape
+    /// does not authorize any provider for recall.
+    #[must_use]
+    pub fn selected_execution_shape(&self) -> ProviderExecutionShapeV1 {
+        self.selected_registration().map_or(
+            ProviderExecutionShapeV1::HostAuthoredInProcess,
+            |registration| registration.execution_shape,
+        )
     }
 
     /// Returns the recall scope bindings the host recorded for `provider_id`
@@ -862,6 +1027,18 @@ impl ProjectMemoryProviderRegistry {
         self.fabric.invoke_active(call)
     }
 
+    /// Invokes a host-authorized lifecycle control against the original
+    /// provider, registration revision and scope pinned by `call`.
+    /// Active and observer registrations may receive controls; recall remains
+    /// active-only. This route never consults selection or fallback policy.
+    ///
+    /// The caller must obtain and hold the target's supervised readiness
+    /// dispatch guard through this call, including its quarantine checks.
+    /// The fabric preserves all live receipt, capability and terminal checks.
+    pub fn invoke_control(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
+        self.fabric.invoke_control(call)
+    }
+
     /// Routes one active call under an explicit host routing policy.
     ///
     /// The configured provider is refused before any contact unless it is
@@ -898,37 +1075,77 @@ impl ProjectMemoryProviderRegistry {
         self.fabric.deliver_observation_result(call)
     }
 
-    /// Registers the one selected adapter under the identity and the recall
-    /// scope bindings that adapter itself declares.
+    /// Registers an injected adapter without replacing the fabric's authority.
     fn register_selected(
         &mut self,
-        selected: SelectedRegistration,
-        registration_revision: u64,
-        mode: EnabledProviderMode,
+        registration: ProviderRegistrationV1,
+        require_common_profile: bool,
     ) -> Result<(), RegistryError> {
-        let kind = selected.kind();
-        let bindings =
-            RecallScopeBindingsV1::from_wire(kind.declared_recall_scope_bindings().iter().copied())
-                .map_err(RegistryError::RecallScopeBindings)?;
-        let provider = selected.into_provider()?;
-        // The identity is read back from the constructed adapter's own
-        // descriptor and compared with the kind's declared identity, so a
-        // misdeclared adapter is refused instead of being registered under a
-        // name it does not answer to.
-        let provider_id = provider.descriptor().provider_id;
-        if provider_id.as_str() != kind.provider_id() {
+        let descriptor = registration.provider.descriptor();
+        if descriptor.provider_id != registration.provider_id {
             return Err(RegistryError::SelectedProviderIdentityMismatch {
-                expected: kind.provider_id(),
-                declared: provider_id.as_str().to_owned(),
+                expected: registration.provider_id.as_str().to_owned(),
+                declared: descriptor.provider_id.as_str().to_owned(),
             });
         }
+        descriptor.validate()?;
+        if require_common_profile && registration.mode == EnabledProviderMode::Active {
+            descriptor.validate_common_advisory_profile()?;
+        }
+        if registration.mode == EnabledProviderMode::Active
+            && registration.recall_scope_bindings.is_empty()
+        {
+            return Err(RegistryError::ActiveRecallScopeBindingsMissing(
+                registration.provider_id.as_str().to_owned(),
+            ));
+        }
+        if registration.execution_shape == ProviderExecutionShapeV1::Foreign
+            && matches!(
+                registration.lifecycle,
+                ProviderLifecycleOwnershipV1::CompositionBound
+            )
+        {
+            return Err(RegistryError::LifecycleOwnerRequired(
+                registration.provider_id.as_str().to_owned(),
+            ));
+        }
+        let provider_id = registration.provider_id;
         self.fabric.register(
             provider_id.clone(),
-            registration_revision,
-            mode.fabric_mode(),
-            provider,
+            registration.registration_revision,
+            registration.mode.fabric_mode(),
+            registration.provider,
         )?;
-        self.recall_scope_bindings.insert(provider_id, bindings);
+        // The fabric re-reads and retains the descriptor when it registers.
+        // Derive metadata and verify the profile against that same authority,
+        // so a descriptor changing between reads cannot substitute limits or
+        // quietly drop the active profile. A failed composition is never published.
+        let registered_descriptor = self
+            .fabric
+            .statuses()?
+            .into_iter()
+            .find(|status| status.provider_id == provider_id)
+            .ok_or_else(|| FabricError::ProviderUnknown(provider_id.as_str().to_owned()))?
+            .descriptor;
+        if require_common_profile && registration.mode == EnabledProviderMode::Active {
+            registered_descriptor.validate_common_advisory_profile()?;
+        }
+        if registration.mode == EnabledProviderMode::Active {
+            self.recall_scope_bindings
+                .insert(provider_id.clone(), registration.recall_scope_bindings);
+        }
+        self.registrations.insert(
+            provider_id.clone(),
+            ProviderRegistrationMetadataV1 {
+                provider_id,
+                registration_revision: registration.registration_revision,
+                mode: registration.mode,
+                requires_common_advisory_profile: require_common_profile,
+                limits: registered_descriptor.limits,
+                execution_shape: registration.execution_shape,
+                lifecycle: registration.lifecycle,
+            },
+        );
         Ok(())
     }
 }

@@ -376,6 +376,19 @@ impl FuzzCanonicalPortV1 {
 }
 
 impl ObservationAdmissionPort for FuzzCanonicalPortV1 {
+    async fn recent_admitted_observation_window(
+        &self,
+        request: tracedecay_store::ObservationRecentWindowRequest,
+    ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError> {
+        let window = recent_record_window(&self.records, request)?;
+        self.hooks.check_verified(
+            HookPointV1::BeforeJournalWrite,
+            |target| window.as_ref().map(|window| window.first_sequence) == Some(target),
+            |target| !self.journalled(target),
+        );
+        Ok(window)
+    }
+
     async fn read_admitted_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,

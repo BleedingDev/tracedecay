@@ -40,7 +40,10 @@
     "unknown_field_policy": "reject_contract_violation",
     "empty_query_allowed": false,
     "provider_may_widen_scope": false,
-    "provider_may_extend_deadline": false
+    "provider_may_extend_deadline": false,
+    "common_profile_optional_fields": [
+      "history_grant"
+    ]
   },
   "exact_scope_semantics": {
     "type_name": "MemoryProviderRecallExactScopeV1",
@@ -399,7 +402,10 @@
       "audit_only"
     ],
     "default_unavailable_policy_action": "exclude",
-    "default_redacted_policy_action": "degrade_allow"
+    "default_redacted_policy_action": "degrade_allow",
+    "common_profile_required_fields": [
+      "original_sources"
+    ]
   },
   "explanation": {
     "type_name": "MemoryProviderRecallExplanationV1",
@@ -523,5 +529,29 @@
     "tdmem-0608",
     "tdmem-0609",
     "tdmem-0903"
-  ]
+  ],
+  "common_advisory_semantics": {
+    "required_profile": "memory.advisory_common.v1",
+    "known_modes_required": [
+      "current",
+      "as_of",
+      "interval",
+      "history"
+    ],
+    "validity_start_inclusive": true,
+    "validity_end_exclusive": true,
+    "unknown_source_revision_allowed_as_null": true,
+    "unknown_validity_requires_explicit_coverage": true,
+    "privacy_deletion_overrides_include_revoked": true,
+    "canonical_unavailable_source_overrides_historical_validity": true,
+    "include_superseded_and_include_revoked_apply_at_requested_time": true,
+    "cross_session_requires_host_validated_original_source_grant": true,
+    "exclusions_apply_before_candidate_limit": true,
+    "content_exclusion_digest": "complete_original_candidate_content_before_truncation",
+    "canonical_facts_are_separate_host_contribution": true,
+    "current_facts_are_historical_evidence": false,
+    "as_of_not_after_evaluation_time": true,
+    "interval_end_may_exceed_evaluation_time": true,
+    "unknown_validity_degrade_admits_with_warning_and_stale_lane": true
+  }
 }

@@ -644,6 +644,735 @@ fn ready_receipt_is_deterministic_and_nonce_bound() {
     assert_ne!(first, ready_receipt(&changed, limits));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_capability_inspection_uses_readiness_and_pages_the_probed_descriptor() {
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let port = Arc::new(
+        ProjectNativeMemoryApplicationPort::new(
+            Arc::new(tokio::sync::RwLock::new(graph)),
+            project_root.clone(),
+            test_profile_id(),
+            &test_provider_state_root(&project_root),
+        )
+        .expect("real Native application port"),
+    );
+    let provider = NativeProvider::new(port.clone()).expect("real Native adapter");
+    let mut request = ready_request();
+    request.exact_scope = recall_exact_scope(project_id.as_str());
+    request.host_limits.response_bytes = 4096;
+    request.host_limits.inspection_items = 64;
+    let ready = provider.handshake(&request);
+    assert_eq!(ready.terminal.terminal_code(), TerminalCode::Success);
+    let call_for = |request: &HandshakeRequest,
+                    ready: &HandshakeResponse,
+                    cursor: Value,
+                    maximum_items: u64,
+                    maximum_bytes: u64| {
+        let value = json!({"common_request":{
+            "provider_id":request.provider_id.as_str(),"registration_revision":request.registration_revision,
+            "ready_receipt_digest":ready.ready_receipt_sha256,
+            "exact_scope_identity":tracedecay_memory_conformance::compatibility::scope_json(&request.exact_scope),
+            "operation_id":"operation.native-capabilities","idempotency_key":null,
+            "expected_state_generation":0,"request_identity":"request.native-capabilities","policy_revision":1,
+            "deadline":{"deadline_utc_micros":i64::MAX,"remaining_millis":5000},"cancellation":"live","extensions":[]},
+            "view":"capability_status","selector":{},"maximum_items":maximum_items,"maximum_bytes":maximum_bytes,
+            "redaction_policy_revision":1,"cursor":cursor});
+        let bytes = serde_json::to_vec(&value).expect("inspection bytes");
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Inspection,
+            provider_id: request.provider_id.clone(),
+            registration_revision: request.registration_revision,
+            ready_receipt_sha256: ready
+                .ready_receipt_sha256
+                .clone()
+                .expect("accepted receipt"),
+            exact_scope: request.exact_scope.clone(),
+            request_id: "request.native-capabilities".into(),
+            operation_id: "operation.native-capabilities".into(),
+            expected_state_generation: 0,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, 5000, CancellationToken::new()),
+            payload: CanonicalPayload::new(
+                OwnedVersionedId::new("tracedecay.memory.provider.inspection.v1")
+                    .expect("inspection contract"),
+                bytes.clone(),
+                sha256_hex(&bytes),
+            )
+            .expect("inspection payload"),
+            required_capabilities: vec![
+                OwnedVersionedId::new(ProviderOperation::Inspection.capability_id())
+                    .expect("inspection capability"),
+            ],
+            extensions: Vec::new(),
+        })
+        .expect("inspection call")
+    };
+    let decode = |reply: &ProviderReply| -> Value {
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        serde_json::from_slice(&reply.payload.as_ref().expect("inspection payload").bytes)
+            .expect("inspection response")
+    };
+    let observation = session_message_payload(
+        "capability-record",
+        "session.capability",
+        "capability state beacon",
+    );
+    let observe_call = staged_session_call(
+        project_id.as_str(),
+        &observation,
+        "key.capability",
+        "operation.capability-observe",
+    );
+    assert_eq!(
+        port.observe(staged_observation_for(&observe_call, observation))
+            .terminal
+            .terminal_code(),
+        TerminalCode::Success
+    );
+    let generation = port.staged.generation().expect("actual generation");
+    assert!(generation > 0);
+    let full_call = call_for(&request, &ready, Value::Null, 64, 65536);
+    let full_reply = provider.invoke(&full_call);
+    full_reply.validate(4096).expect("accepted reply budget");
+    let full = decode(&full_reply);
+    let expected: Vec<Value> = ready
+        .descriptor
+        .as_ref()
+        .expect("accepted descriptor")
+        .capabilities
+        .iter()
+        .map(|capability| json!({"capability_id":capability.as_str(),"state":"available"}))
+        .collect();
+    assert!(expected.len() > 2);
+    assert_eq!(full["view"], "capability_status");
+    assert_eq!(full["items"], json!(expected));
+    assert_eq!(full["coverage"], "complete");
+    assert_eq!(full["next_cursor"], Value::Null);
+    assert_eq!(full["state_generation"], generation);
+    assert_eq!(full["state_generation_before"], generation);
+    assert_eq!(full["state_generation_after"], generation);
+    assert_eq!(full_reply.state_generation, generation);
+    assert_eq!(
+        full_reply
+            .terminal
+            .committed_effect()
+            .state_generation_after(),
+        Some(generation)
+    );
+
+    let first_call = call_for(&request, &ready, Value::Null, 1, 65536);
+    let first_reply = provider.invoke(&first_call);
+    let first = decode(&first_reply);
+    assert_eq!(first["items"], json!([expected[0]]));
+    assert_eq!(first["coverage"], "partial");
+    assert!(first["next_cursor"].as_str().expect("continuation").len() <= 1024);
+    assert_eq!(
+        decode(&provider.invoke(&first_call))["next_cursor"],
+        first["next_cursor"]
+    );
+    let next = decode(&provider.invoke(&call_for(
+        &request,
+        &ready,
+        first["next_cursor"].clone(),
+        64,
+        65536,
+    )));
+    assert_eq!(next["items"], json!(&expected[1..]));
+    assert_eq!(next["coverage"], "complete");
+    assert_eq!(next["next_cursor"], Value::Null);
+    let byte_limit = first_reply
+        .payload
+        .as_ref()
+        .expect("first page")
+        .bytes
+        .len() as u64;
+    let byte_reply = provider.invoke(&call_for(&request, &ready, Value::Null, 64, byte_limit));
+    assert!(
+        byte_reply
+            .payload
+            .as_ref()
+            .expect("byte-limited page")
+            .bytes
+            .len() as u64
+            <= byte_limit
+    );
+    assert_eq!(decode(&byte_reply)["items"], first["items"]);
+    let small = provider.invoke(&call_for(&request, &ready, Value::Null, 64, 1));
+    assert_eq!(
+        small.terminal.terminal_code(),
+        TerminalCode::CapacityExceeded
+    );
+    assert!(small.payload.is_none());
+    assert_eq!(
+        provider
+            .invoke(&call_for(
+                &request,
+                &ready,
+                "wrong-cursor".into(),
+                64,
+                65536
+            ))
+            .terminal
+            .terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+
+    // Completing a previously probed response cannot substitute a later store revision.
+    let mut probe = port
+        .staged
+        .control(&full_call, None)
+        .expect("descriptor generation probe");
+    let accepted = port
+        .accepted_readiness
+        .lock()
+        .expect("readiness")
+        .clone()
+        .expect("accepted readiness");
+    let next_observation = session_message_payload(
+        "capability-record-next",
+        "session.capability",
+        "next capability beacon",
+    );
+    let mut next_call = staged_session_call(
+        project_id.as_str(),
+        &next_observation,
+        "key.capability-next",
+        "operation.capability-observe-next",
+    );
+    next_call.expected_state_generation = generation;
+    assert_eq!(
+        port.observe(staged_observation_for(&next_call, next_observation))
+            .terminal
+            .terminal_code(),
+        TerminalCode::Success
+    );
+    assert!(port.staged.generation().expect("later generation") > generation);
+    let request_value: Value =
+        serde_json::from_slice(&full_call.payload.bytes).expect("request value");
+    port.complete_capability_response(&mut probe, &full_call, &request_value, &accepted)
+        .expect("complete original probe");
+    assert_eq!(probe.response["state_generation"], generation);
+    assert_eq!(probe.response["state_generation_before"], generation);
+    assert_eq!(probe.response["state_generation_after"], generation);
+    assert_eq!(probe.response["items"], json!(expected));
+    assert_eq!(
+        provider
+            .invoke(&call_for(
+                &request,
+                &ready,
+                first["next_cursor"].clone(),
+                64,
+                65536
+            ))
+            .terminal
+            .terminal_code(),
+        TerminalCode::InvalidRequest
+    );
+
+    for mismatch in ["receipt", "scope", "registration"] {
+        let mut wrong = call_for(&request, &ready, Value::Null, 64, 65536);
+        match mismatch {
+            "receipt" => wrong.ready_receipt_sha256 = "f".repeat(64),
+            "scope" => wrong.exact_scope.agent_session_id = "session.wrong".into(),
+            "registration" => wrong.registration_revision += 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            provider.invoke(&wrong).terminal.terminal_code(),
+            TerminalCode::ProviderUnavailable
+        );
+    }
+    let mut limited_request = request.clone();
+    limited_request.challenge_nonce = [19; 32];
+    limited_request.host_limits.inspection_items = 1;
+    let limited_ready = provider.handshake(&limited_request);
+    assert_eq!(
+        limited_ready.terminal.terminal_code(),
+        TerminalCode::Success
+    );
+    assert_eq!(
+        provider
+            .invoke(&call_for(&request, &ready, Value::Null, 64, 65536))
+            .terminal
+            .terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    let negotiated_reply = provider.invoke(&call_for(
+        &limited_request,
+        &limited_ready,
+        Value::Null,
+        64,
+        65536,
+    ));
+    let negotiated = decode(&negotiated_reply);
+    assert_eq!(negotiated["items"], json!([expected[0]]));
+    assert_eq!(negotiated["coverage"], "partial");
+    let next_single_reply = provider.invoke(&call_for(
+        &limited_request,
+        &limited_ready,
+        negotiated["next_cursor"].clone(),
+        64,
+        65536,
+    ));
+    assert_eq!(decode(&next_single_reply)["items"], json!([expected[1]]));
+    // Measure complete one-item replies, including framing, before negotiating
+    // a limit too small for the full descriptor but sufficient for either page.
+    let (mut lower, mut upper) = (1_u64, 4096_u64);
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if negotiated_reply.validate(middle).is_ok() && next_single_reply.validate(middle).is_ok() {
+            upper = middle;
+        } else {
+            lower = middle + 1;
+        }
+    }
+    let mut byte_request = request.clone();
+    byte_request.challenge_nonce = [23; 32];
+    byte_request.host_limits.response_bytes = upper;
+    let byte_ready = provider.handshake(&byte_request);
+    assert_eq!(byte_ready.terminal.terminal_code(), TerminalCode::Success);
+    assert!(full_reply.validate(upper).is_err());
+    let byte_first_reply = provider.invoke(&call_for(
+        &byte_request,
+        &byte_ready,
+        Value::Null,
+        64,
+        65536,
+    ));
+    byte_first_reply
+        .validate(upper)
+        .expect("one item and framing fit negotiated bytes");
+    let byte_first = decode(&byte_first_reply);
+    assert_eq!(byte_first["items"], json!([expected[0]]));
+    assert_eq!(byte_first["coverage"], "partial");
+    let byte_next_reply = provider.invoke(&call_for(
+        &byte_request,
+        &byte_ready,
+        byte_first["next_cursor"].clone(),
+        64,
+        65536,
+    ));
+    byte_next_reply
+        .validate(upper)
+        .expect("second page fits negotiated bytes");
+    let byte_next = decode(&byte_next_reply);
+    assert_eq!(byte_next["items"], json!([expected[1]]));
+    assert_eq!(byte_next["coverage"], "partial");
+    assert_ne!(byte_next["next_cursor"], byte_first["next_cursor"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_health_uses_latest_handshake_evidence_and_the_probed_generation() {
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let port = Arc::new(
+        ProjectNativeMemoryApplicationPort::new(
+            Arc::new(tokio::sync::RwLock::new(graph)),
+            project_root.clone(),
+            test_profile_id(),
+            &test_provider_state_root(&project_root),
+        )
+        .expect("real Native application port"),
+    );
+    let provider = NativeProvider::new(port.clone()).expect("real Native adapter");
+    let mut request = ready_request();
+    request.exact_scope = recall_exact_scope(project_id.as_str());
+    request.host_limits.response_bytes = 4096;
+    request.host_limits.recall_candidates = 2;
+    request
+        .required_capabilities
+        .insert(OwnedVersionedId::new("memory.advisory_common.v1").expect("common capability"));
+    let ready = provider.handshake(&request);
+    assert_eq!(ready.terminal.terminal_code(), TerminalCode::Success);
+    let call_for_health = |request: &HandshakeRequest, ready: &HandshakeResponse| {
+        let payload = serde_json::to_vec(&json!({
+            "common_request": {
+                "provider_id": request.provider_id.as_str(),
+                "registration_revision": request.registration_revision,
+                "ready_receipt_digest": ready.ready_receipt_sha256,
+                "exact_scope_identity": tracedecay_memory_conformance::compatibility::scope_json(&request.exact_scope),
+                "operation_id": "operation.native-health", "idempotency_key": null,
+                "expected_state_generation": 0, "request_identity": "request.native-health",
+                "policy_revision": 1,
+                "deadline": {"deadline_utc_micros": i64::MAX, "remaining_millis": 1000},
+                "cancellation": "live", "extensions": []
+            },
+            "requested_checks": ["protocol", "state", "scope", "capacity", "persistence", "recovery"]
+        })).expect("canonical health request");
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Health,
+            provider_id: request.provider_id.clone(),
+            registration_revision: request.registration_revision,
+            ready_receipt_sha256: ready
+                .ready_receipt_sha256
+                .clone()
+                .expect("accepted receipt"),
+            exact_scope: request.exact_scope.clone(),
+            request_id: "request.native-health".into(),
+            operation_id: "operation.native-health".into(),
+            expected_state_generation: 0,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, 1000, CancellationToken::new()),
+            payload: CanonicalPayload::new(
+                OwnedVersionedId::new("tracedecay.memory.provider.health.v1")
+                    .expect("health contract"),
+                payload.clone(),
+                sha256_hex(&payload),
+            )
+            .expect("health payload"),
+            required_capabilities: vec![
+                OwnedVersionedId::new("provider.health.v1").expect("health capability"),
+            ],
+            extensions: Vec::new(),
+        })
+        .expect("health call")
+    };
+    let call = call_for_health(&request, &ready);
+    let observation =
+        session_message_payload("health-record", "session.health", "health state beacon");
+    let observe_call = staged_session_call(
+        project_id.as_str(),
+        &observation,
+        "key.health",
+        "operation.health-observe",
+    );
+    assert_eq!(
+        port.observe(staged_observation_for(&observe_call, observation))
+            .terminal
+            .terminal_code(),
+        TerminalCode::Success
+    );
+    let observed_generation = port
+        .staged
+        .generation()
+        .expect("committed state generation");
+    assert!(observed_generation > call.expected_state_generation);
+    let reply = provider.invoke(&call);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    reply.validate(4096).expect("negotiated response budget");
+    let body: Value =
+        serde_json::from_slice(&reply.payload.as_ref().expect("health payload").bytes)
+            .expect("health response");
+    let descriptor = ready.descriptor.as_ref().expect("actual descriptor");
+    assert_eq!(
+        body["provider_instance_id"],
+        ready
+            .provider_instance_id
+            .as_deref()
+            .expect("actual instance")
+    );
+    assert_eq!(
+        body["implementation_identity_digest"],
+        descriptor.implementation_identity_sha256
+    );
+    assert_eq!(
+        body["scope_digest"],
+        request.exact_scope.exact_scope_sha256()
+    );
+    assert_eq!(body["state_generation"], observed_generation);
+    assert_eq!(reply.state_generation, observed_generation);
+    assert_eq!(
+        reply.terminal.committed_effect().state_generation_after(),
+        Some(observed_generation)
+    );
+    assert_eq!(body["readiness"], "ready");
+    assert_eq!(body["backlog"], 0);
+    assert_eq!(
+        body["capability_states"],
+        json!(
+            descriptor
+                .capabilities
+                .iter()
+                .map(|capability| json!({"capability_id":capability.as_str(),"state":"available"}))
+                .collect::<Vec<_>>()
+        )
+    );
+    let limits = ready.effective_limits.expect("actual negotiated limits");
+    let limit_bytes: Vec<u8> = [
+        limits.request_bytes,
+        limits.response_bytes,
+        limits.observation_batch_items,
+        limits.recall_candidates,
+        limits.concurrent_operations,
+        limits.operation_millis,
+        limits.snapshot_bytes,
+        limits.inspection_items,
+    ]
+    .into_iter()
+    .flat_map(u64::to_be_bytes)
+    .collect();
+    assert_eq!(body["effective_limits_digest"], sha256_hex(&limit_bytes));
+    assert_ne!(limits, descriptor.limits);
+
+    // A later store mutation must not replace an already-probed health revision.
+    let mut outcome = port
+        .staged
+        .control(&call, None)
+        .expect("health state probe");
+    let accepted = port
+        .accepted_readiness
+        .lock()
+        .expect("readiness")
+        .clone()
+        .expect("accepted handshake");
+    let next_observation = session_message_payload(
+        "health-record-next",
+        "session.health",
+        "next health state beacon",
+    );
+    let mut next_call = staged_session_call(
+        project_id.as_str(),
+        &next_observation,
+        "key.health-next",
+        "operation.health-observe-next",
+    );
+    next_call.expected_state_generation = observed_generation;
+    assert_eq!(
+        port.observe(staged_observation_for(&next_call, next_observation))
+            .terminal
+            .terminal_code(),
+        TerminalCode::Success
+    );
+    assert!(port.staged.generation().expect("new generation") > outcome.generation_after);
+    port.complete_health_response(&mut outcome, &accepted)
+        .expect("complete original probe");
+    assert_eq!(outcome.response["state_generation"], observed_generation);
+    assert_eq!(
+        outcome.response["state_identity_digest"],
+        body["state_identity_digest"]
+    );
+    let later = provider.invoke(&call);
+    let later_body: Value =
+        serde_json::from_slice(&later.payload.as_ref().expect("later health").bytes)
+            .expect("later payload");
+    assert_ne!(
+        later_body["state_identity_digest"],
+        body["state_identity_digest"]
+    );
+
+    let mut wrong_receipt = call.clone();
+    wrong_receipt.ready_receipt_sha256 = "f".repeat(64);
+    assert_eq!(
+        provider.invoke(&wrong_receipt).terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    let mut changed_scope = request.clone();
+    changed_scope.exact_scope.agent_session_id = "session.native-health-next".into();
+    changed_scope.required_capabilities.clear();
+    changed_scope.challenge_nonce = [8; 32];
+    let next_ready = provider.handshake(&changed_scope);
+    assert_eq!(next_ready.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(
+        provider.invoke(&call).terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(
+        provider
+            .invoke(&call_for_health(&changed_scope, &next_ready))
+            .terminal
+            .terminal_code(),
+        TerminalCode::Success
+    );
+    assert!(
+        port.common_scopes
+            .lock()
+            .expect("common eligibility")
+            .contains(&(
+                request.exact_scope.exact_scope_sha256(),
+                request.registration_revision
+            ))
+    );
+    assert!(
+        !port
+            .common_scopes
+            .lock()
+            .expect("legacy eligibility")
+            .contains(&(
+                changed_scope.exact_scope.exact_scope_sha256(),
+                changed_scope.registration_revision
+            ))
+    );
+
+    changed_scope.host_limits.response_bytes = 128;
+    let limited_ready = provider.handshake(&changed_scope);
+    assert_eq!(
+        limited_ready.terminal.terminal_code(),
+        TerminalCode::Success
+    );
+    let limited = provider.invoke(&call_for_health(&changed_scope, &limited_ready));
+    assert_eq!(
+        limited.terminal.terminal_code(),
+        TerminalCode::CapacityExceeded
+    );
+    assert!(limited.payload.is_none());
+    let connection = rusqlite::Connection::open(port.staged.path()).expect("fixture connection");
+    connection
+        .execute_batch("DROP TABLE tdmem_native_state_v2")
+        .expect("break fixture state authority");
+    let unavailable = port.health(&call_for_health(&changed_scope, &limited_ready));
+    assert_eq!(
+        unavailable.terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert!(unavailable.payload.is_none());
+}
+
+#[test]
+fn native_queue_accounting_releases_full_disconnected_and_abandoned_requests() {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let actor = NativeReadActor {
+        sender: Mutex::new(Some(sender)),
+        queued_requests: Arc::new(AtomicU64::new(0)),
+        join: Mutex::new(None),
+    };
+    let call = valid_recall_call("project.queue", recall_request_value("project.queue"));
+    let command = || {
+        let (reply, _receiver) = mpsc::sync_channel(1);
+        NativeReadCommand::Control {
+            call: call.clone(),
+            authority: None,
+            reply,
+        }
+    };
+    actor
+        .enqueue_store(command())
+        .expect("first queued request");
+    assert_eq!(actor.queued_requests.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        actor.enqueue_store(command()),
+        Err(NativeReadFailure::ProviderUnavailable)
+    ));
+    assert_eq!(
+        actor.queued_requests.load(Ordering::Acquire),
+        1,
+        "full send releases only its own reservation"
+    );
+    let QueuedNativeReadCommand {
+        command: _command,
+        queued,
+    } = receiver.recv().expect("dequeue");
+    drop(queued);
+    assert_eq!(actor.queued_requests.load(Ordering::Acquire), 0);
+    call.control.cancellation().cancel();
+    actor
+        .enqueue_store(command())
+        .expect("abandoned queued request");
+    assert_eq!(actor.queued_requests.load(Ordering::Acquire), 1);
+    drop(receiver);
+    assert_eq!(
+        actor.queued_requests.load(Ordering::Acquire),
+        0,
+        "receiver drop releases unconsumed work"
+    );
+    assert!(matches!(
+        actor.enqueue_store(command()),
+        Err(NativeReadFailure::ProviderUnavailable)
+    ));
+    assert_eq!(
+        actor.queued_requests.load(Ordering::Acquire),
+        0,
+        "disconnected send rolls back"
+    );
+}
+
+#[test]
+fn staged_candidate_omits_missing_legacy_sources_and_preserves_recorded_attribution() {
+    let root = tempfile::tempdir().expect("staged candidate fixture");
+    let staged = StagedObservationStore::open(root.path()).expect("real staged store");
+    let project_id = "project.staged-provenance";
+    let call = valid_recall_call(project_id, recall_request_value(project_id));
+    let mut request = parse_native_recall_request(&call).expect("recall request");
+    let canonical = session_message_payload("record.legacy", "session.legacy", "legacy beacon");
+    let observation = staged_session_call(project_id, &canonical, "key.legacy", "operation.legacy");
+    staged
+        .stage_or_duplicate(StagedObservationRecord {
+            scope: call.exact_scope.clone(),
+            idempotency_key: "key.legacy".into(),
+            source_authority: "host_session".into(),
+            source_event_id: "record.legacy".into(),
+            source_revision: None,
+            observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.into(),
+            payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.into(),
+            sanitized_payload: observation.payload.bytes,
+            operation_id: "operation.legacy".into(),
+            request_identity: "request.legacy".into(),
+            admitted_at_unix_ms: 1_750_000_000_000,
+        })
+        .expect("stage legacy observation");
+    let mut rows = staged
+        .recall(&call.exact_scope, "legacy", 1)
+        .expect("legacy recall");
+    assert_eq!(rows.len(), 1);
+    let row = rows.pop().expect("legacy row");
+    assert!(row.original_source.is_none());
+    let observed_micros = row.admitted_at_unix_ms * 1000;
+    let legacy = native_staged_recall_candidate(
+        &call,
+        &row,
+        &row.message_text,
+        false,
+        observed_micros,
+        &request,
+    )
+    .expect("legacy projection");
+    assert!(legacy["provenance"].get("original_sources").is_none());
+    assert_eq!(legacy["content"], "legacy beacon");
+
+    let original = tracedecay_memory_conformance::compatibility::common_observation(
+        &row.scope,
+        1,
+        Some("r1"),
+        &row.message_text,
+        Some("2025-01-01T00:00:00Z"),
+        None,
+    )["source_identity"]["original_source"]
+        .clone();
+    let mut recorded = row.clone();
+    recorded.original_source = Some(original.clone());
+    let projected = native_staged_recall_candidate(
+        &call,
+        &recorded,
+        &recorded.message_text,
+        false,
+        observed_micros,
+        &request,
+    )
+    .expect("recorded projection");
+    assert_eq!(
+        projected["provenance"]["original_sources"],
+        json!([original])
+    );
+
+    // Allowing unknown validity cannot grant missing source attribution to
+    // the common profile; legacy content remains eligible only in its lane.
+    request.common_profile = true;
+    request.temporal_query.unknown_validity_policy = "allow_with_warning".into();
+    let page = ProjectMemoryFactSearchPageV1::new(
+        FactOwnerV1::Project {
+            project_id: ProjectId::new(project_id).expect("project identity"),
+        },
+        Vec::new(),
+        None,
+        tracedecay_store::ProjectMemoryFactSearchGraphCoverageV1::NotApplicable,
+    )
+    .expect("empty fact page");
+    let reply = build_native_recall_reply(&call, &request, &test_profile_id(), &page, &[row])
+        .expect("bounded common recall");
+    let response = recall_payload(&reply);
+    assert!(
+        response["candidates"]
+            .as_array()
+            .expect("candidates")
+            .is_empty()
+    );
+    assert_eq!(response["coverage"]["excluded_items"], 1);
+    assert!(
+        response["coverage"]["reasons"]
+            .as_array()
+            .expect("coverage reasons")
+            .contains(&json!("source_attribution_unavailable"))
+    );
+}
+
 #[test]
 fn settled_fact_validation_accepts_exact_projection() {
     let (call, payload) = settled_fixture();
@@ -1212,14 +1941,14 @@ async fn native_recall_rejects_malformed_unsupported_inputs_without_mutating_sto
             RECALL_INVALID_DIAGNOSTIC,
         ),
         (
-            "unsupported temporal mode",
+            "as-of missing bound",
             {
                 let mut request = base.clone();
                 request["temporal_query"]["mode"] = json!("as_of");
                 request
             },
-            TerminalCode::CapabilityUnsupported,
-            RECALL_UNSUPPORTED_DIAGNOSTIC,
+            TerminalCode::InvalidRequest,
+            RECALL_INVALID_DIAGNOSTIC,
         ),
         (
             "foreign scope",
@@ -1252,14 +1981,14 @@ async fn native_recall_rejects_malformed_unsupported_inputs_without_mutating_sto
             RECALL_INVALID_DIAGNOSTIC,
         ),
         (
-            "unsupported exclusion",
+            "malformed content exclusion",
             {
                 let mut request = base.clone();
-                request["exclusions"]["candidate_ids"] = json!(["already-returned"]);
+                request["exclusions"]["content_sha256"] = json!(["not-a-sha256"]);
                 request
             },
-            TerminalCode::CapabilityUnsupported,
-            RECALL_UNSUPPORTED_DIAGNOSTIC,
+            TerminalCode::InvalidRequest,
+            RECALL_INVALID_DIAGNOSTIC,
         ),
     ];
     for (label, request, terminal_code, diagnostic_id) in cases {
@@ -1541,14 +2270,13 @@ async fn staged_session_observation_round_trips_into_an_advisory_recall_candidat
         effect.state_generation_before(),
         Some(call.expected_state_generation)
     );
-    // Native's declared state generation is a fixed descriptor identity, so a
-    // commit reports it unchanged; the provider-local admission sequence
-    // travels in the committed item reference instead.
+    // The durable provider-local generation advances with the staged row.
     assert_eq!(
         effect.state_generation_after(),
-        Some(call.expected_state_generation)
+        Some(call.expected_state_generation + 1)
     );
-    assert_eq!(reply.state_generation, call.expected_state_generation);
+    assert_eq!(reply.state_generation, call.expected_state_generation + 1);
+    assert_eq!(port.descriptor().state_generation, reply.state_generation);
     let committed_refs = effect.committed_item_refs().to_vec();
     assert_eq!(committed_refs.len(), 1);
     let provider_reference = committed_refs[0].clone();
@@ -2189,10 +2917,12 @@ async fn facts_and_staged_rows_share_one_candidate_ceiling_with_deterministic_or
         "the shared budget returned no staged row at all"
     );
     assert_merge_order(&capped_candidates);
-    // One fact hit plus the two staged rows the ceiling admitted for scoring.
-    assert_eq!(capped["coverage"]["matched_items"], json!(3));
+    // The bounded scan scores one fact and all three eligible staged rows
+    // before the shared ceiling excludes the lowest-ranked candidates.
+    assert_eq!(capped["coverage"]["matched_items"], json!(4));
     assert_eq!(capped["coverage"]["returned_items"], json!(2));
-    assert_eq!(capped["coverage"]["excluded_items"], json!(1));
+    assert_eq!(capped["coverage"]["excluded_items"], json!(2));
+    assert_eq!(capped["coverage"]["truncated_items"], json!(0));
     assert_eq!(capped["coverage"]["reasons"], json!(["candidate_limit"]));
 
     // A ceiling of one answers the same ranking's first element, not a
@@ -2208,9 +2938,10 @@ async fn facts_and_staged_rows_share_one_candidate_ceiling_with_deterministic_or
         &capped_candidates[..1],
         "the tighter ceiling selected a different candidate instead of truncating one ranking"
     );
-    assert_eq!(single["coverage"]["matched_items"], json!(2));
+    assert_eq!(single["coverage"]["matched_items"], json!(4));
     assert_eq!(single["coverage"]["returned_items"], json!(1));
-    assert_eq!(single["coverage"]["excluded_items"], json!(1));
+    assert_eq!(single["coverage"]["excluded_items"], json!(3));
+    assert_eq!(single["coverage"]["truncated_items"], json!(0));
     assert_eq!(single["coverage"]["reasons"], json!(["candidate_limit"]));
 
     // Deterministic: the identical request answers the identical ranking.
@@ -2521,3 +3252,6 @@ async fn high_scoring_staged_rows_cannot_starve_a_low_scoring_canonical_fact() {
         );
     }
 }
+
+#[path = "native_common_tests.rs"]
+mod common_profile;

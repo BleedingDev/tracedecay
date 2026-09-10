@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use tracedecay_contracts::memory::{
-    CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallPort,
-    CognitiveRecallProvenance, CognitiveRecallProviderIdentity, CognitiveRecallRequest,
-    CognitiveRecallResult, MAX_COGNITIVE_RECALL_CANDIDATE_BYTES, MAX_COGNITIVE_RECALL_CANDIDATES,
+    CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallExclusions,
+    CognitiveRecallPort, CognitiveRecallProvenance, CognitiveRecallProviderIdentity,
+    CognitiveRecallRequest, CognitiveRecallResult, CognitiveRecallTemporalMode,
+    CognitiveRecallTemporalQuery, CognitiveRecallUnknownValidityPolicy,
+    MAX_COGNITIVE_RECALL_CANDIDATE_BYTES, MAX_COGNITIVE_RECALL_CANDIDATES,
     MAX_COGNITIVE_RECALL_REFERENCE_BYTES,
 };
 use tracedecay_contracts::{CancellationContext, Deadline, RequestId, ResolvedScope};
@@ -48,6 +50,115 @@ fn candidate(id: &str) -> CognitiveRecallCandidate {
         CognitiveRecallProvenance::available("fixture.observation").unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn legacy_request_json_and_constructor_remain_valid_without_options() {
+    let request = request(scope("project.cognitive-recall"));
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert!(serialized.get("temporal_query").is_none());
+    assert!(serialized.get("exclusions").is_none());
+    let restored: CognitiveRecallRequest = serde_json::from_value(serialized).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(restored, request);
+    assert!(restored.temporal_query().is_none());
+    assert!(restored.exclusions().is_none());
+}
+
+#[test]
+fn temporal_and_exclusion_inputs_round_trip_without_narrowing() {
+    let temporal = CognitiveRecallTemporalQuery::current(UtcMicros(50))
+        .with_interval(UtcMicros(10), UtcMicros(20))
+        .unwrap()
+        .with_policy(
+            true,
+            true,
+            CognitiveRecallUnknownValidityPolicy::AllowWithWarning,
+        );
+    let exclusions = CognitiveRecallExclusions {
+        stable_memory_refs: vec!["stable-1".into()],
+        candidate_ids: vec!["candidate-1".into()],
+        source_refs: vec!["source-1".into()],
+        trace_refs: vec!["trace-1".into()],
+        observation_ids: vec!["observation-1".into()],
+        content_sha256: vec!["a".repeat(64)],
+    };
+    let request = request(scope("project.cognitive-recall"))
+        .with_temporal_query(temporal.clone())
+        .unwrap()
+        .with_exclusions(exclusions.clone())
+        .unwrap();
+    let serialized = serde_json::to_value(&request).unwrap();
+    assert_eq!(serialized["temporal_query"]["mode"], "interval");
+    let restored: CognitiveRecallRequest = serde_json::from_value(serialized).unwrap();
+    restored.validate().unwrap();
+    assert_eq!(restored.temporal_query(), Some(&temporal));
+    assert_eq!(restored.exclusions(), Some(&exclusions));
+    assert_eq!(temporal.mode(), CognitiveRecallTemporalMode::Interval);
+    assert_eq!(temporal.interval_start(), Some(UtcMicros(10)));
+    assert_eq!(temporal.interval_end(), Some(UtcMicros(20)));
+    assert!(temporal.include_revoked());
+    assert!(temporal.include_superseded());
+}
+
+#[test]
+fn invalid_temporal_modes_bounds_and_future_admission_clock_fail() {
+    let temporal = CognitiveRecallTemporalQuery::current(UtcMicros(50));
+    assert!(temporal.validate_at(UtcMicros(49)).is_err());
+    temporal.validate_at(UtcMicros(50)).unwrap();
+    assert!(
+        temporal
+            .clone()
+            .with_interval(UtcMicros(20), UtcMicros(20))
+            .is_err()
+    );
+    assert!(
+        temporal
+            .clone()
+            .with_interval(UtcMicros(21), UtcMicros(20))
+            .is_err()
+    );
+    assert!(temporal.clone().with_as_of(UtcMicros(51)).is_err());
+    // Existing canonical interval admission permits future bounds.
+    temporal
+        .clone()
+        .with_interval(UtcMicros(60), UtcMicros(70))
+        .unwrap();
+    let historical = temporal.clone().with_as_of(UtcMicros(20)).unwrap();
+    assert_eq!(historical.as_of(), Some(UtcMicros(20)));
+    assert_eq!(historical.clone().with_history().as_of(), None);
+
+    let mut serialized = serde_json::to_value(&temporal).unwrap();
+    serialized["mode"] = serde_json::json!("unsupported_mode");
+    assert!(serde_json::from_value::<CognitiveRecallTemporalQuery>(serialized).is_err());
+    let mut serialized = serde_json::to_value(&temporal).unwrap();
+    serialized["as_of"] = serde_json::json!(20);
+    let invalid: CognitiveRecallTemporalQuery = serde_json::from_value(serialized).unwrap();
+    assert!(
+        request(scope("project.cognitive-recall"))
+            .with_temporal_query(invalid)
+            .is_err()
+    );
+}
+
+#[test]
+fn exclusion_duplicates_digest_and_bounds_are_rejected() {
+    let mut exclusions = CognitiveRecallExclusions {
+        source_refs: vec!["source-1".into(), "source-1".into()],
+        ..Default::default()
+    };
+    assert!(
+        request(scope("project.cognitive-recall"))
+            .with_exclusions(exclusions.clone())
+            .is_err()
+    );
+    exclusions.source_refs.pop();
+    exclusions.content_sha256 = vec!["A".repeat(64)];
+    assert!(exclusions.validate().is_err());
+    exclusions.content_sha256 = vec!["a".repeat(64)];
+    exclusions.validate().unwrap();
+    exclusions.trace_refs = (0..1025).map(|index| format!("trace-{index}")).collect();
+    assert!(exclusions.validate().is_err());
 }
 
 struct EchoRecallPort {

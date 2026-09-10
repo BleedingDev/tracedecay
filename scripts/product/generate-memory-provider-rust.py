@@ -318,6 +318,8 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
     handshake = contracts["tracedecay.memory.provider.handshake.v1"]
     recall = contracts["tracedecay.memory.provider.recall.v1"]
     terminal = contracts["tracedecay.memory.provider.terminal.v1"]
+    lifecycle = contracts["tracedecay.memory.provider.lifecycle.v1"]
+    observation = contracts["tracedecay.memory.provider.observation.v1"]
     terminal_rows = terminal.get("terminal_codes")
     if not isinstance(terminal_rows, list) or not terminal_rows:
         raise GenerationError("terminal code table must be a non-empty array")
@@ -342,6 +344,24 @@ def enum_sources(contracts: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
         ),
         "TemporalMode": list_strings(
             recall.get("temporal_query", {}).get("modes"), "temporal modes"
+        ),
+        "UnknownValidityPolicy": list_strings(
+            recall["temporal_query"]["unknown_validity_policies"], "unknown validity policies"
+        ),
+        "SourceDisposition": list_strings(
+            observation["common_source_attribution"]["source_disposition_states"],
+            "source dispositions",
+        ),
+        "HistoryRelation": list_strings(
+            observation["common_source_attribution"]["history_relations"], "history relations"
+        ),
+        "FeedbackSignal": list_strings(lifecycle["feedback"]["signals"], "feedback signals"),
+        "MaintenanceTask": list_strings(lifecycle["maintenance"]["tasks"], "maintenance tasks"),
+        "InspectionView": list_strings(lifecycle["inspection"]["views"], "inspection views"),
+        "CorrectionKind": list_strings(lifecycle["correction"]["correction_kinds"], "correction kinds"),
+        "DeletionMode": list_strings(lifecycle["deletion_by_source"]["modes"], "deletion modes"),
+        "ReplayItemState": list_strings(
+            lifecycle["common_advisory_semantics"]["replay_item_states"], "replay item states"
         ),
         "ProvenanceState": list_strings(
             recall.get("provenance", {}).get("states"), "provenance states"
@@ -792,6 +812,21 @@ def render_rust(
             ]
         )
     lines.extend(["];", ""])
+
+    profile = contracts["tracedecay.memory.provider.registry.v1"]["common_advisory_profile"]
+    lines.extend([
+        "/// Explicit opt-in capability for the complete common advisory profile.",
+        f"pub const COMMON_ADVISORY_PROFILE_ID: &str = {rust_string(profile['profile_id'])};",
+        "",
+    ])
+    for name, key in (
+        ("COMMON_ADVISORY_REQUIRED_CAPABILITIES", "required_capabilities"),
+        ("COMMON_ADVISORY_OBSERVATION_KINDS", "required_observation_kinds"),
+        ("COMMON_ADVISORY_OPTIONAL_CAPABILITIES", "optional_capabilities"),
+        ("COMMON_ADVISORY_OPTIONAL_OBSERVATION_KINDS", "optional_observation_kinds"),
+    ):
+        lines.extend(render_string_slice(name, list_strings(profile[key], key),
+                                        "Canonical common advisory profile declaration."))
 
     for name, values in fields.items():
         lines.extend(

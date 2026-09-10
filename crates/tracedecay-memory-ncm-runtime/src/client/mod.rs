@@ -116,6 +116,16 @@ pub struct WorkerClient {
     pid: Arc<AtomicU32>,
     reconciliation_deadline: Duration,
     root: PathBuf,
+    lifecycle: Arc<LifecycleState>,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    gate: Mutex<()>,
+    stopped: AtomicBool,
+    requested: AtomicU64,
+    completed: AtomicU64,
+    force: AtomicBool,
 }
 
 impl WorkerClient {
@@ -138,6 +148,8 @@ impl WorkerClient {
         let owner_shutdown = Arc::clone(&shutdown);
         let owner_pid = Arc::clone(&pid);
         let owner_queued_bytes = Arc::clone(&queued_bytes);
+        let lifecycle = Arc::new(LifecycleState::default());
+        let owner_lifecycle = Arc::clone(&lifecycle);
         let launch = Launch {
             binary: binary_path.as_ref().to_path_buf(),
             root: root.as_ref().to_path_buf(),
@@ -154,6 +166,7 @@ impl WorkerClient {
                     owner_pid,
                     owner_queued_bytes,
                     launch,
+                    owner_lifecycle,
                 )
             })
             .map_err(|error| ClientError::Spawn(error.to_string()))?;
@@ -166,6 +179,7 @@ impl WorkerClient {
             pid,
             reconciliation_deadline: options.reconciliation_deadline,
             root: root.as_ref().to_path_buf(),
+            lifecycle,
         })
     }
 
@@ -186,6 +200,16 @@ impl WorkerClient {
         if cancelled() || deadline.is_zero() {
             return Err(ClientError::Cancelled);
         }
+        if self.lifecycle.stopped.load(Ordering::Acquire) {
+            return Err(ClientError::Disabled);
+        }
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let epoch = lifecycle.requested.load(Ordering::Acquire);
+        let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+            cancelled()
+                || lifecycle.stopped.load(Ordering::Acquire)
+                || lifecycle.requested.load(Ordering::Acquire) != epoch
+        });
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         request.deadline_ms = deadline_ms;
         let logical_request = request.clone();
@@ -299,12 +323,101 @@ impl WorkerClient {
         }
     }
 
+    /// Starts or resumes this owner's actual worker and proves its handshake
+    /// before the supplied deadline. No additional supervisor is created.
+    pub fn start(&self, deadline: Instant) -> Result<(), ClientError> {
+        let _gate = self.lifecycle_gate(deadline)?;
+        if self.lifecycle.completed.load(Ordering::Acquire)
+            < self.lifecycle.requested.load(Ordering::Acquire)
+        {
+            return Err(ClientError::Busy);
+        }
+        self.lifecycle.stopped.store(false, Ordering::Release);
+        let remaining = remaining(deadline).ok_or(ClientError::Cancelled)?;
+        let request = Request::new(
+            0,
+            remaining.as_millis().try_into().unwrap_or(u64::MAX),
+            Operation::Handshake,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            json!({"algorithm_profile": "ncm-biomem-rs.v1"}),
+        );
+        let reply = self.call(request, remaining)?;
+        if reply.outcome == crate::engine::Outcome::Success && self.pid().is_some() {
+            Ok(())
+        } else {
+            Err(ClientError::Transport(
+                "worker did not establish readiness".to_owned(),
+            ))
+        }
+    }
+
+    /// Requests graceful termination and waits for the owner to confirm child
+    /// reap and pipe-thread completion. False leaves termination unconfirmed.
+    pub fn request_stop(&self, deadline: Instant) -> Result<bool, ClientError> {
+        self.stop_owned_worker(deadline, false)
+    }
+
+    /// Forces termination through this existing owner. Success proves the child
+    /// was reaped; callers must not treat a deadline error as confirmed erasure.
+    pub fn kill(&self, deadline: Instant) -> Result<(), ClientError> {
+        if self.stop_owned_worker(deadline, true)? {
+            Ok(())
+        } else {
+            Err(ClientError::Cancelled)
+        }
+    }
+
+    fn lifecycle_gate(
+        &self,
+        deadline: Instant,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, ClientError> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ClientError::Cancelled);
+            }
+            match self.lifecycle.gate.try_lock() {
+                Ok(gate) => return Ok(gate),
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(ClientError::OwnerStopped),
+                Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(2)),
+            }
+        }
+    }
+
+    fn stop_owned_worker(&self, deadline: Instant, force: bool) -> Result<bool, ClientError> {
+        let _gate = self.lifecycle_gate(deadline)?;
+        self.lifecycle.stopped.store(true, Ordering::Release);
+        self.lifecycle.force.store(force, Ordering::Release);
+        let requested = self
+            .lifecycle
+            .requested
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        loop {
+            if self.lifecycle.completed.load(Ordering::Acquire) >= requested {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(ClientError::OwnerStopped);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn externalize_snapshot_restore(&self, request: &mut Request) -> Result<PathBuf, ClientError> {
-        let snapshot = request
+        let common = request
             .payload
-            .get("snapshot")
-            .cloned()
-            .ok_or(ClientError::RequestTooLarge)?;
+            .pointer("/common_portability/action")
+            .is_some_and(|value| value == "snapshot_restore");
+        let snapshot = if common {
+            request.payload.pointer("/common_portability/bytes")
+        } else {
+            request.payload.get("snapshot")
+        }
+        .cloned()
+        .ok_or(ClientError::RequestTooLarge)?;
         let bytes: Vec<u8> = serde_json::from_value(snapshot)
             .map_err(|error| ClientError::Transport(format!("snapshot payload: {error}")))?;
         if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_TRANSPORT_BYTES {
@@ -330,10 +443,18 @@ impl WorkerClient {
         atomic_write(&temporary_file, &snapshot_file, &bytes).map_err(ClientError::Transport)?;
         let byte_length = u64::try_from(bytes.len()).map_err(|_| ClientError::RequestTooLarge)?;
         let content_sha256 = sha256_hex(&bytes);
-        let object = request.payload.as_object_mut().ok_or_else(|| {
+        let object = (if common {
+            request
+                .payload
+                .get_mut("common_portability")
+                .and_then(Value::as_object_mut)
+        } else {
+            request.payload.as_object_mut()
+        })
+        .ok_or_else(|| {
             ClientError::Transport("snapshot restore payload must be an object".to_owned())
         })?;
-        object.remove("snapshot");
+        object.remove(if common { "bytes" } else { "snapshot" });
         object.insert(
             "snapshot_file".to_owned(),
             Value::String(snapshot_file.to_string_lossy().into_owned()),
@@ -393,6 +514,15 @@ impl WorkerClient {
             byte_length,
             content_sha256,
         )?;
+        let common = request
+            .payload
+            .pointer("/common_portability/action")
+            .is_some_and(|value| value == "snapshot_export");
+        if common && payload["common_portability"] != "snapshot_export" {
+            return Err(ClientError::MalformedReply(
+                "common snapshot marker differs".to_owned(),
+            ));
+        }
         reply.payload = Some(json!({
             "format": "ncm-snapshot.v1",
             "bytes": bytes,
@@ -400,6 +530,11 @@ impl WorkerClient {
             "content_sha256": content_sha256,
             "state_generation": reply.state_generation
         }));
+        if common {
+            reply.payload = Some(
+                json!({"common_portability": "snapshot_export", "bytes": reply.payload.as_ref().and_then(|payload| payload.get("bytes")), "warnings": []}),
+            );
+        }
         Ok(reply)
     }
 
@@ -570,7 +705,19 @@ impl Drop for WorkerClient {
 
 fn idempotency_key(request: &Request) -> Option<&str> {
     if request.op.is_mutating() {
-        request.payload.get("idempotency_key")?.as_str()
+        request
+            .payload
+            .get("idempotency_key")
+            .or_else(|| {
+                matches!(request.op, Operation::SnapshotRestore | Operation::Replay)
+                    .then(|| {
+                        request
+                            .payload
+                            .pointer("/common_portability/idempotency_key")
+                    })
+                    .flatten()
+            })?
+            .as_str()
     } else {
         None
     }
@@ -599,10 +746,19 @@ fn owner_loop(
     pid: Arc<AtomicU32>,
     queued_bytes: Arc<AtomicUsize>,
     launch: Launch,
+    lifecycle: Arc<LifecycleState>,
 ) {
     let mut process: Option<WorkerProcess> = None;
     let mut restart_failures = 0_u32;
     while !shutdown.load(Ordering::Acquire) {
+        let requested = lifecycle.requested.load(Ordering::Acquire);
+        if requested > lifecycle.completed.load(Ordering::Acquire) {
+            if let Some(worker) = process.take() {
+                worker.terminate(!lifecycle.force.load(Ordering::Acquire));
+            }
+            restart_failures = 0;
+            lifecycle.completed.store(requested, Ordering::Release);
+        }
         let command = match calls.recv_timeout(Duration::from_millis(10)) {
             Ok(command) => command,
             Err(RecvTimeoutError::Timeout) => continue,

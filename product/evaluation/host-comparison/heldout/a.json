@@ -1,0 +1,1451 @@
+{
+  "schema_version": 1,
+  "case_batch": "a",
+  "cases": [
+    {
+      "id": "hc-a-01",
+      "family": "stale_change",
+      "description": "A sprite metadata migration changes the coordinate frame of pivots; identical rendering symptoms require different arithmetic before and after the format boundary.",
+      "sources": [
+        {
+          "id": "hc-a-01-pivot-r1",
+          "lineage_id": "hc-a-01-pivot-contract",
+          "revision": "1",
+          "origin": {
+            "project": "lumen-sprites",
+            "repository": "lumen-sprites-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "sprite-session-a"
+          },
+          "observed_at": "2025-02-01T09:00:00Z",
+          "valid_from": "2025-02-01T09:00:00Z",
+          "valid_until": "2025-02-03T10:00:00Z",
+          "content": "Lumen sprite metadata revision 1 defines pivot in the trimmed rectangle coordinate system. For a local trimmed vertex v, emit v - pivot; do not convert pivot using trim_origin. The sail fixture stores pivot [6,12] after trimming. This rule is valid only for revision 1 metadata."
+        },
+        {
+          "id": "hc-a-01-packing-r1",
+          "lineage_id": "hc-a-01-packing",
+          "revision": "1",
+          "origin": {
+            "project": "lumen-sprites",
+            "repository": "lumen-sprites-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "sprite-session-a"
+          },
+          "observed_at": "2025-02-01T09:10:00Z",
+          "valid_from": "2025-02-01T09:10:00Z",
+          "valid_until": null,
+          "content": "Lumen atlas packing sorts rectangles by descending height before the skyline pass. Equal-height entries use the asset name to stabilize the atlas digest. This controls placement inside an atlas page and does not define a sprite pivot or its local vertices."
+        },
+        {
+          "id": "hc-a-01-pivot-r2",
+          "lineage_id": "hc-a-01-pivot-contract",
+          "revision": "2",
+          "origin": {
+            "project": "lumen-sprites",
+            "repository": "lumen-sprites-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "sprite-session-a"
+          },
+          "observed_at": "2025-02-03T10:00:00Z",
+          "valid_from": "2025-02-03T10:00:00Z",
+          "valid_until": null,
+          "content": "Lumen sprite metadata revision 2 now stores pivot in the original untrimmed frame. Convert once with local_pivot = pivot - trim_origin, then emit each trimmed vertex as v - local_pivot. The sail fixture has original pivot [14,18] and trim_origin [8,6], giving local_pivot [6,12] and top-left local vertex [-6,-12]. Treating the stored pivot as trim-local gives [-14,-18] and moves the sprite. Atlas placement never enters this conversion. Revision 2 supersedes the revision 1 pivot convention from 2025-02-03T10:00:00Z."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-01-pivot-r1",
+          "source_revision": "1",
+          "session": "sprite-session-a",
+          "at": "2025-02-01T09:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-01-packing-r1",
+          "source_revision": "1",
+          "session": "sprite-session-a",
+          "at": "2025-02-01T09:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "sprite-session-a",
+          "at": "2025-02-02T10:00:00Z",
+          "query_id": "hc-a-01-q1"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-01-pivot-r2",
+          "source_revision": "2",
+          "session": "sprite-session-a",
+          "at": "2025-02-03T10:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-01-pivot-r1",
+          "source_revision": "1",
+          "session": "sprite-session-a",
+          "at": "2025-02-03T10:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-01-pivot-r1",
+            "replacement_source_id": "hc-a-01-pivot-r2",
+            "lineage_id": "hc-a-01-pivot-contract",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "recall",
+          "session": "sprite-session-a",
+          "at": "2025-02-03T10:00:00Z",
+          "query_id": "hc-a-01-q2"
+        },
+        {
+          "action": "recall",
+          "session": "sprite-session-a",
+          "at": "2025-02-04T10:00:00Z",
+          "query_id": "hc-a-01-q3"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-01-q1",
+          "text": "Before the exporter format changes, how does the sail frame keep its attachment point fixed after empty margins are cropped?",
+          "at": "2025-02-02T10:00:00Z",
+          "session": "sprite-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-02T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-01-pivot-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "Revision 1 pivot coordinates are relative to the trimmed rectangle.",
+            "Revision 1 emits local vertices as v - pivot; the sail pivot is [6,12]."
+          ],
+          "prohibited_claims": [
+            "Revision 1 requires subtracting trim_origin from its already trim-local pivot."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-01-q2",
+          "text": "The new exporter landed and a cropped sail now jumps away from its attachment. Which coordinate conversion belongs in the reader, and what should its first corner be?",
+          "at": "2025-02-03T10:00:00Z",
+          "session": "sprite-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-02-03T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-01-pivot-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-01-pivot-r1"
+          ],
+          "required_facts": [
+            "Revision 2 stores pivot in the original untrimmed frame.",
+            "Compute local_pivot = pivot - trim_origin exactly once, then subtract local_pivot from trimmed vertices.",
+            "For pivot [14,18] and trim_origin [8,6], the top-left local vertex is [-6,-12]."
+          ],
+          "prohibited_claims": [
+            "Treat the revision 2 stored pivot as already trim-local.",
+            "The sail top-left local vertex should be [-14,-18].",
+            "Atlas packing order fixes the attachment displacement."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-01-q3",
+          "text": "For the importer before the exporter format switch, did the attachment coordinates already account for cropping?",
+          "at": "2025-02-04T10:00:00Z",
+          "session": "sprite-session-a",
+          "temporal": {
+            "mode": "as_of",
+            "evaluation_time": "2025-02-04T10:00:00Z",
+            "as_of": "2025-02-02T12:00:00Z",
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-01-pivot-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-01-pivot-r2"
+          ],
+          "required_facts": [
+            "At 2025-02-02T12:00:00Z, revision 1 was valid and the pivot was already trim-local.",
+            "The historical reader subtracts the stored [6,12] pivot directly from trimmed vertices."
+          ],
+          "prohibited_claims": [
+            "The untrimmed-frame pivot convention was valid on 2025-02-02T12:00:00Z."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-01-q1",
+          "hc-a-01-q2",
+          "hc-a-01-q3"
+        ],
+        "expected_source_ids": [
+          "hc-a-01-pivot-r1",
+          "hc-a-01-pivot-r2"
+        ],
+        "description": "Recall revision 1 while valid, revision 2 exactly at the exclusive end of revision 1, and revision 1 again through an explicit historical request."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "The revision 1 interval ends exactly when revision 2 begins. The boundary current query must exclude revision 1 even if it ranks highly.",
+        "The historical request permits superseded evidence but requires historical validity; revision 2 is future evidence relative to its as_of time."
+      ],
+      "rationale": "This tests a change in coordinate meaning and an arithmetic consequence, with a packing fact that shares the sprite context but cannot answer the query. The two conventions remain separately useful at their declared times."
+    },
+    {
+      "id": "hc-a-02",
+      "family": "stale_change",
+      "description": "A parser switches its diagnostic protocol from normalized UTF-16 positions to original UTF-8 byte ranges; CRLF and a supplementary character distinguish the contracts.",
+      "sources": [
+        {
+          "id": "hc-a-02-span-r1",
+          "lineage_id": "hc-a-02-span-contract",
+          "revision": "1",
+          "origin": {
+            "project": "reed-parser",
+            "repository": "reed-parser-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "span-session-a"
+          },
+          "observed_at": "2025-03-10T08:00:00Z",
+          "valid_from": "2025-03-10T08:00:00Z",
+          "valid_until": "2025-03-12T14:00:00Z",
+          "content": "Reed diagnostic protocol revision 1 reports UTF-16 code-unit ranges over editor text after CRLF is normalized to LF. For original input A followed by CRLF, the fox emoji U+1F98A, and z, the fox range in the normalized editor text is [2,4). Revision 1 consumers use that range directly as editor positions."
+        },
+        {
+          "id": "hc-a-02-fix-order-r1",
+          "lineage_id": "hc-a-02-fix-order",
+          "revision": "1",
+          "origin": {
+            "project": "reed-parser",
+            "repository": "reed-parser-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "span-session-a"
+          },
+          "observed_at": "2025-03-10T08:10:00Z",
+          "valid_from": "2025-03-10T08:10:00Z",
+          "valid_until": null,
+          "content": "Reed sorts independent quick-fix titles alphabetically in the menu. This sort affects only display order; it never alters diagnostic locations, source bytes or edit ranges."
+        },
+        {
+          "id": "hc-a-02-span-r2",
+          "lineage_id": "hc-a-02-span-contract",
+          "revision": "2",
+          "origin": {
+            "project": "reed-parser",
+            "repository": "reed-parser-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "span-session-a"
+          },
+          "observed_at": "2025-03-12T14:00:00Z",
+          "valid_from": "2025-03-12T14:00:00Z",
+          "valid_until": null,
+          "content": "Reed diagnostic protocol revision 2 reports half-open byte ranges in the original UTF-8 source, including both bytes of each CRLF. The parser must not normalize line endings or convert to UTF-16 when producing these ranges. For original bytes representing A, CRLF, U+1F98A, z, the fox occupies [3,7). The editor bridge translates original-byte ranges to its normalized UTF-16 positions only when rendering, where that same fox is [2,4). The bridge owns the line-ending map. Revision 2 replaces the revision 1 range contract from 2025-03-12T14:00:00Z."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-02-span-r1",
+          "source_revision": "1",
+          "session": "span-session-a",
+          "at": "2025-03-10T08:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-02-fix-order-r1",
+          "source_revision": "1",
+          "session": "span-session-a",
+          "at": "2025-03-10T08:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "span-session-a",
+          "at": "2025-03-11T09:00:00Z",
+          "query_id": "hc-a-02-q1"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-02-span-r2",
+          "source_revision": "2",
+          "session": "span-session-a",
+          "at": "2025-03-12T14:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-02-span-r1",
+          "source_revision": "1",
+          "session": "span-session-a",
+          "at": "2025-03-12T14:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-02-span-r1",
+            "replacement_source_id": "hc-a-02-span-r2",
+            "lineage_id": "hc-a-02-span-contract",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "recall",
+          "session": "span-session-a",
+          "at": "2025-03-12T14:00:00Z",
+          "query_id": "hc-a-02-q2"
+        },
+        {
+          "action": "recall",
+          "session": "span-session-a",
+          "at": "2025-03-13T08:00:00Z",
+          "query_id": "hc-a-02-q3"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-02-q1",
+          "text": "Under the first diagnostic format, what range points at the animal symbol after a Windows newline, and can the editor use it directly?",
+          "at": "2025-03-11T09:00:00Z",
+          "session": "span-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-11T09:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-02-span-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "Revision 1 uses UTF-16 code units after CRLF-to-LF normalization.",
+            "The fox range is [2,4), and revision 1 consumers use it directly as editor positions."
+          ],
+          "prohibited_claims": [
+            "Revision 1 returns original UTF-8 byte offsets."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-02-q2",
+          "text": "After the diagnostic wire change, a Windows-authored document with an astral character gets the wrong underline. What must the parser send, and which component translates it for display?",
+          "at": "2025-03-12T14:00:00Z",
+          "session": "span-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-03-12T14:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-02-span-r2"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-02-span-r1"
+          ],
+          "required_facts": [
+            "Revision 2 emits half-open ranges in original UTF-8 bytes and counts both CR and LF.",
+            "The fox in A, CRLF, U+1F98A, z has parser byte range [3,7).",
+            "Only the editor bridge converts the original-byte range to normalized UTF-16 display positions using its line-ending map."
+          ],
+          "prohibited_claims": [
+            "The revision 2 parser should normalize CRLF before calculating source ranges.",
+            "The parser should send [2,4) as the fox original-byte range.",
+            "Sorting quick-fix titles repairs the underline."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-02-q3",
+          "text": "An archived client predates the wire change. Which location convention was in force for its diagnostic payload?",
+          "at": "2025-03-13T08:00:00Z",
+          "session": "span-session-a",
+          "temporal": {
+            "mode": "as_of",
+            "evaluation_time": "2025-03-13T08:00:00Z",
+            "as_of": "2025-03-11T12:00:00Z",
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": true,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-02-span-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-02-span-r2"
+          ],
+          "required_facts": [
+            "At 2025-03-11T12:00:00Z the valid contract was normalized-editor UTF-16 ranges.",
+            "For the fox fixture, the historical diagnostic range is [2,4)."
+          ],
+          "prohibited_claims": [
+            "Original-byte ranges were already the valid diagnostic contract on 2025-03-11T12:00:00Z."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-02-q1",
+          "hc-a-02-q2",
+          "hc-a-02-q3"
+        ],
+        "expected_source_ids": [
+          "hc-a-02-span-r1",
+          "hc-a-02-span-r2"
+        ],
+        "description": "Establish useful recall of the old convention, require the replacement at its first valid instant, and recover the old convention only for a time before the switch."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "The current request at 2025-03-12T14:00:00Z must use revision 2; revision 1 valid_until is exclusive.",
+        "Keep parser bytes and editor UTF-16 positions distinct. A correct number attributed to the wrong coordinate system fails.",
+        "The as_of answer must not silently substitute the current parser contract."
+      ],
+      "rationale": "The required answer needs source units, newline treatment and ownership of conversion. A repeated offset without its coordinate space cannot satisfy the case, and the quick-fix menu fact is true but irrelevant."
+    },
+    {
+      "id": "hc-a-03",
+      "family": "failed_approach",
+      "description": "A migration matcher passes an append-only smoke check but silently swaps field meanings after reordering two fields with the same type.",
+      "sources": [
+        {
+          "id": "hc-a-03-match-r1",
+          "lineage_id": "hc-a-03-matcher-findings",
+          "revision": "1",
+          "origin": {
+            "project": "wicker-schema",
+            "repository": "wicker-schema-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "schema-session-a"
+          },
+          "observed_at": "2025-04-01T09:00:00Z",
+          "valid_from": "2025-04-01T09:00:00Z",
+          "valid_until": "2025-04-02T11:00:00Z",
+          "content": "Wicker schema matcher trial 1 pairs fields by ordinal position when their types agree. The only completed smoke check appends a new final field to an unchanged form, and that check passes. Use positional matching for the next dry-run trial. No reorder test has run, so this note does not establish that reorder is safe."
+        },
+        {
+          "id": "hc-a-03-sql-style-r1",
+          "lineage_id": "hc-a-03-sql-style",
+          "revision": "1",
+          "origin": {
+            "project": "wicker-schema",
+            "repository": "wicker-schema-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "schema-session-a"
+          },
+          "observed_at": "2025-04-01T09:10:00Z",
+          "valid_from": "2025-04-01T09:10:00Z",
+          "valid_until": null,
+          "content": "Wicker renders generated SQL with four-space indentation and uppercase statement keywords. Formatting changes leave the migration operation list unchanged."
+        },
+        {
+          "id": "hc-a-03-match-r2",
+          "lineage_id": "hc-a-03-matcher-findings",
+          "revision": "2",
+          "origin": {
+            "project": "wicker-schema",
+            "repository": "wicker-schema-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "schema-session-a"
+          },
+          "observed_at": "2025-04-02T11:00:00Z",
+          "valid_from": "2025-04-02T11:00:00Z",
+          "valid_until": null,
+          "content": "Wicker reorder trial disproves ordinal-plus-type field matching. The form starts with integer fields left_qty and right_qty, then the user swaps their positions without changing either identity. The positional matcher sees equal integer types at both positions and reports no identity change, so existing values appear under the opposite labels. Increasing string-name similarity does not establish identity when labels can also be edited. Retire the positional matcher. This failure report supersedes the trial-1 recommendation; the earlier append-only smoke result remains historically true."
+        },
+        {
+          "id": "hc-a-03-identity-r1",
+          "lineage_id": "hc-a-03-field-identity",
+          "revision": "1",
+          "origin": {
+            "project": "wicker-schema",
+            "repository": "wicker-schema-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "schema-session-a"
+          },
+          "observed_at": "2025-04-02T11:10:00Z",
+          "valid_from": "2025-04-02T11:10:00Z",
+          "valid_until": null,
+          "content": "Wicker now persists an immutable field_key on each form field and matches migration identity by field_key before comparing label, position or type. A moved field retains its field_key and existing values. Legacy fields lacking field_key remain unresolved in the preview and require an explicit user mapping; the migration generator must not guess identity from position, type or label similarity. The swapped left_qty/right_qty regression preserves both value columns under their original field keys."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-03-match-r1",
+          "source_revision": "1",
+          "session": "schema-session-a",
+          "at": "2025-04-01T09:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-03-sql-style-r1",
+          "source_revision": "1",
+          "session": "schema-session-a",
+          "at": "2025-04-01T09:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "schema-session-a",
+          "at": "2025-04-01T12:00:00Z",
+          "query_id": "hc-a-03-q1"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-03-match-r2",
+          "source_revision": "2",
+          "session": "schema-session-a",
+          "at": "2025-04-02T11:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-03-match-r1",
+          "source_revision": "1",
+          "session": "schema-session-a",
+          "at": "2025-04-02T11:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-03-match-r1",
+            "replacement_source_id": "hc-a-03-match-r2",
+            "lineage_id": "hc-a-03-matcher-findings",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-03-identity-r1",
+          "source_revision": "1",
+          "session": "schema-session-a",
+          "at": "2025-04-02T11:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "schema-session-a",
+          "at": "2025-04-02T12:00:00Z",
+          "query_id": "hc-a-03-q2"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-03-q1",
+          "text": "What correspondence rule did the first migration dry run try, and what did its passing check actually cover?",
+          "at": "2025-04-01T12:00:00Z",
+          "session": "schema-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-01T12:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-03-match-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "The trial pairs fields by ordinal position when types agree.",
+            "The passing check only appended a final field to an unchanged form; reorder had not been tested."
+          ],
+          "prohibited_claims": [
+            "The first trial proved positional matching safe for field reordering."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-03-q2",
+          "text": "Two amount inputs traded places and the migration preview says nothing changed, but their saved values follow the wrong labels. What failed in the earlier attempt, and what identity rule did we settle on?",
+          "at": "2025-04-02T12:00:00Z",
+          "session": "schema-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-02T12:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-03-match-r2",
+            "hc-a-03-identity-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-03-match-r1"
+          ],
+          "required_facts": [
+            "Pairing by ordinal and matching type hides swaps of same-type fields and puts existing values under the opposite labels.",
+            "Match fields by immutable field_key before considering mutable label, position or type.",
+            "Legacy fields without field_key require an explicit mapping and remain unresolved until one is supplied."
+          ],
+          "prohibited_claims": [
+            "Keep positional matching because both quantities have the same type.",
+            "Name similarity is sufficient to infer legacy field identity.",
+            "The append-only smoke check validated the reorder behavior.",
+            "SQL indentation changes fix field identity."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-03-q1",
+          "hc-a-03-q2"
+        ],
+        "expected_source_ids": [
+          "hc-a-03-match-r1",
+          "hc-a-03-match-r2",
+          "hc-a-03-identity-r1"
+        ],
+        "description": "First retrieve the limited trial result, then retrieve both the counterexample and the adopted fix after the trial recommendation is replaced."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "The failed experiment is useful current evidence. Do not discard it merely because the tested approach failed.",
+        "The final query requires the failure mechanism and the explicit treatment of missing field keys; naming a new key alone is insufficient.",
+        "It is valid to discuss the retired approach as a failed experiment using revision 2. Do not deliver the superseded recommendation or present its trial as successful for reorder."
+      ],
+      "rationale": "This case separates remembering a failed experiment from repeating its recommendation. The append-only pass is real but too narrow, and the repair needs an identity invariant plus an honest unresolved path."
+    },
+    {
+      "id": "hc-a-04",
+      "family": "failed_approach",
+      "description": "An in-band stop marker deadlocks a saturated audio queue when the consumer needs an acknowledgement from the blocked panel.",
+      "sources": [
+        {
+          "id": "hc-a-04-stop-r1",
+          "lineage_id": "hc-a-04-stop-findings",
+          "revision": "1",
+          "origin": {
+            "project": "copper-audio",
+            "repository": "copper-audio-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "audio-session-a"
+          },
+          "observed_at": "2025-04-14T08:00:00Z",
+          "valid_from": "2025-04-14T08:00:00Z",
+          "valid_until": "2025-04-15T10:00:00Z",
+          "content": "Copper capture-panel trial 1 sends an EndFrame sentinel through the bounded audio-frame queue and then joins the capture thread. Closing an idle panel with an empty queue passed the smoke check. The trial recommendation is to use this handshake. Closing while the queue is full and the consumer is waiting for a panel acknowledgement has not been tested."
+        },
+        {
+          "id": "hc-a-04-meter-r1",
+          "lineage_id": "hc-a-04-meter-display",
+          "revision": "1",
+          "origin": {
+            "project": "copper-audio",
+            "repository": "copper-audio-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "audio-session-a"
+          },
+          "observed_at": "2025-04-14T08:10:00Z",
+          "valid_from": "2025-04-14T08:10:00Z",
+          "valid_until": null,
+          "content": "Copper peak-meter labels refresh every 50 milliseconds while capture frames continue at the device cadence. Changing the meter label refresh interval affects display smoothness, not ownership of queued frames or the capture-thread stop protocol."
+        },
+        {
+          "id": "hc-a-04-stop-r2",
+          "lineage_id": "hc-a-04-stop-findings",
+          "revision": "2",
+          "origin": {
+            "project": "copper-audio",
+            "repository": "copper-audio-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "audio-session-a"
+          },
+          "observed_at": "2025-04-15T10:00:00Z",
+          "valid_from": "2025-04-15T10:00:00Z",
+          "valid_until": null,
+          "content": "Copper saturated-close reproduction fails the EndFrame handshake. During device reconfiguration, the consumer waits for a panel acknowledgement before draining. With all queue slots occupied, the panel blocks trying to enqueue EndFrame, so it never publishes the acknowledgement that would let the consumer free a slot. Increasing capacity only postpones the same cycle. The idle empty-queue pass did not cover this state. Retire the in-band stop handshake; this failure finding supersedes trial 1."
+        },
+        {
+          "id": "hc-a-04-close-r1",
+          "lineage_id": "hc-a-04-close-protocol",
+          "revision": "1",
+          "origin": {
+            "project": "copper-audio",
+            "repository": "copper-audio-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "audio-session-a"
+          },
+          "observed_at": "2025-04-15T10:10:00Z",
+          "valid_from": "2025-04-15T10:10:00Z",
+          "valid_until": null,
+          "content": "Copper close now sets a closed flag outside the frame queue and wakes the consumer condition variable. New frame submissions fail after the flag is set. The awakened consumer releases queued frame leases, acknowledges closure and exits; only then does the panel join it and free the backing sample buffer. The saturated-close regression checks both a terminated thread and zero outstanding frame leases. Returning from the panel callback alone does not prove that cleanup finished."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-04-stop-r1",
+          "source_revision": "1",
+          "session": "audio-session-a",
+          "at": "2025-04-14T08:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-04-meter-r1",
+          "source_revision": "1",
+          "session": "audio-session-a",
+          "at": "2025-04-14T08:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "audio-session-a",
+          "at": "2025-04-14T12:00:00Z",
+          "query_id": "hc-a-04-q1"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-04-stop-r2",
+          "source_revision": "2",
+          "session": "audio-session-a",
+          "at": "2025-04-15T10:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-04-stop-r1",
+          "source_revision": "1",
+          "session": "audio-session-a",
+          "at": "2025-04-15T10:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-04-stop-r1",
+            "replacement_source_id": "hc-a-04-stop-r2",
+            "lineage_id": "hc-a-04-stop-findings",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-04-close-r1",
+          "source_revision": "1",
+          "session": "audio-session-a",
+          "at": "2025-04-15T10:10:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "audio-session-a",
+          "at": "2025-04-15T12:00:00Z",
+          "query_id": "hc-a-04-q2"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-04-q1",
+          "text": "Which stop handshake was tried for the recording panel, and under what load did the initial check pass?",
+          "at": "2025-04-14T12:00:00Z",
+          "session": "audio-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-14T12:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-04-stop-r1"
+          ],
+          "forbidden_source_ids": [],
+          "required_facts": [
+            "The trial enqueues an EndFrame sentinel through the bounded frame queue and joins the capture thread.",
+            "Only closing an idle panel with an empty queue was validated."
+          ],
+          "prohibited_claims": [
+            "The initial smoke check validated closing a full queue during device reconfiguration."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-04-q2",
+          "text": "Closing the recorder freezes only while the device is being reconfigured and frames are backed up. Which prior shutdown attempt should we avoid, and what has to finish before releasing the samples?",
+          "at": "2025-04-15T12:00:00Z",
+          "session": "audio-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-04-15T12:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-04-stop-r2",
+            "hc-a-04-close-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-04-stop-r1"
+          ],
+          "required_facts": [
+            "Enqueueing the stop sentinel can block on a full queue while the consumer waits for an acknowledgement the blocked panel cannot publish.",
+            "Publish closure outside the queue and wake the consumer; reject new frame submissions after closure.",
+            "The consumer must release queued frame leases and exit before the panel joins it and frees the backing buffer.",
+            "Verify thread termination and zero outstanding frame leases; callback return alone is insufficient."
+          ],
+          "prohibited_claims": [
+            "A larger frame queue removes the shutdown dependency cycle.",
+            "Wait until EndFrame is successfully enqueued before publishing closure.",
+            "Free the backing buffer as soon as the panel callback returns.",
+            "Changing peak-meter refresh cadence fixes shutdown ownership."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-04-q1",
+          "hc-a-04-q2"
+        ],
+        "expected_source_ids": [
+          "hc-a-04-stop-r1",
+          "hc-a-04-stop-r2",
+          "hc-a-04-close-r1"
+        ],
+        "description": "Retrieve the initial trial with its limited coverage, then require both the failed dependency cycle and the verified replacement protocol."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "The final query must explain why the full-queue state defeats the earlier handshake; a generic recommendation to add a timeout does not supply the frozen facts.",
+        "The failed experiment remains admissible through revision 2. The stale recommendation in revision 1 must not be delivered for the current query.",
+        "Cleanup evidence requires both thread termination and released frame leases. Do not infer either from callback completion."
+      ],
+      "rationale": "The tempting repair of increasing capacity preserves the wait cycle. Useful recall must carry the failed-state conditions and the ownership rule for cleanup, while the true meter-timing note cannot resolve either."
+    },
+    {
+      "id": "hc-a-05",
+      "family": "cross_session_reuse",
+      "description": "A later session needs a prior watch-service diagnosis that joins two observations and distinguishes current multi-stream behavior from a sibling lab simplification.",
+      "sources": [
+        {
+          "id": "hc-a-05-pair-r1",
+          "lineage_id": "hc-a-05-pairing-contract",
+          "revision": "1",
+          "origin": {
+            "project": "alder-watch",
+            "repository": "alder-watch-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "watch-session-a"
+          },
+          "observed_at": "2025-05-05T08:00:00Z",
+          "valid_from": "2025-05-05T08:00:00Z",
+          "valid_until": "2025-05-06T09:00:00Z",
+          "content": "Alder watcher revision 1 has exactly one uninterrupted event stream and pairs rename halves by rename_cookie. The pending table is keyed only by that cookie. This contract predates multi-stream watching and reconnection support."
+        },
+        {
+          "id": "hc-a-05-pair-r2",
+          "lineage_id": "hc-a-05-pairing-contract",
+          "revision": "2",
+          "origin": {
+            "project": "alder-watch",
+            "repository": "alder-watch-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "watch-session-a"
+          },
+          "observed_at": "2025-05-06T09:00:00Z",
+          "valid_from": "2025-05-06T09:00:00Z",
+          "valid_until": null,
+          "content": "Alder watcher revision 2 receives cookies that are unique only within one stream incarnation. Pair rename halves using the full tuple stream_id, reconnect_epoch, rename_cookie. Clear unmatched halves for an incarnation when that stream overflows or reconnects; a later incarnation cannot complete an old half. Otherwise an identical cookie from another watched root or a new connection can steal the previous source pathname. This replaces revision 1 cookie-only pairing."
+        },
+        {
+          "id": "hc-a-05-regression-r1",
+          "lineage_id": "hc-a-05-pairing-regression",
+          "revision": "1",
+          "origin": {
+            "project": "alder-watch",
+            "repository": "alder-watch-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "watch-session-a"
+          },
+          "observed_at": "2025-05-06T09:10:00Z",
+          "valid_from": "2025-05-06T09:10:00Z",
+          "valid_until": null,
+          "content": "Alder regression rename_incarnation_collision records a source half in stream cedar at epoch 4 with cookie 17, then a destination half in stream ash at epoch 4 with cookie 17. They remain unpaired. A second trace records a source in cedar epoch 4 and reconnects cedar to epoch 5 before a destination with cookie 17; those also remain unpaired. Only source and destination halves matching all three tuple components produce a rename."
+        },
+        {
+          "id": "hc-a-05-display-r1",
+          "lineage_id": "hc-a-05-root-display",
+          "revision": "1",
+          "origin": {
+            "project": "alder-watch",
+            "repository": "alder-watch-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "watch-session-a"
+          },
+          "observed_at": "2025-05-06T09:20:00Z",
+          "valid_from": "2025-05-06T09:20:00Z",
+          "valid_until": null,
+          "content": "Alder displays watched roots sorted by their user-facing labels in the sidebar. Labels can be edited without restarting a watcher, so this display order does not define event-stream identity."
+        },
+        {
+          "id": "hc-a-05-lab-r1",
+          "lineage_id": "hc-a-05-lab-pairing",
+          "revision": "1",
+          "origin": {
+            "project": "alder-watch",
+            "repository": "alder-watch-repo",
+            "worktree": "single-stream-lab",
+            "branch": "single-stream-lab",
+            "session": "watch-lab-session"
+          },
+          "observed_at": "2025-05-06T09:30:00Z",
+          "valid_from": "2025-05-06T09:30:00Z",
+          "valid_until": null,
+          "content": "The single-stream-lab worktree intentionally uses a replay file with one stream, no reconnects and globally unique rename cookies. Its test reader pairs halves by cookie alone. That lab simplification is valid only for this worktree and branch; it is not the multi-stream main-checkout contract."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-05-pair-r1",
+          "source_revision": "1",
+          "session": "watch-session-a",
+          "at": "2025-05-05T08:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-05-pair-r2",
+          "source_revision": "2",
+          "session": "watch-session-a",
+          "at": "2025-05-06T09:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-05-pair-r1",
+          "source_revision": "1",
+          "session": "watch-session-a",
+          "at": "2025-05-06T09:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-05-pair-r1",
+            "replacement_source_id": "hc-a-05-pair-r2",
+            "lineage_id": "hc-a-05-pairing-contract",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-05-regression-r1",
+          "source_revision": "1",
+          "session": "watch-session-a",
+          "at": "2025-05-06T09:10:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-05-display-r1",
+          "source_revision": "1",
+          "session": "watch-session-a",
+          "at": "2025-05-06T09:20:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-05-lab-r1",
+          "source_revision": "1",
+          "session": "watch-lab-session",
+          "at": "2025-05-06T09:30:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "watch-session-a",
+          "at": "2025-05-06T10:00:00Z",
+          "query_id": "hc-a-05-q1"
+        },
+        {
+          "action": "replay",
+          "session": "watch-session-b",
+          "at": "2025-05-07T09:00:00Z",
+          "details": {
+            "grant_id": "hc-a-05-share-a-to-b",
+            "authorization": "host_authorized_same_checkout_session_reuse",
+            "origin_scope": {
+              "project": "alder-watch",
+              "repository": "alder-watch-repo",
+              "worktree": "main-checkout",
+              "branch": "main",
+              "session": "watch-session-a"
+            },
+            "destination_scope": {
+              "project": "alder-watch",
+              "repository": "alder-watch-repo",
+              "worktree": "main-checkout",
+              "branch": "main",
+              "session": "watch-session-b"
+            },
+            "source_ids": [
+              "hc-a-05-pair-r2",
+              "hc-a-05-regression-r1",
+              "hc-a-05-display-r1"
+            ],
+            "retain_original_origin": true,
+            "exclude_source_ids": [
+              "hc-a-05-pair-r1",
+              "hc-a-05-lab-r1"
+            ],
+            "description": "Replay the current eligible canonical observations from watch-session-a into the authorized watch-session-b view. Revalidate source validity and lineage. No grant exists for single-stream-lab. Do not invent fresh B-origin evidence."
+          }
+        },
+        {
+          "action": "recall",
+          "session": "watch-session-b",
+          "at": "2025-05-07T10:00:00Z",
+          "query_id": "hc-a-05-q2"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-05-q1",
+          "text": "What did the two-root collision reproduction establish about matching the two sides of a move?",
+          "at": "2025-05-06T10:00:00Z",
+          "session": "watch-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-05-06T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-05-pair-r2",
+            "hc-a-05-regression-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-05-pair-r1",
+            "hc-a-05-lab-r1"
+          ],
+          "required_facts": [
+            "Rename halves must match stream_id, reconnect_epoch and rename_cookie.",
+            "Equal cookies from different streams or different reconnect epochs remain unpaired."
+          ],
+          "prohibited_claims": [
+            "Equal rename cookies alone prove that two halves form a move.",
+            "The lab reader defines the main-checkout pairing rule."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-05-q2",
+          "text": "I am back in the main checkout. After the event service reconnects, files in separate watched folders sometimes seem to exchange names. Retrieve the earlier diagnosis and the checks that prevent this.",
+          "at": "2025-05-07T10:00:00Z",
+          "session": "watch-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-05-07T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-05-pair-r2",
+            "hc-a-05-regression-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-05-pair-r1",
+            "hc-a-05-lab-r1"
+          ],
+          "required_facts": [
+            "Session watch-session-a established the tuple stream_id, reconnect_epoch, rename_cookie as the rename pairing identity.",
+            "Discard unmatched halves for a stream incarnation on overflow or reconnect; a new incarnation cannot complete an old half.",
+            "The regression keeps equal-cookie halves unpaired across both different streams and different reconnect epochs."
+          ],
+          "prohibited_claims": [
+            "Pair a source from one watched root with a destination from another solely because their cookies match.",
+            "Keep pre-reconnect unmatched halves available to the new stream incarnation.",
+            "Sort sidebar labels to repair rename association.",
+            "The single-stream-lab rule is authorized evidence for the main checkout.",
+            "The earlier diagnosis originated in watch-session-b."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-05-q1",
+          "hc-a-05-q2"
+        ],
+        "expected_source_ids": [
+          "hc-a-05-pair-r2",
+          "hc-a-05-regression-r1"
+        ],
+        "description": "Establish useful current recall in the originating session, then require the same source identities and facts in an explicitly authorized later session with no new diagnosis observation."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "Only the declared main-checkout/main branch grant permits A-to-B reuse. The shared repository name does not authorize the single-stream-lab source.",
+        "The B query needs both the pairing contract and regression evidence, each attributed to watch-session-a.",
+        "Cookie-only revision 1 is historical from 2025-05-06T09:00:00Z onward and is forbidden in both current queries."
+      ],
+      "rationale": "The second session paraphrases a symptom instead of repeating the tuple names. The useful answer requires an earlier invariant and a separate counterexample, while stale and wrong-worktree sources offer a plausible shortcut."
+    },
+    {
+      "id": "hc-a-06",
+      "family": "cross_session_reuse",
+      "description": "A later game-development session must recover the invariant and regression behind deterministic pause-buffer playback without borrowing a debug branch ordering rule.",
+      "sources": [
+        {
+          "id": "hc-a-06-order-r1",
+          "lineage_id": "hc-a-06-command-order",
+          "revision": "1",
+          "origin": {
+            "project": "tangent-arena",
+            "repository": "tangent-arena-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "arena-session-a"
+          },
+          "observed_at": "2025-05-20T08:00:00Z",
+          "valid_from": "2025-05-20T08:00:00Z",
+          "valid_until": "2025-05-21T09:00:00Z",
+          "content": "Tangent command queue revision 1 sorts queued commands by tick and then entity_id. Revision 1 admits at most one command per tick, so the entity tie-breaker has no observable effect. This contract predates paused input buffering, which can accept multiple interacting commands for the same tick."
+        },
+        {
+          "id": "hc-a-06-order-r2",
+          "lineage_id": "hc-a-06-command-order",
+          "revision": "2",
+          "origin": {
+            "project": "tangent-arena",
+            "repository": "tangent-arena-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "arena-session-a"
+          },
+          "observed_at": "2025-05-21T09:00:00Z",
+          "valid_from": "2025-05-21T09:00:00Z",
+          "valid_until": null,
+          "content": "Tangent command queue revision 2 assigns accept_seq once when an input is accepted, before any pause buffer. Interpret commands ordered by tick and then accept_seq. Retain that sequence in the replay log and when resuming; do not reassign it while reading a buffer. Entity grouping or map iteration order can move a contact calculation ahead of an already accepted position update at the same tick. Revision 2 replaces the old entity_id tie-breaker."
+        },
+        {
+          "id": "hc-a-06-regression-r1",
+          "lineage_id": "hc-a-06-command-regression",
+          "revision": "1",
+          "origin": {
+            "project": "tangent-arena",
+            "repository": "tangent-arena-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "arena-session-a"
+          },
+          "observed_at": "2025-05-21T09:10:00Z",
+          "valid_from": "2025-05-21T09:10:00Z",
+          "valid_until": null,
+          "content": "Tangent regression paused_contact_order uses tick 240. First accept a paddle move for entity 90 with accept_seq 701; then accept a ball contact calculation for entity 2 with accept_seq 702. Pausing and resuming must execute the move before contact, just as the uninterrupted run does. Sorting by entity_id incorrectly executes contact first. The replay log must retain 701 and 702, and the resumed simulation state must equal the uninterrupted state for this trace."
+        },
+        {
+          "id": "hc-a-06-overlay-r1",
+          "lineage_id": "hc-a-06-spectator-overlay",
+          "revision": "1",
+          "origin": {
+            "project": "tangent-arena",
+            "repository": "tangent-arena-repo",
+            "worktree": "main-checkout",
+            "branch": "main",
+            "session": "arena-session-a"
+          },
+          "observed_at": "2025-05-21T09:20:00Z",
+          "valid_from": "2025-05-21T09:20:00Z",
+          "valid_until": null,
+          "content": "Tangent spectator overlay batches name-label draw calls by entity_id to reduce font switches. These are read-only display commands after simulation; their order never defines the simulation command order."
+        },
+        {
+          "id": "hc-a-06-debug-r1",
+          "lineage_id": "hc-a-06-debug-order",
+          "revision": "1",
+          "origin": {
+            "project": "tangent-arena",
+            "repository": "tangent-arena-repo",
+            "worktree": "main-checkout",
+            "branch": "entity-sweep-debug",
+            "session": "arena-debug-session"
+          },
+          "observed_at": "2025-05-21T09:30:00Z",
+          "valid_from": "2025-05-21T09:30:00Z",
+          "valid_until": null,
+          "content": "The entity-sweep-debug branch deliberately groups commands by entity_id so an investigator can pause after each entity. Its output is an inspection trace and is not required to match game simulation or recorded match replay. This branch-local behavior does not revise the main branch command contract."
+        }
+      ],
+      "steps": [
+        {
+          "action": "observe",
+          "source_id": "hc-a-06-order-r1",
+          "source_revision": "1",
+          "session": "arena-session-a",
+          "at": "2025-05-20T08:00:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-06-order-r2",
+          "source_revision": "2",
+          "session": "arena-session-a",
+          "at": "2025-05-21T09:00:00Z"
+        },
+        {
+          "action": "correct",
+          "source_id": "hc-a-06-order-r1",
+          "source_revision": "1",
+          "session": "arena-session-a",
+          "at": "2025-05-21T09:00:00Z",
+          "details": {
+            "replaces_source_id": "hc-a-06-order-r1",
+            "replacement_source_id": "hc-a-06-order-r2",
+            "lineage_id": "hc-a-06-command-order",
+            "valid_until_is_exclusive": true,
+            "effect": "Retain the old revision as historical evidence and apply the replacement from its valid_from time. This changes advisory source lineage, not canonical fact trust."
+          }
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-06-regression-r1",
+          "source_revision": "1",
+          "session": "arena-session-a",
+          "at": "2025-05-21T09:10:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-06-overlay-r1",
+          "source_revision": "1",
+          "session": "arena-session-a",
+          "at": "2025-05-21T09:20:00Z"
+        },
+        {
+          "action": "observe",
+          "source_id": "hc-a-06-debug-r1",
+          "source_revision": "1",
+          "session": "arena-debug-session",
+          "at": "2025-05-21T09:30:00Z"
+        },
+        {
+          "action": "recall",
+          "session": "arena-session-a",
+          "at": "2025-05-21T10:00:00Z",
+          "query_id": "hc-a-06-q1"
+        },
+        {
+          "action": "replay",
+          "session": "arena-session-b",
+          "at": "2025-05-22T09:00:00Z",
+          "details": {
+            "grant_id": "hc-a-06-share-a-to-b",
+            "authorization": "host_authorized_same_checkout_session_reuse",
+            "origin_scope": {
+              "project": "tangent-arena",
+              "repository": "tangent-arena-repo",
+              "worktree": "main-checkout",
+              "branch": "main",
+              "session": "arena-session-a"
+            },
+            "destination_scope": {
+              "project": "tangent-arena",
+              "repository": "tangent-arena-repo",
+              "worktree": "main-checkout",
+              "branch": "main",
+              "session": "arena-session-b"
+            },
+            "source_ids": [
+              "hc-a-06-order-r2",
+              "hc-a-06-regression-r1",
+              "hc-a-06-overlay-r1"
+            ],
+            "retain_original_origin": true,
+            "exclude_source_ids": [
+              "hc-a-06-order-r1",
+              "hc-a-06-debug-r1"
+            ],
+            "description": "Share current main-branch canonical observations from arena-session-a with arena-session-b, preserving origin and revalidating source disposition. The entity-sweep-debug branch has no grant, even though it names the same worktree. No new B-session diagnosis is observed."
+          }
+        },
+        {
+          "action": "recall",
+          "session": "arena-session-b",
+          "at": "2025-05-22T10:00:00Z",
+          "query_id": "hc-a-06-q2"
+        }
+      ],
+      "queries": [
+        {
+          "id": "hc-a-06-q1",
+          "text": "Which ordering rule made the pause-buffer reproduction agree with the uninterrupted match?",
+          "at": "2025-05-21T10:00:00Z",
+          "session": "arena-session-a",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-05-21T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-06-order-r2",
+            "hc-a-06-regression-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-06-order-r1",
+            "hc-a-06-debug-r1"
+          ],
+          "required_facts": [
+            "Order simulation commands by tick and then their original accept_seq.",
+            "At tick 240, paddle move sequence 701 executes before ball contact sequence 702 despite the paddle having the larger entity_id.",
+            "The pause and resume trace must match the uninterrupted simulation state."
+          ],
+          "prohibited_claims": [
+            "Within a tick, sort simulation commands by entity_id.",
+            "The debug branch inspection order is the main branch simulation rule."
+          ],
+          "expected_terminal": "success"
+        },
+        {
+          "id": "hc-a-06-q2",
+          "text": "Returning to the game work: after unpausing, the ball bounces using where the paddle used to be, even though the player moved it first. What did the earlier investigation require us to preserve through buffering and playback?",
+          "at": "2025-05-22T10:00:00Z",
+          "session": "arena-session-b",
+          "temporal": {
+            "mode": "current",
+            "evaluation_time": "2025-05-22T10:00:00Z",
+            "as_of": null,
+            "interval_start": null,
+            "interval_end": null,
+            "include_superseded": false,
+            "include_revoked": false,
+            "unknown_validity_policy": "exclude"
+          },
+          "expected_useful_source_ids": [
+            "hc-a-06-order-r2",
+            "hc-a-06-regression-r1"
+          ],
+          "forbidden_source_ids": [
+            "hc-a-06-order-r1",
+            "hc-a-06-debug-r1"
+          ],
+          "required_facts": [
+            "Session arena-session-a established that accept_seq is assigned once at input acceptance before pause buffering and is retained in replay.",
+            "Execute commands by tick and original accept_seq, without regrouping by entity or regenerating sequence values on resume.",
+            "The tick-240 check executes entity-90 paddle move 701 before entity-2 contact 702 and compares resumed state with uninterrupted state."
+          ],
+          "prohibited_claims": [
+            "Reassign accept_seq while draining the pause buffer.",
+            "Process the lower entity_id first for commands sharing a tick.",
+            "The spectator label batch order determines contact calculation order.",
+            "The entity-sweep-debug branch is authorized to redefine main branch replay semantics.",
+            "The ordering diagnosis originated in arena-session-b."
+          ],
+          "expected_terminal": "success"
+        }
+      ],
+      "positive_control": {
+        "query_ids": [
+          "hc-a-06-q1",
+          "hc-a-06-q2"
+        ],
+        "expected_source_ids": [
+          "hc-a-06-order-r2",
+          "hc-a-06-regression-r1"
+        ],
+        "description": "Retrieve the investigation and its check in session A, then require both unchanged source identities in an authorized session B without rewriting their origin."
+      },
+      "rubric": [
+        "Assess only the exact context delivered by the host. An adapter candidate or compiled but withheld context does not satisfy a query.",
+        "All required facts must be supported by the listed eligible source revisions. Equivalent wording is allowed; query-word overlap alone is insufficient.",
+        "Every delivered item must retain its source ID, revision, lineage and original project, repository, worktree, branch and session. Do not relabel earlier evidence as originating in the requesting session.",
+        "No forbidden source or unqualified prohibited claim may appear in delivered context. True but irrelevant distractors earn no useful-recall credit and are labeled irrelevant if delivered.",
+        "A successful terminal with no useful delivered evidence fails the retrieval rubric. Unsupported behavior or missing provenance remains incomplete or indeterminate.",
+        "These checks assess source-grounded retrieval, not executed coding-task success. Apply identical observations, requests and truth to both provider selections.",
+        "The main branch same-checkout grant covers arena-session-a only. The debug branch remains outside the grant despite sharing a worktree identity.",
+        "The B query must recover the earlier input-acceptance invariant and concrete move-before-contact check; a generic deterministic-sort suggestion is insufficient.",
+        "The old entity_id rule expired before both queries. An explanation may describe its failure using current revision 2 evidence, but must not deliver revision 1 as current guidance."
+      ],
+      "rationale": "The user describes a game symptom without naming the recorded sequence field. Useful reuse needs both the causal ordering rule and its specific regression, while display batching and branch-local inspection order are credible but inapplicable alternatives."
+    }
+  ]
+}

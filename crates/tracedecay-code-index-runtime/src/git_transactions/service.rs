@@ -878,7 +878,9 @@ fn terminal_execution(
 
 const fn operation_termination(termination: EffectTermination) -> OperationTermination {
     match termination {
-        EffectTermination::Completed => OperationTermination::Completed,
+        EffectTermination::Completed | EffectTermination::NoChange => {
+            OperationTermination::Completed
+        }
         EffectTermination::Cancelled => OperationTermination::Cancelled,
         EffectTermination::TimedOut => OperationTermination::TimedOut,
         EffectTermination::Failed => OperationTermination::Failed,

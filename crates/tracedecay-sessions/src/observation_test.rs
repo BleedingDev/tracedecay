@@ -250,6 +250,25 @@ impl ObservationStore for FakeStore {
         Ok(observation)
     }
 
+    async fn recent_observation_window(
+        &self,
+        request: tracedecay_store::ObservationRecentWindowRequest,
+    ) -> ObservationStoreResult<Option<tracedecay_store::ObservationRecentWindowV1>> {
+        let sequences: Vec<_> = self
+            .observations
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(request.limit() + 1)
+            .map(StoredObservation::sequence)
+            .collect();
+        if let Some(cancellation) = self.cancel_on_replay.lock().unwrap().take() {
+            cancellation.cancel();
+        }
+        tracedecay_store::ObservationRecentWindowV1::from_descending_sequences(request, &sequences)
+    }
+
     async fn replay_observations(
         &self,
         request: ObservationReplayRequest,

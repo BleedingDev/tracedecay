@@ -1,6 +1,11 @@
+pub(super) mod common_maintenance;
+mod common_reads;
+mod control;
 mod mutation;
 mod observe;
+mod portability;
 mod recovery;
+mod selection;
 mod util;
 
 pub(crate) use util::canonical_digest;
@@ -59,7 +64,7 @@ impl NcmEngine {
             Ok(namespaces) => namespaces,
             Err(reply) => return reply,
         };
-        let handle = match self.ensure_handle(&mut namespaces, namespace, false) {
+        let handle = match self.ensure_handle_mode(&mut namespaces, namespace, false, true) {
             Ok(Some(handle)) => handle,
             Ok(None) => {
                 return EngineReply::new(Outcome::Empty, 0, ready_payload(&prepared, 0, true));
@@ -125,6 +130,26 @@ impl NcmEngine {
 
     /// Encodes a query and recalls only from the published immutable view.
     pub fn recall(&self, namespace: &str, request: RecallRequest) -> EngineReply {
+        self.recall_inner(namespace, request, None)
+    }
+
+    /// Recalls with adapter-admitted neutral temporal bounds and opaque
+    /// exclusions. Filtering changes only a request-local support view.
+    pub fn recall_selected(
+        &self,
+        namespace: &str,
+        request: RecallRequest,
+        selection: Value,
+    ) -> EngineReply {
+        self.recall_inner(namespace, request, Some(selection))
+    }
+
+    fn recall_inner(
+        &self,
+        namespace: &str,
+        request: RecallRequest,
+        selection: Option<Value>,
+    ) -> EngineReply {
         let started = Instant::now();
         if request.deadline.remaining_ms == 0 {
             return EngineReply::new(Outcome::Cancelled, 0, Value::Null);
@@ -135,14 +160,28 @@ impl NcmEngine {
                 0,
             );
         }
-        let (live, commit_seq) = {
+        let selection = match selection.map(selection::Selection::parse).transpose() {
+            Ok(selection) => selection,
+            Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
+        };
+        let (live, commit_seq, evidence) = {
             let mut namespaces = match self.namespace_lock() {
                 Ok(namespaces) => namespaces,
                 Err(reply) => return reply,
             };
             let handle = match self.ensure_handle(&mut namespaces, namespace, false) {
                 Ok(Some(handle)) => handle,
-                Ok(None) => return EngineReply::new(Outcome::Empty, 0, Value::Null),
+                Ok(None) => {
+                    return EngineReply::new(
+                        Outcome::Empty,
+                        0,
+                        if selection.is_some() {
+                            selection::empty_payload()
+                        } else {
+                            Value::Null
+                        },
+                    );
+                }
                 Err(reply) => return reply,
             };
             if handle.fenced {
@@ -152,7 +191,14 @@ impl NcmEngine {
                 Ok(live) => live,
                 Err(reply) => return reply,
             };
-            (live, handle.commit_seq)
+            let evidence = match selection.as_ref() {
+                Some(selection) => match selection.prepare(namespace, &live, &handle.store) {
+                    Ok(evidence) => Some(evidence),
+                    Err(error) => return store_reply(error, handle.commit_seq),
+                },
+                None => None,
+            };
+            (live, handle.commit_seq, evidence)
         };
         let deadline = remaining_deadline(request.deadline, started);
         if deadline.remaining_ms == 0 {
@@ -166,10 +212,28 @@ impl NcmEngine {
             Ok(_) => return EngineReply::new(Outcome::Corrupt, commit_seq, Value::Null),
             Err(error) => return encoder_reply(error, commit_seq),
         };
-        let output = match live.recall(&encoded.0, request.top_k, RecallPolicy::default()) {
+        let selected_live = match evidence
+            .as_ref()
+            .map(|evidence| evidence.filtered_view(&live))
+            .transpose()
+        {
+            Ok(view) => view,
+            Err(error) => return util::core_reply(error, commit_seq),
+        };
+        let recall_view = selected_live.as_ref().unwrap_or(&live);
+        let policy = RecallPolicy {
+            max_candidates: selection
+                .as_ref()
+                .map_or(MAX_TOP_K, |selection| selection.maximum_candidates),
+            ..RecallPolicy::default()
+        };
+        let output = match recall_view.recall(&encoded.0, request.top_k, policy) {
             Ok(output) => output,
             Err(error) => return util::core_reply(error, commit_seq),
         };
+        if let Some(evidence) = evidence {
+            return evidence.reply(output, commit_seq);
+        }
         match output {
             RecallOutput::Empty => EngineReply::new(Outcome::Empty, commit_seq, Value::Null),
             candidates @ RecallOutput::Candidates { .. } => {
@@ -310,6 +374,16 @@ impl NcmEngine {
         namespace: &str,
         materialize: bool,
     ) -> Result<Option<&'a mut NamespaceHandle>, EngineReply> {
+        self.ensure_handle_mode(namespaces, namespace, materialize, false)
+    }
+
+    fn ensure_handle_mode<'a>(
+        &self,
+        namespaces: &'a mut BTreeMap<String, NamespaceHandle>,
+        namespace: &str,
+        materialize: bool,
+        recover_privacy: bool,
+    ) -> Result<Option<&'a mut NamespaceHandle>, EngineReply> {
         if let Err(reason) = self.root.namespace_dir(namespace) {
             return Err(EngineReply::rejected(
                 RejectReason::InvalidRequest(reason),
@@ -322,6 +396,16 @@ impl NcmEngine {
             .saturating_add(1);
         if namespaces.contains_key(namespace) {
             if let Some(handle) = namespaces.get_mut(namespace) {
+                if recover_privacy && handle.fenced {
+                    if let Some(resumed) =
+                        crate::privacy::resume_pending_rebuild(&mut handle.store, &self.config)?
+                    {
+                        handle.commit_seq = resumed.meta.commit_seq;
+                        handle.epoch = resumed.meta.epoch;
+                        util::publish(handle, resumed.kernel)?;
+                        handle.fenced = false;
+                    }
+                }
                 handle.last_used = use_id;
                 return Ok(Some(handle));
             }
@@ -347,8 +431,24 @@ impl NcmEngine {
         let (store, kernel, meta, fenced) = if exists {
             let mut store = NamespaceStore::open(&self.root, namespace, &prepared)
                 .map_err(|error| store_reply(error, 0))?;
-            if let Some(resumed) = crate::privacy::resume_pending_rebuild(&mut store, &self.config)?
+            if !recover_privacy
+                && store
+                    .fenced()
+                    .map_err(|error| store_reply(error, 0))?
+                    .is_some()
             {
+                return Err(unavailable_recovery(
+                    store
+                        .meta()
+                        .map_err(|error| store_reply(error, 0))?
+                        .commit_seq,
+                ));
+            }
+            if let Some(resumed) = if recover_privacy {
+                crate::privacy::resume_pending_rebuild(&mut store, &self.config)?
+            } else {
+                None
+            } {
                 (store, resumed.kernel, resumed.meta, false)
             } else {
                 let fenced = store

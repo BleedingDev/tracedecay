@@ -1,7 +1,8 @@
 use tracedecay_domain::{
     AnchorSourceGenerationV2, DurableObservationV1, EvidenceAvailabilityV1,
-    GenerationBoundRepositoryProvenanceV1, ObservationScopeV1, ObservationSourceCursorV1,
-    ProjectionGenerationId, RetrievalAnchorId, RetrievalAnchorRecordV2, RetrievalAnchorTargetV2,
+    GenerationBoundRepositoryProvenanceV1, ObservationIdentityMaterialV1, ObservationScopeV1,
+    ObservationSourceCursorV1, ProjectionGenerationId, RetrievalAnchorId, RetrievalAnchorRecordV2,
+    RetrievalAnchorTargetV2,
 };
 
 use super::{ObservationStoreError, ObservationStoreResult, ObservationWrite};
@@ -51,12 +52,33 @@ pub(super) fn validate_retrieval_anchor_binding(
 }
 
 /// Optional repository evidence captured after observation sanitization.
+/// Retained origin evidence is distinct from an ingestion-time repository capture.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservationOriginV1 {
+    /// No original live-source admission was retained (including legacy JSON).
+    #[default]
+    Unavailable,
+    /// Capture describes only the checkout in which import occurred.
+    IngestionOnly,
+    /// Exact source identity bound to a host-validated live event receipt.
+    Recorded {
+        /// Retained original-event authority; not proof merely by construction.
+        authority_ref: String,
+        /// Complete original provider/session/key/generation/range identity.
+        source_identity: ObservationIdentityMaterialV1,
+    },
+}
+
+/// Optional repository evidence captured after observation sanitization.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryProvenanceAttachmentV1 {
     availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor: Option<RetrievalAnchorRecordV2>,
+    #[serde(default)]
+    origin: ObservationOriginV1,
 }
 
 impl RepositoryProvenanceAttachmentV1 {
@@ -78,6 +100,11 @@ impl RepositoryProvenanceAttachmentV1 {
                 .map_err(ObservationStoreError::RepositoryProvenanceContract)?;
         }
         Ok(Self {
+            origin: if availability.value().is_some() {
+                ObservationOriginV1::IngestionOnly
+            } else {
+                ObservationOriginV1::Unavailable
+            },
             availability,
             anchor,
         })
@@ -87,6 +114,7 @@ impl RepositoryProvenanceAttachmentV1 {
         Self {
             availability: EvidenceAvailabilityV1::Unavailable,
             anchor: None,
+            origin: ObservationOriginV1::Unavailable,
         }
     }
 
@@ -102,11 +130,61 @@ impl RepositoryProvenanceAttachmentV1 {
         self.anchor.as_ref()
     }
 
-    pub(super) fn validate_for_observation(
+    /// Returns retained original-source evidence without promoting it to a grant.
+    pub fn origin(&self) -> &ObservationOriginV1 {
+        &self.origin
+    }
+
+    /// Retains the live-event proof already checked by the host producer. A caller
+    /// must revalidate the referenced receipt before granting cross-session reuse.
+    pub fn with_recorded_origin(
+        mut self,
+        authority_ref: String,
+        source_identity: ObservationIdentityMaterialV1,
+    ) -> ObservationStoreResult<Self> {
+        if authority_ref.is_empty()
+            || authority_ref.len() > 1024
+            || authority_ref.trim() != authority_ref
+            || authority_ref.chars().any(char::is_control)
+            || self.provenance().is_none()
+            || self.anchor().is_none()
+        {
+            return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+        }
+        source_identity
+            .validate()
+            .map_err(ObservationStoreError::Contract)?;
+        self.origin = ObservationOriginV1::Recorded {
+            authority_ref,
+            source_identity,
+        };
+        Ok(self)
+    }
+
+    pub fn validate_for_observation(
         &self,
         observation: &DurableObservationV1,
         projection_generation: &ProjectionGenerationId,
     ) -> ObservationStoreResult<()> {
+        if let ObservationOriginV1::Recorded {
+            authority_ref,
+            source_identity,
+        } = &self.origin
+        {
+            if source_identity != observation.identity()
+                || authority_ref.is_empty()
+                || authority_ref.len() > 1024
+                || authority_ref.trim() != authority_ref
+                || authority_ref.chars().any(char::is_control)
+                || self.provenance().is_none()
+                || self.anchor().is_none()
+            {
+                return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+            }
+            source_identity
+                .validate()
+                .map_err(ObservationStoreError::Contract)?;
+        }
         let (Some(provenance), Some(anchor)) = (self.availability.value(), self.anchor.as_ref())
         else {
             return if self.availability.value().is_none() && self.anchor.is_none() {
@@ -216,6 +294,17 @@ impl AnchoredObservationWrite {
         anchor: Option<RetrievalAnchorRecordV2>,
     ) -> ObservationStoreResult<Self> {
         let repository_provenance = RepositoryProvenanceAttachmentV1::new(availability, anchor)?;
+        repository_provenance
+            .validate_for_observation(self.write.observation(), &self.projection_generation)?;
+        self.repository_provenance = repository_provenance;
+        Ok(self)
+    }
+
+    /// Attaches the frozen original repository capture after exact source binding.
+    pub fn with_original_repository_provenance_attachment(
+        mut self,
+        repository_provenance: RepositoryProvenanceAttachmentV1,
+    ) -> ObservationStoreResult<Self> {
         repository_provenance
             .validate_for_observation(self.write.observation(), &self.projection_generation)?;
         self.repository_provenance = repository_provenance;

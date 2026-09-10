@@ -1953,3 +1953,642 @@ fn a_composed_provider_set_is_bounded_and_identity_disjoint() {
         orphaned.map(|_| ())
     );
 }
+
+fn canonical_observation_source(exact: &OwnedExactScope) -> serde_json::Value {
+    serde_json::json!({
+        "source": {
+            "canonical_provider_id": "claude", "canonical_session_id": "session-original",
+            "source_key": "source-key", "stable_record_id": null,
+            "observation_id": "observation-original", "source_revision": "revision-original",
+            "content_sha256": "a".repeat(64),
+        },
+        "origin_scope": {"state": "recorded", "exact_scope_identity": scope_value(exact), "authority_ref": "host-original"},
+        "source_sequence": 7, "occurred_at": null, "ingested_at": "2025-01-01T00:00:00.000000Z",
+        "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null},
+    })
+}
+
+fn observation_candidate_fields(
+    source: &serde_json::Value,
+    delivery_scope: &OwnedExactScope,
+) -> serde_json::Value {
+    let record = source["source"]["stable_record_id"]
+        .as_str()
+        .unwrap_or(source["source"]["observation_id"].as_str().unwrap());
+    serde_json::json!({
+        "memory_class": "session_observation",
+        "exact_scope_identity": exact_scope_candidate_value(delivery_scope),
+        "provenance": {
+            "state": "available",
+            "origin_refs": [format!("record:{record}")],
+            "source_refs": [format!("record:{record}")],
+            "observation_refs": [source["source"]["observation_id"]],
+            "transform_chain": [], "provider_trace_refs": [], "redaction_reason": null,
+            "original_sources": [source],
+        },
+    })
+}
+
+#[tokio::test]
+async fn selected_inline_outcome_preserves_actual_admitted_original_sources() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding
+        .bind_exact_scope(&scope)
+        .expect("bound scope");
+    let source = canonical_observation_source(&exact);
+    let mut fixture = RecallFixturePort::new();
+    fixture.candidate_contents = Some(duplicate_candidate_stream());
+    for id in [
+        "aa-duplicate-1",
+        "ab-duplicate-2",
+        "mm-distinct",
+        "zz-other",
+    ] {
+        fixture
+            .candidate_overrides
+            .insert(id.to_owned(), observation_candidate_fields(&source, &exact));
+    }
+    let port = mount(
+        compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        Arc::new(LedgerObserver::default()),
+    )
+    .expect("mounted port");
+    let outcome = port
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
+        .await
+        .expect("recall");
+    let ids: Vec<_> = outcome
+        .result
+        .candidates()
+        .iter()
+        .map(|candidate| candidate.candidate_id().to_owned())
+        .collect();
+    assert_eq!(
+        outcome.original_sources.keys().cloned().collect::<Vec<_>>(),
+        ids
+    );
+    assert!(!outcome.original_sources.contains_key("ab-duplicate-2"));
+    assert_eq!(
+        outcome.original_sources.len(),
+        3,
+        "admission={:?}",
+        outcome.report
+    );
+    for sources in outcome.original_sources.values() {
+        assert_eq!(
+            serde_json::to_value(sources).expect("typed sources"),
+            serde_json::json!([source.clone()])
+        );
+    }
+}
+
+#[tokio::test]
+async fn buggy_provider_exclusions_are_denied_before_normalization_and_selection() {
+    use tracedecay_contracts::memory::CognitiveRecallExclusions;
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    let source = canonical_observation_source(&exact);
+    let full_content = format!(
+        "{} excluded full content tail",
+        "long source content ".repeat(100)
+    );
+    for field in [
+        "stable_memory_refs",
+        "candidate_ids",
+        "source_refs",
+        "trace_refs",
+        "observation_ids",
+        "content_sha256",
+    ] {
+        let mut exclusions = CognitiveRecallExclusions::default();
+        match field {
+            "stable_memory_refs" => exclusions
+                .stable_memory_refs
+                .push("memory:aa-denied".to_owned()),
+            "candidate_ids" => exclusions.candidate_ids.push("aa-denied".to_owned()),
+            // These two classes also inspect original typed attribution, even
+            // when the provider omits the corresponding top-level list.
+            "source_refs" => exclusions.source_refs.push("source-key".to_owned()),
+            "trace_refs" => exclusions.trace_refs.push("trace:excluded".to_owned()),
+            "observation_ids" => exclusions
+                .observation_ids
+                .push("observation-original".to_owned()),
+            "content_sha256" => exclusions
+                .content_sha256
+                .push(sha256_hex(full_content.as_bytes())),
+            _ => unreachable!(),
+        }
+        let mut fixture = RecallFixturePort::new();
+        fixture.candidate_contents = Some(vec![
+            ("aa-denied".to_owned(), full_content.clone()),
+            (
+                "zz-survivor".to_owned(),
+                "distinct surviving content".to_owned(),
+            ),
+        ]);
+        let mut fields = observation_candidate_fields(&source, &exact);
+        fields["provenance"]["provider_trace_refs"] = serde_json::json!(["trace:excluded"]);
+        fixture
+            .candidate_overrides
+            .insert("aa-denied".to_owned(), fields);
+        let port = mount(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+        )
+        .unwrap()
+        .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
+        let request = request(scope.clone(), 60_000_000, false)
+            .with_exclusions(exclusions)
+            .unwrap();
+        let outcome = port.recall_admitted(request, &live_signal()).await.unwrap();
+        assert_eq!(outcome.result.candidates().len(), 1, "{field}");
+        assert_eq!(
+            outcome.result.candidates()[0].candidate_id(),
+            "zz-survivor",
+            "{field}"
+        );
+        assert_eq!(
+            outcome.normalization.as_ref().unwrap().candidates.len(),
+            1,
+            "{field}"
+        );
+        let report = outcome.report.unwrap();
+        assert_eq!(
+            (
+                report.received_count,
+                report.admitted_count,
+                report.denied.len()
+            ),
+            (2, 1, 1),
+            "{field}"
+        );
+        assert!(
+            matches!(&report.denied[0].reason, RecallDenialReason::RequestExcluded { field: actual } if actual == field),
+            "{field}: denied={:?}",
+            report.denied
+        );
+        assert_eq!(report.denial_counts(), vec![("request_excluded", 1)]);
+        assert!(
+            outcome.selection.unwrap().budget_excluded.is_empty(),
+            "{field}"
+        );
+        assert!(outcome.original_sources.is_empty(), "{field}");
+    }
+}
+
+#[tokio::test]
+async fn typed_sources_preserve_unavailable_redacted_and_legacy_fact_provenance() {
+    use tracedecay_contracts::memory::CognitiveRecallProvenance;
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    let source = canonical_observation_source(&exact);
+    for state in ["unavailable", "redacted", "legacy_fact"] {
+        let mut fields = observation_candidate_fields(&source, &exact);
+        let expected = match state {
+            "unavailable" => {
+                fields["provenance"]["state"] = serde_json::json!("unavailable");
+                CognitiveRecallProvenance::unavailable()
+            }
+            "redacted" => {
+                fields["provenance"]["state"] = serde_json::json!("redacted");
+                fields["provenance"]["redaction_reason"] = serde_json::json!("source redacted");
+                CognitiveRecallProvenance::redacted("source redacted").unwrap()
+            }
+            "legacy_fact" => {
+                fields["memory_class"] = serde_json::json!("project");
+                fields["exact_scope_identity"] = project_facts_candidate_value(&exact);
+                fields["provenance"]["origin_refs"] = serde_json::json!(["record:foreign-fact"]);
+                CognitiveRecallProvenance::available("record:foreign-fact").unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let mut fixture = RecallFixturePort::new();
+        fixture.candidate_contents =
+            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
+        fixture
+            .candidate_overrides
+            .insert("claim".to_owned(), fields);
+        let port = mount(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+        )
+        .unwrap();
+        let outcome = port
+            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.result.candidates().len(),
+            1,
+            "{state}: admission={:?}",
+            outcome.report
+        );
+        assert_eq!(
+            outcome.result.candidates()[0].provenance(),
+            &expected,
+            "{state}"
+        );
+        assert!(
+            outcome.original_sources.is_empty(),
+            "{state} must use its declared provenance authority"
+        );
+    }
+}
+
+#[tokio::test]
+async fn contradictory_observation_claims_cannot_borrow_legitimate_typed_sources() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    let mut source = canonical_observation_source(&exact);
+    source["source"]["stable_record_id"] = serde_json::json!("stable-original");
+    for defect in [
+        "foreign_record",
+        "observation_instead_of_stable_record",
+        "foreign_source",
+        "missing_observation",
+        "extra_observation",
+    ] {
+        let mut fields = observation_candidate_fields(&source, &exact);
+        match defect {
+            "foreign_record" => {
+                fields["provenance"]["origin_refs"] = serde_json::json!(["record:foreign-fact"])
+            }
+            "observation_instead_of_stable_record" => {
+                fields["provenance"]["origin_refs"] =
+                    serde_json::json!(["record:observation-original"])
+            }
+            "foreign_source" => {
+                fields["source_refs"] = serde_json::json!(["source:foreign.rs#L1-L2"])
+            }
+            "missing_observation" => {
+                fields["provenance"]["observation_refs"] = serde_json::json!([])
+            }
+            "extra_observation" => {
+                fields["provenance"]["observation_refs"] =
+                    serde_json::json!(["observation-original", "observation-unrelated"])
+            }
+            _ => unreachable!(),
+        }
+        let mut fixture = RecallFixturePort::new();
+        fixture.candidate_contents =
+            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
+        fixture
+            .candidate_overrides
+            .insert("claim".to_owned(), fields);
+        let port = mount(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+        )
+        .unwrap();
+        let outcome = port
+            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+            .await
+            .unwrap();
+        assert!(outcome.result.candidates().is_empty(), "{defect}");
+        assert!(outcome.original_sources.is_empty(), "{defect}");
+        let report = outcome.report.unwrap();
+        assert_eq!(report.denied.len(), 1, "{defect}");
+        assert!(
+            matches!(
+                report.denied[0].reason,
+                RecallDenialReason::InvalidSourceAttribution { .. }
+            ),
+            "{defect}: denied={:?}",
+            report.denied
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_sources() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    for format in ["native", "ncm_observation", "ncm_stable"] {
+        let mut source = canonical_observation_source(&exact);
+        if format == "ncm_stable" {
+            source["source"]["stable_record_id"] = serde_json::json!("stable-original");
+        }
+        let mut fields = observation_candidate_fields(&source, &exact);
+        if format == "native" {
+            fields["provenance"]["origin_refs"] = serde_json::json!([
+                "native-stage:original",
+                "operation:delivery",
+                "request:delivery"
+            ]);
+            fields["provenance"]["source_refs"] = serde_json::json!(["source-key"]);
+        }
+        let mut fixture = RecallFixturePort::new();
+        fixture.candidate_contents =
+            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
+        fixture
+            .candidate_overrides
+            .insert("claim".to_owned(), fields);
+        let port = mount(
+            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+            Arc::new(LedgerObserver::default()),
+        )
+        .unwrap();
+        let outcome = port
+            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.result.candidates().len(),
+            1,
+            "{format}: admission={:?}",
+            outcome.report
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome.original_sources["claim"]).unwrap(),
+            serde_json::json!([source]),
+            "{format}"
+        );
+    }
+}
+
+/// Both paths use the exact same provider identity and capability declaration.
+/// Only the actual host registration path decides the common-profile policy.
+fn compose_profile_fixture(
+    mut fixture: RecallFixturePort,
+    common_profile: bool,
+) -> Arc<ProjectMemoryProviderComposition> {
+    use tracedecay_memory_provider_api::OwnedVersionedId;
+    use tracedecay_memory_provider_native::NativeProvider;
+    use tracedecay_memory_provider_registry::{
+        COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES,
+        ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1, ProviderRegistrationV1,
+        SelectedProviderActivationV1,
+    };
+    for capability in std::iter::once(COMMON_ADVISORY_PROFILE_ID)
+        .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
+    {
+        fixture
+            .descriptor
+            .capabilities
+            .insert(OwnedVersionedId::new(capability).unwrap());
+    }
+    let fixture = Arc::new(fixture);
+    let composition = if common_profile {
+        Arc::new(
+            ProjectMemoryProviderComposition::compose_registered(
+                SelectedProviderActivationV1::Injected {
+                    fabric_config: FabricConfig {
+                        max_registered_providers: 1,
+                        max_in_flight: 2,
+                    },
+                    registration: ProviderRegistrationV1 {
+                        provider: Arc::new(NativeProvider::new(fixture).unwrap()),
+                        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap(),
+                        registration_revision: 31,
+                        mode: EnabledProviderMode::Active,
+                        execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                        recall_scope_bindings: authorized_native(),
+                        lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                    },
+                },
+                vec![],
+            )
+            .unwrap(),
+        )
+    } else {
+        compose_mode(fixture, EnabledProviderMode::Active)
+    };
+    assert_eq!(
+        composition
+            .registry()
+            .unwrap()
+            .selected_registration()
+            .unwrap()
+            .requires_common_advisory_profile,
+        common_profile
+    );
+    composition
+}
+
+/// Host-dispatched canonical history fixture. The registry checks membership;
+/// the production host separately revalidates disposition before hydration.
+fn dispatched_history_fixture(
+    exact: &OwnedExactScope,
+    source: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "authorization_ref": "host.history.fixture", "policy_revision": 1,
+        "destination_scope": scope_value(exact), "relation": "exact_scope",
+        "sources": [{ "attribution": source, "current_disposition": {
+            "state": "available", "authority_ref": "host.disposition.fixture",
+            "authority_revision": 1, "checked_at": EVALUATION_TIME,
+        }}],
+        "disposition_checkpoint": { "exact_scope": scope_value(exact),
+            "authority_ref": "host.checkpoint.fixture", "authority_revision": 1,
+            "checked_at": EVALUATION_TIME,
+        },
+    })
+}
+
+#[tokio::test]
+async fn common_profile_denies_fact_projection_and_ungranted_sources_before_selection() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    let source = canonical_observation_source(&exact);
+    for defect in [
+        "project_fact",
+        "profile_fact",
+        "exact_scope_fact",
+        "missing_sources",
+        "ungranted_revision",
+    ] {
+        let mut denied = observation_candidate_fields(&source, &exact);
+        match defect {
+            "project_fact" => {
+                denied["memory_class"] = serde_json::json!("project");
+                denied["exact_scope_identity"] = project_facts_candidate_value(&exact);
+            }
+            "profile_fact" => {
+                denied["memory_class"] = serde_json::json!("profile");
+                denied["exact_scope_identity"] = serde_json::json!({
+                    "scope_binding": "profile_facts", "profile_id": exact.profile_id,
+                    "project_id": "", "repository_identity": "", "worktree_identity": "",
+                    "branch_identity": "", "agent_session_id": "", "resolved_scope_digest": "",
+                });
+            }
+            "exact_scope_fact" => denied["memory_class"] = serde_json::json!("project"),
+            "missing_sources" => {
+                denied["provenance"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("original_sources");
+            }
+            "ungranted_revision" => {
+                denied["provenance"]["original_sources"][0]["source"]["source_revision"] =
+                    serde_json::json!("revision-not-granted");
+            }
+            _ => unreachable!(),
+        }
+        let mut fixture = RecallFixturePort::new();
+        fixture.candidate_contents = Some(vec![
+            (
+                "aa-denied".to_owned(),
+                "higher-ranked denied candidate".to_owned(),
+            ),
+            (
+                "zz-granted".to_owned(),
+                "distinct granted observation".to_owned(),
+            ),
+        ]);
+        fixture
+            .candidate_overrides
+            .insert("aa-denied".to_owned(), denied);
+        fixture.candidate_overrides.insert(
+            "zz-granted".to_owned(),
+            observation_candidate_fields(&source, &exact),
+        );
+        let port = mount(
+            compose_profile_fixture(fixture, true),
+            Arc::new(LedgerObserver::default()),
+        )
+        .unwrap()
+        .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
+        let outcome = port
+            .recall_admitted_with_history(
+                request(scope.clone(), 60_000_000, false),
+                &live_signal(),
+                Some(dispatched_history_fixture(&exact, &source)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.result.candidates().len(),
+            1,
+            "{defect}: {:?}",
+            outcome.report
+        );
+        assert_eq!(
+            outcome.result.candidates()[0].candidate_id(),
+            "zz-granted",
+            "{defect}"
+        );
+        assert_eq!(
+            outcome.normalization.as_ref().unwrap().candidates.len(),
+            1,
+            "{defect}"
+        );
+        assert!(
+            outcome
+                .selection
+                .as_ref()
+                .unwrap()
+                .budget_excluded
+                .is_empty(),
+            "{defect}"
+        );
+        let report = outcome.report.unwrap();
+        assert_eq!(
+            (
+                report.received_count,
+                report.admitted_count,
+                report.denied.len()
+            ),
+            (2, 1, 1),
+            "{defect}"
+        );
+        assert!(
+            !report
+                .authorized_scope_bindings
+                .authorizes(ScopeBinding::ProjectFacts)
+        );
+        assert!(
+            !report
+                .authorized_scope_bindings
+                .authorizes(ScopeBinding::ProfileFacts)
+        );
+        assert_eq!(report.denied[0].candidate_id, "aa-denied", "{defect}");
+        if matches!(defect, "project_fact" | "profile_fact") {
+            assert!(
+                matches!(
+                    report.denied[0].reason,
+                    RecallDenialReason::ScopeBindingUnauthorized { .. }
+                ),
+                "{defect}: {:?}",
+                report.denied
+            );
+        } else {
+            assert!(
+                matches!(
+                    report.denied[0].reason,
+                    RecallDenialReason::InvalidSourceAttribution { .. }
+                ),
+                "{defect}: {:?}",
+                report.denied
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&outcome.original_sources["zz-granted"]).unwrap(),
+            serde_json::json!([source.clone()])
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or_grant_presence() {
+    let scope = resolved_scope(Some("refs/heads/recall-port"));
+    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
+    let source = canonical_observation_source(&exact);
+    // The common registration cannot escape its policy when no grant exists.
+    let mut common = RecallFixturePort::new();
+    common.candidate_contents = Some(vec![(
+        "observation".to_owned(),
+        "ungranted observation".to_owned(),
+    )]);
+    common.candidate_overrides.insert(
+        "observation".to_owned(),
+        observation_candidate_fields(&source, &exact),
+    );
+    let port = mount(
+        compose_profile_fixture(common, true),
+        Arc::new(LedgerObserver::default()),
+    )
+    .unwrap();
+    let outcome = port
+        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+        .await
+        .unwrap();
+    assert!(outcome.result.candidates().is_empty());
+    assert!(matches!(
+        outcome.report.unwrap().denied[0].reason,
+        RecallDenialReason::InvalidSourceAttribution { .. }
+    ));
+    // The legacy registration keeps fact extension bindings even with the
+    // same common capabilities and a real-shaped host history grant present.
+    let mut legacy = RecallFixturePort::new();
+    legacy.candidate_contents = Some(vec![(
+        "legacy-fact".to_owned(),
+        "retained canonical fact extension".to_owned(),
+    )]);
+    let port = mount(
+        compose_profile_fixture(legacy, false),
+        Arc::new(LedgerObserver::default()),
+    )
+    .unwrap();
+    let outcome = port
+        .recall_admitted_with_history(
+            request(scope, 60_000_000, false),
+            &live_signal(),
+            Some(dispatched_history_fixture(&exact, &source)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.result.candidates().len(), 1, "{:?}", outcome.report);
+    assert_eq!(outcome.result.candidates()[0].candidate_id(), "legacy-fact");
+    let report = outcome.report.unwrap();
+    assert!(
+        report
+            .authorized_scope_bindings
+            .authorizes(ScopeBinding::ProjectFacts)
+    );
+    assert!(
+        report
+            .authorized_scope_bindings
+            .authorizes(ScopeBinding::ProfileFacts)
+    );
+    assert!(outcome.original_sources.is_empty());
+}

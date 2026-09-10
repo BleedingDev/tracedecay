@@ -61,7 +61,7 @@ fn descriptor() -> ProviderDescriptor {
     .expect("descriptor")
 }
 
-fn descriptor_with_replay() -> ProviderDescriptor {
+fn descriptor_with_capability(capability: &str) -> ProviderDescriptor {
     ProviderDescriptor::new(
         OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
         IMPLEMENTATION_SHA,
@@ -71,7 +71,7 @@ fn descriptor_with_replay() -> ProviderDescriptor {
             "provider.health.v1",
             "observation.accept.v1",
             "recall.query.v1",
-            "replay.apply.v1",
+            capability,
         ]
         .into_iter()
         .map(|value| OwnedVersionedId::new(value).expect("capability")),
@@ -129,11 +129,11 @@ impl MountedNativePort {
         }
     }
 
-    /// A provider that also declares the replay capability, which is the only
-    /// sanctioned channel for a provider-local acknowledged position.
-    fn retaining_a_replay_position() -> Self {
+    /// A provider that declares one additional capability in its real
+    /// handshake descriptor.
+    fn with_capability(capability: &str) -> Self {
         Self {
-            descriptor: descriptor_with_replay(),
+            descriptor: descriptor_with_capability(capability),
             handshake_terminal: TerminalCode::Success,
             omit_state_namespace: AtomicBool::new(false),
             handshake_calls: AtomicUsize::new(0),
@@ -342,25 +342,50 @@ fn one_readiness_pass_carries_both_the_target_and_the_state_evidence() {
     );
     assert!(
         !evidence.retains_replay_position(),
-        "a provider that declares no replay capability must be reported as keeping no \
-         replay position, not as evidence the host may ignore"
+        "a provider with no observation-recovery-position declaration uses host \
+         receipt and idempotency recovery"
     );
 }
 
-/// The replay-position policy is read from the incarnation's own validated
-/// descriptor, so a host can tell a provider that keeps an acknowledged
-/// position apart from one that keeps none. Without this the two collapse into
-/// a single absent value and restart recovery silently stops comparing.
+/// Canonical replay capability remains negotiable without claiming a
+/// provider-local position for the host journal's recovery target. Direct
+/// observations and policy-specific history streams have their own receipts.
+#[test]
+fn canonical_replay_capability_does_not_claim_an_observation_recovery_position() {
+    let port = Arc::new(MountedNativePort::with_capability("replay.apply.v1"));
+    let readiness = mount(enabled_composition(Arc::clone(&port)), 4);
+    let mut request = handshake_request(exact_scope("worktree-canonical-replay"));
+    request
+        .required_capabilities
+        .insert(OwnedVersionedId::new("replay.apply.v1").expect("canonical replay capability"));
+
+    let (_, evidence) = readiness
+        .ready_target_with_evidence(&request, 1_000)
+        .expect("canonical replay remains negotiable");
+    assert!(!evidence.retains_replay_position());
+    assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 1);
+}
+
+/// The dedicated declaration comes from the incarnation's validated
+/// descriptor. It remains a claim the recovery gate must compare or refuse
+/// as unreadable; canonical replay support cannot silently replace it.
 #[test]
 fn readiness_evidence_reports_whether_the_provider_retains_a_replay_position() {
-    let port = Arc::new(MountedNativePort::retaining_a_replay_position());
+    let port = Arc::new(MountedNativePort::with_capability(
+        "observation.recovery_position.v1",
+    ));
     let readiness = mount(enabled_composition(Arc::clone(&port)), 4);
-    let request = handshake_request(exact_scope("worktree-replay"));
+    let mut request = handshake_request(exact_scope("worktree-recovery-position"));
+    request.required_capabilities.insert(
+        OwnedVersionedId::new("observation.recovery_position.v1")
+            .expect("observation recovery position capability"),
+    );
 
     let (_, evidence) = readiness
         .ready_target_with_evidence(&request, 1_000)
         .expect("readiness target and evidence");
     assert!(evidence.retains_replay_position());
+    assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 1);
 }
 
 /// A disabled composition produces typed unavailability on every pass, and

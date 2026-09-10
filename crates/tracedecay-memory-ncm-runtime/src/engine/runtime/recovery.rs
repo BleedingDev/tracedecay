@@ -1,5 +1,5 @@
 use super::super::*;
-use super::util::{core_reply, corrupt_reply, sha256_hex, store_reply};
+use super::util::{core_reply, corrupt_reply, sha256_hex, store_reply, validate_common_capsule};
 use crate::store::{Event, NamespaceStore, StoreMeta, StoredCapsule};
 use tracedecay_memory_ncm_core::kernel::{NcmKernel, NewRecord};
 use tracedecay_memory_ncm_core::types::{CoreError, NcmConfig};
@@ -54,6 +54,12 @@ pub(super) fn recover_kernel(
     let capsules = store
         .capsules_in_commit_order(false)
         .map_err(|error| store_reply(error, meta.commit_seq))?;
+    for capsule in &capsules {
+        let provenance: serde_json::Value = serde_json::from_str(&capsule.provenance)
+            .map_err(|_| corrupt_reply(meta.commit_seq, "invalid capsule provenance"))?;
+        validate_common_capsule(&provenance)
+            .map_err(|error| store_reply(error, meta.commit_seq))?;
+    }
     let events = store
         .events_after(applied_seq)
         .map_err(|error| store_reply(error, meta.commit_seq))?;
@@ -113,6 +119,25 @@ fn replay_event(
     commit_seq: u64,
 ) -> Result<(), EngineReply> {
     match operation {
+        DurableOperation::CommonControl { operations } => {
+            for operation in operations {
+                let mut inner = event.clone();
+                inner.kind = match operation {
+                    DurableOperation::Observe { .. } => "observe",
+                    DurableOperation::Feedback { .. } => "feedback",
+                    DurableOperation::Correction { .. } => "correction",
+                    DurableOperation::Maintenance { .. } => "maintenance",
+                    _ => {
+                        return Err(corrupt_reply(
+                            commit_seq,
+                            "invalid common control operation",
+                        ));
+                    }
+                }
+                .to_owned();
+                replay_event(kernel, &inner, operation, capsules, commit_seq)?;
+            }
+        }
         DurableOperation::Observe { record_id } => {
             if event.kind != "observe" {
                 return Err(corrupt_reply(commit_seq, "observe receipt kind mismatch"));

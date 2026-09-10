@@ -108,8 +108,8 @@ use multi_root_http::router_with_executor as multi_root_application_router_with_
 pub(crate) use registered_http::RegisteredHttpOperation;
 use registered_http::validated_daemon_outcome;
 use request_control::{
-    ActiveHttpRequest, HttpCancellationRegistry, RequestControlError, accepts_supplied_request_id,
-    supplied_request_id,
+    ActiveHttpRequest, HttpCancellationRegistry, RequestControlError, supplied_request_id,
+    supplied_request_id_operation,
 };
 pub(crate) use workflow::invoke_workflow_operation;
 use workflow::router_with_executor as workflow_application_router_with_executor;
@@ -887,7 +887,8 @@ async fn application_http_context(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if supplied_request_id.is_some() && !accepts_supplied_request_id(request.uri().path()) {
+    let request_id_operation = supplied_request_id_operation(request.uri().path());
+    if supplied_request_id.is_some() && request_id_operation.is_none() {
         return invalid_http_request_control_response();
     }
     let request_id = match supplied_request_id {
@@ -930,7 +931,10 @@ async fn application_http_context(
     ) {
         Ok(active) => active,
         Err(RequestControlError::ActiveCollision) => {
-            return retained::active_request_conflict_response(request_id);
+            let Some(operation) = request_id_operation else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            return retained::active_request_conflict_response(operation, request_id);
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };

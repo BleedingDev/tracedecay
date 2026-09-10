@@ -469,6 +469,7 @@ pub(crate) fn initialize(
         transaction.execute_batch(SCHEMA_DDL)?;
         transaction.execute_batch("INSERT INTO tdmem_observation_replay_cursor_v1 SELECT * FROM tdmem_observation_replay_cursor_old; DROP TABLE tdmem_observation_replay_cursor_old;")?;
     }
+    super::retention::initialize_provider_source_fences(&transaction)?;
     let audit = validate_withheld_page(&transaction, None, OPEN_WITHHELD_AUDIT_ROWS)?;
     transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     transaction.commit()?;

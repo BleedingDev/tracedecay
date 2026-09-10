@@ -176,7 +176,9 @@ pub(super) fn reconciliation_attempt_record(
         committed_state
     };
     let operation_termination = match termination {
-        EffectTermination::Completed => OperationTermination::Completed,
+        EffectTermination::Completed | EffectTermination::NoChange => {
+            OperationTermination::Completed
+        }
         EffectTermination::Cancelled => OperationTermination::Cancelled,
         EffectTermination::TimedOut => OperationTermination::TimedOut,
         EffectTermination::Failed => OperationTermination::Failed,
@@ -246,7 +248,9 @@ pub(super) fn durable_record(
 ) -> Result<SourceEditDurableResultV1> {
     let request = &journal.request;
     let operation_termination = match termination {
-        EffectTermination::Completed => OperationTermination::Completed,
+        EffectTermination::Completed | EffectTermination::NoChange => {
+            OperationTermination::Completed
+        }
         EffectTermination::Cancelled => OperationTermination::Cancelled,
         EffectTermination::TimedOut => OperationTermination::TimedOut,
         EffectTermination::Failed => OperationTermination::Failed,

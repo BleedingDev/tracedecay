@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 TOP_LEVEL = {
+    "common_advisory_profile",
     'schema_version', 'contract_id', 'bead_id', 'title', 'status', 'authority',
     'scope', 'provider_identity', 'capability_identity', 'capability_registry',
     'capability_catalog', 'unknown_capability_contract', 'registration_contract', 'selection_contract',
@@ -21,6 +22,7 @@ MANDATORY = {
     'recall.query.v1': 'tdmem-0204',
 }
 OPTIONAL = {
+    'memory.advisory_common.v1': 'tdmem-0201',
     'feedback.record.v1': 'tdmem-0205',
     'maintenance.run.v1': 'tdmem-0205',
     'recall.temporal.v1': 'tdmem-0204',
@@ -557,8 +559,8 @@ def validate_schema(schema: dict[str, Any], contract: dict[str, Any], errors: li
     if registry.get('additionalProperties') is not False or set(registry.get('required', [])) != {'mandatory', 'optional'}:
         errors.append('schema must strictly separate mandatory and optional capability arrays')
     catalog = properties.get('capability_catalog', {})
-    if catalog.get('minItems') != 15 or catalog.get('maxItems') != 15:
-        errors.append('schema capability_catalog must remain the bounded 15-entry compatibility projection')
+    if catalog.get('minItems') != len(MANDATORY) + len(OPTIONAL) or catalog.get('maxItems') != len(MANDATORY) + len(OPTIONAL):
+        errors.append('schema capability_catalog must remain the bounded capability compatibility projection')
     catalog_item = catalog.get('items', {}) if isinstance(catalog, dict) else {}
     if catalog_item.get('additionalProperties') is not False or set(catalog_item.get('required', [])) != {'id'}:
         errors.append('schema capability_catalog item must contain only id')
@@ -638,6 +640,9 @@ def validate(repo: Path, contract_path: Path, schema_path: Path, readme_path: Pa
     validate_bootstrap(contract, issue_ids, errors)
     validate_invariants(contract, errors)
     validate_verification_beads(contract, issue_ids, errors)
+    common = contract.get("common_advisory_profile")
+    if not isinstance(common, dict) or schema.get("properties", {}).get("common_advisory_profile", {}).get("const") != common:
+        errors.append("common_advisory_profile must match its canonical schema semantics")
     validate_schema(schema, contract, errors)
     validate_readme(readme_path, errors)
     registry = contract.get('capability_registry', {}) if isinstance(contract, dict) else {}

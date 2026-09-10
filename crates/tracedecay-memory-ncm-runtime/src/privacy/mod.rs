@@ -54,6 +54,62 @@ pub fn delete_by_source(
     namespace: &str,
     request: DeleteRequest,
 ) -> EngineReply {
+    delete_sources_inner(engine, namespace, request, None, None, None)
+}
+
+pub(crate) fn delete_sources(
+    engine: &NcmEngine,
+    namespace: &str,
+    sources: &[SourceId],
+    key: &str,
+    deadline: Deadline,
+    expected_generation: u64,
+    bindings: Option<&[crate::source_binding::DeletionSourceBinding]>,
+) -> EngineReply {
+    if let Some(bindings) = bindings {
+        if let Err(reason) =
+            crate::source_binding::DeletionSourceBinding::validate_set(bindings, sources)
+        {
+            return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
+        }
+    }
+    let Some(first) = sources.first() else {
+        return EngineReply::rejected(
+            RejectReason::InvalidRequest("empty deletion source set".to_owned()),
+            0,
+        );
+    };
+    if sources.len() > 1024
+        || sources.iter().any(|source| source.0.is_empty())
+        || sources.iter().collect::<BTreeSet<_>>().len() != sources.len()
+    {
+        return EngineReply::rejected(
+            RejectReason::InvalidRequest("invalid deletion source set".to_owned()),
+            0,
+        );
+    }
+    delete_sources_inner(
+        engine,
+        namespace,
+        DeleteRequest {
+            idempotency_key: key.to_owned(),
+            source: first.clone(),
+            deadline,
+        },
+        Some(sources),
+        Some(expected_generation),
+        bindings,
+    )
+}
+
+fn delete_sources_inner(
+    engine: &NcmEngine,
+    namespace: &str,
+    request: DeleteRequest,
+    source_set: Option<&[SourceId]>,
+    expected_generation: Option<u64>,
+    bindings: Option<&[crate::source_binding::DeletionSourceBinding]>,
+) -> EngineReply {
     let started = Instant::now();
     if request.deadline.remaining_ms == 0 {
         return EngineReply::new(Outcome::Cancelled, 0, Value::Null);
@@ -61,7 +117,16 @@ pub fn delete_by_source(
     if let Err(reason) = validate_request(&request) {
         return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
     }
-    let payload_sha256 = match canonical_source_digest(&request.source) {
+    let sources = source_set
+        .map(|sources| sources.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_else(|| BTreeSet::from([request.source.clone()]));
+    let payload_sha256 = match if source_set.is_some() {
+        serde_json::to_vec(&sources)
+            .map(|bytes| sha256_hex(&bytes))
+            .map_err(|error| error.to_string())
+    } else {
+        canonical_source_digest(&request.source)
+    } {
         Ok(digest) => digest,
         Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
     };
@@ -69,7 +134,7 @@ pub fn delete_by_source(
         Ok(namespaces) => namespaces,
         Err(reply) => return reply,
     };
-    let handle = match engine.ensure_handle(&mut namespaces, namespace, false) {
+    let handle = match engine.ensure_handle(&mut namespaces, namespace, true) {
         Ok(Some(handle)) => handle,
         Ok(None) => return EngineReply::new(Outcome::Empty, 0, Value::Null),
         Err(reply) => return reply,
@@ -82,8 +147,28 @@ pub fn delete_by_source(
         Ok(None) => {}
         Err(reply) => return reply,
     }
+    if expected_generation.is_some_and(|expected| expected != handle.commit_seq) {
+        return EngineReply::rejected(RejectReason::IdempotencyConflict, handle.commit_seq);
+    }
     if remaining_ms(request.deadline, started) == 0 {
         return EngineReply::new(Outcome::Cancelled, handle.commit_seq, Value::Null);
+    }
+    if let Some(bindings) = bindings {
+        for binding in bindings {
+            match handle.store.has_retained_source(&binding.legacy_source_id) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return EngineReply::rejected(
+                        RejectReason::InvalidRequest(
+                            "targeted deletion cannot disambiguate retained legacy source identity"
+                                .to_owned(),
+                        ),
+                        handle.commit_seq,
+                    );
+                }
+                Err(error) => return store_reply(error, handle.commit_seq),
+            }
+        }
     }
     let live = match handle.live.read() {
         Ok(live) => Arc::clone(&live),
@@ -101,10 +186,29 @@ pub fn delete_by_source(
         Ok(capsules) => capsules,
         Err(error) => return store_reply(error, handle.commit_seq),
     };
+    let mut matched_ids = BTreeSet::new();
+    for capsule in &capsules {
+        let matched = if bindings.is_some() {
+            sources.contains(&capsule.source_id)
+        } else {
+            match crate::source_binding::matches_sources(
+                namespace,
+                &capsule.source_id,
+                &capsule.provenance,
+                &sources,
+            ) {
+                Ok(matched) => matched,
+                Err(reason) => return corrupt_reply(handle.commit_seq, &reason),
+            }
+        };
+        if matched {
+            matched_ids.insert(capsule.record_id);
+        }
+    }
     let revoked_ids = capsules
         .iter()
         .filter(|capsule| {
-            capsule.source_id == request.source && capsule.status != CapsuleStatus::Revoked
+            matched_ids.contains(&capsule.record_id) && capsule.status != CapsuleStatus::Revoked
         })
         .map(|capsule| capsule.record_id)
         .collect::<Vec<_>>();
@@ -135,14 +239,21 @@ pub fn delete_by_source(
         Ok(mutation) => mutation,
         Err(error) => return store_reply(error, handle.commit_seq),
     };
-    if let Err(error) = mutation.add_revocation(&request.source.0, target_epoch, fence_seq) {
-        return store_reply(error, handle.commit_seq);
+    for source in &sources {
+        if let Err(error) = mutation.add_revocation(&source.0, target_epoch, fence_seq) {
+            return store_reply(error, handle.commit_seq);
+        }
     }
     if let Err(error) = mutation.set_fence("rebuilding") {
         return store_reply(error, handle.commit_seq);
     }
-    for record_id in &revoked_ids {
-        if let Err(error) = mutation.mark_capsule_status(*record_id, CapsuleStatus::Revoked) {
+    // Reapply erasure to older tombstones too, while counting only newly revoked records.
+    for capsule in capsules
+        .iter()
+        .filter(|capsule| matched_ids.contains(&capsule.record_id))
+    {
+        if let Err(error) = mutation.mark_capsule_status(capsule.record_id, CapsuleStatus::Revoked)
+        {
             return store_reply(error, handle.commit_seq);
         }
     }
@@ -477,61 +588,71 @@ fn sanitized_replay(
     for event in events {
         let durable: DurableReceipt = serde_json::from_str(&event.receipt)
             .map_err(|error| corrupt_reply(event.seq, &format!("decode receipt: {error}")))?;
-        match durable.operation {
-            DurableOperation::Observe { record_id } => {
-                let capsule = by_record.get(&record_id).ok_or_else(|| {
-                    corrupt_reply(event.seq, "observe receipt capsule is missing")
-                })?;
-                if capsule.status == CapsuleStatus::Revoked {
-                    continue;
+        let operations = match durable.operation {
+            DurableOperation::CommonControl { operations } => operations,
+            operation => vec![operation],
+        };
+        for operation in operations {
+            match operation {
+                DurableOperation::CommonControl { .. } => {
+                    return Err(corrupt_reply(event.seq, "nested common control operation"));
                 }
-                let observed = kernel
-                    .observe(
-                        &capsule.key_embedding,
-                        &capsule.value_embedding,
-                        NewRecord {
-                            source: capsule.source_id.clone(),
-                            key_text: capsule.key_text.clone(),
-                            value_text: capsule.value_text.clone(),
-                            affect: capsule.affect,
-                            surprise: capsule.surprise,
-                            intensity: capsule.intensity,
-                        },
-                    )
-                    .map_err(|error| core_reply(error, event.seq))?;
-                old_to_new.insert(record_id, observed.record_id);
-                replayed_records = replayed_records.saturating_add(1);
-            }
-            DurableOperation::Feedback { record_ids } => {
-                let retained = record_ids
-                    .into_iter()
-                    .filter_map(|record_id| old_to_new.get(&record_id).copied())
-                    .collect::<Vec<_>>();
-                if !retained.is_empty() {
-                    kernel
-                        .feedback(&retained)
+                DurableOperation::Observe { record_id } => {
+                    let capsule = by_record.get(&record_id).ok_or_else(|| {
+                        corrupt_reply(event.seq, "observe receipt capsule is missing")
+                    })?;
+                    if capsule.status == CapsuleStatus::Revoked {
+                        continue;
+                    }
+                    let observed = kernel
+                        .observe(
+                            &capsule.key_embedding,
+                            &capsule.value_embedding,
+                            NewRecord {
+                                source: capsule.source_id.clone(),
+                                key_text: capsule.key_text.clone(),
+                                value_text: capsule.value_text.clone(),
+                                affect: capsule.affect,
+                                surprise: capsule.surprise,
+                                intensity: capsule.intensity,
+                            },
+                        )
+                        .map_err(|error| core_reply(error, event.seq))?;
+                    old_to_new.insert(record_id, observed.record_id);
+                    replayed_records = replayed_records.saturating_add(1);
+                }
+                DurableOperation::Feedback { record_ids } => {
+                    let retained = record_ids
+                        .into_iter()
+                        .filter_map(|record_id| old_to_new.get(&record_id).copied())
+                        .collect::<Vec<_>>();
+                    if !retained.is_empty() {
+                        kernel
+                            .feedback(&retained)
+                            .map_err(|error| core_reply(error, event.seq))?;
+                    }
+                }
+                DurableOperation::Correction {
+                    superseded,
+                    superseding,
+                    evidence,
+                } => {
+                    if let (Some(old), Some(new)) = (
+                        old_to_new.get(&superseded).copied(),
+                        old_to_new.get(&superseding).copied(),
+                    ) {
+                        kernel
+                            .correction(old, new, evidence)
+                            .map_err(|error| core_reply(error, event.seq))?;
+                    }
+                }
+                DurableOperation::Maintenance { kind } => {
+                    apply_maintenance(&mut kernel, &kind)
                         .map_err(|error| core_reply(error, event.seq))?;
                 }
+                DurableOperation::DeletionFence { .. }
+                | DurableOperation::DeleteBySource { .. } => {}
             }
-            DurableOperation::Correction {
-                superseded,
-                superseding,
-                evidence,
-            } => {
-                if let (Some(old), Some(new)) = (
-                    old_to_new.get(&superseded).copied(),
-                    old_to_new.get(&superseding).copied(),
-                ) {
-                    kernel
-                        .correction(old, new, evidence)
-                        .map_err(|error| core_reply(error, event.seq))?;
-                }
-            }
-            DurableOperation::Maintenance { kind } => {
-                apply_maintenance(&mut kernel, &kind)
-                    .map_err(|error| core_reply(error, event.seq))?;
-            }
-            DurableOperation::DeletionFence { .. } | DurableOperation::DeleteBySource { .. } => {}
         }
     }
     let next_id = capsules
@@ -540,7 +661,12 @@ fn sanitized_replay(
         .max()
         .unwrap_or(0)
         .checked_add(1)
-        .ok_or_else(|| corrupt_reply(0, "record identity overflow"))?;
+        .ok_or_else(|| corrupt_reply(0, "record identity overflow"))?
+        .max(
+            store
+                .next_record_id()
+                .map_err(|error| store_reply(error, 0))?,
+        );
     kernel = remap_record_ids(kernel, &old_to_new, next_id)?;
     Ok(ReplayResult {
         kernel,
@@ -809,6 +935,7 @@ fn store_reply(error: StoreError, commit_seq: u64) -> EngineReply {
         StoreError::IdempotencyConflict => {
             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
         }
+        StoreError::SourceRevoked => EngineReply::rejected(RejectReason::SourceRevoked, commit_seq),
         StoreError::InvalidInput(reason) | StoreError::InvalidNamespace(reason) => {
             EngineReply::rejected(RejectReason::InvalidRequest(reason), commit_seq)
         }

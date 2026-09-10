@@ -21,11 +21,13 @@ mod enabled {
     use sha2::{Digest, Sha256};
     use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
     use tracedecay_memory_provider_api::{
-        CancellationToken, CanonicalPayload, HandshakeRequest, HandshakeRequestParts,
-        MemoryProvider, OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+        AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CancellationToken, CanonicalPayload,
+        CurrentAdvisoryAdmission, CurrentSourceDisposition, GrantedHistorySource, HandshakeRequest,
+        HandshakeRequestParts, MemoryProvider, OperationControl, OriginScopeEvidence,
+        OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
         PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderCall,
-        ProviderCallParts, ProviderLimits, ProviderOperation, ProviderReply,
-        observation_extensions_digest,
+        ProviderCallParts, ProviderLimits, ProviderOperation, ProviderReply, RecordedValidity,
+        SourceAttribution, observation_extensions_digest,
     };
     use tracedecay_memory_provider_ncm::{
         NCM_PROVIDER_ID, NcmCognitiveSurface, NcmProviderAdapter, NcmSurfaceCall,
@@ -166,6 +168,9 @@ mod enabled {
             "deletion.by_source.v1",
             "snapshot.export.v1",
             "snapshot.restore.v1",
+            "recall.temporal.v1",
+            "replay.apply.v1",
+            "memory.advisory_common.v1",
         ]
         .into_iter()
         .map(|value| OwnedVersionedId::new(value).expect("known capability"))
@@ -478,6 +483,1204 @@ mod enabled {
             output.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
         output
+    }
+
+    fn canonical_ready(
+        adapter: &NcmProviderAdapter,
+        exact_scope: &OwnedExactScope,
+    ) -> (String, u64) {
+        let mut response = handshake(adapter, exact_scope);
+        if response.terminal.terminal_code() == TerminalCode::StaleIdentity {
+            response = handshake(adapter, exact_scope);
+        }
+        ready_parts(&response)
+    }
+
+    fn canonical_observation(exact_scope: &OwnedExactScope, number: u64, text: &str) -> Value {
+        let source_session = "canonical-ncm-source-session";
+        let observation_id = format!("canonical-ncm-observation-{number}");
+        let mut canonical = json!({"version": 1, "provider": "codex", "native_record_kind": "session_message",
+            "stable_record_id": format!("canonical-ncm-record-{number}"),
+            "relations": {"session_id": source_session, "project_id": exact_scope.project_id},
+            "facts": [{"kind": "message", "role": "assistant", "content": text}]});
+        canonical.sort_all_objects();
+        let original_digest = hex_sha256(&serde_json::to_vec(&canonical).unwrap());
+        let original = json!({
+            "source": {"canonical_provider_id": "codex", "canonical_session_id": source_session,
+                "source_key": exact_scope.session_forget_source_key(source_session),
+                "stable_record_id": format!("canonical-ncm-record-{number}"), "observation_id": observation_id,
+                "source_revision": "cache_policy_r2", "content_sha256": original_digest},
+            "origin_scope": {"state": "recorded", "authority_ref": "host.observation.receipt.v1",
+                "exact_scope_identity": {
+                    "profile_id": exact_scope.profile_id, "project_id": exact_scope.project_id,
+                    "repository_identity": exact_scope.repository_identity, "worktree_identity": exact_scope.worktree_identity,
+                    "branch_identity": exact_scope.branch_identity, "agent_session_id": exact_scope.agent_session_id,
+                    "resolved_scope_digest": exact_scope.resolved_scope_digest}},
+            "source_sequence": number, "occurred_at": "2025-01-02T12:00:00.123456789Z",
+            "ingested_at": "2025-01-03T12:00:00Z", "validity": {
+                "valid_from": "2025-01-02T12:00:00.123456789Z", "valid_until": null,
+                "superseded_at": null, "superseded_by": null, "revoked_at": null}
+        });
+        json!({"observation_kind": "session.message_committed.v1",
+            "payload_contract": "tracedecay.memory.observation.session-message.v1",
+            "source_identity": {"original_source": original},
+            "canonical_payload": canonical})
+    }
+
+    fn canonical_recall_call(
+        adapter: &NcmProviderAdapter,
+        exact_scope: &OwnedExactScope,
+        query: &str,
+        temporal: tracedecay_memory_provider_registry::recall_admission::AdmittedTemporalQuery,
+        request_identity: &str,
+    ) -> ProviderCall {
+        use tracedecay_memory_provider_registry::recall_admission::{
+            RecallBudgetsV1, RecallRequestParts, build_recall_request_payload,
+        };
+        let (receipt, generation) = canonical_ready(adapter, exact_scope);
+        let request_id = request_identity.to_owned();
+        let payload = build_recall_request_payload(&RecallRequestParts {
+            provider_id: OwnedProviderId::new(NCM_PROVIDER_ID).unwrap(),
+            registration_revision: 1,
+            ready_receipt_sha256: receipt.clone(),
+            exact_scope: exact_scope.clone(),
+            request_id: request_id.clone(),
+            objective: "Retrieve source-grounded cache policy".to_owned(),
+            query: query.to_owned(),
+            temporal,
+            budgets: RecallBudgetsV1 {
+                maximum_candidates: 4,
+                maximum_candidate_content_bytes: 8192,
+                maximum_total_content_bytes: 32768,
+                maximum_source_refs_per_candidate: 4,
+                maximum_trace_refs_per_candidate: 4,
+                maximum_warnings: 4,
+                maximum_extensions_per_candidate: 4,
+            },
+            policy_revision: 1,
+            deadline_utc_micros: i64::MAX,
+            remaining_millis: 10_000,
+        })
+        .unwrap();
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Recall,
+            provider_id: OwnedProviderId::new(NCM_PROVIDER_ID).unwrap(),
+            registration_revision: 1,
+            ready_receipt_sha256: receipt,
+            exact_scope: exact_scope.clone(),
+            request_id,
+            operation_id: format!("canonical-op-{}", NEXT_ROOT.fetch_add(1, Ordering::Relaxed)),
+            expected_state_generation: generation,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, 10_000, CancellationToken::new()),
+            payload,
+            required_capabilities: vec![OwnedVersionedId::new("recall.query.v1").unwrap()],
+            extensions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn exercise_canonical_recall(options: WorkerOptions) {
+        use tracedecay_memory_provider_registry::recall_admission::{
+            AdmittedTemporalQuery, RecallScopeBindingsV1, ScopeBinding, admit_recall_reply,
+            decode_recall_outcome,
+        };
+        let root = TestRoot::new("canonical-recall");
+        #[cfg(unix)]
+        if !options.test_double {
+            let installed = PathBuf::from(
+                std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT")
+                    .expect("installed pinned model fixture"),
+            );
+            assert!(installed.is_absolute());
+            std::os::unix::fs::symlink(installed.join("models"), root.0.join("models"))
+                .expect("share immutable models only");
+        }
+        let exact_scope = scope("canonical-source-provenance");
+        let text = "The build cache key includes the compiler version, target triple, and dependency lockfile digest.";
+        let mut expected = Vec::new();
+        let mut stable_before = Vec::new();
+        let mut ordering_before = Vec::new();
+        for restarted in [false, true] {
+            let surface = Arc::new(
+                RustNcmSurface::new(RustNcmConfig {
+                    worker_binary: worker_binary(),
+                    state_root: root.state_root(),
+                    worker_options: options.clone(),
+                })
+                .unwrap(),
+            );
+            let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+            if !restarted {
+                for number in 1..=3 {
+                    let value = canonical_observation(&exact_scope, number, text);
+                    expected.push(value["source_identity"]["original_source"].clone());
+                    let (receipt, generation) = canonical_ready(&adapter, &exact_scope);
+                    let observed = adapter.invoke(&call(
+                        ProviderOperation::Observe,
+                        &exact_scope,
+                        &receipt,
+                        generation,
+                        Some(&format!("canonical-observe-{number}")),
+                        value,
+                        10_000,
+                    ));
+                    assert_eq!(
+                        observed.terminal.terminal_code(),
+                        TerminalCode::Success,
+                        "{observed:?}"
+                    );
+                }
+            }
+            let temporal = AdmittedTemporalQuery::current("2025-02-01T00:00:00Z").unwrap();
+            let recall = canonical_recall_call(
+                &adapter,
+                &exact_scope,
+                text,
+                temporal.clone(),
+                "canonical-current-recall-across-restart",
+            );
+            let original_request_bytes = recall.payload.bytes.clone();
+            let reply = adapter.invoke(&recall);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            assert_eq!(
+                recall.payload.bytes, original_request_bytes,
+                "canonical builder bytes must remain unchanged"
+            );
+            let outcome = decode_recall_outcome(reply.payload.as_ref().unwrap()).unwrap();
+            assert!(
+                !outcome.candidates.is_empty(),
+                "real NCM support must be nonempty"
+            );
+            let admitted = admit_recall_reply(
+                &recall,
+                &temporal,
+                4,
+                &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+                &reply,
+            )
+            .unwrap();
+            assert_eq!(
+                admitted.report.admitted_count,
+                outcome.candidates.len(),
+                "{:?}",
+                admitted.report
+            );
+            assert!(admitted.report.denied.is_empty());
+            for pair in outcome.candidates.windows(2) {
+                let score = |index: usize| {
+                    pair[index].native_score["raw_value"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<f64>()
+                        .unwrap()
+                };
+                assert!(
+                    score(0) > score(1)
+                        || (score(0) == score(1) && pair[0].candidate_id < pair[1].candidate_id)
+                );
+            }
+            for candidate in &outcome.candidates {
+                assert_eq!(
+                    candidate.content.as_deref(),
+                    Some(format!("assistant: {text}").as_str())
+                );
+                assert!(expected.contains(&candidate.provenance["original_sources"][0]));
+                assert_eq!(
+                    candidate.validity.source_revision.as_deref(),
+                    Some("cache_policy_r2")
+                );
+                assert_eq!(
+                    candidate.validity.valid_from.as_deref(),
+                    Some("2025-01-02T12:00:00.123456789Z")
+                );
+            }
+            let stable = outcome
+                .candidates
+                .iter()
+                .map(|candidate| candidate.stable_memory_ref.clone())
+                .collect::<Vec<_>>();
+            let ordering = outcome
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.candidate_id.clone(),
+                        candidate.native_score.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if restarted {
+                assert_eq!(stable, stable_before);
+                assert_eq!(ordering, ordering_before);
+            } else {
+                stable_before = stable;
+                ordering_before = ordering;
+            }
+
+            let before = AdmittedTemporalQuery::as_of(
+                "2025-02-01T00:00:00Z",
+                "2025-01-02T12:00:00.123456788Z",
+            )
+            .unwrap();
+            let recall = canonical_recall_call(
+                &adapter,
+                &exact_scope,
+                text,
+                before.clone(),
+                "canonical-before-recall-across-restart",
+            );
+            let reply = adapter.invoke(&recall);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::SuccessZeroResults,
+                "{reply:?}"
+            );
+            let zero = admit_recall_reply(
+                &recall,
+                &before,
+                4,
+                &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+                &reply,
+            )
+            .unwrap();
+            assert_eq!(zero.report.admitted_count, 0);
+            drop(adapter);
+            drop(surface);
+        }
+    }
+
+    #[test]
+    fn canonical_recall_hash_fixture_preserves_source_across_restart() {
+        exercise_canonical_recall(WorkerOptions {
+            test_double: true,
+            ..WorkerOptions::default()
+        });
+    }
+
+    fn canonical_lifecycle_call(
+        adapter: &NcmProviderAdapter,
+        exact_scope: &OwnedExactScope,
+        operation: ProviderOperation,
+        key: Option<&str>,
+        mut value: Value,
+    ) -> ProviderCall {
+        let (receipt, generation) = canonical_ready(adapter, exact_scope);
+        let mut request = call(
+            operation,
+            exact_scope,
+            &receipt,
+            generation,
+            key,
+            value.clone(),
+            10_000,
+        );
+        let scope = canonical_observation(exact_scope, 1, "scope")["source_identity"]["original_source"]["origin_scope"]["exact_scope_identity"].clone();
+        value["common_request"] = json!({"provider_id":"ncm", "registration_revision":1, "ready_receipt_digest":receipt,
+            "exact_scope_identity":scope,"operation_id":request.operation_id,"idempotency_key":key,"expected_state_generation":generation,
+            "request_identity":request.request_id,"policy_revision":1,"deadline":{"deadline_utc_micros":i64::MAX,"remaining_millis":10_000},"cancellation":"live","extensions":[]});
+        if operation == ProviderOperation::Replay {
+            value["expected_state_generation"] = json!(generation);
+        }
+        request.payload = payload(operation, value);
+        request
+    }
+
+    struct FixtureHistoryAuthority(Vec<GrantedHistorySource>);
+
+    impl AdvisoryAdmissionAuthority for FixtureHistoryAuthority {
+        fn admit(
+            &self,
+            request: &ProviderCall,
+        ) -> Result<CurrentAdvisoryAdmission, AdvisoryAdmissionError> {
+            CurrentAdvisoryAdmission::new(
+                request,
+                if request.operation == ProviderOperation::Replay {
+                    self.0.clone()
+                } else {
+                    Vec::new()
+                },
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn canonical_replay_retries_through_projection_preserve_receipt_and_reject_changed_item() {
+        let root = TestRoot::new("canonical-replay-retry");
+        let exact = scope("canonical-replay-retry");
+        let mut observation =
+            canonical_observation(&exact, 1, "The cache reuses the compiler result.");
+        observation["idempotency_key"] = json!("canonical-replay-delivery");
+        observation["source_sequence"] = json!(1);
+        let original = &observation["source_identity"]["original_source"];
+        let source = &original["source"];
+        let time = |value: &Value| {
+            chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap())
+                .unwrap()
+                .timestamp_nanos_opt()
+                .unwrap()
+        };
+        let granted = GrantedHistorySource {
+            attribution: SourceAttribution {
+                source: OriginalSourceIdentity {
+                    canonical_provider_id: OwnedProviderId::new(
+                        source["canonical_provider_id"].as_str().unwrap(),
+                    )
+                    .unwrap(),
+                    canonical_session_id: source["canonical_session_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    source_key: source["source_key"].as_str().unwrap().to_owned(),
+                    stable_record_id: Some(source["stable_record_id"].as_str().unwrap().to_owned()),
+                    observation_id: source["observation_id"].as_str().unwrap().to_owned(),
+                    source_revision: Some(source["source_revision"].as_str().unwrap().to_owned()),
+                    content_sha256: source["content_sha256"].as_str().unwrap().to_owned(),
+                },
+                origin_scope: OriginScopeEvidence::Recorded {
+                    scope: exact.clone(),
+                    authority_ref: original["origin_scope"]["authority_ref"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                },
+                source_sequence: 1,
+                occurred_at_utc_nanos: Some(time(&original["occurred_at"])),
+                ingested_at_utc_nanos: time(&original["ingested_at"]),
+                validity: RecordedValidity {
+                    valid_from_utc_nanos: Some(time(&original["validity"]["valid_from"])),
+                    ..RecordedValidity::default()
+                },
+            },
+            current_disposition: CurrentSourceDisposition {
+                state: tracedecay_memory_provider_api::contract::SourceDisposition::Available,
+                authority_ref: "test.current-source".to_owned(),
+                authority_revision: Some(1),
+                checked_at_utc_nanos: time(&original["ingested_at"]),
+            },
+        };
+        let adapter = NcmProviderAdapter::new(surface(&root))
+            .unwrap()
+            .with_admission_authority(Arc::new(FixtureHistoryAuthority(vec![granted])));
+        let disposition = json!({"state":"available","authority_ref":"test.current-source","authority_revision":1,"checked_at":"2025-01-03T12:00:00Z"});
+        let mut body = json!({"observation_batch_refs":["test.observation.receipt.1"],"first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":0,"expected_previous_acknowledged_sequence":0,
+            "history_grant":{"authorization_ref":"test.history-authority","policy_revision":1,"destination_scope":original["origin_scope"]["exact_scope_identity"],"relation":"exact_scope",
+                "sources":[{"attribution":original,"current_disposition":disposition}],"disposition_checkpoint":{"exact_scope":original["origin_scope"]["exact_scope_identity"],"authority_ref":"test.current-source","authority_revision":1,"checked_at":"2025-01-03T12:00:00Z"}},
+            "resolved_observations":[{"receipt_ref":"test.observation.receipt.1","observation":observation}]});
+        let first_call = canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Replay,
+            Some("canonical-replay-page"),
+            body.clone(),
+        );
+        let first = adapter.invoke(&first_call);
+        assert_eq!(
+            first.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{first:?}"
+        );
+        assert_eq!(response_json(&first)["applied_observations"], 1);
+        let receipt = first
+            .terminal
+            .committed_effect()
+            .provider_receipt_sha256()
+            .unwrap()
+            .to_owned();
+        let retry_call = canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Replay,
+            Some("canonical-replay-page"),
+            body.clone(),
+        );
+        assert_ne!(first_call.operation_id, retry_call.operation_id);
+        let duplicate = adapter.invoke(&retry_call);
+        assert_eq!(
+            duplicate.terminal.committed_effect().state(),
+            CommittedEffectState::Duplicate,
+            "{duplicate:?}"
+        );
+        assert_eq!(
+            duplicate
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256(),
+            Some(receipt.as_str())
+        );
+        assert_eq!(response_json(&duplicate)["duplicate_observations"], 1);
+        assert_eq!(response_json(&duplicate)["applied_observations"], 0);
+        assert_eq!(
+            duplicate.state_generation,
+            retry_call.expected_state_generation
+        );
+        body["expected_previous_acknowledged_sequence"] = json!(1);
+        let next_page = adapter.invoke(&canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Replay,
+            Some("canonical-replay-fresh-page"),
+            body.clone(),
+        ));
+        assert_eq!(
+            next_page.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{next_page:?}"
+        );
+        assert_eq!(response_json(&next_page)["sources_already_applied"], 1);
+        assert_eq!(response_json(&next_page)["duplicate_observations"], 0);
+        assert_eq!(response_json(&next_page)["applied_observations"], 0);
+        assert_eq!(response_json(&next_page)["acknowledged_sequence"], 1);
+        assert_eq!(next_page.state_generation, duplicate.state_generation);
+        let effect = next_page.terminal.committed_effect();
+        assert_eq!(effect.state(), CommittedEffectState::None);
+        assert!(effect.provider_receipt_sha256().is_none());
+        assert!(effect.verification_sha256().is_none());
+        assert!(effect.duplicate_of_operation_id().is_none());
+        assert!(effect.duplicate_of_idempotency_key().is_none());
+        let public = response_json(&next_page);
+        assert!(public.get("no_change").is_none());
+        assert!(public.get("page_delivery_capsule").is_none());
+        assert_eq!(
+            public["provider_receipt_digest"].as_str().unwrap().len(),
+            64
+        );
+        body["resolved_observations"][0]["observation"]["canonical_payload"]["facts"][0]["content"] =
+            json!("Changed source content under the same delivery key.");
+        body["expected_previous_acknowledged_sequence"] = json!(0);
+        let changed = adapter.invoke(&canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Replay,
+            Some("canonical-replay-page"),
+            body,
+        ));
+        assert_eq!(
+            changed.terminal.terminal_code(),
+            TerminalCode::Conflict,
+            "{changed:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_trace_preserves_legacy_decimal_reference_and_unknown_attribution() {
+        let root = TestRoot::new("legacy-canonical-trace");
+        let exact = scope("legacy-canonical-trace");
+        let text = "Stored legacy 🦀 text with \"quoted\" evidence.".repeat(30);
+        let worker = surface(&root);
+        let adapter = NcmProviderAdapter::new(worker.clone()).unwrap();
+        let (ready, generation) = canonical_ready(&adapter, &exact);
+        let observed = adapter.invoke(&call(
+            ProviderOperation::Observe,
+            &exact,
+            &ready,
+            generation,
+            Some("legacy-observe"),
+            observe_value("legacy-source", "legacy key", &text),
+            10_000,
+        ));
+        assert_eq!(
+            observed.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{observed:?}"
+        );
+        let reference = response_json(&observed)["record_id"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        assert_eq!(reference, "1");
+        drop(adapter);
+        drop(worker);
+        let worker = surface(&root);
+        let adapter = NcmProviderAdapter::new(worker).unwrap();
+        for maximum_bytes in [512, 65536] {
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &exact,
+                ProviderOperation::Inspection,
+                None,
+                json!({"view":"trace","selector":{"stable_memory_ref":reference},"maximum_items":1,
+                    "maximum_bytes":maximum_bytes,"redaction_policy_revision":1,"cursor":null}),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            let output = response_json(&reply);
+            let item = &output["items"][0];
+            let content = item["content"].as_str().unwrap();
+            assert!(!content.is_empty());
+            assert!(text.starts_with(content));
+            if maximum_bytes == 65536 {
+                assert_eq!(content, text);
+            }
+            assert_eq!(item["stable_memory_ref"], reference);
+            assert_eq!(item["content_sha256"], hex_sha256(content.as_bytes()));
+            assert_eq!(item["original_source"], Value::Null);
+            assert_eq!(output["coverage"], "partial");
+            assert_eq!(output["next_cursor"], Value::Null);
+            assert!(serde_json::to_vec(item).unwrap().len() <= maximum_bytes as usize);
+            assert_eq!(reply.state_generation, request.expected_state_generation);
+        }
+        for malformed in ["0", "01", "+1", "1.0", " 1", "9223372036854775808"] {
+            let reply = adapter.invoke(&canonical_lifecycle_call(
+                &adapter,
+                &exact,
+                ProviderOperation::Inspection,
+                None,
+                json!({"view":"trace","selector":{"stable_memory_ref":malformed},"maximum_items":1,
+                    "maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+            ));
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::InvalidRequest,
+                "{malformed}: {reply:?}"
+            );
+        }
+        let influence = adapter.invoke(&canonical_lifecycle_call(
+            &adapter, &exact, ProviderOperation::Inspection, None,
+            json!({"view":"source_influence","selector":{"source_key":"legacy-source"},
+                "maximum_items":1,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+        ));
+        assert_eq!(influence.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(response_json(&influence)["items"], json!([]));
+        assert_eq!(response_json(&influence)["coverage"], "partial");
+        drop(adapter);
+        let worker = surface(&root);
+        let adapter = NcmProviderAdapter::new(worker).unwrap();
+        let different = scope("legacy-other-namespace");
+        let other = adapter.invoke(&canonical_lifecycle_call(
+            &adapter,
+            &different,
+            ProviderOperation::Inspection,
+            None,
+            json!({"view":"trace","selector":{"stable_memory_ref":reference},"maximum_items":1,
+                "maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+        ));
+        assert!(
+            !serde_json::to_string(&response_json(&other))
+                .unwrap()
+                .contains("Stored legacy")
+        );
+    }
+
+    #[test]
+    fn canonical_feedback_retry_retains_original_public_identity_across_restart() {
+        let root = TestRoot::new("canonical-feedback-retry");
+        let exact = scope("canonical-feedback-retry");
+        let worker = surface(&root);
+        let adapter = NcmProviderAdapter::new(worker.clone()).unwrap();
+        let observation = canonical_observation(&exact, 1, "The cache retains compiler identity.");
+        let (ready, generation) = canonical_ready(&adapter, &exact);
+        let observed = adapter.invoke(&call(
+            ProviderOperation::Observe,
+            &exact,
+            &ready,
+            generation,
+            Some("feedback-source"),
+            observation.clone(),
+            10_000,
+        ));
+        assert_eq!(
+            observed.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{observed:?}"
+        );
+        let source = &observation["source_identity"]["original_source"];
+        let body = json!({"target": {"provider_id":"ncm","registration_revision":1,
+            "original_scope":source["origin_scope"],
+            "delivery_scope":source["origin_scope"]["exact_scope_identity"],"source":source["source"],
+            "reference":{"kind":"stable_memory_ref","reference":response_json(&observed)["stable_memory_ref"]}},
+            "signal":"helpful","weight":"1","canonical_outcome_receipt":"feedback-outcome",
+            "evidence_refs":[],"occurred_at":"2025-01-03T12:00:00Z"});
+        let original = canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Feedback,
+            Some("feedback-original-key"),
+            body.clone(),
+        );
+        let committed = adapter.invoke(&original);
+        assert_eq!(
+            committed.terminal.committed_effect().state(),
+            CommittedEffectState::Committed,
+            "{committed:?}"
+        );
+        let receipt = committed
+            .terminal
+            .committed_effect()
+            .provider_receipt_sha256()
+            .unwrap()
+            .to_owned();
+        assert!(
+            response_json(&committed)
+                .get("feedback_delivery_capsule")
+                .is_none()
+        );
+        drop(adapter);
+        drop(worker);
+        let worker = surface(&root);
+        let adapter = NcmProviderAdapter::new(worker).unwrap();
+        let retry = canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Feedback,
+            Some("feedback-original-key"),
+            body.clone(),
+        );
+        assert_ne!(retry.operation_id, original.operation_id);
+        let duplicate = adapter.invoke(&retry);
+        let effect = duplicate.terminal.committed_effect();
+        assert_eq!(
+            effect.state(),
+            CommittedEffectState::Duplicate,
+            "{duplicate:?}"
+        );
+        assert_eq!(
+            effect.duplicate_of_operation_id(),
+            Some(original.operation_id.as_str())
+        );
+        assert_eq!(
+            effect.duplicate_of_idempotency_key(),
+            Some("feedback-original-key")
+        );
+        assert_eq!(effect.provider_receipt_sha256(), Some(receipt.as_str()));
+        assert_eq!(duplicate.state_generation, retry.expected_state_generation);
+        let mut changed = body;
+        changed["signal"] = json!("harmful");
+        let changed = adapter.invoke(&canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Feedback,
+            Some("feedback-original-key"),
+            changed,
+        ));
+        assert_eq!(
+            changed.terminal.terminal_code(),
+            TerminalCode::Conflict,
+            "{changed:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_original_receipt_and_trace_are_inspectable_across_restart() {
+        let root = TestRoot::new("canonical-inspection");
+        let exact_scope = scope("canonical-inspection");
+        let text = "The cache key contains compiler version and dependency lock digest.";
+        let mut original_operation = String::new();
+        let mut original_receipt = String::new();
+        let mut stable = String::new();
+        let key = "canonical-inspection-original";
+        for restart in [false, true] {
+            let surface = Arc::new(
+                RustNcmSurface::new(RustNcmConfig {
+                    worker_binary: worker_binary(),
+                    state_root: root.state_root(),
+                    worker_options: WorkerOptions {
+                        test_double: true,
+                        ..WorkerOptions::default()
+                    },
+                })
+                .unwrap(),
+            );
+            let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+            if !restart {
+                let (receipt, generation) = canonical_ready(&adapter, &exact_scope);
+                let request = call(
+                    ProviderOperation::Observe,
+                    &exact_scope,
+                    &receipt,
+                    generation,
+                    Some(key),
+                    canonical_observation(&exact_scope, 1, text),
+                    10_000,
+                );
+                original_operation = request.operation_id.clone();
+                let reply = adapter.invoke(&request);
+                assert_eq!(
+                    reply.terminal.terminal_code(),
+                    TerminalCode::Success,
+                    "{reply:?}"
+                );
+                original_receipt = reply
+                    .terminal
+                    .committed_effect()
+                    .provider_receipt_sha256()
+                    .unwrap()
+                    .to_owned();
+                stable = response_json(&reply)["stable_memory_ref"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Inspection,
+                None,
+                json!({"view":"delivery_receipt","selector":{"idempotency_key":key},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            assert_eq!(reply.state_generation, request.expected_state_generation);
+            assert_eq!(
+                response_json(&reply)["items"][0],
+                json!({"operation_id":original_operation,"idempotency_key":key,"provider_receipt_digest":original_receipt,"stable_memory_ref":stable})
+            );
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Inspection,
+                None,
+                json!({"view":"trace","selector":{"stable_memory_ref":stable},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            let trace = &response_json(&reply)["items"][0];
+            assert_eq!(trace["content"], format!("assistant: {text}"));
+            assert_eq!(
+                trace["content_sha256"],
+                hex_sha256(format!("assistant: {text}").as_bytes())
+            );
+            assert_eq!(
+                trace["original_source"],
+                canonical_observation(&exact_scope, 1, text)["source_identity"]["original_source"]
+            );
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Inspection,
+                None,
+                json!({"view":"source_influence","selector":{"source_key":trace["original_source"]["source"]["source_key"]},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            let influence = &response_json(&reply)["items"][0];
+            let summary = influence["provider_local_effect_summary"]
+                .as_str()
+                .expect("source influence summary is a string");
+            assert!((1..=8192).contains(&summary.len()));
+            assert_eq!(
+                serde_json::from_str::<Value>(summary).unwrap(),
+                json!({"provider_id":"ncm","suppressed":false,"centers_updated":0})
+            );
+            assert_eq!(influence["active"], true);
+            assert_eq!(influence["disposition"], "available");
+            let (receipt, generation) = canonical_ready(&adapter, &exact_scope);
+            let request = call(
+                ProviderOperation::Observe,
+                &exact_scope,
+                &receipt,
+                generation,
+                Some(key),
+                canonical_observation(&exact_scope, 1, text),
+                10_000,
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::Duplicate,
+                "{reply:?}"
+            );
+            assert_eq!(
+                reply
+                    .terminal
+                    .committed_effect()
+                    .duplicate_of_operation_id(),
+                Some(original_operation.as_str())
+            );
+            assert_eq!(
+                reply.terminal.committed_effect().provider_receipt_sha256(),
+                Some(original_receipt.as_str())
+            );
+            drop(adapter);
+            drop(surface);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+    fn canonical_recall_real_model_is_admitted_without_request_rewriting() {
+        exercise_canonical_recall(WorkerOptions::default());
+    }
+
+    #[test]
+    fn explicit_worker_owner_lifecycle_stops_reaps_and_restarts_same_owner() {
+        let root = TestRoot::new("owner-lifecycle");
+        let owner = RustNcmWorkerOwner::new(RustNcmConfig {
+            worker_binary: worker_binary(),
+            state_root: root.state_root(),
+            worker_options: WorkerOptions {
+                test_double: true,
+                ..WorkerOptions::default()
+            },
+        })
+        .unwrap();
+        assert_eq!(owner.worker_pid(), None);
+        owner
+            .start(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let first = owner.worker_pid().unwrap();
+        assert!(
+            owner
+                .request_stop(std::time::Instant::now() + Duration::from_secs(5))
+                .unwrap()
+        );
+        assert_eq!(owner.worker_pid(), None);
+        owner
+            .start(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let second = owner.worker_pid().unwrap();
+        assert_ne!(first, second);
+        owner
+            .kill(std::time::Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(owner.worker_pid(), None);
+        assert!(owner.start(std::time::Instant::now()).is_err());
+        assert_eq!(
+            owner.worker_pid(),
+            None,
+            "expired start must not create a child"
+        );
+    }
+
+    #[test]
+    fn canonical_correction_checks_actual_revision_and_retains_cross_source_history() {
+        use tracedecay_memory_provider_registry::recall_admission::{
+            AdmittedTemporalQuery, decode_recall_outcome,
+        };
+
+        let root = TestRoot::new("canonical-correction-revisions");
+        let exact = scope("canonical-correction-revisions");
+        let old_text = "The cache uses compiler version one.";
+        let new_text = "The cache uses compiler version two.";
+        let transition = "2025-01-04T00:00:00Z";
+        let before_transition = "2025-01-03T00:00:00Z";
+        let evaluation = "2025-02-01T00:00:00Z";
+        let adapter = NcmProviderAdapter::new(surface(&root))
+            .unwrap()
+            .with_admission_authority(Arc::new(FixtureHistoryAuthority(Vec::new())));
+        let mut original = canonical_observation(&exact, 1, old_text);
+        original["source_identity"]["original_source"]["source"]["source_key"] = json!("source/1");
+        let observed = invoke_after_handshake(
+            &adapter,
+            &exact,
+            ProviderOperation::Observe,
+            Some("correction-revision-seed"),
+            original.clone(),
+        );
+        assert_eq!(
+            observed.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{observed:?}"
+        );
+        let old_ref = response_json(&observed)["stable_memory_ref"].clone();
+        let mut replacement = canonical_observation(&exact, 2, new_text);
+        replacement["source_identity"]["original_source"]["source"]["source_key"] =
+            json!("source/2");
+        replacement["source_identity"]["original_source"]["source"]["source_revision"] =
+            json!("cache_policy_r3");
+        replacement["source_identity"]["original_source"]["validity"]["valid_from"] =
+            json!(transition);
+        let source = &original["source_identity"]["original_source"];
+        let correction = json!({"target":{"provider_id":"ncm","registration_revision":1,
+            "original_scope":source["origin_scope"],
+            "delivery_scope":source["origin_scope"]["exact_scope_identity"],
+            "source":source["source"],"reference":{"kind":"stable_memory_ref","reference":old_ref}},
+            "correction_kind":"supersede","replacement":replacement,
+            "expected_target_revision":"cache_policy_r2","reason":"Settled compiler correction",
+            "evidence_refs":["test.compiler.revision-settled"]});
+        // The replacement revision may equal a stale CAS value; only equality
+        // with the actual retained target revision makes the replacement invalid.
+        for expected in ["99", "cache_policy_r3"] {
+            let mut stale = correction.clone();
+            stale["expected_target_revision"] = json!(expected);
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &exact,
+                ProviderOperation::Correction,
+                Some(&format!("correction-stale-{expected}")),
+                stale,
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Conflict,
+                "{reply:?}"
+            );
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::None
+            );
+            assert_eq!(reply.state_generation, observed.state_generation);
+            assert_eq!(
+                canonical_ready(&adapter, &exact).1,
+                observed.state_generation
+            );
+        }
+        let mut same_revision = correction.clone();
+        same_revision["expected_target_revision"] = json!("99");
+        same_revision["replacement"]["source_identity"]["original_source"]["source"]["source_revision"] =
+            json!("cache_policy_r2");
+        let mut wrong_target = correction.clone();
+        wrong_target["target"]["source"]["source_revision"] = json!("invented-target");
+        for (key, body) in [
+            ("correction-same-revision", same_revision),
+            ("correction-wrong-target", wrong_target),
+        ] {
+            let reply = adapter.invoke(&canonical_lifecycle_call(
+                &adapter,
+                &exact,
+                ProviderOperation::Correction,
+                Some(key),
+                body,
+            ));
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::InvalidRequest,
+                "{reply:?}"
+            );
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::None
+            );
+            assert_eq!(
+                canonical_ready(&adapter, &exact).1,
+                observed.state_generation
+            );
+        }
+        let corrected = adapter.invoke(&canonical_lifecycle_call(
+            &adapter,
+            &exact,
+            ProviderOperation::Correction,
+            Some("correction-source-two"),
+            correction,
+        ));
+        assert_eq!(
+            corrected.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{corrected:?}"
+        );
+        assert_eq!(
+            corrected.terminal.committed_effect().state(),
+            CommittedEffectState::Committed
+        );
+        assert_eq!(corrected.state_generation, observed.state_generation + 1);
+        let new_ref = response_json(&corrected)["replacement_ref"].clone();
+        assert_ne!(new_ref, old_ref);
+        drop(adapter);
+
+        let adapter = NcmProviderAdapter::new(surface(&root)).unwrap();
+        for (name, temporal, query, expected_source, expected_ref) in [
+            (
+                "current",
+                AdmittedTemporalQuery::current(evaluation).unwrap(),
+                new_text,
+                replacement["source_identity"]["original_source"].clone(),
+                new_ref.clone(),
+            ),
+            (
+                "as-of",
+                AdmittedTemporalQuery::as_of(evaluation, before_transition).unwrap(),
+                old_text,
+                source.clone(),
+                old_ref.clone(),
+            ),
+            (
+                "interval",
+                AdmittedTemporalQuery::interval(evaluation, before_transition, transition).unwrap(),
+                old_text,
+                source.clone(),
+                old_ref,
+            ),
+        ] {
+            let request = canonical_recall_call(
+                &adapter,
+                &exact,
+                query,
+                temporal,
+                &format!("correction-retained-{name}"),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{name}: {reply:?}"
+            );
+            assert_eq!(reply.state_generation, corrected.state_generation);
+            let outcome = decode_recall_outcome(reply.payload.as_ref().unwrap()).unwrap();
+            assert_eq!(outcome.candidates.len(), 1, "{name}: {outcome:?}");
+            let candidate = &outcome.candidates[0];
+            assert_eq!(
+                candidate.stable_memory_ref.as_deref(),
+                expected_ref.as_str(),
+                "{name}"
+            );
+            assert_eq!(
+                candidate.provenance["original_sources"],
+                json!([expected_source]),
+                "{name}"
+            );
+            let expected_supersession = if name == "current" {
+                (None, None)
+            } else {
+                (Some(transition), new_ref.as_str())
+            };
+            assert_eq!(
+                (
+                    candidate.validity.superseded_at.as_deref(),
+                    candidate.validity.superseded_by.as_deref(),
+                ),
+                expected_supersession,
+                "{name}"
+            );
+            assert_eq!(
+                candidate.content.as_deref(),
+                Some(format!("assistant: {query}").as_str()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_control_retries_keep_original_receipt_and_reject_changed_effects() {
+        let root = TestRoot::new("canonical-control-retries");
+        let exact = scope("canonical-control-retries");
+        let surface = Arc::new(
+            RustNcmSurface::new(RustNcmConfig {
+                worker_binary: worker_binary(),
+                state_root: root.state_root(),
+                worker_options: WorkerOptions {
+                    test_double: true,
+                    ..WorkerOptions::default()
+                },
+            })
+            .unwrap(),
+        );
+        let adapter = NcmProviderAdapter::new(surface).unwrap();
+        let original = canonical_observation(&exact, 1, "The cache uses compiler version one.");
+        let (ready, generation) = canonical_ready(&adapter, &exact);
+        let observed = adapter.invoke(&call(
+            ProviderOperation::Observe,
+            &exact,
+            &ready,
+            generation,
+            Some("retry-seed"),
+            original.clone(),
+            10_000,
+        ));
+        assert_eq!(
+            observed.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{observed:?}"
+        );
+        let stable = response_json(&observed)["stable_memory_ref"].clone();
+        let mut replacement =
+            canonical_observation(&exact, 2, "The cache uses compiler version two.");
+        replacement["source_identity"]["original_source"]["source"]["source_revision"] =
+            json!("cache_policy_r3");
+        replacement["source_identity"]["original_source"]["validity"]["valid_from"] =
+            json!("2025-01-04T00:00:00Z");
+        let source = &original["source_identity"]["original_source"];
+        let correction = json!({"target":{"provider_id":"ncm","registration_revision":1,"original_scope":source["origin_scope"],
+            "delivery_scope":source["origin_scope"]["exact_scope_identity"],"source":source["source"],"reference":{"kind":"stable_memory_ref","reference":stable}},
+            "correction_kind":"replace_content","replacement":replacement,"expected_target_revision":"cache_policy_r2","reason":"Compiler version corrected","evidence_refs":["test.compiler.version"]});
+        let maintenance = json!({"task":"consolidate","maximum_items":64,"maximum_bytes":65536,"maximum_duration_millis":1000,"dry_run":false});
+        let deletion = json!({"forget_source_keys":[source["source"]["source_key"]],"mode":"hard_delete","include_snapshots":true,"retention_lock_policy_revision":1,"verification_query":"cache compiler"});
+        for (operation, key, body) in [
+            (
+                ProviderOperation::Correction,
+                "retry-correction",
+                correction,
+            ),
+            (
+                ProviderOperation::Maintenance,
+                "retry-maintenance",
+                maintenance,
+            ),
+            (
+                ProviderOperation::DeleteBySource,
+                "retry-deletion",
+                deletion,
+            ),
+        ] {
+            let request =
+                canonical_lifecycle_call(&adapter, &exact, operation, Some(key), body.clone());
+            let first = adapter.invoke(&request);
+            assert_eq!(
+                first.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{operation:?}: {first:?}"
+            );
+            if operation == ProviderOperation::DeleteBySource {
+                let deletion = response_json(&first);
+                assert_eq!(
+                    deletion["postcondition"]["verification_state"],
+                    "verified_absent"
+                );
+                assert_eq!(deletion["postcondition"]["matched_effects"], 2);
+                assert_eq!(deletion["postcondition"]["removed_effects"], 2);
+                assert_eq!(deletion["postcondition"]["remaining_influence_count"], 0);
+                assert!(first.state_generation > request.expected_state_generation);
+            }
+            let receipt = first
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256()
+                .unwrap()
+                .to_owned();
+            let retry =
+                canonical_lifecycle_call(&adapter, &exact, operation, Some(key), body.clone());
+            assert_ne!(request.operation_id, retry.operation_id);
+            let duplicate = adapter.invoke(&retry);
+            assert_eq!(
+                duplicate.terminal.committed_effect().state(),
+                CommittedEffectState::Duplicate,
+                "{operation:?}: {duplicate:?}"
+            );
+            assert_eq!(
+                duplicate
+                    .terminal
+                    .committed_effect()
+                    .provider_receipt_sha256(),
+                Some(receipt.as_str())
+            );
+            assert_eq!(duplicate.state_generation, retry.expected_state_generation);
+            let mut changed = body;
+            match operation {
+                ProviderOperation::Correction => changed["reason"] = json!("Different evidence"),
+                ProviderOperation::Maintenance => changed["task"] = json!("decay"),
+                _ => changed["forget_source_keys"] = json!(["different-source-key"]),
+            }
+            let changed = canonical_lifecycle_call(&adapter, &exact, operation, Some(key), changed);
+            let rejected = adapter.invoke(&changed);
+            assert_eq!(
+                rejected.terminal.terminal_code(),
+                TerminalCode::Conflict,
+                "{operation:?}: {rejected:?}"
+            );
+            assert_eq!(rejected.state_generation, changed.expected_state_generation);
+        }
     }
 
     fn exercise_shared_worker_project_surfaces(root: &TestRoot, options: WorkerOptions) {
@@ -1047,6 +2250,290 @@ mod enabled {
                 beta.terminal.terminal_code(),
                 TerminalCode::SuccessZeroResults
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod cancellation {
+        use std::fs::{self, File};
+        use std::io::{Cursor, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, mpsc};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use serde_json::json;
+        use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
+        use tracedecay_memory_ncm_runtime::engine::NcmEngine;
+        use tracedecay_memory_ncm_runtime::wire;
+        use tracedecay_memory_ncm_runtime::worker::{ServeOptions, serve_with_options};
+        use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
+        use tracedecay_memory_provider_api::{
+            CancellationToken, HandshakeRequest, HandshakeRequestParts, MemoryProvider,
+            OperationControl, OwnedProviderId, ProviderOperation,
+        };
+        use tracedecay_memory_provider_ncm::{
+            NCM_PROVIDER_ID, NcmProviderAdapter, RustNcmConfig, RustNcmSurface, StateRoot,
+            WorkerOptions,
+        };
+
+        use super::{
+            TestRoot, all_capabilities, call, handshake, invoke_after_handshake, limits,
+            observe_value, ready_parts, response_json, scope,
+        };
+
+        /// Runs the real engine and worker dispatcher in the supervised test
+        /// process. Only the input boundary is held; replies use the runtime's
+        /// canonical framing and the original request remains unchanged.
+        #[test]
+        #[ignore = "subprocess fixture for adapter cancellation tests"]
+        fn worker_fixture() {
+            // This is only a self-exec harness entry. Broad ignored-test runs
+            // may call it without a launcher; it is never behavioral evidence.
+            let Some(root) = std::env::var_os("TRACEDECAY_NCM_CANCELLATION_FIXTURE_ROOT") else {
+                return;
+            };
+            let root = StateRoot::new(root).unwrap();
+            let engine = Arc::new(NcmEngine::new(
+                root.clone(),
+                Arc::new(HashEncoder::new()),
+                Default::default(),
+            ));
+            let address = fs::read_to_string(root.path().join("control-address")).unwrap();
+            let mut control = TcpStream::connect(address).unwrap();
+            control
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            control
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut input = std::io::stdin().lock();
+            // The launcher reserves fd 3 for worker replies so libtest's own
+            // progress output cannot enter the supervised protocol stream.
+            let mut output = File::options().write(true).open("/dev/fd/3").unwrap();
+            while let Some(request) = wire::read_request(&mut input).unwrap() {
+                let marker = root.path().join("cancel-next-request");
+                if marker.exists() {
+                    fs::remove_file(marker).unwrap();
+                    control
+                        .write_all(&std::process::id().to_be_bytes())
+                        .unwrap();
+                    let mut release = [0];
+                    control.read_exact(&mut release).unwrap();
+                }
+                serve_with_options(
+                    Cursor::new(wire::encode_request(&request).unwrap()),
+                    &mut output,
+                    Arc::clone(&engine),
+                    ServeOptions {
+                        allow_test_delays: true,
+                        encoder_ready: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        fn controlled_surface(root: &TestRoot) -> (Arc<RustNcmSurface>, TcpListener, TcpStream) {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            fs::write(
+                root.0.join("control-address"),
+                listener.local_addr().unwrap().to_string(),
+            )
+            .unwrap();
+            symlink(std::env::current_exe().unwrap(), root.0.join("test-runner")).unwrap();
+            let launcher = root.0.join("controlled-worker");
+            fs::write(
+                &launcher,
+                "#!/bin/sh\n\
+                 test \"$1\" = --state-root || exit 2\n\
+                 export TRACEDECAY_NCM_CANCELLATION_FIXTURE_ROOT=\"$2\"\n\
+                 exec \"$(dirname \"$0\")/test-runner\" --exact \
+                 enabled::cancellation::worker_fixture --ignored --nocapture 3>&1 1>&2\n",
+            )
+            .unwrap();
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+            let surface = Arc::new(
+                RustNcmSurface::new(RustNcmConfig {
+                    worker_binary: launcher,
+                    state_root: root.state_root(),
+                    worker_options: WorkerOptions {
+                        test_double: true,
+                        ..WorkerOptions::default()
+                    },
+                })
+                .unwrap(),
+            );
+            // The child connects before servicing preflight. Proved identity
+            // therefore guarantees a pending connection; fallback construction
+            // alone does not, so assert identity before entering accept.
+            assert!(surface.provider_instance_id().unwrap().is_some());
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            (surface, listener, stream)
+        }
+
+        struct ReleaseOnDrop {
+            cancellation: CancellationToken,
+            stream: TcpStream,
+        }
+
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.cancellation.cancel();
+                let _ = self.stream.write_all(&[1]);
+            }
+        }
+
+        fn cancel_dispatched<T: Send>(
+            root: &TestRoot,
+            surface: &RustNcmSurface,
+            stream: TcpStream,
+            cancellation: CancellationToken,
+            invoke: impl FnOnce() -> T + Send,
+        ) -> T {
+            let pid = surface
+                .worker_pid()
+                .expect("preflight started fixture worker");
+            fs::write(root.0.join("cancel-next-request"), []).unwrap();
+            thread::scope(|threads| {
+                let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+                let task = threads.spawn(move || reply_tx.send(invoke()).unwrap());
+                // Drop runs before the scoped join, including on assertion
+                // failures, so a live fixture is always released and cancelled.
+                let mut guard = ReleaseOnDrop {
+                    cancellation,
+                    stream,
+                };
+                let mut entered_pid = [0; 4];
+                guard
+                    .stream
+                    .read_exact(&mut entered_pid)
+                    .expect("worker must decode the armed request");
+                assert_eq!(u32::from_be_bytes(entered_pid), pid);
+                assert_eq!(surface.worker_pid(), Some(pid));
+
+                let started = Instant::now();
+                guard.cancellation.cancel();
+                let reply = reply_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("cancellation must finish before the long request deadline");
+                task.join().unwrap();
+                assert!(started.elapsed() < Duration::from_secs(1));
+                assert!(
+                    surface.worker_pid().is_none(),
+                    "cancelled worker must be reaped"
+                );
+                assert!(
+                    !Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "retired fixture process must no longer exist"
+                );
+                reply
+            })
+        }
+
+        #[test]
+        fn inflight_handshake_cancellation_reaps_worker_and_recovers() {
+            let root = TestRoot::new("cancel-handshake");
+            let (surface, _listener, stream) = controlled_surface(&root);
+            let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+            let exact_scope = scope("cancel-handshake");
+            let request = HandshakeRequest::new(HandshakeRequestParts {
+                provider_id: OwnedProviderId::new(NCM_PROVIDER_ID).unwrap(),
+                registration_revision: 1,
+                exact_scope: exact_scope.clone(),
+                request_id: "cancel-handshake".to_owned(),
+                required_capabilities: all_capabilities(),
+                host_limits: limits(),
+                control: OperationControl::new(i64::MAX, 10_000, CancellationToken::new()),
+                challenge_nonce: [7; 32],
+            })
+            .unwrap();
+            let reply = cancel_dispatched(
+                &root,
+                &surface,
+                stream,
+                request.control.cancellation(),
+                || adapter.handshake(&request),
+            );
+            assert_eq!(reply.terminal.terminal_code(), TerminalCode::Cancelled);
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::None
+            );
+            assert!(reply.ready_receipt_sha256.is_none());
+            assert!(reply.provider_instance_id.is_none());
+            ready_parts(&handshake(&adapter, &exact_scope));
+            assert!(surface.worker_pid().is_some());
+        }
+
+        #[test]
+        fn inflight_recall_cancellation_reaps_worker_and_retains_observation() {
+            let root = TestRoot::new("cancel-recall");
+            let (surface, _listener, stream) = controlled_surface(&root);
+            let adapter = NcmProviderAdapter::new(surface.clone()).unwrap();
+            let exact_scope = scope("cancel-recall");
+            let observed = invoke_after_handshake(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Observe,
+                Some("cancel-recall-observation"),
+                observe_value(
+                    "cancel-recall-source",
+                    "cancellation command",
+                    "durable outcome",
+                ),
+            );
+            assert_eq!(observed.terminal.terminal_code(), TerminalCode::Success);
+            let (receipt, generation) = ready_parts(&handshake(&adapter, &exact_scope));
+            let request = call(
+                ProviderOperation::Recall,
+                &exact_scope,
+                &receipt,
+                generation,
+                None,
+                json!({"query_text": "cancellation command", "top_k": 5}),
+                10_000,
+            );
+            let reply = cancel_dispatched(
+                &root,
+                &surface,
+                stream,
+                request.control.cancellation(),
+                || adapter.invoke(&request),
+            );
+            assert_eq!(reply.terminal.terminal_code(), TerminalCode::Cancelled);
+            assert_eq!(
+                reply.terminal.committed_effect().state(),
+                CommittedEffectState::None
+            );
+            assert!(reply.payload.is_none());
+            let recalled = invoke_after_handshake(
+                &adapter,
+                &exact_scope,
+                ProviderOperation::Recall,
+                None,
+                json!({"query_text": "cancellation command", "top_k": 5}),
+            );
+            assert_eq!(recalled.terminal.terminal_code(), TerminalCode::Success);
+            let value = response_json(&recalled);
+            let candidates = value["Candidates"]["candidates"].as_array().unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0]["value_text"], "durable outcome");
+            assert!(surface.worker_pid().is_some());
         }
     }
 

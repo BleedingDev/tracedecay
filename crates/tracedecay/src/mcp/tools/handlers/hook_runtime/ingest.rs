@@ -65,20 +65,38 @@ fn host_admission_facade<'a>(
     authorities: SessionAuthorities<'a>,
 ) -> Result<HostAdmissionFacade<'a>> {
     let authority = match scope {
-        HostAdmissionScope::Project => match (authorities.project, authorities.profile_identity) {
-            (Some(registered), Some(identity)) => {
-                let project_id = project_observation_id(
-                    cg.ok_or_else(|| config_error("project admission requires a project"))?,
-                )?;
-                HostAdmissionAuthorities::for_project(
-                    identity.brain_id().clone(),
-                    identity.profile_id().clone(),
-                    project_id,
-                    registered,
-                )
+        HostAdmissionScope::Project => {
+            match (authorities.project, authorities.profile_identity) {
+                (Some(registered), Some(identity)) => {
+                    let cg =
+                        cg.ok_or_else(|| config_error("project admission requires a project"))?;
+                    let project_id = project_observation_id(cg)?;
+                    let provenance = tracedecay_runtime_core::storage::read_repository_identity_marker(cg.project_root())
+                    .ok().flatten().and_then(|marker| {
+                        tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext::from_authoritative_project_marker(
+                            cg.project_root(), &project_id, &marker,
+                        )
+                    });
+                    #[cfg(feature = "memory-provider-host")]
+                let provenance = provenance.map(|context| context.with_original_provenance_resolver(std::sync::Arc::new(
+                    crate::daemon::retained_owner::provider_history::HookOriginReaderV1::new(
+                        cg.hook_store_layout().data_root.clone(), identity.brain_id().clone(), identity.profile_id().clone(),
+                    ),
+                )));
+                    let authority = HostAdmissionAuthorities::for_project(
+                        identity.brain_id().clone(),
+                        identity.profile_id().clone(),
+                        project_id,
+                        registered,
+                    );
+                    match provenance {
+                        Some(context) => authority.with_repository_provenance(context),
+                        None => authority,
+                    }
+                }
+                (Some(_), None) | (None, _) => HostAdmissionAuthorities::default(),
             }
-            (Some(_), None) | (None, _) => HostAdmissionAuthorities::default(),
-        },
+        }
         HostAdmissionScope::Profile => match (authorities.user, authorities.profile_identity) {
             (Some(registered), Some(identity)) => HostAdmissionAuthorities::for_profile(
                 identity.brain_id().clone(),

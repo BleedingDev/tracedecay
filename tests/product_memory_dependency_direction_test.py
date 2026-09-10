@@ -33,6 +33,9 @@ POLICY = REPO / "product/architecture/memory-dependency-policy.json"
 REGISTRY = "tracedecay-memory-provider-registry"
 CONTRACTS = "tracedecay-contracts"
 CONTRACTS_RULE = "application-contract-crate-capability-closure"
+NCM = "tracedecay-memory-provider-ncm"
+RUNTIME = "tracedecay-memory-ncm-runtime"
+API = "tracedecay-memory-provider-api"
 
 # Every concrete capability family the composition registry must never reach,
 # named exactly rather than matched by a glob. Each one is injected on its own
@@ -203,6 +206,7 @@ def valid_metadata() -> dict[str, Any]:
             package_of(
                 "tracedecay-memory-provider-ncm",
                 [
+                    dependency("chrono", features=["std"], uses_default_features=False),
                     dependency("serde_json"),
                     dependency("sha2"),
                     dependency("tracedecay-memory-provider-api"),
@@ -213,6 +217,7 @@ def valid_metadata() -> dict[str, Any]:
                         optional=True,
                     ),
                     dependency("tracedecay-memory-conformance", kind="dev"),
+                    dependency(REGISTRY, kind="dev"),
                 ],
             ),
             package_of(
@@ -236,6 +241,7 @@ def valid_metadata() -> dict[str, Any]:
                     dependency("serde_json"),
                     dependency("sha2"),
                     dependency("tracedecay-memory-ncm-core"),
+                    dependency(API),
                     dependency("tempfile", kind="dev"),
                 ],
             ),
@@ -319,8 +325,11 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
             destination = root / "crates" / REGISTRY / "src"
             destination.parent.mkdir(parents=True)
             shutil.copytree(REPO / "crates" / REGISTRY / "src", destination)
-            for contracted in self.policy["source_contracts"]:
-                name = contracted["package"]
+            for name in {
+                contracted["package"]
+                for contracted in self.policy["source_contracts"]
+                + self.policy.get("edge_source_contracts", [])
+            }:
                 if name != REGISTRY:
                     shutil.copytree(
                         REPO / "crates" / name / "src", root / "crates" / name / "src"
@@ -348,6 +357,24 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_valid_product_graph_passes(self) -> None:
         self.assertEqual(CHECKER.check_policy(REPO, self.policy, valid_metadata()), [])
+
+    def test_ncm_registry_dev_edge_requires_both_exact_dev_allowances(self) -> None:
+        for kind in ("package_contracts", "rules"):
+            with self.subTest(policy_kind=kind):
+                policy = copy.deepcopy(self.policy)
+                for row in policy[kind]:
+                    if row.get("package") == NCM or row.get("id") == "ncm-adapter-cannot-reach-tracedecay-internals":
+                        row["allowed_dev_dependencies"].remove(REGISTRY)
+                errors = CHECKER.check_policy(REPO, policy, valid_metadata())
+                self.assertTrue(any(f"{NCM} -> {REGISTRY}" in error for error in errors), errors)
+
+    def test_ncm_registry_dev_allowance_cannot_authorize_production_edges(self) -> None:
+        for kind in (None, "build"):
+            with self.subTest(kind=kind):
+                metadata = valid_metadata()
+                find(metadata, NCM)["dependencies"].append(dependency(REGISTRY, kind=kind))
+                errors = CHECKER.check_policy(REPO, self.policy, metadata)
+                self.assertTrue(any(f"{NCM} -> {REGISTRY}" in error for error in errors), errors)
 
     def test_ncm_store_edge_fails_closed(self) -> None:
         metadata = valid_metadata()
@@ -600,6 +627,37 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
             errors,
         )
 
+    def test_edge_contract_cannot_replace_a_mandatory_full_contract(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        registry = next(row for row in policy["source_contracts"] if row["package"] == REGISTRY)
+        policy["source_contracts"].remove(registry)
+        policy.setdefault("edge_source_contracts", []).append({
+            "package": REGISTRY,
+            "dependency": CONTRACTS,
+            "allowed_imports": registry["allowed_imports"]["tracedecay_contracts"],
+        })
+        metadata = valid_metadata()
+        find(metadata, CONTRACTS)["dependencies"].append(dependency("gix", optional=True))
+        errors = CHECKER.check_policy(REPO, policy, metadata)
+        for target in (CONTRACTS, "tokio"):
+            self.assertTrue(any(f"{REGISTRY} allows production dependency {target} but declares no source contract" in error for error in errors), errors)
+
+    def test_additional_edge_contract_preserves_executor_and_forbidden_symbol_floors(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        registry = next(row for row in policy["source_contracts"] if row["package"] == REGISTRY)
+        policy.setdefault("edge_source_contracts", []).append({
+            "package": REGISTRY,
+            "dependency": CONTRACTS,
+            "allowed_imports": registry["allowed_imports"]["tracedecay_contracts"],
+        })
+        for snippet, diagnostic in (
+            ("fn probe() { let _ = tokio::spawn(async {}); }", "[executor-site-not-reviewed]"),
+            ("fn probe() { let _ = rusqlite::Connection::open_in_memory(); }", "forbidden source symbol"),
+        ):
+            with self.subTest(snippet=snippet):
+                errors = self.check_with_source(self.append_source(snippet), policy)
+                self.assertTrue(any(diagnostic in error for error in errors), errors)
+
     def test_registry_cannot_import_the_unified_native_git_reader(self) -> None:
         """Reject a hypothetical reader export, including one enabled by unification.
 
@@ -824,6 +882,101 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
                 repo, policy, valid_metadata(), source_repo=REPO
             )
             self.assertTrue(any("unused dependency exception" in error for error in errors))
+
+
+class EdgeSourceContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.source = self.root / "crates" / RUNTIME / "src" / "lib.rs"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_text("use tracedecay_memory_provider_api::RecordedValidity;\n", encoding="utf-8")
+        self.edge = {
+            "package": RUNTIME,
+            "dependency": API,
+            "allowed_imports": ["tracedecay_memory_provider_api::RecordedValidity"],
+        }
+        self.policy = {"schema_version": 1, "edge_source_contracts": [self.edge]}
+        self.metadata = {
+            "packages": [
+                {**package(RUNTIME, [API]), "id": RUNTIME},
+                {**package(API, []), "id": API},
+            ],
+            "workspace_members": [RUNTIME, API],
+        }
+
+    def check(self) -> list[str]:
+        return CHECKER.check_policy(self.root, self.policy, self.metadata)
+
+    def test_runtime_can_own_filesystem_process_and_database_beside_numeric_import(self) -> None:
+        self.source.write_text(
+            self.source.read_text(encoding="utf-8")
+            + 'fn worker() { let _ = std::fs::read("x"); '
+            + 'let _ = std::process::Command::new("worker"); '
+            + 'let _ = rusqlite::Connection::open_in_memory(); }\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(self.check(), [])
+
+    def test_unlisted_host_authority_and_glob_imports_are_rejected(self) -> None:
+        for snippet in (
+            "use tracedecay_memory_provider_api::{RecordedValidity, SourceIdentity};",
+            "fn worker() { let _ = tracedecay_memory_provider_api::HostAuthority::new(); }",
+            "use tracedecay_memory_provider_api::*;",
+        ):
+            with self.subTest(snippet=snippet):
+                self.source.write_text(snippet, encoding="utf-8")
+                self.assertIn("[source-import-not-allowed]", "\n".join(self.check()))
+
+    def test_stale_numeric_allowance_is_rejected(self) -> None:
+        self.edge["allowed_imports"].append("tracedecay_memory_provider_api::TemporalEligibility")
+        self.assertIn("stale source import allowance", "\n".join(self.check()))
+
+    def test_contract_requires_a_declared_normal_edge(self) -> None:
+        for dependencies in ([], [dependency(API, kind="dev")], [dependency(API, kind="build")]):
+            with self.subTest(dependencies=dependencies):
+                find(self.metadata, RUNTIME)["dependencies"] = dependencies
+                self.assertIn("requires a declared normal dependency edge", "\n".join(self.check()))
+
+    def test_target_specific_renamed_normal_edge_uses_its_declared_root(self) -> None:
+        find(self.metadata, RUNTIME)["dependencies"] = [
+            {**dependency(API), "rename": "numeric_api", "target": "cfg(unix)"}
+        ]
+        self.edge["allowed_imports"] = ["numeric_api::RecordedValidity"]
+        self.source.write_text("use numeric_api::RecordedValidity;", encoding="utf-8")
+        self.assertEqual(self.check(), [])
+
+    def test_dependency_must_be_a_workspace_package(self) -> None:
+        self.metadata["workspace_members"].remove(API)
+        self.assertIn("must name an existing package and workspace dependency", "\n".join(self.check()))
+
+    def test_invalid_import_allowances_fail_closed(self) -> None:
+        for paths in (
+            None,
+            [],
+            ["tracedecay_memory_provider_api::*"],
+            ["other_api::RecordedValidity"],
+            ["tracedecay_memory_provider_api::RecordedValidity"] * 2,
+            [{}],
+        ):
+            with self.subTest(paths=paths):
+                self.edge["allowed_imports"] = paths
+                self.assertIn("distinct exact item paths rooted at its declared dependency", "\n".join(self.check()))
+
+    def test_duplicate_edge_contract_is_rejected(self) -> None:
+        self.policy["edge_source_contracts"].append(copy.deepcopy(self.edge))
+        self.assertIn("duplicate edge source contract", "\n".join(self.check()))
+
+    def test_malformed_edge_contracts_are_rejected(self) -> None:
+        for rows, diagnostic in (
+            ({}, "policy edge_source_contracts must be an array"),
+            ([None], "edge source contract must be an object"),
+            ([{"package": RUNTIME}], "package and dependency must name exact packages"),
+        ):
+            with self.subTest(rows=rows):
+                self.policy["edge_source_contracts"] = rows
+                self.assertIn(diagnostic, "\n".join(self.check()))
 
 
 if __name__ == "__main__":

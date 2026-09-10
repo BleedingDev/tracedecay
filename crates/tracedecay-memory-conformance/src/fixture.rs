@@ -290,6 +290,8 @@ pub enum GenerationExpectation {
     Unchanged,
     /// Require an exact positive or zero increment.
     IncreasedBy(u64),
+    /// Require a durable mutation without prescribing provider-local write counts.
+    Increased,
 }
 
 /// Expected provider payload shape without interpreting provider-specific bytes.

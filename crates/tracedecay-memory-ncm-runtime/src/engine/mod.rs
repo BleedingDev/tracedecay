@@ -7,6 +7,8 @@
 
 mod runtime;
 
+pub(crate) use runtime::common_maintenance::portable_event as portable_common_maintenance_event;
+
 use crate::ports::{Deadline, StateRoot, TextEncoder};
 use crate::store::{CommitSeq, NamespaceStore};
 use serde::{Deserialize, Serialize};
@@ -93,6 +95,8 @@ pub enum Outcome {
 pub enum RejectReason {
     /// The same idempotency key was previously bound to another payload digest.
     IdempotencyConflict,
+    /// A durable source revocation rejects a new effect before commit.
+    SourceRevoked,
     /// The request was malformed or outside a declared input bound.
     InvalidRequest(String),
     /// A referenced record does not exist.
@@ -172,6 +176,10 @@ impl ObserveRequest {
             intensity: f32,
             provenance: &'a Value,
         }
+        let mut effect_provenance = self.provenance.clone();
+        if let Some(object) = effect_provenance.as_object_mut() {
+            object.remove("delivery_capsule");
+        }
         runtime::canonical_digest(&Payload {
             source: &self.source,
             key_text: &self.key_text,
@@ -179,7 +187,7 @@ impl ObserveRequest {
             affect: &self.affect,
             surprise: self.surprise,
             intensity: self.intensity,
-            provenance: &self.provenance,
+            provenance: &effect_provenance,
         })
     }
 }
@@ -282,6 +290,9 @@ pub(crate) struct DurableReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DurableOperation {
+    CommonControl {
+        operations: Vec<DurableOperation>,
+    },
     Observe {
         record_id: RecordId,
     },

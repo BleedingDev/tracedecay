@@ -2,6 +2,7 @@
 #![doc = "Process-level acceptance tests for the bounded NCM worker transport."]
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -439,6 +440,160 @@ fn observe_killed_after_commit_reconciles_without_second_record() {
     assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["tick"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn common_replay_killed_after_commit_reconciles_the_nested_delivery_key() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(18);
+    let page_key = "18".repeat(32);
+    let delivery_key = "19".repeat(32);
+    let source = "20".repeat(32);
+    let mut observation = ObserveRequest {
+        idempotency_key: delivery_key.clone(),
+        payload_sha256: String::new(),
+        source: SourceId(source.clone()),
+        key_text: "common replay retained key".to_owned(),
+        value_text: "common replay retained value".to_owned(),
+        affect: None,
+        surprise: 0.4,
+        intensity: 1.0,
+        provenance: json!({"common_capsule":{"version":1,"bytes":[],"sha256":"21".repeat(32)},"selection":{"observation_identity":"22".repeat(32),"revision_digest":"23".repeat(32)}}),
+        deadline: Deadline {
+            remaining_ms: u64::MAX,
+        },
+    };
+    observation.payload_sha256 = observation.canonical_payload_sha256().unwrap();
+    let observation = json!({"idempotency_key":observation.idempotency_key,"payload_sha256":observation.payload_sha256,"source":observation.source.0,"key_text":observation.key_text,"value_text":observation.value_text,"affect":observation.affect,"surprise":observation.surprise,"intensity":observation.intensity,"provenance":observation.provenance});
+    let request = Request::new(
+        180,
+        0,
+        Operation::Replay,
+        &ns,
+        json!({
+            "common_portability":{"action":"replay","idempotency_key":page_key,"expected_generation":0,"first_source_sequence":1,"last_source_sequence":1,"expected_previous_acknowledged_sequence":0,
+                "items":[{"source_sequence":1,"receipt_digest":"24".repeat(32),"delivery_key":delivery_key,"source":source,"admitted":true,"blocked":false,"observation":observation}]},
+            "test_sleep_after_commit_ms":CALL_DEADLINE.as_millis() as u64
+        }),
+    );
+    assert_eq!(
+        client.call(request, CALL_DEADLINE),
+        Err(ClientError::EffectUnknown { op_id: 180 })
+    );
+    assert_eq!(client.pid(), None);
+    let reconciled = client
+        .reconcile_unknown(&page_key)
+        .expect("nested replay key is retained");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    let result = reconciled.payload.unwrap();
+    assert_eq!(
+        result["replayed"], true,
+        "first page committed before its reply was interrupted"
+    );
+    assert_eq!(result["applied_observations"], 1);
+    assert_eq!(result["acknowledged_sequence"], 1);
+    let inspected = client
+        .call(
+            Request::new(181, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(inspected.payload.as_ref().unwrap()["records"], 1);
+    assert_eq!(inspected.payload.as_ref().unwrap()["tick"], 1);
+    assert_eq!(
+        client.reconcile_unknown(&page_key),
+        Err(ClientError::UnknownIdempotencyKey)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
+    let source_root = TempDir::new().expect("source root");
+    let source = client(&source_root);
+    let ns = namespace(19);
+    let observed = source
+        .call(
+            Request::new(
+                190,
+                0,
+                Operation::Observe,
+                &ns,
+                observe_payload(
+                    "common-restore",
+                    "restore durable key",
+                    "restore durable value",
+                ),
+            ),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(observed.outcome, Outcome::Success);
+    let exported = source
+        .call(
+            Request::new(191, 0, Operation::SnapshotExport, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(exported.outcome, Outcome::Success);
+    let bytes: Vec<u8> =
+        serde_json::from_value(exported.payload.unwrap()["bytes"].clone()).unwrap();
+    assert!(
+        bytes.len() > MAX_REQUEST_BYTES,
+        "restore must use file transport"
+    );
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let snapshot_id = format!("ncm-snapshot:{digest}");
+    let target_root = TempDir::new().expect("destination root");
+    let target = client(&target_root);
+    let key = "25".repeat(32);
+    let request = Request::new(
+        192,
+        0,
+        Operation::SnapshotRestore,
+        &ns,
+        json!({
+            "common_portability":{"action":"snapshot_restore","idempotency_key":key,"expected_generation":0,"bytes":bytes,"blocked_sources":[],"snapshot_id":snapshot_id,"observation_sequence":1},
+            "test_sleep_after_commit_ms":CALL_DEADLINE.as_millis() as u64
+        }),
+    );
+    assert_eq!(
+        target.call(request, CALL_DEADLINE),
+        Err(ClientError::EffectUnknown { op_id: 192 })
+    );
+    assert_eq!(target.pid(), None);
+    let transport = target_root
+        .path()
+        .join("namespaces")
+        .join(&ns)
+        .join("snapshots");
+    assert_eq!(
+        fs::read_dir(&transport).unwrap().count(),
+        0,
+        "interrupted transport file is consumed"
+    );
+    let reconciled = target
+        .reconcile_unknown(&key)
+        .expect("original inline bytes survive transport cleanup");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    assert_eq!(reconciled.payload.as_ref().unwrap()["replayed"], true);
+    assert_eq!(fs::read_dir(&transport).unwrap().count(), 0);
+    let inspected = target
+        .call(
+            Request::new(193, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    assert_eq!(inspected.payload.as_ref().unwrap()["records"], 1);
+    assert_eq!(
+        target.reconcile_unknown(&key),
+        Err(ClientError::UnknownIdempotencyKey)
+    );
 }
 
 #[test]

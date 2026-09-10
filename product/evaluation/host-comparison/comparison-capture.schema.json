@@ -1,0 +1,1050 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tracedecay.host-comparison.capture.v1",
+  "title": "Trusted host fixture case capture; serialization supplies no host authority",
+  "type": "object",
+  "required": [
+    "case_trial_id",
+    "status"
+  ],
+  "properties": {
+    "case_trial_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "unexecuted"
+      ]
+    },
+    "mode": {
+      "enum": [
+        "controlled_preparation",
+        "production_host"
+      ]
+    },
+    "consumed_case": {
+      "type": "object"
+    },
+    "budgets": {
+      "type": "object"
+    },
+    "selected_provider": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "projection_sha256": {
+      "type": "string"
+    },
+    "canonical_start_sha256": {
+      "type": "string"
+    },
+    "observer_enabled": {
+      "const": false
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "input",
+          "status",
+          "terminal",
+          "provider_contacted",
+          "selected_provider",
+          "phase",
+          "timing",
+          "delivery"
+        ],
+        "properties": {
+          "input": {
+            "type": "object",
+            "required": [
+              "action_id",
+              "step",
+              "source",
+              "query"
+            ],
+            "properties": {
+              "action_id": {
+                "type": "string"
+              },
+              "step": {
+                "type": "object"
+              },
+              "source": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "query": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            }
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "censored",
+              "unexecuted"
+            ]
+          },
+          "terminal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_contacted": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "selected_provider": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "timing": {
+            "type": "object"
+          },
+          "delivery": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/$defs/rendered_text_v1"
+              },
+              {
+                "$ref": "#/$defs/tool_result_v1"
+              }
+            ]
+          },
+          "resources": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "control_evidence": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "mode",
+          "consumed_case",
+          "budgets",
+          "selected_provider",
+          "projection_sha256",
+          "canonical_start_sha256",
+          "observer_enabled",
+          "actions"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "rendered_text_v1": {
+      "type": "object",
+      "required": [
+        "final_text",
+        "final_sha256",
+        "tokenizer",
+        "final_tokens",
+        "canonical_tokens",
+        "advisory_tokens",
+        "candidate_body_tokens",
+        "sections",
+        "candidates"
+      ],
+      "properties": {
+        "final_text": {
+          "type": "string"
+        },
+        "final_sha256": {
+          "type": "string"
+        },
+        "tokenizer": {
+          "const": {
+            "identity": "tiktoken.o200k_base",
+            "revision": "tiktoken-rs-0.12"
+          }
+        },
+        "final_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "canonical_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "advisory_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "candidate_body_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "kind",
+              "text"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "canonical",
+                  "advisory",
+                  "framing"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "candidate_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_refs": {
+                "type": "array"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "kind": {
+                      "const": "framing"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "pattern": "^[\\t\\n\\f\\r ]*$"
+                    },
+                    "candidate_ref": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "candidate_ref",
+              "sources",
+              "returned",
+              "admitted",
+              "selected",
+              "packed",
+              "delivered",
+              "withholding_reason"
+            ],
+            "properties": {
+              "candidate_ref": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "content_sha256": {
+                "type": "string"
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "source_id",
+                    "revision",
+                    "lineage_id",
+                    "origin",
+                    "content_sha256"
+                  ],
+                  "properties": {
+                    "source_id": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "lineage_id": {
+                      "type": "string"
+                    },
+                    "origin": {
+                      "type": "object"
+                    },
+                    "content_sha256": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "withholding_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "returned": {
+                "type": "boolean"
+              },
+              "admitted": {
+                "type": "boolean"
+              },
+              "selected": {
+                "type": "boolean"
+              },
+              "packed": {
+                "type": "boolean"
+              },
+              "delivered": {
+                "type": "boolean"
+              },
+              "scope_match": {
+                "type": "boolean"
+              },
+              "from_corrupt_state": {
+                "type": "boolean"
+              },
+              "provenance": {
+                "enum": [
+                  "available",
+                  "redacted",
+                  "unavailable",
+                  "missing"
+                ]
+              }
+            }
+          }
+        },
+        "representation": {
+          "const": "rendered_text_v1"
+        }
+      },
+      "not": {
+        "required": [
+          "tool_result"
+        ]
+      }
+    },
+    "tool_result_v1": {
+      "type": "object",
+      "required": [
+        "representation",
+        "tokenizer",
+        "raw_carrier",
+        "projection",
+        "text_blocks",
+        "canonical_spans",
+        "canonical_sha256",
+        "advisory_spans",
+        "advisory_blocks",
+        "advisory_review_sha256",
+        "final_tokens",
+        "canonical_tokens",
+        "advisory_tokens",
+        "candidate_body_tokens",
+        "candidates",
+        "retained_trace",
+        "model_input_tokens",
+        "payload_syntax_spans"
+      ],
+      "properties": {
+        "representation": {
+          "const": "tool_result_v1"
+        },
+        "tokenizer": {
+          "const": {
+            "identity": "tiktoken.o200k_base",
+            "revision": "tiktoken-rs-0.12"
+          }
+        },
+        "raw_carrier": {
+          "type": "object",
+          "required": [
+            "artifact_path",
+            "utf8",
+            "byte_length",
+            "sha256"
+          ],
+          "properties": {
+            "artifact_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "utf8": {
+              "type": "string"
+            },
+            "byte_length": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        "projection": {
+          "type": "object",
+          "required": [
+            "result",
+            "text_blocks",
+            "payload_content_index",
+            "host_evidence",
+            "advisory"
+          ],
+          "properties": {
+            "result": {
+              "type": "object"
+            },
+            "text_blocks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "content_index",
+                  "text"
+                ],
+                "properties": {
+                  "content_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "payload_content_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "host_evidence": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind",
+                  "pointer",
+                  "value",
+                  "authority",
+                  "section"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "json_member"
+                  },
+                  "pointer": {
+                    "type": "string"
+                  },
+                  "value": {},
+                  "authority": {
+                    "type": "string"
+                  },
+                  "section": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "advisory": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "pointer",
+                    "value"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "json_member"
+                    },
+                    "pointer": {
+                      "type": "string"
+                    },
+                    "value": {}
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "text_blocks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "content_index",
+              "text",
+              "sha256",
+              "utf8_bytes",
+              "tokens"
+            ],
+            "properties": {
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "utf8_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tokens": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "canonical_spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "pointer",
+              "start",
+              "end",
+              "sha256",
+              "value",
+              "content_index",
+              "text",
+              "source_refs",
+              "authority",
+              "section"
+            ],
+            "properties": {
+              "pointer": {
+                "type": "string"
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "value": {},
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string"
+              },
+              "source_refs": {
+                "type": "array"
+              },
+              "authority": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "canonical_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "advisory_spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "pointer",
+              "start",
+              "end",
+              "sha256",
+              "value",
+              "content_index",
+              "attribution"
+            ],
+            "properties": {
+              "pointer": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "value": {},
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "attribution": {
+                "enum": [
+                  "observed_advisory_member",
+                  "unclassified_text"
+                ]
+              }
+            }
+          }
+        },
+        "advisory_blocks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "content_index",
+              "text",
+              "sha256",
+              "tokens"
+            ],
+            "properties": {
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "tokens": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "advisory_review_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "final_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 128000
+        },
+        "canonical_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "advisory_tokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "candidate_body_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "candidate_ref",
+              "content",
+              "content_sha256",
+              "sources",
+              "presentation_span",
+              "presentation_sha256",
+              "final_join"
+            ],
+            "properties": {
+              "candidate_ref": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "content_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "source_id",
+                    "revision",
+                    "lineage_id",
+                    "origin",
+                    "content_sha256"
+                  ],
+                  "properties": {
+                    "source_id": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "lineage_id": {
+                      "type": "string"
+                    },
+                    "origin": {
+                      "type": "object"
+                    },
+                    "content_sha256": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "presentation_span": {
+                "type": "object",
+                "required": [
+                  "pointer",
+                  "start",
+                  "end",
+                  "sha256",
+                  "value"
+                ],
+                "properties": {
+                  "pointer": {
+                    "type": "string"
+                  },
+                  "start": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "end": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "value": {}
+                }
+              },
+              "presentation_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "final_join": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "required": [
+                      "status",
+                      "reason"
+                    ],
+                    "properties": {
+                      "status": {
+                        "const": "unresolved"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "required": [
+                      "status",
+                      "trace_ref",
+                      "item_ref",
+                      "provider_rank",
+                      "retained_candidate_id",
+                      "compiled_stage"
+                    ],
+                    "properties": {
+                      "status": {
+                        "const": "bound"
+                      },
+                      "trace_ref": {
+                        "type": "string",
+                        "pattern": "^recall-trace-v1:[0-9a-f]{64}:[0-9a-f]{64}$"
+                      },
+                      "item_ref": {
+                        "type": "string",
+                        "pattern": "^recall-item-v1:(0|[1-9][0-9]*)$"
+                      },
+                      "provider_rank": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "retained_candidate_id": {
+                        "type": "string"
+                      },
+                      "compiled_stage": {
+                        "const": "injected"
+                      }
+                    }
+                  }
+                ]
+              },
+              "scope_match": {
+                "type": "boolean"
+              },
+              "provenance": {
+                "enum": [
+                  "available",
+                  "redacted",
+                  "unavailable",
+                  "missing"
+                ]
+              },
+              "from_corrupt_state": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "retained_trace": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "status",
+                "reason"
+              ],
+              "properties": {
+                "status": {
+                  "const": "unavailable"
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "status",
+                "artifact",
+                "correlation",
+                "provider_id",
+                "registration_revision",
+                "delivery_scope",
+                "store_evidence",
+                "daemon_identity"
+              ],
+              "properties": {
+                "status": {
+                  "const": "observed"
+                },
+                "artifact": {
+                  "type": "object",
+                  "required": [
+                    "artifact_path",
+                    "utf8",
+                    "byte_length",
+                    "sha256"
+                  ],
+                  "properties": {
+                    "artifact_path": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "utf8": {
+                      "type": "string"
+                    },
+                    "byte_length": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  }
+                },
+                "correlation": {
+                  "type": "object",
+                  "required": [
+                    "trace_ref",
+                    "request_id"
+                  ],
+                  "properties": {
+                    "trace_ref": {
+                      "type": "string"
+                    },
+                    "request_id": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "provider_id": {
+                  "type": "string"
+                },
+                "registration_revision": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "delivery_scope": {
+                  "type": "object"
+                },
+                "store_evidence": {
+                  "type": "object"
+                },
+                "daemon_identity": {
+                  "type": "object"
+                }
+              }
+            }
+          ]
+        },
+        "model_input_tokens": {
+          "type": "object",
+          "required": [
+            "status",
+            "reason"
+          ],
+          "properties": {
+            "status": {
+              "const": "unmeasured"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "payload_syntax_spans": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "content_index",
+              "start",
+              "end",
+              "text",
+              "sha256"
+            ],
+            "properties": {
+              "content_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "end": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "text": {
+                "type": "string",
+                "pattern": "^[ \\t\\r\\n{},]*$"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "final_text"
+            ]
+          },
+          {
+            "required": [
+              "final_sha256"
+            ]
+          },
+          {
+            "required": [
+              "sections"
+            ]
+          },
+          {
+            "required": [
+              "tool_result"
+            ]
+          }
+        ]
+      },
+      "description": "Original CLI UTF-8 carrier plus every decoded text block. Byte spans are independently parsed JSON member/value boundaries and semantically checked against the observed production projection. Full token cost is the sum of independently recounted text blocks, capped at 128000. Advisory cost conservatively includes the entire advisory_provider_memory member and every other text block, concatenating spans only within each original block and summing its independent counts, capped at 1024. No complete model-input token count is claimed. Every candidate annotation must bind both its full original presentation SHA-256 and the length-prefixed ordered advisory-block review digest. Unknown final joins and unreviewed notices remain unresolved. Other text blocks are unclassified_text, conservatively charged without asserting provider authorship. Original payload delimiter gaps are retained and remain total-charged. Annotation presentation_review explicitly covers candidate_metadata, shared_text, source_attribution, and prohibited_claims; digest equality alone is insufficient."
+    }
+  }
+}

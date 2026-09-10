@@ -112,6 +112,8 @@ use tracedecay_store::{
     ObservationAdmissionPort, ObservationReplayRequest, ObservationStoreError, StoredObservation,
 };
 
+pub(crate) mod control_dispatch;
+
 /// File name of the project-owned observation journal inside the canonical
 /// store layout. Placement only; never an identity input.
 #[cfg(test)]
@@ -350,6 +352,8 @@ impl ObservationJourneyPolicyV1 {
 /// Every way the mounted journey can refuse, typed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ObservationJourneyError {
+    #[error("host history authorization failed: {0}")]
+    History(#[from] super::provider_history::ProviderHistoryErrorV1),
     /// Composition is disabled, so there is no registry to mount against.
     #[error("provider composition is disabled, so no observation journey can mount")]
     CompositionDisabled,
@@ -872,7 +876,7 @@ pub(super) fn provider_agent_session_id(
 /// `scope_digest` is already an algorithm-tagged `sha256:` digest, which is
 /// exactly the shape `OwnedExactScope` requires of `resolved_scope_digest`; it
 /// is passed through untouched rather than re-tagged or re-hashed.
-fn exact_scope_for_session(
+pub(super) fn exact_scope_for_session(
     profile_id: &UserProfileId,
     scope: &ResolvedScope,
     canonical_session_id: &str,
@@ -988,6 +992,8 @@ struct CanonicalObservationAdmissionAdapterV1 {
 /// ingress at the offending record with that record's own identity attached.
 #[derive(Debug, thiserror::Error)]
 enum AdmissionAdapterError {
+    #[error("host history authorization failed: {0}")]
+    History(#[source] super::provider_history::ProviderHistoryErrorV1),
     #[error(
         "canonical observation {source_event_id} is scoped outside the mounted project, so it \
          cannot be admitted under this journey's exact scope"
@@ -1078,6 +1084,17 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
         record: &SourceRecordV1<Self::Record>,
         control: &Self::Control,
     ) -> Result<AdmissionDecisionV1, Self::Error> {
+        self.decide_with_history(record, control, None)
+    }
+}
+
+impl CanonicalObservationAdmissionAdapterV1 {
+    fn decide_with_history(
+        &self,
+        record: &SourceRecordV1<StoredObservation>,
+        control: &ReplayIngestControlV1,
+        history: Option<&tracedecay_memory_provider_registry::HistoryGrant>,
+    ) -> Result<AdmissionDecisionV1, AdmissionAdapterError> {
         let context = &self.context;
         let stored = &record.record;
         let observation = stored.observation();
@@ -1093,15 +1110,18 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
         if !scoped_here {
             return Err(AdmissionAdapterError::ScopeMismatch { source_event_id });
         }
-        let exact_scope = exact_scope_for_session(
-            &context.profile_id,
-            &context.scope,
-            observation.source().session_id().as_str(),
-        )
-        .map_err(|source| AdmissionAdapterError::ExactScope {
-            source_event_id: source_event_id.clone(),
-            source,
-        })?;
+        let exact_scope = match history {
+            Some(history) => history.destination_scope.clone(),
+            None => exact_scope_for_session(
+                &context.profile_id,
+                &context.scope,
+                observation.source().session_id().as_str(),
+            )
+            .map_err(|source| AdmissionAdapterError::ExactScope {
+                source_event_id: source_event_id.clone(),
+                source,
+            })?,
+        };
 
         let message_payload = eligible_message_payload(observation).map_err(|detail| {
             AdmissionAdapterError::InvalidCanonicalEnvelope {
@@ -1121,11 +1141,21 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
         // minted over the inner payload alone would not describe them. The
         // sanitizer walks the whole structure, so a secret nested anywhere in
         // the canonical payload is still found.
-        let envelope = provider_observation_envelope(
+        let mut envelope = provider_observation_envelope(
             context.observation_kind.as_str(),
             SESSION_MESSAGE_PAYLOAD_CONTRACT,
             &message_payload,
         );
+        if let Some(history) = history {
+            let attribution = super::provider_history::validate_history_record(history, stored)
+                .map_err(AdmissionAdapterError::History)?;
+            envelope["source_identity"] = serde_json::json!({
+                "original_source": super::provider_history::source_attribution_json(attribution)
+                    .map_err(AdmissionAdapterError::History)?,
+            });
+            envelope["history_grant"] = super::provider_history::history_grant_json(history)
+                .map_err(AdmissionAdapterError::History)?;
+        }
         // A settled record whose *shape* hygiene will not walk — nested or
         // sized beyond the ceilings the store itself never lets a record reach
         // — has been classified as nothing, so it is withheld under a typed
@@ -1154,13 +1184,20 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
             })?;
 
         let settlement = canonical_settlement_receipt(record, stored);
-        let forget_source_key =
-            forget_source_key_for(&exact_scope, observation).map_err(|source| {
-                AdmissionAdapterError::Journal {
-                    source_event_id: source_event_id.clone(),
-                    source,
-                }
-            })?;
+        let forget_source_key = match history {
+            Some(history) => {
+                let attribution = super::provider_history::validate_history_record(history, stored)
+                    .map_err(AdmissionAdapterError::History)?;
+                let digest = super::provider_history::original_source_fence_digest(attribution)
+                    .map_err(AdmissionAdapterError::History)?;
+                ForgetSourceKeyV1::new(format!("original-source:{digest}"))
+            }
+            None => forget_source_key_for(&exact_scope, observation),
+        }
+        .map_err(|source| AdmissionAdapterError::Journal {
+            source_event_id: source_event_id.clone(),
+            source,
+        })?;
 
         match admission {
             ObservationAdmission::Withheld {
@@ -1214,6 +1251,16 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
                 // can attribute back to redaction.
                 if !envelope_shape_survived(&sanitized, context.observation_kind.as_str()) {
                     return Err(AdmissionAdapterError::EnvelopeShapeRewritten { source_event_id });
+                }
+                if history.is_some()
+                    && (sanitized.get("history_grant") != envelope.get("history_grant")
+                        || sanitized.get("source_identity") != envelope.get("source_identity"))
+                {
+                    return Err(AdmissionAdapterError::History(
+                        super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                            "sanitized history metadata",
+                        ),
+                    ));
                 }
                 let bytes = canonical_payload_bytes(&sanitized).map_err(|source| {
                     AdmissionAdapterError::CanonicalEncoding {
@@ -1327,6 +1374,178 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
     }
 }
 
+struct GrantedHistoryAdmissionAdapterV1 {
+    canonical: Arc<CanonicalObservationAdmissionAdapterV1>,
+    grant: Option<tracedecay_memory_provider_registry::HistoryGrant>,
+}
+
+impl ObservationAdmissionAdapterV1 for GrantedHistoryAdmissionAdapterV1 {
+    type Record = StoredObservation;
+    type Error = AdmissionAdapterError;
+    type Control = ReplayIngestControlV1;
+
+    fn lane(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLaneKeyV1 {
+        self.canonical.lane(record)
+    }
+
+    fn classify(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLoadClassV1 {
+        self.canonical.classify(record)
+    }
+
+    fn decide(
+        &self,
+        record: &SourceRecordV1<Self::Record>,
+        control: &Self::Control,
+    ) -> Result<AdmissionDecisionV1, Self::Error> {
+        let Some(grant) = self.grant.as_ref().filter(|grant| {
+            grant
+                .sources
+                .iter()
+                .any(|source| source.attribution.source.observation_id == record.source_event_id)
+        }) else {
+            // An authoritative bounded scan found this canonical event outside
+            // this destination's delivery contract. Checkpoint it in this
+            // destination stream; no source bytes are copied or relabeled.
+            return Ok(AdmissionDecisionV1::NonMessage(Box::new(
+                canonical_settlement_receipt(record, &record.record),
+            )));
+        };
+        let mut grant = grant.clone();
+        grant
+            .sources
+            .retain(|source| source.attribution.source.observation_id == record.source_event_id);
+        self.canonical
+            .decide_with_history(record, control, Some(&grant))
+    }
+}
+
+/// Exact operation identity used by every original Observe delivery attempt.
+pub(crate) fn delivery_operation_id(
+    observation_id: &tracedecay_memory_observation::ObservationIdV1,
+    attempt_number: u32,
+) -> String {
+    format!("{}.{}", observation_id.as_str(), attempt_number)
+}
+
+pub(crate) fn history_source_stream(
+    destination: &OwnedExactScope,
+    policy_revision: u64,
+) -> Result<SourceStreamIdV1, ObservationJournalError> {
+    SourceStreamIdV1::new(format!(
+        "host-history.{policy_revision}.{}",
+        destination.exact_scope_sha256()
+    ))
+}
+
+/// Cancels a queued/running bounded snapshot even if its async caller is dropped.
+struct HistoryDeliveryCancellationV1(CancellationToken);
+
+impl Drop for HistoryDeliveryCancellationV1 {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+pub(crate) fn validate_history_delivery_evidence(
+    grant: &tracedecay_memory_provider_registry::HistoryGrant,
+    evidence: Vec<tracedecay_memory_observation::SourceDeliveryEvidenceV1>,
+    cancellation: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<bool, ObservationJourneyError> {
+    use super::provider_history::ProviderHistoryErrorV1;
+    use tracedecay_memory_observation::{
+        DeliveryStateV1, ObservationCommittedEffectV1, ObservationOutcomeV1,
+        SourceDeliveryEvidenceV1,
+    };
+    if evidence.len() != grant.sources.len() {
+        return Err(
+            ProviderHistoryErrorV1::ClaimMismatch("history delivery evidence count").into(),
+        );
+    }
+    let mut settled = true;
+    for (source, evidence) in grant.sources.iter().zip(evidence) {
+        if cancellation.is_cancelled() {
+            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 });
+        }
+        let (admitted, state, receipt) = match evidence {
+            SourceDeliveryEvidenceV1::Missing => {
+                return Err(
+                    ProviderHistoryErrorV1::Ineligible("history source not admitted").into(),
+                );
+            }
+            SourceDeliveryEvidenceV1::Purged { .. } => {
+                return Err(ProviderHistoryErrorV1::Ineligible("history source purged").into());
+            }
+            SourceDeliveryEvidenceV1::Retained {
+                admitted,
+                state,
+                receipt,
+            } => (admitted, state, receipt),
+        };
+        let payload: Value = serde_json::from_slice(&admitted.payload.bytes)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("history delivery envelope"))?;
+        let retained = payload
+            .get("history_grant")
+            .ok_or(ProviderHistoryErrorV1::ClaimMismatch(
+                "history delivery grant",
+            ))
+            .and_then(super::provider_history::history_grant_from_json)?;
+        let original = super::provider_history::source_attribution_json(&source.attribution)?;
+        if retained.policy_revision != grant.policy_revision
+            || retained.destination_scope != grant.destination_scope
+            || retained.relation != grant.relation
+            || retained.sources.len() != 1
+            || retained.sources[0].attribution != source.attribution
+            || payload.pointer("/source_identity/original_source") != Some(&original)
+            || admitted.source.source_event_id != source.attribution.source.observation_id
+            || admitted.source.source_sequence.0 != source.attribution.source_sequence
+            || admitted.source.settled_at_unix_micros.checked_mul(1_000)
+                != Some(source.attribution.ingested_at_utc_nanos)
+            || admitted.observation_kind.as_str() != SESSION_MESSAGE_OBSERVATION_KIND
+            || !envelope_shape_survived(&payload, SESSION_MESSAGE_OBSERVATION_KIND)
+        {
+            return Err(
+                ProviderHistoryErrorV1::ClaimMismatch("history delivery original source").into(),
+            );
+        }
+        match state {
+            DeliveryStateV1::Pending | DeliveryStateV1::Leased | DeliveryStateV1::EffectUnknown => {
+                settled = false
+            }
+            DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged => {
+                let receipt = receipt.ok_or(ProviderHistoryErrorV1::ClaimMismatch(
+                    "history acknowledgement receipt",
+                ))?;
+                if !matches!(
+                    (receipt.outcome, receipt.committed_effect),
+                    (
+                        ObservationOutcomeV1::Applied,
+                        ObservationCommittedEffectV1::Applied
+                    ) | (
+                        ObservationOutcomeV1::DuplicateAcknowledged,
+                        ObservationCommittedEffectV1::Duplicate
+                    )
+                ) {
+                    return Err(ProviderHistoryErrorV1::Ineligible(
+                        "history delivery has no complete effect",
+                    )
+                    .into());
+                }
+            }
+            _ => {
+                return Err(ProviderHistoryErrorV1::Ineligible(
+                    "history delivery terminal refusal",
+                )
+                .into());
+            }
+        }
+    }
+    Ok(settled)
+}
+
 /// Builds the provider observation envelope the Native adapter parses.
 fn provider_observation_envelope(
     observation_kind: &str,
@@ -1366,7 +1585,7 @@ fn envelope_shape_survived(sanitized: &Value, observation_kind: &str) -> bool {
 /// operating system. Feeding a counter here would collide on the journal's
 /// unique index, so the entropy is not decorative — and an entropy failure is
 /// reported rather than papered over with a constant.
-fn mint_observation_id(
+pub(super) fn mint_observation_id(
     admitted_at_unix_micros: i64,
 ) -> Result<ObservationIdV1, ObservationJournalError> {
     let unix_millis = u64::try_from(admitted_at_unix_micros.max(0) / 1_000).unwrap_or(0);
@@ -1522,6 +1741,7 @@ struct RegistryObservationDeliveryAdapterV1 {
     /// Restart recovery. Every attempt passes through it, so a provider whose
     /// state moved under the journal is refused before it is written to.
     recovery: ObservationRecoveryGateV1,
+    history_authority: Arc<OnceLock<Arc<dyn super::provider_history::HistoryGrantRevalidationV1>>>,
 }
 
 /// Typed delivery-adapter failures and provider-terminal refusals.
@@ -1531,6 +1751,8 @@ struct RegistryObservationDeliveryAdapterV1 {
 /// as refusal evidence with an unknown-effect receipt before redelivery.
 #[derive(Debug, thiserror::Error)]
 enum DeliveryAdapterError {
+    #[error("host history authorization failed: {0}")]
+    History(#[source] super::provider_history::ProviderHistoryErrorV1),
     #[error("provider composition is disabled, so no observation can be delivered")]
     Disabled,
     #[error("provider readiness could not be proven for the leased exact scope: {0}")]
@@ -1572,6 +1794,8 @@ const DELIVERY_REFUSAL_HISTORY: usize = 16;
 /// answer, typed, published by the lane and carried on its log line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeliveryRefusalClassV1 {
+    /// Current host source/session/privacy authority refused historical reuse.
+    HistoryRefused,
     /// The provider composition is disabled, so nothing could be delivered.
     CompositionDisabled,
     /// Readiness could not be proven for the leased exact scope.
@@ -1607,6 +1831,7 @@ impl DeliveryRefusalClassV1 {
     /// Stable wire label for the log line and any operator surface built on it.
     pub(crate) const fn as_wire(&self) -> &'static str {
         match self {
+            Self::HistoryRefused => "history_refused",
             Self::CompositionDisabled => "composition_disabled",
             Self::ReadinessRefused => "readiness_refused",
             Self::RecoveryRefused => "recovery_refused",
@@ -1631,6 +1856,7 @@ impl DeliveryRefusalClassV1 {
     fn classify(cause: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
         if let Some(adapter) = cause.downcast_ref::<DeliveryAdapterError>() {
             return match adapter {
+                DeliveryAdapterError::History(_) => Self::HistoryRefused,
                 DeliveryAdapterError::Disabled => Self::CompositionDisabled,
                 DeliveryAdapterError::Readiness(_) => Self::ReadinessRefused,
                 DeliveryAdapterError::Recovery(_) => Self::RecoveryRefused,
@@ -1986,6 +2212,59 @@ impl RegistryObservationDeliveryAdapterV1 {
                 control.cancellation(),
             )
         };
+        let payload: Value = serde_json::from_slice(&leased.payload.bytes).map_err(|_| {
+            DeliveryAdapterError::History(
+                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch("journal envelope"),
+            )
+        })?;
+        let history = payload
+            .get("history_grant")
+            .map(super::provider_history::history_grant_from_json)
+            .transpose()
+            .map_err(DeliveryAdapterError::History)?;
+        let mut recovery = self.recovery.clone();
+        if let Some(history) = &history {
+            if history.destination_scope != leased.exact_scope || history.sources.len() != 1 {
+                return Err(DeliveryAdapterError::History(
+                    super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                        "journal history destination/source",
+                    ),
+                ));
+            }
+            let original =
+                super::provider_history::source_attribution_json(&history.sources[0].attribution)
+                    .map_err(DeliveryAdapterError::History)?;
+            if payload.pointer("/source_identity/original_source") != Some(&original) {
+                return Err(DeliveryAdapterError::History(
+                    super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                        "journal original attribution",
+                    ),
+                ));
+            }
+            let authority = self.history_authority.get().ok_or_else(|| {
+                DeliveryAdapterError::History(
+                    super::provider_history::ProviderHistoryErrorV1::Unavailable(
+                        "history authority mount",
+                    ),
+                )
+            })?;
+            authority
+                .revalidate(
+                    &self.provider_id,
+                    history,
+                    &operation_control(started_at_unix_micros),
+                )
+                .map_err(DeliveryAdapterError::History)?;
+            recovery.source_stream =
+                history_source_stream(&history.destination_scope, history.policy_revision)
+                    .map_err(|_| {
+                        DeliveryAdapterError::History(
+                            super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                                "history stream",
+                            ),
+                        )
+                    })?;
+        }
         let readiness_request = readiness_handshake_request(
             &self.provider_id,
             &leased.exact_scope,
@@ -2029,7 +2308,7 @@ impl RegistryObservationDeliveryAdapterV1 {
         // before one byte reaches the provider. A refusal is typed and leaves
         // the row exactly as deliverable as it was; shutdown cancellation is
         // additionally recorded as host-owned attempt evidence.
-        let expected_state_generation = match self.recovery.admit_delivery(
+        let expected_state_generation = match recovery.admit_delivery(
             &leased.exact_scope_sha256,
             readiness_dispatch.evidence(),
             control,
@@ -2066,11 +2345,7 @@ impl RegistryObservationDeliveryAdapterV1 {
                 .to_owned(),
             exact_scope: leased.exact_scope.clone(),
             request_id: leased.observation_id.as_str().to_owned(),
-            operation_id: format!(
-                "{}.{}",
-                leased.observation_id.as_str(),
-                leased.attempt_number
-            ),
+            operation_id: delivery_operation_id(&leased.observation_id, leased.attempt_number),
             expected_state_generation,
             idempotency_key: Some(leased.idempotency_key.as_str().to_owned()),
             control,
@@ -2087,6 +2362,20 @@ impl RegistryObservationDeliveryAdapterV1 {
         .with_sanitization(sanitization);
         call.validate_request_bytes(self.limits.request_bytes)
             .map_err(DeliveryAdapterError::Call)?;
+
+        if let Some(history) = &history {
+            self.history_authority
+                .get()
+                .ok_or_else(|| {
+                    DeliveryAdapterError::History(
+                        super::provider_history::ProviderHistoryErrorV1::Unavailable(
+                            "history authority mount",
+                        ),
+                    )
+                })?
+                .revalidate(&self.provider_id, history, &call.control)
+                .map_err(DeliveryAdapterError::History)?;
+        }
 
         // This helper itself runs on the attempt's borrowed worker. Keep the
         // readiness guard alive through the direct registry call so no other
@@ -2514,6 +2803,29 @@ impl ThreadBoundedProviderCallV1 {
     where
         T: Send + 'static,
     {
+        self.call_within_with_shutdown(budget_millis, cancellation, None, false, work)
+    }
+
+    /// Runs the same bounded engine while synchronously forwarding journey
+    /// shutdown to the original provider token at its existing checkpoints.
+    /// No additional worker, relay task, token or timeout budget is created.
+    fn call_within_with_shutdown<T>(
+        &self,
+        budget_millis: u64,
+        cancellation: &CancellationToken,
+        stopping: Option<&HostCancellationToken>,
+        preserve_settled_result: bool,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, BoundedCallRefusalV1>
+    where
+        T: Send + 'static,
+    {
+        let is_cancelled = || {
+            if stopping.is_some_and(HostCancellationToken::is_cancelled) {
+                cancellation.cancel();
+            }
+            cancellation.is_cancelled()
+        };
         // Consent that is already withdrawn is checked before a slot is
         // claimed and before a worker is borrowed, so a caller that has
         // nothing to wait for never reaches the provider at all. Checking only
@@ -2521,7 +2833,7 @@ impl ThreadBoundedProviderCallV1 {
         // the finite ceiling, still handed the provider work the host no
         // longer wanted, and — if the provider was quick — still had its
         // answer accepted.
-        if cancellation.is_cancelled() {
+        if is_cancelled() {
             return Err(BoundedCallRefusalV1::Cancelled);
         }
         let maximum = self.max_abandoned;
@@ -2580,24 +2892,19 @@ impl ThreadBoundedProviderCallV1 {
             let wait = remaining.min(slice);
             match inbox.recv_timeout(wait) {
                 Ok(Ok(answer)) => {
-                    // Cancellation wins over an answer that arrives after it,
-                    // however narrow the margin: the worker releases its slot
-                    // before it sends, so there is nothing to abandon here —
-                    // only an answer the host no longer has consent to act on.
-                    // Without this, a provider that ignores cancellation could
-                    // still settle a delivery by being fast enough to beat the
-                    // next polling slice.
-                    if cancellation.is_cancelled() {
-                        return Err(BoundedCallRefusalV1::Cancelled);
-                    }
-                    return Ok(answer);
+                    return Self::settled_answer(
+                        cancellation,
+                        stopping,
+                        preserve_settled_result,
+                        answer,
+                    );
                 }
                 Ok(Err(_)) => {
                     // Shutdown owns classification once it has fired, even if
                     // the contained worker reports its panic on the same edge.
                     // The worker already diagnosed the crash independently of
                     // this attempt's terminal outcome.
-                    if cancellation.is_cancelled() {
+                    if is_cancelled() {
                         return Err(BoundedCallRefusalV1::Cancelled);
                     }
                     return Err(BoundedCallRefusalV1::Unavailable(
@@ -2611,7 +2918,7 @@ impl ThreadBoundedProviderCallV1 {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     remaining = remaining.saturating_sub(wait);
-                    if cancellation.is_cancelled() {
+                    if is_cancelled() {
                         // The caller walks away while the worker is still
                         // inside the provider: the boundary says so instead of
                         // quietly forgetting a thread it still owns.
@@ -2627,6 +2934,24 @@ impl ThreadBoundedProviderCallV1 {
                 }
             }
         }
+    }
+
+    /// A received control answer may contain committed effects. Forward stop
+    /// into the original token, but never discard that witnessed evidence.
+    /// Observation calls retain their existing cancellation-wins policy.
+    fn settled_answer<T>(
+        cancellation: &CancellationToken,
+        stopping: Option<&HostCancellationToken>,
+        preserve_settled_result: bool,
+        answer: T,
+    ) -> Result<T, BoundedCallRefusalV1> {
+        if stopping.is_some_and(HostCancellationToken::is_cancelled) {
+            cancellation.cancel();
+        }
+        if !preserve_settled_result && cancellation.is_cancelled() {
+            return Err(BoundedCallRefusalV1::Cancelled);
+        }
+        Ok(answer)
     }
 }
 
@@ -2912,6 +3237,299 @@ pub(crate) struct ProjectObservationJourneyV1 {
 }
 
 impl ProjectObservationJourneyV1 {
+    /// Installs the root's existing-authority adapter once. Replacing an
+    /// authority while queued records are being delivered is not permitted.
+    pub(crate) fn bind_history_authority(
+        &self,
+        authority: Arc<dyn super::provider_history::HistoryGrantRevalidationV1>,
+    ) -> Result<(), ObservationJourneyError> {
+        self.delivery.history_authority.set(authority).map_err(|_| {
+            super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                "history authority already bound",
+            )
+            .into()
+        })
+    }
+
+    /// Checks a selected history binding against this journey's existing
+    /// mounted identity without retaining another copy of that identity.
+    pub(crate) fn validate_history_mount(
+        &self,
+        provider_id: &OwnedProviderId,
+        registration_revision: u64,
+        profile_id: &UserProfileId,
+        scope: &ResolvedScope,
+    ) -> Result<(), ObservationJourneyError> {
+        let context = &self.adapter.context;
+        if self.provider_id != provider_id.as_str()
+            || self.registration_revision != registration_revision
+            || &self.provider_lane.provider_id != provider_id
+            || self.provider_lane.registration_revision != registration_revision
+            || &context.provider_lane.provider_id != provider_id
+            || context.provider_lane.registration_revision != registration_revision
+            || &context.profile_id != profile_id
+            || &context.scope != scope
+        {
+            return Err(
+                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                    "history journey mount",
+                )
+                .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Provider-specific host deletion intents share this existing journal.
+    /// The caller records intent here before attempting provider control.
+    pub(crate) fn history_journal(&self) -> Arc<SqliteObservationJournal> {
+        Arc::clone(&self.journal)
+    }
+
+    /// Each exact destination/policy has independent durable scan progress.
+    pub(crate) async fn history_replay_watermark(
+        &self,
+        destination: &OwnedExactScope,
+        policy_revision: u64,
+    ) -> Result<u64, ObservationJourneyError> {
+        let source_stream = history_source_stream(destination, policy_revision)
+            .map_err(ObservationJourneyError::Journal)?;
+        let journal = Arc::clone(&self.journal);
+        tokio::task::spawn_blocking(move || {
+            journal.maximum_replay_sequence(SourceAuthorityV1::HostSession, &source_stream)
+        })
+        .await
+        .map_err(ObservationJourneyError::IngestTask)?
+        .map(|position| position.map_or(0, |position| position.0))
+        .map_err(ObservationJourneyError::Journal)
+    }
+
+    /// Waits for actual durable full-effect receipts for every granted source.
+    /// Current provider readiness/recovery remains a separate pre-recall check.
+    pub(crate) async fn await_history_delivery(
+        &self,
+        grant: &tracedecay_memory_provider_registry::HistoryGrant,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<(), ObservationJourneyError> {
+        use super::provider_history::ProviderHistoryErrorV1;
+        check_replay_bounds(bounds, 0)?;
+        if grant.sources.len() > 256 {
+            return Err(
+                ProviderHistoryErrorV1::ClaimMismatch("history delivery source bound").into(),
+            );
+        }
+        let authority = self.delivery.history_authority.get().cloned().ok_or(
+            ProviderHistoryErrorV1::Unavailable("history authority mount"),
+        )?;
+        let cancellation = HistoryDeliveryCancellationV1(CancellationToken::new());
+        let deadline_micros = wall_deadline_micros(bounds.deadline);
+        let control = OperationControl::new(
+            deadline_micros,
+            u64::try_from(
+                deadline_micros
+                    .saturating_sub(tracedecay_contracts::now_micros().0)
+                    .max(0)
+                    / 1_000,
+            )
+            .unwrap_or(u64::MAX),
+            cancellation.0.clone(),
+        );
+        let work = async {
+            authority
+                .revalidate_async(
+                    &self.adapter.context.provider_lane.provider_id,
+                    grant,
+                    &control,
+                )
+                .await?;
+            if grant.sources.is_empty() {
+                return Ok(());
+            }
+            let stream = SourceStreamKeyV1 {
+                source_authority: SourceAuthorityV1::HostSession,
+                exact_scope_sha256: grant.destination_scope.exact_scope_sha256(),
+                source_stream: history_source_stream(
+                    &grant.destination_scope,
+                    grant.policy_revision,
+                )
+                .map_err(ObservationJourneyError::Journal)?,
+            };
+            let sources = grant
+                .sources
+                .iter()
+                .map(
+                    |source| tracedecay_memory_observation::ExpectedSourceDeliveryV1 {
+                        source_sequence: SourceSequenceV1(source.attribution.source_sequence),
+                        source_event_id: source.attribution.source.observation_id.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            loop {
+                // Enable before observing: a commit during the snapshot must
+                // wake this waiter even if the worker publishes before await.
+                let mut changed = Box::pin(self.delivery_changed.async_changed.notified());
+                changed.as_mut().enable();
+                self.wake_delivery();
+                let journal = Arc::clone(&self.journal);
+                let lane = self.adapter.context.provider_lane.clone();
+                let snapshot_grant = grant.clone();
+                let stream = stream.clone();
+                let sources = sources.clone();
+                let token = cancellation.0.clone();
+                let deadline = bounds.deadline;
+                let settled = tokio::task::spawn_blocking(move || {
+                    let evidence = journal
+                        .read_source_deliveries(
+                            &lane,
+                            &snapshot_grant.destination_scope,
+                            &stream,
+                            &sources,
+                            tracedecay_memory_observation::RecoveryTimeBudgetV1 {
+                                remaining_micros: i64::try_from(
+                                    deadline
+                                        .saturating_duration_since(tokio::time::Instant::now())
+                                        .as_micros(),
+                                )
+                                .unwrap_or(i64::MAX),
+                            },
+                            &token,
+                        )
+                        .map_err(ObservationJourneyError::Journal)?;
+                    validate_history_delivery_evidence(&snapshot_grant, evidence, &token, deadline)
+                })
+                .await
+                .map_err(ObservationJourneyError::IngestTask)??;
+                if settled {
+                    authority
+                        .revalidate_async(
+                            &self.adapter.context.provider_lane.provider_id,
+                            grant,
+                            &control,
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                changed.await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = bounds.cancellation.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+            () = self.stopping.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+            result = tokio::time::timeout_at(bounds.deadline, work) => {
+                match result {
+                    Err(_) => Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 }),
+                    Ok(Err(ObservationJourneyError::Journal(ObservationJournalError::BudgetExhausted { .. }))) => Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 }),
+                    Ok(Err(ObservationJourneyError::Journal(ObservationJournalError::OperationCancelled { .. }))) => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+                    Ok(result) => result,
+                }
+            }
+        }
+    }
+
+    /// Delivers one bounded canonical history page through the same hygiene,
+    /// journal, idempotency, backpressure and supervised provider path as live
+    /// observations. Every effect retains the original source session/key.
+    pub(crate) async fn replay_authorized_history_page(
+        &self,
+        page: super::provider_history::ProviderHistoryPageV1,
+        destination: OwnedExactScope,
+        policy_revision: u64,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<ReplayPassV1, ObservationJourneyError> {
+        check_replay_bounds(bounds, 0)?;
+        if policy_revision == 0
+            || page.records.len() > 256
+            || page.grant.as_ref().is_some_and(|grant| {
+                grant.destination_scope != destination || grant.policy_revision != policy_revision
+            })
+        {
+            return Err(
+                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
+                    "history page destination/bounds",
+                )
+                .into(),
+            );
+        }
+        let authority = self.delivery.history_authority.get().cloned().ok_or(
+            super::provider_history::ProviderHistoryErrorV1::Unavailable("history authority mount"),
+        )?;
+        if let Some(grant) = &page.grant {
+            let deadline = wall_deadline_micros(bounds.deadline);
+            let now = tracedecay_contracts::now_micros().0;
+            let control = OperationControl::new(
+                deadline,
+                u64::try_from(deadline.saturating_sub(now).max(0) / 1000).unwrap_or(u64::MAX),
+                CancellationToken::new(),
+            );
+            tokio::select! {
+                () = bounds.cancellation.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+                () = self.stopping.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+                result = tokio::time::timeout_at(bounds.deadline, authority.revalidate_async(
+                    &self.adapter.context.provider_lane.provider_id, grant, &control,
+                )) => {
+                    result.map_err(|_| ObservationJourneyError::DeadlineExceeded { admitted: 0 })??;
+                }
+            }
+        }
+        let adapter = Arc::new(GrantedHistoryAdmissionAdapterV1 {
+            canonical: Arc::clone(&self.adapter),
+            grant: page.grant,
+        });
+        let stream = SourceStreamKeyV1 {
+            source_authority: SourceAuthorityV1::HostSession,
+            exact_scope_sha256: destination.exact_scope_sha256(),
+            source_stream: history_source_stream(&destination, policy_revision)
+                .map_err(ObservationJourneyError::Journal)?,
+        };
+        let mut admitted = 0;
+        for stored in page.records {
+            check_replay_bounds(bounds, admitted)?;
+            if self.stopping.is_cancelled() {
+                break;
+            }
+            let record = SourceRecordV1 {
+                stream: stream.clone(),
+                source_sequence: SourceSequenceV1(stored.sequence()),
+                source_event_id: stored.observation().observation_id().as_str().to_owned(),
+                source_event_revision: 1,
+                record: stored,
+            };
+            let report = match self
+                .ingest_record_with_adapter(record, Arc::clone(&adapter), bounds)
+                .await?
+            {
+                RecordOutcomeV1::Reported(report) => report,
+                RecordOutcomeV1::DeadlineExceeded => {
+                    return Err(ObservationJourneyError::DeadlineExceeded { admitted });
+                }
+            };
+            admitted += u64::from(report.appended);
+            if let Some(stop) = report.stopped_on {
+                return Err(match stop.reason {
+                    IngressStopReasonV1::Cancelled => {
+                        ObservationJourneyError::Cancelled { admitted }
+                    }
+                    IngressStopReasonV1::DeadlineExceeded => {
+                        ObservationJourneyError::DeadlineExceeded { admitted }
+                    }
+                });
+            }
+            if report.halted_on.is_some() || report.shed_on.is_some() {
+                return Ok(ReplayPassV1 {
+                    admitted,
+                    halted: report.halted_on,
+                    shed: report.shed_on,
+                });
+            }
+        }
+        Ok(ReplayPassV1 {
+            admitted,
+            halted: None,
+            shed: None,
+        })
+    }
+
     /// Storage placement of the journal. Diagnostics only — never identity.
     pub(crate) fn journal_path(&self) -> &Path {
         &self.journal_path
@@ -3115,8 +3733,26 @@ impl ProjectObservationJourneyV1 {
         record: SourceRecordV1<StoredObservation>,
         bounds: ReplayBoundsV1<'_>,
     ) -> Result<RecordOutcomeV1, ObservationJourneyError> {
+        self.ingest_record_with_adapter(record, Arc::clone(&self.adapter), bounds)
+            .await
+    }
+
+    async fn ingest_record_with_adapter<A>(
+        &self,
+        record: SourceRecordV1<StoredObservation>,
+        adapter: Arc<A>,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<RecordOutcomeV1, ObservationJourneyError>
+    where
+        A: ObservationAdmissionAdapterV1<
+                Record = StoredObservation,
+                Error = AdmissionAdapterError,
+                Control = ReplayIngestControlV1,
+            > + Send
+            + Sync
+            + 'static,
+    {
         let journal = Arc::clone(&self.journal);
-        let adapter = Arc::clone(&self.adapter);
         let wake = Arc::clone(&self.wake);
         let backpressure = Arc::clone(&self.backpressure);
         // The caller's bound, carried into the record rather than checked
@@ -4186,6 +4822,7 @@ fn construct_project_observation_journey(
         },
     });
     let delivery = Arc::new(RegistryObservationDeliveryAdapterV1 {
+        history_authority: Arc::new(OnceLock::new()),
         provider_id: inputs.provider.provider_id.clone(),
         composition: Arc::clone(&inputs.composition),
         readiness: supervised_readiness,
@@ -4622,16 +5259,24 @@ pub(crate) async fn mount_and_replay<S>(
 where
     S: ObservationAdmissionPort + 'static,
 {
-    // Off the runtime worker. `mount_project_observation_journey` opens the
-    // journal file, applies its schema inside an IMMEDIATE transaction, and
-    // creates the provider state directory — all synchronous filesystem work
-    // that can wait on an fsync or on another writer holding the same
-    // database. Running it inline made project open park a tokio worker for
-    // however long the disk took, which on a single-worker runtime is the
-    // whole runtime.
-    let journey = tokio::task::spawn_blocking(move || mount_project_observation_journey(inputs))
-        .await
-        .map_err(ObservationJourneyError::MountTask)??;
+    let journey = mount_observer_dormant(inputs, cancellation).await?;
+    activate_required_with_startup_replay(journey, observation_store, cancellation).await
+}
+
+/// Starts the existing required journey after its source authority is bound,
+/// preserving startup replay classification and the project-open cancellation.
+pub(crate) async fn activate_required_with_startup_replay<S>(
+    journey: Arc<ProjectObservationJourneyV1>,
+    observation_store: S,
+    cancellation: &HostCancellationToken,
+) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError>
+where
+    S: ObservationAdmissionPort + 'static,
+{
+    if cancellation.is_cancelled() {
+        return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+    }
+    journey.start_delivery_worker()?;
     let admitted = match run_startup_replay(journey.as_ref(), &observation_store, cancellation)
         .await
     {
@@ -4742,12 +5387,15 @@ mod tests {
         "2222222222222222222222222222222222222222222222222222222222222222";
     const EFFECT_DIGEST: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
+    mod control_dispatch;
+
     /// Seeded crash and restart fuzzing of this mount (`tdmem-5lc`). It lives
     /// beside the journey's own suite because it reuses these fixtures to
     /// build the very same mount, and kills it in a child process at every
     /// boundary between the host's canonical commit and the provider's durable
     /// acknowledgement.
     mod crash_restart_fuzz;
+    mod provider_history;
     #[cfg(unix)]
     mod real_ncm_observer;
 
@@ -6881,6 +7529,7 @@ mod tests {
         observe_calls: AtomicUsize,
         delivered: Mutex<Vec<DeliveredObservation>>,
         handshake_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        health_hook: Mutex<Option<Box<dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync>>>,
     }
 
     impl JourneyNativePort {
@@ -6914,6 +7563,7 @@ mod tests {
                 observe_calls: AtomicUsize::new(0),
                 delivered: Mutex::new(Vec::new()),
                 handshake_hook: Mutex::new(None),
+                health_hook: Mutex::new(None),
             }
         }
 
@@ -6922,6 +7572,11 @@ mod tests {
         /// point inside record admission a test can act from.
         fn on_handshake(&self, hook: impl Fn() + Send + Sync + 'static) {
             *self.handshake_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        /// Holds or answers a control through the same mounted provider port.
+        fn on_health(&self, hook: impl Fn(&ProviderCall) -> ProviderReply + Send + Sync + 'static) {
+            *self.health_hook.lock().unwrap() = Some(Box::new(hook));
         }
 
         fn unexpected<T>() -> T {
@@ -6964,8 +7619,11 @@ mod tests {
             }
         }
 
-        fn health(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
+        fn health(&self, call: &ProviderCall) -> ProviderReply {
+            match self.health_hook.lock().unwrap().as_ref() {
+                Some(hook) => hook(call),
+                None => Self::unexpected(),
+            }
         }
 
         fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
@@ -7242,6 +7900,19 @@ mod tests {
     /// the canonical store only where the store's own write boundary cannot
     /// produce the row under test; the journey reads it through the same
     /// trait it reads the store through.
+    fn recent_record_window(
+        records: &[StoredObservation],
+        request: tracedecay_store::ObservationRecentWindowRequest,
+    ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError> {
+        let sequences: Vec<_> = records
+            .iter()
+            .rev()
+            .take(request.limit() + 1)
+            .map(StoredObservation::sequence)
+            .collect();
+        tracedecay_store::ObservationRecentWindowV1::from_descending_sequences(request, &sequences)
+    }
+
     struct SettledRecordsPort {
         records: Vec<StoredObservation>,
     }
@@ -7255,6 +7926,14 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for SettledRecordsPort {
+        async fn recent_admitted_observation_window(
+            &self,
+            request: tracedecay_store::ObservationRecentWindowRequest,
+        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
+        {
+            recent_record_window(&self.records, request)
+        }
+
         async fn read_admitted_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
@@ -7300,6 +7979,15 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for CountingReplayPort {
+        async fn recent_admitted_observation_window(
+            &self,
+            request: tracedecay_store::ObservationRecentWindowRequest,
+        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
+        {
+            self.passes.fetch_add(1, Ordering::Relaxed);
+            self.inner.recent_admitted_observation_window(request).await
+        }
+
         async fn read_admitted_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
@@ -9658,6 +10346,21 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for RefusingReplayPort {
+        async fn recent_admitted_observation_window(
+            &self,
+            request: tracedecay_store::ObservationRecentWindowRequest,
+        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
+        {
+            let next = match self.refusals.lock() {
+                Ok(mut slot) => slot.pop(),
+                Err(poisoned) => poisoned.into_inner().pop(),
+            };
+            if let Some(error) = next {
+                return Err(error);
+            }
+            recent_record_window(&self.then, request)
+        }
+
         async fn read_admitted_observation(
             &self,
             _observation_id: &CanonicalObservationIdV1,

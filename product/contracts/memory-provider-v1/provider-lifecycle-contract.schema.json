@@ -26,16 +26,32 @@
     "provider_local_projection",
     "lifecycle_specific_terminal_states",
     "invariants",
-    "verification_beads"
+    "verification_beads",
+    "common_advisory_semantics"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "contract_id": { "const": "tracedecay.memory.provider.lifecycle.v1" },
-    "bead_id": { "const": "tdmem-0205" },
-    "title": { "type": "string", "minLength": 1 },
-    "status": { "const": "accepted" },
-    "authority": { "const": "TraceDecay lifecycle admission and provider-local capability fabric" },
-    "scope": { "const": "coding_agents_only" },
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "const": "tracedecay.memory.provider.lifecycle.v1"
+    },
+    "bead_id": {
+      "const": "tdmem-0205"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "const": "accepted"
+    },
+    "authority": {
+      "const": "TraceDecay lifecycle admission and provider-local capability fabric"
+    },
+    "scope": {
+      "const": "coding_agents_only"
+    },
     "depends_on_contracts": {
       "type": "array",
       "const": [
@@ -45,35 +61,199 @@
         "tracedecay.memory.provider.recall.v1"
       ]
     },
-    "common_request": { "$ref": "#/$defs/object" },
-    "capability_gating": { "$ref": "#/$defs/object" },
-    "health": { "$ref": "#/$defs/object" },
-    "feedback": { "$ref": "#/$defs/object" },
-    "maintenance": { "$ref": "#/$defs/object" },
-    "inspection": { "$ref": "#/$defs/object" },
-    "correction": { "$ref": "#/$defs/object" },
-    "deletion_by_source": { "$ref": "#/$defs/object" },
-    "snapshot": { "$ref": "#/$defs/object" },
-    "replay": { "$ref": "#/$defs/object" },
-    "provider_local_projection": { "$ref": "#/$defs/object" },
+    "common_request": {
+      "$ref": "#/$defs/object"
+    },
+    "capability_gating": {
+      "$ref": "#/$defs/object"
+    },
+    "health": {
+      "$ref": "#/$defs/object"
+    },
+    "feedback": {
+      "$ref": "#/$defs/object"
+    },
+    "maintenance": {
+      "$ref": "#/$defs/object"
+    },
+    "inspection": {
+      "$ref": "#/$defs/object"
+    },
+    "correction": {
+      "$ref": "#/$defs/object"
+    },
+    "deletion_by_source": {
+      "$ref": "#/$defs/object"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/object"
+    },
+    "replay": {
+      "$ref": "#/$defs/object"
+    },
+    "provider_local_projection": {
+      "$ref": "#/$defs/object"
+    },
     "lifecycle_specific_terminal_states": {
       "type": "array",
       "minItems": 25,
       "maxItems": 25,
       "uniqueItems": true,
-      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
     },
     "invariants": {
       "type": "array",
       "minItems": 15,
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 20 }
+      "items": {
+        "type": "string",
+        "minLength": 20
+      }
     },
     "verification_beads": {
       "type": "array",
       "minItems": 10,
       "uniqueItems": true,
-      "items": { "$ref": "#/$defs/beadId" }
+      "items": {
+        "$ref": "#/$defs/beadId"
+      }
+    },
+    "common_advisory_semantics": {
+      "const": {
+        "required_profile": "memory.advisory_common.v1",
+        "target_fields": [
+          "provider_id",
+          "registration_revision",
+          "original_scope",
+          "delivery_scope",
+          "source",
+          "reference"
+        ],
+        "candidate_id_alone_is_target": false,
+        "source_revision_required_for_correction": true,
+        "replacement_preserves_original_observation_and_receipt": true,
+        "replacement_closes_previous_validity_interval": true,
+        "feedback_effect_is_provider_local_and_inspectable": true,
+        "neutral_ignored_may_report_no_change": true,
+        "deletion_fence_precedes_dispatch": true,
+        "offline_deletion_intent_proves_erasure": false,
+        "new_bytes_or_new_key_authorize_resurrection": false,
+        "source_revision_transition_requires_explicit_admission_and_deletion_policy": true,
+        "same_delivery_reports_original_commit_receipt": true,
+        "replay_item_states": [
+          "applied",
+          "delivery_duplicate",
+          "source_already_applied",
+          "rejected",
+          "effect_unknown"
+        ],
+        "restore_live_generation_monotone": true,
+        "restore_may_alias_discarded_public_targets": false,
+        "restore_requires_current_host_disposition_revalidation": true,
+        "unchanged_authoritative_disposition_checkpoint_is_valid": true,
+        "disposition_revision_is_provider_generation": false,
+        "provider_switch_uses_canonical_replay": true,
+        "health_inspection_export_recall_are_reads": true,
+        "pending_privacy_recovery_requires_lifecycle_transition": true,
+        "target_carried_in": "feedback.target_and_correction.target",
+        "source_revision_type": "opaque_string_or_null",
+        "expected_target_revision_type": "nonempty_opaque_string",
+        "target_origin_may_be_unknown_for_retained_provider_control": true,
+        "restore_checkpoint_carried_in": "snapshot_restore.disposition_checkpoint",
+        "replacement_carried_in": "correction.replacement",
+        "content_correction_kinds": [
+          "supersede",
+          "replace_content"
+        ],
+        "content_replacement_shape": "full_admitted_canonical_observation_envelope",
+        "replacement_revision_must_differ_from_target": true,
+        "replacement_transition_time": "replacement.source_identity.original_source.validity.valid_from",
+        "metadata_correction_shapes": {
+          "change_validity": [
+            "valid_from",
+            "valid_until"
+          ],
+          "mark_incorrect": [
+            "revoked_at"
+          ],
+          "restrict_scope": [
+            "exact_scope_identity"
+          ]
+        },
+        "metadata_correction_unadmitted_or_nonrestricting_policy": "reject_invalid_request",
+        "replay_resolved_observations_fields": [
+          "receipt_ref",
+          "observation"
+        ],
+        "replay_receipt_ref_must_belong_to_observation_batch_refs": true,
+        "replay_resolved_observations_host_owned": true,
+        "replay_history_grant_must_cover_every_source": true,
+        "replay_source_order_and_bounds_required": true,
+        "snapshot_payload_fields": [
+          "identity",
+          "bytes",
+          "sources"
+        ],
+        "restore_source_dispositions_fields": [
+          "source",
+          "current_disposition"
+        ],
+        "snapshot_inventory_must_equal_actual_internal_sources": true,
+        "restore_current_effective_disposition_includes_provider_fence": true,
+        "restore_missing_duplicate_or_unknown_disposition_prevents_ready": true,
+        "snapshot_identity_digest_and_length_bind_actual_bytes": true,
+        "snapshot_bytes_and_response_limits_both_apply": true,
+        "source_influence_item_fields": [
+          "target",
+          "source",
+          "active",
+          "disposition",
+          "settled_feedback",
+          "last_feedback_receipt",
+          "provider_local_effect_summary"
+        ],
+        "feedback_effect_summary_cross_provider_comparable": false,
+        "replay_response_counter_fields": [
+          "applied_observations",
+          "duplicate_observations",
+          "sources_already_applied",
+          "rejected_observations",
+          "effect_unknown_observations"
+        ],
+        "replay_response_partition_total": "resolved_observations.length",
+        "delivery_receipt_selector_fields": [
+          "idempotency_key"
+        ],
+        "delivery_receipt_item_fields": [
+          "operation_id",
+          "idempotency_key",
+          "provider_receipt_digest",
+          "stable_memory_ref"
+        ],
+        "delivery_receipt_items_preserve_original_effect_identity": true,
+        "delivery_receipt_missing_original_evidence_policy": "omit_item_report_partial_or_warning",
+        "trace_selector_fields": [
+          "stable_memory_ref"
+        ],
+        "trace_item_fields": [
+          "stable_memory_ref",
+          "content",
+          "content_sha256",
+          "original_source"
+        ],
+        "trace_content_digest": "sha256_exact_emitted_utf8_content",
+        "trace_missing_original_source": "null_without_synthesis",
+        "trace_privacy_withheld_fields": [
+          "content",
+          "content_sha256",
+          "original_source"
+        ],
+        "inspection_existing_outer_limits_apply": true,
+        "inspection_read_projection_may_grant_source_authority": false
+      }
     }
   },
   "$defs": {
@@ -84,6 +264,501 @@
     "object": {
       "type": "object",
       "minProperties": 1
+    },
+    "lifecycleTargetReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "stable_memory_ref",
+            "recall_trace_ref",
+            "context_pack_item_ref"
+          ]
+        },
+        "reference": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        }
+      }
+    },
+    "lifecycleTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "registration_revision",
+        "original_scope",
+        "delivery_scope",
+        "source",
+        "reference"
+      ],
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "maxLength": 128
+        },
+        "registration_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "original_scope": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originScopeEvidence"
+        },
+        "delivery_scope": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/commonExactScope"
+        },
+        "source": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
+        },
+        "reference": {
+          "$ref": "#/$defs/lifecycleTargetReference"
+        }
+      }
+    },
+    "restoreDispositionCheckpoint": {
+      "$ref": "provider-observation-contract.schema.json#/$defs/restoreDispositionCheckpoint"
+    },
+    "contentCorrectionReplacement": {
+      "$ref": "provider-observation-contract.schema.json#/$defs/commonAdvisoryObservation"
+    },
+    "validityCorrectionReplacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "valid_from",
+        "valid_until"
+      ],
+      "properties": {
+        "valid_from": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "valid_until": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "incorrectCorrectionReplacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revoked_at"
+      ],
+      "properties": {
+        "revoked_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "scopeCorrectionReplacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exact_scope_identity"
+      ],
+      "properties": {
+        "exact_scope_identity": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/commonExactScope"
+        }
+      }
+    },
+    "resolvedReplayObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_ref",
+        "observation"
+      ],
+      "properties": {
+        "receipt_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "observation": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/commonAdvisoryObservation"
+        }
+      }
+    },
+    "resolvedReplayObservations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/resolvedReplayObservation"
+      }
+    },
+    "providerSnapshotIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_id",
+        "provider_id",
+        "implementation_identity_digest",
+        "state_schema_version",
+        "exact_scope_digest",
+        "state_generation",
+        "observation_sequence",
+        "parent_snapshot_id",
+        "content_sha256",
+        "byte_length",
+        "created_at"
+      ],
+      "properties": {
+        "snapshot_id": {},
+        "provider_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "implementation_identity_digest": {},
+        "state_schema_version": {},
+        "exact_scope_digest": {},
+        "state_generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observation_sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "parent_snapshot_id": {},
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "created_at": {}
+      }
+    },
+    "providerSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "bytes",
+        "sources"
+      ],
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/providerSnapshotIdentity"
+        },
+        "bytes": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          }
+        },
+        "sources": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
+          }
+        }
+      }
+    },
+    "sourceDispositionBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "current_disposition"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
+        },
+        "current_disposition": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/currentSourceDisposition"
+        }
+      }
+    },
+    "snapshotRestoreState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot",
+        "disposition_checkpoint",
+        "source_dispositions"
+      ],
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/providerSnapshot"
+        },
+        "disposition_checkpoint": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/restoreDispositionCheckpoint"
+        },
+        "source_dispositions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sourceDispositionBinding"
+          }
+        }
+      }
+    },
+    "sourceInfluenceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "source",
+        "active",
+        "disposition",
+        "settled_feedback",
+        "last_feedback_receipt",
+        "provider_local_effect_summary"
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/lifecycleTarget"
+        },
+        "source": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "disposition": {
+          "enum": [
+            "available",
+            "superseded",
+            "revoked",
+            "deleted",
+            "redacted",
+            "expired",
+            "unknown"
+          ]
+        },
+        "settled_feedback": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "helpful",
+            "harmful",
+            "ignored",
+            "corrected",
+            "superseded"
+          ],
+          "properties": {
+            "helpful": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "harmful": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "ignored": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "corrected": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "superseded": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "last_feedback_receipt": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider_local_effect_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        }
+      }
+    },
+    "inspectionDeliveryReceiptSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "idempotency_key"
+      ],
+      "properties": {
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        }
+      }
+    },
+    "inspectionDeliveryReceiptItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "idempotency_key",
+        "provider_receipt_digest",
+        "stable_memory_ref"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        },
+        "idempotency_key": {
+          "$ref": "#/$defs/inspectionDeliveryReceiptSelector/properties/idempotency_key"
+        },
+        "provider_receipt_digest": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "stable_memory_ref": {
+          "$ref": "#/$defs/lifecycleTargetReference/properties/reference"
+        }
+      }
+    },
+    "inspectionTraceSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_memory_ref"
+      ],
+      "properties": {
+        "stable_memory_ref": {
+          "$ref": "#/$defs/lifecycleTargetReference/properties/reference"
+        }
+      }
+    },
+    "inspectionTraceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_memory_ref",
+        "content",
+        "content_sha256",
+        "original_source"
+      ],
+      "properties": {
+        "stable_memory_ref": {
+          "$ref": "#/$defs/lifecycleTargetReference/properties/reference"
+        },
+        "content": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "$comment": "Exact emitted UTF-8 content and its complete item obey request maximum_bytes and negotiated response limits; truncation is explicit partial coverage."
+        },
+        "content_sha256": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "original_source": {
+          "anyOf": [
+            {
+              "$ref": "provider-observation-contract.schema.json#/$defs/sourceAttribution"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "content": {
+                "const": null
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "content_sha256": {
+                "const": null
+              },
+              "original_source": {
+                "const": null
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "content_sha256": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "replayAccounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applied_observations",
+        "duplicate_observations",
+        "sources_already_applied",
+        "rejected_observations",
+        "effect_unknown_observations"
+      ],
+      "properties": {
+        "applied_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duplicate_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sources_already_applied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rejected_observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "effect_unknown_observations": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   }
 }

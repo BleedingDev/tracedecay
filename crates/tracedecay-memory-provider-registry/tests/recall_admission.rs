@@ -240,11 +240,11 @@ fn provider_claims_cannot_expand_validity() -> Result<(), Box<dyn Error>> {
                 &[("superseded_at", json!("2026-08-15T00:00:00.000000Z"))],
             ),
         ),
-        // Missing source revision.
+        // Supplied empty source revision is malformed.
         candidate(
-            "no-source-revision",
+            "empty-source-revision",
             scope.clone(),
-            validity_with("current", &[("source_revision", Value::Null)]),
+            validity_with("current", &[("source_revision", json!(""))]),
         ),
         // Not a contract state.
         candidate("bogus-state", scope.clone(), validity_with("live", &[])),
@@ -337,6 +337,337 @@ fn unknown_validity_policy_is_host_owned() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn unknown_source_revision_preserves_known_temporal_truth_with_degraded_coverage()
+-> Result<(), Box<dyn Error>> {
+    let value = validity_with("current", &[("source_revision", Value::Null)]);
+    let candidate = candidate("legacy-revision", scope_value(&admitted_scope()), value);
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![candidate.clone()],
+    )?;
+    assert_eq!(admission.admitted.len(), 1);
+    assert_eq!(
+        admission.admitted[0].host_temporal_state(),
+        TemporalState::Current
+    );
+    assert!(admission.report.degraded);
+    assert!(
+        admission.admitted[0]
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("source revision unknown"))
+    );
+    let mut wire = serde_json::to_value(candidate)?;
+    wire["validity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_revision");
+    assert!(serde_json::from_value::<RecallCandidateV1>(wire).is_err());
+    Ok(())
+}
+
+#[test]
+fn lifecycle_events_apply_at_requested_time_and_clip_spanning_intervals()
+-> Result<(), Box<dyn Error>> {
+    let event = "2026-08-15T00:00:00.000000001Z";
+    let before = "2026-08-15T00:00:00.000000000Z";
+    let original = |state| {
+        candidate(
+            "original",
+            scope_value(&admitted_scope()),
+            validity_with(
+                state,
+                &[
+                    ("superseded_at", json!(event)),
+                    ("superseded_by", json!("memory:replacement")),
+                    ("valid_until", json!(event)),
+                ],
+            ),
+        )
+    };
+    let earlier = AdmittedTemporalQuery::as_of(EVALUATION_TIME, before)?;
+    let admitted = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &earlier,
+        &authorized_exact(),
+        vec![original("current")],
+    )?;
+    assert_eq!(
+        admitted.admitted.len(),
+        1,
+        "the nanosecond before replacement is still valid"
+    );
+    let stale_claim = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &earlier,
+        &authorized_exact(),
+        vec![original("superseded")],
+    )?;
+    assert!(matches!(
+        stale_claim.report.denied[0].reason,
+        RecallDenialReason::InvalidValidityRecord { .. }
+    ));
+    let boundary = AdmittedTemporalQuery::as_of(EVALUATION_TIME, event)?;
+    let denied = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &boundary,
+        &authorized_exact(),
+        vec![original("superseded")],
+    )?;
+    assert_eq!(
+        denied.report.denied[0].reason,
+        RecallDenialReason::Superseded
+    );
+
+    let spanning =
+        AdmittedTemporalQuery::interval(EVALUATION_TIME, before, "2026-08-16T00:00:00Z")?;
+    let admitted = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &spanning,
+        &authorized_exact(),
+        vec![original("superseded")],
+    )?;
+    assert_eq!(admitted.admitted.len(), 1);
+    assert_eq!(
+        admitted.admitted[0].host_temporal_state(),
+        TemporalState::Current
+    );
+    let after = AdmittedTemporalQuery::interval(EVALUATION_TIME, event, "2026-08-16T00:00:00Z")?
+        .with_include_superseded(true);
+    let denied = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &after,
+        &authorized_exact(),
+        vec![original("superseded")],
+    )?;
+    assert_eq!(
+        denied.report.denied[0].reason,
+        RecallDenialReason::Expired,
+        "include flags cannot extend explicit valid_until"
+    );
+    Ok(())
+}
+
+#[test]
+fn history_admits_expired_evidence_but_never_future_assertions() -> Result<(), Box<dyn Error>> {
+    let history = AdmittedTemporalQuery::history(EVALUATION_TIME)?;
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &history,
+        &authorized_exact(),
+        vec![
+            candidate(
+                "past",
+                scope_value(&admitted_scope()),
+                validity_with("expired", &[("valid_until", json!("2026-08-10T00:00:00Z"))]),
+            ),
+            candidate(
+                "future",
+                scope_value(&admitted_scope()),
+                validity_with("future", &[("valid_from", json!("2026-09-02T00:00:00Z"))]),
+            ),
+        ],
+    )?;
+    assert_eq!(admission.admitted.len(), 1);
+    assert_eq!(
+        admission.admitted[0].host_temporal_state(),
+        TemporalState::Expired
+    );
+    assert_eq!(admission.report.denied[0].candidate_id, "future");
+    assert_eq!(
+        admission.report.denied[0].reason,
+        RecallDenialReason::NotYetValid
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_start_retains_known_end_and_revocation_without_fabricated_history()
+-> Result<(), Box<dyn Error>> {
+    for (field, expected) in [
+        ("valid_until", RecallDenialReason::Expired),
+        ("revoked_at", RecallDenialReason::Revoked),
+    ] {
+        let unknown = || {
+            candidate(
+                "unknown-start",
+                scope_value(&admitted_scope()),
+                validity_with(
+                    "unknown",
+                    &[
+                        ("valid_from", Value::Null),
+                        (field, json!("2026-08-15T00:00:00Z")),
+                    ],
+                ),
+            )
+        };
+        let earlier = AdmittedTemporalQuery::as_of(EVALUATION_TIME, "2026-08-10T00:00:00Z")?
+            .with_unknown_validity_policy(UnknownValidityPolicy::AllowWithWarning);
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &earlier,
+            &authorized_exact(),
+            vec![unknown()],
+        )?;
+        assert_eq!(admission.admitted.len(), 1);
+        assert_eq!(
+            admission.admitted[0].host_temporal_state(),
+            TemporalState::Unknown
+        );
+        assert!(admission.report.degraded);
+        let boundary = AdmittedTemporalQuery::as_of(EVALUATION_TIME, "2026-08-15T00:00:00Z")?
+            .with_unknown_validity_policy(UnknownValidityPolicy::AllowWithWarning);
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &boundary,
+            &authorized_exact(),
+            vec![unknown()],
+        )?;
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.report.denied[0].reason, expected);
+    }
+    Ok(())
+}
+
+fn original_source_wire() -> Value {
+    json!({
+        "source": {
+            "canonical_provider_id": "codex", "canonical_session_id": "original-session-a",
+            "source_key": "original-source-key", "stable_record_id": "native-message-12",
+            "observation_id": "canonical-observation-12", "source_revision": "cache_policy_r2",
+            "content_sha256": "a".repeat(64),
+        },
+        "origin_scope": { "state": "unavailable" },
+        "source_sequence": 12,
+        "occurred_at": "2026-08-01T00:00:00.000000001Z",
+        "ingested_at": "2026-08-01T00:00:00.000000002Z",
+        "validity": {
+            "valid_from": "2026-08-01T00:00:00.000000001Z", "valid_until": null,
+            "superseded_at": null, "superseded_by": null, "revoked_at": null,
+        },
+    })
+}
+
+#[test]
+fn source_attribution_is_typed_lossless_and_never_a_hydration_authority()
+-> Result<(), Box<dyn Error>> {
+    let mut with_source = candidate(
+        "attributed",
+        scope_value(&admitted_scope()),
+        current_validity(),
+    );
+    let original = original_source_wire();
+    with_source.provenance["original_sources"] = json!([original.clone()]);
+    let wire = serde_json::to_value(&with_source)?;
+    let round_trip: RecallCandidateV1 = serde_json::from_value(wire)?;
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![round_trip],
+    )?;
+    let sources = admission.admitted[0].original_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(serde_json::to_value(&sources[0])?, original);
+    let owned = sources[0]
+        .to_owned_attribution()
+        .map_err(|reason| format!("{reason:?}"))?;
+    assert_eq!(owned.source.canonical_session_id, "original-session-a");
+    assert_eq!(
+        owned.source.source_revision.as_deref(),
+        Some("cache_policy_r2")
+    );
+    assert_eq!(
+        owned.ingested_at_utc_nanos - owned.occurred_at_utc_nanos.unwrap(),
+        1
+    );
+    assert!(matches!(
+        owned.origin_scope,
+        tracedecay_memory_provider_api::OriginScopeEvidence::Unavailable
+    ));
+    let claim = tracedecay_memory_provider_registry::ProviderItemProvenanceV1::from_candidate(
+        admission.admitted[0].candidate(),
+    );
+    assert!(
+        !claim.is_hydrated(),
+        "source parsing cannot establish host evidence"
+    );
+    let legacy = admit_recall_candidates(
+        &admitted_scope(),
+        "request",
+        &current_query(),
+        &authorized_exact(),
+        vec![candidate(
+            "legacy",
+            scope_value(&admitted_scope()),
+            current_validity(),
+        )],
+    )?;
+    assert!(legacy.admitted[0].original_sources().is_empty());
+    Ok(())
+}
+
+#[test]
+fn malformed_source_attribution_is_denied_without_losing_valid_candidates()
+-> Result<(), Box<dyn Error>> {
+    let mut non_string_revision = original_source_wire();
+    non_string_revision["source"]["source_revision"] = json!(2);
+    let mut missing_nullable = original_source_wire();
+    missing_nullable
+        .as_object_mut()
+        .unwrap()
+        .remove("occurred_at");
+    let mut bad_digest = original_source_wire();
+    bad_digest["source"]["content_sha256"] = json!("not-a-digest");
+    let mut orphan_lineage = original_source_wire();
+    orphan_lineage["validity"]["superseded_by"] = json!("replacement");
+    let mut unknown_field = original_source_wire();
+    unknown_field["host_authorized"] = json!(true);
+    let cases = [
+        json!(null),
+        json!([]),
+        json!([non_string_revision]),
+        json!([missing_nullable]),
+        json!([bad_digest]),
+        json!([orphan_lineage]),
+        json!([unknown_field]),
+        json!([original_source_wire(), original_source_wire()]),
+        Value::Array(vec![original_source_wire(); 65]),
+    ];
+    for sources in cases {
+        let mut bad = candidate("bad", scope_value(&admitted_scope()), current_validity());
+        bad.provenance["original_sources"] = sources;
+        let good = candidate("good", scope_value(&admitted_scope()), current_validity());
+        let admission = admit_recall_candidates(
+            &admitted_scope(),
+            "request",
+            &current_query(),
+            &authorized_exact(),
+            vec![bad, good],
+        )?;
+        assert_eq!(admission.admitted.len(), 1);
+        assert_eq!(admission.report.denied[0].candidate_id, "bad");
+        assert!(matches!(
+            admission.report.denied[0].reason,
+            RecallDenialReason::InvalidSourceAttribution { .. }
+        ));
+    }
+    Ok(())
+}
+
+#[test]
 fn include_flags_admit_revoked_and_superseded_with_host_state() -> Result<(), Box<dyn Error>> {
     let scope = scope_value(&admitted_scope());
     let candidates = vec![
@@ -353,7 +684,10 @@ fn include_flags_admit_revoked_and_superseded_with_host_state() -> Result<(), Bo
             scope,
             validity_with(
                 "superseded",
-                &[("superseded_at", json!("2026-08-15T00:00:00.000000Z"))],
+                &[
+                    ("superseded_at", json!("2026-08-15T00:00:00.000000Z")),
+                    ("superseded_by", json!("memory:replacement")),
+                ],
             ),
         ),
     ];

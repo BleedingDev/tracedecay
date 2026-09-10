@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tracedecay.host-comparison.events.v1",
+  "title": "Durable host-comparison action events; final lines require newline and successful fsync",
+  "type": "object",
+  "required": [
+    "format",
+    "event",
+    "case_trial_id"
+  ],
+  "properties": {
+    "format": {
+      "const": "tracedecay.host-comparison.events.v1"
+    },
+    "event": {
+      "enum": [
+        "case_begin",
+        "case_metadata",
+        "action",
+        "case_finish"
+      ]
+    },
+    "case_trial_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invocation": {
+      "type": "object"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "result": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "case_begin"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "invocation"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "case_metadata"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "metadata"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "action"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "result"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "const": "case_finish"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "result"
+        ]
+      }
+    }
+  ]
+}

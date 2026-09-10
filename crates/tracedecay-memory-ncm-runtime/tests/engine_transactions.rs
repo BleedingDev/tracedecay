@@ -8,6 +8,7 @@
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
@@ -552,4 +553,113 @@ fn real_encoder_paraphrase_journey_returns_the_matching_record_first() {
         recalled_values(&recalled.payload).first(),
         Some(&"rust-record")
     );
+}
+
+fn integrity_observation(common: bool) -> ObserveRequest {
+    let mut request = observe_request("integrity key", "retained answer", "integrity-observe");
+    if common {
+        // Opaque bytes deliberately need not contain JSON or host schema.
+        let bytes = vec![255_u8, 0, 42];
+        let sha256 = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        request.provenance["common_capsule"] =
+            json!({"version":1,"sha256":sha256,"bytes":bytes});
+    }
+    request.payload_sha256 = request.canonical_payload_sha256().unwrap();
+    request
+}
+
+fn corrupt_capsule_bytes(tempdir: &TempDir, ns: &str) {
+    let connection = Connection::open(
+        tempdir
+            .path()
+            .join("namespaces")
+            .join(ns)
+            .join("ncm.sqlite"),
+    )
+    .unwrap();
+    let stored: String = connection
+        .query_row(
+            "SELECT provenance FROM capsules WHERE record_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut provenance: Value = serde_json::from_str(&stored).unwrap();
+    provenance["common_capsule"]["bytes"][2] = json!(43);
+    connection
+        .execute(
+            "UPDATE capsules SET provenance = ?1 WHERE record_id = 1",
+            [provenance.to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn checkpoint_recovery_rejects_changed_common_capsule_bytes() {
+    let tempdir = TempDir::new().unwrap();
+    let ns = namespace(91);
+    let engine = make_engine(&tempdir);
+    assert_eq!(
+        engine.observe(&ns, integrity_observation(true)).outcome,
+        Outcome::Success
+    );
+    let checkpoint = engine.maintenance(
+        &ns,
+        MaintenanceRequest {
+            idempotency_key: "integrity-checkpoint".to_owned(),
+            kind: MaintenanceKind::Checkpoint,
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(checkpoint.outcome, Outcome::Success);
+    drop(engine);
+    corrupt_capsule_bytes(&tempdir, &ns);
+    let reopened = make_engine(&tempdir);
+    let reply = reopened.handshake(&ns);
+    assert_eq!(reply.outcome, Outcome::Corrupt, "{reply:?}");
+    assert_eq!(reply.state_generation, checkpoint.state_generation);
+}
+
+#[test]
+fn valid_opaque_and_legacy_capsules_survive_checkpoint_recovery() {
+    for common in [false, true] {
+        let tempdir = TempDir::new().unwrap();
+        let ns = namespace(92);
+        let engine = make_engine(&tempdir);
+        assert_eq!(
+            engine.observe(&ns, integrity_observation(common)).outcome,
+            Outcome::Success
+        );
+        assert_eq!(
+            engine
+                .maintenance(
+                    &ns,
+                    MaintenanceRequest {
+                        idempotency_key: "valid-checkpoint".to_owned(),
+                        kind: MaintenanceKind::Checkpoint,
+                        deadline: DEADLINE
+                    }
+                )
+                .outcome,
+            Outcome::Success
+        );
+        let before = inspect(&engine, &ns);
+        drop(engine);
+        let reopened = make_engine(&tempdir);
+        assert_eq!(reopened.handshake(&ns).outcome, Outcome::Success);
+        assert_semantic_state_eq(&before, &inspect(&reopened, &ns));
+        let reply = reopened.recall(
+            &ns,
+            RecallRequest {
+                query_text: "integrity key".to_owned(),
+                top_k: 8,
+                deadline: DEADLINE,
+            },
+        );
+        assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
+        assert!(recalled_values(&reply.payload).contains(&"retained answer"));
+    }
 }

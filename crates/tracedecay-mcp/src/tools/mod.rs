@@ -7,6 +7,7 @@ pub mod renderers;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Write as _;
+use tracedecay_contracts::retrieval::ContextMemoryContributionV1;
 
 pub use definitions::ast_grep::{
     ast_grep_available, ast_grep_diagnostics_json, ast_grep_outline_available,
@@ -52,6 +53,9 @@ pub struct ToolResult {
     /// Internal analytics metadata for the server runtime. This must never be
     /// serialized into the tool response payload.
     internal_analytics: Option<Value>,
+    /// Canonical context identities and validated request policy retained for
+    /// host recall. This sidecar is never serialized into the MCP payload.
+    context_memory_contribution: Option<ContextMemoryContributionV1>,
     /// Structural signal that the handler itself determined this call failed
     /// semantically (e.g. an edit whose `success` field is `false`), set by
     /// the handler rather than inferred later from rendered response text.
@@ -73,6 +77,7 @@ impl ToolResult {
             value,
             touched_files,
             internal_analytics: None,
+            context_memory_contribution: None,
             semantic_error: None,
             failure_message: None,
         }
@@ -82,6 +87,22 @@ impl ToolResult {
     pub fn with_internal_analytics(mut self, internal_analytics: Value) -> Self {
         self.internal_analytics = Some(internal_analytics);
         self
+    }
+
+    /// Attaches the handler's typed canonical contribution without modifying
+    /// rendered output or re-deriving identities from presentation text.
+    #[must_use]
+    pub fn with_context_memory_contribution(
+        mut self,
+        contribution: ContextMemoryContributionV1,
+    ) -> Self {
+        self.context_memory_contribution = Some(contribution);
+        self
+    }
+
+    /// Returns the internal canonical contribution, absent for ordinary tools.
+    pub fn context_memory_contribution(&self) -> Option<&ContextMemoryContributionV1> {
+        self.context_memory_contribution.as_ref()
     }
 
     pub fn internal_analytics(&self) -> Option<&Value> {
@@ -678,11 +699,50 @@ mod tests {
     }
 
     #[test]
+    fn context_memory_sidecar_is_internal_and_keeps_disabled_lane_policy() {
+        use tracedecay_contracts::memory::{
+            CognitiveRecallExclusions, CognitiveRecallTemporalQuery,
+        };
+        use tracedecay_contracts::retrieval::ContextSurfaceRequestV1;
+        use tracedecay_domain::UtcMicros;
+
+        let policy = CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history();
+        let exclusions = CognitiveRecallExclusions {
+            source_refs: vec!["original-source".to_owned()],
+            ..CognitiveRecallExclusions::default()
+        };
+        let request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
+            "task": "disabled canonical lane", "include_memory": false,
+            "temporal_query": policy, "exclusions": exclusions
+        }))
+        .expect("context policy");
+        let contribution =
+            ContextMemoryContributionV1::from_matches(&request, &[], None, None, UtcMicros(20))
+                .expect("disabled contribution preserves admitted policy");
+        let payload = json!({"content": [{"type": "text", "text": "unchanged rendered output"}]});
+        let result = ToolResult::new(payload.clone(), Vec::new())
+            .with_context_memory_contribution(contribution);
+        assert_eq!(result.value, payload);
+        let contribution = result
+            .context_memory_contribution()
+            .expect("internal sidecar");
+        assert_eq!(contribution.temporal_query(), Some(&policy));
+        assert_eq!(contribution.exclusions(), Some(&exclusions));
+        assert!(contribution.facts().is_empty());
+        assert!(contribution.temporal_coverage().is_none());
+        assert_eq!(
+            result.clone().context_memory_contribution(),
+            Some(contribution)
+        );
+    }
+
+    #[test]
     fn tool_result_constructors_keep_internal_analytics_explicit() {
         let result = ToolResult::new(json!({"content": []}), vec!["src/lib.rs".to_string()]);
         assert_eq!(result.value, json!({"content": []}));
         assert_eq!(result.touched_files, vec!["src/lib.rs"]);
         assert!(result.internal_analytics().is_none());
+        assert!(result.context_memory_contribution().is_none());
 
         let result = result.with_internal_analytics(json!({"context_memory": {"match_count": 1}}));
         assert_eq!(

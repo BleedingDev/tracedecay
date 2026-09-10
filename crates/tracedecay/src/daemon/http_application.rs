@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
+use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
 use tracedecay_contracts::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationProblem, LegalAction, RequestId, RetryDirective,
     SafeDiagnostic,
@@ -563,10 +564,14 @@ fn outer_application_request_id(
     if values.next().is_some() {
         return Err(OuterApplicationRequestIdError::DuplicateHeader);
     }
-    let curate_path = tracedecay_api::retained_route_path(
-        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::FactStoreCurate,
-    );
-    if curate_path.strip_prefix('/') != Some(tail) {
+    let operation = tail
+        .strip_prefix("retained/")
+        .and_then(RetainedSurfaceOperation::from_operation_name)
+        .ok_or(OuterApplicationRequestIdError::DisallowedOperation)?;
+    if !matches!(
+        operation.sdk_operation_contract().request_id,
+        SdkRequestIdControlV1::Required
+    ) {
         return Err(OuterApplicationRequestIdError::DisallowedOperation);
     }
     let value = value

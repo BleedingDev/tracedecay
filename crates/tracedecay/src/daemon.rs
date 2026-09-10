@@ -288,6 +288,8 @@ use http_application_router::{
     install_http_application_cold_resolver, install_remote_http_application_router,
     mount_http_application_router,
 };
+#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
+pub use retained_owner::test_context_evidence;
 mod invocation_dispatch;
 #[cfg(any(not(unix), test))]
 use invocation_dispatch::execute_portable_daemon_invocation;

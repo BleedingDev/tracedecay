@@ -303,3 +303,22 @@ budget. A topology migration keeps `NcmCognitiveSurface`, exact-scope ownership,
 readiness invalidation, access denial, and effect truth stable while replacing
 the private transport in a staged observer-first rollout with rollback to the
 last compatible provider build and state snapshot.
+
+
+## Common advisory temporal values (2026-09-10)
+
+The runtime may import only `OwnedTemporalQuery`, `RecordedValidity`,
+`TemporalEligibility`, their validation error and generated temporal/disposition
+values from the dependency-light provider API. These operate on exact numeric UTC
+nanoseconds and contain no host lookup or execution authority. Duplicating temporal
+selection in the runtime would permit Native/NCM/host boundary drift; importing the
+registry would expose host orchestration. Both alternatives are rejected.
+
+The NCM adapter uses chrono with default features disabled and only `std` to parse
+canonical RFC3339 time without precision loss. Original host source metadata stays
+in bounded opaque provenance capsules; the public adapter validates it after worker
+containment. These edges do not move model execution into the host, widen namespaces,
+or permit runtime host identity imports. The dependency policy pins exact imports;
+shared temporal/admission tests and real-provider conformance verify the behavior.
+
+A test-only registry dependency allows the NCM integration fixture to call the unchanged canonical recall builder and host admission. A separate copied parser would hide interface incompatibility; the production adapter still cannot import the registry.

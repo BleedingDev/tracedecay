@@ -240,6 +240,8 @@ pub struct RecallFixturePort {
     pub stable_memory_ref_overrides: std::collections::BTreeMap<String, Value>,
     /// Replaces the validity object of named candidates.
     pub validity_overrides: std::collections::BTreeMap<String, Value>,
+    /// Candidate field replacements for deliberately contradictory provider replies.
+    pub candidate_overrides: std::collections::BTreeMap<String, Value>,
     /// Replaces the whole candidate list with `(candidate_id, content)` pairs,
     /// every one of them in-scope and current, so a test can drive the real
     /// fabric, adapter, and port path with a candidate stream of its own
@@ -259,6 +261,7 @@ impl RecallFixturePort {
             native_score_overrides: std::collections::BTreeMap::new(),
             stable_memory_ref_overrides: std::collections::BTreeMap::new(),
             validity_overrides: std::collections::BTreeMap::new(),
+            candidate_overrides: std::collections::BTreeMap::new(),
             candidate_contents: None,
         }
     }
@@ -282,6 +285,11 @@ impl RecallFixturePort {
                 }
                 if let Some(validity) = self.validity_overrides.get(&id) {
                     candidate["validity"] = validity.clone();
+                }
+                if let Some(fields) = self.candidate_overrides.get(&id).and_then(Value::as_object) {
+                    for (field, value) in fields {
+                        candidate[field.as_str()] = value.clone();
+                    }
                 }
             }
         }

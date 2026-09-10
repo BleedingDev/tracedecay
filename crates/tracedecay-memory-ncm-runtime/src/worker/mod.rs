@@ -112,6 +112,69 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
         };
     }
     let deadline = Deadline { remaining_ms };
+    if let Some(control) = request.payload.get("common_portability") {
+        if !matches!(
+            request.op,
+            Operation::SnapshotExport | Operation::SnapshotRestore | Operation::Replay
+        ) || serde_json::to_value(request.op).ok().as_ref() != Some(&control["action"])
+        {
+            return rejected("common portability operation mismatch".to_owned());
+        }
+        if request.op == Operation::SnapshotExport {
+            let mut reply = crate::snapshot::export_to_file(engine, &request.namespace, deadline);
+            if reply.outcome == Outcome::Success {
+                reply.payload["common_portability"] = json!("snapshot_export");
+            }
+            return reply;
+        }
+        let mut control = control.clone();
+        if request.op == Operation::SnapshotRestore && control.get("snapshot_file").is_some() {
+            let Some(file) = control["snapshot_file"].as_str() else {
+                return rejected("invalid snapshot file".to_owned());
+            };
+            let Some(length) = control["byte_length"].as_u64() else {
+                return rejected("invalid snapshot length".to_owned());
+            };
+            let Some(digest) = control["content_sha256"].as_str() else {
+                return rejected("invalid snapshot digest".to_owned());
+            };
+            let bytes = match crate::snapshot::read_transport_file(
+                &engine.root,
+                &request.namespace,
+                std::path::Path::new(file),
+                length,
+                digest,
+            ) {
+                Ok(bytes) => bytes,
+                Err(reason) => return rejected(reason),
+            };
+            let Some(object) = control.as_object_mut() else {
+                return rejected("invalid snapshot control".to_owned());
+            };
+            object.remove("snapshot_file");
+            object.remove("byte_length");
+            object.remove("content_sha256");
+            object.insert("bytes".to_owned(), json!(bytes));
+        }
+        let result = engine.common_portability(&request.namespace, control, deadline);
+        hold_committed_reply(&request, &result, options);
+        return result;
+    }
+    if let Some(control) = request.payload.get("common_control") {
+        if !matches!(
+            request.op,
+            Operation::Feedback
+                | Operation::Correction
+                | Operation::Health
+                | Operation::Inspection
+                | Operation::Maintenance
+                | Operation::DeleteBySource
+        ) || serde_json::to_value(request.op).ok().as_ref() != Some(&control["action"])
+        {
+            return rejected("common control operation mismatch".to_owned());
+        }
+        return engine.common_control(&request.namespace, control.clone(), deadline);
+    }
     let result = match request.op {
         Operation::Handshake => {
             if options.encoder_ready {
@@ -146,14 +209,17 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
         }
         Operation::Recall => {
             parse_payload::<RecallPayload>(&request.payload).map_or_else(rejected, |payload| {
-                engine.recall(
-                    &request.namespace,
-                    RecallRequest {
-                        query_text: payload.query_text,
-                        top_k: payload.top_k,
-                        deadline,
-                    },
-                )
+                let recall = RecallRequest {
+                    query_text: payload.query_text,
+                    top_k: payload.top_k,
+                    deadline,
+                };
+                match payload.selection {
+                    Some(selection) => {
+                        engine.recall_selected(&request.namespace, recall, selection)
+                    }
+                    None => engine.recall(&request.namespace, recall),
+                }
             })
         }
         Operation::Feedback => {
@@ -239,6 +305,11 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
             }),
         Operation::Replay => engine.replay(&request.namespace, deadline),
     };
+    hold_committed_reply(&request, &result, options);
+    result
+}
+
+fn hold_committed_reply(request: &Request, result: &EngineReply, options: ServeOptions) {
     let replayed = result
         .payload
         .get("replayed")
@@ -251,7 +322,6 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
     {
         apply_delay(&request.payload, "test_sleep_after_commit_ms");
     }
-    result
 }
 
 fn health(engine: &NcmEngine, encoder_ready: bool) -> EngineReply {
@@ -357,6 +427,8 @@ struct ObservePayload {
 struct RecallPayload {
     query_text: String,
     top_k: usize,
+    #[serde(default)]
+    selection: Option<Value>,
 }
 
 #[derive(Deserialize)]

@@ -702,7 +702,7 @@ fn render_operations(
          \x20 readonly operation: Name; readonly operationId: string;\n\
          \x20 readonly effect: string; readonly idempotency: string;\n\
          \x20 readonly requestIdControl: \"server_minted\" | \"required\";\n\
-         \x20 readonly resultSemantics: \"schema_only\" | \"fact_store_curate_terminal\";\n\
+         \x20 readonly resultSemantics: \"schema_only\" | \"fact_store_curate_terminal\" | \"provider_control_terminal\";\n\
          \x20 readonly bindingId: string;\n\
          \x20 readonly requestSchema: { schemaId: string; revision: number };\n\
          \x20 readonly resultSchema: { schemaId: string; revision: number };\n\
@@ -1026,7 +1026,7 @@ fn render_types() -> String {
 export type RetryDirective = "never" | "same_request" | "after_delay" | "after_revalidate" | "after_reconcile" | UnknownValue;
 export type LegalAction = "correct_request" | "reauthorize" | "refresh" | "retry" | "reconcile" | "reset" | "contact_administrator" | UnknownValue;
 export type OperationTermination = "completed" | "cancelled" | "timed_out" | "failed" | "unavailable" | "partial" | "effect_unknown" | UnknownValue;
-export type EffectTermination = "completed" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
+export type EffectTermination = "completed" | "no_change" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
 export type ApplicationProblemKind = "invalid_request" | "not_found_or_not_authorized" | "conflict" | "partial_effect" | "stale" | "unsupported" | "unavailable" | "execution_failed" | "reset_required" | "saturated" | "cancelled" | "timed_out" | UnknownValue;
 export type ApplicationUnavailableClassV1 = "authority" | "backend_unavailable" | "backend_disconnected" | "backend_retryable" | UnknownValue;
 export type ApplicationExecutionFailureClassV1 = "denied" | "malformed_output" | "permanent" | UnknownValue;

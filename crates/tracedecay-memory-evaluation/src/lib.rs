@@ -27,16 +27,17 @@
 //! [`tracedecay_memory_conformance::BaselineRunOutput`]; it does not call this
 //! crate. [`provider_run_from_baseline`] converts that output plus
 //! [`BaselineAnnotations`] into run records without inferring anything the
-//! runner did not measure. The intended consumer is the Native versus NCM
-//! differential runner (`tdmem-0905`), which does not exist yet; today the only
-//! callers are this crate's integration tests, which drive the real
-//! `BaselineRunner` over the `NoMemory` and `ExplicitDocumentation` lanes. The
-//! root-crate Native lane (`native_baseline`) is not yet evaluated here.
+//! runner did not measure. [`evaluate_host_retrieval`] adds a strict join from
+//! final host delivery to these same records, including exact tokenizer recounts.
+//! The comparison preparation scripts produce inputs for that boundary; actual
+//! production host execution is supplied and verified by the downstream host
+//! fixture connection. Retrieval assessments do not measure agent task benefit.
 
 mod baseline;
 mod catalog;
 mod error;
 mod evaluate;
+mod host_retrieval;
 mod record;
 mod report;
 
@@ -52,6 +53,10 @@ pub use catalog::{
 };
 pub use error::{CatalogError, EvaluationError};
 pub use evaluate::{evaluate, nearest_rank_percentile};
+pub use host_retrieval::{
+    HostCandidateEvidence, HostContextSection, HostDeliveredContext, HostRecallEvidence,
+    HostRetrievalError, HostRetrievalReport, HostRetrievalRun, evaluate_host_retrieval,
+};
 pub use record::{
     AdmittedCandidate, CandidateLabel, CheckOutcome, CorrectionEvidence, CorruptStateEvidence,
     DiscoveryEvidence, Measured, ProvenanceState, ProviderRunIdentity, ProviderRunRecord,

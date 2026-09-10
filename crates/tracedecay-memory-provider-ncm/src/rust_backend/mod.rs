@@ -17,9 +17,9 @@ pub use tracedecay_memory_ncm_runtime::ports::StateRoot;
 use tracedecay_memory_ncm_runtime::wire::{Operation, Reply, Request};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    CanonicalPayload, CommittedEffectEvidence, FallbackDirective, OwnedProviderId,
-    OwnedVersionedId, ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply,
-    TerminalRecord,
+    CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
+    OwnedProviderId, OwnedVersionedId, ProviderDescriptor, ProviderLimits, ProviderOperation,
+    ProviderReply, TerminalRecord,
 };
 
 use crate::{
@@ -124,6 +124,21 @@ impl RustNcmWorkerOwner {
     #[must_use]
     pub fn worker_pid(&self) -> Option<u32> {
         self.client.pid()
+    }
+
+    /// Starts this owner's existing worker and proves readiness by deadline.
+    pub fn start(&self, deadline: std::time::Instant) -> Result<(), ClientError> {
+        self.client.start(deadline)
+    }
+
+    /// Requests termination; true confirms actual child reap and pipe cleanup.
+    pub fn request_stop(&self, deadline: std::time::Instant) -> Result<bool, ClientError> {
+        self.client.request_stop(deadline)
+    }
+
+    /// Forces termination and returns success only after confirmed cleanup.
+    pub fn kill(&self, deadline: std::time::Instant) -> Result<(), ClientError> {
+        self.client.kill(deadline)
     }
 
     fn request_id(&self) -> u64 {
@@ -336,6 +351,7 @@ impl RustNcmSurface {
         namespace: &NcmNamespace,
         payload: Value,
         millis: u64,
+        cancellation: CancellationToken,
     ) -> Result<Reply, ClientError> {
         let request = Request::new(
             self.worker.request_id(),
@@ -344,9 +360,11 @@ impl RustNcmSurface {
             namespace.as_str(),
             payload,
         );
-        self.worker
-            .client
-            .call(request, Duration::from_millis(millis))
+        self.worker.client.call_cancellable(
+            request,
+            Duration::from_millis(millis),
+            Arc::new(move || cancellation.is_cancelled()),
+        )
     }
 }
 
@@ -364,6 +382,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                     request,
                     code,
                     "ncm.rust.control_terminal",
+                    None,
                 );
             }
         };
@@ -387,6 +406,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             &request.namespace,
             payload,
             control.remaining_millis,
+            request.control.cancellation(),
         ) {
             Ok(reply) => reply,
             Err(error) => {
@@ -395,6 +415,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                     request,
                     client_terminal_code(&error),
                     client_diagnostic(&error),
+                    None,
                 );
             }
         };
@@ -404,6 +425,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 request,
                 outcome_terminal_code(&reply.outcome),
                 outcome_diagnostic(&reply.outcome),
+                Some(reply.state_generation),
             );
         }
         let identity = match parse_runtime_identity(&reply) {
@@ -414,6 +436,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                     request,
                     TerminalCode::StateIncompatible,
                     error_diagnostic(&error),
+                    Some(reply.state_generation),
                 );
             }
         };
@@ -425,6 +448,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                     request,
                     TerminalCode::StateIncompatible,
                     error_diagnostic(&error),
+                    Some(reply.state_generation),
                 );
             }
         };
@@ -435,6 +459,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 request,
                 TerminalCode::StateIncompatible,
                 "ncm.rust.handshake_immutable_identity_mismatch",
+                Some(reply.state_generation),
             );
         }
         if current.state_generation != candidate.state_generation {
@@ -444,6 +469,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 request,
                 TerminalCode::StaleIdentity,
                 "ncm.rust.handshake_identity_refresh_required",
+                Some(reply.state_generation),
             );
         }
         if self
@@ -455,6 +481,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 request,
                 TerminalCode::ProviderUnavailable,
                 "ncm.rust.surface_state_unavailable",
+                Some(reply.state_generation),
             );
         }
         let descriptor = self.descriptor_snapshot();
@@ -514,6 +541,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
             &call.namespace,
             payload,
             control.remaining_millis,
+            call.control.cancellation(),
         ) {
             Ok(reply) => reply,
             Err(error) => {
@@ -556,6 +584,38 @@ fn descriptor_for(
     .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))
 }
 
+/// Copies the pinned production declaration without a worker, model, or state root.
+///
+/// The descriptor generation is its registration-time value, not live state.
+/// The returned instance and eight-field limits digest must be matched against
+/// a successful fresh health response before treating the limits as negotiated.
+///
+/// # Errors
+/// Returns the same declaration/profile errors as the production surface.
+#[cfg(feature = "test-helpers")]
+pub fn production_provider_declaration_for_test()
+-> Result<(ProviderDescriptor, String, String), RustNcmError> {
+    let (algorithm, encoder) =
+        tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
+            .map_err(RustNcmError::HandshakeIdentity)?;
+    if algorithm.profile != ALGORITHM_PROFILE {
+        return Err(RustNcmError::HandshakeIdentity(
+            "production algorithm profile does not match adapter".to_owned(),
+        ));
+    }
+    let descriptor = descriptor_for(
+        &algorithm.config_sha256,
+        &encoder.model,
+        &encoder.artifact_sha256,
+        0,
+    )?;
+    let instance = implementation_version(&algorithm.config_sha256);
+    let mut digest = Sha256::new();
+    crate::digest_limits(&mut digest, descriptor.limits);
+    let limits_digest = hex_digest(&digest.finalize());
+    Ok((descriptor, instance, limits_digest))
+}
+
 fn descriptor_from_identity(
     identity: &RuntimeIdentity,
     generation: u64,
@@ -578,6 +638,7 @@ fn capability_ids() -> Result<BTreeSet<OwnedVersionedId>, RustNcmError> {
         "provider.health.v1",
         "observation.accept.v1",
         "recall.query.v1",
+        "recall.temporal.v1",
         "feedback.record.v1",
         "maintenance.run.v1",
         "inspection.read.v1",
@@ -585,6 +646,8 @@ fn capability_ids() -> Result<BTreeSet<OwnedVersionedId>, RustNcmError> {
         "deletion.by_source.v1",
         "snapshot.export.v1",
         "snapshot.restore.v1",
+        "replay.apply.v1",
+        "memory.advisory_common.v1",
     ]
     .into_iter()
     .map(|value| {
@@ -692,6 +755,7 @@ fn handshake_failure(
     request: &NcmSurfaceHandshakeRequest,
     code: TerminalCode,
     diagnostic: &'static str,
+    observed_generation: Option<u64>,
 ) -> NcmSurfaceHandshakeResponse {
     NcmSurfaceHandshakeResponse {
         terminal: surface_terminal(
@@ -700,7 +764,7 @@ fn handshake_failure(
             &request.request_id,
             request.namespace.as_str(),
             code,
-            CommittedEffectEvidence::none(None),
+            CommittedEffectEvidence::none(observed_generation),
             Some(diagnostic),
         ),
         descriptor: None,
@@ -808,7 +872,22 @@ fn client_error_reply(
 }
 
 fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply) -> ProviderReply {
-    let terminal_code = outcome_terminal_code(&reply.outcome);
+    let replay_accounting = call.operation == ProviderOperation::Replay
+        && reply
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload["common_portability"] == "replay");
+    let replay_partial = replay_accounting
+        && reply.outcome == Outcome::Success
+        && reply
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload["partial"] == true);
+    let terminal_code = if replay_partial {
+        TerminalCode::PartialEffect
+    } else {
+        outcome_terminal_code(&reply.outcome)
+    };
     let success = matches!(reply.outcome, Outcome::Success | Outcome::Empty);
     let replayed = reply
         .payload
@@ -818,9 +897,61 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
         .unwrap_or(false);
     let receipt = worker_receipt(call.operation, &reply);
     let effect = if call.operation.mutates_provider_state() {
-        if reply.outcome == Outcome::Success && replayed {
-            CommittedEffectEvidence::duplicate(
+        if reply.outcome == Outcome::Success
+            && reply
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload["no_change"] == true)
+        {
+            CommittedEffectEvidence::none(Some(call.expected_state_generation))
+        } else if replay_partial {
+            let mut committed = Vec::new();
+            let mut uncommitted = Vec::new();
+            for item in reply
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["items"].as_array())
+                .into_iter()
+                .flatten()
+            {
+                let reference = format!(
+                    "ncm.replay.item.{}.{}",
+                    item["source_sequence"].as_u64().unwrap_or(0),
+                    item["receipt_digest"].as_str().unwrap_or("invalid")
+                );
+                let acknowledged = reply
+                    .payload
+                    .as_ref()
+                    .and_then(|payload| payload["acknowledged_sequence"].as_u64())
+                    .unwrap_or(0);
+                if item["source_sequence"]
+                    .as_u64()
+                    .is_some_and(|sequence| sequence <= acknowledged)
+                {
+                    committed.push(reference);
+                } else {
+                    uncommitted.push(reference);
+                }
+            }
+            if uncommitted.is_empty() {
+                uncommitted.push("ncm.replay.page_ack".to_owned());
+            }
+            CommittedEffectEvidence::partial(
+                "ncm.replay.partition.v1",
+                call.expected_state_generation,
                 reply.state_generation,
+                committed,
+                uncommitted,
+                &receipt,
+                format!("ncm.worker.reconcile-idempotency.v1:{}", &receipt[..16]),
+                &receipt,
+            )
+            .unwrap_or_else(|_| {
+                CommittedEffectEvidence::unknown_from_reconciliation_digest([0; 32])
+            })
+        } else if reply.outcome == Outcome::Success && replayed {
+            CommittedEffectEvidence::duplicate(
+                call.expected_state_generation,
                 call.idempotency_key.as_deref().unwrap_or("ncm-no-key"),
                 format!("ncm.engine.operation.{}", &receipt[..16]),
                 &receipt,
@@ -853,7 +984,7 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
     } else {
         CommittedEffectEvidence::none(Some(call.expected_state_generation))
     };
-    let payload = if success {
+    let payload = if success || (replay_accounting && reply.outcome == Outcome::EffectUnknown) {
         reply
             .payload
             .as_ref()
@@ -861,7 +992,11 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
     } else {
         None
     };
-    let diagnostic = (!success).then(|| worker_diagnostic(&reply));
+    let diagnostic = if replay_partial {
+        Some("ncm.rust.replay_partial")
+    } else {
+        (!success).then(|| worker_diagnostic(&reply))
+    };
     ProviderReply {
         terminal: surface_terminal(
             provider,
@@ -875,13 +1010,16 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
         payload,
         warnings: Vec::new(),
         extensions: Vec::new(),
-        state_generation: reply
-            .state_generation
-            .max(if call.operation.mutates_provider_state() {
-                0
-            } else {
-                call.expected_state_generation
-            }),
+        state_generation: (if replayed {
+            call.expected_state_generation
+        } else {
+            reply.state_generation
+        })
+        .max(if call.operation.mutates_provider_state() {
+            0
+        } else {
+            call.expected_state_generation
+        }),
     }
 }
 
@@ -915,6 +1053,40 @@ fn translate_payload(call: &NcmSurfaceCall) -> Result<Value, &'static str> {
     let value: Value =
         serde_json::from_slice(&call.payload.bytes).map_err(|_| "ncm.rust.payload_invalid_json")?;
     let object = value.as_object().ok_or("ncm.rust.payload_not_object")?;
+    if let Some(common) = object.get("common_portability") {
+        let mut common = common.clone();
+        if call.operation.mutates_provider_state() {
+            common["idempotency_key"] = json!(required_key(call)?);
+        }
+        if call.operation == ProviderOperation::Replay {
+            let items = common["items"]
+                .as_array_mut()
+                .ok_or("ncm.rust.replay_items_missing")?;
+            for item in items {
+                if item["observation"].is_null() {
+                    continue;
+                }
+                let observation = item["observation"]
+                    .as_object()
+                    .ok_or("ncm.rust.replay_observation_missing")?;
+                let mut translated = translate_observe(call, observation)?;
+                translated["idempotency_key"] = item["delivery_key"].clone();
+                item["observation"] = translated;
+            }
+        }
+        return Ok(json!({"common_portability": common}));
+    }
+    if let Some(common) = object.get("common_control") {
+        let mut common = common.clone();
+        if call.operation.mutates_provider_state() {
+            common["idempotency_key"] = json!(required_key(call)?);
+        }
+        if let Some(replacement) = common.get("replacement").and_then(Value::as_object) {
+            let replacement = translate_observe(call, replacement)?;
+            common["replacement"] = replacement;
+        }
+        return Ok(json!({"common_control": common}));
+    }
     match call.operation {
         ProviderOperation::Handshake => Err("ncm.rust.handshake_wrong_port"),
         ProviderOperation::Health
@@ -927,7 +1099,11 @@ fn translate_payload(call: &NcmSurfaceCall) -> Result<Value, &'static str> {
             let top_k = u64_at(object, &["top_k", "maximum_candidates"])
                 .unwrap_or(5)
                 .min(16);
-            Ok(json!({"query_text": query, "top_k": top_k}))
+            let mut payload = json!({"query_text": query, "top_k": top_k});
+            if let Some(selection) = object.get("selection") {
+                payload["selection"] = selection.clone();
+            }
+            Ok(payload)
         }
         ProviderOperation::Feedback => {
             let records = object
@@ -1071,6 +1247,12 @@ fn observation_source(
 }
 
 fn observation_text(kind: &str, payload: &Map<String, Value>) -> Option<(String, String)> {
+    if let (Some(key), Some(value)) = (
+        payload.get("_ncm_key_text").and_then(Value::as_str),
+        payload.get("_ncm_value_text").and_then(Value::as_str),
+    ) {
+        return Some((key.to_owned(), value.to_owned()));
+    }
     let nested = payload
         .get("payload")
         .and_then(Value::as_object)
@@ -1140,7 +1322,11 @@ fn observe_digest(
     let affect = serde_json::to_string(affect)?;
     let surprise = serde_json::to_string(&surprise)?;
     let intensity = serde_json::to_string(&intensity)?;
-    let provenance = serde_json::to_string(provenance)?;
+    let mut effect_provenance = provenance.clone();
+    if let Some(object) = effect_provenance.as_object_mut() {
+        object.remove("delivery_capsule");
+    }
+    let provenance = serde_json::to_string(&effect_provenance)?;
     let bytes = format!(
         "{{\"source\":{source},\"key_text\":{key_text},\"value_text\":{value_text},\"affect\":{affect},\"surprise\":{surprise},\"intensity\":{intensity},\"provenance\":{provenance}}}"
     );
@@ -1201,6 +1387,7 @@ fn outcome_terminal_code(outcome: &Outcome) -> TerminalCode {
         Outcome::Success => TerminalCode::Success,
         Outcome::Empty => TerminalCode::SuccessZeroResults,
         Outcome::Rejected(RejectReason::IdempotencyConflict) => TerminalCode::Conflict,
+        Outcome::Rejected(RejectReason::SourceRevoked) => TerminalCode::Unauthorized,
         Outcome::Rejected(RejectReason::InvalidRequest(_) | RejectReason::UnknownRecord(_)) => {
             TerminalCode::InvalidRequest
         }
@@ -1226,6 +1413,7 @@ fn outcome_diagnostic(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Success | Outcome::Empty => "ncm.rust.success",
         Outcome::Rejected(RejectReason::IdempotencyConflict) => "ncm.rust.idempotency_conflict",
+        Outcome::Rejected(RejectReason::SourceRevoked) => "ncm.rust.source_revoked",
         Outcome::Rejected(_) => "ncm.rust.request_rejected",
         Outcome::Busy => "ncm.rust.worker_busy",
         Outcome::Cancelled => "ncm.rust.worker_cancelled",
@@ -1282,14 +1470,29 @@ fn error_diagnostic(error: &RustNcmError) -> &'static str {
 
 fn worker_receipt(operation: ProviderOperation, reply: &Reply) -> String {
     let mut payload = reply.payload.clone().unwrap_or(Value::Null);
+    let mut generation = reply.state_generation;
+    if matches!(
+        operation,
+        ProviderOperation::DeleteBySource
+            | ProviderOperation::Maintenance
+            | ProviderOperation::SnapshotRestore
+    ) {
+        if let Some(basis) = payload.get("_retained_receipt").cloned() {
+            if let Some(original_generation) = basis["generation"].as_u64() {
+                generation = original_generation;
+                payload = basis["payload"].clone();
+            }
+        }
+    }
     if let Some(object) = payload.as_object_mut() {
         object.remove("replayed");
+        object.remove("common_observation");
     }
     let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
     let mut digest = Sha256::new();
     digest.update(RECEIPT_DOMAIN);
     digest_field(&mut digest, operation.as_wire().as_bytes());
-    digest.update(reply.state_generation.to_be_bytes());
+    digest.update(generation.to_be_bytes());
     digest_field(&mut digest, &payload_bytes);
     hex_digest(&digest.finalize())
 }
@@ -1316,4 +1519,80 @@ fn hex_digest(value: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(test)]
+mod source_revocation_tests {
+    use super::*;
+
+    #[test]
+    fn revocation_is_unauthorized_without_reclassifying_invalid_requests() {
+        let revoked = Outcome::Rejected(RejectReason::SourceRevoked);
+        assert_eq!(outcome_terminal_code(&revoked), TerminalCode::Unauthorized);
+        assert_eq!(outcome_diagnostic(&revoked), "ncm.rust.source_revoked");
+        let malformed = Outcome::Rejected(RejectReason::InvalidRequest("invalid field".into()));
+        assert_eq!(
+            outcome_terminal_code(&malformed),
+            TerminalCode::InvalidRequest
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod failed_handshake_generation_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_preserves_only_observed_generation_and_never_readiness() {
+        let request = NcmSurfaceHandshakeRequest {
+            registration_revision: 1,
+            namespace: NcmNamespace("a1".repeat(32)),
+            request_id: "request".into(),
+            required_capabilities: BTreeSet::new(),
+            host_limits: ProviderLimits {
+                request_bytes: 4096,
+                response_bytes: 4096,
+                observation_batch_items: 1,
+                recall_candidates: 1,
+                concurrent_operations: 1,
+                operation_millis: 1000,
+                snapshot_bytes: 4096,
+                inspection_items: 1,
+            },
+            control: tracedecay_memory_provider_api::OperationControl::new(
+                i64::MAX,
+                1000,
+                CancellationToken::default(),
+            ),
+            challenge_nonce: [0; 32],
+        };
+        for observed in [None, Some(0), Some(1), Some(9)] {
+            let response = handshake_failure(
+                &OwnedProviderId::new(NCM_PROVIDER_ID).unwrap(),
+                &request,
+                TerminalCode::ResetRequired,
+                "ncm.rust.state_corrupt",
+                observed,
+            );
+            assert_eq!(
+                response.terminal.terminal_code(),
+                TerminalCode::ResetRequired
+            );
+            let effect = response.terminal.committed_effect();
+            assert_eq!(
+                effect.state(),
+                tracedecay_memory_provider_api::contract::CommittedEffectState::None
+            );
+            assert_eq!(effect.state_generation_before(), observed);
+            assert_eq!(effect.state_generation_after(), observed);
+            assert!(effect.provider_receipt_sha256().is_none());
+            assert!(response.descriptor.is_none());
+            assert!(response.provider_instance_id.is_none());
+            assert!(response.namespace.is_none());
+            assert!(response.effective_limits.is_none());
+            assert!(response.ready_receipt_sha256.is_none());
+            assert!(response.challenge_response_sha256.is_none());
+        }
+    }
 }

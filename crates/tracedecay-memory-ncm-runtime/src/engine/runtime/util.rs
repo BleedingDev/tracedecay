@@ -46,8 +46,35 @@ pub(super) fn lookup_replay(
         ));
     }
     let mut replay = durable.reply;
+    attach_observation_delivery(handle, &mut replay)?;
     mark_replayed(&mut replay.payload);
     Ok(Some(replay))
+}
+
+pub(super) fn attach_observation_delivery(
+    handle: &NamespaceHandle,
+    reply: &mut EngineReply,
+) -> Result<(), EngineReply> {
+    let Some(id) = reply.payload["record_id"].as_u64() else {
+        return Ok(());
+    };
+    let Some(capsule) = handle
+        .store
+        .capsule(RecordId(id))
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+    else {
+        return Ok(());
+    };
+    if capsule.status == crate::store::CapsuleStatus::Revoked {
+        return Ok(());
+    }
+    let provenance: Value = serde_json::from_str(&capsule.provenance)
+        .map_err(|_| corrupt_reply(handle.commit_seq, "invalid retained observation delivery"))?;
+    if provenance.get("delivery_capsule").is_some() {
+        reply.payload["common_observation"] =
+            json!({"record_id": id, "source": capsule.source_id.0, "provenance": provenance});
+    }
+    Ok(())
 }
 
 fn mark_replayed(payload: &mut Value) {
@@ -291,6 +318,42 @@ pub(super) fn core_reply(error: CoreError, commit_seq: u64) -> EngineReply {
     }
 }
 
+/// Validates the integrity wrapper without interpreting opaque host evidence.
+pub(super) fn validate_common_capsule(provenance: &Value) -> Result<(), StoreError> {
+    let Some(capsule) = provenance.get("common_capsule") else {
+        return Ok(());
+    };
+    let corrupt = || StoreError::Corrupt("common capsule integrity mismatch".to_owned());
+    if capsule["version"].as_u64() != Some(1) {
+        return Err(corrupt());
+    }
+    let values = capsule["bytes"].as_array().ok_or_else(corrupt)?;
+    if values.len() > 131_072 {
+        return Err(corrupt());
+    }
+    let digest = capsule["sha256"].as_str().ok_or_else(corrupt)?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(corrupt());
+    }
+    let bytes = values
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(corrupt)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if sha256_hex(&bytes) != digest {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
 pub(super) fn store_reply(error: StoreError, commit_seq: u64) -> EngineReply {
     match error {
         StoreError::Busy => EngineReply::new(Outcome::Busy, commit_seq, Value::Null),
@@ -304,6 +367,7 @@ pub(super) fn store_reply(error: StoreError, commit_seq: u64) -> EngineReply {
         StoreError::IdempotencyConflict => {
             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
         }
+        StoreError::SourceRevoked => EngineReply::rejected(RejectReason::SourceRevoked, commit_seq),
         StoreError::InvalidInput(reason) | StoreError::InvalidNamespace(reason) => {
             EngineReply::rejected(RejectReason::InvalidRequest(reason), commit_seq)
         }

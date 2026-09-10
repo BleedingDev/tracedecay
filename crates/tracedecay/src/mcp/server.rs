@@ -479,6 +479,8 @@ pub struct McpServer {
     _memory_provider_host_mount: Option<MemoryProviderHostMount>,
     #[cfg(feature = "memory-provider-host")]
     _observation_journey_mount: Vec<ObservationJourneyMount>,
+    #[cfg(feature = "memory-provider-host")]
+    provider_control_mount: Option<ProviderControlMount>,
     /// Retains the cognitive-recall route so session recall ports can be
     /// minted against this project server's exact scope and admission ledger.
     #[cfg(feature = "memory-provider-host")]
@@ -868,6 +870,8 @@ impl McpServer {
             #[cfg(feature = "memory-provider-host")]
             observation_journey_mount,
             #[cfg(feature = "memory-provider-host")]
+            provider_control_mount,
+            #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount,
             project_server_live,
             #[cfg(any(test, feature = "test-transport"))]
@@ -1171,6 +1175,8 @@ impl McpServer {
             #[cfg(feature = "memory-provider-host")]
             _observation_journey_mount: observation_journey_mount,
             #[cfg(feature = "memory-provider-host")]
+            provider_control_mount,
+            #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount,
             project_server_live,
             project_server_lifecycle: ProjectServerResponseLifecycle::default(),
@@ -1419,6 +1425,8 @@ impl McpServer {
                     .map(|mounted| Arc::clone(&mounted.service)),
                 project_workflow_index,
                 project_lcm: self.project_lcm_authority.clone(),
+                #[cfg(feature = "memory-provider-host")]
+                provider_control: self.provider_control_mount.clone(),
                 invocation_service: self.daemon_invocation_service.clone(),
             },
         )

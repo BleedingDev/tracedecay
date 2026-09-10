@@ -40,8 +40,14 @@ pub fn sync_directory(dir: &Path, policy: DirectorySyncPolicy) -> io::Result<()>
     }
     #[cfg(not(unix))]
     {
-        let _ = (dir, policy);
-        Ok(())
+        let _ = dir;
+        match policy {
+            DirectorySyncPolicy::Strict => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "strict directory synchronization is unsupported on this platform",
+            )),
+            DirectorySyncPolicy::TolerateUnsupported => Ok(()),
+        }
     }
 }
 
@@ -162,6 +168,21 @@ fn normalize_no_follow_error(error: io::Error) -> io::Error {
 #[cfg(not(unix))]
 fn normalize_no_follow_error(error: io::Error) -> io::Error {
     error
+}
+
+/// Open a regular file for bounded caller-owned reads. Empty regular files
+/// are valid; final symlinks, reparse points, directories and FIFOs are not.
+/// The handle check follows the nonblocking, no-follow open, so replacing a
+/// pathname with a FIFO cannot park an origin-capture worker in `open`.
+pub fn open_regular_read_no_follow(path: &Path) -> io::Result<File> {
+    let file = open_no_follow(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Read a whole regular file of at most `maximum` bytes, or `None` when
@@ -767,7 +788,61 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{DirectorySyncPolicy, atomic_write_prepared};
+    use super::{DirectorySyncPolicy, atomic_write_prepared, open_regular_read_no_follow};
+
+    #[cfg(not(unix))]
+    #[test]
+    fn strict_directory_sync_rejects_unsupported_platforms() {
+        let root = tempfile::tempdir().expect("directory sync fixture");
+        let error = super::sync_directory(root.path(), DirectorySyncPolicy::Strict)
+            .expect_err("strict sync cannot claim unsupported durability");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        super::sync_directory(root.path(), DirectorySyncPolicy::TolerateUnsupported)
+            .expect("unsupported directory sync remains tolerated");
+    }
+
+    #[test]
+    fn regular_read_opener_accepts_empty_files_and_rejects_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        fs::write(&empty, []).unwrap();
+        assert_eq!(
+            open_regular_read_no_follow(&empty)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            open_regular_read_no_follow(root.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_read_opener_rejects_symlinks_and_fifos_without_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"source").unwrap();
+        let link = root.path().join("link");
+        symlink(&file, &link).unwrap();
+        assert_eq!(
+            open_regular_read_no_follow(&link).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let fifo = root.path().join("fifo");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `native` is a live NUL-terminated path for this fixture.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            open_regular_read_no_follow(&fifo).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 
     fn deny_writes(path: &Path) {
         let mut permissions = fs::metadata(path).expect("staging metadata").permissions();

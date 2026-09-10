@@ -385,3 +385,56 @@ fn cursor_ledger_identity_keeps_canonical_values_typed() {
             if receipt_id.as_str() == "receipt.ledger"
     ));
 }
+
+#[test]
+fn recent_observation_windows_bound_rows_without_assuming_contiguous_sequences() {
+    assert!(ObservationRecentWindowRequest::new(0).is_err());
+    assert!(ObservationRecentWindowRequest::new(4097).is_err());
+    assert_eq!(
+        ObservationRecentWindowRequest::new(4096).unwrap().limit(),
+        4096
+    );
+    let request = ObservationRecentWindowRequest::new(2).unwrap();
+    assert_eq!(
+        ObservationRecentWindowV1::from_descending_sequences(request, &[]).unwrap(),
+        None
+    );
+    assert_eq!(
+        ObservationRecentWindowV1::from_descending_sequences(request, &[300, 90, 7]).unwrap(),
+        Some(ObservationRecentWindowV1 {
+            first_sequence: 90,
+            last_sequence: 300,
+            has_older: true
+        })
+    );
+    assert_eq!(
+        ObservationRecentWindowV1::from_descending_sequences(request, &[300, 90]).unwrap(),
+        Some(ObservationRecentWindowV1 {
+            first_sequence: 90,
+            last_sequence: 300,
+            has_older: false
+        })
+    );
+    for sequences in [
+        &[0][..],
+        &[90, 300][..],
+        &[300, 300][..],
+        &[300, 90, 7, 1][..],
+    ] {
+        assert!(
+            ObservationRecentWindowV1::from_descending_sequences(request, sequences).is_err(),
+            "{sequences:?}"
+        );
+    }
+    for (first_sequence, last_sequence) in [(0, 1), (2, 1)] {
+        assert!(
+            ObservationRecentWindowV1 {
+                first_sequence,
+                last_sequence,
+                has_older: false
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}

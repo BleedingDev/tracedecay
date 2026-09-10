@@ -62,6 +62,7 @@ impl Operation {
                 | Self::Maintenance
                 | Self::DeleteBySource
                 | Self::SnapshotRestore
+                | Self::Replay
         )
     }
 }

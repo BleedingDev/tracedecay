@@ -1024,6 +1024,10 @@ struct CodexDiscoverySourceKey {
 }
 
 const EXACT_HOOK_DISCOVERY_UNITS_PER_CALL: usize = 64;
+// Match one exact-hook slice's structural-work ceiling. Unlike retained
+// ingestion discovery, a live lookup must finish both roots before succeeding.
+const LIVE_SESSION_DISCOVERY_ENTRIES: usize =
+    EXACT_HOOK_DISCOVERY_UNITS_PER_CALL * (MAX_SCAN_DEPTH as usize + 2);
 const MAX_EXACT_HOOK_SOURCE_AUTHORITIES: usize = 8;
 const MAX_EXACT_HOOK_SESSION_REQUESTS: usize = 64;
 
@@ -1032,6 +1036,46 @@ pub struct CodexExactSessionLookupOutcome {
     pub source_deferred: bool,
     #[cfg(test)]
     pub files_considered: u64,
+}
+
+/// A strict native locator and the source identity whose header was validated.
+/// This guard grants no history authority. The live origin caller must compare
+/// it again after capture and before registering the locator or live boundary.
+pub struct CodexLiveSessionTranscript {
+    path: PathBuf,
+    native_identity: crate::runtime::source::JsonlNativeFileIdentity,
+    source_identity: [u8; 32],
+}
+
+impl CodexLiveSessionTranscript {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Compare the current no-follow source to the exact header validation
+    /// generation. The retained evidence includes native file identity, length,
+    /// mtime and ctime on Unix; a same-inode rewrite therefore invalidates it.
+    pub fn matches_current_source(
+        &self,
+        deadline: std::time::Instant,
+    ) -> TranscriptIngestResult<bool> {
+        check_live_codex_deadline(deadline)?;
+        let current = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&self.path)
+            .map_err(|error| {
+                live_codex_scan_io("reopen guarded live Codex source", &self.path, error)
+            })?;
+        let metadata = current.metadata().map_err(|error| {
+            live_codex_scan_io("stat guarded live Codex source", &self.path, error)
+        })?;
+        let matches = crate::runtime::source::jsonl_native_file_identity(&current, &metadata)
+            == Some(self.native_identity)
+            && codex_corpus_identity(&self.path, &metadata)? == self.source_identity
+            && std::fs::canonicalize(&self.path).map_err(|error| {
+                live_codex_scan_io("resolve guarded live Codex source", &self.path, error)
+            })? == self.path;
+        check_live_codex_deadline(deadline)?;
+        Ok(matches)
+    }
 }
 
 struct CodexExactSessionPathAuthority {
@@ -1216,6 +1260,254 @@ impl CodexSource {
             sessions_dir: self.sessions_dir.clone(),
             archived_sessions_dir: self.archived_sessions_dir.clone(),
         }
+    }
+
+    /// Find a native SessionStart source without trusting an ingest row or a
+    /// filename as session identity. The caller owns the CPU permit and must
+    /// capture its live boundary separately, then revalidate the returned guard
+    /// before using the locator; a returned guard grants no history authority.
+    ///
+    /// Both configured native roots must be completely and stably enumerated
+    /// under `deadline`. This lock-free lookup intentionally does not use the
+    /// retained exact-hook cache: a cached hit can precede scan completion.
+    /// The walk allows at most 512 directory entries, plus their bounded parent
+    /// bookkeeping. Larger corpora can return `None` on every Start; this method
+    /// neither retains progress nor claims partial coverage is unique.
+    pub fn find_live_session_transcript(
+        &self,
+        native_session: &str,
+        project_root: &Path,
+        deadline: std::time::Instant,
+    ) -> TranscriptIngestResult<Option<CodexLiveSessionTranscript>> {
+        check_live_codex_deadline(deadline)?;
+        if native_session.is_empty()
+            || native_session.len() > 256
+            || !native_session
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !project_root.is_absolute()
+        {
+            return Ok(None);
+        }
+        let project_root = std::fs::canonicalize(project_root).map_err(|error| {
+            live_codex_scan_io("resolve live Codex project", project_root, error)
+        })?;
+        if !project_root.is_dir() {
+            return Ok(None);
+        }
+        let bounds =
+            TranscriptDiscoveryBounds::from_discovered_units(EXACT_HOOK_DISCOVERY_UNITS_PER_CALL);
+        let mut queued = VecDeque::new();
+        let mut roots = Vec::new();
+        let mut directories = Vec::new();
+        let mut work = 0_usize;
+        let mut charged = 0_u64;
+        let mut candidate = None;
+
+        for configured in [&self.sessions_dir, &self.archived_sessions_dir] {
+            check_live_codex_deadline(deadline)?;
+            match std::fs::symlink_metadata(configured) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    roots.push((configured.clone(), None));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(live_codex_scan_io(
+                        "stat live Codex root",
+                        configured,
+                        error,
+                    ));
+                }
+            };
+            let canonical = std::fs::canonicalize(configured).map_err(|error| {
+                live_codex_scan_io("resolve live Codex root", configured, error)
+            })?;
+            if path_byte_len(&canonical) > bounds.max_path_bytes {
+                return Ok(None);
+            }
+            roots.push((configured.clone(), Some(canonical.clone())));
+            queued.push_back((canonical.clone(), canonical, 0_u8));
+        }
+
+        while let Some((directory, root, depth)) = queued.pop_front() {
+            check_live_codex_deadline(deadline)?;
+            if directories.len() >= MAX_BUCKET_DIRS {
+                return Ok(None);
+            }
+            let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+                live_codex_scan_io("stat live Codex directory", &directory, error)
+            })?;
+            if !metadata.file_type().is_dir()
+                || std::fs::canonicalize(&directory).map_err(|error| {
+                    live_codex_scan_io("resolve live Codex directory", &directory, error)
+                })? != directory
+            {
+                return Ok(None);
+            }
+            let identity = codex_corpus_identity(&directory, &metadata)?;
+            directories.push((directory.clone(), identity));
+            let mut entries = std::fs::read_dir(&directory).map_err(|error| {
+                live_codex_scan_io("enumerate live Codex directory", &directory, error)
+            })?;
+            loop {
+                check_live_codex_deadline(deadline)?;
+                // Never enumerate another entry after spending the full slice,
+                // even when the next entry might be EOF.
+                if work >= LIVE_SESSION_DISCOVERY_ENTRIES {
+                    return Ok(None);
+                }
+                let Some(entry) = entries.next() else { break };
+                work += 1;
+                let entry = entry.map_err(|error| {
+                    live_codex_scan_io("read live Codex entry", &directory, error)
+                })?;
+                let path = entry.path();
+                let charge =
+                    candidate_charge(&path, std::mem::size_of::<std::fs::Metadata>() as u64)?;
+                charged = charged.saturating_add(charge);
+                if path_byte_len(&path) > bounds.max_path_bytes
+                    || charged > bounds.max_discovery_bytes
+                {
+                    return Ok(None);
+                }
+                let kind = entry
+                    .file_type()
+                    .map_err(|error| live_codex_scan_io("stat live Codex entry", &path, error))?;
+                // A skipped link could hide a second locator. This strict walk
+                // cannot establish coverage of any tree containing one.
+                if kind.is_symlink() {
+                    return Ok(None);
+                }
+                if kind.is_dir() {
+                    if depth >= MAX_SCAN_DEPTH {
+                        return Ok(None);
+                    }
+                    queued.push_back((path, root.clone(), depth + 1));
+                    continue;
+                }
+                let matches = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.strip_prefix("rollout-")
+                            .and_then(|stem| stem.strip_suffix(".jsonl"))
+                            .is_some_and(|stem| {
+                                stem == native_session
+                                    || stem
+                                        .strip_suffix(native_session)
+                                        .is_some_and(|prefix| prefix.ends_with('-'))
+                            })
+                    });
+                if matches {
+                    if !kind.is_file() || candidate.is_some() {
+                        return Ok(None);
+                    }
+                    candidate = Some((path, root.clone()));
+                }
+            }
+        }
+        let Some((path, root)) = candidate else {
+            return Ok(None);
+        };
+        check_live_codex_deadline(deadline)?;
+        if std::fs::canonicalize(&path)
+            .map_err(|error| live_codex_scan_io("resolve live Codex candidate", &path, error))?
+            != path
+            || !path.starts_with(&root)
+        {
+            return Ok(None);
+        }
+        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path)
+            .map_err(|error| live_codex_scan_io("open live Codex candidate", &path, error))?;
+        let initial = file.metadata().map_err(|error| {
+            live_codex_scan_io("stat live Codex candidate handle", &path, error)
+        })?;
+        let Some(cwd) = meta::live_session_meta_cwd(&file, native_session, deadline)? else {
+            return Ok(None);
+        };
+        if !cwd.is_absolute() || path_byte_len(&cwd) > bounds.max_path_bytes {
+            return Ok(None);
+        }
+        check_live_codex_deadline(deadline)?;
+        let cwd = std::fs::canonicalize(&cwd)
+            .map_err(|error| live_codex_scan_io("resolve live Codex cwd", &cwd, error))?;
+        if !cwd.starts_with(&project_root) || !cwd.is_dir() {
+            return Ok(None);
+        }
+        // Prefix containment alone would admit a nested independent checkout.
+        // Bound ancestor checks as well as source enumeration; never invoke git.
+        let mut checkout_cwd = cwd.as_path();
+        let mut ancestors = 0_usize;
+        while checkout_cwd != project_root {
+            check_live_codex_deadline(deadline)?;
+            ancestors += 1;
+            if ancestors > LIVE_SESSION_DISCOVERY_ENTRIES {
+                return Ok(None);
+            }
+            let git_marker = checkout_cwd.join(".git");
+            match std::fs::symlink_metadata(&git_marker) {
+                Ok(_) => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(live_codex_scan_io(
+                        "check live Codex checkout",
+                        &git_marker,
+                        error,
+                    ));
+                }
+            }
+            let Some(parent) = checkout_cwd.parent() else {
+                return Ok(None);
+            };
+            checkout_cwd = parent;
+        }
+
+        // Revalidate the full scanned namespace, including roots absent when
+        // enumeration began. New/moved sources make uniqueness unproven.
+        for (configured, canonical) in roots {
+            check_live_codex_deadline(deadline)?;
+            match (std::fs::symlink_metadata(&configured), canonical) {
+                (Err(error), None) if error.kind() == std::io::ErrorKind::NotFound => {}
+                (Ok(metadata), Some(canonical)) if metadata.file_type().is_dir() => {
+                    if std::fs::canonicalize(&configured).map_err(|error| {
+                        live_codex_scan_io("revalidate live Codex root", &configured, error)
+                    })? != canonical
+                    {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        for (directory, expected) in directories {
+            check_live_codex_deadline(deadline)?;
+            let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+                live_codex_scan_io("revalidate live Codex directory", &directory, error)
+            })?;
+            if !metadata.file_type().is_dir()
+                || codex_corpus_identity(&directory, &metadata)? != expected
+            {
+                return Ok(None);
+            }
+        }
+        check_live_codex_deadline(deadline)?;
+        if !live_codex_candidate_unchanged(&path, &file, &initial, deadline)? {
+            return Ok(None);
+        }
+        let Some(native_identity) =
+            crate::runtime::source::jsonl_native_file_identity(&file, &initial)
+        else {
+            return Ok(None);
+        };
+        let source_identity = codex_corpus_identity(&path, &initial)?;
+        check_live_codex_deadline(deadline)?;
+        Ok(Some(CodexLiveSessionTranscript {
+            path,
+            native_identity,
+            source_identity,
+        }))
     }
 
     /// Advances one bounded retained discovery slice and resolves the exact
@@ -2431,6 +2723,60 @@ fn retained_scan_step(
     })
 }
 
+fn live_codex_candidate_unchanged(
+    path: &Path,
+    file: &std::fs::File,
+    initial: &std::fs::Metadata,
+    deadline: std::time::Instant,
+) -> TranscriptIngestResult<bool> {
+    check_live_codex_deadline(deadline)?;
+    let Some(native_identity) = crate::runtime::source::jsonl_native_file_identity(file, initial)
+    else {
+        return Ok(false);
+    };
+    let initial_identity = codex_corpus_identity(path, initial)?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| live_codex_scan_io("revalidate live Codex handle", path, error))?;
+    let current = tracedecay_private_fs::framed_log::open_regular_read_no_follow(path)
+        .map_err(|error| live_codex_scan_io("reopen live Codex candidate", path, error))?;
+    let current_metadata = current
+        .metadata()
+        .map_err(|error| live_codex_scan_io("stat live Codex reopened handle", path, error))?;
+    if crate::runtime::source::jsonl_native_file_identity(&current, &current_metadata)
+        != Some(native_identity)
+        || codex_corpus_identity(path, &final_metadata)? != initial_identity
+        || codex_corpus_identity(path, &current_metadata)? != initial_identity
+        || std::fs::canonicalize(path)
+            .map_err(|error| live_codex_scan_io("revalidate live Codex path", path, error))?
+            != path
+    {
+        return Ok(false);
+    }
+    check_live_codex_deadline(deadline)?;
+    Ok(true)
+}
+
+fn live_codex_scan_io(
+    operation: &'static str,
+    path: &Path,
+    source: std::io::Error,
+) -> TranscriptIngestError {
+    TranscriptIngestError::ScanIo {
+        operation,
+        path: path.to_owned(),
+        source,
+    }
+}
+
+fn check_live_codex_deadline(deadline: std::time::Instant) -> TranscriptIngestResult<()> {
+    if std::time::Instant::now() >= deadline {
+        Err(TranscriptIngestError::Cancelled { provider: PROVIDER })
+    } else {
+        Ok(())
+    }
+}
+
 fn retain_active_file(
     files: &mut BinaryHeap<Reverse<CodexFileIdentity>>,
     candidate: CodexFileIdentity,
@@ -2865,5 +3211,322 @@ impl TranscriptSource for CodexSource {
         preflight_and_parse_new(PROVIDER, path, prev, max_new_bytes, || {
             self.parse_new(path, prev, project_root, max_new_bytes)
         })
+    }
+}
+
+#[cfg(test)]
+mod live_session_locator_tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::{Duration, Instant};
+
+    const NATIVE_ID: &str = "0198a011-1234-5678-abcd-0123456789ab";
+
+    fn fixture() -> (tempfile::TempDir, PathBuf, CodexSource) {
+        let home = tempfile::tempdir().expect("fixture home");
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).expect("fixture project");
+        std::fs::create_dir(project.join(".git")).expect("checkout marker");
+        let project = project.canonicalize().expect("canonical fixture project");
+        let source = CodexSource::with_home(home.path());
+        (home, project, source)
+    }
+
+    fn write_rollout(directory: &Path, prefix: &str, payload: serde_json::Value) -> PathBuf {
+        std::fs::create_dir_all(directory).expect("rollout directory");
+        let path = directory.join(format!("rollout-{prefix}-{NATIVE_ID}.jsonl"));
+        let header = json!({"type":"session_meta", "payload":payload});
+        std::fs::write(&path, format!("{header}\n")).expect("native header");
+        path.canonicalize().expect("canonical rollout")
+    }
+
+    fn locate(source: &CodexSource, project: &Path) -> Option<PathBuf> {
+        source
+            .find_live_session_transcript(
+                NATIVE_ID,
+                project,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("bounded live locator")
+            .map(|locator| locator.path().to_owned())
+    }
+
+    #[test]
+    fn metadata_only_native_start_needs_no_transcript_path() {
+        let (_home, project, source) = fixture();
+        let path = write_rollout(
+            &source.sessions_dir.join("2026/09/10"),
+            "2026-09-10T12-00-00",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(locate(&source, &project), Some(path.clone()));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!source.archived_sessions_dir.exists());
+    }
+
+    #[test]
+    fn archived_native_header_and_session_id_alias_are_supported() {
+        let (_home, project, source) = fixture();
+        let cwd = project.join("src");
+        std::fs::create_dir(&cwd).unwrap();
+        let path = write_rollout(
+            &source.archived_sessions_dir,
+            "archived",
+            json!({"session_id": NATIVE_ID, "cwd": cwd}),
+        );
+        assert_eq!(locate(&source, &project), Some(path));
+    }
+
+    #[test]
+    fn filename_fallback_and_conflicting_native_ids_do_not_bootstrap() {
+        for payload in [
+            json!({}),
+            json!({"id": "another-session"}),
+            json!({"id": ""}),
+            json!({"id": null}),
+            json!({"id": 42}),
+            json!({"id": NATIVE_ID, "session_id": "another-session"}),
+            json!({"id": null, "session_id": NATIVE_ID}),
+        ] {
+            let (_home, project, source) = fixture();
+            let mut payload = payload;
+            payload["cwd"] = json!(project);
+            write_rollout(&source.sessions_dir, "match", payload);
+            assert_eq!(locate(&source, &project), None);
+        }
+    }
+
+    #[test]
+    fn cwd_must_belong_to_the_admitted_checkout() {
+        let (home, project, source) = fixture();
+        let sibling = home.path().join("project-other");
+        let nested = project.join("nested");
+        std::fs::create_dir(&sibling).unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
+        for cwd in [
+            sibling,
+            nested,
+            PathBuf::from("."),
+            home.path().join("missing"),
+        ] {
+            write_rollout(
+                &source.sessions_dir,
+                "match",
+                json!({"id": NATIVE_ID, "cwd": cwd}),
+            );
+            assert!(!matches!(
+                source.find_live_session_transcript(
+                    NATIVE_ID,
+                    &project,
+                    Instant::now() + Duration::from_secs(5)
+                ),
+                Ok(Some(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn header_must_be_the_first_complete_bounded_frame() {
+        let (_home, project, source) = fixture();
+        let path = write_rollout(
+            &source.sessions_dir,
+            "match",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let valid = std::fs::read_to_string(&path).unwrap();
+        for invalid in [
+            String::new(),
+            valid.trim_end().to_owned(),
+            format!("\n{valid}"),
+            format!("not-json\n{valid}"),
+            format!("{{\"type\":\"event_msg\"}}\n{valid}"),
+            format!("{}\n{valid}", " ".repeat(64 * 1024 + 1)),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(locate(&source, &project), None);
+        }
+    }
+
+    #[test]
+    fn duplicate_after_an_exact_hook_page_in_other_root_is_ambiguous() {
+        let (_home, project, source) = fixture();
+        write_rollout(
+            &source.sessions_dir,
+            "first",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        for index in 0..EXACT_HOOK_DISCOVERY_UNITS_PER_CALL + 1 {
+            std::fs::write(
+                source.sessions_dir.join(format!("unrelated-{index}.jsonl")),
+                "{}\n",
+            )
+            .unwrap();
+        }
+        write_rollout(
+            &source.archived_sessions_dir,
+            "second",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        assert_eq!(locate(&source, &project), None);
+    }
+
+    #[test]
+    fn missing_roots_are_not_created_and_expired_start_is_cancelled() {
+        let (_home, project, source) = fixture();
+        assert_eq!(locate(&source, &project), None);
+        assert!(!source.sessions_dir.exists());
+        assert!(!source.archived_sessions_dir.exists());
+        assert!(matches!(
+            source.find_live_session_transcript(NATIVE_ID, &project, Instant::now()),
+            Err(TranscriptIngestError::Cancelled { provider: "codex" })
+        ));
+    }
+
+    #[test]
+    fn an_over_budget_corpus_never_claims_a_unique_early_hit() {
+        let (_home, project, source) = fixture();
+        write_rollout(
+            &source.sessions_dir,
+            "early",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        for index in 0..LIVE_SESSION_DISCOVERY_ENTRIES {
+            std::fs::write(
+                source.sessions_dir.join(format!("unrelated-{index}.jsonl")),
+                "{}\n",
+            )
+            .unwrap();
+        }
+        assert_eq!(locate(&source, &project), None);
+        assert_eq!(locate(&source, &project), None);
+    }
+
+    #[test]
+    fn an_unvisited_deep_directory_prevents_a_completeness_claim() {
+        let (_home, project, source) = fixture();
+        write_rollout(
+            &source.sessions_dir,
+            "early",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let mut deep = source.archived_sessions_dir.clone();
+        for _ in 0..=MAX_SCAN_DEPTH {
+            deep.push("nested");
+        }
+        std::fs::create_dir_all(deep).unwrap();
+        assert_eq!(locate(&source, &project), None);
+    }
+
+    #[test]
+    fn header_validation_rejects_replacement_or_changes_to_the_opened_source() {
+        let (_home, project, source) = fixture();
+        let path = write_rollout(
+            &source.sessions_dir,
+            "match",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path).unwrap();
+        let initial = file.metadata().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let guard = source
+            .find_live_session_transcript(NATIVE_ID, &project, deadline)
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.path(), path);
+        assert!(guard.matches_current_source(deadline).unwrap());
+        assert_eq!(
+            meta::live_session_meta_cwd(&file, NATIVE_ID, deadline).unwrap(),
+            Some(project)
+        );
+        assert!(live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
+        let contents = std::fs::read(&path).unwrap();
+        let saved = path.with_extension("saved");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::write(&path, &contents).unwrap();
+        assert!(!live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
+        assert!(!guard.matches_current_source(deadline).unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(saved, &path).unwrap();
+        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path).unwrap();
+        let initial = file.metadata().unwrap();
+        let guard = CodexLiveSessionTranscript {
+            path: path.clone(),
+            native_identity: crate::runtime::source::jsonl_native_file_identity(&file, &initial)
+                .unwrap(),
+            source_identity: codex_corpus_identity(&path, &initial).unwrap(),
+        };
+        std::fs::write(
+            &path,
+            format!("{}{{}}\n", String::from_utf8(contents).unwrap()),
+        )
+        .unwrap();
+        assert!(!live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
+        assert!(!guard.matches_current_source(deadline).unwrap());
+        assert!(matches!(
+            guard.matches_current_source(Instant::now()),
+            Err(TranscriptIngestError::Cancelled { provider: "codex" })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_inode_same_size_header_rewrite_invalidates_the_guard() {
+        let (_home, project, source) = fixture();
+        let path = write_rollout(
+            &source.sessions_dir,
+            "match",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let guard = source
+            .find_live_session_transcript(NATIVE_ID, &project, deadline)
+            .unwrap()
+            .unwrap();
+        let initial = std::fs::metadata(&path).unwrap();
+        let changed = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(NATIVE_ID, "0198a011-1234-5678-abcd-0123456789ac");
+        std::fs::write(&path, changed).unwrap();
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_last_modification_time(&initial),
+        )
+        .unwrap();
+        let current = std::fs::metadata(&path).unwrap();
+        assert_eq!(current.ino(), initial.ino());
+        assert_eq!(current.len(), initial.len());
+        assert!(!guard.matches_current_source(deadline).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_and_nonregular_native_candidates_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (_home, project, source) = fixture();
+        let path = write_rollout(
+            &source.sessions_dir,
+            "match",
+            json!({"id": NATIVE_ID, "cwd": project}),
+        );
+        let saved = path.with_extension("saved");
+        std::fs::rename(&path, &saved).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert_eq!(locate(&source, &project), None);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(locate(&source, &project), None);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        symlink(&source.sessions_dir, &source.archived_sessions_dir).unwrap();
+        assert_eq!(locate(&source, &project), None);
     }
 }

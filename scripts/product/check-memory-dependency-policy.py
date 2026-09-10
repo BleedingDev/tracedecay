@@ -23,6 +23,11 @@ REQUIRED_EXCEPTION_FIELDS = {
 }
 EXPECTED_STATUS_VALUES = {"active", "retired"}
 EXPECTED_ADR_PREFIX = "product/architecture/adr/"
+DEPENDENCY_SECTIONS = {
+    "normal": "dependencies",
+    "dev": "dev-dependencies",
+    "build": "build-dependencies",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,34 +57,34 @@ def package_matches(package: str, patterns: Iterable[str]) -> bool:
     return any(fnmatch.fnmatchcase(package, pattern) for pattern in patterns)
 
 
-def dependency_names(manifest: dict[str, Any]) -> set[str]:
-    names: set[str] = set()
+def dependency_names(manifest: dict[str, Any]) -> dict[str, set[str]]:
+    names: dict[str, set[str]] = {kind: set() for kind in DEPENDENCY_SECTIONS}
 
-    def collect(section: Any) -> None:
+    def collect(section: Any, kind: str) -> None:
         if not isinstance(section, dict):
             return
         for key, value in section.items():
             if isinstance(value, dict) and isinstance(value.get("package"), str):
-                names.add(value["package"])
+                names[kind].add(value["package"])
             else:
-                names.add(key)
+                names[kind].add(key)
 
-    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-        collect(manifest.get(key))
+    for kind, key in DEPENDENCY_SECTIONS.items():
+        collect(manifest.get(key), kind)
     targets = manifest.get("target")
     if isinstance(targets, dict):
         for target in targets.values():
             if not isinstance(target, dict):
                 continue
-            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-                collect(target.get(key))
+            for kind, key in DEPENDENCY_SECTIONS.items():
+                collect(target.get(key), kind)
     return names
 
 
 def scan_manifests(
     repo: Path, errors: list[str]
-) -> dict[str, tuple[Path, set[str]]]:
-    manifests: dict[str, tuple[Path, set[str]]] = {}
+) -> dict[str, tuple[Path, dict[str, set[str]]]]:
+    manifests: dict[str, tuple[Path, dict[str, set[str]]]] = {}
     for path in sorted((repo / "crates").glob("*/Cargo.toml")):
         try:
             document = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -125,6 +130,18 @@ def index_rules(policy: dict[str, Any], errors: list[str]) -> dict[str, dict[str
             isinstance(value, str) and value for value in forbidden
         ):
             errors.append(f"dependency rule {rule_id} has invalid forbidden_dependencies")
+        kinds = raw.get("dependency_kinds", list(DEPENDENCY_SECTIONS))
+        if (
+            not isinstance(kinds, list)
+            or not kinds
+            or not all(isinstance(kind, str) and kind in DEPENDENCY_SECTIONS for kind in kinds)
+            or len(set(kinds)) != len(kinds)
+        ):
+            errors.append(
+                f"dependency rule {rule_id} dependency_kinds must be a non-empty array"
+                " of distinct normal, dev, or build values"
+            )
+            continue
         rules[rule_id] = raw
     return rules
 
@@ -271,7 +288,10 @@ def validate_repository(
                 package, except_patterns
             ):
                 continue
-            for dependency in sorted(dependencies):
+            selected = set().union(
+                *(dependencies[kind] for kind in rule.get("dependency_kinds", DEPENDENCY_SECTIONS))
+            )
+            for dependency in sorted(selected):
                 if not package_matches(dependency, forbidden):
                     continue
                 if package_matches(dependency, allowed):

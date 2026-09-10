@@ -18,6 +18,9 @@ mod context_scout;
 mod envelope;
 mod hermes;
 mod ingest;
+mod origin;
+#[cfg(test)]
+pub(crate) use origin::capture_live_origin_for_control_test;
 mod terminal;
 
 #[cfg(test)]

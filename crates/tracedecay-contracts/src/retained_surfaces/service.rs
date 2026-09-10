@@ -13,9 +13,10 @@ use super::{
     FactStoreRemoveRequestV1, FactStoreSearchRequestV1, FactStoreSupersedeRequestV1,
     FactStoreUpdateRequestV1, LcmDescribeRequestV1, LcmDoctorRequestV1, LcmExpandQueryRequestV1,
     LcmExpandRequestV1, LcmGrepRequestV1, LcmLoadSessionRequestV1, LcmStatusRequestV1,
-    MemoryStatusRequestV1, MessageSearchRequestV1, RetainedSurfaceOperation,
-    RetainedSurfaceRequestV1, RetainedSurfaceResultV1, SessionRefreshRequestV1,
-    SessionsForRequestV1, WorkflowsRequestV1, retained_surface_application_operation,
+    MemoryStatusRequestV1, MessageSearchRequestV1, ProviderControlRequestV1,
+    RetainedSurfaceOperation, RetainedSurfaceRequestV1, RetainedSurfaceResultV1,
+    SessionRefreshRequestV1, SessionsForRequestV1, WorkflowsRequestV1,
+    retained_surface_application_operation,
 };
 use crate::{
     ApplicationOperation, ApplicationOutcome, ApplicationProblem, CancellationSignal,
@@ -137,6 +138,16 @@ pub trait RetainedMemoryExecutionPortV1: Send + Sync {
     ) -> RetainedSurfaceExecutionFutureV1<'a>;
 }
 
+/// Provider-local lifecycle authority mounted independently from canonical
+/// fact CRUD. The host resolves every selector and validates current authority.
+pub trait RetainedProviderControlExecutionPortV1: Send + Sync {
+    fn execute_provider_control<'a>(
+        &'a self,
+        context: RetainedSurfaceExecutionContextV1<'a>,
+        request: &'a ProviderControlRequestV1,
+    ) -> RetainedSurfaceExecutionFutureV1<'a>;
+}
+
 /// Session authority mounted independently from memory and LCM authorities.
 pub trait RetainedSessionExecutionPortV1: Send + Sync {
     fn execute_session<'a>(
@@ -161,6 +172,7 @@ pub trait RetainedLcmExecutionPortV1: Send + Sync {
 pub struct RetainedSurfacePortsV1<'a> {
     automation: Option<Arc<dyn RetainedAutomationExecutionPortV1 + 'a>>,
     memory: Option<Arc<dyn RetainedMemoryExecutionPortV1 + 'a>>,
+    provider_control: Option<Arc<dyn RetainedProviderControlExecutionPortV1 + 'a>>,
     session: Option<Arc<dyn RetainedSessionExecutionPortV1 + 'a>>,
     lcm: Option<Arc<dyn RetainedLcmExecutionPortV1 + 'a>>,
 }
@@ -180,9 +192,10 @@ impl<'a> RetainedSurfacePortsV1<'a> {
         // Do not short-circuit: each independent family must be considered.
         let automation = mount(&mut self.automation, &other.automation);
         let memory = mount(&mut self.memory, &other.memory);
+        let provider_control = mount(&mut self.provider_control, &other.provider_control);
         let session = mount(&mut self.session, &other.session);
         let lcm = mount(&mut self.lcm, &other.lcm);
-        automation || memory || session || lcm
+        automation || memory || provider_control || session || lcm
     }
 
     pub fn with_automation(
@@ -195,6 +208,14 @@ impl<'a> RetainedSurfacePortsV1<'a> {
 
     pub fn with_memory(mut self, port: Arc<dyn RetainedMemoryExecutionPortV1 + 'a>) -> Self {
         self.memory = Some(port);
+        self
+    }
+
+    pub fn with_provider_control(
+        mut self,
+        port: Arc<dyn RetainedProviderControlExecutionPortV1 + 'a>,
+    ) -> Self {
+        self.provider_control = Some(port);
         self
     }
 
@@ -271,6 +292,21 @@ impl<'a> RetainedSurfaceServiceV1<'a> {
                     }
                 }
             }
+            RetainedSurfaceDispatch::ProviderControl(request) => {
+                if request.validate_at(observed_at).is_err() {
+                    Err(RetainedSurfaceExecutionErrorV1::InvalidRequest)
+                } else {
+                    match self.ports.provider_control.as_ref() {
+                        Some(port) => {
+                            port.execute_provider_control(execution_context, request)
+                                .await
+                        }
+                        None => Err(RetainedSurfaceExecutionErrorV1::unavailable(
+                            "the retained provider-control authority is not mounted for this scope",
+                        )),
+                    }
+                }
+            }
             RetainedSurfaceDispatch::Memory(request) => match self.ports.memory.as_ref() {
                 Some(port) => port.execute_memory(execution_context, request).await,
                 None => Err(RetainedSurfaceExecutionErrorV1::unavailable(
@@ -292,7 +328,19 @@ impl<'a> RetainedSurfaceServiceV1<'a> {
         }
         .map_err(retained_surface_execution_problem)?;
         ensure_post_execution_cancellation(request.operation(), cancellation)?;
-        if outcome_matches_operation(request.operation(), &outcome) {
+        let provider_request_matches = match request {
+            RetainedSurfaceRequestV1::ProviderControl(request) => {
+                provider_control_outcome_matches_request(request, &outcome)
+                    && super::retained_surface_outcome_matches_terminal(
+                        request.operation(),
+                        context.request_id(),
+                        context.scope(),
+                        &outcome,
+                    )
+            }
+            _ => true,
+        };
+        if provider_request_matches && outcome_matches_operation(request.operation(), &outcome) {
             Ok(outcome)
         } else {
             Err(unavailable_problem(
@@ -306,6 +354,7 @@ impl<'a> RetainedSurfaceServiceV1<'a> {
 enum RetainedSurfaceDispatch<'a> {
     Automation(&'a FactStoreCurateRequestV1),
     Memory(RetainedMemoryRequestV1<'a>),
+    ProviderControl(&'a ProviderControlRequestV1),
     Session(RetainedSessionRequestV1<'a>),
     Lcm(RetainedLcmRequestV1<'a>),
 }
@@ -352,6 +401,9 @@ fn classify_retained_surface_request(
         }
         RetainedSurfaceRequestV1::FactFeedback(request) => {
             RetainedSurfaceDispatch::Memory(RetainedMemoryRequestV1::FactFeedback(request))
+        }
+        RetainedSurfaceRequestV1::ProviderControl(request) => {
+            RetainedSurfaceDispatch::ProviderControl(request)
         }
         RetainedSurfaceRequestV1::MemoryStatus(request) => {
             RetainedSurfaceDispatch::Memory(RetainedMemoryRequestV1::MemoryStatus(request))
@@ -419,6 +471,12 @@ pub(super) fn outcome_matches_operation(
         ApplicationOutcome::Effect(effect) => effect.payload.as_ref(),
         ApplicationOutcome::Preview(_) => None,
     };
+    if let Some(RetainedSurfaceResultV1::ProviderControl(result)) = result {
+        return operation == result.operation()
+            && class_matches
+            && result.validate().is_ok()
+            && provider_control_intent_matches_outcome(result, outcome);
+    }
     if let Some(RetainedSurfaceResultV1::FactStoreCurate(result)) = result {
         return operation == RetainedSurfaceOperation::FactStoreCurate
             && class_matches
@@ -509,6 +567,29 @@ pub(super) fn outcome_matches_operation(
         )
 }
 
+fn provider_control_outcome_matches_request(
+    request: &ProviderControlRequestV1,
+    outcome: &ApplicationOutcome<RetainedSurfaceResultV1>,
+) -> bool {
+    let result = match outcome {
+        ApplicationOutcome::Evidence(packet) => packet.payload.as_ref(),
+        ApplicationOutcome::Effect(effect) => effect.payload.as_ref(),
+        ApplicationOutcome::Preview(_) => None,
+    };
+    matches!(result, Some(RetainedSurfaceResultV1::ProviderControl(result)) if result.validate_for(request).is_ok())
+}
+
+fn provider_control_intent_matches_outcome(
+    result: &super::ProviderControlResultV1,
+    outcome: &ApplicationOutcome<RetainedSurfaceResultV1>,
+) -> bool {
+    let super::ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result
+    else {
+        return true;
+    };
+    matches!(outcome, ApplicationOutcome::Effect(effect) if effect.receipt == deletion.intent.host_receipt)
+}
+
 /// Whether a retained operation can cross its durable effect boundary.
 pub const fn retained_surface_operation_is_effect(operation: RetainedSurfaceOperation) -> bool {
     matches!(
@@ -519,6 +600,12 @@ pub const fn retained_surface_operation_is_effect(operation: RetainedSurfaceOper
             | RetainedSurfaceOperation::FactStoreRemove
             | RetainedSurfaceOperation::FactStoreSupersede
             | RetainedSurfaceOperation::FactFeedback
+            | RetainedSurfaceOperation::ProviderFeedback
+            | RetainedSurfaceOperation::ProviderCorrection
+            | RetainedSurfaceOperation::ProviderDeleteBySource
+            | RetainedSurfaceOperation::ProviderMaintenance
+            | RetainedSurfaceOperation::ProviderSnapshotRestore
+            | RetainedSurfaceOperation::ProviderReplay
             | RetainedSurfaceOperation::SessionRefreshCancel
             | RetainedSurfaceOperation::SessionRefreshBegin
     )
@@ -865,6 +952,102 @@ mod tests {
         RetainedSurfaceServiceV1::new(
             RetainedSurfacePortsV1::default().with_memory(Arc::new(ErrorMemoryPort(error))),
         )
+    }
+
+    struct CountedProviderControlPort(std::sync::atomic::AtomicUsize);
+
+    impl RetainedProviderControlExecutionPortV1 for CountedProviderControlPort {
+        fn execute_provider_control<'a>(
+            &'a self,
+            _context: RetainedSurfaceExecutionContextV1<'a>,
+            _request: &'a ProviderControlRequestV1,
+        ) -> RetainedSurfaceExecutionFutureV1<'a> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(RetainedSurfaceExecutionErrorV1::Unsupported) })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_control_authority_is_independent_and_admission_precedes_dispatch() {
+        use crate::retained_surfaces::{
+            ProviderControlHealthCheckV1, ProviderControlStateSelectorV1, ProviderHealthRequestV1,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let port = Arc::new(CountedProviderControlPort(AtomicUsize::new(0)));
+        let service = RetainedSurfaceServiceV1::new(
+            RetainedSurfacePortsV1::default().with_provider_control(port.clone()),
+        );
+        let operation =
+            retained_surface_application_operation(RetainedSurfaceOperation::ProviderHealth)
+                .expect("provider health operation");
+        let context = context_for(&operation);
+        let cancellation = CancellationSignal::active("cancel.retained.fixture").expect("signal");
+        let request = RetainedSurfaceRequestV1::ProviderControl(ProviderControlRequestV1::Health(
+            ProviderHealthRequestV1 {
+                state: ProviderControlStateSelectorV1::CanonicalSession {
+                    provider_id: "native".to_owned(),
+                    registration_revision: 7,
+                    canonical_provider_id: "claude".to_owned(),
+                    session_id: "session.1".to_owned(),
+                },
+                requested_checks: vec![ProviderControlHealthCheckV1::State],
+            },
+        ));
+        let mut malformed = request.clone();
+        if let RetainedSurfaceRequestV1::ProviderControl(ProviderControlRequestV1::Health(
+            request,
+        )) = &mut malformed
+        {
+            request.requested_checks.clear();
+        }
+        let invalid = service
+            .execute(&context, &cancellation, UtcMicros(2), &malformed)
+            .await
+            .expect_err("invalid request");
+        assert_eq!(invalid.kind(), ApplicationProblemKind::InvalidRequest);
+        let wrong_operation =
+            retained_surface_application_operation(RetainedSurfaceOperation::FactStoreSearch)
+                .expect("fact operation");
+        assert!(
+            service
+                .execute(
+                    &context_for(&wrong_operation),
+                    &cancellation,
+                    UtcMicros(2),
+                    &request
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .execute(&context, &cancellation, UtcMicros(600), &request)
+                .await
+                .is_err()
+        );
+        let cancelled = CancellationSignal::active("cancel.retained.fixture").expect("signal");
+        cancelled.cancel(UtcMicros(2));
+        assert!(
+            service
+                .execute(&context, &cancelled, UtcMicros(2), &request)
+                .await
+                .is_err()
+        );
+        assert_eq!(port.0.load(Ordering::SeqCst), 0);
+        let valid = service
+            .execute(&context, &cancellation, UtcMicros(2), &request)
+            .await
+            .expect_err("authority's actual unsupported terminal");
+        assert_eq!(valid.kind(), ApplicationProblemKind::Unsupported);
+        assert_eq!(port.0.load(Ordering::SeqCst), 1);
+        let unmounted = RetainedSurfaceServiceV1::new(RetainedSurfacePortsV1::default());
+        assert!(
+            unmounted
+                .execute(&context, &cancellation, UtcMicros(2), &request)
+                .await
+                .is_err()
+        );
+        assert_eq!(port.0.load(Ordering::SeqCst), 1);
     }
 
     #[test]

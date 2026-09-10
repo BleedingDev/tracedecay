@@ -21,7 +21,7 @@ mod anchored_write;
 
 use anchored_write::validate_retrieval_anchor_binding;
 pub use anchored_write::{
-    AnchoredObservationWrite, ObservationIdentityCollisionDispositionV1,
+    AnchoredObservationWrite, ObservationIdentityCollisionDispositionV1, ObservationOriginV1,
     RepositoryProvenanceAttachmentV1,
 };
 
@@ -1029,6 +1029,16 @@ impl StoredObservation {
         self.commit_receipt.repository_provenance_attachment()
     }
 
+    /// Revalidates generation, owner, source identity and live-origin attachment
+    /// together before a host history producer reads it as source evidence.
+    pub fn validated_repository_provenance_attachment(
+        &self,
+    ) -> ObservationStoreResult<&RepositoryProvenanceAttachmentV1> {
+        let attachment = self.repository_provenance_attachment();
+        attachment.validate_for_observation(self.observation(), self.projection_generation())?;
+        Ok(attachment)
+    }
+
     pub fn retrieval_anchor(&self) -> &RetrievalAnchorRecordV2 {
         self.commit_receipt.retrieval_anchor()
     }
@@ -1104,6 +1114,74 @@ pub enum ObservationBatchFallbackCause {
     IntraBatchDurableFrontier,
 }
 
+/// Hard bound for one recent canonical sequence-window lookup.
+pub const MAX_RECENT_OBSERVATION_WINDOW_LIMIT: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservationRecentWindowRequest {
+    limit: usize,
+}
+
+impl ObservationRecentWindowRequest {
+    pub fn new(limit: usize) -> ObservationStoreResult<Self> {
+        if limit == 0 || limit > MAX_RECENT_OBSERVATION_WINDOW_LIMIT {
+            return Err(ObservationStoreError::InvalidReplayLimit {
+                limit,
+                max: MAX_RECENT_OBSERVATION_WINDOW_LIMIT,
+            });
+        }
+        Ok(Self { limit })
+    }
+
+    pub fn limit(self) -> usize {
+        self.limit
+    }
+}
+
+/// Frozen inclusive bounds over the requested newest canonical rows. Sequence
+/// gaps are retained, and has_older reports the one bounded look-behind row.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationRecentWindowV1 {
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+    pub has_older: bool,
+}
+
+impl ObservationRecentWindowV1 {
+    pub fn validate(&self) -> ObservationStoreResult<()> {
+        if self.first_sequence == 0 || self.first_sequence > self.last_sequence {
+            return Err(ObservationStoreError::InvalidRecentWindow);
+        }
+        Ok(())
+    }
+
+    /// Validates a bounded sequence-only query result without interpreting
+    /// missing sequence numbers as missing rows.
+    pub fn from_descending_sequences(
+        request: ObservationRecentWindowRequest,
+        sequences: &[u64],
+    ) -> ObservationStoreResult<Option<Self>> {
+        if sequences.len() > request.limit() + 1
+            || sequences.iter().any(|sequence| *sequence == 0)
+            || sequences.windows(2).any(|pair| pair[0] <= pair[1])
+        {
+            return Err(ObservationStoreError::InvalidRecentWindow);
+        }
+        let Some(last_sequence) = sequences.first().copied() else {
+            return Ok(None);
+        };
+        let retained = sequences.len().min(request.limit());
+        let window = Self {
+            first_sequence: sequences[retained - 1],
+            last_sequence,
+            has_older: sequences.len() > request.limit(),
+        };
+        window.validate()?;
+        Ok(Some(window))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservationReplayRequest {
     after_sequence: u64,
@@ -1136,6 +1214,8 @@ impl ObservationReplayRequest {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ObservationStoreError {
+    #[error("recent observation window has invalid sequence bounds or order")]
+    InvalidRecentWindow,
     #[error("observation batch requires scalar fallback: {cause:?}")]
     BatchRequiresScalarFallback {
         cause: ObservationBatchFallbackCause,
@@ -1246,6 +1326,11 @@ pub trait ObservationAdmissionPort: Send + Sync {
         &self,
         request: ObservationReplayRequest,
     ) -> impl Future<Output = ObservationStoreResult<Vec<StoredObservation>>> + Send;
+
+    fn recent_admitted_observation_window(
+        &self,
+        request: ObservationRecentWindowRequest,
+    ) -> impl Future<Output = ObservationStoreResult<Option<ObservationRecentWindowV1>>> + Send;
 }
 
 /// Authoritative persistence boundary for sanitized observations and their stable anchors.
@@ -1286,6 +1371,11 @@ pub trait ObservationStore: Send + Sync {
         &self,
         request: ObservationReplayRequest,
     ) -> impl Future<Output = ObservationStoreResult<Vec<StoredObservation>>> + Send;
+
+    fn recent_observation_window(
+        &self,
+        request: ObservationRecentWindowRequest,
+    ) -> impl Future<Output = ObservationStoreResult<Option<ObservationRecentWindowV1>>> + Send;
 }
 
 impl<T> ObservationCaptureSink for T
@@ -1341,6 +1431,14 @@ where
         request: ObservationReplayRequest,
     ) -> ObservationStoreResult<Vec<StoredObservation>> {
         self.replay_observations(request).await
+    }
+
+    #[hotpath::skip]
+    async fn recent_admitted_observation_window(
+        &self,
+        request: ObservationRecentWindowRequest,
+    ) -> ObservationStoreResult<Option<ObservationRecentWindowV1>> {
+        self.recent_observation_window(request).await
     }
 }
 

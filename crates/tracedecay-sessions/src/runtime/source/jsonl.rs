@@ -540,6 +540,186 @@ pub struct JsonlResumeState {
     pub fingerprint: u64,
 }
 
+/// Content-free frame witness captured between admitted live hook boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveJsonlOriginFrame {
+    pub offset: u64,
+    pub end_offset: u64,
+    pub resume_fingerprint: u64,
+}
+
+/// A bounded source watermark; a first baseline carries no historical frames.
+#[derive(Debug)]
+pub struct LiveJsonlOriginCapture {
+    pub generation: u64,
+    pub file_identity: u64,
+    pub complete_frontier: u64,
+    pub complete_prefix_fingerprint: u64,
+    pub physical_eof: u64,
+    pub validated_previous: bool,
+    pub frames: Vec<LiveJsonlOriginFrame>,
+}
+
+/// Reads only bounded bytes and frame offsets. No transcript content is parsed
+/// or retained. The opened file's size is checked before any fingerprint read,
+/// and both deadline and generation are checked before returning evidence.
+pub fn capture_live_jsonl_origin(
+    path: &Path,
+    previous: Option<(StoredCursor, JsonlResumeState)>,
+    max_source_bytes: u64,
+    max_new_frames: usize,
+    deadline: std::time::Instant,
+) -> TranscriptIngestResult<LiveJsonlOriginCapture> {
+    const PROVIDER: &str = "hook-live-origin";
+    let check_deadline = || {
+        if std::time::Instant::now() >= deadline {
+            Err(TranscriptIngestError::Cancelled { provider: PROVIDER })
+        } else {
+            Ok(())
+        }
+    };
+    check_deadline()?;
+    if max_source_bytes == 0 || max_new_frames == 0 || max_new_frames > 256 {
+        return Err(TranscriptIngestError::InvalidFrameState { provider: PROVIDER });
+    }
+    let mut file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(path)
+        .map_err(|error| TranscriptIngestError::scan_io("open", path, error))?;
+    let initial = file
+        .metadata()
+        .map_err(|error| TranscriptIngestError::scan_io("fstat", path, error))?;
+    let extent = initial.len();
+    if !initial.is_file() || extent > max_source_bytes {
+        return Err(TranscriptIngestError::BackgroundResourceUnavailable {
+            provider: PROVIDER,
+            resource: "source_byte_bound",
+        });
+    }
+    check_deadline()?;
+    let file_identity = stable_jsonl_file_id(&mut file, &initial)
+        .map_err(|error| TranscriptIngestError::scan_io("fingerprint", path, error))?
+        .0;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| TranscriptIngestError::scan_io("seek", path, error))?;
+    let mut digest = ResumeDigest::new();
+    let mut snapshot = Sha256::new();
+    snapshot.update(b"tracedecay-jsonl-snapshot-v2");
+    snapshot.update(extent.to_le_bytes());
+    let previous_end = previous.map(|(cursor, _)| cursor.position);
+    let mut prefix_matches = previous.is_some_and(|(cursor, resume)| {
+        cursor.position == 0 && resume.fingerprint == digest.fingerprint(0)
+    });
+    let mut position = 0_u64;
+    let mut complete_frontier = 0_u64;
+    let mut complete_prefix_fingerprint = digest.fingerprint(0);
+    let mut frame_start = 0_u64;
+    let mut frames = Vec::new();
+    let mut buffer = vec![0_u8; JSONL_HASH_CHUNK_BYTES];
+    while position < extent {
+        check_deadline()?;
+        let boundary = previous_end
+            .filter(|end| position < *end)
+            .unwrap_or(extent)
+            .min(extent);
+        let count =
+            usize::try_from((boundary - position).min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file
+            .read(&mut buffer[..count])
+            .map_err(|error| TranscriptIngestError::scan_io("read", path, error))?;
+        if read == 0 {
+            return Err(TranscriptIngestError::ScanGenerationChanged {
+                path: path.to_owned(),
+            });
+        }
+        let chunk = &buffer[..read];
+        snapshot.update(chunk);
+        if previous.is_some_and(|(cursor, resume)| {
+            position >= cursor.position
+                && prefix_matches
+                && cursor.file_id == resume.generation
+                && resume.file_identity == file_identity
+        }) {
+            let mut consumed = 0;
+            for (index, _) in chunk.iter().enumerate().filter(|(_, byte)| **byte == b'\n') {
+                digest.extend(&chunk[consumed..=index]);
+                consumed = index + 1;
+                complete_frontier = position + consumed as u64;
+                complete_prefix_fingerprint = digest.fingerprint(complete_frontier);
+                if frames.len() == max_new_frames {
+                    return Err(TranscriptIngestError::BackgroundResourceUnavailable {
+                        provider: PROVIDER,
+                        resource: "source_frame_bound",
+                    });
+                }
+                frames.push(LiveJsonlOriginFrame {
+                    offset: frame_start,
+                    end_offset: complete_frontier,
+                    resume_fingerprint: complete_prefix_fingerprint,
+                });
+                frame_start = complete_frontier;
+            }
+            digest.extend(&chunk[consumed..]);
+        } else if let Some(last) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            digest.extend(&chunk[..=last]);
+            complete_frontier = position + last as u64 + 1;
+            complete_prefix_fingerprint = digest.fingerprint(complete_frontier);
+            frame_start = complete_frontier;
+            digest.extend(&chunk[last + 1..]);
+        } else {
+            digest.extend(chunk);
+        }
+        position += read as u64;
+        if let Some((cursor, resume)) = previous
+            && position == cursor.position
+        {
+            prefix_matches = complete_frontier == cursor.position
+                && digest.fingerprint(position) == resume.fingerprint;
+        }
+    }
+    check_deadline()?;
+    let final_metadata = file
+        .metadata()
+        .map_err(|error| TranscriptIngestError::scan_io("fstat", path, error))?;
+    if final_metadata.len() != extent
+        || jsonl_file_change_token(&initial) != jsonl_file_change_token(&final_metadata)
+        || jsonl_native_file_identity(&file, &initial)
+            != jsonl_native_file_identity(&file, &final_metadata)
+    {
+        return Err(TranscriptIngestError::ScanGenerationChanged {
+            path: path.to_owned(),
+        });
+    }
+    let validated_previous = previous.is_some_and(|(cursor, resume)| {
+        cursor.file_id == resume.generation
+            && resume.file_identity == file_identity
+            && cursor.position <= extent
+            && prefix_matches
+    });
+    let generation = match previous {
+        Some((_, resume)) if validated_previous => resume.generation,
+        Some((_, resume)) if resume.file_identity == file_identity => rewritten_jsonl_generation(
+            resume,
+            file_identity,
+            digest_prefix_u64(snapshot.finalize()),
+            extent,
+            file_mtime_secs(&initial),
+        ),
+        _ => file_identity,
+    };
+    if !validated_previous {
+        frames.clear();
+    }
+    check_deadline()?;
+    Ok(LiveJsonlOriginCapture {
+        generation,
+        file_identity,
+        complete_frontier,
+        complete_prefix_fingerprint,
+        physical_eof: extent,
+        validated_previous,
+        frames,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawJsonlFrame {
     Eof,
@@ -1852,6 +2032,87 @@ fn try_stream_new_jsonl_raw_from_file(
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+
+    #[test]
+    fn live_origin_baseline_does_not_materialize_old_frames_and_matches_canonical_resume() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.jsonl");
+        let old = "{\"old\":true}\n".repeat(500);
+        std::fs::write(&path, &old).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let baseline = capture_live_jsonl_origin(&path, None, 1_000_000, 2, deadline).unwrap();
+        assert!(baseline.frames.is_empty());
+        assert_eq!(baseline.complete_frontier, old.len() as u64);
+        let previous = (
+            StoredCursor {
+                position: baseline.complete_frontier,
+                mtime: 0,
+                file_id: baseline.generation,
+            },
+            JsonlResumeState {
+                generation: baseline.generation,
+                file_identity: baseline.file_identity,
+                fingerprint: baseline.complete_prefix_fingerprint,
+            },
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"new\":true}\npartial")
+            .unwrap();
+        let live =
+            capture_live_jsonl_origin(&path, Some(previous), 1_000_000, 2, deadline).unwrap();
+        assert!(live.validated_previous);
+        assert_eq!(live.frames.len(), 1);
+        assert_eq!(live.frames[0].offset, old.len() as u64);
+        assert!(live.physical_eof > live.complete_frontier);
+        let canonical = try_stream_new_jsonl_raw_strict_with_resume(
+            &path,
+            previous.0,
+            Some(1_000_000),
+            MAX_JSONL_RECORD_BYTES,
+            Some(previous.1),
+        )
+        .unwrap();
+        assert_eq!(canonical.new_cursor.position, live.complete_frontier);
+        assert_eq!(canonical.new_cursor.file_id, live.generation);
+        assert_eq!(
+            canonical.frames[0].resume_fingerprint,
+            live.frames[0].resume_fingerprint
+        );
+    }
+
+    #[test]
+    fn live_origin_rejects_size_frame_and_deadline_bounds_and_discards_rewrite_interval() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.jsonl");
+        std::fs::write(&path, b"old\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(capture_live_jsonl_origin(&path, None, 2, 1, deadline).is_err());
+        assert!(capture_live_jsonl_origin(&path, None, 100, 1, std::time::Instant::now()).is_err());
+        let baseline = capture_live_jsonl_origin(&path, None, 100, 1, deadline).unwrap();
+        let previous = (
+            StoredCursor {
+                position: 4,
+                mtime: 0,
+                file_id: baseline.generation,
+            },
+            JsonlResumeState {
+                generation: baseline.generation,
+                file_identity: baseline.file_identity,
+                fingerprint: baseline.complete_prefix_fingerprint,
+            },
+        );
+        std::fs::write(&path, b"old\nnew1\nnew2\n").unwrap();
+        assert!(capture_live_jsonl_origin(&path, Some(previous), 100, 1, deadline).is_err());
+        std::fs::write(&path, b"changed\nnew1\nnew2\n").unwrap();
+        let changed = capture_live_jsonl_origin(&path, Some(previous), 100, 1, deadline).unwrap();
+        assert!(!changed.validated_previous);
+        assert!(changed.frames.is_empty());
+    }
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

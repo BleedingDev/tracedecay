@@ -8,10 +8,10 @@
 //! reports carry one shared-inputs digest and are comparable.
 //!
 //! Assertions state measured Native behavior: the corpus emits source-edit,
-//! test-execution, and feedback-outcome observations, none of which Native
-//! accepts — it accepts only its own fact-promotion kind and the host session
-//! message kind — so each is refused with a typed `capability_unsupported`
-//! terminal that commits nothing, and its recalls at the corpus project
+//! test-execution, and feedback-outcome observations without the original-source
+//! attribution required by the common advisory profile. These legacy fixtures
+//! are refused with typed `capability_unsupported` terminals that commit nothing,
+//! and their recalls at the corpus project
 //! resolve to typed zero-result or scope-mismatch terminals without admitting
 //! any context.
 
@@ -218,10 +218,9 @@ async fn native_baseline_records_typed_terminals_and_zero_admitted_context() {
                     "observe" => {
                         observe_calls += 1;
                         if call.provider_contacted {
-                            // No corpus observation kind is one of the two
-                            // kinds Native accepts, so each is refused before
-                            // the port with a typed unsupported terminal and
-                            // commits nothing.
+                            // These legacy structured observations lack the
+                            // admitted original-source attribution, so the
+                            // adapter refuses them before any staged write.
                             assert_eq!(
                                 call.terminal_code, "capability_unsupported",
                                 "{} step {} {:?}",
@@ -259,15 +258,17 @@ async fn native_baseline_records_typed_terminals_and_zero_admitted_context() {
                         assert!(call.provider_contacted);
                         assert_eq!(call.terminal_code, "success");
                     }
-                    "deletion_by_source" | "snapshot_restore" => {
-                        // Native declares neither optional capability; the host
-                        // refuses before dispatch with a typed terminal.
-                        assert!(!call.provider_contacted);
-                        assert_eq!(call.terminal_code, "capability_unsupported");
-                        assert_eq!(
-                            call.diagnostic_id.as_deref(),
-                            Some("host.capability_undeclared")
-                        );
+                    "deletion_by_source" => {
+                        assert!(call.provider_contacted);
+                        // The old singular selector is not the common deletion request.
+                        assert_eq!(call.terminal_code, "invalid_request");
+                        assert_eq!(call.committed_effect_state, "none");
+                    }
+                    "snapshot_restore" => {
+                        assert!(call.provider_contacted);
+                        // A legacy snapshot label cannot supply current host authority.
+                        assert_eq!(call.terminal_code, "provider_unavailable");
+                        assert_eq!(call.committed_effect_state, "none");
                     }
                     other => panic!("unexpected operation {other}"),
                 }

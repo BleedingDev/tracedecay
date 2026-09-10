@@ -92,12 +92,16 @@ const MAX_PROVIDER_INSTANCE_ID_BYTES: usize = 256;
 const MAX_STATE_NAMESPACE_BYTES: usize = 256;
 /// Mandatory health capability every readiness handshake must prove.
 const HEALTH_CAPABILITY_ID: &str = "provider.health.v1";
-/// The capability whose contract is the only sanctioned channel for a
-/// provider-local replay position (`acknowledged_sequence`). A provider that
-/// declares it retains one; a provider that does not, does not — and the host
-/// records which of the two it is rather than treating an absent position as
-/// permission to skip verification.
-const REPLAY_CAPABILITY_ID: &str = "replay.apply.v1";
+/// Optional evidence that the provider retains an observation-recovery
+/// position for each target: provider, registration revision, source authority,
+/// exact scope, and source stream (`RecoveryTargetKeyV1`).
+///
+/// Canonical `replay.apply.v1` acknowledges original source sequences for a
+/// replay operation; it does not attest the host journal's per-stream delivery
+/// watermark. A provider may declare this distinct capability only when it
+/// supports reading that target-bound recovery position. A declared position
+/// that the host cannot read remains unreadable and must refuse delivery.
+const OBSERVATION_RECOVERY_POSITION_CAPABILITY_ID: &str = "observation.recovery_position.v1";
 
 /// The transport-agnostic seam a supervised provider adapter implements.
 ///
@@ -1296,13 +1300,15 @@ impl ReadinessEvidenceV1 {
         self.state_generation
     }
 
-    /// Whether this incarnation declares the replay capability, and therefore
-    /// keeps a provider-local acknowledged position a host may compare against
-    /// its own durable watermark.
+    /// Whether this incarnation declares `observation.recovery_position.v1`:
+    /// a retained position for the host journal's provider, registration,
+    /// source authority, exact scope, and source stream recovery target.
     ///
-    /// This is validated evidence, not a host guess: it is read from the same
-    /// descriptor the handshake proved, so a caller can tell "this provider
-    /// keeps no replay position" apart from "nobody asked".
+    /// This declaration comes from the validated handshake descriptor. It
+    /// requires the host to read and compare that position; an unreadable
+    /// declared position must refuse delivery. Canonical `replay.apply.v1`
+    /// alone makes no observation-recovery-position claim, so recovery uses
+    /// the host's durable receipts and content-derived idempotency keys.
     #[must_use]
     pub const fn retains_replay_position(&self) -> bool {
         self.retains_replay_position
@@ -2205,7 +2211,7 @@ fn validate_readiness(
         return Err(ReadinessDefectV1::EffectiveLimitAboveHostCeiling { limit });
     }
 
-    let retains_replay_position = descriptor.supports(REPLAY_CAPABILITY_ID);
+    let retains_replay_position = descriptor.supports(OBSERVATION_RECOVERY_POSITION_CAPABILITY_ID);
     Ok(ReadinessEvidenceV1 {
         provider_instance_id,
         state_namespace,

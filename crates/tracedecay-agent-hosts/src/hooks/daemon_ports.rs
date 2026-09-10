@@ -25,13 +25,14 @@ use crate::agents::context_scout_v2::ContextScoutDeliveryReceiptHookV1;
 use crate::ports::hook_runtime::HookRuntimeV1;
 
 use super::analytics::HookTimingSpan;
-use super::dispatch::NativeContextScoutLifecycleV1;
+use super::dispatch::{NativeContextScoutLifecycleV1, NativeSessionStartLocatorV1};
 
 pub(crate) struct DaemonAdmissionPort<'a> {
     runtime: &'a HookRuntimeV1,
     project_root: &'a Path,
     session_id: Option<&'a str>,
     lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
+    start_locator: Option<&'a NativeSessionStartLocatorV1>,
     feedback_notice: Mutex<Option<tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>>,
     github_stack_signal_available: Mutex<bool>,
     /// The caller's hook span, so the admission round trip is attributed like
@@ -46,6 +47,7 @@ impl<'a> DaemonAdmissionPort<'a> {
         project_root: &'a Path,
         session_id: Option<&'a str>,
         lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
+        start_locator: Option<&'a NativeSessionStartLocatorV1>,
         telemetry: Option<&'a HookTimingSpan>,
     ) -> Self {
         Self {
@@ -53,6 +55,7 @@ impl<'a> DaemonAdmissionPort<'a> {
             project_root,
             session_id,
             lifecycle,
+            start_locator,
             feedback_notice: Mutex::new(None),
             github_stack_signal_available: Mutex::new(false),
             telemetry,
@@ -191,6 +194,7 @@ impl AsyncHookAdmissionPortV1 for DaemonAdmissionPort<'_> {
                         "envelope": envelope,
                         "native_session_id": self.session_id,
                         "native_lifecycle": self.lifecycle,
+                        "native_start_locator": self.start_locator,
                     }),
                     self.telemetry,
                 ),

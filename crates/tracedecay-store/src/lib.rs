@@ -160,9 +160,10 @@ pub use observation::{
     ObservationAdmissionPort, ObservationBatchFallbackCause, ObservationBatchPersistOutcome,
     ObservationCaptureSink, ObservationCommitReceipt, ObservationCoverageReason,
     ObservationCoverageV1, ObservationCursorAdvance, ObservationCursorPort,
-    ObservationPersistOutcome, ObservationProjectionStatus, ObservationReplayRequest,
-    ObservationStore, ObservationStoreError, ObservationStoreResult, ObservationWrite,
-    ObservedEvidenceAnchorResolution, RepositoryProvenanceAttachmentV1, StoredObservation,
+    ObservationPersistOutcome, ObservationProjectionStatus, ObservationRecentWindowRequest,
+    ObservationRecentWindowV1, ObservationReplayRequest, ObservationStore, ObservationStoreError,
+    ObservationStoreResult, ObservationWrite, ObservedEvidenceAnchorResolution,
+    RepositoryProvenanceAttachmentV1, StoredObservation,
     build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
     build_scope_resolution_authorization_v1, observation_capture_access_policy_digest_v1,
 };

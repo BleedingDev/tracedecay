@@ -1782,7 +1782,7 @@ export const EffectReceiptSchema = z.object({
 export type EffectReceipt = z.infer<typeof EffectReceiptSchema>;
 
 /** Durable effect receipt terminal state. */
-export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "partial", "timed_out"]);
+export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "no_change", "partial", "timed_out"]);
 export type EffectTermination = z.infer<typeof EffectTerminationSchema>;
 
 export const EnvironmentSettingsPayloadV1Schema = z.object({

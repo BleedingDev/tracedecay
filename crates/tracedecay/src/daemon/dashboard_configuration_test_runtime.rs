@@ -425,6 +425,8 @@ pub(crate) async fn register_dashboard_test_retained_runtime(
             project_retrieval: None,
             project_workflow_index: None,
             project_lcm: None,
+            #[cfg(feature = "memory-provider-host")]
+            provider_control: None,
             invocation_service: Some(service.clone()),
             configuration_digest: retained_access.configuration_digest.clone(),
         },

@@ -38,11 +38,14 @@ use tracedecay_memory_provider_api::contract::{
     CAPABILITIES, CommittedEffectState, FallbackEligibility, RequestControl, TerminalCode,
 };
 use tracedecay_memory_provider_api::{
-    CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
-    HandshakeResponse, MemoryProvider, OperationControl, OwnedExactScope, OwnedOpaqueExtension,
-    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
-    ProviderOperation, ProviderReply, TerminalRecord,
+    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CanonicalPayload, CommittedEffectEvidence,
+    CurrentAdvisoryAdmission, FallbackDirective, HandshakeRequest, HandshakeResponse,
+    MemoryProvider, OperationControl, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId,
+    OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits, ProviderOperation,
+    ProviderReply, TerminalRecord,
 };
+
+mod common;
 
 /// Stable logical provider identity reserved for NCM.
 pub const NCM_PROVIDER_ID: &str = "ncm";
@@ -357,6 +360,7 @@ impl Drop for OperationAdmission<'_> {
 pub struct NcmProviderAdapter {
     surface: Arc<dyn NcmCognitiveSurface>,
     readiness: RwLock<ReadinessState>,
+    admission_authority: Option<Arc<dyn AdvisoryAdmissionAuthority>>,
 }
 
 impl NcmProviderAdapter {
@@ -373,7 +377,19 @@ impl NcmProviderAdapter {
         Ok(Self {
             surface,
             readiness: RwLock::new(ReadinessState::default()),
+            admission_authority: None,
         })
+    }
+
+    /// Installs the trusted host authority used freshly for each invocation.
+    /// Payload grants never substitute for this composition-owned port.
+    #[must_use]
+    pub fn with_admission_authority(
+        mut self,
+        authority: Arc<dyn AdvisoryAdmissionAuthority>,
+    ) -> Self {
+        self.admission_authority = Some(authority);
+        self
     }
 
     fn supports_required_capabilities(
@@ -444,7 +460,12 @@ impl NcmProviderAdapter {
         }
     }
 
-    fn surface_payload(call: &ProviderCall) -> Option<CanonicalPayload> {
+    fn surface_payload(
+        call: &ProviderCall,
+        admission: Option<&CurrentAdvisoryAdmission>,
+        descriptor: &ProviderDescriptor,
+        limits: ProviderLimits,
+    ) -> Option<CanonicalPayload> {
         if Self::operation_contract_id(call.operation) != Some(call.payload.contract_id.as_str()) {
             return None;
         }
@@ -454,7 +475,28 @@ impl NcmProviderAdapter {
         }
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
+        if let Some(projected) =
+            common::project_portability(call, &value, &namespace, admission, descriptor, limits)?
+        {
+            value = projected;
+        }
+        if let Some(projected) = common::project_lifecycle(call, &value, &namespace, admission)? {
+            value = projected;
+        }
+        if call.operation == ProviderOperation::Recall && value.get("temporal_query").is_some() {
+            value = common::project_recall(call, &value, &namespace)?;
+        }
+        let retained = if call.operation == ProviderOperation::Observe {
+            common::project_attribution(call, &value, &namespace, admission)?
+        } else {
+            None
+        };
         project_observation_sources(&mut value, call, &namespace)?;
+        if let Some(retained) = retained {
+            value
+                .as_object_mut()?
+                .insert("provenance".to_owned(), retained);
+        }
         remove_exact_scope_identity(&mut value);
         if !rewrite_caller_identity_fields(&mut value, call, &opaque_ids)
             || json_contains_scope_component(&value, &call.exact_scope)
@@ -563,6 +605,14 @@ impl NcmProviderAdapter {
         let terminal_code = terminal.terminal_code();
         let committed_effect = terminal.committed_effect();
         let success = Self::success_terminal(terminal_code);
+        let replay_accounting = call.operation == ProviderOperation::Replay
+            && common::valid_replay_payload(surface_call, reply);
+        if call.operation == ProviderOperation::Replay
+            && reply.payload.is_some()
+            && !replay_accounting
+        {
+            return false;
+        }
         if committed_effect
             .state_generation_before()
             .is_some_and(|generation| generation != call.expected_state_generation)
@@ -573,7 +623,8 @@ impl NcmProviderAdapter {
             return false;
         }
         if !success
-            && (reply.payload.is_some() || terminal.diagnostic_id().is_none_or(str::is_empty))
+            && ((reply.payload.is_some() && !replay_accounting)
+                || terminal.diagnostic_id().is_none_or(str::is_empty))
         {
             return false;
         }
@@ -634,7 +685,7 @@ impl NcmProviderAdapter {
                 ) && committed_effect
                     .provider_receipt_sha256()
                     .is_some_and(Self::valid_sha256)
-                    && reply.payload.is_none()
+                    && (reply.payload.is_none() || replay_accounting)
             }
             CommittedEffectState::Unknown => {
                 matches!(
@@ -645,7 +696,7 @@ impl NcmProviderAdapter {
                 ) && committed_effect
                     .provider_receipt_sha256()
                     .is_some_and(Self::valid_sha256)
-                    && reply.payload.is_none()
+                    && (reply.payload.is_none() || replay_accounting)
             }
         }
     }
@@ -1246,7 +1297,38 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.request_payload_or_extension_invalid",
             );
         }
-        let Some(surface_payload) = Self::surface_payload(call) else {
+        let current_admission = match &self.admission_authority {
+            Some(authority) => match authority.admit(call).and_then(|admission| {
+                admission.verify_for(call)?;
+                call.control
+                    .snapshot()
+                    .map_err(AdvisoryAdmissionError::Control)?;
+                Ok(admission)
+            }) {
+                Ok(admission) => Some(admission),
+                Err(error) => {
+                    return Self::invoke_failure(
+                        call,
+                        match error {
+                            AdvisoryAdmissionError::Control(code) => code,
+                            AdvisoryAdmissionError::Denied(_) => TerminalCode::Unauthorized,
+                            AdvisoryAdmissionError::Unavailable(_) => {
+                                TerminalCode::ProviderUnavailable
+                            }
+                            _ => TerminalCode::InvalidRequest,
+                        },
+                        "ncm.current_advisory_admission_refused",
+                    );
+                }
+            },
+            None => None,
+        };
+        let Some(surface_payload) = Self::surface_payload(
+            call,
+            current_admission.as_ref(),
+            &readiness.descriptor,
+            readiness.effective_limits,
+        ) else {
             return Self::invoke_failure(
                 call,
                 TerminalCode::InvalidRequest,
@@ -1304,7 +1386,70 @@ impl MemoryProvider for NcmProviderAdapter {
                 return Self::surface_contract_failure(call, &surface_call, &reply);
             };
             reply.terminal = public_terminal;
+            if matches!(
+                call.operation,
+                ProviderOperation::SnapshotExport
+                    | ProviderOperation::SnapshotRestore
+                    | ProviderOperation::Replay
+            ) && serde_json::from_slice::<Value>(&call.payload.bytes)
+                .is_ok_and(|value| value.get("common_request").is_some())
+                && reply.payload.is_some()
+                && common::reconstruct_portability(
+                    call,
+                    &mut reply,
+                    &readiness.descriptor,
+                    readiness.effective_limits,
+                )
+                .is_none()
+            {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            }
+            if matches!(
+                call.operation,
+                ProviderOperation::Health
+                    | ProviderOperation::Inspection
+                    | ProviderOperation::Maintenance
+                    | ProviderOperation::DeleteBySource
+                    | ProviderOperation::Feedback
+                    | ProviderOperation::Correction
+            ) && serde_json::from_slice::<Value>(&call.payload.bytes)
+                .is_ok_and(|value| value.get("common_request").is_some())
+                && reply.terminal.terminal_code() == TerminalCode::Success
+                && common::reconstruct_lifecycle(call, &mut reply, readiness).is_none()
+            {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            }
+            if call.operation == ProviderOperation::Observe
+                && serde_json::from_slice::<Value>(&call.payload.bytes)
+                    .is_ok_and(|value| value.pointer("/source_identity/original_source").is_some())
+                && reply.terminal.terminal_code() == TerminalCode::Success
+                && common::reconstruct_observation(call, &mut reply).is_none()
+            {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            }
+            if call.operation == ProviderOperation::Recall
+                && serde_json::from_slice::<Value>(&call.payload.bytes)
+                    .is_ok_and(|value| value.get("temporal_query").is_some())
+                && matches!(
+                    reply.terminal.terminal_code(),
+                    TerminalCode::Success | TerminalCode::SuccessZeroResults
+                )
+                && common::reconstruct_recall(
+                    call,
+                    &readiness.provider_instance_id,
+                    &mut reply,
+                    current_admission.as_ref(),
+                )
+                .is_none()
+            {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            }
             reply.extensions.clone_from(&call.extensions);
+            if encoded_response_bytes(call, &reply) > readiness.effective_limits.response_bytes
+                && call.operation != ProviderOperation::SnapshotExport
+            {
+                return Self::surface_contract_failure(call, &surface_call, &reply);
+            }
             reply
         } else {
             Self::surface_contract_failure(call, &surface_call, &reply)
@@ -1658,6 +1803,19 @@ fn project_observation_sources(
     if call.operation != ProviderOperation::Observe {
         return Some(());
     }
+    if let Some(original) = object
+        .get("source_identity")
+        .and_then(|value| value.get("original_source"))
+    {
+        let source_id = common::project_source_id(namespace, original)?;
+        let kind = object.get("observation_kind").and_then(Value::as_str)?;
+        let contract = object.get("payload_contract").and_then(Value::as_str)?;
+        let (key_text, value_text) = common::evidence_text(kind, object.get("canonical_payload")?)?;
+        *value = serde_json::json!({"observation_kind": kind, "payload_contract": contract,
+            "canonical_payload": {"forget_source_key": source_id,
+                "_ncm_key_text": key_text, "_ncm_value_text": value_text}});
+        return Some(());
+    }
     let source = observe_source_alias(object).ok()?;
     let is_session = object.get("observation_kind").and_then(Value::as_str)
         == Some("session.message_committed.v1");
@@ -1769,6 +1927,17 @@ fn unique_source_alias(
 }
 
 fn observe_source_alias(object: &serde_json::Map<String, Value>) -> Result<Option<String>, ()> {
+    if let Some(original) = object
+        .get("source_identity")
+        .and_then(|value| value.get("original_source"))
+    {
+        let source = original
+            .pointer("/source/source_key")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(())?;
+        return Ok(Some(source.to_owned()));
+    }
     let canonical_source = object
         .get("canonical_payload")
         .and_then(Value::as_object)

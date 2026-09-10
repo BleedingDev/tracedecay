@@ -1,4 +1,5 @@
 use super::super::*;
+use super::common_maintenance::{CommonMaintenanceContext, present_reply};
 use super::util::{
     canonical_digest, core_reply, durable_receipt, lookup_replay, maintenance_name,
     meta_for_kernel, publish, put_checkpoint, read_live, remaining_deadline, store_reply,
@@ -25,6 +26,7 @@ impl NcmEngine {
             &digest,
             request.deadline,
             "feedback",
+            None,
             |kernel| {
                 let report = kernel.feedback(&request.record_ids)?;
                 Ok((
@@ -74,6 +76,7 @@ impl NcmEngine {
             &digest,
             request.deadline,
             "correction",
+            None,
             |kernel| {
                 kernel.correction(
                     request.superseded,
@@ -100,8 +103,26 @@ impl NcmEngine {
 
     /// Runs one idempotent bounded maintenance mutation.
     pub fn maintenance(&self, namespace: &str, request: MaintenanceRequest) -> EngineReply {
+        self.maintenance_impl(namespace, request, None)
+    }
+
+    pub(super) fn maintenance_with_common_context(
+        &self,
+        namespace: &str,
+        request: MaintenanceRequest,
+        common: CommonMaintenanceContext,
+    ) -> EngineReply {
+        present_reply(self.maintenance_impl(namespace, request, Some(&common)))
+    }
+
+    fn maintenance_impl(
+        &self,
+        namespace: &str,
+        request: MaintenanceRequest,
+        common: Option<&CommonMaintenanceContext>,
+    ) -> EngineReply {
         if matches!(request.kind, MaintenanceKind::Compact) {
-            return self.compact_maintenance(namespace, request);
+            return self.compact_maintenance(namespace, request, common);
         }
         let started = Instant::now();
         let before = {
@@ -119,7 +140,10 @@ impl NcmEngine {
                 Err(error) => return store_reply(error, handle.commit_seq),
             }
         };
-        let digest = match canonical_digest(&request.kind) {
+        let digest = match common.map_or_else(
+            || canonical_digest(&request.kind),
+            |common| Ok(common.request_semantic_sha256.clone()),
+        ) {
             Ok(digest) => digest,
             Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
         };
@@ -127,8 +151,13 @@ impl NcmEngine {
             namespace,
             &request.idempotency_key,
             &digest,
-            request.deadline,
+            if common.is_some() {
+                remaining_deadline(request.deadline, started)
+            } else {
+                request.deadline
+            },
             "maintenance",
+            common,
             |kernel| {
                 let payload = match &request.kind {
                     MaintenanceKind::Advance { ticks } => {
@@ -170,7 +199,12 @@ impl NcmEngine {
         )
     }
 
-    fn compact_maintenance(&self, namespace: &str, request: MaintenanceRequest) -> EngineReply {
+    fn compact_maintenance(
+        &self,
+        namespace: &str,
+        request: MaintenanceRequest,
+        common: Option<&CommonMaintenanceContext>,
+    ) -> EngineReply {
         let started = Instant::now();
         if request.deadline.remaining_ms == 0 {
             return EngineReply::new(Outcome::Cancelled, 0, Value::Null);
@@ -178,7 +212,10 @@ impl NcmEngine {
         if let Err(reason) = validate_idempotency_key(&request.idempotency_key) {
             return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
         }
-        let digest = match canonical_digest(&request.kind) {
+        let digest = match common.map_or_else(
+            || canonical_digest(&request.kind),
+            |common| Ok(common.request_semantic_sha256.clone()),
+        ) {
             Ok(digest) => digest,
             Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
         };
@@ -194,10 +231,22 @@ impl NcmEngine {
         if handle.fenced {
             return unavailable_recovery(handle.commit_seq);
         }
-        match lookup_replay(handle, &request.idempotency_key, &digest) {
+        if common.is_some() && remaining_deadline(request.deadline, started).remaining_ms == 0 {
+            return EngineReply::new(Outcome::Cancelled, handle.commit_seq, Value::Null);
+        }
+        let replay = match common {
+            Some(common) => common.lookup_replay(namespace, handle, &request.idempotency_key),
+            None => lookup_replay(handle, &request.idempotency_key, &digest),
+        };
+        match replay {
             Ok(Some(reply)) => return reply,
             Ok(None) => {}
             Err(reply) => return reply,
+        }
+        if let Some(common) = common
+            && let Err(reply) = common.check_generation(handle.commit_seq)
+        {
+            return reply;
         }
         if remaining_deadline(request.deadline, started).remaining_ms == 0 {
             return EngineReply::new(Outcome::Cancelled, handle.commit_seq, Value::Null);
@@ -223,7 +272,13 @@ impl NcmEngine {
             json!({"compact": true, "replayed": false}),
             MaintenanceMeasurement::new(started, before, after),
         );
-        let reply = EngineReply::new(Outcome::Success, pending_seq, payload);
+        let mut reply = EngineReply::new(Outcome::Success, pending_seq, payload);
+        if let Some(common) = common
+            && let Err(reply) =
+                common.retain(&mut reply, &MaintenanceKind::Compact, &live, &candidate)
+        {
+            return reply;
+        }
         let receipt = match durable_receipt(
             &reply,
             DurableOperation::Maintenance {
@@ -303,6 +358,7 @@ impl NcmEngine {
         payload_sha256: &str,
         deadline: Deadline,
         event_kind: &str,
+        common: Option<&CommonMaintenanceContext>,
         mutate: F,
     ) -> EngineReply
     where
@@ -329,10 +385,22 @@ impl NcmEngine {
         if handle.fenced {
             return unavailable_recovery(handle.commit_seq);
         }
-        match lookup_replay(handle, idempotency_key, payload_sha256) {
+        if common.is_some() && remaining_deadline(deadline, started).remaining_ms == 0 {
+            return EngineReply::new(Outcome::Cancelled, handle.commit_seq, Value::Null);
+        }
+        let replay = match common {
+            Some(common) => common.lookup_replay(namespace, handle, idempotency_key),
+            None => lookup_replay(handle, idempotency_key, payload_sha256),
+        };
+        match replay {
             Ok(Some(reply)) => return reply,
             Ok(None) => {}
             Err(reply) => return reply,
+        }
+        if let Some(common) = common
+            && let Err(reply) = common.check_generation(handle.commit_seq)
+        {
+            return reply;
         }
         if remaining_deadline(deadline, started).remaining_ms == 0 {
             return EngineReply::new(Outcome::Cancelled, handle.commit_seq, Value::Null);
@@ -401,6 +469,14 @@ impl NcmEngine {
                     "bytes_after".to_owned(),
                     Value::from(after.physical_bytes()),
                 );
+            }
+        }
+        if let Some(common) = common {
+            let DurableOperation::Maintenance { kind } = &operation else {
+                return EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null);
+            };
+            if let Err(reply) = common.retain(&mut reply, kind, &live, &candidate) {
+                return reply;
             }
         }
         let receipt = match durable_receipt(&reply, operation, &candidate) {

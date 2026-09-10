@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use axum::http::HeaderMap;
+use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
 use tracedecay_contracts::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationRequestControlV1, CancellationSignal, RequestId,
 };
@@ -38,10 +39,15 @@ pub(super) fn supplied_request_id(
     ))
 }
 
-pub(super) fn accepts_supplied_request_id(path: &str) -> bool {
-    path == tracedecay_api::retained_route_path(
-        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::FactStoreCurate,
+pub(super) fn supplied_request_id_operation(path: &str) -> Option<RetainedSurfaceOperation> {
+    let operation = path
+        .strip_prefix("/retained/")
+        .and_then(RetainedSurfaceOperation::from_operation_name)?;
+    matches!(
+        operation.sdk_operation_contract().request_id,
+        SdkRequestIdControlV1::Required
     )
+    .then_some(operation)
 }
 
 pub(super) struct ActiveHttpRequest {
@@ -117,8 +123,14 @@ mod tests {
             supplied_request_id(&headers),
             Err(RequestControlError::DuplicateHeader)
         );
-        assert!(accepts_supplied_request_id("/retained/fact_store_curate"));
-        assert!(!accepts_supplied_request_id("/retained/fact_store_add"));
+        assert_eq!(
+            supplied_request_id_operation("/retained/fact_store_curate"),
+            Some(RetainedSurfaceOperation::FactStoreCurate)
+        );
+        assert_eq!(
+            supplied_request_id_operation("/retained/fact_store_add"),
+            None
+        );
     }
 
     #[test]

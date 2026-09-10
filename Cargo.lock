@@ -5839,6 +5839,7 @@ dependencies = [
  "base64 0.22.1",
  "cap-fs-ext",
  "cap-std",
+ "chrono",
  "clap",
  "constant_time_eq",
  "criterion",
@@ -6758,6 +6759,7 @@ version = "0.1.0-beta.37"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.19",
  "tracedecay-memory-conformance",
  "tracedecay-memory-provider-api",
@@ -6805,6 +6807,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tracedecay-memory-ncm-core",
+ "tracedecay-memory-provider-api",
  "tracedecay-private-fs",
 ]
 
@@ -6840,11 +6843,13 @@ dependencies = [
 name = "tracedecay-memory-provider-ncm"
 version = "0.1.0-beta.37"
 dependencies = [
+ "chrono",
  "serde_json",
  "sha2 0.11.0",
  "tracedecay-memory-conformance",
  "tracedecay-memory-ncm-runtime",
  "tracedecay-memory-provider-api",
+ "tracedecay-memory-provider-registry",
 ]
 
 [[package]]

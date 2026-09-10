@@ -46,7 +46,7 @@ pub fn codex_additional_context_json(event_name: &str, additional_context: &str)
     super::additional_context_json(event_name, additional_context)
 }
 
-/// Codex `Stop` response: admit daemon-owned ingest before optional V2 guidance.
+/// Codex `Stop` response: seal the live frontier before queuing transcript ingest.
 pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
     let started = Instant::now();
     let event = read_hook_event!();
@@ -63,20 +63,17 @@ pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
         &event,
         &parsed,
     );
-    // Required producer admission must not be starved by optional guidance work.
-    let queued =
-        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started).await;
-    let guidance = super::dispatch::dispatch_for_scope(
+    let (dispatched, queued) = super::dispatch::dispatch_for_scope_with_required_work(
         runtime,
         tracedecay_hooks::HookHostV1::Codex,
         &event,
         root.as_deref(),
         Some(&telemetry),
         started,
+        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started),
     )
-    .await
-    .into_recorded_guidance(&telemetry)
-    .flatten();
+    .await;
+    let guidance = dispatched.into_recorded_guidance(&telemetry).flatten();
     let output = guidance.map_or_else(
         || "{}".to_owned(),
         |guidance| additional_context_json("Stop", &guidance),
@@ -199,15 +196,6 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
         &event,
         &parsed,
     );
-    if let Some(project_root) = root.as_deref() {
-        super::notify_hook_event_with_telemetry(
-            runtime,
-            project_root,
-            codex_session_start_route_event(&parsed, project_root),
-            &hook_telemetry,
-        )
-        .await;
-    }
     let guidance = super::dispatch::dispatch_for_scope(
         runtime,
         tracedecay_hooks::HookHostV1::Codex,
@@ -219,6 +207,15 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
     .await
     .into_recorded_guidance(&hook_telemetry)
     .flatten();
+    if let Some(project_root) = root.as_deref() {
+        super::notify_hook_event_with_telemetry(
+            runtime,
+            project_root,
+            codex_session_start_route_event(&parsed, project_root),
+            &hook_telemetry,
+        )
+        .await;
+    }
     let output = guidance.map_or_else(
         || serde_json::json!({}).to_string(),
         |guidance| additional_context_json("SessionStart", &guidance),

@@ -8551,6 +8551,7 @@
       "description": "Durable effect receipt terminal state.",
       "enum": [
         "completed",
+        "no_change",
         "cancelled",
         "timed_out",
         "failed",

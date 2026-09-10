@@ -184,6 +184,22 @@ async fn claude_session_start_response(
         event,
         &parsed,
     );
+    // Record the live frontier before catch-up can admit the appended rows.
+    let output = super::dispatch::dispatch_for_scope(
+        runtime,
+        tracedecay_hooks::HookHostV1::ClaudeCode,
+        event,
+        root.as_deref(),
+        Some(&hook_telemetry),
+        started,
+    )
+    .await
+    .into_recorded_guidance(&hook_telemetry)
+    .flatten()
+    .map_or_else(
+        || serde_json::json!({}).to_string(),
+        |guidance| additional_context_json("SessionStart", &guidance),
+    );
     if let Some(project_root) = root.as_deref() {
         super::notify_hook_event_with_telemetry(
             runtime,
@@ -202,21 +218,6 @@ async fn claude_session_start_response(
         )
         .await;
     }
-    let output = super::dispatch::dispatch_for_scope(
-        runtime,
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        event,
-        root.as_deref(),
-        Some(&hook_telemetry),
-        started,
-    )
-    .await
-    .into_recorded_guidance(&hook_telemetry)
-    .flatten()
-    .map_or_else(
-        || serde_json::json!({}).to_string(),
-        |guidance| additional_context_json("SessionStart", &guidance),
-    );
     (root, output)
 }
 
@@ -361,17 +362,7 @@ async fn claude_stop_response_for_event(
         event,
         &parsed,
     );
-    if let Some(project_root) = root.as_deref() {
-        ingest_claude_project_transcript(
-            runtime,
-            "Stop",
-            event,
-            project_root,
-            CLAUDE_STOP_INGEST_BUDGET,
-            &hook_telemetry,
-        )
-        .await;
-    }
+    // Record the live frontier before catch-up can admit the appended rows.
     let output = super::dispatch::dispatch_for_scope(
         runtime,
         tracedecay_hooks::HookHostV1::ClaudeCode,
@@ -387,6 +378,17 @@ async fn claude_stop_response_for_event(
         || serde_json::json!({}).to_string(),
         |guidance| additional_context_json("Stop", &guidance),
     );
+    if let Some(project_root) = root.as_deref() {
+        ingest_claude_project_transcript(
+            runtime,
+            "Stop",
+            event,
+            project_root,
+            CLAUDE_STOP_INGEST_BUDGET,
+            &hook_telemetry,
+        )
+        .await;
+    }
     (root, output)
 }
 

@@ -519,3 +519,37 @@ pub(crate) fn decode_receipt(
     receipt.validate()?;
     Ok(receipt)
 }
+
+/// Rebuilds a retained admission without claiming or updating a lease.
+/// The columns are LEASE_SELECT_COLUMNS followed by the five admission fields.
+pub(crate) fn decode_admitted(
+    row: &Row<'_>,
+) -> Result<crate::AdmittedObservationV1, ObservationJournalError> {
+    // The decoder derives a value only. No lease is acquired and the
+    // persisted attempt count is never advanced by this read.
+    let admitted_instance: String = row.get(3)?;
+    let decoded = decode_leased(row, &admitted_instance, "admission-read", 0, 1)?;
+    let source = decode_json(&row.get::<_, String>(28)?, "settlement_receipt_json")?;
+    let admitted = crate::AdmittedObservationV1 {
+        observation_id: decoded.observation_id,
+        idempotency_key: decoded.idempotency_key,
+        target: decoded.target,
+        exact_scope: decoded.exact_scope,
+        source,
+        observation_kind: decoded.observation_kind,
+        payload: decoded.payload,
+        extensions: decoded.extensions,
+        extensions_digest: decoded.extensions_digest,
+        provenance_origin: decoded.provenance_origin,
+        provenance_sha256: row.get(29)?,
+        privacy: decoded.privacy,
+        sanitization: decoded.sanitization,
+        occurred_at_unix_micros: row.get(30)?,
+        admitted_at_unix_micros: row.get(31)?,
+        deadline_unix_micros: decoded.deadline_unix_micros,
+        request_id: row.get(32)?,
+        envelope_sha256: row.get(33)?,
+    };
+    admitted.validate()?;
+    Ok(admitted)
+}

@@ -10,8 +10,10 @@ use tracedecay_memory_provider_ncm::{
     StateRoot, WorkerOptions,
 };
 use tracedecay_memory_provider_registry::{
-    ObservationInstanceProofV1, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
-    ObserverProviderRegistration,
+    EnabledProviderMode, ObservationInstanceProofV1, ObservationProviderMountV1,
+    ObservationStateNamespacePolicyV1, ProviderExecutionShapeV1, ProviderLifecycleOwnerErrorV1,
+    ProviderLifecycleOwnerV1, ProviderLifecycleOwnershipV1, ProviderRegistrationV1,
+    RecallScopeBindingsV1,
 };
 
 /// Construction failed before an NCM registration could be mounted.
@@ -31,6 +33,9 @@ pub(in crate::daemon) enum NcmObserverConstructionError {
     /// The real worker could not be constructed or report coherent identity.
     #[error("NCM observer worker is unavailable: {0}")]
     Worker(#[from] tracedecay_memory_provider_ncm::RustNcmError),
+    /// Composition could not admit the adapter's declared scope bindings.
+    #[error("NCM registration is invalid: {0}")]
+    Registration(String),
     /// The real surface declared an invalid adapter identity.
     #[error("NCM observer adapter is invalid: {0}")]
     Adapter(#[from] tracedecay_memory_provider_ncm::NcmAdapterError),
@@ -115,30 +120,99 @@ impl ObservationInstanceProofV1 for NcmInstanceProof {
     }
 }
 
-/// Builds only the real worker-backed NCM adapter, always as an observer.
-///
-/// Construction declares pinned identity without starting the worker. The
-/// retained delivery thread proves it later; encoder unavailability remains
-/// typed not-ready. No synthetic encoder or
-/// active recall registration can be selected through this constructor.
-pub(in crate::daemon) fn construct_ncm_observer(
+/// Lifecycle adapter over the daemon's existing worker owner. This is not a
+/// second process registry and does not claim its host wrapper thread is killable.
+struct NcmLifecycleOwner(Arc<RustNcmWorkerOwner>);
+
+fn lifecycle_deadline(
+    deadline_unix_micros: i64,
+) -> Result<std::time::Instant, ProviderLifecycleOwnerErrorV1> {
+    let remaining = deadline_unix_micros
+        .checked_sub(tracedecay_contracts::now_micros().0)
+        .filter(|remaining| *remaining > 0)
+        .ok_or(ProviderLifecycleOwnerErrorV1::DeadlineElapsed)?;
+    std::time::Instant::now()
+        .checked_add(std::time::Duration::from_micros(remaining as u64))
+        .ok_or(ProviderLifecycleOwnerErrorV1::DeadlineElapsed)
+}
+
+fn owner_result<T>(
+    result: Result<T, impl std::fmt::Display>,
+    deadline: std::time::Instant,
+) -> Result<T, ProviderLifecycleOwnerErrorV1> {
+    result.map_err(|error| {
+        if std::time::Instant::now() >= deadline {
+            ProviderLifecycleOwnerErrorV1::DeadlineElapsed
+        } else {
+            ProviderLifecycleOwnerErrorV1::Unavailable(error.to_string())
+        }
+    })
+}
+
+impl ProviderLifecycleOwnerV1 for NcmLifecycleOwner {
+    fn start(&self, deadline_unix_micros: i64) -> Result<(), ProviderLifecycleOwnerErrorV1> {
+        let deadline = lifecycle_deadline(deadline_unix_micros)?;
+        owner_result(self.0.start(deadline), deadline)
+    }
+    fn request_stop(
+        &self,
+        deadline_unix_micros: i64,
+    ) -> Result<bool, ProviderLifecycleOwnerErrorV1> {
+        let deadline = lifecycle_deadline(deadline_unix_micros)?;
+        owner_result(self.0.request_stop(deadline), deadline)
+    }
+    fn kill(&self, deadline_unix_micros: i64) -> Result<(), ProviderLifecycleOwnerErrorV1> {
+        let deadline = lifecycle_deadline(deadline_unix_micros)?;
+        owner_result(self.0.kill(deadline), deadline)
+    }
+}
+
+/// Builds one lazy registration over the existing NCM worker slot. Active mode
+/// is passed by validated composition; no Native advisory authority is required.
+pub(in crate::daemon) fn construct_ncm_registration(
     owners: &NcmWorkerOwnerSlot,
     profile_id: &UserProfileId,
     worker_binary: PathBuf,
     state_root: PathBuf,
     registration_revision: u64,
-) -> Result<(ObserverProviderRegistration, ObservationProviderMountV1), NcmObserverConstructionError>
-{
+    mode: EnabledProviderMode,
+) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
+    construct_ncm_registration_with_authority(
+        owners,
+        profile_id,
+        worker_binary,
+        state_root,
+        registration_revision,
+        mode,
+        None,
+    )
+}
+
+pub(in crate::daemon) fn construct_ncm_registration_with_authority(
+    owners: &NcmWorkerOwnerSlot,
+    profile_id: &UserProfileId,
+    worker_binary: PathBuf,
+    state_root: PathBuf,
+    registration_revision: u64,
+    mode: EnabledProviderMode,
+    authority: Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
+) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
     let worker = owners.acquire(profile_id, &worker_binary, &state_root)?;
+    let lifecycle =
+        ProviderLifecycleOwnershipV1::Owned(Arc::new(NcmLifecycleOwner(Arc::clone(&worker))));
     let surface = Arc::new(RustNcmSurface::from_production_worker(worker)?);
     let provider_instance_id = surface.provider_instance_id()?;
     let descriptor = surface.descriptor();
     let instance_proof = Some(
         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
     );
-    let provider = Arc::new(NcmProviderAdapter::new(surface)?);
+    let provider = NcmProviderAdapter::new(surface)?;
+    let provider = Arc::new(match authority {
+        Some(authority) => provider.with_admission_authority(authority),
+        None => provider,
+    });
     let mount = ObservationProviderMountV1 {
-        provider_id: descriptor.provider_id,
+        provider_id: descriptor.provider_id.clone(),
         registration_revision,
         provider_instance_id,
         instance_proof,
@@ -148,8 +222,52 @@ pub(in crate::daemon) fn construct_ncm_observer(
         state_namespace_policy: ObservationStateNamespacePolicyV1::AdapterAttestedExactScope,
     };
     Ok((
-        ObserverProviderRegistration {
+        ProviderRegistrationV1 {
+            provider_id: descriptor.provider_id,
             provider,
+            registration_revision,
+            mode,
+            // Workspace-authored cooperative adapter code runs on the host invocation
+            // thread; its model process is separately owned and cancellable below it.
+            execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+            recall_scope_bindings: RecallScopeBindingsV1::from_wire(
+                tracedecay_memory_provider_ncm::NCM_RECALL_SCOPE_BINDINGS
+                    .iter()
+                    .copied(),
+            )
+            .map_err(|error| NcmObserverConstructionError::Registration(error.to_string()))?,
+            lifecycle,
+        },
+        mount,
+    ))
+}
+
+/// Compatibility constructor for existing observer harnesses.
+#[cfg(test)]
+pub(in crate::daemon) fn construct_ncm_observer(
+    owners: &NcmWorkerOwnerSlot,
+    profile_id: &UserProfileId,
+    worker_binary: PathBuf,
+    state_root: PathBuf,
+    registration_revision: u64,
+) -> Result<
+    (
+        tracedecay_memory_provider_registry::ObserverProviderRegistration,
+        ObservationProviderMountV1,
+    ),
+    NcmObserverConstructionError,
+> {
+    let (registration, mount) = construct_ncm_registration(
+        owners,
+        profile_id,
+        worker_binary,
+        state_root,
+        registration_revision,
+        EnabledProviderMode::Observer,
+    )?;
+    Ok((
+        tracedecay_memory_provider_registry::ObserverProviderRegistration {
+            provider: registration.provider,
             registration_revision,
         },
         mount,

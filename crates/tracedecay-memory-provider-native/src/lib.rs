@@ -459,14 +459,21 @@ impl NativeProvider {
         if payload_contract != expected_payload_contract {
             return Err(ObservationParseError::KindContractMismatch);
         }
-        // Classification is the authorization boundary: exactly two kinds are
-        // accepted, and each is handed to the port as its own variant. Every
-        // other contract-known kind is refused here, before the port is
-        // reached, because accepting it would commit Native to a projection,
-        // retention rule, and containment story it does not have.
+        // Common structured observations require retained original-source
+        // attribution and use the staged projection. Legacy session messages
+        // and canonical fact promotion retain their existing distinct variants.
         let staged = match observation_kind.as_str() {
             NATIVE_FACT_PROMOTION_OBSERVATION_KIND => false,
             NATIVE_STAGED_SESSION_OBSERVATION_KIND => true,
+            "source.edit_settled.v1"
+            | "test.execution_settled.v1"
+            | "feedback.outcome_settled.v1"
+                if envelope
+                    .pointer("/source_identity/original_source")
+                    .is_some() =>
+            {
+                true
+            }
             _ => return Err(ObservationParseError::UnsupportedKind),
         };
         let envelope = NativeObservationEnvelope {

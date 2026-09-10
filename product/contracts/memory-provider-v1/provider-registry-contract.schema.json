@@ -21,7 +21,8 @@
     "selection_contract",
     "bootstrap_slots",
     "invariants",
-    "verification_beads"
+    "verification_beads",
+    "common_advisory_profile"
   ],
   "properties": {
     "schema_version": {
@@ -102,8 +103,8 @@
     },
     "capability_catalog": {
       "type": "array",
-      "minItems": 15,
-      "maxItems": 15,
+      "minItems": 16,
+      "maxItems": 16,
       "uniqueItems": true,
       "items": {
         "type": "object",
@@ -154,6 +155,49 @@
       "items": {
         "$ref": "#/$defs/beadId"
       }
+    },
+    "common_advisory_profile": {
+      "const": {
+        "profile_id": "memory.advisory_common.v1",
+        "required_capabilities": [
+          "provider.health.v1",
+          "observation.accept.v1",
+          "recall.query.v1",
+          "recall.temporal.v1",
+          "feedback.record.v1",
+          "maintenance.run.v1",
+          "inspection.read.v1",
+          "correction.apply.v1",
+          "deletion.by_source.v1",
+          "snapshot.export.v1",
+          "snapshot.restore.v1",
+          "replay.apply.v1"
+        ],
+        "required_observation_kinds": [
+          "session.message_committed.v1",
+          "source.edit_settled.v1",
+          "test.execution_settled.v1",
+          "feedback.outcome_settled.v1"
+        ],
+        "optional_capabilities": [
+          "recall.associative.v1",
+          "facts.explicit.v1",
+          "explain.trace.v1"
+        ],
+        "optional_observation_kinds": [
+          "tool.execution_settled.v1",
+          "diagnostic.observed.v1",
+          "git.evidence_observed.v1",
+          "native.fact_promoted.v1",
+          "automation.outcome_settled.v1"
+        ],
+        "legacy_mandatory_capabilities_unchanged": true,
+        "activation_requires_explicit_registration_and_selection": true,
+        "required_unsupported_is_compatibility_failure": true,
+        "canonical_fact_projection_in_common_profile": false,
+        "structured_evidence_projection": "bounded_supported_evidence_fields_never_arbitrary_json_as_message",
+        "provider_name_implies_profile": false
+      }
     }
   },
   "$defs": {
@@ -188,7 +232,7 @@
         },
         "contract_id": {
           "type": "string",
-          "pattern": "^tracedecay\\\\.memory\\\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\\\.(?:request|outcome)\\\\.v[1-9][0-9]*$",
+          "pattern": "^tracedecay\\.memory\\.[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\\.(?:request|outcome)\\.v[1-9][0-9]*$",
           "maxLength": 160
         },
         "required": {

@@ -119,6 +119,9 @@ impl OperationReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum EffectTermination {
     Completed,
+    // The admitted command completed with verified no effect. This does not
+    // represent an unknown outcome or a policy refusal.
+    NoChange,
     Cancelled,
     TimedOut,
     Failed,
@@ -129,7 +132,7 @@ pub enum EffectTermination {
 impl From<EffectTermination> for OperationTermination {
     fn from(value: EffectTermination) -> Self {
         match value {
-            EffectTermination::Completed => Self::Completed,
+            EffectTermination::Completed | EffectTermination::NoChange => Self::Completed,
             EffectTermination::Cancelled => Self::Cancelled,
             EffectTermination::TimedOut => Self::TimedOut,
             EffectTermination::Failed => Self::Failed,
@@ -141,7 +144,23 @@ impl From<EffectTermination> for OperationTermination {
 
 #[cfg(test)]
 mod tests {
-    use super::OperationTermination;
+    use super::{EffectTermination, OperationTermination};
+
+    #[test]
+    fn no_change_effect_has_a_distinct_wire_state_and_completed_operation() {
+        let encoded =
+            serde_json::to_string(&EffectTermination::NoChange).expect("encode termination");
+
+        assert_eq!(encoded, "\"no_change\"");
+        assert_eq!(
+            serde_json::from_str::<EffectTermination>(&encoded).expect("decode termination"),
+            EffectTermination::NoChange
+        );
+        assert_eq!(
+            OperationTermination::from(EffectTermination::NoChange),
+            OperationTermination::Completed
+        );
+    }
 
     #[test]
     fn unavailable_read_receipt_has_a_distinct_wire_state() {
@@ -256,6 +275,13 @@ impl EffectReceipt {
         }
         if let Some(proof) = &self.external_proof {
             proof.validate()?;
+        }
+        if self.outcome == EffectTermination::NoChange
+            && (self.committed_state.is_some() || self.external_proof.is_some())
+        {
+            return Err(ApplicationContractError::Inconsistent {
+                field: "no-change effect receipt proof",
+            });
         }
         if self.outcome == EffectTermination::Completed
             && self.committed_state.is_none()

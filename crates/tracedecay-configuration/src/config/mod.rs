@@ -535,6 +535,45 @@ mod memory_provider_snapshot_tests {
     }
 
     #[test]
+    fn legacy_participation_snapshot_selects_ncm_without_enabling_native() {
+        use tracedecay_domain::configuration::{
+            MemoryProviderKindV1, MemoryProviderParticipationV1, MemoryProviderSelectionV1,
+        };
+        let base = default_snapshot();
+        let mut values = base.effective_values.clone();
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\ncm")
+        } else {
+            PathBuf::from("/ncm")
+        };
+        let ncm = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: root.join("worker"),
+            state_root: root.join("state"),
+        };
+        values.insert(
+            setting_key(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY),
+            ConfigurationValueV1::Text(serde_json::to_string(&ncm).unwrap()),
+        );
+        values.insert(
+            setting_key(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY),
+            ConfigurationValueV1::Text(r#"{"active_provider":"ncm"}"#.to_owned()),
+        );
+        let snapshot = ConfigurationSnapshotV1::new(values, base.provenance).unwrap();
+        let config = runtime_config_from_snapshot(&snapshot).unwrap();
+        assert!(!config.memory_provider_native_enabled);
+        assert_eq!(config.memory_provider_ncm_observer, ncm);
+        let selection = MemoryProviderSelectionV1::resolve(
+            config.memory_provider_native_enabled,
+            &config.memory_provider_ncm_observer,
+            &config.memory_provider_recall_routing,
+        )
+        .unwrap();
+        assert_eq!(selection.active_provider(), Some(MemoryProviderKindV1::Ncm));
+        assert_eq!(selection.native, MemoryProviderParticipationV1::Disabled);
+        assert_eq!(selection.ncm, MemoryProviderParticipationV1::Active);
+    }
+
+    #[test]
     fn both_memory_provider_settings_extract_from_the_resolved_snapshot() {
         // Stock configuration composes no provider and routes no recall.
         let stock = runtime_config_from_snapshot(&default_snapshot())

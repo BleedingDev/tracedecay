@@ -418,6 +418,7 @@ impl McpServer {
                     self.cognitive_recall_port_for_session(call.canonical_session_id()),
                     self.cognitive_recall_mount.as_deref(),
                     call,
+                    result.context_memory_contribution(),
                 )
                 .await
                 {

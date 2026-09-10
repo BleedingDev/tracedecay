@@ -136,6 +136,8 @@ pub enum FabricError {
     ProviderObserverOnly(String),
     /// Observation routing was requested for a non-observation operation.
     OperationNotObservation,
+    /// Control routing was requested for recall, observation or handshake.
+    OperationNotControl,
     /// The registration does not declare a required capability.
     MissingCapability(String),
     /// The finite concurrent-call budget is exhausted.
@@ -256,6 +258,9 @@ impl fmt::Display for FabricError {
             }
             Self::OperationNotObservation => {
                 formatter.write_str("observer delivery requires observation.accept.v1")
+            }
+            Self::OperationNotControl => {
+                formatter.write_str("provider control requires a lifecycle operation")
             }
             Self::MissingCapability(capability) => {
                 write!(
@@ -825,6 +830,40 @@ impl MemoryFabric {
 
     /// Invokes one operation that is allowed to influence active product flow.
     pub fn invoke_active(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
+        self.invoke_registered(call, true)
+    }
+
+    /// Invokes an explicit provider-local lifecycle control against its pinned
+    /// provider and registration revision, including an enabled observer.
+    /// Recall, observation and handshake never enter this route, and no
+    /// selected-provider or fallback policy can redirect the call.
+    ///
+    /// The host must authorize the target and hold its supervised readiness
+    /// dispatch guard through this call. Quarantine belongs to that supervisor;
+    /// this boundary independently revalidates the live readiness receipt.
+    pub fn invoke_control(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
+        if !matches!(
+            call.operation,
+            ProviderOperation::Feedback
+                | ProviderOperation::Correction
+                | ProviderOperation::DeleteBySource
+                | ProviderOperation::Health
+                | ProviderOperation::Inspection
+                | ProviderOperation::Maintenance
+                | ProviderOperation::SnapshotExport
+                | ProviderOperation::SnapshotRestore
+                | ProviderOperation::Replay
+        ) {
+            return Err(FabricError::OperationNotControl);
+        }
+        self.invoke_registered(call, false)
+    }
+
+    fn invoke_registered(
+        &self,
+        call: &ProviderCall,
+        require_active: bool,
+    ) -> Result<ProviderReply, FabricError> {
         call.validate()?;
         let registration = self.registration(&call.provider_id)?;
         let dispatch_gate = Arc::clone(&registration.dispatch_gate);
@@ -835,6 +874,7 @@ impl MemoryFabric {
         Self::require_revision(&registration, call.registration_revision)?;
         match registration.mode {
             ProviderMode::Active => {}
+            ProviderMode::Observer if !require_active => {}
             ProviderMode::Observer => {
                 return Err(FabricError::ProviderObserverOnly(
                     call.provider_id.as_str().to_owned(),
@@ -850,7 +890,7 @@ impl MemoryFabric {
         let readiness = Self::require_readiness(&registration, call)?;
         call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
         Self::preflight(&call.control)?;
-        let _permit = self.active_permits.try_acquire()?;
+        let _permit = self.admission_lane(registration.mode).try_acquire()?;
         let reply = registration.provider.invoke(call);
         if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
             self.invalidate_matching_readiness(call)?;
@@ -952,8 +992,8 @@ impl MemoryFabric {
     ///
     /// Lane choice is the registration's own participation mode, never the
     /// call route: an `Observer` registration draws from the observer lane
-    /// for every contact it ever receives (handshake and observation
-    /// delivery alike), so no observer — blocking, slow, or slow-failing —
+    /// for every contact it ever receives (handshake, observation delivery
+    /// and lifecycle control alike), so no observer — blocking, slow, or slow-failing —
     /// can hold a permit an active call needs. A `Disabled` registration is
     /// refused before this point; it is mapped to the observer lane so a
     /// future caller that forgets the enabled check can still never reach

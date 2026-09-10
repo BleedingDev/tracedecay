@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 TOP_LEVEL = {
+    "common_advisory_semantics",
     "schema_version",
     "contract_id",
     "bead_id",
@@ -902,6 +903,8 @@ def validate_snapshot_replay_projection(
 
     replay = obj(contract.get("replay"), "replay", errors)
     keys = {
+        "common_profile_required_fields",
+        "common_profile_response_fields",
         "type_name",
         "contract_id",
         "capability_id",
@@ -1101,6 +1104,49 @@ def validate(
     validate_correction_deletion(contract, errors)
     validate_snapshot_replay_projection(contract, errors)
     validate_terminal_invariants_beads(contract, issue_ids, errors)
+    common = contract.get("common_advisory_semantics")
+    if not isinstance(common, dict) or schema.get("properties", {}).get("common_advisory_semantics", {}).get("const") != common:
+        errors.append("common_advisory_semantics must match its canonical schema semantics")
+    inspection_shapes = {
+        "inspectionDeliveryReceiptSelector": (
+            "delivery_receipt_selector_fields", ["idempotency_key"]
+        ),
+        "inspectionDeliveryReceiptItem": (
+            "delivery_receipt_item_fields",
+            ["operation_id", "idempotency_key", "provider_receipt_digest", "stable_memory_ref"],
+        ),
+        "inspectionTraceSelector": (
+            "trace_selector_fields", ["stable_memory_ref"]
+        ),
+        "inspectionTraceItem": (
+            "trace_item_fields",
+            ["stable_memory_ref", "content", "content_sha256", "original_source"],
+        ),
+    }
+    definitions = schema.get("$defs", {})
+    for name, (semantic, fields) in inspection_shapes.items():
+        definition = definitions.get(name, {})
+        if (
+            definition.get("type") != "object"
+            or definition.get("additionalProperties") is not False
+            or definition.get("required") != fields
+            or set(definition.get("properties", {})) != set(fields)
+            or not isinstance(common, dict)
+            or common.get(semantic) != fields
+        ):
+            errors.append(f"{name} must pin the exact common inspection fields")
+    inspection_policies = {
+        "delivery_receipt_items_preserve_original_effect_identity": True,
+        "delivery_receipt_missing_original_evidence_policy": "omit_item_report_partial_or_warning",
+        "trace_content_digest": "sha256_exact_emitted_utf8_content",
+        "trace_missing_original_source": "null_without_synthesis",
+        "trace_privacy_withheld_fields": ["content", "content_sha256", "original_source"],
+        "inspection_existing_outer_limits_apply": True,
+        "inspection_read_projection_may_grant_source_authority": False,
+    }
+    for name, expected in inspection_policies.items():
+        if not isinstance(common, dict) or common.get(name) != expected:
+            errors.append(f"common inspection policy {name} drifted")
     validate_schema(schema, errors)
     validate_doc(doc_path, errors)
     return errors

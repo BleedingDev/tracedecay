@@ -652,6 +652,10 @@
         "tracedecay-memory-provider-ncm"
       ],
       "id": "ncm_adapter_does_not_reach_native_store",
+      "dependency_kinds": [
+        "normal",
+        "build"
+      ],
       "reason": "NCM uses provider contracts and its licensed Biomem SDK/transport, never Native persistence, raw storage/private-filesystem engines, TraceDecay runtime internals, or a separate NCM/OCEAN adapter SDK."
     },
     {

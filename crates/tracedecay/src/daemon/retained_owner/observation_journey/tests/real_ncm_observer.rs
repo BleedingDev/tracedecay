@@ -199,10 +199,7 @@ async fn persist_position(
     position: u64,
 ) {
     let anchored = anchored_write(canonical_observation_at(
-        project_id,
-        session_id,
-        text,
-        position,
+        project_id, session_id, text, position,
     ));
     let observation = anchored.observation();
     let expected_cursor = store

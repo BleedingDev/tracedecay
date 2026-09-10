@@ -2731,3 +2731,233 @@ fn conflicting_or_malformed_source_aliases_fail_closed() {
         assert!(captured.is_none());
     }
 }
+
+/// The runtime probes generation; the adapter supplies capability rows from its
+/// actual accepted readiness. This surface never supplies capability rows.
+struct CapabilityProbeSurface(MockSurface);
+
+impl NcmCognitiveSurface for CapabilityProbeSurface {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.0.descriptor()
+    }
+
+    fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+        self.0.handshake(request)
+    }
+
+    fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
+        let projected: serde_json::Value =
+            serde_json::from_slice(&call.payload.bytes).expect("projected capability request");
+        assert_eq!(projected["common_control"]["view"], "capability_status");
+        let mut reply = self.0.invoke(call);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "common_control": "inspection", "view": "capability_status",
+            "state_generation": reply.state_generation
+        }))
+        .expect("generation probe");
+        reply.payload = Some(canonical_payload(call.operation, &bytes));
+        reply
+    }
+}
+
+fn capability_inspection_call(
+    ready: &str,
+    cursor: serde_json::Value,
+    maximum_items: u64,
+    maximum_bytes: u64,
+) -> ProviderCall {
+    let mut request = call(NCM_PROVIDER_ID, ProviderOperation::Inspection);
+    request.ready_receipt_sha256 = ready.to_owned();
+    // Real returned extensions make reply framing significant while the
+    // descriptor handshake remains much smaller than a single public page.
+    request.extensions.push(opaque_extension(&vec![b'x'; 2048]));
+    let exact = &request.exact_scope;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "common_request": {
+            "provider_id": request.provider_id.as_str(),
+            "registration_revision": request.registration_revision,
+            "ready_receipt_digest": request.ready_receipt_sha256,
+            "exact_scope_identity": {
+                "profile_id": exact.profile_id, "project_id": exact.project_id,
+                "repository_identity": exact.repository_identity, "worktree_identity": exact.worktree_identity,
+                "branch_identity": exact.branch_identity, "agent_session_id": exact.agent_session_id,
+                "resolved_scope_digest": exact.resolved_scope_digest
+            },
+            "operation_id": request.operation_id, "idempotency_key": null,
+            "expected_state_generation": request.expected_state_generation,
+            "request_identity": request.request_id, "policy_revision": 1,
+            "deadline": {"deadline_utc_micros": i64::MAX, "remaining_millis": 500},
+            "cancellation": "live", "extensions": []
+        },
+        "view": "capability_status", "selector": {}, "maximum_items": maximum_items,
+        "maximum_bytes": maximum_bytes, "redaction_policy_revision": 1, "cursor": cursor
+    }))
+    .expect("common capability request");
+    request.payload = canonical_payload(request.operation, &bytes);
+    request
+}
+
+#[test]
+fn capability_pages_obey_negotiated_reply_framing_and_item_limits_without_stalled_cursors() {
+    use serde_json::{Value, json};
+
+    let provider_for = |host_limits: ProviderLimits| {
+        let surface = Arc::new(CapabilityProbeSurface(MockSurface::new(
+            NCM_PROVIDER_ID,
+            &[
+                ProviderOperation::Inspection.capability_id(),
+                ProviderOperation::Feedback.capability_id(),
+                ProviderOperation::Correction.capability_id(),
+                ProviderOperation::Maintenance.capability_id(),
+            ],
+            false,
+        )));
+        let provider = NcmProviderAdapter::new(surface).expect("capability adapter");
+        let mut request = handshake(NCM_PROVIDER_ID);
+        request.host_limits = host_limits;
+        let response = provider.handshake(&request);
+        assert_eq!(response.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(response.effective_limits, Some(host_limits));
+        let ready = response.ready_receipt_sha256.expect("accepted readiness");
+        (provider, ready)
+    };
+    let decode = |reply: &ProviderReply| -> Value {
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+        serde_json::from_slice(&reply.payload.as_ref().expect("capability page").bytes)
+            .expect("capability page JSON")
+    };
+    let (baseline, ready) = provider_for(limits());
+    let expected: Vec<Value> = baseline
+        .descriptor()
+        .capabilities
+        .iter()
+        .map(|capability| json!({"capability_id": capability.as_str(), "state": "available"}))
+        .collect();
+    assert!(expected.len() >= 7);
+    let first_call = capability_inspection_call(&ready, Value::Null, 1, 65536);
+    let first_reply = baseline.invoke(&first_call);
+    let first = decode(&first_reply);
+    let second_call = capability_inspection_call(&ready, first["next_cursor"].clone(), 1, 65536);
+    let second_reply = baseline.invoke(&second_call);
+    let second = decode(&second_reply);
+    assert_eq!(first["items"], json!([expected[0]]));
+    assert_eq!(second["items"], json!([expected[1]]));
+    let first_size = canonical_response_size(&first_call, &first_reply);
+    let second_size = canonical_response_size(&second_call, &second_reply);
+    let boundary = first_size.max(second_size);
+    assert!(
+        (first_reply
+            .payload
+            .as_ref()
+            .expect("first payload")
+            .bytes
+            .len() as u64)
+            < boundary
+    );
+    first_reply
+        .validate(boundary)
+        .expect("actual first reply fits");
+    second_reply
+        .validate(boundary)
+        .expect("actual second reply fits");
+
+    let mut byte_limits = limits();
+    byte_limits.response_bytes = boundary;
+    let (bounded, bounded_ready) = provider_for(byte_limits);
+    let bounded_first_call = capability_inspection_call(&bounded_ready, Value::Null, 64, 65536);
+    let bounded_first_reply = bounded.invoke(&bounded_first_call);
+    bounded_first_reply
+        .validate(boundary)
+        .expect("negotiated first reply framing");
+    let bounded_first = decode(&bounded_first_reply);
+    assert_eq!(bounded_first["items"], first["items"]);
+    assert_eq!(bounded_first["coverage"], "partial");
+    assert_eq!(
+        bounded_first_reply.extensions,
+        bounded_first_call.extensions
+    );
+    let bounded_second_call = capability_inspection_call(
+        &bounded_ready,
+        bounded_first["next_cursor"].clone(),
+        64,
+        65536,
+    );
+    let bounded_second_reply = bounded.invoke(&bounded_second_call);
+    bounded_second_reply
+        .validate(boundary)
+        .expect("negotiated second reply framing");
+    let bounded_second = decode(&bounded_second_reply);
+    assert_eq!(bounded_second["items"], second["items"]);
+    assert_ne!(bounded_second["next_cursor"], bounded_first["next_cursor"]);
+    assert!(canonical_response_size(&bounded_first_call, &bounded_first_reply) <= boundary);
+    assert!(canonical_response_size(&bounded_second_call, &bounded_second_reply) <= boundary);
+
+    let first_payload_bytes = first_reply
+        .payload
+        .as_ref()
+        .expect("first payload")
+        .bytes
+        .len() as u64;
+    let payload_bounded = baseline.invoke(&capability_inspection_call(
+        &ready,
+        Value::Null,
+        64,
+        first_payload_bytes,
+    ));
+    assert_eq!(decode(&payload_bounded)["items"], first["items"]);
+    assert!(
+        payload_bounded
+            .payload
+            .as_ref()
+            .expect("bounded payload")
+            .bytes
+            .len() as u64
+            <= first_payload_bytes
+    );
+    let no_payload_room = baseline.invoke(&capability_inspection_call(&ready, Value::Null, 64, 1));
+    assert_eq!(
+        no_payload_room.terminal.terminal_code(),
+        TerminalCode::CapacityExceeded
+    );
+    assert!(no_payload_room.payload.is_none());
+
+    let mut item_limits = limits();
+    item_limits.inspection_items = 1;
+    let (item_bounded, item_ready) = provider_for(item_limits);
+    let item_first = decode(&item_bounded.invoke(&capability_inspection_call(
+        &item_ready,
+        Value::Null,
+        64,
+        65536,
+    )));
+    let item_second = decode(&item_bounded.invoke(&capability_inspection_call(
+        &item_ready,
+        item_first["next_cursor"].clone(),
+        64,
+        65536,
+    )));
+    assert_eq!(item_first["items"], first["items"]);
+    assert_eq!(item_second["items"], second["items"]);
+
+    let mut insufficient_limits = limits();
+    insufficient_limits.response_bytes = first_size - 1;
+    let (insufficient, insufficient_ready) = provider_for(insufficient_limits);
+    let refused = insufficient.invoke(&capability_inspection_call(
+        &insufficient_ready,
+        Value::Null,
+        64,
+        65536,
+    ));
+    assert_eq!(
+        refused.terminal.terminal_code(),
+        TerminalCode::CapacityExceeded
+    );
+    assert_eq!(
+        refused.terminal.committed_effect().state(),
+        CommittedEffectState::None
+    );
+    assert!(refused.payload.is_none());
+    refused
+        .validate(insufficient_limits.response_bytes)
+        .expect("bounded capacity reply");
+}

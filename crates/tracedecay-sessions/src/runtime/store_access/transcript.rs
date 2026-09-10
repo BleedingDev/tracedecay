@@ -8,7 +8,9 @@ use tracedecay_lcm::retrieval_content::derived_text_for_index;
 use super::super::git_correlation::{
     CommitSessionRecord, SpanObservation, enqueue_git_evidence_publication,
 };
-use super::super::registered_db::{SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn};
+use super::super::registered_db::{
+    SessionExec, SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn,
+};
 use super::super::shared::path_identity_key;
 use super::codex_goal_reconciliation::find_preceding_codex_goal_response;
 use super::types::{TranscriptBatch, TranscriptPersistenceError};
@@ -327,6 +329,69 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         self.begin_write_transaction()
             .await
             .map_err(|error| TranscriptPersistenceError::storage("begin transcript batch", error))
+    }
+
+    /// Registers a locator for a newly admitted live SessionStart without
+    /// granting transcript-history authority or replacing observed metadata.
+    ///
+    /// The caller supplies the admitted project's canonical path and verifies
+    /// its binding to this shard's project identity. The registered-store port
+    /// exposes the shard identity, but has no project-root registry lookup.
+    /// Existing provider project keys remain opaque and byte-exact.
+    #[hotpath::skip]
+    pub async fn register_live_session_locator(
+        &self,
+        provider: &str,
+        session_id: &str,
+        project_path: &str,
+        transcript_path: &str,
+    ) -> Result<bool, TranscriptPersistenceError> {
+        if !matches!(
+            &self.registered_binding().shard_id.scope,
+            StoreShardScopeV1::ProjectSessions { .. }
+        ) {
+            return Err(TranscriptPersistenceError::storage(
+                "register live session locator",
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "live session locator requires ProjectSessions authority",
+                ),
+            ));
+        }
+        let canonical_project_path = path_identity_key(project_path);
+        let transaction = self.begin_transcript_transaction().await?;
+        // The conflict predicate and NULL-only fill share the writer lease
+        // with insertion, so competing sources cannot replace the winner.
+        let changed = SessionExec::execute(
+            &transaction,
+            "INSERT INTO sessions
+                     (provider, session_id, project_key, project_path, title, started_at,
+                      ended_at, transcript_path, metadata_json, parent_session_id,
+                      is_subagent, agent_id, parent_tool_use_id)
+                 VALUES (?1, ?2, ?3, ?3, NULL, NULL, NULL, ?4, NULL, NULL, 0, NULL, NULL)
+                 ON CONFLICT(provider, session_id) DO UPDATE SET
+                    transcript_path = COALESCE(sessions.transcript_path, excluded.transcript_path)
+                 WHERE sessions.project_path = excluded.project_path
+                   AND (sessions.transcript_path IS NULL
+                        OR sessions.transcript_path = excluded.transcript_path)",
+            params![
+                provider,
+                session_id,
+                canonical_project_path,
+                transcript_path
+            ],
+        )
+        .await
+        .map_err(|error| {
+            TranscriptPersistenceError::storage("register live session locator", error)
+        })?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        transaction.commit().await.map_err(|error| {
+            TranscriptPersistenceError::storage("commit live session locator", error)
+        })?;
+        Ok(true)
     }
 
     #[hotpath::skip]

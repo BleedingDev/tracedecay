@@ -1162,3 +1162,272 @@ impl AdversarialProviderV1 {
         }
     }
 }
+
+/// Focused semantic mutations for the common advisory compatibility program.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommonProfileMutation {
+    /// Remove canonical exclusions before search/truncation.
+    DropExclusions,
+    /// Substitute a current request for an explicitly historical request.
+    DropTemporalQuery,
+    /// Return empty success instead of grounded positive recall.
+    EmptyPositiveRecall,
+    /// Rewrite retained original session identity while preserving a valid payload digest.
+    ForgeOriginalSource,
+    /// Change only effective candidate validity, preserving original evidence and membership.
+    ForgeCandidateValidityTimestamp,
+    /// Claim revocation without a supporting temporal event.
+    ForgeCandidateTemporalState,
+    /// Keep valid canonical bytes under the wrong operation's versioned contract.
+    WrongPayloadContract,
+    /// Change the payload digest while preserving the operation and response bytes.
+    CorruptPayloadDigest,
+    /// Return candidate scope from another coding scope.
+    LeakCandidateScope,
+    /// Claim an advertised required operation is unsupported.
+    UnsupportedRequired(ProviderOperation),
+    /// Claim success without dispatching the requested mutation.
+    SuccessfulNoOp(ProviderOperation),
+    /// Reintroduce a previously returned source into a later empty recall.
+    ResurrectDeletedSource,
+}
+
+/// Wraps any controlled or real provider with exactly one observable semantic defect.
+/// The unchanged suite must reject it; this wrapper is never a compatibility lane.
+pub struct CommonProfileAdversary {
+    inner: Arc<dyn MemoryProvider>,
+    mutation: CommonProfileMutation,
+    retained_candidates: Mutex<Option<serde_json::Value>>,
+    exhibited: AtomicU64,
+}
+
+impl CommonProfileAdversary {
+    /// Installs one mutation around a provider without changing its descriptor identity.
+    pub fn new(inner: Arc<dyn MemoryProvider>, mutation: CommonProfileMutation) -> Self {
+        Self {
+            inner,
+            mutation,
+            retained_candidates: Mutex::new(None),
+            exhibited: AtomicU64::new(0),
+        }
+    }
+
+    /// Number of calls where the chosen mutation was actually exercised.
+    pub fn exhibited(&self) -> u64 {
+        self.exhibited.load(Ordering::Acquire)
+    }
+
+    fn mutate_payload(
+        payload: &mut CanonicalPayload,
+        change: impl FnOnce(&mut serde_json::Value),
+    ) -> bool {
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&payload.bytes) else {
+            return false;
+        };
+        let before = value.clone();
+        change(&mut value);
+        if value == before {
+            return false;
+        }
+        let Ok(bytes) = serde_json::to_vec(&value) else {
+            return false;
+        };
+        payload.sha256 = digest_of(&bytes);
+        payload.bytes = bytes;
+        true
+    }
+}
+
+impl MemoryProvider for CommonProfileAdversary {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.inner.handshake(request)
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        let failure = match self.mutation {
+            CommonProfileMutation::UnsupportedRequired(operation)
+                if operation == call.operation =>
+            {
+                Some(TerminalCode::CapabilityUnsupported)
+            }
+            CommonProfileMutation::SuccessfulNoOp(operation) if operation == call.operation => {
+                Some(TerminalCode::Success)
+            }
+            _ => None,
+        };
+        if let Some(code) = failure {
+            self.exhibited.fetch_add(1, Ordering::AcqRel);
+            let terminal = TerminalRecord::new(
+                call.operation,
+                call.provider_id.clone(),
+                code,
+                CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                (code != TerminalCode::Success)
+                    .then(|| "adversarial.required-operation-unsupported".into()),
+            );
+            return ProviderReply {
+                terminal: terminal.unwrap_or_else(|_| {
+                    TerminalRecord::internal_failure_before_dispatch_for_call(
+                        call,
+                        HARNESS_DEFECT_DIAGNOSTIC_ID,
+                    )
+                }),
+                payload: None,
+                warnings: Vec::new(),
+                extensions: Vec::new(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+        let mut dispatched = call.clone();
+        let mut exhibited = false;
+        if call.operation == ProviderOperation::Recall {
+            match self.mutation {
+                CommonProfileMutation::DropExclusions => {
+                    exhibited = Self::mutate_payload(&mut dispatched.payload, |value| {
+                        if let Some(fields) = value
+                            .get_mut("exclusions")
+                            .and_then(serde_json::Value::as_object_mut)
+                        {
+                            for values in fields.values_mut() {
+                                *values = serde_json::json!([]);
+                            }
+                        }
+                    })
+                }
+                CommonProfileMutation::DropTemporalQuery => {
+                    exhibited = Self::mutate_payload(&mut dispatched.payload, |value| {
+                        if let Some(query) = value.get_mut("temporal_query") {
+                            query["mode"] = serde_json::json!("current");
+                            query["as_of"] = serde_json::Value::Null;
+                            query["interval_start"] = serde_json::Value::Null;
+                            query["interval_end"] = serde_json::Value::Null;
+                        }
+                    })
+                }
+                _ => {}
+            }
+        }
+        let mut reply = self.inner.invoke(&dispatched);
+        if let Some(payload) = reply.payload.as_mut() {
+            match self.mutation {
+                CommonProfileMutation::WrongPayloadContract => {
+                    let wrong = if call.operation == ProviderOperation::Health {
+                        "tracedecay.memory.provider.recall.v1"
+                    } else {
+                        "tracedecay.memory.provider.health.v1"
+                    };
+                    if let Ok(contract) = OwnedVersionedId::new(wrong) {
+                        payload.contract_id = contract;
+                        exhibited = true;
+                    }
+                }
+                CommonProfileMutation::CorruptPayloadDigest => {
+                    payload.sha256 = if payload.sha256 == "a".repeat(64) {
+                        "b".repeat(64)
+                    } else {
+                        "a".repeat(64)
+                    };
+                    exhibited = true;
+                }
+                _ => {}
+            }
+        }
+        if call.operation == ProviderOperation::Recall
+            && let Some(payload) = reply.payload.as_mut()
+        {
+            match self.mutation {
+                CommonProfileMutation::EmptyPositiveRecall => {
+                    exhibited = Self::mutate_payload(payload, |value| {
+                        value["candidates"] = serde_json::json!([]);
+                        value["coverage"]["returned_items"] = serde_json::json!(0);
+                    })
+                }
+                CommonProfileMutation::ForgeOriginalSource => {
+                    exhibited = Self::mutate_payload(payload, |value| {
+                        if let Some(candidates) = value
+                            .get_mut("candidates")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for candidate in candidates {
+                                if let Some(source) =
+                                    candidate.pointer_mut("/provenance/original_sources/0/source")
+                                {
+                                    source["canonical_session_id"] =
+                                        serde_json::json!("forged-source-session");
+                                }
+                            }
+                        }
+                    })
+                }
+                CommonProfileMutation::ForgeCandidateValidityTimestamp
+                | CommonProfileMutation::ForgeCandidateTemporalState => {
+                    exhibited = Self::mutate_payload(payload, |value| {
+                        if let Some(candidates) = value
+                            .get_mut("candidates")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for candidate in candidates {
+                                match self.mutation {
+                                    CommonProfileMutation::ForgeCandidateValidityTimestamp => {
+                                        candidate["validity"]["valid_from"] =
+                                            serde_json::json!("2025-01-01T00:00:01.000000001Z");
+                                    }
+                                    CommonProfileMutation::ForgeCandidateTemporalState => {
+                                        candidate["validity"]["temporal_state"] =
+                                            serde_json::json!("revoked");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                }
+                CommonProfileMutation::LeakCandidateScope => {
+                    exhibited = Self::mutate_payload(payload, |value| {
+                        if let Some(candidates) = value
+                            .get_mut("candidates")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for candidate in candidates {
+                                candidate["exact_scope_identity"]["worktree_identity"] =
+                                    serde_json::json!("foreign-worktree");
+                            }
+                        }
+                    })
+                }
+                CommonProfileMutation::ResurrectDeletedSource => {
+                    let mut retained = self
+                        .retained_candidates
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    exhibited = Self::mutate_payload(payload, |value| {
+                        if let Some(candidates) = value
+                            .get("candidates")
+                            .and_then(serde_json::Value::as_array)
+                        {
+                            if !candidates.is_empty() {
+                                *retained = Some(serde_json::json!(candidates));
+                            } else if let Some(previous) = retained.as_ref() {
+                                value["candidates"] = previous.clone();
+                                value["coverage"]["returned_items"] =
+                                    serde_json::json!(previous.as_array().map_or(0, Vec::len));
+                            }
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+        if exhibited {
+            self.exhibited.fetch_add(1, Ordering::AcqRel);
+        }
+        reply
+    }
+}

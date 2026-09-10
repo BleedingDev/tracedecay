@@ -265,6 +265,7 @@ production = [
 # cannot journal or sanitize would be a dispatch path with no outbox and no
 # secret gate, which is worse than no mount at all.
 memory-provider-host = [
+    "dep:chrono",
     "dep:tracedecay-memory-provider-registry",
     "dep:tracedecay-memory-provider-ncm",
     "dep:tracedecay-memory-observation",
@@ -341,6 +342,7 @@ test-helpers = [
     "tracedecay-daemon-service/test-helpers",
     "tracedecay-host-admission/test-helpers",
     "tracedecay-maintenance/test-helpers",
+    "tracedecay-memory-provider-ncm?/test-helpers",
     "tracedecay-runtime-core/test-helpers",
     "tracedecay-session-runtime/test-helpers",
     "tracedecay-sessions/test-helpers",
@@ -437,6 +439,7 @@ path = "../../tests/storage_runtime_rusqlite_suite/main.rs"
 
 [dependencies]
 axum = "0.8"
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 hotpath.workspace = true
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }

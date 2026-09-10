@@ -83,6 +83,12 @@ pub enum HostEvidenceRefV1 {
         /// The record identity.
         record_id: String,
     },
+    /// Actual canonical observation revisions re-read through host history
+    /// authority. This evidence is never constructed by parsing a label.
+    CanonicalObservations {
+        /// Every immutable attribution supporting this candidate, host-confirmed.
+        sources: Vec<crate::recall_admission::source_attribution::RecallSourceAttributionV1>,
+    },
 }
 
 impl HostEvidenceRefV1 {
@@ -101,6 +107,14 @@ impl HostEvidenceRefV1 {
                 end_ordinal,
             } => format!("session:{session_id}#{start_ordinal}-{end_ordinal}"),
             Self::CanonicalRecord { record_id } => format!("record:{record_id}"),
+            Self::CanonicalObservations { sources } => format!(
+                "observations:{}",
+                sources
+                    .iter()
+                    .map(|source| source.source.observation_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
         }
     }
 
@@ -689,6 +703,12 @@ impl HostProvenanceAuthority for MountedHostProvenanceAuthorityV1 {
                 self.record
                     .confirm_canonical_record(scope, record_id)
                     .map_err(|error| unresolvable(source, error.to_string()))?;
+            }
+            HostEvidenceRefV1::CanonicalObservations { .. } => {
+                return Err(unresolvable(
+                    source,
+                    "canonical observations require typed host confirmation",
+                ));
             }
         }
         Ok(evidence)

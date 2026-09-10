@@ -69,6 +69,9 @@ ENFORCEMENT INDEX
   a process, the filesystem, a socket, an embedded store, an HTTP stack, a git
   object store, or the concrete `NativeHistoricalBlobReaderV1` reader. A policy
   edit can add to this floor and can never remove from it.
+* `edge_source_contracts` adds exact import checks for one declared normal edge
+  to a workspace package. These additional checks do not satisfy any mandatory
+  full source contract and cannot relax its forbidden symbols or executor sites.
 """
 
 from __future__ import annotations
@@ -218,6 +221,13 @@ def dependency_entries(package: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(
                 f"package {label} dependency {dependency['name']} has malformed optional"
             )
+        rename = dependency.get("rename")
+        if rename is not None and (
+            not isinstance(rename, str) or not IDENT_RE.fullmatch(rename.replace("-", "_"))
+        ):
+            raise ValueError(
+                f"package {label} dependency {dependency['name']} has malformed rename"
+            )
         entries.append(
             {
                 "name": dependency["name"],
@@ -225,6 +235,7 @@ def dependency_entries(package: dict[str, Any]) -> list[dict[str, Any]]:
                 "features": features,
                 "uses_default_features": uses_default_features,
                 "optional": optional,
+                "rename": rename,
             }
         )
     return entries
@@ -436,6 +447,80 @@ def crate_source_files(repo: Path, package_name: str) -> list[Path]:
     return sorted(path for path in directory.rglob("*.rs") if path.is_file())
 
 
+def check_source_imports(
+    repo: Path,
+    package_name: str,
+    imports: dict[str, list[str]],
+    call_sites: dict[str, list[str]],
+    forbidden_symbols: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """Scan exact imports and stale allowances with the existing Rust path parser."""
+    errors: list[str] = []
+    files = crate_source_files(repo, package_name)
+    if not files:
+        errors.append(
+            f"{package_name} has a source contract but no readable crate source at"
+            f" crates/{package_name}/src"
+        )
+        return errors
+
+    seen_paths: set[str] = set()
+    seen_sites: dict[str, set[str]] = {path: set() for path in call_sites}
+    for file_path in files:
+        relative = file_path.relative_to(repo / "crates" / package_name / "src").as_posix()
+        try:
+            raw = file_path.read_text(encoding="utf-8")
+        except OSError as error:
+            errors.append(f"{package_name} cannot read {relative}: {error}")
+            continue
+        source = strip_rust_comments(raw)
+        lines = source.splitlines()
+
+        for pattern, label in forbidden_symbols:
+            for match in re.finditer(pattern, source):
+                line = source.count("\n", 0, match.start()) + 1
+                errors.append(
+                    f"forbidden source symbol in {package_name} ({label}):"
+                    f" {relative}:{line} names {match.group(0)!r}"
+                )
+
+        for root, allowed_paths in sorted(imports.items()):
+            allowed_set = set(allowed_paths)
+            for path, line in extract_crate_paths(source, root):
+                if path not in allowed_set:
+                    errors.append(
+                        f"[source-import-not-allowed] forbidden source import in {package_name}:"
+                        f" {relative}:{line} names {path}, which is outside the"
+                        " exact reviewed import allowlist"
+                    )
+                    continue
+                seen_paths.add(path)
+                if path in call_sites:
+                    site = f"{relative}::{enclosing_function(lines, line)}"
+                    seen_sites[path].add(site)
+                    if site not in call_sites[path]:
+                        errors.append(
+                            f"[executor-site-not-reviewed] unreviewed executor call site in {package_name}:"
+                            f" {path} at {relative}:{line} is in {site}, which is"
+                            " not a pinned call site"
+                        )
+
+    for root, allowed_paths in sorted(imports.items()):
+        for path in sorted(set(allowed_paths) - seen_paths):
+            errors.append(
+                f"stale source import allowance in {package_name}: {path} is"
+                " allowed but never used; the allowlist must stay the exact"
+                " reviewed set"
+            )
+    for path, sites in sorted(seen_sites.items()):
+        for site in sorted(set(call_sites[path]) - sites):
+            errors.append(
+                f"stale executor call site in {package_name}: {path} is pinned to"
+                f" {site}, which no longer exists"
+            )
+    return errors
+
+
 def check_source_contracts(
     repo: Path,
     policy: dict[str, Any],
@@ -558,70 +643,80 @@ def check_source_contracts(
                         " to exact call sites in executor_call_sites"
                     )
 
-        files = crate_source_files(repo, package_name)
-        if not files:
+        errors.extend(
+            check_source_imports(
+                repo,
+                package_name,
+                imports,
+                call_sites,
+                FORBIDDEN_SOURCE_SYMBOL_FLOOR
+                + tuple((item, "forbidden by policy") for item in extra_forbidden),
+            )
+        )
+    return errors
+
+
+def check_edge_source_contracts(
+    repo: Path,
+    policy: dict[str, Any],
+    packages: dict[str, dict[str, Any]],
+    workspace_packages: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Add edge import restrictions without discharging full source obligations."""
+    rows = policy.get("edge_source_contracts", [])
+    if not isinstance(rows, list):
+        return ["policy edge_source_contracts must be an array"]
+    errors: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            errors.append("edge source contract must be an object")
+            continue
+        package_name, target = row.get("package"), row.get("dependency")
+        if not all(isinstance(value, str) and value for value in (package_name, target)):
+            errors.append("edge source contract package and dependency must name exact packages")
+            continue
+        label = f"edge source contract {package_name} -> {target}"
+        edge = (package_name, target)
+        if edge in seen:
+            errors.append(f"duplicate {label}")
+            continue
+        seen.add(edge)
+        if package_name not in packages or target not in workspace_packages:
+            errors.append(f"{label} must name an existing package and workspace dependency")
+            continue
+        try:
+            entries = dependency_entries(packages[package_name])
+        except ValueError as error:
+            errors.append(str(error))
+            continue
+        roots = {
+            crate_root_ident(entry.get("rename") or target)
+            for entry in entries
+            if entry["name"] == target and entry["kind"] == KIND_NORMAL
+        }
+        if not roots:
+            errors.append(f"{label} requires a declared normal dependency edge")
+            continue
+        paths = row.get("allowed_imports")
+        if (
+            not isinstance(paths, list)
+            or not paths
+            or not all(
+                isinstance(path, str)
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+", path)
+                and path.split("::", 1)[0] in roots
+                for path in paths
+            )
+            or len(set(paths)) != len(paths)
+        ):
             errors.append(
-                f"{package_name} has a source contract but no readable crate source at"
-                f" crates/{package_name}/src"
+                f"{label} allowed_imports must be a non-empty array of distinct exact"
+                " item paths rooted at its declared dependency"
             )
             continue
-
-        seen_paths: set[str] = set()
-        seen_sites: dict[str, set[str]] = {path: set() for path in call_sites}
-        for file_path in files:
-            relative = file_path.relative_to(repo / "crates" / package_name / "src").as_posix()
-            try:
-                raw = file_path.read_text(encoding="utf-8")
-            except OSError as error:
-                errors.append(f"{package_name} cannot read {relative}: {error}")
-                continue
-            source = strip_rust_comments(raw)
-            lines = source.splitlines()
-
-            for pattern, label in FORBIDDEN_SOURCE_SYMBOL_FLOOR + tuple(
-                (item, "forbidden by policy") for item in extra_forbidden
-            ):
-                for match in re.finditer(pattern, source):
-                    line = source.count("\n", 0, match.start()) + 1
-                    errors.append(
-                        f"forbidden source symbol in {package_name} ({label}):"
-                        f" {relative}:{line} names {match.group(0)!r}"
-                    )
-
-            for root, allowed_paths in sorted(imports.items()):
-                allowed_set = set(allowed_paths)
-                for path, line in extract_crate_paths(source, root):
-                    if path not in allowed_set:
-                        errors.append(
-                            f"[source-import-not-allowed] forbidden source import in {package_name}:"
-                            f" {relative}:{line} names {path}, which is outside the"
-                            " exact reviewed import allowlist"
-                        )
-                        continue
-                    seen_paths.add(path)
-                    if path in call_sites:
-                        site = f"{relative}::{enclosing_function(lines, line)}"
-                        seen_sites[path].add(site)
-                        if site not in call_sites[path]:
-                            errors.append(
-                                f"[executor-site-not-reviewed] unreviewed executor call site in {package_name}:"
-                                f" {path} at {relative}:{line} is in {site}, which is"
-                                " not a pinned call site"
-                            )
-
-        for root, allowed_paths in sorted(imports.items()):
-            for path in sorted(set(allowed_paths) - seen_paths):
-                errors.append(
-                    f"stale source import allowance in {package_name}: {path} is"
-                    " allowed but never used; the allowlist must stay the exact"
-                    " reviewed set"
-                )
-        for path, sites in sorted(seen_sites.items()):
-            for site in sorted(set(call_sites[path]) - sites):
-                errors.append(
-                    f"stale executor call site in {package_name}: {path} is pinned to"
-                    f" {site}, which no longer exists"
-                )
+        imports = {root: [path for path in paths if path.startswith(f"{root}::")] for root in roots}
+        errors.extend(check_source_imports(repo, package_name, imports, {}, ()))
     return errors
 
 
@@ -927,6 +1022,21 @@ def check_policy(
                     )
 
     errors.extend(check_source_contracts(source_root, policy, packages, contracts))
+    workspace_members = metadata.get("workspace_members")
+    if workspace_members is None:
+        workspace_packages = packages
+    elif not isinstance(workspace_members, list) or not all(
+        isinstance(member, str) for member in workspace_members
+    ):
+        errors.append("cargo metadata workspace_members must be an array of package IDs")
+        workspace_packages = {}
+    else:
+        workspace_packages = {
+            name: package
+            for name, package in packages.items()
+            if package.get("id") in workspace_members
+        }
+    errors.extend(check_edge_source_contracts(source_root, policy, packages, workspace_packages))
 
     for key in sorted(set(exceptions) - used_exceptions):
         errors.append(

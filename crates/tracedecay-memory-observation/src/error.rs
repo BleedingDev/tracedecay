@@ -219,6 +219,12 @@ pub enum ObservationJournalError {
     /// The journal mutex was poisoned by a panicking writer.
     #[error("observation journal connection lock is poisoned")]
     LockPoisoned,
+    /// The caller cancelled a bounded journal read. Nothing was written.
+    #[error("observation journal operation {operation} was cancelled")]
+    OperationCancelled {
+        /// Logical operation cancelled by the caller.
+        operation: &'static str,
+    },
     /// The caller's remaining budget ran out while the operation was waiting
     /// for the journal connection or for SQLite itself. Nothing was written.
     #[error("observation journal operation {operation} exhausted its remaining budget")]

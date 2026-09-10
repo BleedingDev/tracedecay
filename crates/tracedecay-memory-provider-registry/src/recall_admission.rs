@@ -28,6 +28,12 @@
 
 use std::collections::BTreeSet;
 
+#[path = "recall_source_attribution.rs"]
+/// Strict canonical source attribution wire projections; decoding grants no authority.
+pub mod source_attribution;
+
+use source_attribution::{RecallSourceAttributionV1, original_sources_from_provenance};
+
 use chrono::{DateTime, SecondsFormat};
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
@@ -331,6 +337,16 @@ pub enum RecallDenialReason {
         /// Bounded, content-free description of the inconsistency.
         detail: String,
     },
+    /// Original-source attribution is malformed, unbounded or inconsistent.
+    InvalidSourceAttribution {
+        /// Bounded content-free structural defect, never raw source content.
+        detail: String,
+    },
+    /// A returned candidate matches an exclusion in the dispatched request.
+    RequestExcluded {
+        /// Host-owned canonical exclusion field name, without provider content.
+        field: String,
+    },
     /// Inline content does not hash to the declared `content_sha256`.
     ContentDigestMismatch,
     /// The candidate carries neither or both of `content` / `content_ref`.
@@ -367,6 +383,8 @@ impl RecallDenialReason {
             Self::Superseded => "superseded",
             Self::UnknownValidity => "unknown_validity",
             Self::InvalidValidityRecord { .. } => "invalid_validity_record",
+            Self::InvalidSourceAttribution { .. } => "invalid_source_attribution",
+            Self::RequestExcluded { .. } => "request_excluded",
             Self::ContentDigestMismatch => "content_digest_mismatch",
             Self::ContentSelectionInvalid => "content_selection_invalid",
             Self::NativeScoreMalformed { .. } => "native_score_malformed",
@@ -447,6 +465,12 @@ pub enum RecallAdmissionError {
         field: &'static str,
         /// Bounded diagnostic.
         detail: &'static str,
+    },
+    /// The dispatched request did not carry valid canonical exclusions.
+    #[error("recall request exclusions invalid: {detail}")]
+    InvalidRequestExclusions {
+        /// Bounded structural diagnostic.
+        detail: String,
     },
     /// A recall request part failed API validation.
     #[error("recall request part invalid: {0}")]
@@ -750,15 +774,45 @@ pub struct RecallRequestParts {
 pub fn build_recall_request_payload(
     parts: &RecallRequestParts,
 ) -> Result<CanonicalPayload, RecallAdmissionError> {
+    build_recall_request_payload_with_context(parts, None, None)
+}
+
+/// Attaches only host-admitted exclusions and canonical history grant JSON.
+/// Source authorization remains with the mounted host authority at dispatch.
+/// The complete value is encoded and hashed once, after these fields are bound.
+pub fn build_recall_request_payload_with_context(
+    parts: &RecallRequestParts,
+    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+    history_grant: Option<&Value>,
+) -> Result<CanonicalPayload, RecallAdmissionError> {
     parts.exact_scope.validate()?;
     parts.budgets.validate()?;
+    if let Some(exclusions) = exclusions {
+        exclusions
+            .validate()
+            .map_err(|_| RecallAdmissionError::InvalidTemporalQuery {
+                field: "exclusions",
+                detail: "exclusions violate the admitted application bounds",
+            })?;
+    }
+    if let Some(grant) = history_grant {
+        if !grant.is_object()
+            || grant.get("policy_revision").and_then(Value::as_u64) != Some(parts.policy_revision)
+            || grant.get("destination_scope") != Some(&scope_wire_value(&parts.exact_scope))
+        {
+            return Err(RecallAdmissionError::InvalidTemporalQuery {
+                field: "history_grant",
+                detail: "history grant must bind the request policy and exact destination",
+            });
+        }
+    }
     if parts.policy_revision == 0 {
         return Err(RecallAdmissionError::InvalidTemporalQuery {
             field: "policy_revision",
             detail: "policy revision must be positive",
         });
     }
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "provider_id": parts.provider_id.as_str(),
         "registration_revision": parts.registration_revision,
         "ready_receipt_digest": parts.ready_receipt_sha256,
@@ -785,6 +839,16 @@ pub fn build_recall_request_payload(
         },
         "cancellation": "live",
     });
+    if let Some(exclusions) = exclusions {
+        value["exclusions"] = serde_json::to_value(exclusions).map_err(|error| {
+            RecallAdmissionError::RequestEncode {
+                detail: bounded_detail(&error.to_string()),
+            }
+        })?;
+    }
+    if let Some(grant) = history_grant {
+        value["history_grant"] = grant.clone();
+    }
     let bytes =
         serde_json::to_vec(&value).map_err(|error| RecallAdmissionError::RequestEncode {
             detail: bounded_detail(&error.to_string()),
@@ -1099,9 +1163,27 @@ pub struct AdmittedRecallCandidate {
     warnings: Vec<String>,
     native_score: ValidatedNativeScoreV1,
     confidence: Option<Number>,
+    // The original wire fields remain in candidate.provenance. This typed
+    // projection supplies validated access without another serialized authority.
+    #[serde(skip)]
+    original_sources: Vec<RecallSourceAttributionV1>,
 }
 
 impl AdmittedRecallCandidate {
+    /// Structurally validated original source claims. Source existence, history
+    /// relations and current disposition still require host revalidation.
+    #[must_use]
+    pub fn original_sources(&self) -> &[RecallSourceAttributionV1] {
+        &self.original_sources
+    }
+
+    /// Observation claims whose declared provenance passed the canonical
+    /// binding checks. Host authority must still confirm every source.
+    #[must_use]
+    pub fn observation_history_sources(&self) -> Option<&[RecallSourceAttributionV1]> {
+        observation_history_claim(&self.candidate, &self.original_sources)
+            .then_some(self.original_sources.as_slice())
+    }
     /// Returns the candidate as the provider returned it.
     #[must_use]
     pub const fn candidate(&self) -> &RecallCandidateV1 {
@@ -1265,6 +1347,31 @@ pub fn admit_recall_reply(
     authorized: &RecallScopeBindingsV1,
     reply: &ProviderReply,
 ) -> Result<RecallAdmission, RecallAdmissionError> {
+    admit_recall_reply_with_profile(call, temporal, maximum_candidates, authorized, reply, false)
+}
+
+/// The production port supplies this requirement from the exact registration
+/// metadata it pinned, never from a provider or payload claim.
+pub(crate) fn admit_recall_reply_with_profile(
+    call: &ProviderCall,
+    temporal: &AdmittedTemporalQuery,
+    maximum_candidates: usize,
+    authorized: &RecallScopeBindingsV1,
+    reply: &ProviderReply,
+    requires_common_profile: bool,
+) -> Result<RecallAdmission, RecallAdmissionError> {
+    let common_bindings;
+    let authorized = if requires_common_profile {
+        common_bindings = RecallScopeBindingsV1::new(authorized.iter().filter(|binding| {
+            !matches!(
+                binding,
+                ScopeBinding::ProjectFacts | ScopeBinding::ProfileFacts
+            )
+        }));
+        &common_bindings
+    } else {
+        authorized
+    };
     let terminal_code = reply.terminal.terminal_code();
     if !matches!(
         terminal_code,
@@ -1284,12 +1391,42 @@ pub fn admit_recall_reply(
             maximum: maximum_candidates,
         });
     }
-    admit_recall_candidates(
+    // Read the exclusions from the exact hashed request that was dispatched,
+    // so a buggy provider cannot make a returned candidate eligible again.
+    #[derive(Deserialize)]
+    struct DispatchedRecallExclusions {
+        exclusions: tracedecay_contracts::memory::CognitiveRecallExclusions,
+        policy_revision: u64,
+        history_grant: Option<Value>,
+    }
+    let context: DispatchedRecallExclusions =
+        serde_json::from_slice(&call.payload.bytes).map_err(|error| {
+            RecallAdmissionError::InvalidRequestExclusions {
+                detail: bounded_detail(&error.to_string()),
+            }
+        })?;
+    context.exclusions.validate().map_err(|error| {
+        RecallAdmissionError::InvalidRequestExclusions {
+            detail: bounded_detail(&error.to_string()),
+        }
+    })?;
+    let common_profile = requires_common_profile
+        .then(|| {
+            CommonRecallProfileV1::from_dispatched_history(
+                call,
+                context.policy_revision,
+                context.history_grant.as_ref(),
+            )
+        })
+        .transpose()?;
+    admit_recall_candidates_with_context(
         &call.exact_scope,
         &call.request_id,
         temporal,
         authorized,
         outcome.candidates,
+        Some(&context.exclusions),
+        common_profile.as_ref(),
     )
 }
 
@@ -1364,6 +1501,26 @@ pub fn admit_recall_candidates(
     authorized: &RecallScopeBindingsV1,
     candidates: Vec<RecallCandidateV1>,
 ) -> Result<RecallAdmission, RecallAdmissionError> {
+    admit_recall_candidates_with_context(
+        admitted_scope,
+        request_id,
+        temporal,
+        authorized,
+        candidates,
+        None,
+        None,
+    )
+}
+
+fn admit_recall_candidates_with_context(
+    admitted_scope: &OwnedExactScope,
+    request_id: &str,
+    temporal: &AdmittedTemporalQuery,
+    authorized: &RecallScopeBindingsV1,
+    candidates: Vec<RecallCandidateV1>,
+    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+    common_profile: Option<&CommonRecallProfileV1>,
+) -> Result<RecallAdmission, RecallAdmissionError> {
     admitted_scope.validate()?;
     let mut seen = BTreeSet::new();
     for candidate in &candidates {
@@ -1382,14 +1539,22 @@ pub fn admit_recall_candidates(
     let mut denied = Vec::new();
     let mut degraded = false;
     for candidate in candidates {
-        match admit_one(admitted_scope, temporal, authorized, &candidate) {
-            Ok((decision, native_score, confidence)) => {
-                degraded |= decision.degrades_lane;
+        match admit_one(
+            admitted_scope,
+            temporal,
+            authorized,
+            &candidate,
+            exclusions,
+            common_profile,
+        ) {
+            Ok(parts) => {
+                degraded |= parts.decision.degrades_lane;
                 admitted.push(AdmittedRecallCandidate {
-                    host_temporal_state: decision.host_temporal_state,
-                    warnings: decision.warnings,
-                    native_score,
-                    confidence,
+                    host_temporal_state: parts.decision.host_temporal_state,
+                    warnings: parts.decision.warnings,
+                    native_score: parts.native_score,
+                    confidence: parts.confidence,
+                    original_sources: parts.original_sources,
                     candidate,
                 });
             }
@@ -1407,10 +1572,8 @@ pub fn admit_recall_candidates(
     }
     let mut warnings = Vec::new();
     if degraded {
-        warnings.push(
-            "unknown-validity candidates admitted under the degrade policy; lane is degraded"
-                .to_owned(),
-        );
+        warnings
+            .push("incomplete source revision or validity coverage; lane is degraded".to_owned());
     }
     Ok(RecallAdmission {
         report: RecallAdmissionReport {
@@ -1435,6 +1598,90 @@ struct AdmitDecision {
     host_temporal_state: TemporalState,
     warnings: Vec<String>,
     degrades_lane: bool,
+}
+
+/// Sources the host already selected and freshly revalidated before dispatch.
+/// Matching this snapshot is an admission prerequisite, not privacy authority:
+/// the root still re-reads canonical disposition before any source is hydrated.
+struct CommonRecallProfileV1 {
+    granted_sources: Vec<tracedecay_memory_provider_api::SourceAttribution>,
+}
+
+impl CommonRecallProfileV1 {
+    fn from_dispatched_history(
+        call: &ProviderCall,
+        policy_revision: u64,
+        grant: Option<&Value>,
+    ) -> Result<Self, RecallAdmissionError> {
+        let invalid = || RecallAdmissionError::InvalidTemporalQuery {
+            field: "history_grant",
+            detail: "common recall history must bind the dispatched scope and original sources",
+        };
+        let Some(grant) = grant else {
+            // A required common profile remains required when history is
+            // absent; its empty allowlist cannot admit a fabricated source.
+            return Ok(Self {
+                granted_sources: Vec::new(),
+            });
+        };
+        if grant.get("destination_scope") != Some(&scope_wire_value(&call.exact_scope))
+            || grant.get("policy_revision").and_then(Value::as_u64) != Some(policy_revision)
+        {
+            return Err(invalid());
+        }
+        let sources = grant
+            .get("sources")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
+        if sources.is_empty()
+            || sources.len() > tracedecay_memory_provider_api::MAX_ADVISORY_ADMISSION_SOURCES
+        {
+            return Err(invalid());
+        }
+        let granted_sources = sources
+            .iter()
+            .map(|source| {
+                let attribution: RecallSourceAttributionV1 =
+                    serde_json::from_value(source.get("attribution").ok_or_else(invalid)?.clone())
+                        .map_err(|_| invalid())?;
+                attribution.to_owned_attribution().map_err(|_| invalid())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { granted_sources })
+    }
+
+    fn check_candidate(
+        &self,
+        candidate: &RecallCandidateV1,
+        sources: &[RecallSourceAttributionV1],
+    ) -> Result<(), RecallDenialReason> {
+        let invalid = |detail: &str| RecallDenialReason::InvalidSourceAttribution {
+            detail: detail.to_owned(),
+        };
+        if candidate.memory_class.as_str() != Some(SESSION_OBSERVATION_MEMORY_CLASS)
+            || sources.is_empty()
+        {
+            return Err(invalid(
+                "common advisory recall requires original observation attribution",
+            ));
+        }
+        for source in sources {
+            let attribution = source.to_owned_attribution()?;
+            if !self.granted_sources.contains(&attribution) {
+                return Err(invalid(
+                    "original observation is outside dispatched canonical history",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct AdmittedCandidateParts {
+    decision: AdmitDecision,
+    native_score: ValidatedNativeScoreV1,
+    confidence: Option<Number>,
+    original_sources: Vec<RecallSourceAttributionV1>,
 }
 
 fn validate_recall_confidence(
@@ -1464,13 +1711,21 @@ fn admit_one(
     temporal: &AdmittedTemporalQuery,
     authorized: &RecallScopeBindingsV1,
     candidate: &RecallCandidateV1,
-) -> Result<(AdmitDecision, ValidatedNativeScoreV1, Option<Number>), RecallDenialReason> {
+    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+    common_profile: Option<&CommonRecallProfileV1>,
+) -> Result<AdmittedCandidateParts, RecallDenialReason> {
     check_class_binding(
         &candidate.memory_class,
         candidate.exact_scope_identity.scope_binding,
     )?;
     check_scope(admitted_scope, authorized, &candidate.exact_scope_identity)?;
     check_content(candidate)?;
+    let original_sources = original_sources_from_provenance(&candidate.provenance)?;
+    check_recall_exclusions(candidate, &original_sources, exclusions)?;
+    check_original_source_claims(candidate, &original_sources)?;
+    if let Some(common_profile) = common_profile {
+        common_profile.check_candidate(candidate, &original_sources)?;
+    }
     let decision = check_validity(temporal, &candidate.validity)?;
     // Relevance inputs are admitted, never repaired: a score the host cannot
     // project honestly denies the candidate here rather than reaching
@@ -1479,7 +1734,181 @@ fn admit_one(
         .map_err(|defect| RecallDenialReason::NativeScoreMalformed { defect })?;
     let confidence = validate_recall_confidence(candidate.confidence.as_ref())
         .map_err(|defect| RecallDenialReason::ConfidenceMalformed { defect })?;
-    Ok((decision, native_score, confidence))
+    Ok(AdmittedCandidateParts {
+        decision,
+        native_score,
+        confidence,
+        original_sources,
+    })
+}
+
+fn provenance_refs<'a>(
+    candidate: &'a RecallCandidateV1,
+    field: &str,
+) -> impl Iterator<Item = &'a str> {
+    candidate
+        .provenance
+        .get(field)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+fn observation_history_claim(
+    candidate: &RecallCandidateV1,
+    sources: &[RecallSourceAttributionV1],
+) -> bool {
+    !sources.is_empty()
+        && candidate.memory_class.as_str() == Some(SESSION_OBSERVATION_MEMORY_CLASS)
+        && candidate.provenance.get("state").and_then(Value::as_str) == Some("available")
+}
+
+fn original_record_ref(source: &RecallSourceAttributionV1) -> String {
+    format!(
+        "record:{}",
+        source
+            .source
+            .stable_record_id
+            .as_deref()
+            .unwrap_or(&source.source.observation_id)
+    )
+}
+
+/// Typed attribution cannot replace a contradictory declared claim. Native
+/// observations name source keys and staged origins; NCM observations name
+/// canonical records. Facts retain their separate host record authority.
+fn check_original_source_claims(
+    candidate: &RecallCandidateV1,
+    sources: &[RecallSourceAttributionV1],
+) -> Result<(), RecallDenialReason> {
+    if !observation_history_claim(candidate, sources) {
+        return Ok(());
+    }
+    let invalid = |detail: &str| RecallDenialReason::InvalidSourceAttribution {
+        detail: detail.to_owned(),
+    };
+    let declared = candidate
+        .provenance
+        .get("observation_refs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("observation_refs must cover original source identities"))?;
+    if declared.iter().any(|value| value.as_str().is_none()) {
+        return Err(invalid("observation_refs contains a non-reference"));
+    }
+    let declared: BTreeSet<_> = declared.iter().filter_map(Value::as_str).collect();
+    let original: BTreeSet<_> = sources
+        .iter()
+        .map(|source| source.source.observation_id.as_str())
+        .collect();
+    if declared != original {
+        return Err(invalid(
+            "observation_refs contradict original source identities",
+        ));
+    }
+    let record_refs: BTreeSet<_> = sources.iter().map(original_record_ref).collect();
+    let source_keys: BTreeSet<_> = sources
+        .iter()
+        .map(|source| source.source.source_key.as_str())
+        .collect();
+    for field in ["source_refs", "origin_refs"] {
+        let Some(values) = candidate.provenance.get(field).and_then(Value::as_array) else {
+            return Err(invalid("source provenance references must be arrays"));
+        };
+        if values.iter().any(|value| value.as_str().is_none()) {
+            return Err(invalid("source provenance contains a non-reference"));
+        }
+    }
+    for reference in provenance_refs(candidate, "source_refs")
+        .chain(candidate.source_refs.iter().map(String::as_str))
+    {
+        if !source_keys.contains(reference) && !record_refs.contains(reference) {
+            return Err(invalid("source_refs contradict original source identities"));
+        }
+    }
+    for reference in provenance_refs(candidate, "origin_refs") {
+        if reference.starts_with("record:") && !record_refs.contains(reference)
+            || (reference.starts_with("source:") || reference.starts_with("session:"))
+                && !source_keys.contains(reference)
+        {
+            return Err(invalid("origin_refs contradict original source identities"));
+        }
+    }
+    Ok(())
+}
+
+/// Exclusions run over the complete admitted content and reference sets,
+/// before normalization, deduplication, or host output truncation.
+fn check_recall_exclusions(
+    candidate: &RecallCandidateV1,
+    sources: &[RecallSourceAttributionV1],
+    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+) -> Result<(), RecallDenialReason> {
+    let Some(exclusions) = exclusions else {
+        return Ok(());
+    };
+    let contains =
+        |values: &[String], reference: &str| values.iter().any(|value| value == reference);
+    let field = if candidate
+        .stable_memory_ref
+        .as_deref()
+        .is_some_and(|reference| contains(&exclusions.stable_memory_refs, reference))
+    {
+        Some("stable_memory_refs")
+    } else if contains(&exclusions.candidate_ids, &candidate.candidate_id) {
+        Some("candidate_ids")
+    } else if candidate
+        .source_refs
+        .iter()
+        .map(String::as_str)
+        .chain(provenance_refs(candidate, "source_refs"))
+        .chain(provenance_refs(candidate, "origin_refs"))
+        .any(|reference| contains(&exclusions.source_refs, reference))
+        || sources.iter().any(|source| {
+            contains(&exclusions.source_refs, &source.source.source_key)
+                || contains(&exclusions.source_refs, &original_record_ref(source))
+        })
+    {
+        Some("source_refs")
+    } else if candidate
+        .trace_refs
+        .iter()
+        .map(String::as_str)
+        .chain(provenance_refs(candidate, "provider_trace_refs"))
+        .chain(
+            candidate
+                .explanation
+                .get("activation_trace_refs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        )
+        .any(|reference| contains(&exclusions.trace_refs, reference))
+    {
+        Some("trace_refs")
+    } else if provenance_refs(candidate, "observation_refs")
+        .any(|reference| contains(&exclusions.observation_ids, reference))
+        || sources
+            .iter()
+            .any(|source| contains(&exclusions.observation_ids, &source.source.observation_id))
+    {
+        Some("observation_ids")
+    } else if contains(&exclusions.content_sha256, &candidate.content_sha256)
+        || sources
+            .iter()
+            .any(|source| contains(&exclusions.content_sha256, &source.source.content_sha256))
+    {
+        Some("content_sha256")
+    } else {
+        None
+    };
+    match field {
+        Some(field) => Err(RecallDenialReason::RequestExcluded {
+            field: field.to_owned(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Memory class of one provider-local staged session observation.
@@ -1620,13 +2049,17 @@ fn check_validity(
 ) -> Result<AdmitDecision, RecallDenialReason> {
     let claimed_state = TemporalState::from_wire(&validity.temporal_state)
         .ok_or_else(|| invalid("temporal_state is not a contract value"))?;
-    if validity
-        .source_revision
-        .as_deref()
-        .is_none_or(|revision| revision.trim().is_empty())
+    if let Some(revision) = validity.source_revision.as_deref()
+        && (revision.is_empty()
+            || revision.trim() != revision
+            || revision.len() > 1024
+            || revision.chars().any(char::is_control))
     {
-        return Err(invalid("source_revision is required"));
+        return Err(invalid(
+            "source_revision must be a nonempty opaque revision token",
+        ));
     }
+    let revision_unknown = validity.source_revision.is_none();
     parse_optional_instant(validity.observed_at.as_ref(), "observed_at")?;
     let valid_from = parse_optional_instant(validity.valid_from.as_ref(), "valid_from")?;
     let valid_until = parse_optional_instant(validity.valid_until.as_ref(), "valid_until")?;
@@ -1637,113 +2070,166 @@ fn check_validity(
     {
         return Err(invalid("valid_from must lie before valid_until"));
     }
-    if validity.superseded_by.is_some() && superseded_at.is_none() {
-        return Err(invalid("superseded_by requires superseded_at"));
+    if validity.superseded_by.is_some() != superseded_at.is_some() {
+        return Err(invalid(
+            "superseded_by and superseded_at must be retained together",
+        ));
+    }
+    if let Some(replacement) = validity.superseded_by.as_deref()
+        && (replacement.is_empty()
+            || replacement.trim() != replacement
+            || replacement.len() > 1024
+            || replacement.chars().any(char::is_control))
+    {
+        return Err(invalid("superseded_by must be a bounded stable reference"));
+    }
+    for event in [superseded_at, revoked_at].into_iter().flatten() {
+        if valid_from.is_some_and(|from| event < from) {
+            return Err(invalid("lifecycle event precedes valid_from"));
+        }
     }
 
+    let mut effective_until = valid_until;
+    for boundary in [
+        superseded_at.filter(|_| !temporal.include_superseded),
+        revoked_at.filter(|_| !temporal.include_revoked),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        effective_until = Some(effective_until.map_or(boundary, |end| end.min(boundary)));
+    }
+    let cutoff_reason = |at| {
+        if !temporal.include_revoked && revoked_at.is_some_and(|event| event <= at) {
+            RecallDenialReason::Revoked
+        } else if !temporal.include_superseded && superseded_at.is_some_and(|event| event <= at) {
+            RecallDenialReason::Superseded
+        } else {
+            RecallDenialReason::Expired
+        }
+    };
+    let revision_warnings = || {
+        if revision_unknown {
+            vec!["source revision unknown; retained validity evaluated independently".to_owned()]
+        } else {
+            Vec::new()
+        }
+    };
+
     if claimed_state == TemporalState::Unknown {
-        // The provider disclaims validity. It may not also assert revocation,
-        // supersession, or a window it says it does not know.
-        if revoked_at.is_some() || superseded_at.is_some() {
-            return Err(invalid(
-                "unknown temporal_state cannot carry revocation or supersession",
-            ));
+        // A provider may disclaim the start while retaining an end or event.
+        // Those known upper bounds still exclude later requests; no admission
+        // clock or occurrence timestamp is substituted for the unknown start.
+        let earliest_requested = temporal
+            .point_instant()
+            .or_else(|| temporal.interval.as_ref().map(|((_, start), _)| *start))
+            .unwrap_or(temporal.evaluation_nanos);
+        if effective_until.is_some_and(|end| end <= earliest_requested) {
+            return Err(cutoff_reason(earliest_requested));
         }
         return match temporal.unknown_validity_policy {
             UnknownValidityPolicy::Exclude => Err(RecallDenialReason::UnknownValidity),
-            UnknownValidityPolicy::Degrade => Ok(AdmitDecision {
-                host_temporal_state: TemporalState::Unknown,
-                warnings: vec!["validity unknown; admitted under degrade policy".to_owned()],
-                degrades_lane: true,
-            }),
-            UnknownValidityPolicy::AllowWithWarning => Ok(AdmitDecision {
-                host_temporal_state: TemporalState::Unknown,
-                warnings: vec![
-                    "validity unknown; admitted under allow_with_warning policy".to_owned(),
-                ],
-                // Unknown validity is still stale content. The warning policy
-                // changes the candidate annotation, not the lane's validity,
-                // so the routing policy's explicit Stale gate must still run.
-                degrades_lane: true,
-            }),
+            UnknownValidityPolicy::Degrade | UnknownValidityPolicy::AllowWithWarning => {
+                let mut warnings = revision_warnings();
+                warnings.push(format!(
+                    "validity unknown; admitted under {} policy",
+                    temporal.unknown_validity_policy.as_wire()
+                ));
+                Ok(AdmitDecision {
+                    host_temporal_state: TemporalState::Unknown,
+                    warnings,
+                    degrades_lane: true,
+                })
+            }
         };
     }
 
-    // A known state must be backed by a validity start.
     let Some(from) = valid_from else {
         return Err(invalid("valid_from is required for a known temporal_state"));
     };
-
-    // Revocation and supersession dominate any window arithmetic.
-    let host_state = if revoked_at.is_some() {
-        TemporalState::Revoked
-    } else if superseded_at.is_some() {
-        TemporalState::Superseded
-    } else {
-        match temporal.point_instant() {
-            Some(instant) => window_state(from, valid_until, instant),
-            None => match temporal.interval {
-                Some(((_, start), (_, end))) => {
-                    if from >= end {
-                        TemporalState::Future
-                    } else if valid_until.is_some_and(|until| until <= start) {
-                        TemporalState::Expired
-                    } else {
-                        TemporalState::Current
-                    }
+    // Point claims describe the requested instant, not the present disposition.
+    // Comparing nanoseconds directly preserves the wire parser's precision.
+    let state_at = |instant| {
+        if from > instant {
+            TemporalState::Future
+        } else if revoked_at.is_some_and(|at| at <= instant) {
+            TemporalState::Revoked
+        } else if superseded_at.is_some_and(|at| at <= instant) {
+            TemporalState::Superseded
+        } else {
+            window_state(from, valid_until, instant)
+        }
+    };
+    let host_state = match temporal.point_instant() {
+        Some(instant) => state_at(instant),
+        None => match temporal.interval.as_ref() {
+            Some(((_, start), (_, end))) => {
+                if from >= *end {
+                    TemporalState::Future
+                } else if effective_until.is_some_and(|until| until <= *start || until <= from) {
+                    state_at(*start)
+                } else {
+                    TemporalState::Current
                 }
-                // History: the record is retained with its metadata; the
-                // provider's own window classification stands only if it is
-                // consistent with the evaluation instant.
-                None => window_state(from, valid_until, temporal.evaluation_nanos),
-            },
-        }
-    };
-
-    // Provider claims cannot expand what the host computed. Revocation and
-    // supersession are compared strictly; window states are compared strictly
-    // for point queries, while interval/history queries evaluate the window
-    // against the query and only reject claims that contradict the record's
-    // own timestamps.
-    let claim_consistent = match host_state {
-        TemporalState::Revoked | TemporalState::Superseded => claimed_state == host_state,
-        _ => {
-            if claimed_state == TemporalState::Revoked || claimed_state == TemporalState::Superseded
-            {
-                false
-            } else if temporal.point_instant().is_some() {
-                claimed_state == host_state
-            } else {
-                // Interval/history: the provider classifies against its own
-                // evaluation instant; only an impossible claim is rejected.
-                let against_evaluation = window_state(from, valid_until, temporal.evaluation_nanos);
-                claimed_state == against_evaluation || claimed_state == host_state
             }
-        }
+            None => state_at(temporal.evaluation_nanos),
+        },
     };
+    // Interval claims may describe their eligible portion or the evaluation
+    // instant. Current/as-of/history have one unambiguous comparison instant.
+    let claim_consistent = claimed_state == host_state
+        || (temporal.mode == TemporalMode::Interval
+            && claimed_state == state_at(temporal.evaluation_nanos));
     if !claim_consistent {
         return Err(invalid(
             "provider temporal_state contradicts validity timestamps",
         ));
     }
 
-    match host_state {
-        TemporalState::Revoked if !temporal.include_revoked => Err(RecallDenialReason::Revoked),
-        TemporalState::Superseded if !temporal.include_superseded => {
-            Err(RecallDenialReason::Superseded)
+    match temporal.mode {
+        TemporalMode::Current | TemporalMode::AsOf => {
+            let Some(instant) = temporal.point_instant() else {
+                return Err(invalid("point temporal mode has no admitted instant"));
+            };
+            if from > instant {
+                return Err(RecallDenialReason::NotYetValid);
+            }
+            if effective_until.is_some_and(|until| until <= instant) {
+                return Err(cutoff_reason(instant));
+            }
         }
-        TemporalState::Future if temporal.mode != TemporalMode::History => {
-            Err(RecallDenialReason::NotYetValid)
+        TemporalMode::Interval => {
+            let Some(((_, start), (_, end))) = temporal.interval.as_ref() else {
+                return Err(invalid("interval mode has no admitted bounds"));
+            };
+            if from >= *end {
+                return Err(RecallDenialReason::NotYetValid);
+            }
+            if effective_until.is_some_and(|until| until <= *start || until <= from) {
+                return Err(cutoff_reason((*start).max(from)));
+            }
         }
-        TemporalState::Expired if temporal.mode != TemporalMode::History => {
-            Err(RecallDenialReason::Expired)
+        TemporalMode::History => {
+            if from > temporal.evaluation_nanos {
+                return Err(RecallDenialReason::NotYetValid);
+            }
+            if !temporal.include_revoked
+                && revoked_at.is_some_and(|at| at <= temporal.evaluation_nanos)
+            {
+                return Err(RecallDenialReason::Revoked);
+            }
+            if !temporal.include_superseded
+                && superseded_at.is_some_and(|at| at <= temporal.evaluation_nanos)
+            {
+                return Err(RecallDenialReason::Superseded);
+            }
         }
-        state => Ok(AdmitDecision {
-            host_temporal_state: state,
-            warnings: Vec::new(),
-            degrades_lane: false,
-        }),
     }
+    Ok(AdmitDecision {
+        host_temporal_state: host_state,
+        warnings: revision_warnings(),
+        degrades_lane: revision_unknown,
+    })
 }
 
 fn window_state(from: i64, until: Option<i64>, instant: i64) -> TemporalState {
@@ -1815,5 +2301,111 @@ impl Serialize for AdmittedTemporalQuery {
         S: serde::Serializer,
     {
         self.to_wire_value().serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use tracedecay_contracts::memory::CognitiveRecallExclusions;
+
+    fn parts() -> RecallRequestParts {
+        RecallRequestParts {
+            provider_id: OwnedProviderId::new("provider.context").unwrap(),
+            registration_revision: 1,
+            ready_receipt_sha256: "1".repeat(64),
+            exact_scope: OwnedExactScope::new(
+                "profile",
+                "project",
+                "repository",
+                "worktree",
+                "refs/heads/main",
+                "session",
+                format!("sha256:{}", "2".repeat(64)),
+            )
+            .unwrap(),
+            request_id: "request.context".to_owned(),
+            objective: "search".to_owned(),
+            query: "query".to_owned(),
+            temporal: AdmittedTemporalQuery::current("2025-01-01T00:00:00.000000Z").unwrap(),
+            budgets: RecallBudgetsV1 {
+                maximum_candidates: 8,
+                maximum_candidate_content_bytes: 4096,
+                maximum_total_content_bytes: 8192,
+                maximum_source_refs_per_candidate: 8,
+                maximum_trace_refs_per_candidate: 8,
+                maximum_warnings: 8,
+                maximum_extensions_per_candidate: 8,
+            },
+            policy_revision: 3,
+            deadline_utc_micros: 42,
+            remaining_millis: 7,
+        }
+    }
+
+    #[test]
+    fn exclusions_and_history_are_in_the_single_canonical_payload_hash() {
+        let parts = parts();
+        let exclusions = CognitiveRecallExclusions {
+            stable_memory_refs: vec!["stable".to_owned()],
+            candidate_ids: vec!["candidate".to_owned()],
+            source_refs: vec!["source".to_owned()],
+            trace_refs: vec!["trace".to_owned()],
+            observation_ids: vec!["observation".to_owned()],
+            content_sha256: vec!["3".repeat(64)],
+        };
+        // This fixture tests the envelope binding only; it is not a source grant.
+        let mut grant = serde_json::json!({"policy_revision": 3, "destination_scope": scope_wire_value(&parts.exact_scope), "authorization_ref": "host.first"});
+        let first =
+            build_recall_request_payload_with_context(&parts, Some(&exclusions), Some(&grant))
+                .unwrap();
+        let wire: Value = serde_json::from_slice(&first.bytes).unwrap();
+        assert_eq!(
+            wire["exclusions"],
+            serde_json::to_value(&exclusions).unwrap()
+        );
+        assert_eq!(wire["history_grant"], grant);
+        assert_eq!(first.sha256, hex::encode(Sha256::digest(&first.bytes)));
+        grant["authorization_ref"] = Value::String("host.second".to_owned());
+        let changed =
+            build_recall_request_payload_with_context(&parts, Some(&exclusions), Some(&grant))
+                .unwrap();
+        assert_ne!(first.sha256, changed.sha256);
+        assert_ne!(
+            first.sha256,
+            build_recall_request_payload(&parts).unwrap().sha256
+        );
+    }
+
+    #[test]
+    fn grant_envelope_refuses_nonobject_policy_and_every_foreign_destination_field() {
+        let parts = parts();
+        let valid = serde_json::json!({"policy_revision": 3, "destination_scope": scope_wire_value(&parts.exact_scope)});
+        for invalid in [
+            Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({"policy_revision": 4, "destination_scope": scope_wire_value(&parts.exact_scope)}),
+        ] {
+            assert!(
+                build_recall_request_payload_with_context(&parts, None, Some(&invalid)).is_err()
+            );
+        }
+        for field in [
+            "profile_id",
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+            "agent_session_id",
+            "resolved_scope_digest",
+        ] {
+            let mut foreign = valid.clone();
+            foreign["destination_scope"][field] = Value::String("foreign".to_owned());
+            assert!(
+                build_recall_request_payload_with_context(&parts, None, Some(&foreign)).is_err(),
+                "{field}"
+            );
+        }
     }
 }

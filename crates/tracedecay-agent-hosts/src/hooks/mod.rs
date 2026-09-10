@@ -33,6 +33,7 @@ mod store_layout;
 pub mod tool_hints;
 pub use dispatch::NATIVE_HOOK_HOSTS;
 pub use dispatch::NativeContextScoutLifecycleV1;
+pub use dispatch::NativeSessionStartLocatorV1;
 pub use dispatch::native_capture_material;
 pub use dispatch::project_and_worktree_locators_for_scope as hook_scope_locators;
 pub use dispatch::project_id_for_layout as hook_project_id_for_layout;
@@ -47,8 +48,8 @@ pub use codex::{
     codex_additional_context_json, codex_apply_patch_rel_paths, codex_project_root_from_event,
     codex_subagent_start_log_line, codex_user_prompt_submit_context_for_event,
     codex_workspace_status_from_event, evaluate_codex_subagent_start, hook_codex_post_compact,
-    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_stop, hook_codex_user_prompt_submit,
-    record_codex_subagent_start,
+    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_stop,
+    hook_codex_user_prompt_submit, record_codex_subagent_start,
 };
 pub use cursor::{
     CURSOR_CATCH_UP_INGEST_MAX_BYTES, cursor_project_root_from_event, cursor_session_start_json,

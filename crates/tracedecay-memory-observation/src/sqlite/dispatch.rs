@@ -214,6 +214,30 @@ pub(crate) struct ExpireDeliveryRequest<'a> {
 }
 
 impl SqliteObservationJournal {
+    /// Reads one retained admission by its exact content-derived key. This
+    /// shares delivery's strict decoder without claiming or updating a lease.
+    /// Purged content is unavailable even when its delivery audit remains.
+    pub fn read_admitted_observation_by_idempotency(
+        &self,
+        key: &ObservationIdempotencyKeyV1,
+    ) -> Result<Option<crate::AdmittedObservationV1>, ObservationJournalError> {
+        ObservationIdempotencyKeyV1::parse(key.as_str())?;
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {LEASE_SELECT_COLUMNS}, j.provenance_sha256, \
+                 j.occurred_at_micros, j.admitted_at_micros, j.request_id, j.envelope_sha256 \
+                 FROM tdmem_observation_journal_v1 j \
+                 JOIN tdmem_observation_delivery_v1 d ON d.idempotency_key = j.idempotency_key \
+                 WHERE j.idempotency_key = ?1 AND j.payload_bytes IS NOT NULL LIMIT 1"
+            ))?;
+            let mut rows = statement.query(params![key.as_str()])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(super::row::decode_admitted(row)?))
+        })
+    }
+
     /// Marks one delivery terminal with a terminal receipt of its own rather
     /// than deleting it. ADR-0005 invariant 7: nothing is silently dropped.
     ///

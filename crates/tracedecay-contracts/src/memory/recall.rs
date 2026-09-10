@@ -12,6 +12,7 @@ use std::future::Future;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracedecay_domain::UtcMicros;
 
 use crate::context::{CancellationContext, Deadline, RequestId, ResolvedScope};
 use crate::error::ApplicationContractError;
@@ -33,6 +34,253 @@ pub const MAX_COGNITIVE_RECALL_REFERENCE_BYTES: usize = 1024;
 /// Maximum UTF-8 byte length of an optional provider explanation summary.
 pub const MAX_COGNITIVE_RECALL_EXPLANATION_BYTES: usize = 8 * 1024;
 
+/// Maximum exclusions in each canonical exclusion class.
+pub const MAX_COGNITIVE_RECALL_EXCLUSIONS_PER_CLASS: usize = 1024;
+
+/// Canonical temporal modes at the application boundary. Host adapters map
+/// these values to the provider contract without narrowing the requested mode.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveRecallTemporalMode {
+    /// Valid at the admitted evaluation time.
+    Current,
+    /// Valid at the specified historical time.
+    AsOf,
+    /// Validity overlaps the inclusive-start, exclusive-end interval.
+    Interval,
+    /// Retained history with explicit supersession/revocation policy.
+    History,
+}
+
+/// Explicit policy for candidates with no retained assertion validity.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CognitiveRecallUnknownValidityPolicy {
+    /// Withhold candidates whose validity is unknown.
+    Exclude,
+    /// Permit unknown validity with a warning and degraded temporal coverage.
+    Degrade,
+    /// Permit unknown validity with an explicit warning and partial coverage.
+    AllowWithWarning,
+}
+
+/// Optional application temporal selection. Times use the application UTC
+/// microsecond value; wire adapters retain the canonical RFC3339 representation.
+/// Source occurrence and ingestion are never substituted for assertion validity.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveRecallTemporalQuery {
+    mode: CognitiveRecallTemporalMode,
+    evaluation_time: UtcMicros,
+    as_of: Option<UtcMicros>,
+    interval_start: Option<UtcMicros>,
+    interval_end: Option<UtcMicros>,
+    include_superseded: bool,
+    include_revoked: bool,
+    unknown_validity_policy: CognitiveRecallUnknownValidityPolicy,
+}
+
+impl CognitiveRecallTemporalQuery {
+    /// Current query using the caller's admitted clock and canonical defaults.
+    #[must_use]
+    pub fn current(evaluation_time: UtcMicros) -> Self {
+        Self {
+            mode: CognitiveRecallTemporalMode::Current,
+            evaluation_time,
+            as_of: None,
+            interval_start: None,
+            interval_end: None,
+            include_superseded: false,
+            include_revoked: false,
+            unknown_validity_policy: CognitiveRecallUnknownValidityPolicy::Exclude,
+        }
+    }
+
+    /// Select a recorded historical instant, preserving the evaluation clock.
+    pub fn with_as_of(mut self, as_of: UtcMicros) -> Result<Self, ApplicationContractError> {
+        self.mode = CognitiveRecallTemporalMode::AsOf;
+        self.as_of = Some(as_of);
+        self.interval_start = None;
+        self.interval_end = None;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Select an inclusive-start, exclusive-end historical interval.
+    pub fn with_interval(
+        mut self,
+        start: UtcMicros,
+        end: UtcMicros,
+    ) -> Result<Self, ApplicationContractError> {
+        self.mode = CognitiveRecallTemporalMode::Interval;
+        self.as_of = None;
+        self.interval_start = Some(start);
+        self.interval_end = Some(end);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Select retained history using the explicit inclusion policies.
+    #[must_use]
+    pub fn with_history(mut self) -> Self {
+        self.mode = CognitiveRecallTemporalMode::History;
+        self.as_of = None;
+        self.interval_start = None;
+        self.interval_end = None;
+        self
+    }
+
+    /// Set temporal inclusion policy. Privacy deletion always overrides these flags.
+    #[must_use]
+    pub fn with_policy(
+        mut self,
+        include_superseded: bool,
+        include_revoked: bool,
+        unknown_validity_policy: CognitiveRecallUnknownValidityPolicy,
+    ) -> Self {
+        self.include_superseded = include_superseded;
+        self.include_revoked = include_revoked;
+        self.unknown_validity_policy = unknown_validity_policy;
+        self
+    }
+
+    /// Validates mode-specific bounds without consulting a clock or provider.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        let valid = match self.mode {
+            CognitiveRecallTemporalMode::Current | CognitiveRecallTemporalMode::History => {
+                self.as_of.is_none() && self.interval_start.is_none() && self.interval_end.is_none()
+            }
+            CognitiveRecallTemporalMode::AsOf => {
+                self.as_of.is_some_and(|at| at <= self.evaluation_time)
+                    && self.interval_start.is_none()
+                    && self.interval_end.is_none()
+            }
+            CognitiveRecallTemporalMode::Interval => {
+                self.as_of.is_none()
+                    && matches!((self.interval_start, self.interval_end), (Some(start), Some(end)) if start < end)
+            }
+        };
+        if !valid {
+            return Err(ApplicationContractError::InvalidRange {
+                field: "cognitive recall temporal bounds",
+            });
+        }
+        Ok(())
+    }
+
+    /// Reject a future evaluation clock at actual host admission.
+    pub fn validate_at(&self, now: UtcMicros) -> Result<(), ApplicationContractError> {
+        self.validate()?;
+        if self.evaluation_time > now {
+            return Err(ApplicationContractError::InvalidRange {
+                field: "cognitive recall evaluation time",
+            });
+        }
+        Ok(())
+    }
+
+    /// Requested canonical temporal mode.
+    #[must_use]
+    pub const fn mode(&self) -> CognitiveRecallTemporalMode {
+        self.mode
+    }
+    /// Host-admitted evaluation clock.
+    #[must_use]
+    pub const fn evaluation_time(&self) -> UtcMicros {
+        self.evaluation_time
+    }
+    /// Requested historical instant.
+    #[must_use]
+    pub const fn as_of(&self) -> Option<UtcMicros> {
+        self.as_of
+    }
+    /// Inclusive interval start.
+    #[must_use]
+    pub const fn interval_start(&self) -> Option<UtcMicros> {
+        self.interval_start
+    }
+    /// Exclusive interval end.
+    #[must_use]
+    pub const fn interval_end(&self) -> Option<UtcMicros> {
+        self.interval_end
+    }
+    /// Whether ordinarily superseded evidence is permitted.
+    #[must_use]
+    pub const fn include_superseded(&self) -> bool {
+        self.include_superseded
+    }
+    /// Whether ordinarily revoked evidence is permitted.
+    #[must_use]
+    pub const fn include_revoked(&self) -> bool {
+        self.include_revoked
+    }
+    /// Requested policy for unknown validity.
+    #[must_use]
+    pub const fn unknown_validity_policy(&self) -> CognitiveRecallUnknownValidityPolicy {
+        self.unknown_validity_policy
+    }
+}
+
+/// Canonical exclusion classes, applied before candidate limits. A content
+/// digest identifies full candidate content before output truncation.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CognitiveRecallExclusions {
+    /// Stable provider memory references.
+    pub stable_memory_refs: Vec<String>,
+    /// Request-scoped candidate IDs.
+    pub candidate_ids: Vec<String>,
+    /// Original source references.
+    pub source_refs: Vec<String>,
+    /// Retained trace references.
+    pub trace_refs: Vec<String>,
+    /// Original canonical observation IDs.
+    pub observation_ids: Vec<String>,
+    /// Lowercase SHA-256 digests of full content.
+    pub content_sha256: Vec<String>,
+}
+
+impl CognitiveRecallExclusions {
+    /// Validates every exclusion class and rejects duplicates within each class.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        for values in [
+            &self.stable_memory_refs,
+            &self.candidate_ids,
+            &self.source_refs,
+            &self.trace_refs,
+            &self.observation_ids,
+            &self.content_sha256,
+        ] {
+            if values.len() > MAX_COGNITIVE_RECALL_EXCLUSIONS_PER_CLASS {
+                return Err(ApplicationContractError::InvalidRange {
+                    field: "cognitive recall exclusions",
+                });
+            }
+            let mut seen = BTreeSet::new();
+            for value in values {
+                validate_reference(value, "cognitive recall exclusion")?;
+                if !seen.insert(value) {
+                    return Err(ApplicationContractError::Duplicate {
+                        field: "cognitive recall exclusion",
+                    });
+                }
+            }
+        }
+        for digest in &self.content_sha256 {
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(ApplicationContractError::InvalidIdentifier {
+                    field: "cognitive recall content exclusion digest",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Immutable request for one bounded advisory recall attempt.
 ///
 /// `scope`, `request_id`, `deadline`, and `cancellation` are copied from the
@@ -49,6 +297,10 @@ pub struct CognitiveRecallRequest {
     cancellation: CancellationContext,
     query: String,
     maximum_candidates: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporal_query: Option<CognitiveRecallTemporalQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusions: Option<CognitiveRecallExclusions>,
 }
 
 impl CognitiveRecallRequest {
@@ -68,6 +320,8 @@ impl CognitiveRecallRequest {
             cancellation,
             query: query.into(),
             maximum_candidates,
+            temporal_query: None,
+            exclusions: None,
         };
         request.validate()?;
         Ok(request)
@@ -96,7 +350,46 @@ impl CognitiveRecallRequest {
                 field: "cognitive recall maximum candidates",
             });
         }
+        if let Some(temporal_query) = &self.temporal_query {
+            temporal_query.validate()?;
+        }
+        if let Some(exclusions) = &self.exclusions {
+            exclusions.validate()?;
+        }
         Ok(())
+    }
+
+    /// Attach a validated temporal selection; absence preserves the legacy
+    /// current-time selection using the host's actual admission clock.
+    pub fn with_temporal_query(
+        mut self,
+        temporal_query: CognitiveRecallTemporalQuery,
+    ) -> Result<Self, ApplicationContractError> {
+        self.temporal_query = Some(temporal_query);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Attach bounded canonical exclusions without silently dropping any class.
+    pub fn with_exclusions(
+        mut self,
+        exclusions: CognitiveRecallExclusions,
+    ) -> Result<Self, ApplicationContractError> {
+        self.exclusions = Some(exclusions);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Explicit temporal selection, or legacy current-time behavior if absent.
+    #[must_use]
+    pub fn temporal_query(&self) -> Option<&CognitiveRecallTemporalQuery> {
+        self.temporal_query.as_ref()
+    }
+
+    /// Explicit exclusions, or the legacy empty set if absent.
+    #[must_use]
+    pub fn exclusions(&self) -> Option<&CognitiveRecallExclusions> {
+        self.exclusions.as_ref()
     }
 
     #[must_use]

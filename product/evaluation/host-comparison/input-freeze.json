@@ -1,0 +1,20 @@
+{
+  "protocol_revision": 1,
+  "prepared_against": "6010f31e7",
+  "heldout_sha256": {
+    "a.json": "e025922975d254dc7f8b2eb751b797ec4912c64a058095a0a64e8dca98d0c02c",
+    "b.json": "2f16c4552c84931e08ee02e9a40e01c8f986ba6f8a0be000fd86897a575f9d52",
+    "c.json": "00a9df801b06b4d76ac2a90260343acd4ee50d7c6b83bd08e1cbd7e170101b3f"
+  },
+  "thresholds": {
+    "useful_recall_precision_minimum": 0.6,
+    "harmful_stale_recall_ceiling": 0,
+    "scope_leakage_ceiling": 0,
+    "corrupt_state_recall_ceiling": 0,
+    "deleted_source_recall_ceiling": 0
+  },
+  "analysis_seed": 6010317,
+  "bootstrap_resamples": 2000,
+  "task_benefit": "unmeasured",
+  "performance_fixture_sha256": "bee3604b912139c513351a16947d3d1277c8a3142db79e1bf4301ad39dc5ad15"
+}

@@ -902,9 +902,10 @@ pub(in crate::runtime) use jsonl::{
     jsonl_native_file_identity, jsonl_prefix_digest,
 };
 pub use jsonl::{
-    JsonlFrameDeferral, JsonlResumeState, MAX_JSONL_RECORD_BYTES, RawJsonlFrame,
-    RawJsonlFrameReader, RawJsonlRecord, RawJsonlSkippedRange, RawJsonlSkippedReason,
-    STRICT_JSONL_BATCH_BYTES, try_stream_new_jsonl_raw_strict_with_resume,
+    JsonlFrameDeferral, JsonlResumeState, LiveJsonlOriginCapture, LiveJsonlOriginFrame,
+    MAX_JSONL_RECORD_BYTES, RawJsonlFrame, RawJsonlFrameReader, RawJsonlRecord,
+    RawJsonlSkippedRange, RawJsonlSkippedReason, STRICT_JSONL_BATCH_BYTES,
+    capture_live_jsonl_origin, try_stream_new_jsonl_raw_strict_with_resume,
 };
 pub use jsonl::{JsonlLine, NewJsonl, stream_new_jsonl};
 #[cfg(test)]

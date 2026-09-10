@@ -10,10 +10,10 @@ use std::path::Path;
 use serde_json::{Value, json};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_contracts::retrieval::{
-    ContextCodeBlockV1, ContextModeV1, ContextResultV1, ContextSearchMatchV1,
-    ContextSurfaceRequestV1, RenamePreviewNodeV1, RenamePreviewPrimitiveRequestV1,
-    RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1,
-    SimilarSurfaceRequestV1, SimilarSymbolV1,
+    ContextCodeBlockV1, ContextMemoryContributionV1, ContextModeV1, ContextResultV1,
+    ContextSearchMatchV1, ContextSurfaceRequestV1, RenamePreviewNodeV1,
+    RenamePreviewPrimitiveRequestV1, RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1,
+    RenamePreviewTextOnlyMatchV1, SimilarSurfaceRequestV1, SimilarSymbolV1,
 };
 use tracedecay_domain::ExactClass;
 
@@ -40,8 +40,8 @@ mod verified;
 use context_support::context_memory_section;
 use context_support::{
     ContextMemoryOutcome, context_markdown_lane_preview, context_memory_analytics_value,
-    context_memory_options, context_memory_outcome, context_memory_read_control,
-    insert_context_memory_section,
+    context_memory_matches, context_memory_options, context_memory_outcome,
+    context_memory_read_control, insert_context_memory_section,
 };
 use primitive_surface::{
     search_coverage as primitive_search_coverage,
@@ -197,24 +197,26 @@ fn generic_tool_result(
 }
 
 fn rendered_context_tool_result(
-    cg: &TraceDecay,
+    project_root: &Path,
     args: &Value,
     mut value: Value,
     touched_files: Vec<String>,
     full_markdown: String,
     preview_markdown: Option<&str>,
+    memory_contribution: ContextMemoryContributionV1,
 ) -> ToolResult {
     let internal_analytics = take_internal_context_memory_analytics(&mut value);
     let text = if render::wants_json(args) {
-        render::finalize(Some(cg.project_root()), args, &value, || full_markdown)
+        render::finalize(Some(project_root), args, &value, || full_markdown)
     } else {
         render::markdown_preview_with_handle(
-            Some(cg.project_root()),
+            Some(project_root),
             &full_markdown,
             preview_markdown.unwrap_or(&full_markdown),
         )
     };
-    let result = text_tool_result(&text, touched_files);
+    let result = text_tool_result(&text, touched_files)
+        .with_context_memory_contribution(memory_contribution);
     if let Some(internal_analytics) = internal_analytics {
         result.with_internal_analytics(internal_analytics)
     } else {
@@ -804,6 +806,15 @@ where
     F: Future<Output = Result<tracedecay_graph_query::VerifiedGraphQuery>>,
 {
     let request: ContextSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_context")?;
+    let memory_policy_admitted_at =
+        tracedecay_contracts::try_now_micros().map_err(|error| TraceDecayError::Config {
+            message: format!("context memory policy admission clock unavailable: {error}"),
+        })?;
+    request
+        .validate_memory_policy_at(memory_policy_admitted_at)
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("invalid context memory policy: {error}"),
+        })?;
     let task = request.task.as_str();
     let mode = request.mode.unwrap_or(ContextModeV1::Explore);
     let max_nodes = request
@@ -818,7 +829,7 @@ where
         request.lexical_anchors.clone().unwrap_or_default(),
         request.prefer_symbol.unwrap_or(false),
     )?;
-    let memory_options = context_memory_options(&args);
+    let memory_options = context_memory_options(&request);
     let memory_read_control =
         context_memory_read_control(&memory_options, deadline.as_ref(), cancellation.as_ref())?;
     // Search, graph enrichment, and memory are independent. Search is the
@@ -841,7 +852,11 @@ where
             cancellation,
         },
     );
-    let memory = context_memory_outcome(cg, task, &memory_options, memory_read_control.as_ref());
+    let memory = context_memory_outcome(
+        &memory_options,
+        memory_read_control.as_ref(),
+        |read_control| context_memory_matches(cg, task, &memory_options, read_control),
+    );
     let search_and_graph = race_primary_search_with_graph(search, graph, false, None, false);
     let ((outcome, graph), memory_outcome) = tokio::join!(search_and_graph, memory);
     let worktree_freshness = read_worktree_freshness(freshness_reader, cg.project_root()).await;
@@ -917,6 +932,7 @@ where
     let ContextMemoryOutcome {
         hits: memory_matches,
         graph_coverage: memory_graph_coverage,
+        temporal_coverage: memory_temporal_coverage,
         error: memory_matches_error,
     } = memory_outcome;
     let seeds = projection
@@ -961,6 +977,7 @@ where
         &mut output,
         &memory_matches,
         memory_matches_error.as_deref(),
+        memory_temporal_coverage,
     );
     if mode == ContextModeV1::Plan
         && let Some(graph) = graph.as_ref()
@@ -977,6 +994,16 @@ where
         );
     }
 
+    let memory_contribution = ContextMemoryContributionV1::from_matches(
+        &request,
+        &memory_matches,
+        memory_graph_coverage,
+        memory_temporal_coverage,
+        memory_policy_admitted_at,
+    )
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("invalid canonical context memory contribution: {error}"),
+    })?;
     let result = ContextResultV1 {
         task: request.task,
         mode,
@@ -989,6 +1016,7 @@ where
         coverage,
         memory_matches: memory_matches.clone(),
         memory_graph_coverage,
+        memory_temporal_coverage,
         memory_matches_error: memory_matches_error.clone(),
         verified_graph_evidence,
     };
@@ -1023,8 +1051,15 @@ where
         ),
     );
     let preview = (!render::wants_json(&args)).then(|| context_markdown_lane_preview(&output));
-    let result =
-        rendered_context_tool_result(cg, &args, value, touched_files, output, preview.as_deref());
+    let result = rendered_context_tool_result(
+        cg.project_root(),
+        &args,
+        value,
+        touched_files,
+        output,
+        preview.as_deref(),
+        memory_contribution,
+    );
     if strict_semantic_unavailable {
         Ok(result.with_semantic_error(true))
     } else {
@@ -2435,11 +2470,97 @@ mod tests {
     }
 
     #[test]
+    fn canonical_fact_identity_and_source_survive_both_context_renderings() {
+        use tracedecay_contracts::memory::{FactCommitOwnerV1, FactIdentitySourceResultV1};
+        use tracedecay_domain::{
+            FactAssertionId, FactEventId, LocatorDigest, ProjectId, RetrievalAnchorId, UtcMicros,
+        };
+
+        let profile_hit = context_memory_hit("profile content".to_owned());
+        let mut project_hit = context_memory_hit("project content".to_owned());
+        project_hit.fact.owner = FactCommitOwnerV1::Project {
+            project_id: ProjectId::new("project.context-memory").expect("project identity"),
+        };
+        project_hit.fact.active_assertion_id =
+            FactAssertionId::new("assertion.project-context").expect("assertion identity");
+        project_hit.fact.last_event_id =
+            FactEventId::new("event.project-context").expect("event identity");
+        project_hit.fact.source = FactIdentitySourceResultV1::Evidence {
+            anchor_id: RetrievalAnchorId::new("retrieval.source.context").expect("source anchor"),
+            stable_key: LocatorDigest::new(format!("sha256:{}", "a".repeat(64)))
+                .expect("stable locator"),
+        };
+        let hits = vec![profile_hit, project_hit];
+        let request: ContextSurfaceRequestV1 =
+            serde_json::from_value(json!({"task": "context"})).expect("request");
+        let contribution =
+            ContextMemoryContributionV1::from_matches(&request, &hits, None, None, UtcMicros(20))
+                .expect("canonical contribution");
+        assert!(
+            ContextMemoryContributionV1::from_matches(
+                &request,
+                &vec![hits[0].clone(); 11],
+                None,
+                None,
+                UtcMicros(20)
+            )
+            .is_err()
+        );
+        let history_request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
+            "task": "history", "temporal_query": tracedecay_contracts::memory::CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history()
+        })).expect("history request");
+        for (supplied_hits, supplied_mode) in [
+            (
+                hits.as_slice(),
+                tracedecay_contracts::memory::CognitiveRecallTemporalMode::History,
+            ),
+            (
+                &[][..],
+                tracedecay_contracts::memory::CognitiveRecallTemporalMode::AsOf,
+            ),
+        ] {
+            assert!(ContextMemoryContributionV1::from_matches(
+                &history_request,
+                supplied_hits,
+                None,
+                Some(tracedecay_contracts::retrieval::ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
+                    requested_mode: supplied_mode,
+                }),
+                UtcMicros(20)
+            ).is_err());
+        }
+        for args in [json!({}), json!({"format": "json"})] {
+            let result = rendered_context_tool_result(
+                Path::new("."),
+                &args,
+                json!({"memory_matches": hits}),
+                Vec::new(),
+                "### Memory Matches\nRendered summary with no identity parsing.\n".to_owned(),
+                None,
+                contribution.clone(),
+            );
+            let carried = result
+                .context_memory_contribution()
+                .expect("typed context sidecar");
+            assert_eq!(carried.facts().len(), hits.len());
+            for (carried, hit) in carried.facts().iter().zip(&hits) {
+                assert_eq!(carried.owner, hit.fact.owner);
+                assert_eq!(carried.fact_id, hit.fact.fact_id);
+                assert_eq!(carried.last_event_id, hit.fact.last_event_id);
+                assert_eq!(carried.active_assertion_id, hit.fact.active_assertion_id);
+                assert_eq!(carried.source, hit.fact.source);
+            }
+            assert!(result.value.get("context_memory_contribution").is_none());
+            assert!(!response_text(&result).contains("context_memory_contribution"));
+        }
+    }
+
+    #[test]
     fn context_memory_section_keeps_full_content_for_retrieval_handle() {
         let content = format!("{}tail-marker", "long memory body ".repeat(100));
         let hit = context_memory_hit(content.clone());
 
-        let Some(section) = context_memory_section(&[hit], None) else {
+        let Some(section) = context_memory_section(&[hit], None, None) else {
             panic!("memory hit should render");
         };
 
@@ -2453,7 +2574,7 @@ mod tests {
     fn context_memory_section_compacts_multiline_content() {
         let hit = context_memory_hit("first line\n# heading\n- item".to_owned());
 
-        let Some(section) = context_memory_section(&[hit], None) else {
+        let Some(section) = context_memory_section(&[hit], None, None) else {
             panic!("memory hit should render");
         };
 

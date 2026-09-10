@@ -16,8 +16,9 @@ use tracedecay_session_runtime::session_temporal_refresh_scheduler::{
 
 #[cfg(feature = "memory-provider-host")]
 use tracedecay_memory_provider_registry::{
-    NATIVE_PROVIDER_ID, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
-    OwnedProviderId,
+    ConfiguredObservationProviderMountV1, EnabledProviderMode, NATIVE_PROVIDER_ID,
+    ObservationMountActivationV1, ObservationMountRequirementV1, ObservationProviderMountV1,
+    ObservationStateNamespacePolicyV1, OwnedProviderId, ProviderRegistrationV1,
 };
 
 mod code_index_activation;
@@ -32,8 +33,10 @@ use code_index_activation::{
     code_index_freshness_probe_sink, code_index_hook_sink, code_index_reconcile_sink,
     diagnostics_change_generation_resolver,
 };
+#[cfg(all(test, feature = "memory-provider-host"))]
+pub(super) use ncm_observer::construct_ncm_observer;
 #[cfg(feature = "memory-provider-host")]
-pub(super) use ncm_observer::{NcmWorkerOwnerSlot, construct_ncm_observer};
+pub(super) use ncm_observer::{NcmWorkerOwnerSlot, construct_ncm_registration};
 pub(in crate::daemon) use runtime::ProductionProjectCompositionRuntime;
 use runtime::bind_verified_project_graph_runtime;
 use session_database_admission::{join_independent_session_opens, log_session_database_admission};
@@ -49,31 +52,9 @@ pub(super) struct ProductionProjectComposition {
     pub(super) semantic_auto_download_enabled: Option<bool>,
 }
 
-/// Typed product activation seam for a project-scoped provider host.
-///
-/// An enabled caller cannot omit the Native application port, because that
-/// authority is a required field of the `NativeProviderActivation::Enabled`
-/// variant.
-///
-/// The two enabled variants are deliberately distinct rather than one variant
-/// carrying a mode. `memory.provider_native_enabled.v1` alone selects Observer
-/// and nothing else: inferring active output from the boolean that merely
-/// turns the host on would be exactly the silent promotion the activation
-/// gate exists to prevent. `NativeActive` requires the separately pinned
-/// routing gate `memory.provider_recall_routing.v1` to name the Native
-/// provider as the active recall provider; that same gate is the only source
-/// of the recall route's routing policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ProjectMemoryProviderActivation {
-    /// Keep the provider host fully dormant.
-    Disabled,
-    /// Construct and mount the project-owned Native provider as an observer:
-    /// it receives admitted observations and contributes no active output.
-    NativeObserver,
-    /// Construct and mount the project-owned Native provider in active mode:
-    /// the routing gate explicitly named it as the active recall provider.
-    NativeActive,
-}
+/// Independent participation resolved from the pinned project configuration.
+pub(super) type ProjectMemoryProviderActivation =
+    tracedecay_domain::configuration::MemoryProviderSelectionV1;
 
 /// A caller-owned interposition on the Native application port one project
 /// composition mounts.
@@ -111,7 +92,7 @@ pub(super) type NativeApplicationPortInterpositionV1 = Arc<
 pub(super) enum ProjectMemoryProviderActivationSelector {
     /// Resolve from the authoritative runtime configuration this open already
     /// loaded. Default-false configuration yields
-    /// [`ProjectMemoryProviderActivation::Disabled`].
+    /// [`ProjectMemoryProviderActivation::is_disabled`].
     FromRuntimeConfiguration,
     /// Resolve exactly as [`Self::FromRuntimeConfiguration`] does, and hand the
     /// production Native port through the caller's own interposition before it
@@ -188,70 +169,21 @@ impl ProjectMemoryProviderActivationSelector {
 fn resolve_memory_provider_activation(
     config: &tracedecay_configuration::TraceDecayConfig,
 ) -> Result<ProjectMemoryProviderActivation> {
-    config
-        .memory_provider_ncm_observer
-        .validate()
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("NCM observer configuration is invalid: {error}"),
-        })?;
-    if !config.memory_provider_native_enabled
-        && !matches!(
-            config.memory_provider_ncm_observer,
-            tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Disabled {}
-        )
-    {
+    let selection = ProjectMemoryProviderActivation::resolve(
+        config.memory_provider_native_enabled,
+        &config.memory_provider_ncm_observer,
+        &config.memory_provider_recall_routing,
+    )
+    .map_err(|error| TraceDecayError::Config {
+        message: error.to_string(),
+    })?;
+    if !cfg!(feature = "memory-provider-host") && !selection.is_disabled() {
         return Err(TraceDecayError::Config {
-            message: "NCM observer requires the Native provider host; orphan observers are refused"
+            message: "configured memory providers require a build with memory-provider-host"
                 .to_owned(),
         });
     }
-    let routing = &config.memory_provider_recall_routing;
-    routing
-        .validate()
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("memory provider recall routing configuration is invalid: {error}"),
-        })?;
-    match (
-        config.memory_provider_native_enabled,
-        routing.active_provider.as_deref(),
-    ) {
-        (false, None) => Ok(ProjectMemoryProviderActivation::Disabled),
-        (false, Some(provider)) => Err(TraceDecayError::Config {
-            message: format!(
-                "memory provider recall routing names active provider '{provider}' but the \
-                 memory provider host is disabled; enable memory.provider_native_enabled.v1 or \
-                 clear the active provider"
-            ),
-        }),
-        (true, None) => Ok(ProjectMemoryProviderActivation::NativeObserver),
-        (true, Some(provider)) if is_mountable_active_provider(provider) => {
-            Ok(ProjectMemoryProviderActivation::NativeActive)
-        }
-        (true, Some(provider)) => Err(TraceDecayError::Config {
-            message: format!(
-                "memory provider recall routing names active provider '{provider}', which this \
-                 project composition cannot mount as an active provider"
-            ),
-        }),
-    }
-}
-
-/// Whether the routing gate names an adapter this build can mount actively.
-///
-/// The registry, not this composition, owns provider-identity recognition: it
-/// returns a typed kind for a configured name and this gate accepts only the
-/// Native one. A build without the host cannot honour any active provider.
-#[cfg(feature = "memory-provider-host")]
-fn is_mountable_active_provider(provider: &str) -> bool {
-    matches!(
-        tracedecay_memory_provider_registry::mountable_active_provider(provider),
-        Some(tracedecay_memory_provider_registry::MountableProviderKindV1::Native)
-    )
-}
-
-#[cfg(not(feature = "memory-provider-host"))]
-fn is_mountable_active_provider(_provider: &str) -> bool {
-    false
+    Ok(selection)
 }
 
 /// Converts the domain routing document's typed degradation allowlist into
@@ -299,20 +231,16 @@ fn project_recall_degradation_rule(
 /// yield `None`.
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_routing_policy(
-    activation: ProjectMemoryProviderActivation,
+    selected: Option<(&tracedecay_memory_provider_registry::OwnedProviderId, u64)>,
     config: &tracedecay_configuration::TraceDecayConfig,
 ) -> Result<Option<tracedecay_memory_provider_registry::ActiveRoutingPolicy>> {
-    use tracedecay_memory_provider_registry::{
-        ActiveRoutingPolicy, FallbackRule, NATIVE_PROVIDER_ID, OwnedProviderId,
+    use tracedecay_memory_provider_registry::{ActiveRoutingPolicy, FallbackRule};
+    let Some((provider_id, registration_revision)) = selected else {
+        return Ok(None);
     };
-    // The registry declares the routed identity, never this composition.
-    let selected_provider_id = match activation {
-        ProjectMemoryProviderActivation::NativeActive => NATIVE_PROVIDER_ID,
-        _ => return Ok(None),
-    };
+    let selected_provider_id = provider_id.as_str();
+    let active_provider = provider_id.clone();
     let contract = |message: String| TraceDecayError::Config { message };
-    let active_provider = OwnedProviderId::new(selected_provider_id)
-        .map_err(|error| contract(format!("selected provider identity is invalid: {error}")))?;
     let fallback = match &config.memory_provider_recall_routing.fallback {
         None => FallbackRule::Forbidden,
         // This composition registers exactly one provider — the selected
@@ -336,7 +264,7 @@ fn project_recall_routing_policy(
     let degradation = project_recall_degradation_rule(config)?;
     ActiveRoutingPolicy::new_with_degradation(
         active_provider,
-        PROJECT_NATIVE_REGISTRATION_REVISION,
+        registration_revision,
         fallback,
         degradation,
     )
@@ -354,6 +282,22 @@ fn project_recall_routing_policy(
 /// journal's idempotency key, which is why it may not be zero.
 #[cfg(feature = "memory-provider-host")]
 pub(super) const PROJECT_NATIVE_REGISTRATION_REVISION: u64 = 1;
+
+/// Product-owned revision supplied to the project NCM registration and journal.
+#[cfg(feature = "memory-provider-host")]
+pub(super) const PROJECT_NCM_REGISTRATION_REVISION: u64 = 1;
+
+/// Reads the exact composition declarations, without observing a running mount.
+#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
+pub(super) fn declared_project_provider_registration_revision_for_test(
+    provider_id: &str,
+) -> Option<u64> {
+    match provider_id {
+        NATIVE_PROVIDER_ID => Some(PROJECT_NATIVE_REGISTRATION_REVISION),
+        tracedecay_memory_provider_ncm::NCM_PROVIDER_ID => Some(PROJECT_NCM_REGISTRATION_REVISION),
+        _ => None,
+    }
+}
 
 /// Product-owned in-flight budget for the project-scoped provider: one active
 /// provider call at a time per checkout.
@@ -392,6 +336,12 @@ pub(super) fn native_observation_mount(
     })
 }
 
+#[cfg(feature = "memory-provider-host")]
+type ProjectObservationMountWithHistoryV1 = (
+    ConfiguredObservationProviderMountV1,
+    Arc<super::retained_owner::provider_history::ProviderHistoryAuthorityMountV1>,
+);
+
 /// Mounts the project's memory-provider host.
 ///
 /// This is `async` for one reason: the enabled arm opens the Native provider's
@@ -411,110 +361,141 @@ async fn mount_project_memory_provider_host(
     #[cfg(test)] native_port_interposition: Option<NativeApplicationPortInterpositionV1>,
 ) -> Result<(
     crate::mcp::server::MemoryProviderHostMount,
-    Vec<tracedecay_memory_provider_registry::ObservationProviderMountV1>,
+    Vec<ProjectObservationMountWithHistoryV1>,
 )> {
-    // Disabled composition constructs no port, no fabric, no adapter, and no
-    // registration: the concrete provider below is built only inside the
-    // enabled arms, so a default-false configuration allocates nothing.
-    let enabled_mode = match activation {
-        ProjectMemoryProviderActivation::Disabled => None,
-        ProjectMemoryProviderActivation::NativeObserver => {
-            Some(tracedecay_memory_provider_registry::EnabledProviderMode::Observer)
-        }
-        ProjectMemoryProviderActivation::NativeActive => {
-            Some(tracedecay_memory_provider_registry::EnabledProviderMode::Active)
-        }
+    use tracedecay_domain::configuration::{MemoryProviderKindV1, MemoryProviderParticipationV1};
+    use tracedecay_memory_provider_registry::{
+        FabricConfig, NATIVE_RECALL_SCOPE_BINDINGS, NativeProvider,
+        ProjectMemoryProviderComposition, ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1,
+        RecallScopeBindingsV1, SelectedProviderActivationV1,
     };
-    let mut observation_mounts = Vec::new();
-    // Native is required by this host and stays first: its mount failure
-    // refuses project open, while later optional observer failures do not.
-    if enabled_mode.is_some() {
-        observation_mounts.push(native_observation_mount(
-            &cg.store_layout().data_root,
-            PROJECT_NATIVE_REGISTRATION_REVISION,
-        )?);
+    if activation.is_disabled() {
+        return Ok((
+            Arc::new(ProjectMemoryProviderComposition::Disabled),
+            Vec::new(),
+        ));
     }
+    let mut selected = None;
     let mut observers = Vec::new();
-    if let tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Enabled {
-        worker_binary,
-        state_root,
-    } = ncm_observer
-    {
-        let worker_binary = worker_binary.clone();
-        let state_root = state_root.clone();
-        let owners = Arc::clone(ncm_worker_owner);
-        let profile_id = profile_id.clone();
-        // Concrete adapters are injected from daemon composition. Preflight
-        // may block on the worker, so it runs off the Tokio executor.
-        match tokio::task::spawn_blocking(move || {
-            construct_ncm_observer(&owners, &profile_id, worker_binary, state_root, 1)
-        })
-        .await
+    let mut observation_mounts = Vec::new();
+    for (kind, participation) in [
+        (MemoryProviderKindV1::Native, activation.native),
+        (MemoryProviderKindV1::Ncm, activation.ncm),
+    ] {
+        let mode = match participation {
+            MemoryProviderParticipationV1::Disabled => continue,
+            MemoryProviderParticipationV1::Observer => EnabledProviderMode::Observer,
+            MemoryProviderParticipationV1::Active => EnabledProviderMode::Active,
+        };
+        // Keep legacy Native-observer replay mandatory when there is no active
+        // provider. Under explicit selection only that selected provider is required.
+        let requirement = if mode == EnabledProviderMode::Active
+            || (kind == MemoryProviderKindV1::Native && activation.active_provider().is_none())
         {
-            Ok(Ok((observer, mount))) => {
-                observers.push(observer);
-                observation_mounts.push(mount);
+            ObservationMountRequirementV1::Required
+        } else {
+            ObservationMountRequirementV1::Optional
+        };
+        let history_mount = Arc::new(
+            super::retained_owner::provider_history::ProviderHistoryAuthorityMountV1::default(),
+        );
+        let admission_authority: Arc<
+            dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority,
+        > = history_mount.clone();
+        let constructed: Result<(ProviderRegistrationV1, ConfiguredObservationProviderMountV1)> = match kind {
+            MemoryProviderKindV1::Native => async {
+                let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(cg)));
+                let provider_state_root = cg.store_layout().data_root
+                    .join(super::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME);
+                let port = super::retained_owner::native_provider::project_native_memory_application_port_with_authority_off_runtime(
+                    graph_cell, canonical_project_path.to_path_buf(), profile_id.clone(), provider_state_root, Arc::clone(&admission_authority),
+                ).await.map_err(|error| TraceDecayError::Config {
+                    message: format!("could not construct project Native application port: {error}"),
+                })?;
+                #[cfg(test)]
+                let port = match &native_port_interposition {
+                    Some(interpose) => interpose(port), None => port,
+                };
+                let provider = Arc::new(NativeProvider::new(port).map_err(|error| TraceDecayError::Config { message: error.to_string() })?);
+                let registration = ProviderRegistrationV1 {
+                    provider_id: OwnedProviderId::new(kind.provider_id()).map_err(|error| TraceDecayError::Config { message: error.to_string() })?,
+                    provider, registration_revision: PROJECT_NATIVE_REGISTRATION_REVISION, mode,
+                    execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(NATIVE_RECALL_SCOPE_BINDINGS.iter().copied()).map_err(|error| TraceDecayError::Config { message: error.to_string() })?,
+                    lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                };
+                Ok((
+                    registration,
+                    ConfiguredObservationProviderMountV1 {
+                        mount: native_observation_mount(
+                            &cg.store_layout().data_root,
+                            PROJECT_NATIVE_REGISTRATION_REVISION,
+                        )?,
+                        requirement,
+                        activation: if requirement == ObservationMountRequirementV1::Required {
+                            ObservationMountActivationV1::BeforePublication
+                        } else {
+                            ObservationMountActivationV1::AfterPublication
+                        },
+                    },
+                ))
+            }.await,
+            MemoryProviderKindV1::Ncm => {
+                let tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Enabled { worker_binary, state_root } = ncm_observer else {
+                    return Err(TraceDecayError::Config { message: "selected NCM participation is disabled".to_owned() });
+                };
+                let (worker_binary, state_root, owners, profile_id) = (
+                    worker_binary.clone(), state_root.clone(), Arc::clone(ncm_worker_owner), profile_id.clone(),
+                );
+                match tokio::task::spawn_blocking(move || {
+                    ncm_observer::construct_ncm_registration_with_authority(&owners, &profile_id, worker_binary, state_root, PROJECT_NCM_REGISTRATION_REVISION, mode, Some(admission_authority))
+                }).await {
+                    Ok(result) => result.map(|(registration, mount)| (
+                        registration,
+                        ConfiguredObservationProviderMountV1 {
+                            mount,
+                            requirement,
+                            // Worker bootstrap must wait for registered host ingestion,
+                            // including when this provider is required for active recall.
+                            activation: ObservationMountActivationV1::AfterPublication,
+                        },
+                    )).map_err(|error| TraceDecayError::Config {
+                        message: error.to_string(),
+                    }),
+                    Err(error) => Err(TraceDecayError::Config { message: format!("NCM construction task unavailable: {error}") }),
+                }
             }
-            Ok(Err(error)) => {
-                tracing::warn!(error = %error, "NCM observer unavailable before registration")
+        };
+        match constructed {
+            Ok((registration, mount)) => {
+                if mode == EnabledProviderMode::Active {
+                    selected = Some(registration)
+                } else {
+                    observers.push(registration)
+                }
+                observation_mounts.push((mount, history_mount));
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "NCM observer construction task unavailable")
+            Err(error) if requirement == ObservationMountRequirementV1::Optional => {
+                tracing::warn!(provider = kind.provider_id(), error = %error, "optional memory observer unavailable before registration");
             }
+            Err(error) => return Err(error),
         }
     }
-    let activation = match enabled_mode {
-        None => tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
-        Some(mode) => {
-            let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(cg)));
-            // The host-granted root every supervised provider's state lives
-            // under, in the canonical store layout — the same root the
-            // observation journey grants the provider namespace from. The
-            // Native staged-observation store is opened beneath it, so the
-            // provider never names a path outside its granted namespace.
-            let provider_state_root = cg
-                .store_layout()
-                .data_root
-                .join(super::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME);
-            let port = super::retained_owner::native_provider::
-                project_native_memory_application_port_off_runtime(
-                    graph_cell,
-                    canonical_project_path.to_path_buf(),
-                    // The adapter attests the daemon's own profile on every
-                    // candidate; it is fixed at mount, never read from a call.
-                    profile_id.clone(),
-                    provider_state_root,
-                )
-                .await
-                .map_err(|error| TraceDecayError::Config {
-                    message: format!(
-                        "could not construct project Native application port: {error}"
-                    ),
-                })?;
-            // The production port above is what a caller-owned interposition
-            // is handed; without one the injected value is that port itself,
-            // byte for byte the production mount.
-            #[cfg(test)]
-            let port = match native_port_interposition {
-                Some(interpose) => interpose(port),
-                None => port,
-            };
-            tracedecay_memory_provider_registry::NativeProviderActivation::Enabled {
-                fabric_config: tracedecay_memory_provider_registry::FabricConfig {
-                    max_registered_providers: 1 + observers.len(),
-                    max_in_flight: PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT,
-                },
-                port,
-                registration_revision: PROJECT_NATIVE_REGISTRATION_REVISION,
-                mode,
-            }
-        }
+    let fabric_config = FabricConfig {
+        max_registered_providers: observers.len() + usize::from(selected.is_some()),
+        max_in_flight: PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT,
     };
-    let composition =
-        tracedecay_memory_provider_registry::ProjectMemoryProviderComposition::compose_with_observers(activation, observers)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("could not compose project memory-provider host: {error}"),
-            })?;
+    let activation = match selected {
+        Some(registration) => SelectedProviderActivationV1::Injected {
+            fabric_config,
+            registration,
+        },
+        None => SelectedProviderActivationV1::ObserversOnly { fabric_config },
+    };
+    let composition = ProjectMemoryProviderComposition::compose_registered(activation, observers)
+        .map_err(|error| TraceDecayError::Config {
+        message: format!("could not compose project memory-provider host: {error}"),
+    })?;
     Ok((Arc::new(composition), observation_mounts))
 }
 
@@ -838,7 +819,12 @@ pub(super) async fn production_project_server_with_activation(
         })
         .await
         {
-            Ok(PublishedFullServer { server, session_db }) => {
+            Ok(PublishedFullServer {
+                server,
+                session_db,
+                #[cfg(feature = "memory-provider-host")]
+                deferred_observation_journeys,
+            }) => {
                 match Box::pin(inputs.finish_full_server(
                     &opened,
                     &core,
@@ -846,6 +832,8 @@ pub(super) async fn production_project_server_with_activation(
                     &resolved,
                     &server,
                     session_db,
+                    #[cfg(feature = "memory-provider-host")]
+                    deferred_observation_journeys,
                 ))
                 .await
                 {
@@ -1006,8 +994,7 @@ struct ComposedCoreServer {
     #[cfg(feature = "memory-provider-host")]
     memory_provider_host_mount: crate::mcp::server::MemoryProviderHostMount,
     #[cfg(feature = "memory-provider-host")]
-    observation_provider_mounts:
-        Vec<tracedecay_memory_provider_registry::ObservationProviderMountV1>,
+    observation_provider_mounts: Vec<ProjectObservationMountWithHistoryV1>,
     #[cfg(feature = "memory-provider-host")]
     cognitive_recall_mount: Option<crate::mcp::server::CognitiveRecallMount>,
     ports: ProjectRoutePorts,
@@ -1106,6 +1093,16 @@ struct AdmittedSessionDatabases {
 struct PublishedFullServer {
     server: Arc<crate::mcp::McpServer>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    #[cfg(feature = "memory-provider-host")]
+    deferred_observation_journeys: Vec<DeferredObservationJourneyV1>,
+}
+
+/// A dormant journey already retained by the published full server. Starting it
+/// never constructs another owner, and its required/optional policy is explicit.
+#[cfg(feature = "memory-provider-host")]
+struct DeferredObservationJourneyV1 {
+    journey: Arc<super::retained_owner::observation_journey::ProjectObservationJourneyV1>,
+    requirement: ObservationMountRequirementV1,
 }
 
 impl ProjectOpenInputs<'_> {
@@ -1373,13 +1370,28 @@ impl ProjectOpenInputs<'_> {
         // none, so an observer can never be selected for product output.
         #[cfg(feature = "memory-provider-host")]
         let cognitive_recall_mount = match (
-            memory_provider_host_mount.registry().is_some(),
+            memory_provider_host_mount.registry(),
             project_recall_routing_policy(
-                memory_provider_activation,
+                memory_provider_host_mount
+                    .registry()
+                    .and_then(|registry| registry.selected_registration())
+                    .filter(|registration| registration.mode == EnabledProviderMode::Active)
+                    .map(|registration| {
+                        (
+                            &registration.provider_id,
+                            registration.registration_revision,
+                        )
+                    }),
                 runtime_configuration.config(),
             )?,
         ) {
-            (true, Some(routing)) => {
+            (Some(registry), Some(routing)) => {
+                let selected_limits = registry
+                    .selected_registration()
+                    .ok_or_else(|| TraceDecayError::Config {
+                        message: "active recall has no selected registration".to_owned(),
+                    })?
+                    .limits;
                 let mount = super::retained_owner::cognitive_recall::mount_project_cognitive_recall(
                 super::retained_owner::cognitive_recall::CognitiveRecallMountInputsV1 {
                     composition: Arc::clone(&memory_provider_host_mount),
@@ -1394,7 +1406,7 @@ impl ProjectOpenInputs<'_> {
                     canonical_project_path: self.canonical_project_path.to_path_buf(),
                     graph: Arc::clone(cg),
                     routing,
-                    host_limits: super::retained_owner::native_provider::native_provider_limits(),
+                    host_limits: selected_limits,
                     // The host's own execution capability for synchronous
                     // provider work. Provider calls run on workers this
                     // process creates and accounts for, never on the shared
@@ -1840,9 +1852,27 @@ impl ProjectOpenInputs<'_> {
             )
             .await?;
         #[cfg(feature = "memory-provider-host")]
-        let observation_journey_mounts = {
+        let hook_origin_reader = Arc::new(
+            super::retained_owner::provider_history::HookOriginReaderV1::new(
+                cg.hook_store_layout().data_root.clone(),
+                core.profile_identity.brain_id().clone(),
+                core.profile_identity.profile_id().clone(),
+            ),
+        );
+        let original_provenance_resolver: Option<Arc<dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1>> = {
+            #[cfg(feature = "memory-provider-host")]
+            { Some(hook_origin_reader.clone()) }
+            #[cfg(not(feature = "memory-provider-host"))]
+            { None }
+        };
+        #[cfg(feature = "memory-provider-host")]
+        let (observation_journey_mounts, deferred_observation_journeys, control_journals) = {
             let mut journeys = Vec::with_capacity(core.observation_provider_mounts.len());
-            for (index, provider) in core.observation_provider_mounts.iter().enumerate() {
+            let mut deferred = Vec::new();
+            let mut control_journals = Vec::new();
+            for (configured, history_mount) in &core.observation_provider_mounts {
+                let provider = &configured.mount;
+                let required = configured.requirement == ObservationMountRequirementV1::Required;
                 let inputs = super::retained_owner::observation_journey::ObservationJourneyMountInputsV1 {
                         composition: Arc::clone(&core.memory_provider_host_mount),
                         profile_id: core.profile_identity.profile_id().clone(),
@@ -1852,36 +1882,174 @@ impl ProjectOpenInputs<'_> {
                         provider: provider.clone(),
                         policy: super::retained_owner::observation_journey::ObservationJourneyPolicyV1::project_default(),
                     };
-                let mounted = if index == 0 {
-                    Box::pin(
-                        super::retained_owner::observation_journey::mount_and_replay(
-                            inputs,
+                let mounted = async {
+                    use super::retained_owner::observation_journey::{
+                        ObservationJourneyError, activate_required_with_startup_replay,
+                        mount_observer_dormant,
+                    };
+                    use super::retained_owner::provider_history::{
+                        HistoryIdentityBridgeV1, MountedOriginalObservationAuthorityV1,
+                        ProviderHistoryAuthorityV1,
+                    };
+                    let journey = mount_observer_dormant(inputs, self.cancellation).await?;
+                    let original_authority = match HistoryIdentityBridgeV1::admit(
+                        self.canonical_project_path,
+                        core.profile_identity.profile_id(),
+                        &code_index.scope,
+                        &session_db.binding().shard_id,
+                    ) {
+                        Ok(bridge) => Some(Arc::new(MountedOriginalObservationAuthorityV1 {
+                            reader: Arc::clone(&hook_origin_reader), bridge: Arc::new(bridge),
+                        })),
+                        Err(error @ super::retained_owner::provider_history::ProviderHistoryErrorV1::Unavailable(
+                            "repository marker" | "current repository capture" | "canonical repository identity"
+                        )) => {
+                            tracing::debug!(provider = provider.provider_id.as_str(), error = %error, "provider history unavailable without original repository evidence");
+                            None
+                        }
+                        Err(error) => return Err(ObservationJourneyError::History(error)),
+                    };
+                    let authority = Arc::new(ProviderHistoryAuthorityV1 {
+                        mounted_scope: code_index.scope.clone(),
+                        profile_id: core.profile_identity.profile_id().clone(),
+                        registered_shard: session_db.binding().shard_id.clone(),
+                        observations: Arc::new(session_db.observation_store()),
+                        dispositions: Arc::new(cg.db().clone()),
+                        original_authority,
+                        journal: journey.history_journal(),
+                        provider_id: provider.provider_id.clone(),
+                        policy_revision: 1,
+                        runtime: tokio::runtime::Handle::current(),
+                    });
+                    authority.validate_mount()?;
+                    history_mount.bind(authority.clone())?;
+                    journey.bind_history_authority(authority.clone())?;
+                    if let Some(recall) = core.cognitive_recall_mount.as_ref().filter(|recall| {
+                        recall.routing().active_provider() == &provider.provider_id
+                    }) {
+                        recall.bind_selected_history(authority, Arc::clone(&journey))?;
+                    }
+                    if configured.activation == ObservationMountActivationV1::BeforePublication {
+                        activate_required_with_startup_replay(
+                            journey,
                             session_db.observation_store(),
                             self.cancellation,
-                        ),
-                    )
-                    .await
-                } else {
-                    Box::pin(
-                        super::retained_owner::observation_journey::mount_observer_dormant(
-                            inputs,
-                            self.cancellation,
-                        ),
-                    )
-                    .await
-                };
+                        )
+                        .await
+                    } else {
+                        Ok::<_, ObservationJourneyError>(journey)
+                    }
+                }
+                .await;
                 match mounted {
-                    Ok(journey) => journeys.push(journey),
+                    Ok(journey) => {
+                        if configured.activation == ObservationMountActivationV1::AfterPublication {
+                            deferred.push(DeferredObservationJourneyV1 {
+                                journey: Arc::clone(&journey),
+                                requirement: configured.requirement,
+                            });
+                        }
+                        control_journals.push((provider.provider_id.clone(), journey.history_journal()));
+                        journeys.push(journey);
+                    },
                     Err(super::retained_owner::observation_journey::ObservationJourneyError::Cancelled { .. }) => {
                         return Err(project_open_cancellation_error());
                     }
-                    Err(error) if index == 0 => return Err(TraceDecayError::Config {
+                    Err(error) if required => return Err(TraceDecayError::Config {
                         message: format!("could not mount project observation journey: {error}"),
                     }),
                     Err(error) => tracing::warn!(provider = provider.provider_id.as_str(), error = %error, "observer journey unavailable"),
                 }
             }
-            journeys
+            (journeys, deferred, control_journals)
+        };
+        #[cfg(feature = "memory-provider-host")]
+        let provider_control_mount = {
+            use super::retained_owner::provider_control::{
+                ProviderControlMountInputsV1,
+                authority::{ProviderControlAuthorityInputsV1, ProviderControlAuthorityV1},
+                project_provider_control_port,
+            };
+            use tracedecay_memory_provider_registry::{CancellationToken, OperationControl};
+
+            // This is a cooperative admission budget, not a hard bound on the
+            // synchronous filesystem, identity, or existing schema open work.
+            // Keep ownership and always join the one blocking task.
+            let now = tracedecay_contracts::now_micros().0;
+            let control = OperationControl::new(
+                now.saturating_add(1_000_000),
+                1_000,
+                CancellationToken::new(),
+            );
+            let inputs = ProviderControlAuthorityInputsV1 {
+                canonical_project_path: self.canonical_project_path.to_path_buf(),
+                profile_id: core.profile_identity.profile_id().clone(),
+                mounted_scope: code_index.scope.clone(),
+                session_db: session_db.clone(),
+                dispositions: Arc::new(cg.db().clone()),
+                hook_origin_reader: Arc::clone(&hook_origin_reader),
+                store_data_root: cg.store_layout().data_root.clone(),
+                live_ledger: core
+                    .cognitive_recall_mount
+                    .as_ref()
+                    .map(|mount| mount.control_ledger()),
+                live_journals: control_journals,
+                runtime: tokio::runtime::Handle::current(),
+            };
+            let blocking_control = control.clone();
+            let mut work = tokio::task::spawn_blocking(move || {
+                ProviderControlAuthorityV1::from_mounted_data(inputs, &blocking_control)
+            });
+            let joined = tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => {
+                    control.cancellation().cancel();
+                    let _ = work.await;
+                    return Err(project_open_cancellation_error());
+                }
+                joined = &mut work => joined,
+            };
+            project_open_cancellation_checkpoint(self.cancellation)?;
+            let authority = if control.snapshot().is_err() {
+                tracing::debug!(
+                    cause = "admission_budget",
+                    "provider source controls unavailable"
+                );
+                None
+            } else {
+                match joined {
+                    Ok(Ok(authority)) => Some(Arc::new(authority)),
+                    Ok(Err(_)) => {
+                        tracing::debug!(
+                            cause = "retained_authority",
+                            "provider source controls unavailable"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            cause = "mount_task",
+                            "provider source controls unavailable"
+                        );
+                        None
+                    }
+                }
+            };
+            project_provider_control_port(ProviderControlMountInputsV1 {
+                authority,
+                composition: Arc::clone(&core.memory_provider_host_mount),
+                journeys: observation_journey_mounts.clone(),
+                profile_id: core.profile_identity.profile_id().clone(),
+                mounted_scope: code_index.scope.clone(),
+                authoritative_project_id: code_index.project_id.clone(),
+                project_root: self.canonical_project_path.to_path_buf(),
+                configuration_digest: runtime_configuration
+                    .snapshot()
+                    .effective_behavior_digest
+                    .clone(),
+                canonical_session_db: session_db.clone(),
+                canonical_dispositions: Arc::new(cg.db().clone()),
+            })
         };
         self.invocation
             .service
@@ -1931,15 +2099,18 @@ impl ProjectOpenInputs<'_> {
             .ensure_project_with_history(
                 key.owner.clone(),
                 session_db.clone(),
-                Arc::new(ProjectSessionHistoricalIngestor::new(
-                    session_db.clone(),
-                    Arc::new(core.profile_identity.clone()),
-                    self.canonical_project_path.to_path_buf(),
-                    code_index.project_id.clone(),
-                    core.transcript_source_home.clone(),
-                    refresh_schedulers.codex_discovery(),
-                    Arc::clone(&background_cpu),
-                )),
+                Arc::new(
+                    ProjectSessionHistoricalIngestor::new(
+                        session_db.clone(),
+                        Arc::new(core.profile_identity.clone()),
+                        self.canonical_project_path.to_path_buf(),
+                        code_index.project_id.clone(),
+                        core.transcript_source_home.clone(),
+                        refresh_schedulers.codex_discovery(),
+                        Arc::clone(&background_cpu),
+                    )
+                    .with_original_provenance_resolver(original_provenance_resolver.clone()),
+                ),
             )
             .await;
         let user_session_refresh_wake = refresh_schedulers
@@ -1958,22 +2129,25 @@ impl ProjectOpenInputs<'_> {
             .await;
         let session_sync_owner = self.store_administration.session_sync_service();
         session_sync_owner
-            .register_project(DaemonSessionSyncConfig {
-                brain_id: core.profile_identity.brain_id().clone(),
-                profile_id: core.profile_identity.profile_id().clone(),
-                project_id: code_index.project_id.clone(),
-                profile_root: core.profile_identity.profile_root().to_path_buf(),
-                project_root: self.canonical_project_path.to_path_buf(),
-                scope: code_index.scope.clone(),
-                transcript_source_home: core.transcript_source_home.clone(),
-                project_sessions: session_db.clone(),
-                user_sessions: user_session_db.clone(),
-                registry: core.registered_profile_db.clone(),
-                background_cpu: Arc::clone(&background_cpu),
-                startup_import: cg.get_config().sync.session_start_sync,
-                project_refresh: project_session_refresh_wake.clone(),
-                user_refresh: user_session_refresh_wake.clone(),
-            })
+            .register_project_with_original_provenance(
+                DaemonSessionSyncConfig {
+                    brain_id: core.profile_identity.brain_id().clone(),
+                    profile_id: core.profile_identity.profile_id().clone(),
+                    project_id: code_index.project_id.clone(),
+                    profile_root: core.profile_identity.profile_root().to_path_buf(),
+                    project_root: self.canonical_project_path.to_path_buf(),
+                    scope: code_index.scope.clone(),
+                    transcript_source_home: core.transcript_source_home.clone(),
+                    project_sessions: session_db.clone(),
+                    user_sessions: user_session_db.clone(),
+                    registry: core.registered_profile_db.clone(),
+                    background_cpu: Arc::clone(&background_cpu),
+                    startup_import: cg.get_config().sync.session_start_sync,
+                    project_refresh: project_session_refresh_wake.clone(),
+                    user_refresh: user_session_refresh_wake.clone(),
+                },
+                original_provenance_resolver.clone(),
+            )
             .await?;
         let session_sync_port: Arc<dyn tracedecay_contracts::session_sync::SessionSyncServicePort> =
             session_sync_owner;
@@ -2068,7 +2242,8 @@ impl ProjectOpenInputs<'_> {
             .iter()
             .fold(full_context, |context, journey| {
                 context.with_observation_journey_mount(Arc::clone(journey))
-            });
+            })
+            .with_provider_control_mount(provider_control_mount);
         let full_construction_started = Instant::now();
         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
         full_candidate
@@ -2097,24 +2272,11 @@ impl ProjectOpenInputs<'_> {
                 message: "project server changed during session capability upgrade".to_owned(),
             });
         }
-        // Optional provider bootstrap may contend for CPU and storage. Start
-        // it only after the full server can answer registered host ingestion.
-        #[cfg(feature = "memory-provider-host")]
-        for journey in observation_journey_mounts.iter().skip(1) {
-            if let Err(error) =
-                journey.start_observer_with_live_replay(session_db.observation_store())
-            {
-                tracing::warn!(
-                    event = "memory_observation_optional_start_failed",
-                    error = ?error,
-                    journal = %journey.journal_path().display(),
-                    "optional observer could not start after Native host publication"
-                );
-            }
-        }
         Ok(PublishedFullServer {
             server: full_candidate,
             session_db,
+            #[cfg(feature = "memory-provider-host")]
+            deferred_observation_journeys,
         })
     }
 
@@ -2237,8 +2399,36 @@ impl ProjectOpenInputs<'_> {
         resolved: &Arc<crate::mcp::McpServer>,
         full_server: &Arc<crate::mcp::McpServer>,
         session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+        #[cfg(feature = "memory-provider-host")] deferred_observation_journeys: Vec<
+            DeferredObservationJourneyV1,
+        >,
     ) -> Result<()> {
         self.log_phase("session_capabilities_published", None, self.started);
+        // Bootstrap only journeys that were explicitly mounted dormant. The
+        // full server is now reachable for registered host ingestion. A required
+        // start failure returns through the existing published-server failure
+        // funnel; its identity is retained for rollback and tracked retirement.
+        #[cfg(feature = "memory-provider-host")]
+        for deferred in deferred_observation_journeys {
+            if let Err(error) = deferred
+                .journey
+                .start_observer_with_live_replay(session_db.observation_store())
+            {
+                if deferred.requirement == ObservationMountRequirementV1::Required {
+                    return Err(TraceDecayError::Config {
+                        message: format!(
+                            "required memory observation activation failed after full publication: {error}"
+                        ),
+                    });
+                }
+                tracing::warn!(
+                    event = "memory_observation_optional_start_failed",
+                    error = ?error,
+                    journal = %deferred.journey.journal_path().display(),
+                    "optional observer could not start after full host publication"
+                );
+            }
+        }
         Box::pin(self.mount_full_server_owners(opened, core, full_server.as_ref(), session_db))
             .await?;
         if *core.current_key.lock().await != opened.key {
@@ -2816,7 +3006,7 @@ mod memory_provider_routing_tests {
         MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
     };
 
-    use super::{ProjectMemoryProviderActivation, resolve_memory_provider_activation};
+    use super::resolve_memory_provider_activation;
 
     fn config(native_enabled: bool, active_provider: Option<&str>) -> TraceDecayConfig {
         let mut config = TraceDecayConfig::default();
@@ -2829,48 +3019,55 @@ mod memory_provider_routing_tests {
         config
     }
 
+    #[cfg(feature = "memory-provider-host")]
     #[test]
-    fn ncm_observer_cannot_enable_an_orphan_host_or_select_active_recall() {
+    fn ncm_participates_and_selects_active_without_native_advisory() {
+        use tracedecay_domain::configuration::{
+            MemoryProviderKindV1, MemoryProviderNcmObserverV1, MemoryProviderParticipationV1,
+        };
         let mut selected = config(false, None);
-        selected.memory_provider_ncm_observer =
-            tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Enabled {
-                worker_binary: std::path::PathBuf::from("/opt/tracedecay/tracedecay-ncm-worker"),
-                state_root: std::path::PathBuf::from("/var/lib/tracedecay/ncm"),
-            };
-        assert!(matches!(
-            resolve_memory_provider_activation(&selected),
-            Err(super::TraceDecayError::Config { .. })
-        ));
-        selected.memory_provider_native_enabled = true;
-        assert_eq!(
-            resolve_memory_provider_activation(&selected).unwrap(),
-            ProjectMemoryProviderActivation::NativeObserver
-        );
+        selected.memory_provider_ncm_observer = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: std::path::PathBuf::from("/opt/tracedecay/tracedecay-ncm-worker"),
+            state_root: std::path::PathBuf::from("/var/lib/tracedecay/ncm"),
+        };
+        let observer = resolve_memory_provider_activation(&selected).unwrap();
+        assert_eq!(observer.native, MemoryProviderParticipationV1::Disabled);
+        assert_eq!(observer.ncm, MemoryProviderParticipationV1::Observer);
+        assert_eq!(observer.active_provider(), None);
         selected.memory_provider_recall_routing.active_provider = Some("ncm".to_owned());
-        assert!(resolve_memory_provider_activation(&selected).is_err());
+        assert_eq!(
+            resolve_memory_provider_activation(&selected)
+                .unwrap()
+                .active_provider(),
+            Some(MemoryProviderKindV1::Ncm)
+        );
     }
 
     #[test]
-    fn host_boolean_alone_selects_observer_never_active() {
-        assert_eq!(
-            resolve_memory_provider_activation(&config(false, None)).unwrap(),
-            ProjectMemoryProviderActivation::Disabled
+    fn default_configuration_constructs_no_provider() {
+        assert!(
+            resolve_memory_provider_activation(&config(false, None))
+                .unwrap()
+                .is_disabled()
         );
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    #[test]
+    fn native_boolean_alone_selects_observer_never_active() {
+        let selection = resolve_memory_provider_activation(&config(true, None)).unwrap();
         assert_eq!(
-            resolve_memory_provider_activation(&config(true, None)).unwrap(),
-            ProjectMemoryProviderActivation::NativeObserver
+            selection.native,
+            tracedecay_domain::configuration::MemoryProviderParticipationV1::Observer
         );
+        assert_eq!(selection.active_provider(), None);
     }
 
     #[test]
     fn active_provider_without_the_host_is_a_typed_configuration_error() {
         let error = resolve_memory_provider_activation(&config(false, Some("tracedecay.native")))
             .expect_err("an active provider needs the host");
-        assert!(
-            error
-                .to_string()
-                .contains("memory provider host is disabled")
-        );
+        assert!(error.to_string().contains("is disabled"));
     }
 
     #[cfg(feature = "memory-provider-host")]
@@ -2885,8 +3082,14 @@ mod memory_provider_routing_tests {
 
         let mut config = config(true, Some(NATIVE_PROVIDER_ID));
         let activation = resolve_memory_provider_activation(&config).unwrap();
-        assert_eq!(activation, ProjectMemoryProviderActivation::NativeActive);
-        let policy = project_recall_routing_policy(activation, &config)
+        assert_eq!(
+            activation.active_provider(),
+            Some(tracedecay_domain::configuration::MemoryProviderKindV1::Native)
+        );
+        let provider_id =
+            tracedecay_memory_provider_registry::OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap();
+        let selected = Some((&provider_id, PROJECT_NATIVE_REGISTRATION_REVISION));
+        let policy = project_recall_routing_policy(selected, &config)
             .unwrap()
             .expect("active composition has a routing policy");
         assert_eq!(policy.active_provider().as_str(), NATIVE_PROVIDER_ID);
@@ -2923,7 +3126,7 @@ mod memory_provider_routing_tests {
                 policy_revision: 5,
                 allowed_causes: vec![MemoryProviderRecallDegradationCauseV1::Unavailable],
             });
-        let configured = project_recall_routing_policy(activation, &config)
+        let configured = project_recall_routing_policy(selected, &config)
             .unwrap()
             .expect("active composition carries explicit degradation policy");
         assert!(matches!(
@@ -2943,12 +3146,12 @@ mod memory_provider_routing_tests {
 
         // Observer and disabled activations have no route at all.
         assert!(
-            project_recall_routing_policy(ProjectMemoryProviderActivation::NativeObserver, &config)
+            project_recall_routing_policy(None, &config)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            project_recall_routing_policy(ProjectMemoryProviderActivation::Disabled, &config)
+            project_recall_routing_policy(None, &config)
                 .unwrap()
                 .is_none()
         );
@@ -2962,7 +3165,7 @@ mod memory_provider_routing_tests {
             policy_revision: 7,
             target_provider: unregistrable_target.to_owned(),
         });
-        let error = project_recall_routing_policy(activation, &config)
+        let error = project_recall_routing_policy(selected, &config)
             .expect_err("a fallback target this composition cannot register is refused");
         let message = error.to_string();
         assert!(message.contains(unregistrable_target), "{message}");
@@ -2976,6 +3179,6 @@ mod memory_provider_routing_tests {
         let error =
             resolve_memory_provider_activation(&self::config(true, Some("provider.ncm-local")))
                 .expect_err("unknown active provider");
-        assert!(error.to_string().contains("cannot mount"));
+        assert!(error.to_string().contains("is unknown"));
     }
 }

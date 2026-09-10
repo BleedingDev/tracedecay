@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 TOP_LEVEL = {
+    "common_source_attribution",
     "schema_version",
     "contract_id",
     "bead_id",
@@ -409,6 +410,7 @@ def validate_envelope(contract: dict[str, Any], errors: list[str]) -> None:
         "maximum_payload_bytes",
         "unknown_field_policy",
         "empty_payload_allowed",
+        "common_profile_optional_fields",
     }
     exact_keys(envelope, keys, "observation_envelope", errors)
     if envelope.get("type_name") != "MemoryProviderObservationEnvelopeV1":
@@ -444,6 +446,7 @@ def validate_source_and_kinds(contract: dict[str, Any], errors: list[str]) -> No
         "canonical_settlement_receipt_required",
         "unsettled_source_policy",
         "path_is_source_identity",
+        "common_profile_required_fields",
     }
     exact_keys(source, keys, "source_identity", errors)
     if source.get("type_name") != "MemoryProviderObservationSourceIdentityV1":
@@ -1121,6 +1124,9 @@ def validate(
     validate_batch_and_receipt(contract, errors)
     validate_admission_and_observer(contract, errors)
     validate_invariants_and_beads(contract, ids, errors)
+    common = contract.get("common_source_attribution")
+    if not isinstance(common, dict) or schema.get("properties", {}).get("common_source_attribution", {}).get("const") != common:
+        errors.append("common_source_attribution must match its canonical schema semantics")
     validate_schema(schema, errors)
     validate_doc(doc, errors)
     validate_dependencies(repo, errors)

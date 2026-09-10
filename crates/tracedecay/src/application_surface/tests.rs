@@ -2019,3 +2019,59 @@ fn legacy_diagnostics_name_routes_to_canonical_read_surface() {
         })
     );
 }
+
+#[tokio::test]
+async fn http_context_rejects_supplied_identity_for_reads_and_noncanonical_routes() {
+    let paths = [
+        "/retained/provider_health",
+        "/retained/provider_inspection",
+        "/retained/provider_snapshot_export",
+        "/retained/provider_unknown",
+        "/retained/provider_feedback/extra",
+        "/retained/provider_feedback/",
+        "/retained/fact_store_add",
+        "/tests/results",
+    ];
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut app = axum::Router::new();
+    for path in paths {
+        let calls = Arc::clone(&calls);
+        app = app.route(
+            path,
+            axum::routing::post(move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+    }
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        HttpCancellationRegistry::default(),
+        application_http_context,
+    ));
+    for path in paths {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(
+                        tracedecay_contracts::APPLICATION_REQUEST_ID_HEADER,
+                        "request.sdk.provider.disallowed",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body: Value = serde_json::from_str(&response_text(response).await).expect("problem");
+        assert_eq!(body["value"]["problem"]["kind"], "invalid_request");
+        assert_ne!(
+            body["value"]["request_id"],
+            "request.sdk.provider.disallowed"
+        );
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+}

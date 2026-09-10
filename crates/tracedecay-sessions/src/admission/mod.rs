@@ -883,6 +883,24 @@ pub(crate) mod test_support {
         }
 
         #[hotpath::skip]
+        async fn recent_observation_window(
+            &self,
+            request: tracedecay_store::ObservationRecentWindowRequest,
+        ) -> ObservationStoreResult<Option<tracedecay_store::ObservationRecentWindowV1>> {
+            let sequences: Vec<_> = self
+                .state()
+                .observations
+                .iter()
+                .rev()
+                .take(request.limit() + 1)
+                .map(StoredObservation::sequence)
+                .collect();
+            tracedecay_store::ObservationRecentWindowV1::from_descending_sequences(
+                request, &sequences,
+            )
+        }
+
+        #[hotpath::skip]
         async fn replay_observations(
             &self,
             request: ObservationReplayRequest,

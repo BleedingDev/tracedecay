@@ -38,7 +38,10 @@
     "maximum_envelope_bytes": 4194304,
     "maximum_payload_bytes": 3145728,
     "unknown_field_policy": "reject_contract_violation",
-    "empty_payload_allowed": false
+    "empty_payload_allowed": false,
+    "common_profile_optional_fields": [
+      "history_grant"
+    ]
   },
   "source_identity": {
     "type_name": "MemoryProviderObservationSourceIdentityV1",
@@ -64,7 +67,10 @@
     "source_event_revision_minimum": 0,
     "canonical_settlement_receipt_required": true,
     "unsettled_source_policy": "reject_not_canonically_settled",
-    "path_is_source_identity": false
+    "path_is_source_identity": false,
+    "common_profile_required_fields": [
+      "original_source"
+    ]
   },
   "observation_kinds": [
     {
@@ -385,5 +391,119 @@
     "tdmem-0506",
     "tdmem-0703",
     "tdmem-0903"
-  ]
+  ],
+  "common_source_attribution": {
+    "carried_in": "source_identity.original_source",
+    "required_for_profile": "memory.advisory_common.v1",
+    "required_fields": [
+      "source",
+      "origin_scope",
+      "source_sequence",
+      "occurred_at",
+      "ingested_at",
+      "validity"
+    ],
+    "nullable_fields": [
+      "source.stable_record_id",
+      "source.source_revision",
+      "occurred_at"
+    ],
+    "source_revision_semantics": "actual_source_content_revision_never_envelope_schema_version",
+    "unknown_revision_semantics": "null_never_fabricated_zero_or_envelope_version",
+    "origin_scope_states": [
+      "recorded",
+      "ingestion_only",
+      "unavailable"
+    ],
+    "history_requires_recorded_origin_scope": true,
+    "occurrence_proves_validity": false,
+    "source_sequence_is_time": false,
+    "ingestion_scope_proves_original_scope": false,
+    "history_grant_fields": [
+      "authorization_ref",
+      "policy_revision",
+      "destination_scope",
+      "relation",
+      "sources",
+      "disposition_checkpoint"
+    ],
+    "history_relations": [
+      "exact_scope",
+      "same_checkout"
+    ],
+    "history_source_fields": [
+      "attribution",
+      "current_disposition"
+    ],
+    "source_disposition_states": [
+      "available",
+      "superseded",
+      "revoked",
+      "deleted",
+      "redacted",
+      "expired",
+      "unknown"
+    ],
+    "grant_construction_proves_authorization": false,
+    "identity_bridge_authority": "existing_host_project_marker_and_observation_provenance_ports",
+    "privacy_authority": "current_canonical_source_disposition_and_provider_specific_host_journal_fence",
+    "privacy_dominates_all_temporal_modes": true,
+    "source_identity_fields": [
+      "canonical_provider_id",
+      "canonical_session_id",
+      "source_key",
+      "stable_record_id",
+      "observation_id",
+      "source_revision",
+      "content_sha256"
+    ],
+    "source_revision_type": "opaque_string_or_null",
+    "history_grant_carried_in": [
+      "observation_envelope.history_grant",
+      "recall_request.history_grant",
+      "replay.history_grant"
+    ],
+    "history_grant_absent_semantics": "no_cross_session_authorization",
+    "candidate_attribution_carried_in": "provider_candidate.provenance.original_sources",
+    "structured_evidence_projection": {
+      "session.message_committed.v1": {
+        "policy": "existing_canonical_session_message_projection"
+      },
+      "source.edit_settled.v1": {
+        "fields_in_order": [
+          "claim",
+          "status",
+          "assertion",
+          "reason"
+        ]
+      },
+      "test.execution_settled.v1": {
+        "fields_in_order": [
+          "assertion",
+          "status",
+          "approach",
+          "outcome",
+          "reason"
+        ]
+      },
+      "feedback.outcome_settled.v1": {
+        "fields_in_order": [
+          "approach",
+          "outcome",
+          "signal",
+          "reason",
+          "claim",
+          "status"
+        ]
+      },
+      "maximum_field_bytes": 8192,
+      "maximum_projected_content_bytes": 32768,
+      "field_value_type": "nonempty_string",
+      "projection": "field_name_colon_space_value_joined_with_newline",
+      "non_string_selected_field_policy": "reject_invalid_payload",
+      "no_supported_evidence_policy": "reject_invalid_payload",
+      "unknown_fields": "retained_in_canonical_payload_but_never_projected_as_message",
+      "canonical_payload_is_immutable": true
+    }
+  }
 }

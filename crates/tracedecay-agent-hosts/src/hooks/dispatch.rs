@@ -188,6 +188,7 @@ struct NativeIdentityFields {
     #[serde(alias = "sessionID")]
     session_id: Option<String>,
     conversation_id: Option<String>,
+    transcript_path: Option<String>,
     generation_id: Option<String>,
     #[serde(alias = "filePath")]
     file_path: Option<String>,
@@ -260,6 +261,45 @@ struct NativeIdentityRoute {
 #[derive(Default, Deserialize)]
 struct NativeIdentityReceipt {
     tool_call_id: Option<String>,
+}
+
+/// Private native Start locator. The path locates a candidate only; the daemon
+/// validates the actual file and registered project before retaining a boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSessionStartLocatorV1 {
+    pub session_id: SessionId,
+    pub event_id: [u8; 16],
+    pub transcript_path: std::path::PathBuf,
+}
+
+impl NativeSessionStartLocatorV1 {
+    pub fn matches_envelope(&self, envelope: &HookEventEnvelopeV2) -> bool {
+        envelope.producer == HookHostV1::ClaudeCode
+            && matches!(
+                envelope.event,
+                tracedecay_hooks::HookEventV2::SessionBoundary {
+                    boundary: tracedecay_hooks::HookBoundaryV1::Start
+                }
+            )
+            && protected_session_id_for_native(self.session_id.as_str())
+                == envelope.protected_session_id
+            && self.event_id == envelope.event_id
+            && self.transcript_path.is_absolute()
+            && self.transcript_path.as_os_str().len() <= 4096
+    }
+}
+
+fn native_session_start_locator(
+    fields: &NativeIdentityFields,
+    envelope: &HookEventEnvelopeV2,
+) -> Option<NativeSessionStartLocatorV1> {
+    let locator = NativeSessionStartLocatorV1 {
+        session_id: SessionId::new(fields.session_id()?.to_owned()).ok()?,
+        event_id: envelope.event_id,
+        transcript_path: fields.transcript_path.as_deref()?.into(),
+    };
+    locator.matches_envelope(envelope).then_some(locator)
 }
 
 /// Provider-native lifecycle identity that may cross the local hook/daemon
@@ -424,37 +464,62 @@ pub(crate) async fn dispatch(
     telemetry: Option<&HookTimingSpan>,
     started: Instant,
 ) -> HookDispatch {
+    dispatch_with_required_work(
+        runtime,
+        host,
+        event_json,
+        project_root,
+        telemetry,
+        started,
+        async {},
+    )
+    .await
+    .0
+}
+
+async fn dispatch_with_required_work<T>(
+    runtime: &HookRuntimeV1,
+    host: HookHostV1,
+    event_json: &str,
+    project_root: &Path,
+    telemetry: Option<&HookTimingSpan>,
+    started: Instant,
+    required: impl std::future::Future<Output = T>,
+) -> (HookDispatch, T) {
     let decoded = match tracedecay_hooks::decode_native_hook_event(host, event_json.as_bytes()) {
         Ok(decoded) => decoded,
         Err(
             NativeHookDecodeError::UnsupportedNativeEvent
             | NativeHookDecodeError::UnsupportedNativeFamily,
         ) => {
-            return HookDispatch::NotApplicable;
+            return (HookDispatch::NotApplicable, required.await);
         }
-        Err(_) => return unavailable(),
+        Err(_) => return (unavailable(), required.await),
     };
     let Some(prepared) = prepare_bound_hook(host, event_json, project_root, decoded, started)
     else {
-        return unavailable();
+        return (unavailable(), required.await);
     };
     let native_session_id = prepared.native_session_id.clone();
     let native_lifecycle = prepared.native_lifecycle.clone();
+    let native_start_locator = prepared.native_start_locator.clone();
     let admission = DaemonAdmissionPort::new(
         runtime,
         project_root,
         native_session_id.as_deref(),
         native_lifecycle.as_ref(),
+        native_start_locator.as_ref(),
         telemetry,
     );
     let delivery = DaemonFeedbackNoticeDeliveryPort::new(runtime, project_root);
-    dispatch_decoded(
+    dispatch_decoded_with_required_work(
         runtime,
         prepared,
         project_root,
         started,
         &admission,
         &delivery,
+        required,
     )
     .await
 }
@@ -475,6 +540,38 @@ pub(crate) async fn dispatch_for_scope(
             dispatch(runtime, host, event_json, project_root, telemetry, started).await
         }
         None => dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await,
+    }
+}
+
+/// Admit the live event, then run required producer work before any optional
+/// guidance delivery can spend the remainder of the original hook deadline.
+pub(crate) async fn dispatch_for_scope_with_required_work<T>(
+    runtime: &HookRuntimeV1,
+    host: HookHostV1,
+    event_json: &str,
+    project_root: Option<&Path>,
+    telemetry: Option<&HookTimingSpan>,
+    started: Instant,
+    required: impl std::future::Future<Output = T>,
+) -> (HookDispatch, T) {
+    match project_root {
+        Some(project_root) => {
+            dispatch_with_required_work(
+                runtime,
+                host,
+                event_json,
+                project_root,
+                telemetry,
+                started,
+                required,
+            )
+            .await
+        }
+        None => {
+            let dispatched =
+                dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await;
+            (dispatched, required.await)
+        }
     }
 }
 
@@ -575,11 +672,13 @@ pub(crate) async fn dispatch_opencode_tool_after(
     };
     let native_session_id = prepared.native_session_id.clone();
     let native_lifecycle = prepared.native_lifecycle.clone();
+    let native_start_locator = prepared.native_start_locator.clone();
     let admission = DaemonAdmissionPort::new(
         runtime,
         project_root,
         native_session_id.as_deref(),
         native_lifecycle.as_ref(),
+        native_start_locator.as_ref(),
         telemetry,
     );
     let delivery = DaemonFeedbackNoticeDeliveryPort::new(runtime, project_root);
@@ -625,6 +724,7 @@ struct PreparedBoundHook {
     envelope: HookEventEnvelopeV2,
     native_session_id: Option<String>,
     native_lifecycle: Option<NativeContextScoutLifecycleV1>,
+    native_start_locator: Option<NativeSessionStartLocatorV1>,
     prepared_at: UtcMicros,
 }
 
@@ -656,6 +756,7 @@ fn prepare_bound_hook(
             PendingEnvelopeV1::Exact(queued) => queued,
             PendingEnvelopeV1::Unavailable => return None,
         };
+    let native_start_locator = native_session_start_locator(&native_fields, &envelope);
     Some(PreparedBoundHook {
         host,
         layout,
@@ -663,11 +764,11 @@ fn prepare_bound_hook(
         envelope,
         native_session_id,
         native_lifecycle,
+        native_start_locator,
         prepared_at: now,
     })
 }
 
-#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
 async fn dispatch_decoded(
     runtime: &HookRuntimeV1,
     prepared: PreparedBoundHook,
@@ -678,6 +779,31 @@ async fn dispatch_decoded(
         tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
     >,
 ) -> HookDispatch {
+    dispatch_decoded_with_required_work(
+        runtime,
+        prepared,
+        project_root,
+        started,
+        admission,
+        delivery,
+        async {},
+    )
+    .await
+    .0
+}
+
+#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
+async fn dispatch_decoded_with_required_work<T>(
+    runtime: &HookRuntimeV1,
+    prepared: PreparedBoundHook,
+    project_root: &Path,
+    started: Instant,
+    admission: &DaemonAdmissionPort<'_>,
+    delivery: &impl AsyncHookFeedbackDeliveryPortV1<
+        tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+    >,
+    required: impl std::future::Future<Output = T>,
+) -> (HookDispatch, T) {
     let PreparedBoundHook {
         host,
         layout,
@@ -700,6 +826,7 @@ async fn dispatch_decoded(
         },
         None => HookImmediateAdmissionV1::TimedOut,
     };
+    let required_result = required.await;
     let replay = match immediate {
         HookImmediateAdmissionV1::Accepted { .. } | HookImmediateAdmissionV1::CatchupRequired => {
             None
@@ -734,7 +861,7 @@ async fn dispatch_decoded(
     );
     let feedback_notice = admission.take_feedback_notice();
     let github_stack_signal_available = admission.take_github_stack_signal_available();
-    match completed {
+    let dispatched = match completed {
         Ok(result) => {
             let rollback = HookFeedbackRollbackSwitchV1 {
                 configuration_revision: snapshot.revision,
@@ -791,7 +918,8 @@ async fn dispatch_decoded(
             }
         }
         Err(_) => unavailable(),
-    }
+    };
+    (dispatched, required_result)
 }
 
 #[cfg(test)]
@@ -1054,3 +1182,245 @@ fn unavailable() -> HookDispatch {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod start_locator_tests {
+    use super::*;
+
+    fn start(session: &str) -> HookEventEnvelopeV2 {
+        HookEventEnvelopeV2 {
+            schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
+            event_id: [1; 16],
+            producer: HookHostV1::ClaudeCode,
+            protected_session_id: protected_session_id_for_native(session),
+            project_id: [2; 16],
+            repository_id: [3; 16],
+            worktree_id: [4; 16],
+            worktree_epoch: 1,
+            binding_token: [5; 32],
+            ordering: tracedecay_hooks::HookOrderingV1::Unknown,
+            observed_at: UtcMicros(1),
+            event: tracedecay_hooks::HookEventV2::SessionBoundary {
+                boundary: tracedecay_hooks::HookBoundaryV1::Start,
+            },
+        }
+    }
+
+    #[test]
+    fn private_start_locator_is_bound_to_native_session_event_and_host() {
+        let envelope = start("session-one");
+        let fields: NativeIdentityFields = serde_json::from_value(serde_json::json!({
+            "session_id": "session-one", "transcript_path": "/native/session-one.jsonl"
+        }))
+        .unwrap();
+        let locator = native_session_start_locator(&fields, &envelope).unwrap();
+        assert!(locator.matches_envelope(&envelope));
+        for changed in [
+            HookEventEnvelopeV2 {
+                producer: HookHostV1::Codex,
+                ..envelope.clone()
+            },
+            HookEventEnvelopeV2 {
+                event_id: [9; 16],
+                ..envelope.clone()
+            },
+            start("session-two"),
+            HookEventEnvelopeV2 {
+                event: tracedecay_hooks::HookEventV2::SessionBoundary {
+                    boundary: tracedecay_hooks::HookBoundaryV1::TurnComplete,
+                },
+                ..envelope.clone()
+            },
+        ] {
+            assert!(!locator.matches_envelope(&changed));
+        }
+        let encoded = serde_json::to_value(&locator).unwrap();
+        let decoded: NativeSessionStartLocatorV1 = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, locator);
+        let mut open = encoded;
+        open["authority"] = serde_json::json!("caller-claimed");
+        assert!(serde_json::from_value::<NativeSessionStartLocatorV1>(open).is_err());
+    }
+
+    #[test]
+    fn start_locator_rejects_missing_relative_and_oversized_paths() {
+        for path in [
+            None,
+            Some("relative/session-one.jsonl".to_owned()),
+            Some(format!("/{}", "x".repeat(4096))),
+        ] {
+            let fields: NativeIdentityFields = serde_json::from_value(serde_json::json!({
+                "session_id": "session-one", "transcript_path": path
+            }))
+            .unwrap();
+            assert!(native_session_start_locator(&fields, &start("session-one")).is_none());
+        }
+    }
+
+    struct SlowOptionalDelivery {
+        required_done: std::sync::atomic::AtomicBool,
+        delivery_attempted: std::sync::atomic::AtomicBool,
+    }
+
+    impl
+        AsyncHookFeedbackDeliveryPortV1<
+            tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+        > for SlowOptionalDelivery
+    {
+        fn deliver_hook_v2<'a>(
+            &'a self,
+            _envelope: &'a HookEventEnvelopeV2,
+            _feedback: &'a tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+            deadline: HookSynchronousDeadlineV1,
+        ) -> tracedecay_hooks::HookDeliveryFutureV1<'a> {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                assert!(
+                    self.required_done.load(Ordering::SeqCst),
+                    "optional delivery cannot precede required producer work"
+                );
+                self.delivery_attempted.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_micros(deadline.remaining_micros())).await;
+                tracedecay_hooks::HookFeedbackDeliveryOutcomeV1::Unavailable
+            })
+        }
+
+        fn deliver_legacy<'a>(
+            &'a self,
+            _envelope: &'a HookEventEnvelopeV2,
+            _feedback: &'a tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+            _deadline: HookSynchronousDeadlineV1,
+        ) -> tracedecay_hooks::HookDeliveryFutureV1<'a> {
+            Box::pin(async { tracedecay_hooks::HookFeedbackDeliveryOutcomeV1::Unavailable })
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_optional_delivery_cannot_starve_required_stop_enqueue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tracedecay_domain::feedback::{FeedbackCycleId, FeedbackResultId, FeedbackScopeV1};
+        use tracedecay_domain::{
+            CodeGenerationId, CommitId, ManifestDigest, RepositoryId, WorktreeId,
+        };
+
+        let project = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let runtime = crate::ports::hook_runtime::crate_test_runtime();
+        let layout = tracedecay_runtime_core::storage::default_profile_sharded_layout(
+            project.path(),
+            profile.path(),
+        )
+        .unwrap();
+        let notice = tracedecay_application::advisory::AdvisoryHookLookupNoticeV1 {
+            scope: FeedbackScopeV1 {
+                project_id: ProjectId::new("project.required-stop").unwrap(),
+                repository_id: RepositoryId::new("repository.required-stop").unwrap(),
+                worktree_id: WorktreeId::new("worktree.required-stop").unwrap(),
+                branch_ref: "refs/heads/main".to_owned(),
+                head_commit_id: CommitId::new("a".repeat(40)).unwrap(),
+            },
+            result_id: FeedbackResultId::new("result.required-stop").unwrap(),
+            cycle_id: FeedbackCycleId::new("cycle.required-stop").unwrap(),
+            generation_id: CodeGenerationId::new("generation.required-stop").unwrap(),
+            generation_digest: ManifestDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
+            returned_findings: 1,
+            omitted_findings: 0,
+        };
+        let now = now_utc();
+        let mut envelope = start("session-one");
+        envelope.producer = HookHostV1::Codex;
+        envelope.project_id = envelope_identity_hash16("project", notice.scope.project_id.as_str());
+        envelope.repository_id =
+            envelope_identity_hash16("repository", notice.scope.repository_id.as_str());
+        envelope.worktree_id =
+            envelope_identity_hash16("worktree", notice.scope.worktree_id.as_str());
+        envelope.observed_at = now;
+        envelope.event = tracedecay_hooks::HookEventV2::SessionBoundary {
+            boundary: tracedecay_hooks::HookBoundaryV1::TurnComplete,
+        };
+        let snapshot = HookConfigurationSnapshotV1 {
+            schema_version: tracedecay_hooks::HOOK_CONFIGURATION_SCHEMA_VERSION,
+            revision: 1,
+            published_at: now,
+            expires_at: UtcMicros(now.0 + 1_000_000),
+            binding: HookScopeBindingV1 {
+                host: envelope.producer,
+                project_id: envelope.project_id,
+                repository_id: envelope.repository_id,
+                worktree_id: envelope.worktree_id,
+                worktree_epoch: envelope.worktree_epoch,
+                binding_token: envelope.binding_token,
+                capabilities: vec![tracedecay_hooks::HookCapabilityV1 {
+                    family: tracedecay_hooks::HookEventFamily::SessionBoundary,
+                    support: tracedecay_hooks::HookEventSupportV1::Native,
+                }],
+            },
+        };
+        let prepared = PreparedBoundHook {
+            host: HookHostV1::Codex,
+            layout,
+            snapshot,
+            envelope,
+            native_session_id: Some("session-one".to_owned()),
+            native_lifecycle: None,
+            native_start_locator: None,
+            prepared_at: now,
+        };
+        let guard = crate::hooks::TestDaemonHookActionGuard::install([
+            serde_json::json!({
+                "action": "hook_v2_admit", "status": "accepted", "disposition": "accepted",
+                "orchestration": null, "ready_guidance": null, "feedback_notice": notice,
+                "reason": null,
+            }),
+            serde_json::json!({"queued": true}),
+        ]);
+        let admission = DaemonAdmissionPort::new(
+            &runtime,
+            project.path(),
+            Some("session-one"),
+            None,
+            None,
+            None,
+        );
+        let delivery = SlowOptionalDelivery {
+            required_done: AtomicBool::new(false),
+            delivery_attempted: AtomicBool::new(false),
+        };
+        let started = Instant::now();
+        let (dispatched, queued) = dispatch_decoded_with_required_work(
+            &runtime,
+            prepared,
+            project.path(),
+            started,
+            &admission,
+            &delivery,
+            async {
+                assert_eq!(
+                    guard.calls().len(),
+                    1,
+                    "live admission must precede enqueue"
+                );
+                assert!(HookSynchronousDeadlineV1::after_elapsed(elapsed_us(started)).is_some());
+                let response = super::super::daemon_hook_action(
+                    &runtime,
+                    Some(project.path()),
+                    serde_json::json!({"action": "codex_stop", "session_id": "session-one"}),
+                    None,
+                )
+                .await
+                .unwrap();
+                delivery.required_done.store(true, Ordering::SeqCst);
+                response["queued"] == true
+            },
+        )
+        .await;
+        assert!(queued);
+        assert!(delivery.delivery_attempted.load(Ordering::SeqCst));
+        assert!(matches!(dispatched, HookDispatch::Handled { .. }));
+        assert_eq!(guard.calls()[1].1["action"], "codex_stop");
+        assert!(
+            HookSynchronousDeadlineV1::after_elapsed(elapsed_us(started)).is_none(),
+            "slow optional delivery consumes only the original remaining deadline"
+        );
+    }
+}

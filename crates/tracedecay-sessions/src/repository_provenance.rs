@@ -46,6 +46,25 @@ pub struct RepositoryProvenanceAdmissionContext {
     /// A deterministic project-domain salt, not a secret or credential.
     privacy_domain_salt: [u8; 32],
     capture_cache: Arc<Mutex<Option<CachedRepositoryProvenance>>>,
+    original_resolver: Option<Arc<dyn OriginalObservationProvenanceResolverV1>>,
+}
+
+/// Frozen receipt evidence returned by the composition root's live-event
+/// reader. Structural construction is not proof of originating authority.
+#[derive(Clone)]
+pub struct OriginalObservationEvidenceV1 {
+    pub repository: RepositoryProvenanceV1,
+    pub authority_ref: String,
+}
+
+/// Root-supplied reader of the existing live-event ledger. Source identity and
+/// exact committed frame fingerprint must both resolve before returning proof.
+pub trait OriginalObservationProvenanceResolverV1: Send + Sync {
+    fn resolve(
+        &self,
+        identity: &tracedecay_domain::ObservationIdentityMaterialV1,
+        resume_checkpoint: Option<(u64, u64)>,
+    ) -> Option<OriginalObservationEvidenceV1>;
 }
 
 #[derive(Clone)]
@@ -77,6 +96,52 @@ pub struct CapturedRepositoryProvenanceV1 {
     availability: EvidenceAvailabilityV1<RepositoryProvenanceV1>,
 }
 
+/// Frozen original-event repository evidence, carried only by the producer that
+/// validated the live receipt and its exact normalized source identity. This is
+/// deliberately not serializable or a cache of session routing decisions.
+#[derive(Clone)]
+pub struct OriginalObservationProvenanceV1 {
+    context: RepositoryProvenanceAdmissionContext,
+    captured: CapturedRepositoryProvenanceV1,
+    source_identity: tracedecay_domain::ObservationIdentityMaterialV1,
+    authority_ref: String,
+}
+
+impl OriginalObservationProvenanceV1 {
+    /// Binds the original snapshot, even when later ingestion runs on another
+    /// branch. An adjacent record or another source generation cannot reuse it.
+    pub fn bind_after_sanitization(
+        &self,
+        observation: &DurableObservationV1,
+        projection_generation: &ProjectionGenerationId,
+        ingested_at: UtcMicros,
+        authorization: ResolutionAuthorizationV1,
+    ) -> Result<
+        tracedecay_store::observation::RepositoryProvenanceAttachmentV1,
+        tracedecay_store::ObservationStoreError,
+    > {
+        if observation.identity() != &self.source_identity {
+            return Err(
+                tracedecay_store::ObservationStoreError::RepositoryProvenanceBindingMismatch,
+            );
+        }
+        let prepared = self.context.bind_after_sanitization(
+            &self.captured,
+            observation,
+            projection_generation,
+            ingested_at,
+            authorization,
+        );
+        let attachment = tracedecay_store::observation::RepositoryProvenanceAttachmentV1::new(
+            prepared.availability().clone(),
+            prepared.anchor().cloned(),
+        )?
+        .with_recorded_origin(self.authority_ref.clone(), self.source_identity.clone())?;
+        attachment.validate_for_observation(observation, projection_generation)?;
+        Ok(attachment)
+    }
+}
+
 impl CapturedRepositoryProvenanceV1 {
     pub fn availability(&self) -> &EvidenceAvailabilityV1<RepositoryProvenanceV1> {
         &self.availability
@@ -84,6 +149,87 @@ impl CapturedRepositoryProvenanceV1 {
 }
 
 impl RepositoryProvenanceAdmissionContext {
+    #[must_use]
+    pub fn with_original_provenance_resolver(
+        mut self,
+        resolver: Arc<dyn OriginalObservationProvenanceResolverV1>,
+    ) -> Self {
+        self.original_resolver = Some(resolver);
+        self
+    }
+
+    /// Resolves original event evidence after sanitization without replacing it
+    /// with the repository state observed by this later ingestion pass.
+    pub fn resolve_original_observation(
+        &self,
+        source_identity: &tracedecay_domain::ObservationIdentityMaterialV1,
+        resume_checkpoint: Option<(u64, u64)>,
+    ) -> Option<OriginalObservationProvenanceV1> {
+        let evidence = self
+            .original_resolver
+            .as_ref()?
+            .resolve(source_identity, resume_checkpoint)?;
+        source_identity.validate().ok()?;
+        evidence.repository.validate().ok()?;
+        if source_identity.scope()
+            != &(tracedecay_domain::ObservationScopeV1::Project {
+                project_id: self.project_id.clone(),
+            })
+            || evidence.repository.project_id() != Some(&self.project_id)
+            || evidence.repository.repository_id() != &self.repository_id
+            || evidence.repository.worktree_id() != self.worktree_id.as_ref()
+            || evidence.authority_ref.is_empty()
+            || evidence.authority_ref.len() > 1024
+            || evidence.authority_ref.trim() != evidence.authority_ref
+            || evidence.authority_ref.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(OriginalObservationProvenanceV1 {
+            context: self.clone(),
+            captured: CapturedRepositoryProvenanceV1 {
+                availability: EvidenceAvailabilityV1::Known(evidence.repository),
+            },
+            source_identity: source_identity.clone(),
+            authority_ref: evidence.authority_ref,
+        })
+    }
+
+    /// Captures the exact live source only after the host has checked the
+    /// originating-event receipt and source generation/range correlation.
+    /// Constructing this token does not itself validate that external receipt;
+    /// the history authority revalidates it before dispatch and reuse.
+    pub fn capture_original_observation(
+        &self,
+        source_identity: tracedecay_domain::ObservationIdentityMaterialV1,
+        authority_ref: String,
+        captured_at: UtcMicros,
+    ) -> Option<OriginalObservationProvenanceV1> {
+        source_identity.validate().ok()?;
+        if source_identity.scope()
+            != &(tracedecay_domain::ObservationScopeV1::Project {
+                project_id: self.project_id.clone(),
+            })
+            || authority_ref.is_empty()
+            || authority_ref.len() > 1024
+            || authority_ref.trim() != authority_ref
+            || authority_ref.chars().any(char::is_control)
+        {
+            return None;
+        }
+        let captured = self.capture_snapshot(captured_at);
+        // Partial current capture is useful diagnostics, never full origin proof.
+        if !matches!(captured.availability(), EvidenceAvailabilityV1::Known(_)) {
+            return None;
+        }
+        Some(OriginalObservationProvenanceV1 {
+            context: self.clone(),
+            captured,
+            source_identity,
+            authority_ref,
+        })
+    }
+
     #[cfg(test)]
     pub fn new(
         project_root: PathBuf,
@@ -101,6 +247,7 @@ impl RepositoryProvenanceAdmissionContext {
             expected_common_dir,
             privacy_domain_salt,
             capture_cache: Arc::new(Mutex::new(None)),
+            original_resolver: None,
         }
     }
 
@@ -162,6 +309,7 @@ impl RepositoryProvenanceAdmissionContext {
             expected_common_dir: Some(canonical_common_dir),
             privacy_domain_salt,
             capture_cache: Arc::new(Mutex::new(None)),
+            original_resolver: None,
         })
     }
 

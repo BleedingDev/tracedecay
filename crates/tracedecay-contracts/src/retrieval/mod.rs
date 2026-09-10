@@ -110,6 +110,10 @@ pub use primitive_surface::{
     SimilarResultV1, SimilarSurfaceRequestV1, SimilarSymbolV1, TodoMarkerV1, TodosResultV1,
     TodosSurfaceRequestV1,
 };
+pub use primitive_surface::{
+    ContextMemoryContributionV1, ContextMemoryFactIdentityV1, ContextMemoryTemporalCoverageV1,
+    MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS,
+};
 pub use requests::{
     AffectedTestAttributionV1, AffectedTestsRequest, AffectedTestsResult, AnchorExpandRequest,
     AnchorExpandResult, CallChainPrimitiveRequest, CallChainPrimitiveResult,

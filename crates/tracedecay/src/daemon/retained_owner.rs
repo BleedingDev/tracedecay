@@ -18,6 +18,8 @@ use tracedecay_domain::errors::TraceDecayError;
 mod automation;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod cognitive_recall;
+#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
+pub use cognitive_recall::test_context_evidence;
 mod lcm;
 mod memory;
 mod memory_target;
@@ -26,11 +28,18 @@ pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_common_factory_tests.rs"]
+mod native_common_factory_tests;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_staged_observations;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 mod profile;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_control;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_history;
 mod session;
 pub(crate) mod session_refresh;
 
@@ -66,6 +75,10 @@ pub(crate) struct ProductionRetainedAuthoritiesV1 {
     pub(crate) project_workflow_index: Option<Arc<dyn tracedecay_sessions::WorkflowIndexReadPort>>,
     pub(crate) project_lcm:
         Option<Arc<dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>>,
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) provider_control: Option<
+        Arc<dyn tracedecay_contracts::retained_surfaces::RetainedProviderControlExecutionPortV1>,
+    >,
     pub(crate) configuration_digest: ManifestDigest,
     pub(crate) invocation_service: Option<DaemonInvocationService>,
 }
@@ -80,6 +93,10 @@ pub(crate) fn retained_surface_ports(
             authorities.configuration_digest.clone(),
         ),
     ));
+    #[cfg(feature = "memory-provider-host")]
+    if let Some(provider_control) = authorities.provider_control {
+        ports = ports.with_provider_control(provider_control);
+    }
     if let Some(invocation_service) = authorities.invocation_service.clone() {
         ports = ports.with_automation(Arc::new(automation::DirectRetainedAutomationPortV1::new(
             Arc::clone(&authorities.cg),

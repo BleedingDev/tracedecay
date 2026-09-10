@@ -54,13 +54,15 @@
 //! [`ProjectCognitiveRecallPortV1::recall_admitted`] and observed through the
 //! [`RecallAdmissionObserver`] the composition root installs.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
 use tracedecay_contracts::memory::{
-    CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallPort,
-    CognitiveRecallPortResult, CognitiveRecallProvenance, CognitiveRecallProviderIdentity,
-    CognitiveRecallRequest, CognitiveRecallResult,
+    CognitiveRecallCandidate, CognitiveRecallDegradation, CognitiveRecallExclusions,
+    CognitiveRecallPort, CognitiveRecallPortResult, CognitiveRecallProvenance,
+    CognitiveRecallProviderIdentity, CognitiveRecallRequest, CognitiveRecallResult,
+    CognitiveRecallTemporalMode, CognitiveRecallUnknownValidityPolicy,
 };
 use tracedecay_contracts::{
     ApplicationContractError, CancellationSignal, ClockError, ResolvedScope, try_now_micros,
@@ -73,18 +75,20 @@ use tracedecay_memory_fabric::{
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, HandshakeRequest, HandshakeRequestParts, OperationControl,
-    OwnedExactScope, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderLimits,
-    ProviderOperation, ProviderReply,
+    OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts,
+    ProviderLimits, ProviderOperation, ProviderReply,
 };
 
 use crate::ProjectMemoryProviderComposition;
 use crate::provider_invocation::{
     ProviderInvocationBoundaryV1, ProviderInvocationFaultV1, ProviderInvocationRequestV1,
 };
+use crate::recall_admission::source_attribution::RecallSourceAttributionV1;
 use crate::recall_admission::{
     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
-    UnknownValidityPolicy, admit_recall_reply, build_recall_request_payload, rfc3339_utc_micros,
+    UnknownValidityPolicy, admit_recall_reply_with_profile,
+    build_recall_request_payload_with_context, rfc3339_utc_micros,
 };
 use crate::recall_normalization::{
     RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
@@ -388,6 +392,7 @@ pub struct CognitiveRecallPortInputsV1 {
 /// composition.
 pub struct ProjectCognitiveRecallPortV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
+    registration_profiles: BTreeMap<OwnedProviderId, (u64, bool)>,
     scope_binding: Arc<dyn ExactScopeBinding>,
     invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
     admission_observer: Arc<dyn RecallAdmissionObserver>,
@@ -443,6 +448,11 @@ pub struct CognitiveRecallAdmittedOutcomeV1 {
     /// inline content and were therefore withheld pending scope-revalidated
     /// hydration, which this port does not perform.
     pub unhydrated_reference_candidate_ids: Vec<String>,
+    /// Immutable source claims from selected inline observations whose actual
+    /// Available provenance passed the complete declared-reference binding.
+    /// Fact claims and unavailable/redacted states retain their own authority.
+    /// These are still claims; the host must confirm them against canonical history.
+    pub original_sources: BTreeMap<String, Vec<RecallSourceAttributionV1>>,
     /// The router's fallback decision for this recall:
     /// [`FallbackDecision::NotApplicable`] for successful terminals and for
     /// lanes degraded before any provider contact, a typed declined reason
@@ -455,10 +465,26 @@ impl ProjectCognitiveRecallPortV1 {
     /// Mounts the port. A disabled composition has no recall route and is
     /// refused here rather than at first use.
     pub fn mount(inputs: CognitiveRecallPortInputsV1) -> Result<Self, CognitiveRecallPortError> {
-        inputs
+        let registry = inputs
             .composition
             .registry()
             .ok_or(CognitiveRecallPortError::CompositionDisabled)?;
+        // Snapshot the actual composition metadata, including an explicit
+        // false for legacy registrations. Provider names, descriptor claims,
+        // sidecars and history-grant presence cannot set this requirement.
+        let registration_profiles = registry
+            .registrations
+            .iter()
+            .map(|(id, registration)| {
+                (
+                    id.clone(),
+                    (
+                        registration.registration_revision,
+                        registration.requires_common_advisory_profile,
+                    ),
+                )
+            })
+            .collect();
         inputs
             .budgets
             .validate()
@@ -473,6 +499,7 @@ impl ProjectCognitiveRecallPortV1 {
         .map_err(CognitiveRecallPortError::SelectionPolicy)?;
         Ok(Self {
             composition: inputs.composition,
+            registration_profiles,
             scope_binding: inputs.scope_binding,
             invocation_boundary: inputs.invocation_boundary,
             admission_observer: inputs.admission_observer,
@@ -563,7 +590,22 @@ impl ProjectCognitiveRecallPortV1 {
         request: CognitiveRecallRequest,
         cancellation: &CancellationSignal,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
-        let outcome = self.recall_uncounted(request, cancellation).await?;
+        self.recall_admitted_with_history(request, cancellation, None)
+            .await
+    }
+
+    /// Recalls with the canonical JSON produced by the host's freshly
+    /// revalidated typed history grant. The mounted authority still admits it
+    /// at dispatch; carrying this claim never grants source access by itself.
+    pub async fn recall_admitted_with_history(
+        &self,
+        request: CognitiveRecallRequest,
+        cancellation: &CancellationSignal,
+        history_grant: Option<serde_json::Value>,
+    ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
+        let outcome = self
+            .recall_uncounted(request, cancellation, history_grant)
+            .await?;
         if let Some(report) = &outcome.report {
             self.admission_observer
                 .observe_admission(report)
@@ -588,6 +630,7 @@ impl ProjectCognitiveRecallPortV1 {
         &self,
         request: CognitiveRecallRequest,
         cancellation: &CancellationSignal,
+        history_grant: Option<serde_json::Value>,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
         request
             .validate()
@@ -643,12 +686,8 @@ impl ProjectCognitiveRecallPortV1 {
                 .unwrap_or(0),
         )
         .unwrap_or(0);
-        let evaluation_time = rfc3339_utc_micros(now.0).ok_or(CognitiveRecallPortError::Clock(
-            ClockError::OverflowsI64Micros,
-        ))?;
-        let temporal = AdmittedTemporalQuery::current(&evaluation_time)
-            .map_err(CognitiveRecallPortError::Admission)?
-            .with_unknown_validity_policy(self.unknown_validity_policy);
+        let temporal =
+            admitted_application_temporal_query(&request, now.0, self.unknown_validity_policy)?;
         // The candidate budget the provider is told about is the smaller of
         // the application request and the host-owned budget; admission below
         // enforces exactly that dispatched value, never the unclamped request.
@@ -672,10 +711,13 @@ impl ProjectCognitiveRecallPortV1 {
         // into a stranded worker.
         let provider_stop = cancellation_token.clone();
         let plan = RecallCallPlan {
+            registration_profiles: self.registration_profiles.clone(),
             cancellation: cancellation_token,
             exact_scope,
             request_id: request.request_id().as_str().to_owned(),
             query: request.query().to_owned(),
+            exclusions: request.exclusions().cloned(),
+            history_grant,
             temporal: temporal.clone(),
             budgets,
             policy_revision: self.policy_revision,
@@ -724,14 +766,16 @@ impl ProjectCognitiveRecallPortV1 {
                         .registry()
                         .ok_or(CognitiveRecallPortError::CompositionDisabled)
                         .and_then(|registry| {
-                            registry
+                            let routed = registry
                                 .route_active(&routing, RECALL_QUERY_CAPABILITY_ID, &plan)
-                                .map_err(routing_error)
+                                .map_err(routing_error)?;
+                            let requires_common_profile = plan.common_profile_for(&routed.call)?;
+                            Ok((routed, requires_common_profile))
                         })
                 },
             )
             .await;
-        let routed = match dispatched {
+        let (routed, requires_common_profile) = match dispatched {
             Ok(Ok(routed)) => routed,
             Ok(Err(CognitiveRecallPortError::HandshakeNotReady { terminal_code })) => {
                 let Some(degradation) = readiness_degradation(terminal_code) else {
@@ -849,8 +893,15 @@ impl ProjectCognitiveRecallPortV1 {
             .ok_or_else(|| CognitiveRecallPortError::ScopeBindingsUnrecorded {
                 provider_id: call.provider_id.as_str().to_owned(),
             })?;
-        let admission = admit_recall_reply(&call, &temporal, admitted_budget, &authorized, &reply)
-            .map_err(CognitiveRecallPortError::Admission)?;
+        let admission = admit_recall_reply_with_profile(
+            &call,
+            &temporal,
+            admitted_budget,
+            &authorized,
+            &reply,
+            requires_common_profile,
+        )
+        .map_err(CognitiveRecallPortError::Admission)?;
         // Host order is the normalization's order, not the provider's: the
         // provider's own rank is retained inside the normalized set so the
         // reordering stays explainable, and no raw provider score is ever
@@ -872,6 +923,7 @@ impl ProjectCognitiveRecallPortV1 {
         )
         .map_err(CognitiveRecallPortError::Selection)?;
         let mut candidates = Vec::with_capacity(selection.selected.len());
+        let mut original_sources = BTreeMap::new();
         let mut unhydrated_reference_candidate_ids = Vec::new();
         for selected in &selection.selected {
             let Some(admitted) = admission.admitted.get(selected.provider_rank) else {
@@ -914,6 +966,9 @@ impl ProjectCognitiveRecallPortV1 {
                     .with_explanation(summary)
                     .map_err(CognitiveRecallPortError::Application)?;
             }
+            if let Some(sources) = admitted.observation_history_sources() {
+                original_sources.insert(candidate.candidate_id.clone(), sources.to_vec());
+            }
             candidates.push(application_candidate);
         }
 
@@ -946,9 +1001,82 @@ impl ProjectCognitiveRecallPortV1 {
             selection: Some(selection),
             report: Some(admission.report),
             unhydrated_reference_candidate_ids,
+            original_sources,
             fallback,
         })
     }
+}
+
+/// Maps explicit application semantics without replacing their clock or policy.
+fn admitted_application_temporal_query(
+    request: &CognitiveRecallRequest,
+    now_utc_micros: i64,
+    default_unknown_validity: UnknownValidityPolicy,
+) -> Result<AdmittedTemporalQuery, CognitiveRecallPortError> {
+    let timestamp = |at: i64| {
+        rfc3339_utc_micros(at).ok_or(CognitiveRecallPortError::Clock(
+            ClockError::OverflowsI64Micros,
+        ))
+    };
+    let Some(explicit) = request.temporal_query() else {
+        return AdmittedTemporalQuery::current(&timestamp(now_utc_micros)?)
+            .map(|query| query.with_unknown_validity_policy(default_unknown_validity))
+            .map_err(CognitiveRecallPortError::Admission);
+    };
+    explicit
+        .validate()
+        .map_err(CognitiveRecallPortError::Application)?;
+    if explicit.evaluation_time().0 > now_utc_micros {
+        return Err(CognitiveRecallPortError::Application(
+            ApplicationContractError::InvalidRange {
+                field: "cognitive recall evaluation time",
+            },
+        ));
+    }
+    let evaluation = timestamp(explicit.evaluation_time().0)?;
+    let missing = |field| {
+        CognitiveRecallPortError::Application(ApplicationContractError::InvalidRange { field })
+    };
+    let temporal = match explicit.mode() {
+        CognitiveRecallTemporalMode::Current => AdmittedTemporalQuery::current(&evaluation),
+        CognitiveRecallTemporalMode::AsOf => AdmittedTemporalQuery::as_of(
+            &evaluation,
+            &timestamp(
+                explicit
+                    .as_of()
+                    .ok_or_else(|| missing("cognitive recall as_of"))?
+                    .0,
+            )?,
+        ),
+        CognitiveRecallTemporalMode::Interval => AdmittedTemporalQuery::interval(
+            &evaluation,
+            &timestamp(
+                explicit
+                    .interval_start()
+                    .ok_or_else(|| missing("cognitive recall interval_start"))?
+                    .0,
+            )?,
+            &timestamp(
+                explicit
+                    .interval_end()
+                    .ok_or_else(|| missing("cognitive recall interval_end"))?
+                    .0,
+            )?,
+        ),
+        CognitiveRecallTemporalMode::History => AdmittedTemporalQuery::history(&evaluation),
+    }
+    .map_err(CognitiveRecallPortError::Admission)?;
+    let policy = match explicit.unknown_validity_policy() {
+        CognitiveRecallUnknownValidityPolicy::Exclude => UnknownValidityPolicy::Exclude,
+        CognitiveRecallUnknownValidityPolicy::Degrade => UnknownValidityPolicy::Degrade,
+        CognitiveRecallUnknownValidityPolicy::AllowWithWarning => {
+            UnknownValidityPolicy::AllowWithWarning
+        }
+    };
+    Ok(temporal
+        .with_include_superseded(explicit.include_superseded())
+        .with_include_revoked(explicit.include_revoked())
+        .with_unknown_validity_policy(policy))
 }
 
 /// A mounted recall port bound to one live host cancellation identity.
@@ -1032,6 +1160,8 @@ fn bridge_cancellation(
 /// second provider only ever sees a handshake and a call bound to its own
 /// identity, registration revision, ready receipt, and state generation.
 struct RecallCallPlan {
+    /// Host registration/revision profile requirements pinned by this mount.
+    registration_profiles: BTreeMap<OwnedProviderId, (u64, bool)>,
     /// The one live cancellation token of this recall, cloned into every
     /// handshake and call control so a cancellation requested after dispatch
     /// is observed by whichever provider is currently working.
@@ -1039,6 +1169,8 @@ struct RecallCallPlan {
     exact_scope: OwnedExactScope,
     request_id: String,
     query: String,
+    exclusions: Option<CognitiveRecallExclusions>,
+    history_grant: Option<serde_json::Value>,
     temporal: AdmittedTemporalQuery,
     budgets: RecallBudgetsV1,
     policy_revision: u64,
@@ -1049,6 +1181,18 @@ struct RecallCallPlan {
 }
 
 impl RecallCallPlan {
+    fn common_profile_for(&self, call: &ProviderCall) -> Result<bool, CognitiveRecallPortError> {
+        self.registration_profiles
+            .get(&call.provider_id)
+            .filter(|(revision, _)| *revision == call.registration_revision)
+            .map(|(_, required)| *required)
+            .ok_or(CognitiveRecallPortError::Admission(
+                RecallAdmissionError::OutcomeBinding {
+                    field: "host registration profile",
+                },
+            ))
+    }
+
     fn control(&self) -> OperationControl {
         OperationControl::new(
             self.deadline_utc_micros,
@@ -1082,20 +1226,24 @@ impl ActiveCallPlan for RecallCallPlan {
         // the provider verifies the deadline and refuses a remaining budget
         // larger than the one the host actually dispatched.
         let call_control = self.control();
-        let payload = build_recall_request_payload(&RecallRequestParts {
-            provider_id: target.provider_id.clone(),
-            registration_revision: target.registration_revision,
-            ready_receipt_sha256: target.ready_receipt_sha256.clone(),
-            exact_scope: self.exact_scope.clone(),
-            request_id: self.request_id.clone(),
-            objective: RECALL_OBJECTIVE.to_owned(),
-            query: self.query.clone(),
-            temporal: self.temporal.clone(),
-            budgets: self.budgets,
-            policy_revision: self.policy_revision,
-            deadline_utc_micros: call_control.deadline_utc_micros(),
-            remaining_millis: call_control.remaining_millis(),
-        })
+        let payload = build_recall_request_payload_with_context(
+            &RecallRequestParts {
+                provider_id: target.provider_id.clone(),
+                registration_revision: target.registration_revision,
+                ready_receipt_sha256: target.ready_receipt_sha256.clone(),
+                exact_scope: self.exact_scope.clone(),
+                request_id: self.request_id.clone(),
+                objective: RECALL_OBJECTIVE.to_owned(),
+                query: self.query.clone(),
+                temporal: self.temporal.clone(),
+                budgets: self.budgets,
+                policy_revision: self.policy_revision,
+                deadline_utc_micros: call_control.deadline_utc_micros(),
+                remaining_millis: call_control.remaining_millis(),
+            },
+            self.exclusions.as_ref(),
+            self.history_grant.as_ref(),
+        )
         .map_err(RecallRoutePlanError::Admission)?;
         ProviderCall::new(ProviderCallParts {
             operation: ProviderOperation::Recall,
@@ -1264,6 +1412,7 @@ impl ProjectCognitiveRecallPortV1 {
             selection: None,
             report: None,
             unhydrated_reference_candidate_ids: Vec::new(),
+            original_sources: BTreeMap::new(),
             fallback: FallbackDecision::NotApplicable,
         })
     }
@@ -1347,5 +1496,126 @@ fn application_provenance(
             CognitiveRecallProvenance::redacted(reason)
         }
         _ => Ok(CognitiveRecallProvenance::unavailable()),
+    }
+}
+
+#[cfg(test)]
+mod application_context_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use tracedecay_contracts::memory::CognitiveRecallTemporalQuery;
+    use tracedecay_contracts::{CancellationContext, Deadline, RequestId};
+    use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
+
+    fn request() -> CognitiveRecallRequest {
+        CognitiveRecallRequest::new(
+            ResolvedScope::new(
+                ProjectId::new("project.temporal").unwrap(),
+                RepositoryId::new("repository.temporal").unwrap(),
+                WorktreeId::new("worktree.temporal").unwrap(),
+                Some(RefId::new("refs/heads/main").unwrap()),
+            )
+            .unwrap(),
+            RequestId::new("request.temporal").unwrap(),
+            Deadline::new(UtcMicros(1_800_000_000_000_000)).unwrap(),
+            CancellationContext::active("token.temporal").unwrap(),
+            "query",
+            8,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn explicit_temporal_modes_preserve_clock_flags_and_policy() {
+        let now = UtcMicros(1_740_000_000_000_000);
+        let query = CognitiveRecallTemporalQuery::current(now).with_policy(
+            true,
+            true,
+            CognitiveRecallUnknownValidityPolicy::AllowWithWarning,
+        );
+        let modes = [
+            query.clone(),
+            query
+                .clone()
+                .with_as_of(UtcMicros(now.0 - 100_000))
+                .unwrap(),
+            query
+                .clone()
+                .with_interval(UtcMicros(now.0 - 200_000), UtcMicros(now.0 - 100_000))
+                .unwrap(),
+            query.with_history(),
+        ];
+        for explicit in modes {
+            let request = request().with_temporal_query(explicit.clone()).unwrap();
+            let actual = admitted_application_temporal_query(
+                &request,
+                now.0 + 1_000,
+                UnknownValidityPolicy::Exclude,
+            )
+            .unwrap()
+            .to_wire_value();
+            assert_eq!(
+                actual["mode"],
+                serde_json::to_value(explicit.mode()).unwrap()
+            );
+            assert_eq!(
+                actual["evaluation_time"],
+                rfc3339_utc_micros(now.0).unwrap()
+            );
+            assert_eq!(actual["include_superseded"], true);
+            assert_eq!(actual["include_revoked"], true);
+            assert_eq!(actual["unknown_validity_policy"], "allow_with_warning");
+            assert_eq!(
+                actual["as_of"],
+                serde_json::to_value(explicit.as_of().map(|at| rfc3339_utc_micros(at.0).unwrap()))
+                    .unwrap()
+            );
+            assert_eq!(
+                actual["interval_start"],
+                serde_json::to_value(
+                    explicit
+                        .interval_start()
+                        .map(|at| rfc3339_utc_micros(at.0).unwrap())
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                actual["interval_end"],
+                serde_json::to_value(
+                    explicit
+                        .interval_end()
+                        .map(|at| rfc3339_utc_micros(at.0).unwrap())
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn default_unknown_policy_never_overwrites_explicit_exclude_or_future_clock() {
+        let now = UtcMicros(1_740_000_000_000_000);
+        let ordinary =
+            admitted_application_temporal_query(&request(), now.0, UnknownValidityPolicy::Degrade)
+                .unwrap();
+        assert_eq!(
+            ordinary.unknown_validity_policy(),
+            UnknownValidityPolicy::Degrade
+        );
+        let explicit = request()
+            .with_temporal_query(CognitiveRecallTemporalQuery::current(now))
+            .unwrap();
+        assert_eq!(
+            admitted_application_temporal_query(&explicit, now.0, UnknownValidityPolicy::Degrade)
+                .unwrap()
+                .unknown_validity_policy(),
+            UnknownValidityPolicy::Exclude
+        );
+        let future = request()
+            .with_temporal_query(CognitiveRecallTemporalQuery::current(UtcMicros(now.0 + 1)))
+            .unwrap();
+        assert!(
+            admitted_application_temporal_query(&future, now.0, UnknownValidityPolicy::Degrade)
+                .is_err()
+        );
     }
 }

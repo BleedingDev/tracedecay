@@ -1019,7 +1019,9 @@ impl MemoryProviderRecallDegradationV1 {
     }
 }
 
-/// Optional real NCM observer. Changing this setting requires a daemon restart.
+/// Independently enabled real NCM participation. Changing this setting requires
+/// a daemon restart. The legacy observer type/key/JSON remain stable: enabled
+/// means observer unless recall routing explicitly selects NCM as active.
 /// The existing offline installer must install into `state_root/models` before
 /// readiness can be proved; mounting never downloads or copies models.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1027,7 +1029,7 @@ impl MemoryProviderRecallDegradationV1 {
 pub enum MemoryProviderNcmObserverV1 {
     /// Construct no NCM adapter, process, or observation journey.
     Disabled {},
-    /// Observe canonical commits without any authority to answer recall.
+    /// Accept canonical commits; only explicit recall routing permits active output.
     Enabled {
         /// Absolute path of the production NCM worker executable.
         worker_binary: std::path::PathBuf,
@@ -1042,7 +1044,17 @@ impl Default for MemoryProviderNcmObserverV1 {
     }
 }
 
+/// Descriptive alias for the existing serialized NCM participation setting.
+/// Its legacy name and `mode: enabled` wire value remain supported unchanged.
+pub type MemoryProviderNcmParticipationV1 = MemoryProviderNcmObserverV1;
+
 impl MemoryProviderNcmObserverV1 {
+    /// Whether composition may construct this adapter. Enabling does not itself
+    /// authorize recall, and does not depend on Native advisory participation.
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
     /// Reject relative paths and traversal instead of resolving against a host CWD.
     pub fn validate(&self) -> Result<(), DomainError> {
         if let Self::Enabled {
@@ -1066,6 +1078,130 @@ impl MemoryProviderNcmObserverV1 {
         }
         Ok(())
     }
+}
+
+/// Concrete adapters this product composition can explicitly construct.
+/// Recognition chooses a constructor; descriptor/profile validation still
+/// determines whether the constructed adapter is compatible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryProviderKindV1 {
+    /// Host-authored Native advisory adapter; canonical facts are independent.
+    Native,
+    /// Real worker-backed NCM advisory adapter.
+    Ncm,
+}
+
+impl MemoryProviderKindV1 {
+    /// Configured identity for this constructor.
+    pub const fn provider_id(self) -> &'static str {
+        match self {
+            Self::Native => "tracedecay.native",
+            Self::Ncm => "ncm",
+        }
+    }
+
+    /// Resolves an explicitly configured provider without substitution.
+    pub fn from_provider_id(provider_id: &str) -> Result<Self, MemoryProviderSelectionErrorV1> {
+        match provider_id {
+            "tracedecay.native" => Ok(Self::Native),
+            "ncm" => Ok(Self::Ncm),
+            other => Err(MemoryProviderSelectionErrorV1::UnknownProvider(
+                other.to_owned(),
+            )),
+        }
+    }
+}
+
+/// Independent participation for an installed adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryProviderParticipationV1 {
+    /// No adapter, worker, journal or observation journey may be constructed.
+    Disabled,
+    /// Receive observations without active recall authorization.
+    Observer,
+    /// The explicitly selected provider for active advisory recall.
+    Active,
+}
+
+/// Validated composition choices derived from the existing pinned settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryProviderSelectionV1 {
+    /// Native advisory participation, independent of canonical host facts.
+    pub native: MemoryProviderParticipationV1,
+    /// NCM participation, independent of Native advisory enablement.
+    pub ncm: MemoryProviderParticipationV1,
+}
+
+impl MemoryProviderSelectionV1 {
+    /// Resolves legacy enablement plus explicit routing without creating workers
+    /// or migrating a persisted configuration revision. Unknown or disabled active
+    /// selection fails; enabled unselected adapters remain observers.
+    pub fn resolve(
+        native_enabled: bool,
+        ncm: &MemoryProviderNcmObserverV1,
+        routing: &MemoryProviderRecallRoutingV1,
+    ) -> Result<Self, MemoryProviderSelectionErrorV1> {
+        ncm.validate()
+            .map_err(MemoryProviderSelectionErrorV1::InvalidConfiguration)?;
+        routing
+            .validate()
+            .map_err(MemoryProviderSelectionErrorV1::InvalidConfiguration)?;
+        let mut selection = Self {
+            native: if native_enabled {
+                MemoryProviderParticipationV1::Observer
+            } else {
+                MemoryProviderParticipationV1::Disabled
+            },
+            ncm: if ncm.is_enabled() {
+                MemoryProviderParticipationV1::Observer
+            } else {
+                MemoryProviderParticipationV1::Disabled
+            },
+        };
+        if let Some(provider) = &routing.active_provider {
+            let provider = MemoryProviderKindV1::from_provider_id(provider)?;
+            let participation = match provider {
+                MemoryProviderKindV1::Native => &mut selection.native,
+                MemoryProviderKindV1::Ncm => &mut selection.ncm,
+            };
+            if *participation == MemoryProviderParticipationV1::Disabled {
+                return Err(MemoryProviderSelectionErrorV1::SelectedProviderDisabled(
+                    provider,
+                ));
+            }
+            *participation = MemoryProviderParticipationV1::Active;
+        }
+        Ok(selection)
+    }
+
+    /// Selected active constructor, absent when every enabled provider observes.
+    pub const fn active_provider(self) -> Option<MemoryProviderKindV1> {
+        match (self.native, self.ncm) {
+            (MemoryProviderParticipationV1::Active, _) => Some(MemoryProviderKindV1::Native),
+            (_, MemoryProviderParticipationV1::Active) => Some(MemoryProviderKindV1::Ncm),
+            _ => None,
+        }
+    }
+
+    /// Whether composition must create no provider infrastructure.
+    pub const fn is_disabled(self) -> bool {
+        matches!(self.native, MemoryProviderParticipationV1::Disabled)
+            && matches!(self.ncm, MemoryProviderParticipationV1::Disabled)
+    }
+}
+
+/// Selection failed before constructing any concrete adapter.
+#[derive(Debug, Error)]
+pub enum MemoryProviderSelectionErrorV1 {
+    /// A persisted value was not canonical or had invalid paths/policy.
+    #[error("memory provider configuration is invalid: {0}")]
+    InvalidConfiguration(#[source] DomainError),
+    /// This product has no configured constructor for the selected identity.
+    #[error("memory provider '{0}' is unknown to this composition")]
+    UnknownProvider(String),
+    /// Selecting an identity cannot implicitly enable its adapter.
+    #[error("selected memory provider {0:?} is disabled")]
+    SelectedProviderDisabled(MemoryProviderKindV1),
 }
 
 /// Explicit routing gate for cognitive recall.
@@ -2390,4 +2526,104 @@ fn derive_configuration_snapshot_id(
     let encoded =
         crate::canonical_text::sha256_hex_body(digest.as_str(), "configuration snapshot digest")?;
     ConfigurationSnapshotId::new(format!("{CONFIGURATION_SNAPSHOT_ID_DOMAIN}.{encoded}"))
+}
+
+#[cfg(test)]
+mod memory_provider_selection_tests {
+    use super::*;
+
+    fn enabled_ncm() -> MemoryProviderNcmObserverV1 {
+        let root = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\ncm")
+        } else {
+            std::path::PathBuf::from("/ncm")
+        };
+        MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: root.join("worker"),
+            state_root: root.join("state"),
+        }
+    }
+
+    fn routing(provider: Option<&str>) -> MemoryProviderRecallRoutingV1 {
+        MemoryProviderRecallRoutingV1 {
+            active_provider: provider.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn old_default_settings_remain_disabled_without_a_new_wire_value() {
+        let ncm: MemoryProviderNcmObserverV1 =
+            serde_json::from_str(r#"{"mode":"disabled"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&ncm).unwrap(),
+            r#"{"mode":"disabled"}"#
+        );
+        let route: MemoryProviderRecallRoutingV1 = serde_json::from_str("{}").unwrap();
+        let selected = MemoryProviderSelectionV1::resolve(false, &ncm, &route).unwrap();
+        assert!(selected.is_disabled());
+        assert_eq!(selected.active_provider(), None);
+    }
+
+    #[test]
+    fn ncm_active_is_independent_of_native_advisory_enablement() {
+        let ncm = enabled_ncm();
+        for native_enabled in [false, true] {
+            let selected =
+                MemoryProviderSelectionV1::resolve(native_enabled, &ncm, &routing(Some("ncm")))
+                    .unwrap();
+            assert_eq!(selected.active_provider(), Some(MemoryProviderKindV1::Ncm));
+            assert_eq!(selected.ncm, MemoryProviderParticipationV1::Active);
+            assert_eq!(
+                selected.native,
+                if native_enabled {
+                    MemoryProviderParticipationV1::Observer
+                } else {
+                    MemoryProviderParticipationV1::Disabled
+                }
+            );
+        }
+        let decoded: MemoryProviderNcmObserverV1 =
+            serde_json::from_str(&serde_json::to_string(&ncm).unwrap()).unwrap();
+        assert_eq!(decoded, ncm);
+    }
+
+    #[test]
+    fn unselected_participation_remains_observer_for_either_provider() {
+        let ncm = enabled_ncm();
+        let selected = MemoryProviderSelectionV1::resolve(false, &ncm, &routing(None)).unwrap();
+        assert_eq!(selected.native, MemoryProviderParticipationV1::Disabled);
+        assert_eq!(selected.ncm, MemoryProviderParticipationV1::Observer);
+        assert_eq!(selected.active_provider(), None);
+        let selected =
+            MemoryProviderSelectionV1::resolve(true, &ncm, &routing(Some("tracedecay.native")))
+                .unwrap();
+        assert_eq!(selected.native, MemoryProviderParticipationV1::Active);
+        assert_eq!(selected.ncm, MemoryProviderParticipationV1::Observer);
+    }
+
+    #[test]
+    fn unknown_or_disabled_active_selection_never_falls_back() {
+        assert!(
+            matches!(MemoryProviderSelectionV1::resolve(true, &enabled_ncm(), &routing(Some("missing"))), Err(MemoryProviderSelectionErrorV1::UnknownProvider(provider)) if provider == "missing")
+        );
+        for (native, ncm, provider, kind) in [
+            (
+                false,
+                enabled_ncm(),
+                "tracedecay.native",
+                MemoryProviderKindV1::Native,
+            ),
+            (
+                true,
+                MemoryProviderNcmObserverV1::default(),
+                "ncm",
+                MemoryProviderKindV1::Ncm,
+            ),
+        ] {
+            assert!(
+                matches!(MemoryProviderSelectionV1::resolve(native, &ncm, &routing(Some(provider))), Err(MemoryProviderSelectionErrorV1::SelectedProviderDisabled(actual)) if actual == kind)
+            );
+        }
+    }
 }

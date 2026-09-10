@@ -13,6 +13,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
@@ -244,7 +245,7 @@ pub struct StoredCapsule {
     pub value_embedding: Vec<f32>,
     /// Canonical LTM key, empty after revocation.
     pub ltm_key: Vec<f32>,
-    /// JSON provenance retained with the capsule.
+    /// JSON provenance, replaced with an empty object after revocation.
     pub provenance: String,
     /// Durable lifecycle status.
     pub status: CapsuleStatus,
@@ -393,6 +394,8 @@ pub enum StoreError {
     BudgetExceeded,
     /// An idempotency key is already present in the event journal.
     IdempotencyConflict,
+    /// The source is durably revoked and cannot accept a new effect.
+    SourceRevoked,
     /// The caller supplied malformed or dimensionally invalid data.
     InvalidInput(String),
     /// The requested record does not exist.
@@ -414,6 +417,7 @@ impl fmt::Display for StoreError {
             Self::Incompatible { field } => write!(formatter, "incompatible store field: {field}"),
             Self::BudgetExceeded => formatter.write_str("namespace storage budget exceeded"),
             Self::IdempotencyConflict => formatter.write_str("idempotency key already exists"),
+            Self::SourceRevoked => formatter.write_str("source has been revoked"),
             Self::InvalidInput(reason) => write!(formatter, "invalid store input: {reason}"),
             Self::UnknownRecord(record_id) => write!(formatter, "unknown record {}", record_id.0),
             Self::Io(reason) => write!(formatter, "store filesystem error: {reason}"),
@@ -560,6 +564,7 @@ impl NamespaceStore {
             db_path: self.db_path.clone(),
             quota: self.quota,
             pending_commit_seq,
+            namespace: self.namespace.clone(),
         })
     }
 
@@ -590,6 +595,11 @@ impl NamespaceStore {
             .map_err(map_sqlite_error)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(map_sqlite_error)
+    }
+
+    /// Returns one capsule by its stable record identity.
+    pub(crate) fn event_for_key(&self, key: &str) -> Result<Option<Event>, StoreError> {
+        self.conn.query_row("SELECT seq, kind, idempotency_key, payload_sha256, receipt, created_tick FROM events WHERE idempotency_key = ?1", params![key], event_from_row).optional().map_err(map_sqlite_error)
     }
 
     /// Returns one capsule by its stable record identity.
@@ -634,6 +644,40 @@ impl NamespaceStore {
     }
 
     /// Returns all source revocations in deterministic source order.
+    pub(crate) fn capsule_page(
+        &self,
+        source: Option<&str>,
+        after: u64,
+        limit: u64,
+    ) -> Result<Vec<StoredCapsule>, StoreError> {
+        if limit == 0 || limit > 1_000_001 {
+            return Err(StoreError::InvalidInput("capsule page bound".to_owned()));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT record_id, source_id, key_text, value_text, affect, surprise,
+                    intensity, key_embedding, value_embedding, ltm_key, provenance, status, commit_seq
+             FROM capsules WHERE status <> 'revoked' AND record_id > ?1
+               AND (?2 IS NULL OR source_id = ?2 OR (
+                    json_extract(provenance, '$.source_binding.version') = 1
+                AND json_extract(provenance, '$.source_binding.source_id') = source_id
+                AND json_extract(provenance, '$.source_binding.legacy_source_id') = ?2))
+             ORDER BY record_id ASC LIMIT ?3"
+        ).map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    sqlite_i64(after, "cursor record ID")?,
+                    source,
+                    sqlite_i64(limit, "capsule page limit")?
+                ],
+                capsule_from_row,
+            )
+            .map_err(map_sqlite_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
+    /// Returns all source revocations in deterministic source order.
     pub fn revocations(&self) -> Result<Vec<Revocation>, StoreError> {
         let mut statement = self
             .conn
@@ -643,6 +687,26 @@ impl NamespaceStore {
             .query_map([], revocation_from_row)
             .map_err(map_sqlite_error)?;
         rows.collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)
+    }
+
+    /// Checks both exact source identity and any verified legacy authority.
+    pub(crate) fn ensure_source_provenance_not_revoked(
+        &self,
+        source: &SourceId,
+        provenance: &Value,
+    ) -> Result<(), StoreError> {
+        ensure_source_provenance_not_revoked(&self.conn, &self.namespace, source, provenance)
+    }
+
+    pub(crate) fn has_retained_source(&self, source: &SourceId) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM capsules WHERE source_id = ?1 AND status <> 'revoked')",
+                params![source.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|present| present != 0)
             .map_err(map_sqlite_error)
     }
 
@@ -660,6 +724,11 @@ impl NamespaceStore {
     /// Returns persisted scheduler and generation metadata.
     pub fn meta(&self) -> Result<StoreMeta, StoreError> {
         read_store_meta(&self.conn)
+    }
+
+    /// Returns the durable allocation floor, including IDs retired by restore.
+    pub(crate) fn next_record_id(&self) -> Result<u64, StoreError> {
+        read_u64(&self.conn, META_NEXT_RECORD_ID)
     }
 
     /// Returns file and payload accounting for this namespace.
@@ -708,6 +777,7 @@ pub struct Mutation<'a> {
     db_path: PathBuf,
     quota: Quota,
     pending_commit_seq: CommitSeq,
+    namespace: String,
 }
 
 impl<'a> Mutation<'a> {
@@ -784,6 +854,16 @@ impl<'a> Mutation<'a> {
 
     /// Inserts a valid source capsule and allocates its never-reused record ID.
     pub fn insert_capsule(&mut self, capsule: Capsule) -> Result<RecordId, StoreError> {
+        // Encoding runs outside the namespace lock. Check again in the write
+        // transaction so a deletion during encoding cannot reintroduce its source.
+        let provenance: Value = serde_json::from_str(&capsule.provenance)
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        ensure_source_provenance_not_revoked(
+            &self.tx,
+            &self.namespace,
+            &capsule.source_id,
+            &provenance,
+        )?;
         capsule.validate()?;
         let basis_bytes = capsule_byte_lengths(&capsule)?;
         self.ensure_budget(basis_bytes, false)?;
@@ -824,7 +904,7 @@ impl<'a> Mutation<'a> {
     }
 
     /// Changes a capsule status. Revocation irreversibly clears retained text,
-    /// embeddings, and the canonical LTM key in the same transaction.
+    /// embeddings, the canonical LTM key, and provenance in the same transaction.
     pub fn mark_capsule_status(
         &mut self,
         record_id: RecordId,
@@ -852,7 +932,7 @@ impl<'a> Mutation<'a> {
                 .execute(
                     "UPDATE capsules SET key_text = '', value_text = '',
                             key_embedding = X'', value_embedding = X'', ltm_key = X'',
-                            status = 'revoked' WHERE record_id = ?1",
+                            provenance = '{}', status = 'revoked' WHERE record_id = ?1",
                     params![sqlite_record_id],
                 )
                 .map_err(map_sqlite_error)?;
@@ -863,6 +943,57 @@ impl<'a> Mutation<'a> {
                     params![status.as_str(), sqlite_record_id],
                 )
                 .map_err(map_sqlite_error)?;
+        }
+        Ok(())
+    }
+
+    /// Stores or replaces one serialized kernel checkpoint.
+    pub(crate) fn update_capsule_provenance(
+        &mut self,
+        record_id: RecordId,
+        provenance: &str,
+    ) -> Result<(), StoreError> {
+        validate_json(provenance, "provenance")?;
+        let source = self
+            .tx
+            .query_row(
+                "SELECT source_id FROM capsules WHERE record_id = ?1 AND status != 'revoked'",
+                params![sqlite_i64(record_id.0, "record ID")?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .ok_or(StoreError::UnknownRecord(record_id))?;
+        let value: Value = serde_json::from_str(provenance)
+            .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+        ensure_source_provenance_not_revoked(&self.tx, &self.namespace, &SourceId(source), &value)?;
+        self.tx
+            .execute(
+                "UPDATE capsules SET provenance = ?1 WHERE record_id = ?2",
+                params![provenance, sqlite_i64(record_id.0, "record ID")?],
+            )
+            .map_err(map_sqlite_error)?;
+        self.ensure_budget(0, false)?;
+        Ok(())
+    }
+
+    /// Injects physical corruption through the resident transaction for read-integrity tests.
+    /// The caller must commit it; ordinary provenance writes retain all validation.
+    #[cfg(test)]
+    pub(crate) fn corrupt_capsule_provenance_for_test(
+        &mut self,
+        record_id: RecordId,
+        provenance: &str,
+    ) -> Result<(), StoreError> {
+        let updated = self
+            .tx
+            .execute(
+                "UPDATE capsules SET provenance = ?1 WHERE record_id = ?2",
+                params![provenance, sqlite_i64(record_id.0, "record ID")?],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(StoreError::UnknownRecord(record_id));
         }
         Ok(())
     }
@@ -1246,6 +1377,38 @@ fn integrity_check(conn: &Connection) -> Result<(), StoreError> {
         if value != "ok" {
             return Err(StoreError::Corrupt(value));
         }
+    }
+    Ok(())
+}
+
+fn ensure_source_provenance_not_revoked(
+    conn: &Connection,
+    namespace: &str,
+    source: &SourceId,
+    provenance: &Value,
+) -> Result<(), StoreError> {
+    ensure_source_not_revoked(conn, source)?;
+    if let Some(binding) = crate::source_binding::read(namespace, source, provenance)
+        .map_err(StoreError::InvalidInput)?
+    {
+        ensure_source_not_revoked(conn, &binding.legacy_source_id)?;
+        if let Some(full) = &binding.full_source_id {
+            ensure_source_not_revoked(conn, full)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_source_not_revoked(conn: &Connection, source: &SourceId) -> Result<(), StoreError> {
+    let revoked = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM revocations WHERE source_id = ?1)",
+            params![source.0],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(map_sqlite_error)?;
+    if revoked {
+        return Err(StoreError::SourceRevoked);
     }
     Ok(())
 }

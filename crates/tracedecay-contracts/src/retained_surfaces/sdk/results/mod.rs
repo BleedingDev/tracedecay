@@ -65,6 +65,7 @@ pub use session::{
     WorkflowRunV1, WorkflowStatusV1, WorkflowsResultV1,
 };
 
+use crate::retained_surfaces::ProviderControlResultV1;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -132,6 +133,7 @@ pub enum RetainedSurfaceResultV1 {
     FactStoreList(FactStoreListResultV1),
     FactFeedback(FactFeedbackResultV1),
     MemoryStatus(MemoryStatusResultV1),
+    ProviderControl(ProviderControlResultV1),
     SessionRefreshStatus(SessionRefreshStatusResultV1),
     SessionRefreshCancel(SessionRefreshCancelResultV1),
     SessionRefreshBegin(SessionRefreshBeginResultV1),

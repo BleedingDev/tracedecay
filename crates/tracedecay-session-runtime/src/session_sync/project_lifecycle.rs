@@ -38,6 +38,11 @@ pub struct SessionSyncProjectContext {
     pub(super) user_sessions: RegisteredGlobalDbLeaseV1,
     pub registry: RegisteredGlobalDbLeaseV1,
     pub(super) background_cpu: Arc<ProcessBackgroundCpuV1>,
+    pub(super) original_provenance_resolver: Option<
+        Arc<
+            dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
+        >,
+    >,
     pub(super) project_refresh:
         crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
     pub(super) user_refresh: crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
@@ -296,6 +301,17 @@ impl DaemonSessionSyncService {
         &self,
         config: DaemonSessionSyncConfig,
     ) -> tracedecay_domain::errors::Result<()> {
+        self.register_project_with_original_provenance(config, None)
+            .await
+    }
+
+    /// Registers the same existing project worker with its root-owned original
+    /// event reader. The reader never advances a canonical source cursor.
+    pub async fn register_project_with_original_provenance(
+        &self,
+        config: DaemonSessionSyncConfig,
+        original_provenance_resolver: Option<Arc<dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1>>,
+    ) -> tracedecay_domain::errors::Result<()> {
         let scope = SessionSyncScopeV1::new(config.project_id.clone(), config.profile_id.clone());
         let project_gate = self.project_gate(&scope);
         let project = project_gate.lock().await;
@@ -314,6 +330,7 @@ impl DaemonSessionSyncService {
             user_sessions: config.user_sessions,
             registry: config.registry,
             background_cpu: config.background_cpu,
+            original_provenance_resolver,
             project_refresh: config.project_refresh,
             user_refresh: config.user_refresh,
         });

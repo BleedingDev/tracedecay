@@ -13,8 +13,8 @@ use tracedecay_domain::{
 use tracedecay_store::{
     AnchoredObservationWrite, CursorAdvanceLedgerDisagreementV1, CursorAdvanceLedgerIdentityV1,
     ObservationCoverageReason, ObservationCursorAdvance, ObservationReadOperationV1,
-    ObservationReadResultV1, ProjectionRebuildProgressV1, ProjectionRebuildStateV1,
-    SESSION_MESSAGE_PROJECTOR_VERSION,
+    ObservationReadResultV1, ObservationRecentWindowRequest, ObservationRecentWindowV1,
+    ProjectionRebuildProgressV1, ProjectionRebuildStateV1, SESSION_MESSAGE_PROJECTOR_VERSION,
 };
 
 use crate::operation::StorageOperationError;
@@ -300,6 +300,24 @@ impl ObservationExecutor {
                     observations.push(decode_observation_row(row?)?);
                 }
                 Ok(ObservationReadResultV1::Replay(observations))
+            }
+            ObservationReadOperationV1::RecentWindow { limit } => {
+                let request =
+                    ObservationRecentWindowRequest::new(usize::from(*limit)).map_err(invalid)?;
+                let mut statement = snapshot
+                    .prepare("SELECT sequence FROM observations ORDER BY sequence DESC LIMIT ?1")?;
+                let rows =
+                    statement.query_map([i64::from(*limit) + 1], |row| row.get::<_, i64>(0))?;
+                let mut sequences = Vec::with_capacity(request.limit() + 1);
+                for row in rows {
+                    let sequence = u64::try_from(row?)
+                        .map_err(|_| invalid("recent observation sequence must be positive"))?;
+                    sequences.push(sequence);
+                }
+                let window =
+                    ObservationRecentWindowV1::from_descending_sequences(request, &sequences)
+                        .map_err(invalid)?;
+                Ok(ObservationReadResultV1::RecentWindow(window))
             }
             ObservationReadOperationV1::NextQueuedProjection { now_micros } => {
                 let observation_id = snapshot

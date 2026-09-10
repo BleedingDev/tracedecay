@@ -1354,3 +1354,640 @@ fn every_compile_refusal_carries_a_stable_code() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+fn canonical_observation_provenance(branch: &str, revision: &str) -> ProviderItemProvenanceV1 {
+    use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
+    let mut scope = scope_value(&admitted_scope());
+    scope["branch_identity"] = serde_json::json!(branch);
+    let source: RecallSourceAttributionV1 = serde_json::from_value(serde_json::json!({
+        "source": {"canonical_provider_id": "claude", "canonical_session_id": "session-original", "source_key": "source-original", "stable_record_id": null,
+            "observation_id": "observation-original", "source_revision": revision, "content_sha256": ONE_SHA},
+        "origin_scope": {"state": "recorded", "exact_scope_identity": scope, "authority_ref": "host-original"},
+        "source_sequence": 7, "occurred_at": null, "ingested_at": "2025-01-01T00:00:00.000000Z",
+        "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null},
+    })).unwrap();
+    source.to_owned_attribution().unwrap();
+    ProviderItemProvenanceV1::Hydrated {
+        evidence: tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalObservations {
+            sources: vec![source],
+        },
+    }
+}
+
+#[test]
+fn final_provenance_evidence_preserves_original_sources_and_binds_revision_and_scope() {
+    for form in [
+        ContextPackRenderFormV1::Json,
+        ContextPackRenderFormV1::Markdown,
+    ] {
+        let compile = |provenance: ProviderItemProvenanceV1| {
+            let mut item = provider_item("candidate-original", "retained source content");
+            item.provenance = provenance;
+            compile_context_pack(
+                ContextPackPolicyV1::new(12_000, 6_000, form).unwrap(),
+                &CANONICAL,
+                &[],
+                &lane(contribution(vec![item])),
+            )
+            .unwrap()
+        };
+        let provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
+        let expected = match &provenance {
+            ProviderItemProvenanceV1::Hydrated { evidence } => {
+                serde_json::to_value(evidence).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let original = compile(provenance.clone());
+        let revision = compile(canonical_observation_provenance(
+            "refs/heads/a",
+            "revision-2",
+        ));
+        let scope = compile(canonical_observation_provenance(
+            "refs/heads/b",
+            "revision-1",
+        ));
+        for changed in [&revision, &scope] {
+            let original_item = &original
+                .section(ContextSectionKind::ProviderMemory)
+                .unwrap()
+                .items[0];
+            let changed_item = &changed
+                .section(ContextSectionKind::ProviderMemory)
+                .unwrap()
+                .items[0];
+            assert_eq!(original_item.item_id, changed_item.item_id);
+            assert_eq!(original_item.content, changed_item.content);
+            assert_eq!(
+                original_item.tokens, changed_item.tokens,
+                "same-size metadata must not rely on token counts to change the hash"
+            );
+            assert_ne!(original.pack_hash, changed.pack_hash);
+            assert_ne!(
+                sha256_hex(original.rendered.as_bytes()),
+                sha256_hex(changed.rendered.as_bytes())
+            );
+        }
+        assert!(original.rendered.contains("session-original"));
+        assert!(original.rendered.contains("revision-1"));
+        assert!(original.rendered.contains("source-original"));
+        match form {
+            ContextPackRenderFormV1::Json => {
+                let rendered: serde_json::Value = serde_json::from_str(&original.rendered).unwrap();
+                let candidate = &rendered
+                    [tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"]
+                    [0];
+                assert_eq!(candidate["provenance"], provenance.human_label());
+                assert_eq!(candidate["provenance_evidence"], expected);
+            }
+            ContextPackRenderFormV1::Markdown => {
+                assert!(original.rendered.contains(&provenance.human_label()));
+                assert!(
+                    original
+                        .rendered
+                        .contains(&format!("provenance_evidence={expected}"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn confirmed_source_evidence_is_charged_before_candidate_budget_admission() {
+    for form in [
+        ContextPackRenderFormV1::Json,
+        ContextPackRenderFormV1::Markdown,
+    ] {
+        let mut item = provider_item("candidate-original", "retained source content");
+        item.provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
+        let rich = contribution(vec![item.clone()]);
+        let roomy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
+        let full = compile_context_pack(roomy, &CANONICAL, &[], &lane(rich.clone())).unwrap();
+        let quota = full.advisory_tokens() - 1;
+        let tight = ContextPackPolicyV1::new(12_000, quota, form).unwrap();
+        let withheld = compile_context_pack(tight, &CANONICAL, &[], &lane(rich)).unwrap();
+        assert!(
+            withheld
+                .section(ContextSectionKind::ProviderMemory)
+                .is_none()
+        );
+        assert_eq!(withheld.excluded_provider_items.len(), 1);
+        assert!(!withheld.rendered.contains("session-original"));
+        assert!(!withheld.rendered.contains("retained source content"));
+        item.provenance = ProviderItemProvenanceV1::Hydrated {
+            evidence: tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalRecord {
+                record_id: "observation-original".to_owned(),
+            },
+        };
+        let smaller =
+            compile_context_pack(tight, &CANONICAL, &[], &lane(contribution(vec![item]))).unwrap();
+        assert_eq!(
+            smaller
+                .section(ContextSectionKind::ProviderMemory)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(full.advisory_tokens() > smaller.advisory_tokens());
+    }
+}
+
+#[test]
+fn unconfirmed_and_redacted_states_never_render_confirmed_original_sources() {
+    for provenance in [
+        ProviderItemProvenanceV1::Unknown,
+        ProviderItemProvenanceV1::Redacted {
+            reason: "provider redacted".to_owned(),
+        },
+        ProviderItemProvenanceV1::Available {
+            source: "record:observation-original".to_owned(),
+        },
+        ProviderItemProvenanceV1::Unresolvable {
+            source: "record:observation-original".to_owned(),
+            reason: "unavailable".to_owned(),
+        },
+    ] {
+        let mut item = provider_item("candidate-original", "advisory content");
+        item.provenance = provenance;
+        let pack = compile_context_pack(
+            ContextPackPolicyV1::new(12_000, 6_000, ContextPackRenderFormV1::Json).unwrap(),
+            &CANONICAL,
+            &[],
+            &lane(contribution(vec![item])),
+        )
+        .unwrap();
+        let rendered: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
+        let candidate = &rendered
+            [tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"][0];
+        assert!(candidate.get("provenance_evidence").is_none());
+        assert!(!pack.rendered.contains("canonical_observations"));
+    }
+}
+
+#[test]
+fn retained_control_references_share_source_provenance_budget_and_hash_accounting() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::{
+        ContextRecallControlRefV1, compile_context_pack_with_control_refs,
+    };
+    for form in [
+        ContextPackRenderFormV1::Json,
+        ContextPackRenderFormV1::Markdown,
+    ] {
+        let mut item = provider_item("candidate-original", "retained source content");
+        item.provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
+        let lane = lane(contribution(vec![item]));
+        let reference = ContextRecallControlRefV1 {
+            trace_ref: format!("recall-trace-v1:{}:{}", "a".repeat(64), "b".repeat(64)),
+            item_ref: "recall-item-v1:2".to_owned(),
+        };
+        let refs = BTreeMap::from([("candidate-original".to_owned(), reference.clone())]);
+        let roomy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
+        let compiled =
+            compile_context_pack_with_control_refs(roomy, &CANONICAL, &[], &lane, &refs).unwrap();
+        let mut changed_refs = refs.clone();
+        changed_refs.get_mut("candidate-original").unwrap().item_ref =
+            "recall-item-v1:3".to_owned();
+        let changed =
+            compile_context_pack_with_control_refs(roomy, &CANONICAL, &[], &lane, &changed_refs)
+                .unwrap();
+        assert_eq!(compiled.advisory_tokens(), changed.advisory_tokens());
+        assert_ne!(compiled.pack_hash, changed.pack_hash);
+        assert_ne!(compiled.rendered, changed.rendered);
+        assert!(compiled.rendered.contains(&reference.trace_ref));
+        assert!(compiled.rendered.contains(&reference.item_ref));
+        assert!(compiled.rendered.contains("session-original"));
+        assert!(compiled.rendered.contains("observation-original"));
+        let ordinary = compile_context_pack(roomy, &CANONICAL, &[], &lane).unwrap();
+        assert!(!ordinary.rendered.contains("recall-trace-v1:"));
+        assert!(!ordinary.rendered.contains("recall-item-v1:"));
+        assert!(compiled.advisory_tokens() > ordinary.advisory_tokens());
+        let tight = ContextPackPolicyV1::new(12_000, compiled.advisory_tokens() - 1, form).unwrap();
+        let withheld =
+            compile_context_pack_with_control_refs(tight, &CANONICAL, &[], &lane, &refs).unwrap();
+        assert!(
+            withheld
+                .section(ContextSectionKind::ProviderMemory)
+                .is_none()
+        );
+        assert!(!withheld.rendered.contains("recall-trace-v1:"));
+        assert!(!withheld.rendered.contains("retained source content"));
+        assert_eq!(
+            compile_context_pack(tight, &CANONICAL, &[], &lane)
+                .unwrap()
+                .section(ContextSectionKind::ProviderMemory)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        if form == ContextPackRenderFormV1::Json {
+            let value: serde_json::Value = serde_json::from_str(&compiled.rendered).unwrap();
+            let evidence = &value
+                [tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"]
+                [0]["provenance_evidence"];
+            assert_eq!(evidence["kind"], "canonical_observations");
+            assert_eq!(
+                evidence["sources"][0]["source"]["observation_id"],
+                "observation-original"
+            );
+            assert_eq!(evidence["recall"], serde_json::to_value(reference).unwrap());
+        }
+    }
+}
+
+#[test]
+fn control_render_input_is_bounded_and_requires_confirmed_original_sources() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::{
+        ContextRecallControlRefV1, compile_context_pack_with_control_refs,
+    };
+    let reference = ContextRecallControlRefV1 {
+        trace_ref: format!("recall-trace-v1:{}:{}", "a".repeat(64), "b".repeat(64)),
+        item_ref: "recall-item-v1:2".to_owned(),
+    };
+    let mut item = provider_item("candidate-original", "advisory content");
+    let refs = BTreeMap::from([("candidate-original".to_owned(), reference.clone())]);
+    let policy = ContextPackPolicyV1::new(12_000, 6_000, MARKDOWN).unwrap();
+    for provenance in [
+        ProviderItemProvenanceV1::Unknown,
+        ProviderItemProvenanceV1::Redacted {
+            reason: "redacted".to_owned(),
+        },
+        ProviderItemProvenanceV1::Available {
+            source: "record:claimed".to_owned(),
+        },
+        ProviderItemProvenanceV1::Hydrated {
+            evidence: tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalRecord {
+                record_id: "fact-id".to_owned(),
+            },
+        },
+    ] {
+        item.provenance = provenance;
+        assert!(
+            compile_context_pack_with_control_refs(
+                policy,
+                &CANONICAL,
+                &[],
+                &lane(contribution(vec![item.clone()])),
+                &refs
+            )
+            .is_err()
+        );
+    }
+    item.provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
+    let too_many = (0..9)
+        .map(|index| (format!("candidate.{index}"), reference.clone()))
+        .collect();
+    assert!(
+        compile_context_pack_with_control_refs(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane(contribution(vec![item.clone()])),
+            &too_many
+        )
+        .is_err()
+    );
+    let mut hostile = refs.clone();
+    let _ = hostile
+        .get_mut("candidate-original")
+        .unwrap()
+        .trace_ref
+        .pop();
+    hostile
+        .get_mut("candidate-original")
+        .unwrap()
+        .trace_ref
+        .push('\n');
+    assert!(
+        compile_context_pack_with_control_refs(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane(contribution(vec![item.clone()])),
+            &hostile
+        )
+        .is_err()
+    );
+    if let ProviderItemProvenanceV1::Hydrated {
+        evidence:
+            tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalObservations { sources },
+    } = &mut item.provenance
+    {
+        *sources = vec![sources[0].clone(); 65];
+    }
+    assert!(
+        compile_context_pack_with_control_refs(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane(contribution(vec![item])),
+            &refs
+        )
+        .is_err()
+    );
+}
+
+fn settled_replay_metadata()
+-> tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayV1 {
+    use tracedecay_memory_provider_registry::recall_context_pack::{
+        CanonicalHistoryReplayBatchV1, CanonicalHistoryReplayV1,
+    };
+    CanonicalHistoryReplayV1 {
+        provider_id: "provider.native".to_owned(),
+        registration_revision: 7,
+        delivery_scope: tracedecay_memory_provider_registry::RecallOutcomeScopeV1 {
+            profile_id: "profile.replay".to_owned(),
+            project_id: "project.replay".to_owned(),
+            repository_identity: "repository.replay".to_owned(),
+            worktree_identity: "worktree.replay".to_owned(),
+            branch_identity: "refs/heads/replay".to_owned(),
+            agent_session_id: "session.replay".to_owned(),
+            resolved_scope_digest: format!("sha256:{}", "1".repeat(64)),
+        },
+        batches: vec![
+            CanonicalHistoryReplayBatchV1 {
+                observation_batch_ref: format!("host-observation-batch-v1:{}", "a".repeat(64)),
+                first_source_sequence: 11,
+                last_source_sequence: 12,
+                observation_count: 2,
+            },
+            CanonicalHistoryReplayBatchV1 {
+                observation_batch_ref: format!("host-observation-batch-v1:{}", "b".repeat(64)),
+                first_source_sequence: 18,
+                last_source_sequence: 18,
+                observation_count: 1,
+            },
+        ],
+    }
+}
+
+#[test]
+fn settled_replay_metadata_is_budgeted_and_hashed_even_with_zero_recall_candidates() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::compile_context_pack_with_control_metadata;
+    let lane = lane(contribution(Vec::new()));
+    let metadata = settled_replay_metadata();
+    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
+        let policy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
+        let pack = compile_context_pack_with_control_metadata(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&metadata),
+            None,
+        )
+        .unwrap();
+        assert!(pack.items().next().is_none());
+        assert_eq!(pack.canonical_history_replay.as_ref(), Some(&metadata));
+        let wire = if form == ContextPackRenderFormV1::Json {
+            let rendered: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
+            assert_eq!(
+                rendered[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"],
+                serde_json::json!([])
+            );
+            rendered[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["canonical_history_replay"].clone()
+        } else {
+            let line = pack
+                .rendered
+                .lines()
+                .find_map(|line| line.strip_prefix("canonical_history_replay="))
+                .unwrap();
+            serde_json::from_str(line).unwrap()
+        };
+        assert_eq!(wire, serde_json::to_value(&metadata).unwrap());
+        assert_eq!(wire["batches"][0]["last_source_sequence"], 12);
+        assert_eq!(wire["batches"][1]["first_source_sequence"], 18);
+        assert_eq!(wire["batches"].as_array().unwrap().len(), 2);
+        let ordinary = compile_context_pack(policy, &CANONICAL, &[], &lane).unwrap();
+        assert!(ordinary.canonical_history_replay.is_none());
+        assert!(!ordinary.rendered.contains("canonical_history_replay"));
+        assert!(pack.advisory_tokens() > ordinary.advisory_tokens());
+        assert!(pack.rendered_tokens <= policy.total_token_budget());
+        assert!(pack.advisory_tokens() <= policy.advisory_token_quota());
+        let mut changed = metadata.clone();
+        changed.delivery_scope.agent_session_id = "session.replay-other".to_owned();
+        let changed = compile_context_pack_with_control_metadata(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&changed),
+            None,
+        )
+        .unwrap();
+        assert_ne!(pack.pack_hash, changed.pack_hash);
+        let mut empty = metadata.clone();
+        empty.batches.clear();
+        let empty = compile_context_pack_with_control_metadata(
+            policy,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&empty),
+            None,
+        )
+        .unwrap();
+        assert!(empty.canonical_history_replay.unwrap().batches.is_empty());
+        assert!(empty.rendered.contains("canonical_history_replay"));
+    }
+}
+
+#[test]
+fn replay_metadata_that_does_not_fit_is_neither_published_nor_hashed() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::compile_context_pack_with_control_metadata;
+    let lane = lane(contribution(Vec::new()));
+    let metadata = settled_replay_metadata();
+    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
+        let roomy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
+        let full = compile_context_pack_with_control_metadata(
+            roomy,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&metadata),
+            None,
+        )
+        .unwrap();
+        let ordinary = compile_context_pack(roomy, &CANONICAL, &[], &lane).unwrap();
+        assert!(full.advisory_tokens() > ordinary.advisory_tokens());
+        let tight = ContextPackPolicyV1::new(12_000, ordinary.advisory_tokens(), form).unwrap();
+        let withheld = compile_context_pack_with_control_metadata(
+            tight,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&metadata),
+            None,
+        )
+        .unwrap();
+        assert!(withheld.canonical_history_replay.is_none());
+        assert!(!withheld.rendered.contains("canonical_history_replay"));
+        assert!(!withheld.rendered.contains("host-observation-batch-v1:"));
+        assert_eq!(withheld.advisory_tokens(), 0);
+        let mut changed = metadata.clone();
+        changed.batches[0].observation_batch_ref =
+            format!("host-observation-batch-v1:{}", "c".repeat(64));
+        let changed = compile_context_pack_with_control_metadata(
+            tight,
+            &CANONICAL,
+            &[],
+            &lane,
+            &BTreeMap::new(),
+            Some(&changed),
+            None,
+        )
+        .unwrap();
+        assert!(changed.canonical_history_replay.is_none());
+        assert_eq!(withheld.pack_hash, changed.pack_hash);
+        assert_eq!(withheld.rendered, changed.rendered);
+    }
+}
+
+#[test]
+fn replay_projection_refuses_wrong_owner_invalid_scope_and_invented_contiguous_ranges() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::{
+        CanonicalHistoryReplayV1, compile_context_pack_with_control_metadata,
+    };
+    let lane = lane(contribution(Vec::new()));
+    let policy = ContextPackPolicyV1::new(12_000, 6_000, MARKDOWN).unwrap();
+    let changes: [fn(&mut CanonicalHistoryReplayV1); 11] = [
+        |value| value.provider_id = "provider.other".to_owned(),
+        |value| value.registration_revision = 8,
+        |value| value.delivery_scope.agent_session_id.clear(),
+        |value| value.delivery_scope.branch_identity.push('\n'),
+        |value| {
+            value.batches[0].first_source_sequence = 0;
+            value.batches[0].last_source_sequence = 1;
+        },
+        |value| value.batches[1].first_source_sequence = 12,
+        |value| value.batches[0].observation_count = 3,
+        |value| {
+            value.batches[0].last_source_sequence = 18;
+            value.batches.truncate(1);
+            value.batches[0].observation_count = 3;
+        },
+        |value| value.batches[0].observation_batch_ref.push('x'),
+        |value| {
+            value.batches[1].observation_batch_ref = value.batches[0].observation_batch_ref.clone()
+        },
+        |value| value.batches = vec![value.batches[0].clone(); 257],
+    ];
+    for change in changes {
+        let mut metadata = settled_replay_metadata();
+        change(&mut metadata);
+        assert!(
+            compile_context_pack_with_control_metadata(
+                policy,
+                &CANONICAL,
+                &[],
+                &lane,
+                &BTreeMap::new(),
+                Some(&metadata),
+                None,
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        compile_context_pack_with_control_metadata(
+            policy,
+            &CANONICAL,
+            &[],
+            &NO_LANE,
+            &BTreeMap::new(),
+            Some(&settled_replay_metadata()),
+            None,
+        )
+        .is_err()
+    );
+    let mut largest = settled_replay_metadata();
+    largest.batches = (0..256).map(|index| {
+        tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayBatchV1 {
+            observation_batch_ref: format!("host-observation-batch-v1:{:064x}", index + 1),
+            first_source_sequence: index * 2 + 1,
+            last_source_sequence: index * 2 + 1,
+            observation_count: 1,
+        }
+    }).collect();
+    let large = compile_context_pack_with_control_metadata(
+        ContextPackPolicyV1::new(200_000, 100_000, MARKDOWN).unwrap(),
+        &CANONICAL,
+        &[],
+        &lane,
+        &BTreeMap::new(),
+        Some(&largest),
+        None,
+    )
+    .unwrap();
+    assert_eq!(large.canonical_history_replay.unwrap().batches.len(), 256);
+}
+
+#[test]
+fn recall_correlation_roundtrips_and_obeys_the_whole_lane_budget() {
+    use std::collections::BTreeMap;
+    use tracedecay_memory_provider_registry::recall_context_pack::{
+        ContextRecallTraceV1, compile_context_pack_with_control_metadata,
+    };
+    let lane = lane(contribution(Vec::new()));
+    let trace = ContextRecallTraceV1 {
+        request_id: "recall.context.actual.empty".to_owned(),
+        trace_ref: format!("recall-trace-v1:{}:{}", "a".repeat(64), "b".repeat(64)),
+    };
+    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
+        let policy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
+        let compile = |policy, trace: &ContextRecallTraceV1| {
+            compile_context_pack_with_control_metadata(
+                policy,
+                &CANONICAL,
+                &[],
+                &lane,
+                &BTreeMap::new(),
+                None,
+                Some(trace),
+            )
+            .unwrap()
+        };
+        let pack = compile(policy, &trace);
+        assert!(pack.items().next().is_none());
+        assert_eq!(pack.recall_trace.as_ref(), Some(&trace));
+        let wire: serde_json::Value = if form == ContextPackRenderFormV1::Json {
+            let json: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
+            json[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"].clone()
+        } else {
+            serde_json::from_str(
+                pack.rendered
+                    .lines()
+                    .find_map(|line| line.strip_prefix("recall_trace="))
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(wire, serde_json::to_value(&trace).unwrap());
+        assert!(pack.rendered_tokens <= policy.total_token_budget());
+        assert!(pack.advisory_tokens() <= policy.advisory_token_quota());
+        let mut changed = trace.clone();
+        changed.request_id.push_str(".other");
+        assert_ne!(pack.pack_hash, compile(policy, &changed).pack_hash);
+        let ordinary = compile_context_pack(policy, &CANONICAL, &[], &lane).unwrap();
+        assert!(ordinary.recall_trace.is_none());
+        assert!(!ordinary.rendered.contains("recall_trace"));
+        assert!(pack.advisory_tokens() > ordinary.advisory_tokens());
+        let tight = ContextPackPolicyV1::new(12_000, ordinary.advisory_tokens(), form).unwrap();
+        let withheld = compile(tight, &trace);
+        assert!(withheld.recall_trace.is_none());
+        assert!(!withheld.rendered.contains("recall-trace-v1:"));
+        assert_eq!(withheld.advisory_tokens(), 0);
+        assert_eq!(withheld.pack_hash, compile(tight, &changed).pack_hash);
+    }
+}

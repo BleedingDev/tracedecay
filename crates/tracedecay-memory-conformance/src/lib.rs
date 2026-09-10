@@ -24,6 +24,9 @@
 //! [`ScenarioIdentity`].
 
 pub mod adversarial;
+pub mod compatibility;
+/// Trusted real-provider fixture authority and lossless test-child transport.
+pub mod real_fixture;
 mod baseline;
 mod canonical;
 mod error;

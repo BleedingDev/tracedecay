@@ -7,24 +7,11 @@
 //! readiness pass into the same [`ProviderReadinessTargetV1`] the root already
 //! consumes.
 //!
-//! # Why the composed provider set is a real lifecycle adapter
-//!
-//! The first mounted provider is TraceDecay Native, and it is constructed
-//! in-process by [`ProjectMemoryProviderComposition`]. Its instance therefore
-//! has no lifetime distinct from the composition: there is no child to spawn
-//! and none to reap, so [`CompositionLifecycleAdapterV1::start`] performs no
-//! spawn and [`CompositionLifecycleAdapterV1::request_stop`] confirms death
-//! immediately. That is stated plainly rather than dressed up — for this
-//! topology supervision contributes **readiness validation, typed
-//! degradation, enforced restart pacing, and exact-scope ownership**, not
-//! process control. What it does *not* do is claim readiness from
-//! construction: `start` returning `Ok` proves nothing, and the supervisor
-//! still requires a fully validated handshake through the fabric before this
-//! adapter's provider is `Ready`.
-//!
-//! A process topology (ADR-0009 for NCM, bead `tdmem-0703`) implements the
-//! same trait with a real spawn, a real wait, and a real kill; nothing in the
-//! supervisor or in this owner changes when it does.
+//! Lifecycle control is bound to the actual provider registration. Owned
+//! runtimes delegate to the existing admitted owner; composition-bound adapters
+//! only retire readiness and have no separate incarnation to reap. Neither a
+//! bounded handshake wrapper nor its abandonment proves that provider execution
+//! was killed. The invocation boundary accounts for outstanding host work.
 //!
 //! # One owner per exact scope, bounded
 //!
@@ -51,17 +38,18 @@ use crate::supervisor::{
 };
 use crate::{
     CancellationToken, FabricError, HandshakeRequest, HandshakeResponse, OperationControl,
-    OwnedProviderId, ProjectMemoryProviderComposition, ProviderLimits, ProviderReadinessTargetV1,
+    OwnedProviderId, ProjectMemoryProviderComposition, ProviderLifecycleOwnerErrorV1,
+    ProviderLifecycleOwnershipV1, ProviderLimits, ProviderReadinessTargetV1,
 };
 
 /// A concrete [`ProviderLifecycleAdapterV1`] over one composed provider set.
 ///
-/// The adapter owns no process. Its readiness path is the real fabric
-/// handshake against the registered provider, so a supervisor driving it
-/// observes real terminals, real descriptors, and real negotiated limits.
+/// Lifecycle transitions delegate to the bound registration's existing owner.
+/// Readiness still comes only from the real fabric handshake.
 pub struct CompositionLifecycleAdapterV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
     isolation: Arc<dyn BoundedProviderCallV1>,
+    provider_id: Option<OwnedProviderId>,
 }
 
 impl CompositionLifecycleAdapterV1 {
@@ -78,10 +66,45 @@ impl CompositionLifecycleAdapterV1 {
         composition: Arc<ProjectMemoryProviderComposition>,
         isolation: Arc<dyn BoundedProviderCallV1>,
     ) -> Self {
+        let provider_id = composition
+            .registry()
+            .and_then(|registry| registry.selected_registration())
+            .map(|registration| registration.provider_id.clone());
         Self {
             composition,
             isolation,
+            provider_id,
         }
+    }
+
+    /// Binds lifecycle control to the provider the exact-scope supervisor owns,
+    /// including an independently mounted observer.
+    #[must_use]
+    pub fn for_provider(
+        composition: Arc<ProjectMemoryProviderComposition>,
+        isolation: Arc<dyn BoundedProviderCallV1>,
+        provider_id: OwnedProviderId,
+    ) -> Self {
+        Self {
+            composition,
+            isolation,
+            provider_id: Some(provider_id),
+        }
+    }
+
+    fn lifecycle(&self) -> Result<&ProviderLifecycleOwnershipV1, CompositionLifecycleError> {
+        let registry = self
+            .composition
+            .registry()
+            .ok_or(CompositionLifecycleError::CompositionDisabled)?;
+        let provider_id = self
+            .provider_id
+            .as_ref()
+            .ok_or(CompositionLifecycleError::ProviderNotRegistered)?;
+        registry
+            .registration(provider_id)
+            .map(|registration| &registration.lifecycle)
+            .ok_or(CompositionLifecycleError::ProviderNotRegistered)
     }
 }
 
@@ -155,6 +178,15 @@ pub trait BoundedProviderCallV1: Send + Sync + fmt::Debug {
 /// Failure of one [`CompositionLifecycleAdapterV1`] call.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CompositionLifecycleError {
+    /// The bound provider is absent; another registration cannot stand in for it.
+    #[error("bound provider is not registered in this composition")]
+    ProviderNotRegistered,
+    /// A request attempted to use a different provider's lifecycle owner.
+    #[error("handshake provider differs from the bound lifecycle owner")]
+    ProviderIdentityMismatch,
+    /// The existing runtime owner could not prove the requested transition.
+    #[error("provider lifecycle owner failed: {0}")]
+    Owner(#[source] ProviderLifecycleOwnerErrorV1),
     /// Composition is disabled, so no provider instance exists to supervise.
     /// This is the typed unavailability a disabled configuration produces; it
     /// is never a fabricated readiness.
@@ -183,17 +215,16 @@ impl ProviderLifecycleAdapterV1 for CompositionLifecycleAdapterV1 {
     type Error = CompositionLifecycleError;
 
     fn start(&self, deadline_unix_micros: i64) -> Result<(), Self::Error> {
-        // No spawn: the in-process instance is the composed provider set. The
-        // only real precondition is that a provider set exists at all, and
-        // this is emphatically not a readiness claim — the supervisor still
-        // requires a validated handshake next.
-        if self.composition.registry().is_none() {
-            return Err(CompositionLifecycleError::CompositionDisabled);
-        }
+        let lifecycle = self.lifecycle()?;
         if deadline_unix_micros <= 0 {
             return Err(CompositionLifecycleError::DeadlineElapsed { operation: "start" });
         }
-        Ok(())
+        match lifecycle {
+            ProviderLifecycleOwnershipV1::CompositionBound => Ok(()),
+            ProviderLifecycleOwnershipV1::Owned(owner) => owner
+                .start(deadline_unix_micros)
+                .map_err(CompositionLifecycleError::Owner),
+        }
     }
 
     fn handshake(
@@ -203,6 +234,10 @@ impl ProviderLifecycleAdapterV1 for CompositionLifecycleAdapterV1 {
     ) -> Result<HandshakeResponse, Self::Error> {
         if self.composition.registry().is_none() {
             return Err(CompositionLifecycleError::CompositionDisabled);
+        }
+        self.lifecycle()?;
+        if self.provider_id.as_ref() != Some(&request.provider_id) {
+            return Err(CompositionLifecycleError::ProviderIdentityMismatch);
         }
         if deadline_unix_micros <= 0 {
             return Err(CompositionLifecycleError::DeadlineElapsed {
@@ -245,14 +280,39 @@ impl ProviderLifecycleAdapterV1 for CompositionLifecycleAdapterV1 {
             .map_err(CompositionLifecycleError::Isolation)?
     }
 
-    fn request_stop(&self, _deadline_unix_micros: i64) -> Result<bool, Self::Error> {
-        // An in-process incarnation has nothing that outlives this call, so
-        // death is confirmed here rather than escalated to `kill`.
-        Ok(true)
+    fn request_stop(&self, deadline_unix_micros: i64) -> Result<bool, Self::Error> {
+        // Disabled composition never constructed a runtime, so there is no
+        // predecessor to terminate. Missing providers in enabled compositions
+        // still fail through lifecycle() rather than fabricating termination.
+        if matches!(
+            self.composition.as_ref(),
+            ProjectMemoryProviderComposition::Disabled
+        ) {
+            return Ok(true);
+        }
+        match self.lifecycle()? {
+            // No distinct runtime instance is owned. This retires readiness,
+            // never claims that an outstanding invocation thread was killed.
+            ProviderLifecycleOwnershipV1::CompositionBound => Ok(true),
+            ProviderLifecycleOwnershipV1::Owned(owner) => owner
+                .request_stop(deadline_unix_micros)
+                .map_err(CompositionLifecycleError::Owner),
+        }
     }
 
-    fn kill(&self, _deadline_unix_micros: i64) -> Result<(), Self::Error> {
-        Ok(())
+    fn kill(&self, deadline_unix_micros: i64) -> Result<(), Self::Error> {
+        if matches!(
+            self.composition.as_ref(),
+            ProjectMemoryProviderComposition::Disabled
+        ) {
+            return Ok(());
+        }
+        match self.lifecycle()? {
+            ProviderLifecycleOwnershipV1::CompositionBound => Ok(()),
+            ProviderLifecycleOwnershipV1::Owned(owner) => owner
+                .kill(deadline_unix_micros)
+                .map_err(CompositionLifecycleError::Owner),
+        }
     }
 }
 
@@ -428,7 +488,11 @@ impl SupervisedScopeReadinessV1 {
             .map_err(SupervisedReadinessError::Config)?;
         let exact_scope_sha256 = scope.exact_scope_sha256().to_owned();
         let supervisor = ProviderSupervisorV1::new(
-            CompositionLifecycleAdapterV1::new(composition, isolation),
+            CompositionLifecycleAdapterV1::for_provider(
+                composition,
+                isolation,
+                scope.provider_id().clone(),
+            ),
             scope,
             config.restart_budget,
             config.shutdown_budget,
@@ -459,7 +523,11 @@ impl SupervisedScopeReadinessV1 {
             .map_err(SupervisedReadinessError::Config)?;
         let exact_scope_sha256 = scope.exact_scope_sha256().to_owned();
         let supervisor = ProviderSupervisorV1::new(
-            CompositionLifecycleAdapterV1::new(composition, isolation),
+            CompositionLifecycleAdapterV1::for_provider(
+                composition,
+                isolation,
+                scope.provider_id().clone(),
+            ),
             scope,
             config.restart_budget,
             config.shutdown_budget,

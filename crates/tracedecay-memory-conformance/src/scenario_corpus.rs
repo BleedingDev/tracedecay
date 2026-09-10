@@ -296,10 +296,124 @@ impl RecallRequestOperation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecallTemporalQuery {
-    /// Temporal mode; the corpus pins `current`.
+    /// Closed canonical temporal mode: current, as_of, interval, or history.
     pub mode: String,
-    /// Fixed RFC 3339 evaluation instant.
+    /// Fixed UTC RFC 3339 evaluation instant, preserving nanosecond precision.
     pub evaluation_time: String,
+    /// Requested historical instant, required only for as_of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<String>,
+    /// Inclusive interval start, required only for interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_start: Option<String>,
+    /// Exclusive interval end, required only for interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_end: Option<String>,
+    /// Include retained superseded sources; privacy deletion still dominates.
+    #[serde(default)]
+    pub include_superseded: bool,
+    /// Include ordinary revocations; privacy deletion still dominates.
+    #[serde(default)]
+    pub include_revoked: bool,
+    /// Explicit unknown-validity policy; legacy current fixtures default to exclude.
+    #[serde(default = "exclude_unknown_validity")]
+    pub unknown_validity_policy: String,
+}
+
+fn exclude_unknown_validity() -> String {
+    "exclude".into()
+}
+
+impl RecallTemporalQuery {
+    /// Validates closed modes, mode-specific bounds and canonical UTC ordering.
+    pub fn valid_shape(&self) -> bool {
+        let Some(evaluation) = utc_ordering_key(&self.evaluation_time) else {
+            return false;
+        };
+        if !matches!(
+            self.unknown_validity_policy.as_str(),
+            "exclude" | "degrade" | "allow_with_warning"
+        ) {
+            return false;
+        }
+        match self.mode.as_str() {
+            "current" | "history" => {
+                self.as_of.is_none() && self.interval_start.is_none() && self.interval_end.is_none()
+            }
+            "as_of" => {
+                self.interval_start.is_none()
+                    && self.interval_end.is_none()
+                    && self
+                        .as_of
+                        .as_deref()
+                        .and_then(utc_ordering_key)
+                        .is_some_and(|at| at <= evaluation)
+            }
+            "interval" => {
+                self.as_of.is_none()
+                    && match (
+                        self.interval_start.as_deref().and_then(utc_ordering_key),
+                        self.interval_end.as_deref().and_then(utc_ordering_key),
+                    ) {
+                        (Some(start), Some(end)) => start < end,
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
+}
+
+// Corpus timestamps have canonical UTC Z form. Normalize fractional precision
+// before comparing; string ordering alone puts .000000001Z before Z.
+pub(crate) fn utc_ordering_key(value: &str) -> Option<(String, u32)> {
+    let utc = value.strip_suffix('Z')?;
+    let (seconds, fraction) = utc.split_once('.').unwrap_or((utc, ""));
+    if seconds.len() != 19
+        || fraction.len() > 9
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    for (index, byte) in seconds.bytes().enumerate() {
+        let expected = match index {
+            4 | 7 => Some(b'-'),
+            10 => Some(b'T'),
+            13 | 16 => Some(b':'),
+            _ => None,
+        };
+        if expected.map_or_else(|| !byte.is_ascii_digit(), |expected| byte != expected) {
+            return None;
+        }
+    }
+    let month = seconds[5..7].parse::<u32>().ok()?;
+    let day = seconds[8..10].parse::<u32>().ok()?;
+    let year = seconds[..4].parse::<u32>().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day == 0
+        || day > days
+        || seconds[11..13].parse::<u32>().ok()? > 23
+        || seconds[14..16].parse::<u32>().ok()? > 59
+        || seconds[17..19].parse::<u32>().ok()? > 59
+    {
+        return None;
+    }
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse::<u32>()
+            .ok()?
+            .checked_mul(10_u32.pow(9 - fraction.len() as u32))?
+    };
+    Some((seconds.into(), nanos))
 }
 
 /// Finite recall budgets.
@@ -494,6 +608,85 @@ pub enum ScenarioStep {
         /// Exact source key to forget.
         forget_source_key: String,
     },
+    /// Apply settled feedback to a retained stable target.
+    Feedback {
+        /// One-based step number.
+        step: u32,
+        /// Earlier target-producing request identity.
+        target_request_id: String,
+        /// Settled helpful/harmful/ignored/corrected/superseded signal.
+        signal: String,
+    },
+    /// Correct an existing provider target with a canonical replacement observation.
+    Correction {
+        /// One-based step number.
+        step: u32,
+        /// Earlier target-producing request identity.
+        target_request_id: String,
+        /// Canonical replacement observation identity.
+        replacement_observation_id: String,
+        /// Exact opaque source revision being replaced.
+        expected_target_revision: String,
+        /// Canonical correction kind.
+        correction_kind: String,
+    },
+    /// Export provider-specific state through the provider operation.
+    SnapshotExport {
+        /// One-based step number.
+        step: u32,
+        /// Fixture-local snapshot reference.
+        snapshot_id: String,
+    },
+    /// Restore an earlier snapshot after current host disposition revalidation.
+    SnapshotRestore {
+        /// One-based step number.
+        step: u32,
+        /// Earlier exported snapshot reference.
+        snapshot_id: String,
+        /// Select an empty physical namespace under the same exact logical scope.
+        fresh_namespace: bool,
+    },
+    /// Install genuinely encoded legacy state through the host fixture.
+    InstallLegacyState {
+        /// One-based step number.
+        step: u32,
+        /// Fixture state identity.
+        state_id: String,
+        /// Actual persisted legacy format version.
+        stored_version: u64,
+    },
+    /// Change persisted payload bytes while retaining the old claimed digest.
+    CorruptPersistedState {
+        /// One-based step number.
+        step: u32,
+        /// Fixture state identity.
+        state_id: String,
+        /// The stored claimed digest remains unchanged.
+        preserve_claimed_digest: bool,
+    },
+    /// Change the host lifecycle configuration for the selected provider.
+    SetProviderMode {
+        /// One-based step number.
+        step: u32,
+        /// Canonical provider mode.
+        mode: String,
+    },
+    /// Cancel an observation before provider dispatch.
+    CancelBeforeDispatch {
+        /// One-based step number.
+        step: u32,
+        /// Canonical observation identity.
+        observation_id: String,
+    },
+    /// Lose an observation reply after its durable commit is witnessed.
+    LoseReplyAfterCommit {
+        /// One-based step number.
+        step: u32,
+        /// Canonical observation identity.
+        observation_id: String,
+        /// Operation identity retained for later delivery reconciliation.
+        operation_id: String,
+    },
     /// Verify that a catalogued recall admits nothing.
     VerifyAbsence {
         /// One-based step number.
@@ -522,6 +715,15 @@ impl ScenarioStep {
             | Self::LoadProviderState { step, .. }
             | Self::Health { step, .. }
             | Self::DeleteBySource { step, .. }
+            | Self::Feedback { step, .. }
+            | Self::Correction { step, .. }
+            | Self::SnapshotExport { step, .. }
+            | Self::SnapshotRestore { step, .. }
+            | Self::InstallLegacyState { step, .. }
+            | Self::CorruptPersistedState { step, .. }
+            | Self::SetProviderMode { step, .. }
+            | Self::CancelBeforeDispatch { step, .. }
+            | Self::LoseReplyAfterCommit { step, .. }
             | Self::VerifyAbsence { step, .. } => *step,
         }
     }
@@ -544,6 +746,15 @@ impl ScenarioStep {
             Self::LoadProviderState { .. } => "load_provider_state",
             Self::Health { .. } => "health",
             Self::DeleteBySource { .. } => "delete_by_source",
+            Self::Feedback { .. } => "feedback",
+            Self::Correction { .. } => "correction",
+            Self::SnapshotExport { .. } => "snapshot_export",
+            Self::SnapshotRestore { .. } => "snapshot_restore",
+            Self::InstallLegacyState { .. } => "install_legacy_state",
+            Self::CorruptPersistedState { .. } => "corrupt_persisted_state",
+            Self::SetProviderMode { .. } => "set_provider_mode",
+            Self::CancelBeforeDispatch { .. } => "cancel_before_dispatch",
+            Self::LoseReplyAfterCommit { .. } => "lose_reply_after_commit",
             Self::VerifyAbsence { .. } => "verify_absence",
         }
     }
@@ -988,9 +1199,7 @@ impl ScenarioCorpus {
                 }
                 RecallRequestOperation::Health => recall_fields_absent,
             };
-            if !well_formed
-                || request.policy_revision == 0
-                || request.temporal_query.mode != "current"
+            if !well_formed || request.policy_revision == 0 || !request.temporal_query.valid_shape()
             {
                 return Err(CorpusError::RecallRequestMismatch {
                     request_id: request.request_id.clone(),
@@ -1175,7 +1384,13 @@ impl ScenarioCorpus {
         };
         match step {
             ScenarioStep::Observe { observation_id, .. }
-            | ScenarioStep::Replay { observation_id, .. } => {
+            | ScenarioStep::Replay { observation_id, .. }
+            | ScenarioStep::CancelBeforeDispatch { observation_id, .. }
+            | ScenarioStep::LoseReplyAfterCommit { observation_id, .. }
+            | ScenarioStep::Correction {
+                replacement_observation_id: observation_id,
+                ..
+            } => {
                 if !observation_ids.contains(observation_id) {
                     return Err(unknown("observation_id", observation_id));
                 }

@@ -80,7 +80,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::{FactEventId, FactId, ProjectId};
 
-use super::RetainedSurfaceOperation;
+use super::{ProviderControlRequestV1, RetainedSurfaceOperation};
 
 /// Output formatting accepted by legacy MCP calls. SDK and HTTP callers use
 /// JSON, but accepting this field keeps the schema aligned with the mounted
@@ -657,6 +657,7 @@ pub enum RetainedSurfaceRequestV1 {
     FactStoreList(FactStoreListRequestV1),
     FactFeedback(FactFeedbackRequestV1),
     MemoryStatus(MemoryStatusRequestV1),
+    ProviderControl(ProviderControlRequestV1),
     SessionRefresh(SessionRefreshRequestV1),
     MessageSearch(MessageSearchRequestV1),
     SessionsFor(SessionsForRequestV1),
@@ -688,6 +689,7 @@ impl RetainedSurfaceRequestV1 {
             Self::FactStoreList(_) => RetainedSurfaceOperation::FactStoreList,
             Self::FactFeedback(_) => RetainedSurfaceOperation::FactFeedback,
             Self::MemoryStatus(_) => RetainedSurfaceOperation::MemoryStatus,
+            Self::ProviderControl(request) => request.operation(),
             Self::SessionRefresh(request) => request.operation(),
             Self::MessageSearch(_) => RetainedSurfaceOperation::MessageSearch,
             Self::SessionsFor(_) => RetainedSurfaceOperation::SessionsFor,

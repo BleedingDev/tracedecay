@@ -29,12 +29,14 @@ use crate::surface_name;
 mod automation;
 mod evidence;
 mod memory;
+mod provider_control;
 mod sdk;
 mod service;
 mod session;
 mod workflow;
 
 pub use evidence::*;
+pub use provider_control::*;
 pub use sdk::*;
 pub use service::*;
 
@@ -55,6 +57,15 @@ pub enum RetainedSurfaceOperation {
     FactStoreList,
     FactFeedback,
     MemoryStatus,
+    ProviderFeedback,
+    ProviderCorrection,
+    ProviderDeleteBySource,
+    ProviderHealth,
+    ProviderInspection,
+    ProviderMaintenance,
+    ProviderSnapshotExport,
+    ProviderSnapshotRestore,
+    ProviderReplay,
     /// Legacy broad MCP translator; never a current catalog capability.
     SessionRefresh,
     SessionRefreshStatus,
@@ -86,6 +97,7 @@ pub enum SdkRequestIdControlV1 {
 pub enum SdkResultSemanticsV1 {
     SchemaOnly,
     FactStoreCurateTerminal,
+    ProviderControlTerminal,
 }
 
 /// SDK-only transport and terminal controls derived from the application owner.
@@ -105,7 +117,7 @@ impl RetainedSdkOperationContractV1 {
 impl RetainedSurfaceOperation {
     /// Canonical catalog operations. The broad `session_refresh` translator is
     /// intentionally not a catalog operation.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 36] = [
         Self::FactStoreCurate,
         Self::FactStoreAdd,
         Self::FactStoreSearch,
@@ -120,6 +132,15 @@ impl RetainedSurfaceOperation {
         Self::FactStoreList,
         Self::FactFeedback,
         Self::MemoryStatus,
+        Self::ProviderFeedback,
+        Self::ProviderCorrection,
+        Self::ProviderDeleteBySource,
+        Self::ProviderHealth,
+        Self::ProviderInspection,
+        Self::ProviderMaintenance,
+        Self::ProviderSnapshotExport,
+        Self::ProviderSnapshotRestore,
+        Self::ProviderReplay,
         Self::SessionRefreshStatus,
         Self::SessionRefreshCancel,
         Self::SessionRefreshBegin,
@@ -138,11 +159,11 @@ impl RetainedSurfaceOperation {
     /// Operations with a current callable transport. Daemon grants, HTTP
     /// routes, and the SDK all derive from this exact mounted set, which is
     /// the full catalog today.
-    pub const CALLABLE: [Self; 27] = Self::ALL;
+    pub const CALLABLE: [Self; 36] = Self::ALL;
 
     /// Every current retained action has an exact project-open production
     /// adapter. SDK clients invoke the operation-selected routes.
-    pub const SDK_EXECUTABLE: [Self; 27] = Self::ALL;
+    pub const SDK_EXECUTABLE: [Self; 36] = Self::ALL;
 
     #[hotpath::skip]
     pub const fn is_callable(self) -> bool {
@@ -156,6 +177,42 @@ impl RetainedSurfaceOperation {
             Self::FactStoreCurate => RetainedSdkOperationContractV1 {
                 request_id: SdkRequestIdControlV1::Required,
                 result_semantics: SdkResultSemanticsV1::FactStoreCurateTerminal,
+            },
+            Self::ProviderFeedback => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderCorrection => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderDeleteBySource => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderHealth => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::ServerMinted,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderInspection => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::ServerMinted,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderMaintenance => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderSnapshotExport => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::ServerMinted,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderSnapshotRestore => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
+            },
+            Self::ProviderReplay => RetainedSdkOperationContractV1 {
+                request_id: SdkRequestIdControlV1::Required,
+                result_semantics: SdkResultSemanticsV1::ProviderControlTerminal,
             },
             _ => RetainedSdkOperationContractV1::DEFAULT,
         }
@@ -178,6 +235,15 @@ impl RetainedSurfaceOperation {
             Self::FactStoreList => "fact_store_list",
             Self::FactFeedback => "fact_feedback",
             Self::MemoryStatus => "memory_status",
+            Self::ProviderFeedback => "provider_feedback",
+            Self::ProviderCorrection => "provider_correction",
+            Self::ProviderDeleteBySource => "provider_delete_by_source",
+            Self::ProviderHealth => "provider_health",
+            Self::ProviderInspection => "provider_inspection",
+            Self::ProviderMaintenance => "provider_maintenance",
+            Self::ProviderSnapshotExport => "provider_snapshot_export",
+            Self::ProviderSnapshotRestore => "provider_snapshot_restore",
+            Self::ProviderReplay => "provider_replay",
             Self::SessionRefresh => "session_refresh",
             Self::SessionRefreshStatus => "session_refresh_status",
             Self::SessionRefreshCancel => "session_refresh_cancel",
@@ -227,6 +293,7 @@ fn surface_specs() -> Vec<&'static RetainedSurfaceSpec> {
     automation::SPECS
         .iter()
         .chain(memory::SPECS.iter())
+        .chain(provider_control::SPECS.iter())
         .chain(session::SPECS.iter())
         .chain(workflow::SPECS.iter())
         .collect()
@@ -515,6 +582,69 @@ fn retained_surface_executable_schemas(
             RetainedSurfaceOperation::Workflows,
             "tracedecay_contracts::retained_surfaces::WorkflowsRequestV1",
             "tracedecay_contracts::retained_surfaces::WorkflowsResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderFeedbackRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderFeedback,
+            "tracedecay_contracts::retained_surfaces::ProviderFeedbackRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderCorrectionRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderCorrection,
+            "tracedecay_contracts::retained_surfaces::ProviderCorrectionRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<
+            ProviderDeleteBySourceRequestV1,
+            ProviderControlResultV1,
+        >(
+            contribution,
+            RetainedSurfaceOperation::ProviderDeleteBySource,
+            "tracedecay_contracts::retained_surfaces::ProviderDeleteBySourceRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderHealthRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderHealth,
+            "tracedecay_contracts::retained_surfaces::ProviderHealthRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderInspectionRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderInspection,
+            "tracedecay_contracts::retained_surfaces::ProviderInspectionRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderMaintenanceRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderMaintenance,
+            "tracedecay_contracts::retained_surfaces::ProviderMaintenanceRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<
+            ProviderSnapshotExportRequestV1,
+            ProviderControlResultV1,
+        >(
+            contribution,
+            RetainedSurfaceOperation::ProviderSnapshotExport,
+            "tracedecay_contracts::retained_surfaces::ProviderSnapshotExportRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<
+            ProviderSnapshotRestoreRequestV1,
+            ProviderControlResultV1,
+        >(
+            contribution,
+            RetainedSurfaceOperation::ProviderSnapshotRestore,
+            "tracedecay_contracts::retained_surfaces::ProviderSnapshotRestoreRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+        )?,
+        retained_surface_executable_schema::<ProviderReplayRequestV1, ProviderControlResultV1>(
+            contribution,
+            RetainedSurfaceOperation::ProviderReplay,
+            "tracedecay_contracts::retained_surfaces::ProviderReplayRequestV1",
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
         )?,
     ])
 }
