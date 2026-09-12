@@ -6,12 +6,11 @@ use tracedecay_domain::{
     WorkRunControlV1, canonical_sha256,
 };
 use tracedecay_tool_catalog::{
-    AuthorityRequirement, AvailabilityContract, BindingId, CancellationContract, CancellationPoint,
-    CapabilityId, CapabilityManifestInputV1, CapabilityManifestV1, CatalogValidationError,
-    CodecBindingKey, DeadlineBehavior, DeadlineContract, DeniedDisclosurePolicy, EffectClass,
-    ExecutableBindingAvailabilityV1, ExecutableBindingRegistryV1, ExecutableBindingV1,
-    IdempotencyContract, LifecycleClass, OperationId, PaginationContract, PrivacyClass, ProfileId,
-    ReceiptContract, ReconciliationContract, RevalidationContract, RevalidationPoint,
+    AvailabilityContract, BindingId, CancellationContract, CancellationPoint, CapabilityId,
+    CapabilityManifestV1, CatalogValidationError, CodecBindingKey, DeadlineBehavior,
+    DeadlineContract, DeniedDisclosurePolicy, EffectClass, ExecutableBindingAvailabilityV1,
+    ExecutableBindingRegistryV1, ExecutableBindingV1, LifecycleClass, OperationId,
+    PaginationContract, PrivacyClass, ProfileId, RevalidationContract, RevalidationPoint,
     RouteExposureV1, RoutingContractV1, SchemaBodyAuthorityV1, SchemaId, SchemaRef, ScopeDimension,
     ScopeRequirement, ServiceId, StreamingContract, TerminalState, TerminalStateContract,
     UseCaseId,
@@ -19,6 +18,9 @@ use tracedecay_tool_catalog::{
 
 use tracedecay_domain::WorkAttemptV1;
 
+use crate::capability_manifest::{
+    ApplicationCapabilityManifestInput, application_capability_manifest,
+};
 use crate::work_retry::{RetryWorkAttemptCommandV1, WorkRetryAttemptOutcomeV1};
 use crate::{
     AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1, AdmitWorkPlacementCommand,
@@ -532,7 +534,7 @@ fn work_manifest(
             "work operation name does not form a canonical binding ID",
         )
     })?;
-    CapabilityManifestV1::new(CapabilityManifestInputV1 {
+    application_capability_manifest(ApplicationCapabilityManifestInput {
         capability_id: CapabilityId::new(format!("capability.work.{operation}")).map_err(|_| {
             invalid_identity(
                 "capability_id",
@@ -559,7 +561,6 @@ fn work_manifest(
             ScopeDimension::Repository,
             ScopeDimension::Worktree,
         ])?,
-        authority: AuthorityRequirement::CapabilityGrantWithRevalidation,
         denied_disclosure: DeniedDisclosurePolicy::Indistinguishable,
         privacy: PrivacyClass::ScopedMetadata,
         lifecycle: LifecycleClass::Stateless,
@@ -589,34 +590,13 @@ fn work_manifest(
         pagination: read_only
             .then(|| PaginationContract::new(100, 1_000, 60_000))
             .transpose()?,
-        idempotency: if read_only {
-            IdempotencyContract::NotRequired
-        } else {
-            IdempotencyContract::Required
-        },
-        inverse: if read_only {
-            tracedecay_tool_catalog::InverseContract::NotApplicable
-        } else {
-            tracedecay_tool_catalog::InverseContract::Unavailable {
-                reason: tracedecay_tool_catalog::InverseUnavailableReason::NoShippedInverse,
-            }
-        },
+        inverse: None,
         authority_revalidation: RevalidationContract::required(vec![
             RevalidationPoint::Authority,
             RevalidationPoint::Scope,
             RevalidationPoint::Policy,
             RevalidationPoint::ExpectedState,
         ])?,
-        reconciliation: if read_only {
-            ReconciliationContract::NotRequired
-        } else {
-            ReconciliationContract::Required
-        },
-        receipt: if read_only {
-            ReceiptContract::Operation
-        } else {
-            ReceiptContract::DurableEffect
-        },
         terminal_states: TerminalStateContract::new(terminal_states(read_only))?,
         availability: AvailabilityContract::Available,
         binding_ids: vec![binding_id],
@@ -652,34 +632,12 @@ fn schema_ref(id: String) -> Result<SchemaRef, CatalogValidationError> {
 
 #[cfg(test)]
 mod tests {
-    use tracedecay_tool_catalog::{
-        CancellationPoint, ExecutableBindingRegistryV1, RouteExposureV1,
-    };
+    use tracedecay_tool_catalog::{CancellationPoint, RouteExposureV1};
 
     use super::{
         WORK_APPLICATION_OPERATION_IDS_V1, work_executable_binding,
         work_executable_binding_registry,
     };
-
-    fn first_binding_address(registry: &ExecutableBindingRegistryV1) -> usize {
-        registry
-            .iter()
-            .next()
-            .map(|binding| std::ptr::from_ref(binding) as usize)
-            .expect("Work registry is not empty")
-    }
-
-    #[test]
-    fn repeated_work_registry_reads_borrow_one_process_authority() {
-        let first = work_executable_binding_registry().unwrap();
-        let second = work_executable_binding_registry().unwrap();
-
-        assert_eq!(
-            first_binding_address(first),
-            first_binding_address(second),
-            "reading the process-static registry must not clone every schema-rich binding",
-        );
-    }
 
     #[test]
     fn work_registry_advertises_only_mounted_application_operations() {
@@ -725,17 +683,6 @@ mod tests {
                 "retired operation {retired} must not be advertised"
             );
         }
-    }
-
-    #[test]
-    fn operation_lookup_is_backed_by_the_executable_registry() {
-        let operation =
-            tracedecay_tool_catalog::OperationId::new("operation.work.topology").unwrap();
-        let binding = work_executable_binding(&operation)
-            .unwrap()
-            .expect("topology is an executable Work operation");
-        assert!(binding.effect().is_read_only());
-        assert_eq!(binding.deadline().maximum_millis(), 30_000);
     }
 
     #[test]

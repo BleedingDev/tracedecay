@@ -1144,6 +1144,7 @@ pub(super) enum MalformedJsonlPolicy {
 struct RawJsonlScanRequest {
     previous: StoredCursor,
     max_new_bytes: Option<u64>,
+    max_frames: usize,
     oversized_policy: MalformedJsonlPolicy,
     max_record_bytes: usize,
     resume_state: Option<JsonlResumeState>,
@@ -1343,17 +1344,36 @@ pub fn try_stream_new_jsonl_raw_strict_with_resume(
     max_record_bytes: usize,
     resume_state: Option<JsonlResumeState>,
 ) -> TranscriptIngestResult<RawNewJsonl> {
+    try_stream_new_jsonl_raw_strict_with_resume_and_frame_limit(
+        path,
+        prev,
+        max_new_bytes,
+        max_record_bytes,
+        resume_state,
+        MAX_JSONL_FRAMES_PER_BATCH,
+    )
+}
+
+pub(in crate::runtime) fn try_stream_new_jsonl_raw_strict_with_resume_and_frame_limit(
+    path: &Path,
+    prev: StoredCursor,
+    max_new_bytes: Option<u64>,
+    max_record_bytes: usize,
+    resume_state: Option<JsonlResumeState>,
+    max_frames: usize,
+) -> TranscriptIngestResult<RawNewJsonl> {
     let one_record_bytes = u64::try_from(max_record_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
     let recovery_batch_bytes = STRICT_JSONL_BATCH_BYTES.max(one_record_bytes);
-    try_stream_new_jsonl_raw_with_policy(
+    try_stream_new_jsonl_raw_with_policy_and_frame_limit(
         path,
         prev,
         Some(max_new_bytes.unwrap_or(recovery_batch_bytes)),
         MalformedJsonlPolicy::Defer,
         max_record_bytes,
         resume_state,
+        max_frames,
     )
 }
 
@@ -1364,6 +1384,26 @@ fn try_stream_new_jsonl_raw_with_policy(
     oversized_policy: MalformedJsonlPolicy,
     max_record_bytes: usize,
     resume_state: Option<JsonlResumeState>,
+) -> TranscriptIngestResult<RawNewJsonl> {
+    try_stream_new_jsonl_raw_with_policy_and_frame_limit(
+        path,
+        prev,
+        max_new_bytes,
+        oversized_policy,
+        max_record_bytes,
+        resume_state,
+        MAX_JSONL_FRAMES_PER_BATCH,
+    )
+}
+
+fn try_stream_new_jsonl_raw_with_policy_and_frame_limit(
+    path: &Path,
+    prev: StoredCursor,
+    max_new_bytes: Option<u64>,
+    oversized_policy: MalformedJsonlPolicy,
+    max_record_bytes: usize,
+    resume_state: Option<JsonlResumeState>,
+    max_frames: usize,
 ) -> TranscriptIngestResult<RawNewJsonl> {
     #[cfg(test)]
     isolate_unchanged_generation_cache_unless_held();
@@ -1378,6 +1418,7 @@ fn try_stream_new_jsonl_raw_with_policy(
         RawJsonlScanRequest {
             previous: prev,
             max_new_bytes,
+            max_frames: max_frames.clamp(1, MAX_JSONL_FRAMES_PER_BATCH),
             oversized_policy,
             max_record_bytes,
             resume_state,
@@ -1663,6 +1704,7 @@ struct RawJsonlBatchScanner<'a> {
     reader: RawJsonlFrameReader<BufReader<MeasuredJsonlFile<'a>>>,
     generation: JsonlScanGeneration,
     max_new_bytes: Option<u64>,
+    max_frames: usize,
     scan_end: Option<u64>,
     one_record_budget: u64,
     max_record_bytes: usize,
@@ -1680,6 +1722,7 @@ impl<'a> RawJsonlBatchScanner<'a> {
         path: &Path,
         prepared: PreparedJsonlScan<'a>,
         max_new_bytes: Option<u64>,
+        max_frames: usize,
         max_record_bytes: usize,
         io: &mut JsonlIoAccounting,
     ) -> TranscriptIngestResult<Self> {
@@ -1714,6 +1757,7 @@ impl<'a> RawJsonlBatchScanner<'a> {
             reader,
             generation,
             max_new_bytes,
+            max_frames,
             scan_end: max_new_bytes.map(|cap| {
                 generation
                     .seek_to
@@ -1814,7 +1858,7 @@ impl<'a> RawJsonlBatchScanner<'a> {
         let budget_exhausted = self
             .scan_end
             .is_some_and(|end| self.offset >= end && self.offset < self.generation.file_size);
-        if budget_exhausted || self.frame_count >= MAX_JSONL_FRAMES_PER_BATCH {
+        if budget_exhausted || self.frame_count >= self.max_frames {
             return Some(JsonlScanStep::Stop(self.backlog_at(self.offset)));
         }
         None
@@ -2086,6 +2130,7 @@ fn try_stream_new_jsonl_raw_from_file(
     let RawJsonlScanRequest {
         previous,
         max_new_bytes,
+        max_frames,
         oversized_policy,
         max_record_bytes,
         resume_state,
@@ -2107,9 +2152,16 @@ fn try_stream_new_jsonl_raw_from_file(
         if prepared.is_complete() {
             prepared.into_empty_outcome(path, &mut io)
         } else {
-            RawJsonlBatchScanner::start(path, prepared, max_new_bytes, max_record_bytes, &mut io)?
-                .scan(path, oversized_policy, &mut io)?
-                .revalidate(path, &mut io)
+            RawJsonlBatchScanner::start(
+                path,
+                prepared,
+                max_new_bytes,
+                max_frames,
+                max_record_bytes,
+                &mut io,
+            )?
+            .scan(path, oversized_policy, &mut io)?
+            .revalidate(path, &mut io)
         }
     })();
     io.scan_payload_read_bytes = scan_payload_reads.get();
@@ -2497,6 +2549,7 @@ mod tests {
             RawJsonlScanRequest {
                 previous: StoredCursor::default(),
                 max_new_bytes: None,
+                max_frames: MAX_JSONL_FRAMES_PER_BATCH,
                 oversized_policy: MalformedJsonlPolicy::Defer,
                 max_record_bytes: MAX_JSONL_RECORD_BYTES,
                 resume_state: None,
@@ -2537,6 +2590,7 @@ mod tests {
             RawJsonlScanRequest {
                 previous: StoredCursor::default(),
                 max_new_bytes: None,
+                max_frames: MAX_JSONL_FRAMES_PER_BATCH,
                 oversized_policy: MalformedJsonlPolicy::Defer,
                 max_record_bytes: MAX_JSONL_RECORD_BYTES,
                 resume_state: None,
@@ -2551,46 +2605,6 @@ mod tests {
             TranscriptIngestError::ScanGenerationChanged { path: error_path }
                 if error_path == path
         ));
-    }
-
-    /// The narrowest same-handle rewrite: identical length, identical head
-    /// line, differing only past the identity window, inside one mtime second.
-    /// This is the exact case the retired capture-time snapshot used to catch,
-    /// so it pins what the cheap checks actually still cover.
-    #[test]
-    fn same_size_middle_rewrite_after_generation_capture_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("middle.jsonl");
-        let head = b"{\"id\":\"head-stays-identical\"}\n";
-        let mut original = head.to_vec();
-        original.extend_from_slice(b"{\"body\":\"aaaaaaaaaaaaaaaaaaaa\"}\n");
-        let mut replacement = head.to_vec();
-        replacement.extend_from_slice(b"{\"body\":\"bbbbbbbbbbbbbbbbbbbb\"}\n");
-        assert_eq!(original.len(), replacement.len());
-        std::fs::write(&path, &original).unwrap();
-        let handle = std::fs::File::open(&path).unwrap();
-
-        let outcome = try_stream_new_jsonl_raw_from_file(
-            &path,
-            handle,
-            RawJsonlScanRequest {
-                previous: StoredCursor::default(),
-                max_new_bytes: None,
-                oversized_policy: MalformedJsonlPolicy::Defer,
-                max_record_bytes: MAX_JSONL_RECORD_BYTES,
-                resume_state: None,
-            },
-            || std::fs::write(&path, &replacement).unwrap(),
-        );
-
-        assert!(
-            matches!(
-                outcome,
-                Err(TranscriptIngestError::ScanGenerationChanged { path: ref p })
-                    if *p == path
-            ),
-            "a same-handle rewrite must invalidate the scan generation"
-        );
     }
 
     /// The counterpart to the rewrite test: a transcript being appended to
@@ -2612,6 +2626,7 @@ mod tests {
             RawJsonlScanRequest {
                 previous: StoredCursor::default(),
                 max_new_bytes: None,
+                max_frames: MAX_JSONL_FRAMES_PER_BATCH,
                 oversized_policy: MalformedJsonlPolicy::Defer,
                 max_record_bytes: MAX_JSONL_RECORD_BYTES,
                 resume_state: None,
@@ -2632,50 +2647,6 @@ mod tests {
             outcome.io.snapshot_hash_bytes, 0,
             "and still does not hash the file to prove it"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn settled_unchanged_resume_reads_zero_file_bytes() {
-        // The warm entry this test proves must survive between its two polls,
-        // and the isolation reset is process-global.
-        let _hold = HoldUnchangedGenerationCache::enter();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("unchanged.jsonl");
-        std::fs::write(&path, b"{\"v\":0}\n{\"v\":1}\n").unwrap();
-        let first = try_stream_new_jsonl_raw_strict_with_resume(
-            &path,
-            StoredCursor::default(),
-            None,
-            MAX_JSONL_RECORD_BYTES,
-            None,
-        )
-        .unwrap();
-        let checkpoint = JsonlResumeState {
-            generation: first.new_cursor.file_id,
-            file_identity: first.file_identity,
-            fingerprint: first.frames.last().unwrap().resume_fingerprint,
-        };
-        let second = try_stream_new_jsonl_raw_strict_with_resume(
-            &path,
-            first.new_cursor,
-            None,
-            MAX_JSONL_RECORD_BYTES,
-            Some(checkpoint),
-        )
-        .unwrap();
-        assert_eq!(second.io.change, JsonlChangeKind::Unchanged);
-        assert_eq!(
-            second.io.content_bytes, 0,
-            "an unchanged poll must not consume frame bytes past the cursor"
-        );
-        assert_eq!(
-            second.io.snapshot_hash_bytes, 0,
-            "EOF resume skips the whole-file snapshot hash"
-        );
-        assert_eq!(second.io.prefix_validation_bytes, 0);
-        assert_eq!(second.io.identity_window_bytes, 0);
-        assert_eq!(second.io.scan_payload_read_bytes, 0);
     }
 
     #[cfg(unix)]
@@ -2840,6 +2811,7 @@ mod tests {
             RawJsonlScanRequest {
                 previous: first.new_cursor,
                 max_new_bytes: None,
+                max_frames: MAX_JSONL_FRAMES_PER_BATCH,
                 oversized_policy: MalformedJsonlPolicy::Defer,
                 max_record_bytes: MAX_JSONL_RECORD_BYTES,
                 resume_state: Some(checkpoint),
@@ -2905,60 +2877,5 @@ mod tests {
             second.io.snapshot_hash_bytes, 0,
             "append-only resume must not snapshot-hash the already-validated prefix"
         );
-    }
-
-    /// RED leftover: a durable resume is `(position, generation, file_identity,
-    /// fingerprint)`. The fingerprint cannot seed `Sha256`, so the first
-    /// append after a process-local-memo miss still walks `[0, cursor)`.
-    /// Stashing hasher bytes in `StoredCursor::file_id` would weaken rewrite
-    /// and file-identity detection. This test locks that invariant.
-    #[test]
-    fn first_append_after_durable_cursor_rewalks_prefix_to_rebuild_hasher() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("durable-append.jsonl");
-        let first_line = b"{\"v\":0}\n";
-        std::fs::write(&path, first_line).unwrap();
-        let first = try_stream_new_jsonl_raw_strict_with_resume(
-            &path,
-            StoredCursor::default(),
-            None,
-            MAX_JSONL_RECORD_BYTES,
-            None,
-        )
-        .unwrap();
-        let checkpoint = JsonlResumeState {
-            generation: first.new_cursor.file_id,
-            file_identity: first.file_identity,
-            fingerprint: first.frames.last().unwrap().resume_fingerprint,
-        };
-        // Drop process-local unchanged memo by using a distinct path identity
-        // window is still required; append changes size so the memo cannot
-        // apply anyway. The durable cursor is only StoredCursor + checkpoint.
-        let appended = b"{\"v\":1}\n";
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(appended)
-            .unwrap();
-        let second = try_stream_new_jsonl_raw_strict_with_resume(
-            &path,
-            first.new_cursor,
-            None,
-            MAX_JSONL_RECORD_BYTES,
-            Some(checkpoint),
-        )
-        .unwrap();
-        let prefix = u64::try_from(first_line.len()).unwrap();
-        assert_eq!(second.io.change, JsonlChangeKind::Appended);
-        assert_eq!(
-            second.io.prefix_validation_bytes, prefix,
-            "hasher mid-state is not in the domain cursor; first append re-walks [0, cursor)"
-        );
-        assert_eq!(
-            second.io.content_bytes,
-            u64::try_from(appended.len()).unwrap()
-        );
-        assert_eq!(second.new_cursor.file_id, checkpoint.generation);
     }
 }

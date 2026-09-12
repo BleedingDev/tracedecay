@@ -4,37 +4,29 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::ResolvedScope;
-#[cfg(test)]
-use tracedecay_contracts::context_scout::ContextScoutFeedbackV1;
 use tracedecay_contracts::context_scout::{
     ContextScoutAddressV1, ContextScoutDeliveryOutcomeV1, ContextScoutDeliveryReceiptV1,
 };
-use tracedecay_domain::{ObservationId, ProjectId, SessionId, UtcMicros};
+use tracedecay_domain::{ProjectId, SessionId, UtcMicros};
+#[cfg(test)]
+use tracedecay_hooks::HookImmediateAdmissionStateV1;
 use tracedecay_hooks::{
     AsyncHookFeedbackDeliveryPortV1, HookConfigurationFileReaderV1, HookConfigurationReadOutcomeV1,
     HookConfigurationSnapshotV1, HookConfigurationSubscriberV1, HookEventEnvelopeV2,
     HookFeedbackDeliveryRouteV1, HookFeedbackDeliveryV1, HookFeedbackRollbackSwitchV1,
     HookGuidanceStateV1, HookHostV1, HookImmediateAdmissionV1, HookRuntimeControlV1,
     HookScopeBindingV1, HookSpoolConfigV1, HookSpoolError, HookSpoolV1, HookSynchronousDeadlineV1,
-    HookTransportDispositionV1, NativeEnvelopeMaterialV1, NativeHookDecodeError,
-    SpoolAppendOutcomeV1, admit_async_exact_scope, deliver_hook_feedback, envelope_identity_hash16,
-    finish_synchronous_hook,
+    HookTransportDispositionV1, NativeContextScoutLifecycleV1, NativeEnvelopeMaterialV1,
+    NativeHookDecodeError, SpoolAppendOutcomeV1, admit_async_exact_scope, deliver_hook_feedback,
+    envelope_identity_hash16, finish_synchronous_hook,
 };
-#[cfg(test)]
-use tracedecay_hooks::{HookImmediateAdmissionStateV1, HookScopedFeedbackV1};
 
-#[cfg(test)]
-use crate::agents::context_scout_v2::context_scout_delivery_receipt_matches_envelope;
-use crate::agents::context_scout_v2::{
+use crate::agents::context_scout::{
     ContextScoutDeliveryReceiptHookV1, context_scout_delivery_receipt_id,
 };
 use crate::ports::hook_runtime::HookRuntimeV1;
 
 use super::analytics::{HookTimingSpan, elapsed_us};
-#[cfg(test)]
-use super::daemon_ports::{
-    ContextScoutFeedbackCommitV1, DaemonContextScoutFeedbackPort, outcome_is_committed,
-};
 use super::daemon_ports::{
     DaemonAdmissionPort, DaemonDeliveryReceiptPort, DaemonFeedbackNoticeDeliveryPort,
     DaemonOpenCodeLspUpdatePort, now_utc,
@@ -301,42 +293,6 @@ fn native_session_start_locator(
         transcript_path: fields.transcript_path.as_deref()?.into(),
     };
     locator.matches_envelope(envelope).then_some(locator)
-}
-
-/// Provider-native lifecycle identity that may cross the local hook/daemon
-/// boundary. Session and call values come from checked-in host fields; the
-/// event ID binds them to the exact content-free envelope admitted alongside
-/// them. Paths and payloads remain unrepresentable.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeContextScoutLifecycleV1 {
-    pub session_id: SessionId,
-    pub call_id: ObservationId,
-    pub event_id: [u8; 16],
-}
-
-impl NativeContextScoutLifecycleV1 {
-    pub fn new(session_id: &str, call_id: &str, event_id: [u8; 16]) -> Option<Self> {
-        Some(Self {
-            session_id: SessionId::new(session_id.to_owned()).ok()?,
-            call_id: ObservationId::new(call_id.to_owned()).ok()?,
-            event_id,
-        })
-    }
-
-    pub fn matches_envelope(&self, envelope: &HookEventEnvelopeV2) -> bool {
-        matches!(
-            envelope.producer,
-            HookHostV1::KimiCode | HookHostV1::OpenCode
-        ) && protected_session_id_for_native(self.session_id.as_str())
-            == envelope.protected_session_id
-            && self.event_id == envelope.event_id
-            && matches!(
-                envelope.event,
-                tracedecay_hooks::HookEventV2::SavedEdit { .. }
-                    | tracedecay_hooks::HookEventV2::ToolLifecycle { .. }
-            )
-    }
 }
 
 impl NativeIdentityFields {
@@ -914,6 +870,7 @@ async fn dispatch_decoded_with_required_work<T>(
         mut snapshot,
         mut envelope,
         replayed,
+        native_lifecycle,
         prepared_at,
         ..
     } = prepared;
@@ -962,6 +919,7 @@ async fn dispatch_decoded_with_required_work<T>(
             &layout.data_root,
             host,
             &envelope,
+            native_lifecycle,
             binding,
             prepared_at,
         )),
@@ -983,7 +941,9 @@ async fn dispatch_decoded_with_required_work<T>(
         now_utc(),
         elapsed_us(started),
     );
-    let context_scout_address = admission.take_context_scout_address();
+    let Ok(context_scout_address) = admission.take_context_scout_address() else {
+        return unavailable();
+    };
     let feedback_notice = admission.take_feedback_notice();
     let github_stack_signal_available = admission.take_github_stack_signal_available();
     let dispatched = match completed {
@@ -1033,17 +993,17 @@ async fn dispatch_decoded_with_required_work<T>(
                 feedback: None,
                 outcome: None,
             });
+            let guidance = match render_host_delivery(
+                result.rendered_guidance,
+                context_scout_address.as_ref(),
+                delivered.feedback.as_ref(),
+                github_stack_signal_available,
+            ) {
+                Ok(guidance) => guidance,
+                Err(_) => return unavailable(),
+            };
             HookDispatch::Handled {
-                guidance: HookSynchronousDeadlineV1::after_elapsed(elapsed_us(started)).and_then(
-                    |_| {
-                        render_host_delivery(
-                            result.rendered_guidance,
-                            context_scout_address.as_ref(),
-                            delivered.feedback.as_ref(),
-                            github_stack_signal_available,
-                        )
-                    },
-                ),
+                guidance,
                 disposition: result.receipt.disposition,
             }
         }
@@ -1052,64 +1012,25 @@ async fn dispatch_decoded_with_required_work<T>(
     (dispatched, required_result)
 }
 
-#[cfg(test)]
-impl HookScopedFeedbackV1 for ContextScoutFeedbackCommitV1 {
-    fn matches_envelope(&self, envelope: &HookEventEnvelopeV2) -> bool {
-        self.feedback.receipt_id == self.receipt.receipt_id
-            && context_scout_delivery_receipt_matches_envelope(&self.receipt, envelope)
-    }
-}
-
-#[cfg(test)]
-pub(crate) async fn record_context_scout_delivery(
-    runtime: &HookRuntimeV1,
-    project_root: &Path,
-    receipt: &ContextScoutDeliveryReceiptV1,
-) -> bool {
-    let Some(deadline) = HookSynchronousDeadlineV1::after_elapsed(0) else {
-        return false;
-    };
-    outcome_is_committed(
-        DaemonDeliveryReceiptPort::new(runtime, project_root)
-            .post_receipt(receipt, deadline)
-            .await,
-    )
-}
-
-#[cfg(test)]
-pub(crate) async fn commit_context_scout_feedback(
-    runtime: &HookRuntimeV1,
-    project_root: &Path,
-    receipt: &ContextScoutDeliveryReceiptV1,
-    feedback: ContextScoutFeedbackV1,
-) -> bool {
-    let Some(deadline) = HookSynchronousDeadlineV1::after_elapsed(0) else {
-        return false;
-    };
-    outcome_is_committed(
-        DaemonContextScoutFeedbackPort::new(runtime, project_root)
-            .post_feedback(receipt, &feedback, deadline)
-            .await,
-    )
-}
-
 fn render_host_delivery(
     guidance: Option<String>,
     context_scout_address: Option<&ContextScoutAddressV1>,
     feedback_notice: Option<&tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>,
     github_stack_signal_available: bool,
-) -> Option<String> {
+) -> Result<Option<String>, serde_json::Error> {
     let scout_address = context_scout_address
-        .and_then(|address| serde_json::to_string(address).ok())
+        .map(serde_json::to_string)
+        .transpose()?
         .map(|address| {
             format!("TraceDecay Context Scout address for authorized operations: {address}")
         });
     let notice = feedback_notice
-        .and_then(|notice| serde_json::to_string(notice).ok())
+        .map(serde_json::to_string)
+        .transpose()?
         .map(|notice| format!("TraceDecay feedback ready for authorized lookup: {notice}"));
     let stack_wakeup = github_stack_signal_available
         .then_some("TraceDecay GitHub stack update available for authenticated expansion.");
-    [
+    Ok([
         guidance,
         scout_address,
         notice,
@@ -1121,7 +1042,7 @@ fn render_host_delivery(
         rendered.push_str("\n\n");
         rendered.push_str(&next);
         rendered
-    })
+    }))
 }
 
 /// Spool writer admission waits one synchronous budget measured from the lock
@@ -1134,6 +1055,7 @@ fn append_for_replay(
     data_root: &Path,
     host: HookHostV1,
     envelope: &HookEventEnvelopeV2,
+    native_lifecycle: Option<NativeContextScoutLifecycleV1>,
     binding: &HookScopeBindingV1,
     now: UtcMicros,
 ) -> SpoolAppendOutcomeV1 {
@@ -1146,7 +1068,7 @@ fn append_for_replay(
     ) else {
         return SpoolAppendOutcomeV1::Unavailable;
     };
-    match spool.append(envelope.clone(), binding, now) {
+    match spool.append_with_native_lifecycle(envelope.clone(), native_lifecycle, binding, now) {
         Ok(_) => SpoolAppendOutcomeV1::Accepted,
         Err(HookSpoolError::SpoolFull) => SpoolAppendOutcomeV1::Full,
         Err(_) => SpoolAppendOutcomeV1::Unavailable,

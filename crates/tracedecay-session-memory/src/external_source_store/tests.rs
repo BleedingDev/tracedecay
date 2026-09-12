@@ -33,7 +33,7 @@ impl Fixture {
         mode: TestDatabaseRuntimeMode,
         directory: TempDir,
     ) -> Self {
-        tracedecay_global_db::register_test_schema_installer();
+        tracedecay_global_db::register_registered_schema_installer();
         let authority =
             DatabaseAuthority::acquire_test(&path, "cline retained source cutover").unwrap();
         let (database, _) = Database::publish_registered_test_runtime(
@@ -507,7 +507,7 @@ async fn scoped_reset_readmits_the_same_host_observation_without_conflict() {
         );
         let leftover: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM external_source_commit_receipts_v1",
+                "SELECT COUNT(*) FROM external_source_commit_receipts_v2",
                 [],
                 |row| row.get(0),
             )

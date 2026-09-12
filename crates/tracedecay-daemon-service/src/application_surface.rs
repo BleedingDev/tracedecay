@@ -31,6 +31,7 @@ use tracedecay_contracts::{
     CancellationContext, CancellationSignal, CancellationStage, Deadline, LegalAction,
     OperationTermination, PageRequest, ProblemOwningLayer, RequestContext, RequestId,
     ResultContractRef, ResumeToken, RetryDirective, SafeDiagnostic, StreamEvent, StreamEventKind,
+    configuration_surface_catalog_contribution,
 };
 pub use tracedecay_daemon_protocol::GitReadSurfaceRequest;
 use tracedecay_domain::{ManifestDigest, ProjectId, UtcMicros, canonical_sha256};
@@ -80,8 +81,8 @@ mod work;
 mod workflow;
 
 use configuration_wire::{
-    CONFIGURATION_WIRE_OPERATIONS, build_configuration_wire_schema_registry,
-    configuration_invocation_payload, is_configuration_operation, validate_configuration_outcome,
+    CONFIGURATION_WIRE_OPERATIONS, configuration_binding_has_schema,
+    configuration_invocation_payload, is_configuration_operation, validate_application_outcome,
 };
 use handoff::router_with_executor as handoff_application_router_with_executor;
 use multi_root_http::router_with_executor as multi_root_application_router_with_executor;
@@ -157,7 +158,7 @@ fn application_invoker_for_surface(
             .iter()
             .copied()
             .any(is_configuration_operation))
-    .then(|| build_configuration_wire_schema_registry(composition.snapshot()))
+    .then(configuration_surface_catalog_contribution)
     .transpose()?;
     // The HTTP mount is the whole canonical operation family by definition, so
     // it validates the authority's own list and ignores the caller's; every
@@ -177,10 +178,13 @@ fn application_invoker_for_surface(
             return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
         };
         if is_configuration_operation(operation)
-            && configuration_schemas
-                .as_ref()
-                .and_then(|schemas| schemas.get(&binding.binding_id))
-                .is_none()
+            && configuration_schemas.as_ref().is_none_or(|schemas| {
+                !configuration_binding_has_schema(
+                    composition.snapshot(),
+                    schemas,
+                    &binding.binding_id,
+                )
+            })
         {
             return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
         }
@@ -1905,7 +1909,7 @@ pub async fn execute_application_surface(
             Ok(response) => match response
                 .envelope()
                 .filter(|envelope| {
-                    validate_configuration_outcome(
+                    validate_application_outcome(
                         operation,
                         &envelope.outcome,
                         &cancellation_contract,
@@ -2258,7 +2262,7 @@ pub async fn execute_application_surface(
                 scope,
                 outcome,
             } => {
-                if validate_configuration_outcome(
+                if validate_application_outcome(
                     operation,
                     &outcome,
                     &cancellation_contract,
@@ -2404,7 +2408,6 @@ fn feedback_surface_operation(operation: ApplicationSurfaceOperation) -> Feedbac
         | ApplicationSurfaceOperation::SourceBody
         | ApplicationSurfaceOperation::SourceOutline
         | ApplicationSurfaceOperation::ModuleApi
-        | ApplicationSurfaceOperation::FileMetadata
         | ApplicationSurfaceOperation::HealthRead
         | ApplicationSurfaceOperation::HealthDelta
         | ApplicationSurfaceOperation::StorageStatus
@@ -2454,7 +2457,6 @@ fn feedback_surface_is_observable(operation: ApplicationSurfaceOperation) -> boo
             | ApplicationSurfaceOperation::SourceBody
             | ApplicationSurfaceOperation::SourceOutline
             | ApplicationSurfaceOperation::ModuleApi
-            | ApplicationSurfaceOperation::FileMetadata
             | ApplicationSurfaceOperation::HealthRead
             | ApplicationSurfaceOperation::HealthDelta
             | ApplicationSurfaceOperation::StorageStatus
@@ -3010,11 +3012,8 @@ pub fn mcp_project_open_reset_refusal(
 }
 
 pub(crate) fn current_micros() -> Result<UtcMicros, ApplicationSurfaceAdapterError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ApplicationSurfaceAdapterError::InvalidSurfaceRequest)?;
-    let now = i64::try_from(now.as_micros()).unwrap_or(i64::MAX);
-    Ok(UtcMicros(now))
+    tracedecay_contracts::clock::try_now_micros()
+        .map_err(|_| ApplicationSurfaceAdapterError::InvalidSurfaceRequest)
 }
 
 fn invocation_problem(

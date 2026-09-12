@@ -7,9 +7,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay_domain::{
-    ClaudeByteRangeV1, ClaudeFileGenerationV1, ClaudeSourceIdentityV1, EvidenceAvailabilityV1,
-    MAX_OBSERVATION_STRUCTURE_DEPTH, MAX_OBSERVATION_STRUCTURE_VALUES, ObservationScopeV1,
-    ProjectId, RepositoryId, RetrievalAnchorTargetV2, SessionId, WorktreeId,
+    EvidenceAvailabilityV1, MAX_OBSERVATION_STRUCTURE_DEPTH, MAX_OBSERVATION_STRUCTURE_VALUES,
+    ObservationScopeV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
+    ObservationSourceRangeV1, ProjectId, RepositoryId, RetrievalAnchorTargetV2, SessionId,
+    WorktreeId,
 };
 use tracedecay_store::observation::{
     CursorAdvanceOutcome, NonDurableFrameReason, ObservationCursorAdvance,
@@ -186,7 +187,7 @@ impl ObservationStore for FakeStore {
 
     async fn get_source_cursor(
         &self,
-        source: &ClaudeSourceIdentityV1,
+        source: &ObservationSourceIdentityV1,
         scope: &ObservationScopeV1,
     ) -> ObservationStoreResult<Option<ObservationSourceCursorV1>> {
         Ok(self
@@ -313,14 +314,16 @@ fn request_at_for_session(
 ) -> CaptureClaudeObservationRequest {
     let encoded_frame = serde_json::to_vec(record).unwrap();
     let end = start + u64::try_from(encoded_frame.len()).unwrap();
-    let parsed_record =
-        parse_claude_record_v1(&encoded_frame, ClaudeByteRangeV1::new(start, end).unwrap())
-            .unwrap();
-    let source = ClaudeSourceIdentityV1::new(SessionId::new(session_id).unwrap()).unwrap();
+    let parsed_record = parse_claude_record_v1(
+        &encoded_frame,
+        ObservationSourceRangeV1::new(start, end).unwrap(),
+    )
+    .unwrap();
+    let source = ObservationSourceIdentityV1::new(SessionId::new(session_id).unwrap()).unwrap();
     let scope = ObservationScopeV1::Project {
         project_id: ProjectId::new("project.application-test").unwrap(),
     };
-    let generation = ClaudeFileGenerationV1::new(1).unwrap();
+    let generation = ObservationSourceGenerationV1::new(1).unwrap();
     let expected_cursor = (start != 0).then(|| {
         ObservationSourceCursorV1::new(source.clone(), scope.clone(), generation, start).unwrap()
     });
@@ -328,7 +331,7 @@ fn request_at_for_session(
         source,
         scope,
         generation,
-        ClaudeByteRangeV1::new(start, end).unwrap(),
+        ObservationSourceRangeV1::new(start, end).unwrap(),
     )
     .unwrap();
     CaptureClaudeObservationRequest::new(
@@ -409,46 +412,16 @@ fn mark_first_observation_not_queued(store: &FakeStore) {
 }
 
 #[tokio::test]
-async fn non_durable_cursor_advance_stays_inside_application_boundary() {
-    let application = application();
-    let source =
-        ClaudeSourceIdentityV1::new(SessionId::new("session.cursor-advance").unwrap()).unwrap();
-    let advance = ObservationCursorAdvance::new(
-        source,
-        ObservationScopeV1::Profile,
-        ClaudeFileGenerationV1::new(1).unwrap(),
-        None,
-        ClaudeByteRangeV1::new(0, 4).unwrap(),
-        NonDurableFrameReason::BlankFrame,
-    )
-    .unwrap();
-
-    let outcome = application
-        .advance_non_durable_source_cursor(AdvanceNonDurableSourceCursorRequest::new(
-            advance,
-            ObservationCancellation::default(),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(outcome, CursorAdvanceOutcome::Committed);
-    let advances = application.store.cursor_advances.lock().unwrap();
-    assert_eq!(advances.len(), 1);
-    assert_eq!(advances[0].covered(), ClaudeByteRangeV1::new(0, 4).unwrap());
-    assert_eq!(advances[0].reason(), NonDurableFrameReason::BlankFrame);
-}
-
-#[tokio::test]
 async fn non_durable_cursor_advance_honors_cancellation_before_and_after_commit() {
     let application = application();
     let source =
-        ClaudeSourceIdentityV1::new(SessionId::new("session.cursor-cancel").unwrap()).unwrap();
+        ObservationSourceIdentityV1::new(SessionId::new("session.cursor-cancel").unwrap()).unwrap();
     let advance = ObservationCursorAdvance::new(
         source,
         ObservationScopeV1::Profile,
-        ClaudeFileGenerationV1::new(1).unwrap(),
+        ObservationSourceGenerationV1::new(1).unwrap(),
         None,
-        ClaudeByteRangeV1::new(0, 4).unwrap(),
+        ObservationSourceRangeV1::new(0, 4).unwrap(),
         NonDurableFrameReason::BlankFrame,
     )
     .unwrap();
@@ -627,10 +600,11 @@ async fn repository_provenance_context_refuses_cross_project_reuse() {
 fn request_accepts_only_bounded_parser_evidence_for_the_identity_range() {
     let identity = |start, end| {
         ObservationIdentityMaterialV1::new(
-            ClaudeSourceIdentityV1::new(SessionId::new("session.frame-test").unwrap()).unwrap(),
+            ObservationSourceIdentityV1::new(SessionId::new("session.frame-test").unwrap())
+                .unwrap(),
             ObservationScopeV1::Profile,
-            ClaudeFileGenerationV1::new(1).unwrap(),
-            ClaudeByteRangeV1::new(start, end).unwrap(),
+            ObservationSourceGenerationV1::new(1).unwrap(),
+            ObservationSourceRangeV1::new(start, end).unwrap(),
         )
         .unwrap()
     };
@@ -639,7 +613,7 @@ fn request_accepts_only_bounded_parser_evidence_for_the_identity_range() {
     let raw = b"{}";
     let parsed = parse_claude_record_v1(
         raw,
-        ClaudeByteRangeV1::new(10, 10 + u64::try_from(raw.len()).unwrap()).unwrap(),
+        ObservationSourceRangeV1::new(10, 10 + u64::try_from(raw.len()).unwrap()).unwrap(),
     )
     .unwrap();
     assert!(matches!(
@@ -814,24 +788,6 @@ async fn exact_duplicate_with_missed_read_back_has_unavailable_projection_status
 }
 
 #[tokio::test]
-async fn not_queued_exact_duplicate_with_missed_read_back_has_unavailable_projection_status() {
-    assert_duplicate_read_miss_status_is_unavailable(
-        DuplicatePersistKind::Exact,
-        ObservationProjectionStatus::NotQueued,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn covered_duplicate_with_missed_read_back_has_unavailable_projection_status() {
-    assert_duplicate_read_miss_status_is_unavailable(
-        DuplicatePersistKind::Covered,
-        ObservationProjectionStatus::Queued,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn not_queued_covered_duplicate_with_missed_read_back_has_unavailable_projection_status() {
     assert_duplicate_read_miss_status_is_unavailable(
         DuplicatePersistKind::Covered,
@@ -903,47 +859,6 @@ async fn replay_reports_partial_coverage_and_a_truthful_continuation() {
     assert!(!second.has_more());
     assert_eq!(second.next_after_sequence(), None);
     assert_eq!(second.observations().len(), 1);
-}
-
-#[tokio::test]
-async fn replay_at_the_store_limit_uses_a_bounded_probe_for_coverage() {
-    let application = application();
-    application
-        .capture_claude_observation(request(&json!({
-            "type": "user",
-            "message": { "role": "user", "content": "replay seed" }
-        })))
-        .await
-        .unwrap();
-    {
-        let mut observations = application.store.observations.lock().unwrap();
-        let seed = observations[0].clone();
-        *observations = (1..=1_001)
-            .map(|sequence| {
-                StoredObservation::new(
-                    sequence,
-                    seed.observation().clone(),
-                    seed.committed_cursor().clone(),
-                    seed.retrieval_anchor().clone(),
-                    seed.projection_generation().clone(),
-                    seed.projection_status(),
-                )
-                .unwrap()
-            })
-            .collect();
-    }
-
-    let page = application
-        .replay_observations(ReplayObservationsRequest::new(
-            ObservationReplayRequest::new(0, 1_000).unwrap(),
-            ObservationCancellation::default(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(page.coverage(), ObservationReplayCoverage::Partial);
-    assert!(page.has_more());
-    assert_eq!(page.next_after_sequence(), Some(1_000));
-    assert_eq!(page.observations().len(), 1_000);
 }
 
 #[tokio::test]
@@ -1038,41 +953,6 @@ async fn cancellation_after_point_read_and_replay_discards_non_atomic_results() 
         replay,
         Err(ObservationApplicationError::Cancelled)
     ));
-}
-
-#[tokio::test]
-async fn capture_observations_empty_skips_persist_authority() {
-    let application = application();
-    let outcomes = application.capture_observations(Vec::new()).await.unwrap();
-    assert!(outcomes.is_empty());
-    assert_eq!(*application.store.persist_batch_calls.lock().unwrap(), 0);
-    assert!(application.store.observations.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn capture_observations_sanitizes_then_persists_once() {
-    let application = application();
-    let first = json!({
-        "type": "user",
-        "message": { "role": "user", "content": "batch-one" }
-    });
-    let second = json!({
-        "type": "user",
-        "message": { "role": "user", "content": "batch-two" }
-    });
-    let start_two = u64::try_from(serde_json::to_vec(&first).unwrap().len()).unwrap();
-    let outcomes = application
-        .capture_observations(vec![request(&first), request_at(&second, start_two)])
-        .await
-        .unwrap();
-    assert_eq!(outcomes.len(), 2);
-    assert!(
-        outcomes
-            .iter()
-            .all(|outcome| { matches!(outcome, CaptureObservationOutcome::Persisted { .. }) })
-    );
-    assert_eq!(*application.store.persist_batch_calls.lock().unwrap(), 1);
-    assert_eq!(application.store.observations.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -5,7 +5,7 @@
 //! path resolves that route by walking up from the working directory, so
 //! `tracedecay tool circular` works from a checkout without `--project`. The
 //! typed application-surface path must present the same authenticated route:
-//! otherwise `storage_status`, `source_outline`, `file_metadata`, and the git
+//! otherwise `storage_status`, `source_outline`, and the git
 //! reads answer `application.surface.unavailable` /
 //! `not_found_or_not_authorized` from a checkout the operator is standing in.
 
@@ -285,22 +285,6 @@ fn application_surface_primitive_tools_resolve_the_working_directory_project() {
         "source_outline",
         r#"{"file":"src/lib.rs","format":"json"}"#,
     );
-    assert_surface_resolves_project(
-        &home_path,
-        &project_path,
-        "file_metadata",
-        r#"{"files":["src/lib.rs"],"format":"json"}"#,
-    );
-}
-
-#[test]
-fn application_surface_git_reads_resolve_the_working_directory_worktree() {
-    let (_home, _project, home_path, project_path) = surface_fixture();
-    let _daemon = spawn_tracedecay_daemon(&home_path);
-
-    for tool in ["git_status", "git_diff", "git_history"] {
-        assert_surface_resolves_project(&home_path, &project_path, tool, r#"{"format":"json"}"#);
-    }
 }
 
 #[test]

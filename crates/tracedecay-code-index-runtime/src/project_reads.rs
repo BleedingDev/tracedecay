@@ -55,7 +55,7 @@ fn refuse_projection_wait(request: &CodeGraphReadRequest<'_>) -> Result<(), Code
     }
 }
 
-async fn sleep_until_deadline(deadline: &Deadline) {
+pub(crate) async fn sleep_until_deadline(deadline: &Deadline) {
     let now = now_micros();
     if deadline.is_elapsed_at(now) {
         return;
@@ -94,9 +94,14 @@ impl ProjectCodeGraphServingAuthorityV1 {
                 tracedecay_graph_query::CodeGraphReadFreshnessV1::Current,
             );
         }
+        // The owner's native graph store is the only thing this route reads
+        // from it, and the guard below proves that store is ready. Requiring
+        // exact/lexical readiness as well made a restart that resumed an
+        // unfinished ngram index refuse every graph read for the duration of
+        // that build, with a recovered verified head already seated.
         if let Some((text, current)) = self
             .schedulers
-            .latest_text_serving_freshness_for_scope(&self.scope)
+            .retained_text_owner_freshness_for_scope(&self.scope)
             .await
             && text.interactive_graph_store().is_ok()
         {
@@ -163,7 +168,7 @@ impl ProjectCodeGraphServingAuthorityV1 {
                 })?;
         Ok(ProjectCodeGraphServingProjectionV1 {
             generation_id: latest.metadata().manifest().generation_id.clone(),
-            statistics: None,
+            statistics: latest.metadata().generation_statistics().cloned(),
             store,
             freshness,
         })

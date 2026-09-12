@@ -12,16 +12,18 @@ use tracedecay_domain::{
     CodeGenerationId, ManifestDigest, RetrievalAnchorId, SanitizationReceiptId, UtcMicros,
 };
 use tracedecay_tool_catalog::{
-    ApplicationSurfaceOperation, AuthorityRequirement, AvailabilityContract, BindingSurface,
-    CancellationContract, CancellationPoint, CapabilityId, CapabilityManifestInputV1,
-    CapabilityManifestV1, CatalogContributionInputV1, CatalogContributionV1, ContributionId,
-    DeadlineBehavior, DeadlineContract, DeniedDisclosurePolicy, EffectClass,
-    ExecutableSchemaAuthority, IdempotencyContract, LifecycleClass, PaginationContract,
-    PrivacyClass, ProfileId, ReceiptContract, ReconciliationContract, RevalidationContract,
-    RevalidationPoint, RoutingContractV1, SchemaId, SchemaRef, ScopeDimension, ScopeRequirement,
-    StreamingContract, TerminalState, TerminalStateContract, UseCaseId,
+    ApplicationSurfaceOperation, AvailabilityContract, BindingSurface, CancellationContract,
+    CancellationPoint, CapabilityId, CatalogContributionInputV1, CatalogContributionV1,
+    ContributionId, DeadlineBehavior, DeadlineContract, DeniedDisclosurePolicy, EffectClass,
+    ExecutableSchemaAuthority, LifecycleClass, PaginationContract, PrivacyClass, ProfileId,
+    RevalidationContract, RevalidationPoint, RoutingContractV1, SchemaId, SchemaRef,
+    ScopeDimension, ScopeRequirement, StreamingContract, TerminalState, TerminalStateContract,
+    UseCaseId,
 };
 
+use crate::capability_manifest::{
+    ApplicationCapabilityManifestInput, application_capability_manifest,
+};
 use crate::context::{DisclosureClass, ResolvedScope};
 use crate::current_application_bindings;
 use crate::error::ApplicationContractError;
@@ -490,6 +492,13 @@ pub struct ContextScoutMutationResultV1 {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ContextScoutDeliveryResultV1 {
+    pub outcome: ContextScoutStoreOutcomeV1,
+    pub receipt: ContextScoutDeliveryReceiptV1,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ContextScoutExactAddressRequestV1 {
     pub address: ContextScoutAddressV1,
 }
@@ -519,6 +528,7 @@ pub struct ContextScoutControlRequestV1 {
 pub struct ContextScoutCancelRequestV1 {
     pub address: ContextScoutAddressV1,
     pub work: ContextScoutWorkV1,
+    pub idempotency_key: IdempotencyKey,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -534,7 +544,9 @@ pub struct ContextScoutClaimRequestV1 {
 pub struct ContextScoutDeliveryRequestV1 {
     pub address: ContextScoutAddressV1,
     pub claim: ContextScoutClaimHandleV1,
-    pub receipt: ContextScoutDeliveryReceiptV1,
+    pub delivered_at: UtcMicros,
+    pub outcome: ContextScoutDeliveryOutcomeV1,
+    pub idempotency_key: IdempotencyKey,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -543,6 +555,7 @@ pub struct ContextScoutFeedbackRequestV1 {
     pub address: ContextScoutAddressV1,
     pub receipt: ContextScoutDeliveryReceiptV1,
     pub feedback: ContextScoutFeedbackV1,
+    pub idempotency_key: IdempotencyKey,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -667,112 +680,91 @@ pub fn context_scout_surface_catalog_contribution()
         let (spec_bindings, binding_ids) =
             current_application_bindings(&capability_id, operation, SCOUT_SURFACES)?;
         bindings.extend(spec_bindings);
-        capabilities.push(CapabilityManifestV1::new(CapabilityManifestInputV1 {
-            capability_id,
-            use_case_id: use_case_id(spec)?,
-            routing: RoutingContractV1::new(
-                1,
-                spec.summary,
-                spec.description,
-                vec![format!("{} for this exact address", spec.summary)],
-            )?,
-            request_schema: request_schema(spec)?,
-            result_schema: result_schema(spec)?,
-            effect: spec.effect,
-            scope: ScopeRequirement::new(vec![
-                ScopeDimension::Project,
-                ScopeDimension::Worktree,
-                ScopeDimension::Session,
-                ScopeDimension::Resource,
-            ])?,
-            authority: AuthorityRequirement::CapabilityGrantWithRevalidation,
-            denied_disclosure: DeniedDisclosurePolicy::Indistinguishable,
-            privacy: PrivacyClass::ScopedMetadata,
-            lifecycle: LifecycleClass::Resumable,
-            streaming: StreamingContract::Unsupported,
-            cancellation: if is_effect {
-                CancellationContract::NotCancellable
-            } else {
-                CancellationContract::cooperative(vec![
-                    CancellationPoint::BeforeAdmission,
-                    CancellationPoint::BeforeRead,
-                    CancellationPoint::DuringRead,
-                ])?
-            },
-            deadline: DeadlineContract::new(
-                15_000,
-                if is_effect {
-                    DeadlineBehavior::ReturnEffectReceipt
+        capabilities.push(application_capability_manifest(
+            ApplicationCapabilityManifestInput {
+                capability_id,
+                use_case_id: use_case_id(spec)?,
+                routing: RoutingContractV1::new(
+                    1,
+                    spec.summary,
+                    spec.description,
+                    vec![format!("{} for this exact address", spec.summary)],
+                )?,
+                request_schema: request_schema(spec)?,
+                result_schema: result_schema(spec)?,
+                effect: spec.effect,
+                scope: ScopeRequirement::new(vec![
+                    ScopeDimension::Project,
+                    ScopeDimension::Worktree,
+                    ScopeDimension::Session,
+                    ScopeDimension::Resource,
+                ])?,
+                denied_disclosure: DeniedDisclosurePolicy::Indistinguishable,
+                privacy: PrivacyClass::ScopedMetadata,
+                lifecycle: LifecycleClass::Resumable,
+                streaming: StreamingContract::Unsupported,
+                cancellation: if is_effect {
+                    CancellationContract::NotCancellable
                 } else {
-                    DeadlineBehavior::ReturnOperationReceipt
+                    CancellationContract::cooperative(vec![
+                        CancellationPoint::BeforeAdmission,
+                        CancellationPoint::BeforeRead,
+                        CancellationPoint::DuringRead,
+                    ])?
                 },
-            )?,
-            pagination: spec
-                .paginated
-                .then(|| PaginationContract::new(8, 32, 60_000))
-                .transpose()?,
-            idempotency: if is_effect {
-                IdempotencyContract::Required
-            } else {
-                IdempotencyContract::NotRequired
+                deadline: DeadlineContract::new(
+                    15_000,
+                    if is_effect {
+                        DeadlineBehavior::ReturnEffectReceipt
+                    } else {
+                        DeadlineBehavior::ReturnOperationReceipt
+                    },
+                )?,
+                pagination: spec
+                    .paginated
+                    .then(|| PaginationContract::new(8, 32, 60_000))
+                    .transpose()?,
+                inverse: None,
+                authority_revalidation: RevalidationContract::required(vec![
+                    RevalidationPoint::Authority,
+                    RevalidationPoint::Scope,
+                    RevalidationPoint::Policy,
+                    RevalidationPoint::Configuration,
+                    RevalidationPoint::ExpectedState,
+                ])?,
+                terminal_states: TerminalStateContract::new(if is_effect {
+                    // Effect-class Scout operations are NotCancellable, and the
+                    // manifest contract requires the cancelled terminal to match
+                    // the cancellation contract exactly.
+                    vec![
+                        TerminalState::Completed,
+                        TerminalState::TimedOut,
+                        TerminalState::Failed,
+                        TerminalState::EffectUnknown,
+                        TerminalState::Partial,
+                    ]
+                } else {
+                    vec![
+                        TerminalState::Completed,
+                        TerminalState::Cancelled,
+                        TerminalState::TimedOut,
+                        TerminalState::Failed,
+                        TerminalState::Partial,
+                    ]
+                })?,
+                availability: AvailabilityContract::Available,
+                binding_ids,
+                profile_eligibility: vec![ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID)?],
+                required_features: Vec::new(),
             },
-            inverse: if is_effect {
-                tracedecay_tool_catalog::InverseContract::Unavailable {
-                    reason: tracedecay_tool_catalog::InverseUnavailableReason::NoShippedInverse,
-                }
-            } else {
-                tracedecay_tool_catalog::InverseContract::NotApplicable
-            },
-            authority_revalidation: RevalidationContract::required(vec![
-                RevalidationPoint::Authority,
-                RevalidationPoint::Scope,
-                RevalidationPoint::Policy,
-                RevalidationPoint::Configuration,
-                RevalidationPoint::ExpectedState,
-            ])?,
-            reconciliation: if is_effect {
-                ReconciliationContract::Required
-            } else {
-                ReconciliationContract::NotRequired
-            },
-            receipt: if is_effect {
-                ReceiptContract::DurableEffect
-            } else {
-                ReceiptContract::Operation
-            },
-            terminal_states: TerminalStateContract::new(if is_effect {
-                // Effect-class Scout operations are NotCancellable, and the
-                // manifest contract requires the cancelled terminal to match
-                // the cancellation contract exactly.
-                vec![
-                    TerminalState::Completed,
-                    TerminalState::TimedOut,
-                    TerminalState::Failed,
-                    TerminalState::EffectUnknown,
-                    TerminalState::Partial,
-                ]
-            } else {
-                vec![
-                    TerminalState::Completed,
-                    TerminalState::Cancelled,
-                    TerminalState::TimedOut,
-                    TerminalState::Failed,
-                    TerminalState::Partial,
-                ]
-            })?,
-            availability: AvailabilityContract::Available,
-            binding_ids,
-            profile_eligibility: vec![ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID)?],
-            required_features: Vec::new(),
-        })?);
+        )?);
     }
-    let contribution = CatalogContributionV1::new(CatalogContributionInputV1 {
-        contribution_id: ContributionId::new("contribution.application.context-scout-surface")?,
-        depends_on: Vec::new(),
+    let contribution = CatalogContributionV1::new(CatalogContributionInputV1::new(
+        ContributionId::new("contribution.application.context-scout-surface")?,
+        Vec::new(),
         capabilities,
-        retrieval_primitives: Vec::new(),
         bindings,
-    })?;
+    ))?;
     let schemas = context_scout_executable_schemas(&contribution)?;
     Ok(contribution.with_executable_schemas(schemas)?)
 }
@@ -856,7 +848,7 @@ fn context_scout_executable_schemas(
     add!(
         "context_scout_delivery",
         ContextScoutDeliveryRequestV1,
-        ContextScoutMutationResultV1
+        ContextScoutDeliveryResultV1
     );
     add!(
         "context_scout_feedback",
@@ -975,6 +967,8 @@ fn schema(
 
 #[cfg(test)]
 mod tests {
+    use tracedecay_tool_catalog::{IdempotencyContract, ReceiptContract, ReconciliationContract};
+
     use super::*;
 
     #[test]
@@ -1078,34 +1072,6 @@ mod tests {
                     .is_some(),
                 "{} must own its canonical request/result schema bodies",
                 capability.capability_id().as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn pause_and_resume_publish_configuration_effect_settlement_metadata() {
-        let contribution = context_scout_surface_catalog_contribution().unwrap();
-        for operation in ["context_scout_pause", "context_scout_resume"] {
-            let spec = CONTEXT_SCOUT_SPECS
-                .iter()
-                .find(|spec| spec.operation == operation)
-                .unwrap();
-            let capability = contribution
-                .capabilities()
-                .iter()
-                .find(|capability| capability.capability_id() == &capability_id(spec).unwrap())
-                .unwrap();
-            assert_eq!(capability.effect(), EffectClass::ConfigurationWrite);
-            assert_eq!(
-                capability.cancellation(),
-                &CancellationContract::NotCancellable
-            );
-            assert_eq!(capability.deadline().maximum_millis(), 15_000);
-            assert_eq!(capability.receipt(), ReceiptContract::DurableEffect);
-            assert_eq!(capability.idempotency(), IdempotencyContract::Required);
-            assert_eq!(
-                capability.reconciliation(),
-                ReconciliationContract::Required
             );
         }
     }

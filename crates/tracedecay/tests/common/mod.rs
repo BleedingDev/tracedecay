@@ -89,7 +89,7 @@ pub fn register_process_product_runtime() {
 /// (a `test-helpers` dev-dependency). The port keeps the first registration, so
 /// calling this at every fixture entry point is safe and idempotent.
 pub fn register_test_schema_installer() {
-    tracedecay_global_db::register_test_schema_installer();
+    tracedecay_global_db::register_registered_schema_installer();
 }
 
 pub async fn initialize_test_database(
@@ -202,16 +202,24 @@ static ISOLATED_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 /// a ready-made `project` directory inside the temp home.
 pub struct IsolatedEnv {
     toolchain_environment: [(&'static str, Option<OsString>); 3],
-    // Field order matters: fields drop in declaration order, so the lock must
-    // be declared last. Dropping it first would let the next waiting test
+    // Field order matters: fields drop in declaration order, so the locks must
+    // be declared last. Dropping them first would let the next waiting test
     // install its own isolated env, only for `storage`'s restore to clobber it.
     storage: TraceDecayStorageEnvGuard,
     dir: TempDir,
+    // Tests that swap the same process env by hand serialize on
+    // [`GLOBAL_DB_ENV_LOCK`] instead of this fixture. Holding both keeps one
+    // binary's `IsolatedEnv` journeys from interleaving with them: an
+    // `EnvVarGuard` restored mid-journey pointed a live daemon handshake at the
+    // cargo `target/test-profile` socket, and a swapped `HOME` emptied the
+    // Claude transcript root under a running provider fixture.
+    _global_db_env_lock: std::sync::MutexGuard<'static, ()>,
     _env_lock: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl IsolatedEnv {
     fn build(env_lock: tokio::sync::MutexGuard<'static, ()>) -> (Self, PathBuf) {
+        let global_db_env_lock = lock_global_db_env();
         // Every fixture built on top of this guard eventually asks the shipped
         // daemon for a handshake, which reads the registered product runtime.
         // Registering here — the single choke point both `acquire` paths share
@@ -256,6 +264,7 @@ impl IsolatedEnv {
                 toolchain_environment,
                 storage,
                 dir,
+                _global_db_env_lock: global_db_env_lock,
                 _env_lock: env_lock,
             },
             project,
@@ -331,6 +340,7 @@ pub struct TraceDecayStorageEnvGuard {
     _data_dir_guard: EnvVarGuard,
     _global_db_guard: GlobalDbEnvGuard,
     _holder_scan_guard: EnvVarGuard,
+    _daemon_socket_guard: EnvVarGuard,
 }
 
 impl TraceDecayStorageEnvGuard {
@@ -398,6 +408,19 @@ impl TraceDecayStorageEnvGuard {
             _holder_scan_guard: EnvVarGuard::set(
                 "TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN",
                 "1",
+            ),
+            // Storage isolation is only as good as the daemon the client
+            // reaches. An ambient `TRACEDECAY_DAEMON_SOCKET` (an operator's
+            // shell, another lane's private daemon) would route this fixture's
+            // requests to a daemon running under a *different* profile, which
+            // then materializes the fixture's project — hook configs, session
+            // and graph databases, a manifest naming /tmp roots — under its own
+            // home. One operator profile accumulated 111 such stores. Pin the
+            // socket inside the isolated profile so a fixture can only ever
+            // talk to a daemon it started itself.
+            _daemon_socket_guard: EnvVarGuard::set(
+                tracedecay_daemon_protocol::SOCKET_ENV,
+                profile_root.join("daemon.sock"),
             ),
         }
     }
@@ -1495,7 +1518,7 @@ impl LcmTestRuntime {
     pub fn session_temporal_store(
         &self,
     ) -> Result<
-        tracedecay_session_temporal_store::GlobalDbSessionTemporalStore<
+        tracedecay_session_temporal_store::SessionTemporalStore<
             '_,
             tracedecay_global_db::RegisteredGlobalDb,
         >,

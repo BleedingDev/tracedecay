@@ -135,16 +135,20 @@ pub trait WorkAttemptStoragePort: Send + Sync {
         evidence: Option<&WorkAttemptEvidenceRecordV1>,
     ) -> Result<(), WorkAttemptStorageError>;
 
-    /// Every non-terminal attempt in this authority scope, in identity order.
+    /// Every active attempt in this authority scope, in identity order.
+    /// A nonterminal recovery record leaves this census once a durable retry
+    /// receipt transfers execution authority to its replacement.
     fn open_attempts(
         &self,
         authority: &WorkAuthority,
     ) -> Result<Vec<WorkAttemptV1>, WorkAttemptStorageError>;
 
-    /// Whether any non-terminal attempt holds this exact registered Work
+    /// Whether any active attempt holds this exact registered Work
     /// scope, independent of the actor and policy lineage that admitted it.
     /// Cleanup is an infrastructure safety read and must see old-policy and
     /// delegated-actor rows without granting ordinary cross-authority access.
+    /// Retry-superseded recovery records remain historical and do not hold the
+    /// scope open.
     fn has_open_attempts_in_exact_scope(
         &self,
         _project_id: &ProjectId,
@@ -347,11 +351,18 @@ pub struct ResumeWorkAttemptsCommand {
     pub occurred_at: UtcMicros,
 }
 
-/// What resume-after-restart did to each open attempt.
+/// What restart recovery did to each open attempt.
+///
+/// This report never claims that a provider resumed. An attempt in
+/// `recovery_required` remains fenced under its original identity. This report
+/// does not authorize another launch; an explicit `retry_attempt` must verify
+/// the exact recovery fence and effect safety before it can atomically admit a
+/// new identity.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkAttemptRecoveryReportV1 {
-    /// Attempts fenced onto a new epoch and now awaiting recovery execution.
+    /// Attempts fenced onto a new epoch and awaiting an explicit recovery
+    /// decision.
     pub recovery_required: Vec<WorkAttemptV1>,
     /// Attempts whose in-flight cancellation was completed during recovery.
     pub cancelled: Vec<WorkAttemptV1>,
@@ -466,8 +477,7 @@ where
     }
 
     /// Lists one authority-scoped, page-bounded slice of provider attempts in
-    /// stable task/run/attempt order, read under the verified Work topology
-    /// snapshot the caller resolves through the graph publication mount.
+    /// stable task/run/attempt order, bound to the current Work product graph.
     ///
     /// Every non-success is typed: an out-of-bounds page size is an invalid
     /// request, a cursor minted under a superseded topology generation is
@@ -478,7 +488,7 @@ where
         &self,
         context: &RequestContext,
         request: &WorkAttemptListRequestV1,
-        topology: impl FnOnce(&WorkAuthority) -> Result<WorkAttemptTopologyStateV1, ApplicationProblem>,
+        topology: impl FnOnce() -> Result<WorkAttemptTopologyStateV1, ApplicationProblem>,
     ) -> Result<WorkAttemptListV1, ApplicationProblem> {
         if request.page_size == 0 || request.page_size > MAX_WORK_ATTEMPT_LIST_PAGE_SIZE {
             return Err(invalid_problem(
@@ -487,7 +497,7 @@ where
             ));
         }
         let authority = work_authority(context)?;
-        let binding = match topology(&authority)? {
+        let binding = match topology()? {
             WorkAttemptTopologyStateV1::Absent => {
                 return if request.cursor.is_some() {
                     // The snapshot the cursor was minted under no longer
@@ -631,6 +641,7 @@ where
                         &authority,
                         &attempt,
                         WorkRestartReasonV1::ProcessLost,
+                        command.occurred_at,
                     )?;
                     recovery_required.push(fenced);
                 }
@@ -676,6 +687,7 @@ where
                 WorkRecoveryStateV1::RecoveryRequired {
                     source_attempt_id: Some(source),
                     reason,
+                    ..
                 } => WorkRecoveryStateV1::Restarted {
                     source_attempt_id: source.clone(),
                     reason: *reason,
@@ -708,6 +720,7 @@ where
         &self,
         context: &RequestContext,
         identity: &WorkAttemptIdentityV1,
+        observed_at: UtcMicros,
     ) -> Result<WorkAttemptV1, ApplicationProblem> {
         let authority = work_authority(context)?;
         let attempt = self
@@ -718,6 +731,7 @@ where
             &authority,
             &attempt,
             WorkRestartReasonV1::ProviderUnavailable,
+            observed_at,
         )?;
         Ok(fenced)
     }
@@ -903,6 +917,7 @@ where
         authority: &WorkAuthority,
         attempt: &WorkAttemptV1,
         reason: WorkRestartReasonV1,
+        observed_at: UtcMicros,
     ) -> Result<WorkAttemptV1, ApplicationProblem> {
         let epoch = self
             .attempts
@@ -920,6 +935,7 @@ where
                 WorkRecoveryStateV1::RecoveryRequired {
                     source_attempt_id: None,
                     reason,
+                    observed_at,
                 },
                 attempt.actual_route().cloned(),
                 None,

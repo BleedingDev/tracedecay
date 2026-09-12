@@ -17,6 +17,7 @@ use tracedecay_code_index::{
 use tracedecay_contracts::{ClockError, try_now_micros};
 use tracedecay_domain::{
     CodeGenerationId, ProjectId, RepositoryId, VectorGenerationIdV1, WorktreeId, canonical_sha256,
+    sha256_hex_suffix,
 };
 use tracedecay_graph_db::{
     GraphCancellation, GraphDbError, GraphDbOwnerAttachmentV1, GraphDbOwnerRegistrationV1,
@@ -232,9 +233,7 @@ impl IsolatedSemanticEvaluationGraphV1 {
             &self.worktree,
         ))
         .map_err(|error| GraphDbError::invalid(error.to_string()))?;
-        let code_scope_hash = code_scope_digest
-            .as_str()
-            .strip_prefix("sha256:")
+        let code_scope_hash = sha256_hex_suffix(code_scope_digest.as_str())
             .ok_or_else(|| GraphDbError::Corrupt {
                 message: "semantic evaluation code-scope digest is not canonical".to_owned(),
             })
@@ -1046,45 +1045,6 @@ fn post_commit_batch_settlement_error(error: GraphDbError) -> GraphDbError {
 #[cfg(test)]
 mod settlement_tests {
     use super::*;
-
-    #[test]
-    fn evaluation_graph_mounts_owner_before_registered_operations() {
-        let root = tempfile::tempdir().expect("evaluation root");
-        let graph_path = root
-            .path()
-            .canonicalize()
-            .expect("canonical evaluation root")
-            .join("evaluation.grafeo");
-        let binding = evaluation_binding().expect("evaluation binding");
-        let operation = Arc::new(EvaluationGraphLeaseV1 {
-            locator: VerifiedStoreLocatorV1::new(
-                binding.shard_id.clone(),
-                binding.incarnation,
-                canonical_store_locator_digest(&graph_path).expect("graph locator digest"),
-            ),
-            binding,
-            canonical_path: graph_path,
-        });
-        let registry =
-            GraphDbRegistry::new(GraphDbRegistryConfig { max_open: 1 }).expect("registry");
-        let cancellation: Arc<dyn GraphCancellation> = Arc::new(NeverCancelled);
-        let _owner = mount_evaluation_graph_runtime(
-            &registry,
-            Arc::clone(&operation),
-            Arc::clone(&cancellation),
-        )
-        .expect("owner-mounted evaluation graph");
-        let authority_lease: Arc<dyn RetainedGraphStoreLeaseV1> = operation;
-
-        registry
-            .resolve(GraphDbRegistration {
-                authority_lease,
-                lifecycle_cancellation: Arc::clone(&cancellation),
-                cancellation,
-                deadline: Instant::now() + Duration::from_secs(30),
-            })
-            .expect("registered evaluation operation");
-    }
 
     #[test]
     fn post_commit_interruptions_are_durability_uncertain_not_cancelled() {

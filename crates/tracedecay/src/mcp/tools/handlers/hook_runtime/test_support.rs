@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutEvidenceEnvelopeExt;
+use tracedecay_agent_hosts::agents::context_scout::ContextScoutEvidenceEnvelopeExt;
 use tracedecay_contracts::context_scout::{
     ContextScoutAddressV1, ContextScoutCandidateV1, ContextScoutCategoryV1,
     ContextScoutDeliveryWindowV1, ContextScoutDurableClaimV1, ContextScoutDurableQueueEntryV1,
@@ -129,6 +129,7 @@ pub(super) fn retained_claim(id: u8) -> ContextScoutDurableClaimV1 {
                     requested_at: UtcMicros(1),
                     resolved_at: UtcMicros(2),
                     source_generation: Some(generation),
+                    code_graph_freshness: None,
                     watermark_digest: Some(digest('e')),
                     freshness: FreshnessState::Current,
                 },

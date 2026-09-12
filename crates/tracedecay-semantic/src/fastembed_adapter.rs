@@ -37,7 +37,7 @@
 //!   ONNX Runtime execution providers to register. The default (CPU-only)
 //!   build and runtime configuration return an empty list — ORT's own
 //!   default CPU EP — so behavior is byte-identical to before GPU support
-//!   existed; see that module for the opt-in CoreML/CUDA switches.
+//!   existed; see that module for the opt-in CUDA/WebGPU switches.
 #[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use fastembed::{
     InitOptionsUserDefined, Pooling as FastEmbedPooling, QuantizationMode, TextEmbedding,
@@ -49,13 +49,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-#[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
-use std::thread;
-#[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
 use tracedecay_domain::EmbeddingPrecisionV1;
@@ -63,9 +57,9 @@ use tracedecay_domain::EmbeddingPrecisionV1;
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
     AdmittedEmbeddingProjectionKeyV1, ChunkerRevision, EmbeddingDeviceClassV1,
-    EmbeddingDocumentCompositionV1, EmbeddingMetricV1, EmbeddingNormalizationV1,
-    EmbeddingPoolingV1, EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1, ManifestDigest,
-    PrivacyDomainId,
+    EmbeddingDocumentCompositionV1, EmbeddingExecutionProviderV1, EmbeddingMetricV1,
+    EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingProjectionKeyV1,
+    EmbeddingTruncationSideV1, ManifestDigest, PrivacyDomainId,
 };
 use tracedecay_semantic_contracts::{
     ArtifactMemberRoleV1, ArtifactProfileKindV1, SemanticResourceCeilings, Sha256DigestHex,
@@ -101,6 +95,15 @@ pub enum EmbedError {
     TooManyTexts { presented: usize, max: usize },
     /// The batch exceeded the manifest's bounded total sanitized bytes.
     BatchBytesExceeded { presented: usize, max: usize },
+    /// The tensor this batch would build spends more attention-score
+    /// positions than the admitted quadratic budget. Grouping is supposed to
+    /// make this unreachable; reaching it means the grouping seam and the
+    /// embed seam disagree about how long the documents tokenize.
+    AttentionBudgetExceeded {
+        rows: u64,
+        padded_tokens: u64,
+        budget: u64,
+    },
     /// A produced vector does not match the manifest's declared dimension.
     DimensionMismatch { expected: u32, actual: usize },
     /// A produced vector contains NaN or infinite values.
@@ -123,6 +126,14 @@ impl fmt::Display for EmbedError {
             Self::BatchBytesExceeded { presented, max } => write!(
                 f,
                 "batch of {presented} bytes exceeds the manifest bound of {max}"
+            ),
+            Self::AttentionBudgetExceeded {
+                rows,
+                padded_tokens,
+                budget,
+            } => write!(
+                f,
+                "a batch of {rows} rows padded to {padded_tokens} tokens spends more than the admitted attention budget of {budget} token-pair positions"
             ),
             Self::DimensionMismatch { expected, actual } => write!(
                 f,
@@ -217,12 +228,71 @@ pub(crate) struct VerifiedEmbeddingArtifactV1 {
 /// the machine cannot hold, which is a worse failure than embedding narrow.
 const RESIDENT_ESTIMATE_HEADROOM_NUMERATOR: u64 = 5;
 const RESIDENT_ESTIMATE_HEADROOM_DENOMINATOR: u64 = 4;
+// Jina Embeddings v2 Base Code dimensions from its config.json. The catalog
+// does not currently carry transformer shape metadata.
+const FASTEMBED_ATTENTION_HEADS: u64 = 12;
+const FASTEMBED_HIDDEN_SIZE: u64 = 768;
+const FASTEMBED_ACTIVATION_SCALAR_BYTES: u64 = size_of::<f32>() as u64;
+/// Padded sequence length of the historical worst-case batch, the one the
+/// quadratic budget preserves. Sole definition; the projector's grouping seam
+/// and the reservation arithmetic both spend against it.
+pub(crate) const ATTENTION_BUDGET_BASELINE_SEQUENCE: u64 = 512;
+
+/// The quadratic attention-score budget one forward pass may spend, counted in
+/// `rows × padded_tokens²` token-pair positions.
+///
+/// It is the larger of the historical 32-by-512 batch and one row at the full
+/// admitted sequence, because a document longer than the baseline still has to
+/// be embeddable and can only run alone. Everything else about the sizing
+/// follows from this one number: grouping refuses to exceed it,
+/// [`FastEmbedEmbeddingSession::embed_batch`] proves the tensor it actually
+/// builds stays inside it, and the reservation below charges exactly it.
+pub(crate) fn attention_token_square_budget(
+    inference_batch_size: u64,
+    truncation_length: u64,
+) -> u64 {
+    inference_batch_size
+        .saturating_mul(ATTENTION_BUDGET_BASELINE_SEQUENCE.pow(2))
+        .max(truncation_length.saturating_mul(truncation_length))
+}
+
+/// Activation bytes of the largest forward pass the attention budget admits.
+///
+/// `truncation_length` — not the configured sequence ceiling — is the bound
+/// that matters: it is `min(model.max_length, max_sequence_length)`, the
+/// length the tokenizer will actually truncate to, so a model whose own
+/// maximum is shorter reserves less.
+///
+/// Attention scores are `[rows, heads, longest, longest]`, whose worst case is
+/// the budget itself. Hidden states are `[rows, longest, hidden]`, and
+/// `rows × longest` is maximised at the baseline sequence — a longer row must
+/// run with proportionally fewer rows, so widening past the baseline shrinks
+/// this term rather than growing it.
+fn fastembed_worst_batch_activation_bytes(max_batch_size: u32, truncation_length: u32) -> u64 {
+    let batch_size = u64::from(max_batch_size);
+    let truncation_length = u64::from(truncation_length);
+    let attention_bytes = FASTEMBED_ATTENTION_HEADS
+        .saturating_mul(attention_token_square_budget(batch_size, truncation_length))
+        .saturating_mul(FASTEMBED_ACTIVATION_SCALAR_BYTES);
+    let hidden_rows = batch_size
+        .saturating_mul(truncation_length.min(ATTENTION_BUDGET_BASELINE_SEQUENCE))
+        .max(truncation_length);
+    let hidden_bytes = hidden_rows
+        .saturating_mul(FASTEMBED_HIDDEN_SIZE)
+        .saturating_mul(FASTEMBED_ACTIVATION_SCALAR_BYTES);
+    attention_bytes.saturating_add(hidden_bytes)
+}
 
 /// Per-session resident estimate from declared member lengths, clamped into
 /// `1..=ceiling`. A zero or unknown length falls back to the ceiling, which
 /// preserves exactly the previous conservative behaviour for any artifact
 /// that does not declare its sizes.
-fn resident_bytes_estimate_for(member_bytes: u64, resident_byte_ceiling: u64) -> u64 {
+fn resident_bytes_estimate_for(
+    member_bytes: u64,
+    max_batch_size: u32,
+    truncation_length: u32,
+    resident_byte_ceiling: u64,
+) -> u64 {
     if member_bytes == 0 {
         return resident_byte_ceiling;
     }
@@ -230,7 +300,34 @@ fn resident_bytes_estimate_for(member_bytes: u64, resident_byte_ceiling: u64) ->
         .saturating_mul(RESIDENT_ESTIMATE_HEADROOM_NUMERATOR)
         .checked_div(RESIDENT_ESTIMATE_HEADROOM_DENOMINATOR)
         .unwrap_or(resident_byte_ceiling)
+        .saturating_add(fastembed_worst_batch_activation_bytes(
+            max_batch_size,
+            truncation_length,
+        ))
         .clamp(1, resident_byte_ceiling.max(1))
+}
+
+/// The resident ceiling a composed configuration resolved against its host.
+///
+/// An unresolved ceiling is a typed refusal, not a number to invent: the
+/// reservation arithmetic below clamps into it, so substituting a default here
+/// would silently re-admit the sessions the host cannot hold.
+fn resolved_resident_ceiling(resources: SemanticResourceCeilings) -> Result<u64, EmbedError> {
+    resources.resolved_max_resident_bytes().map_err(|_| {
+        fastembed_failure(
+            RuntimeFailureKindV1::IncompatibleRuntime,
+            "the semantic resident ceiling was not resolved against this host",
+        )
+    })
+}
+
+fn lifecycle_execution_provider(backend: EmbeddingRuntimeFamilyV1) -> EmbeddingExecutionProviderV1 {
+    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
+    if backend == EmbeddingRuntimeFamilyV1::FastEmbedOrt {
+        return crate::execution_provider::resolved_execution_provider();
+    }
+    let _ = backend;
+    EmbeddingExecutionProviderV1::Cpu
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -296,6 +393,10 @@ impl VerifiedEmbeddingArtifactV1 {
 
     fn max_threads(&self) -> u32 {
         self.max_threads
+    }
+
+    pub(crate) fn execution_provider(&self) -> EmbeddingExecutionProviderV1 {
+        self.projection.embedding_key().execution_provider
     }
 
     fn max_concurrent_sessions(&self) -> u32 {
@@ -507,6 +608,8 @@ impl AdmittedProjectionArtifactV1 {
                 resident_byte_ceiling: payload.resource_ceiling.max_resident_bytes,
                 resident_bytes_estimate: resident_bytes_estimate_for(
                     declared_member_bytes,
+                    payload.resource_ceiling.max_batch_size,
+                    projection.embedding_key().truncation_length,
                     payload.resource_ceiling.max_resident_bytes,
                 ),
                 load_deadline_ms: payload.resource_ceiling.load_deadline_ms,
@@ -542,6 +645,8 @@ impl AdmittedProjectionArtifactV1 {
         let model_member = member("model")?;
         let tokenizer = member("tokenizer")?;
         let config = member("config")?;
+        let resident_byte_ceiling = resolved_resident_ceiling(resources)?;
+        let truncation_length = projection.embedding_key().truncation_length;
         let lifecycle_install = LifecycleInstallArtifactV1 {
             root: install_path.to_path_buf(),
             members: model.members.clone(),
@@ -581,10 +686,12 @@ impl AdmittedProjectionArtifactV1 {
                 ),
                 max_threads: resources.max_threads,
                 max_concurrent_sessions: resources.max_concurrent_sessions,
-                resident_byte_ceiling: resources.max_resident_bytes,
+                resident_byte_ceiling,
                 resident_bytes_estimate: resident_bytes_estimate_for(
                     model_member.length.saturating_add(tokenizer.length),
-                    resources.max_resident_bytes,
+                    resources.max_batch_size,
+                    truncation_length,
+                    resident_byte_ceiling,
                 ),
                 load_deadline_ms: resources.load_deadline_ms,
             },
@@ -612,7 +719,7 @@ impl AdmittedProjectionArtifactV1 {
         let config = member("config")?;
         if model_member.length > resources.max_model_bytes
             || tokenizer.length > resources.max_tokenizer_bytes
-            || model_member.length > resources.max_resident_bytes
+            || model_member.length > resolved_resident_ceiling(resources)?
         {
             return Err(fastembed_failure(
                 RuntimeFailureKindV1::OutOfMemory,
@@ -631,6 +738,7 @@ impl AdmittedProjectionArtifactV1 {
         // runtime/precision pins, so two backends serving the same upstream
         // package still produce distinct projection identities.
         let backend = model.backend.runtime_family();
+        let execution_provider = lifecycle_execution_provider(backend);
         let projection = EmbeddingProjectionKeyV1 {
             model_artifact_digest: manifest_digest(&catalog_package_digest(model))?,
             tokenizer_digest: manifest_digest(&tokenizer.sha256)?,
@@ -649,6 +757,7 @@ impl AdmittedProjectionArtifactV1 {
             runtime_backend: backend.runtime_family().to_owned(),
             runtime_build_revision: backend.build_revision().to_owned(),
             device_class: EmbeddingDeviceClassV1::Cpu,
+            execution_provider,
             dimensions: model.expected_dimensions,
             metric: EmbeddingMetricV1::Cosine,
             normalization: EmbeddingNormalizationV1::L2,
@@ -688,11 +797,17 @@ impl AdmittedProjectionArtifactV1 {
     pub(crate) fn embedding_execution_plan(
         &self,
     ) -> crate::embedding_parallelism::EmbeddingExecutionPlanV1 {
+        hotpath::gauge!("semantic_embedding_resident_session_estimate_bytes")
+            .set(self.runtime_artifact.resident_bytes_estimate());
         crate::embedding_parallelism::embedding_execution_plan(
             self.runtime_artifact.max_threads(),
             self.runtime_artifact.max_concurrent_sessions(),
             self.runtime_artifact.resident_session_limit(),
         )
+    }
+
+    pub(crate) fn execution_provider(&self) -> EmbeddingExecutionProviderV1 {
+        self.runtime_artifact.execution_provider()
     }
 
     #[cfg(any(test, feature = "semantic-fastembed", feature = "semantic-model2vec"))]
@@ -966,31 +1081,6 @@ pub(crate) fn check_execution_authority(
     }
 }
 
-#[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
-const MODEL_LOAD_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(2);
-
-/// Bridge the request's typed interruption authority to ORT's in-progress
-/// session-load canceler. The monitor is active only while the constructor is
-/// executing and returns the exact interruption that fired.
-#[cfg(any(test, all(feature = "semantic-fastembed", not(windows))))]
-#[hotpath::measure(label = "semantic.model.load.cancel_monitor")]
-fn monitor_model_load(
-    load_finished: &AtomicBool,
-    authority: &dyn SemanticExecutionAuthority,
-    cancel: impl FnOnce() -> Result<(), EmbedError>,
-) -> Result<Option<SemanticExecutionInterruptionV1>, EmbedError> {
-    loop {
-        if load_finished.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        if let Some(interruption) = authority.interruption() {
-            cancel()?;
-            return Ok(Some(interruption));
-        }
-        thread::sleep(MODEL_LOAD_CANCELLATION_POLL_INTERVAL);
-    }
-}
-
 /// A manually flipped cancellation flag.
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -1071,6 +1161,15 @@ pub trait EmbeddingSession: Send {
         batch: &BoundedSanitizedTextBatchV1,
         authority: &dyn SemanticExecutionAuthority,
     ) -> Result<Vec<EmbeddingVectorV1>, EmbedError>;
+    /// Token count of each composed document under this session's own
+    /// tokenizer, after the admitted projection's truncation.
+    ///
+    /// This is the only truthful input to batch grouping: the padded length of
+    /// a group is `max` of these, and attention cost is quadratic in it, so a
+    /// bytes-per-token estimate is wrong by the square of its error. Callers
+    /// pass composed documents, not raw chunk text, because composition is
+    /// what the tensor sees.
+    fn encoded_token_lengths(&mut self, texts: &[String]) -> Result<Vec<usize>, EmbedError>;
 }
 
 /// The root-private embedding runtime port (Plan 31: load verified artifact
@@ -1171,6 +1270,10 @@ impl EmbeddingSession for UnavailableEmbeddingSession {
     ) -> Result<Vec<EmbeddingVectorV1>, EmbedError> {
         match *self {}
     }
+
+    fn encoded_token_lengths(&mut self, _texts: &[String]) -> Result<Vec<usize>, EmbedError> {
+        match *self {}
+    }
 }
 
 #[cfg(not(all(feature = "semantic-fastembed", not(windows))))]
@@ -1249,6 +1352,13 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
                 "the artifact has no permitted FastEmbed inference threads",
             ));
         }
+        if artifact.execution_provider() != crate::execution_provider::resolved_execution_provider()
+        {
+            return Err(fastembed_failure(
+                RuntimeFailureKindV1::IncompatibleRuntime,
+                "the resolved execution provider changed after projection admission",
+            ));
+        }
         Ok(())
     }
 
@@ -1275,64 +1385,34 @@ impl EmbeddingRuntime for FastEmbedEmbeddingRuntime {
         let options = InitOptionsUserDefined::new()
             .with_max_length(artifact.truncation_length() as usize)
             .with_intra_threads(intra_threads)
-            .with_execution_providers(crate::execution_provider::requested_execution_providers());
+            .with_execution_providers(crate::execution_provider::execution_providers(
+                artifact.execution_provider(),
+            ));
         // Last boundary before the ORT constructor: an abandoned load drops
         // the buffered member bytes here instead of parsing and optimizing a
-        // graph nobody will use.
+        // graph nobody will use. The published FastEmbed constructor owns the
+        // ORT session build end to end and exposes no in-progress cancel
+        // handle, so the typed cancellation/deadline authority is honored at
+        // this boundary and again at the first stage after the load returns.
         check_execution_authority(interruption)?;
-        let load_finished = AtomicBool::new(false);
         let embedding = hotpath::measure_block!("semantic.model.load", {
-            thread::scope(|scope| {
-                let mut monitor = None;
-                let monitor_load_finished = &load_finished;
-                let monitor_interruption = interruption;
-                let embedding = TextEmbedding::try_new_from_user_defined_with_load_canceler(
-                    model,
-                    options,
-                    |canceler| {
-                        monitor = Some(scope.spawn(move || {
-                            monitor_model_load(monitor_load_finished, monitor_interruption, || {
-                                canceler.cancel().map_err(|error| {
-                                    fastembed_error(
-                                        RuntimeFailureKindV1::LoadFailed,
-                                        "ONNX Runtime refused model-load cancellation",
-                                        &error,
-                                    )
-                                })
-                            })
-                        }));
-                    },
+            TextEmbedding::try_new_from_user_defined(model, options).map_err(|error| {
+                let failure = fastembed_error(
+                    RuntimeFailureKindV1::LoadFailed,
+                    "FastEmbed could not initialize the verified artifact",
+                    &error,
                 );
-                load_finished.store(true, Ordering::Release);
-                let observed_interruption = match monitor {
-                    Some(monitor) => monitor.join().map_err(|_| {
-                        fastembed_failure(
-                            RuntimeFailureKindV1::LoadFailed,
-                            "the model-load cancellation monitor panicked",
-                        )
-                    })??,
-                    None => None,
-                };
-                match observed_interruption {
-                    Some(SemanticExecutionInterruptionV1::Cancelled) => {
-                        return Err(EmbedError::Cancelled);
-                    }
-                    Some(SemanticExecutionInterruptionV1::DeadlineExceeded) => {
-                        return Err(EmbedError::DeadlineExceeded);
-                    }
-                    None => {}
-                }
-                embedding.map_err(|error| {
-                    let failure = fastembed_error(
-                        RuntimeFailureKindV1::LoadFailed,
-                        "FastEmbed could not initialize the verified artifact",
-                        &error,
-                    );
-                    crate::hotpath_observe::record_embed_error(&failure);
-                    failure
-                })
+                crate::hotpath_observe::record_embed_error(&failure);
+                failure
             })
         })?;
+        // The caller's deadline or cancellation may have fired while ORT was
+        // building the graph. Report the typed interruption and drop the
+        // session nobody is waiting for instead of handing it back.
+        if let Err(interrupted) = check_execution_authority(interruption) {
+            drop(embedding);
+            return Err(interrupted);
+        }
         crate::hotpath_observe::record_model_state("ready");
         Ok(FastEmbedEmbeddingSession {
             authority: authority.clone(),
@@ -1363,8 +1443,20 @@ impl EmbeddingSession for FastEmbedEmbeddingSession {
         batch: &BoundedSanitizedTextBatchV1,
         authority: &dyn SemanticExecutionAuthority,
     ) -> Result<Vec<EmbeddingVectorV1>, EmbedError> {
-        let artifact = self.authority.runtime_artifact();
-        validate_batch_limits(batch, artifact)?;
+        let (max_batch_texts, truncation_length, dimensions, metric, normalization) = {
+            let artifact = self.authority.runtime_artifact();
+            validate_batch_limits(batch, artifact)?;
+            (
+                artifact.max_batch_texts(),
+                self.authority
+                    .projection()
+                    .embedding_key()
+                    .truncation_length,
+                artifact.dimensions(),
+                artifact.metric(),
+                artifact.normalization(),
+            )
+        };
         hotpath::gauge!("semantic_embed_batch_size").set(batch.len());
         // Sanitized input volume — the tokenizer's cost driver. FastEmbed
         // fuses tokenization into `semantic.embed.infer`, so bytes-in is the
@@ -1372,6 +1464,25 @@ impl EmbeddingSession for FastEmbedEmbeddingSession {
         hotpath::gauge!("semantic_embed_batch_bytes").set(batch.total_bytes());
 
         check_execution_authority(authority)?;
+        // Prove the tensor this call is about to build stays inside the
+        // attention budget grouping promised. FastEmbed pads to
+        // `BatchLongest` inside `embed`, so the shape is decided here and
+        // nowhere else; measuring it costs one tokenizer pass over text the
+        // very next line tokenizes again.
+        let token_lengths = self.encoded_token_lengths(batch.texts())?;
+        let longest = token_lengths.iter().copied().max().unwrap_or(0) as u64;
+        let rows = batch.len() as u64;
+        let spent = rows.saturating_mul(longest).saturating_mul(longest);
+        let budget =
+            attention_token_square_budget(u64::from(max_batch_texts), u64::from(truncation_length));
+        hotpath::gauge!("semantic_embed_batch_padded_tokens").set(longest);
+        if spent > budget {
+            return Err(EmbedError::AttentionBudgetExceeded {
+                rows,
+                padded_tokens: longest,
+                budget,
+            });
+        }
         // FastEmbed/ORT inference is synchronous. Keep batches small at the
         // projector boundary, then perform one tensor invocation per admitted
         // batch instead of one invocation per text.
@@ -1407,14 +1518,49 @@ impl EmbeddingSession for FastEmbedEmbeddingSession {
             }
             let vector = EmbeddingVectorV1 {
                 values,
-                dimensions: artifact.dimensions(),
-                metric: artifact.metric(),
-                normalization: artifact.normalization(),
+                dimensions,
+                metric,
+                normalization,
             };
             vector.validate()?;
             vectors.push(vector);
         }
         Ok(vectors)
+    }
+
+    fn encoded_token_lengths(&mut self, texts: &[String]) -> Result<Vec<usize>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `encode_batch` pads to the batch's longest row, so the padded ids
+        // are not the answer; the attention mask is, and it is exactly what
+        // the model will attend over. Truncation is already configured on
+        // this tokenizer from the admitted `truncation_length`.
+        hotpath::measure_block!("semantic.embed.tokenize", {
+            let inputs = texts.iter().map(String::as_str).collect::<Vec<_>>();
+            // This is the tokenizer's own error, not a `fastembed::Error`:
+            // an input-side tokenization failure for the presented batch.
+            let encodings = self
+                .embedding
+                .tokenizer
+                .encode_batch(inputs, true)
+                .map_err(|_| {
+                    fastembed_failure(
+                        RuntimeFailureKindV1::EmbedFailed,
+                        "FastEmbed tokenization failed for the verified artifact",
+                    )
+                })?;
+            Ok(encodings
+                .iter()
+                .map(|encoding| {
+                    encoding
+                        .get_attention_mask()
+                        .iter()
+                        .filter(|attended| **attended != 0)
+                        .count()
+                })
+                .collect())
+        })
     }
 }
 
@@ -1474,19 +1620,52 @@ fn fastembed_failure(kind: RuntimeFailureKindV1, detail: &str) -> EmbedError {
     })
 }
 
+/// Map FastEmbed's typed error onto the runtime failure vocabulary. Only the
+/// kind is derived from the error: the operator-facing detail stays the
+/// caller's fixed stage description so no raw runtime text (which may quote
+/// paths or input) crosses the privacy boundary.
+///
+/// `fastembed::Error` is `#[non_exhaustive]`; unlisted variants keep the
+/// stage's fallback kind (`LoadFailed` while opening, `EmbedFailed` while
+/// embedding) rather than being rewrapped or guessed at.
 #[cfg(all(feature = "semantic-fastembed", not(windows)))]
 fn fastembed_error(
     fallback_kind: RuntimeFailureKindV1,
     detail: &str,
-    error: &impl fmt::Display,
+    error: &fastembed::Error,
 ) -> EmbedError {
-    let message = error.to_string().to_ascii_lowercase();
-    let kind = if message.contains("out of memory") || message.contains("allocation") {
-        RuntimeFailureKindV1::OutOfMemory
-    } else {
-        fallback_kind
+    let kind = match error {
+        // ONNX Runtime itself failed (environment/session builder, session
+        // creation, or a run). Memory exhaustion is the one ORT failure the
+        // pool treats differently, so it is separated by message; every
+        // other ORT failure is the stage's own failure kind.
+        fastembed::Error::Ort(_)
+        | fastembed::Error::OrtBuilder(_)
+        | fastembed::Error::OrtSession(_) => {
+            if ort_reports_out_of_memory(&error.to_string()) {
+                RuntimeFailureKindV1::OutOfMemory
+            } else {
+                fallback_kind
+            }
+        }
+        // The tokenizer members were digest-verified against the catalog
+        // before reaching FastEmbed, so a configuration the linked runtime
+        // rejects is a pin/runtime incompatibility, not corruption.
+        fastembed::Error::TokenizerConfig(_) => RuntimeFailureKindV1::IncompatibleRuntime,
+        // Input-side tokenizer failures are embedding failures for the
+        // presented batch, whichever stage reported them.
+        fastembed::Error::Tokenization(_) | fastembed::Error::EmptyTokenizations => {
+            RuntimeFailureKindV1::EmbedFailed
+        }
+        _ => fallback_kind,
     };
     fastembed_failure(kind, detail)
+}
+
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
+fn ort_reports_out_of_memory(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("out of memory") || message.contains("allocation")
 }
 
 /// Test-observable counters for the deterministic fake runtime.
@@ -1671,6 +1850,27 @@ impl EmbeddingSession for FakeEmbeddingSession {
         }
         self.counters.embed_calls.fetch_add(1, Ordering::SeqCst);
         Ok(out)
+    }
+
+    /// One token per whitespace-separated word, capped at the admitted
+    /// truncation length. The fake has no tokenizer; what the projector's
+    /// tests need is a length authority that varies with the text and can be
+    /// predicted from a fixture, which this is.
+    fn encoded_token_lengths(&mut self, texts: &[String]) -> Result<Vec<usize>, EmbedError> {
+        let truncation_length = self
+            .authority
+            .projection()
+            .embedding_key()
+            .truncation_length as usize;
+        Ok(texts
+            .iter()
+            .map(|text| {
+                text.split_whitespace()
+                    .count()
+                    .max(1)
+                    .min(truncation_length)
+            })
+            .collect())
     }
 }
 
@@ -1972,7 +2172,7 @@ pub(crate) mod lifecycle_test_support {
             SemanticResourceCeilings {
                 max_model_bytes,
                 max_tokenizer_bytes: 1024,
-                max_resident_bytes: max_model_bytes.max(4096),
+                max_resident_bytes: Some(max_model_bytes.max(4096)),
                 max_threads: 1,
                 max_concurrent_sessions: 1,
                 max_batch_size: 4,
@@ -1985,713 +2185,4 @@ pub(crate) mod lifecycle_test_support {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::lifecycle_test_support::{
-        digest_mismatched_lifecycle_authority, lifecycle_authority_from, lifecycle_install_fixture,
-    };
-    use super::*;
-    use tracedecay_domain::{ChunkerRevision, EmbeddingProjectionKeyV1, PrivacyDomainId};
-
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        T::Error: fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("canonical test identity")
-    }
-
-    fn digest(byte: char) -> ManifestDigest {
-        id(&format!("sha256:{}", byte.to_string().repeat(64)))
-    }
-
-    /// A session must be charged what one session retains, not the whole
-    /// process budget.
-    ///
-    /// Charging the ceiling per session is self-defeating: the first session
-    /// reserves the entire budget, so the pool's memory check refuses every
-    /// later acquisition and embedding collapses to one session on every
-    /// host, whatever the CPU width arithmetic asked for.
-    #[test]
-    fn resident_estimate_admits_more_than_one_session_under_the_process_ceiling() {
-        const CEILING: u64 = 2 * 1024 * 1024 * 1024;
-        // The shipped default code model plus its tokenizer.
-        const MEMBER_BYTES: u64 = 612 * 1024 * 1024 + 2 * 1024 * 1024;
-
-        let estimate = resident_bytes_estimate_for(MEMBER_BYTES, CEILING);
-        assert!(
-            estimate < CEILING,
-            "a single session must not reserve the whole process budget"
-        );
-        assert!(
-            estimate >= MEMBER_BYTES,
-            "the estimate must still cover the artifact's own declared bytes"
-        );
-        assert!(
-            CEILING / estimate >= 2,
-            "the default ceiling must admit at least the two concurrent \
-             sessions the host width arithmetic derives"
-        );
-    }
-
-    /// End-to-end over the real admission path: a production-scale artifact
-    /// must not charge one session the whole process budget.
-    ///
-    /// Before the reservation was split from the ceiling, the descriptor
-    /// reported the full `max_resident_bytes` for every session, so the
-    /// pool's `resident_bytes + reserved > memory_ceiling` check refused the
-    /// second acquisition and `RuntimeChunkVectorEncoderV1::ensure_sessions`
-    /// silently broke out of its loop at one session.
-    #[test]
-    fn production_scale_artifact_admits_the_derived_session_width() {
-        const CEILING: u64 = 2 * 1024 * 1024 * 1024;
-        const MODEL_BYTES: u64 = 612 * 1024 * 1024;
-        const TOKENIZER_BYTES: u64 = 2 * 1024 * 1024;
-
-        let artifact = crate::session_pool::test_support::admitted_artifact_sized(
-            MODEL_BYTES,
-            TOKENIZER_BYTES,
-            CEILING,
-        );
-        let projection = crate::session_pool::test_support::projection_for(&artifact)
-            .admit()
-            .expect("production-scale fixture projection");
-        let authority = AdmittedProjectionArtifactV1::admit(&artifact, &projection)
-            .expect("production-scale fixture admits");
-
-        let reserved = authority.resident_bytes_estimate();
-        assert!(
-            reserved <= authority.resident_byte_ceiling(),
-            "a per-session reservation may never exceed the process ceiling"
-        );
-        // The pool admits while `resident_bytes + reserved <= ceiling`.
-        let admitted = (1..=8)
-            .take_while(|n| reserved.saturating_mul(*n) <= CEILING)
-            .count();
-        assert!(
-            admitted >= 2,
-            "the process ceiling must admit at least the two sessions the host \
-             width arithmetic derives, but only {admitted} fit at {reserved} bytes each"
-        );
-    }
-
-    #[test]
-    fn resident_estimate_never_exceeds_the_ceiling_and_survives_unknown_sizes() {
-        const CEILING: u64 = 4096;
-        // An artifact that declares no lengths keeps the previous
-        // conservative behaviour rather than under-reserving.
-        assert_eq!(resident_bytes_estimate_for(0, CEILING), CEILING);
-        // A model larger than the ceiling still clamps to it; the pool's own
-        // `reserved_bytes > resident_byte_ceiling` check then refuses it.
-        assert_eq!(resident_bytes_estimate_for(u64::MAX, CEILING), CEILING);
-        assert!(resident_bytes_estimate_for(1024, CEILING) <= CEILING);
-    }
-
-    fn authority(dimensions: u32) -> AdmittedProjectionArtifactV1 {
-        authority_with(
-            dimensions,
-            'a',
-            EmbeddingMetricV1::Cosine,
-            EmbeddingNormalizationV1::L2,
-        )
-    }
-
-    fn authority_with(
-        dimensions: u32,
-        artifact_digest: char,
-        metric: EmbeddingMetricV1,
-        normalization: EmbeddingNormalizationV1,
-    ) -> AdmittedProjectionArtifactV1 {
-        let projection = EmbeddingProjectionKeyV1 {
-            model_artifact_digest: digest(artifact_digest),
-            tokenizer_digest: digest('b'),
-            config_digest: digest('c'),
-            query_instruction_digest: Some(digest('d')),
-            document_instruction_digest: Some(digest('e')),
-            document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
-            pooling: EmbeddingPoolingV1::Mean,
-            truncation_side: EmbeddingTruncationSideV1::Right,
-            truncation_length: 512,
-            inference_batch_size: 8,
-            inference_batch_bytes: 16 * 1024,
-            runtime_backend: "fastembed-ort".to_owned(),
-            runtime_build_revision: "ort-test-rev-1".to_owned(),
-            device_class: EmbeddingDeviceClassV1::Cpu,
-            dimensions,
-            metric,
-            normalization,
-            precision: EmbeddingPrecisionV1::Fp32,
-            chunk_schema_revision: "code-search-chunk.v1".to_owned(),
-            chunker_revision: id::<ChunkerRevision>("chunker.v1"),
-            privacy_domain: id::<PrivacyDomainId>("privacy.test"),
-            privacy_key_epoch: 7,
-        }
-        .admit()
-        .expect("valid test projection");
-        AdmittedProjectionArtifactV1 {
-            runtime_artifact: VerifiedEmbeddingArtifactV1 {
-                projection,
-                backend: EmbeddingRuntimeFamilyV1::FastEmbedOrt,
-                model_file: "model.onnx".to_string(),
-                tokenizer_file: "tokenizer.json".to_string(),
-                config_file: "config.json".to_string(),
-                artifact: None,
-                lifecycle_install: None,
-                max_batch_texts: 8,
-                max_batch_bytes: 16 * 1024,
-                max_threads: 4,
-                max_concurrent_sessions: 4,
-                resident_byte_ceiling: 64 * 1024 * 1024,
-                resident_bytes_estimate: 8 * 1024 * 1024,
-                load_deadline_ms: 30_000,
-            },
-        }
-    }
-
-    fn descriptor(authority: &AdmittedProjectionArtifactV1) -> &VerifiedEmbeddingArtifactV1 {
-        authority.runtime_artifact()
-    }
-
-    fn descriptor_paths(authority: &AdmittedProjectionArtifactV1) -> (&str, &str, &str) {
-        let descriptor = descriptor(authority);
-        (
-            descriptor.model_file.as_str(),
-            descriptor.tokenizer_file.as_str(),
-            descriptor.config_file.as_str(),
-        )
-    }
-
-    fn batch(texts: &[&str]) -> BoundedSanitizedTextBatchV1 {
-        BoundedSanitizedTextBatchV1::try_new(
-            texts.iter().map(|t| (*t).to_string()).collect(),
-            64,
-            1 << 20,
-        )
-        .expect("batch within bounds")
-    }
-
-    fn never_cancelled() -> ManualCancellation {
-        ManualCancellation::new()
-    }
-
-    #[test]
-    fn private_runtime_descriptor_uses_domain_projection_types() {
-        let authority = authority(384);
-        let descriptor = descriptor(&authority);
-        assert_eq!(descriptor.dimensions(), 384);
-        assert_eq!(descriptor.metric(), EmbeddingMetricV1::Cosine);
-        assert_eq!(descriptor.normalization(), EmbeddingNormalizationV1::L2);
-        assert_eq!(
-            descriptor_paths(&authority),
-            ("model.onnx", "tokenizer.json", "config.json")
-        );
-    }
-
-    #[test]
-    fn lifecycle_install_authority_verifies_member_bytes_at_read() {
-        let fixture = lifecycle_install_fixture(b"model");
-        let authority =
-            lifecycle_authority_from(&fixture, 1024).expect("verified lifecycle authority");
-
-        assert_eq!(
-            authority
-                .runtime_artifact()
-                .required_member_bytes(ArtifactMemberRoleV1::Model)
-                .expect("model bytes"),
-            b"model"
-        );
-        #[cfg(all(feature = "semantic-fastembed", not(windows)))]
-        {
-            let runtime = FastEmbedEmbeddingRuntime;
-            runtime
-                .verify_artifact_compatibility(&authority)
-                .expect("production runtime admits the verified lifecycle install");
-            assert!(matches!(
-                runtime.open_session(&authority, &never_cancelled()),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::LoadFailed,
-                    ..
-                }))
-            ));
-        }
-        std::fs::write(fixture.install.path().join("tokenizer.json"), b"mutated")
-            .expect("corrupt tokenizer");
-        assert!(matches!(
-            authority
-                .runtime_artifact()
-                .required_member_bytes(ArtifactMemberRoleV1::Tokenizer),
-            Err(EmbedError::Runtime(_))
-        ));
-    }
-
-    #[test]
-    fn lifecycle_authority_construction_reads_no_member_bytes() {
-        // The fixture's model member has the pinned length but not the
-        // pinned digest. Only reading and hashing the file could detect the
-        // mismatch, so the successful construction inside the fixture
-        // helper proves zero member byte reads at construction.
-        let mismatched = digest_mismatched_lifecycle_authority();
-        let authority = mismatched.authority;
-
-        assert!(
-            matches!(
-                authority
-                    .runtime_artifact()
-                    .required_member_bytes(ArtifactMemberRoleV1::Model),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::CorruptArtifact,
-                    ..
-                }))
-            ),
-            "every byte consumption still verifies the digest pin"
-        );
-        assert!(
-            matches!(
-                FakeEmbeddingRuntime::new().open_session(&authority, &never_cancelled()),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::CorruptArtifact,
-                    ..
-                }))
-            ),
-            "the default-runtime session open also rejects digest-mismatched bytes"
-        );
-        #[cfg(all(feature = "semantic-fastembed", not(windows)))]
-        assert!(
-            matches!(
-                FastEmbedEmbeddingRuntime.open_session(&authority, &never_cancelled()),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::CorruptArtifact,
-                    ..
-                }))
-            ),
-            "no session can open over digest-mismatched member bytes"
-        );
-    }
-
-    #[test]
-    fn open_session_honors_interruption_before_member_bytes() {
-        // The fixture's member bytes are digest-mismatched, so any byte read
-        // would fail with CorruptArtifact. A fired interruption must win
-        // instead: the typed Cancelled proves the stage-boundary check runs
-        // before the first member read.
-        let cancelled = ManualCancellation::new();
-        cancelled.cancel();
-        let mismatched = digest_mismatched_lifecycle_authority();
-        let authority = mismatched.authority;
-
-        assert!(
-            matches!(
-                FakeEmbeddingRuntime::new().open_session(&authority, &cancelled),
-                Err(EmbedError::Cancelled)
-            ),
-            "cancellation must be observed before any member byte is read"
-        );
-        #[cfg(all(feature = "semantic-fastembed", not(windows)))]
-        assert!(
-            matches!(
-                FastEmbedEmbeddingRuntime.open_session(&authority, &cancelled),
-                Err(EmbedError::Cancelled)
-            ),
-            "the production adapter must abandon the open before buffering members"
-        );
-    }
-
-    #[test]
-    fn model_load_monitor_cancels_promptly_when_authority_fires() {
-        let cancellation = ManualCancellation::new();
-        let load_finished = AtomicBool::new(false);
-        let cancel_called = AtomicBool::new(false);
-        let started = std::time::Instant::now();
-
-        let interruption = std::thread::scope(|scope| {
-            let monitor = scope.spawn(|| {
-                monitor_model_load(&load_finished, &cancellation, || {
-                    cancel_called.store(true, Ordering::SeqCst);
-                    Ok(())
-                })
-            });
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            cancellation.cancel();
-            monitor.join().expect("model-load monitor must not panic")
-        })
-        .expect("the cancellation handle succeeds");
-
-        assert_eq!(
-            interruption,
-            Some(SemanticExecutionInterruptionV1::Cancelled)
-        );
-        assert!(
-            cancel_called.load(Ordering::SeqCst),
-            "token fire must reach the runtime load canceler"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
-            "load cancellation must not wait for the constructor to finish"
-        );
-    }
-
-    #[test]
-    fn lifecycle_authority_construction_rejects_structural_pin_violations() {
-        let fixture = lifecycle_install_fixture(b"model");
-        let model_path = fixture.install.path().join("model.onnx");
-
-        std::fs::write(&model_path, b"model-longer-than-pin").expect("length-mismatched member");
-        assert!(
-            matches!(
-                lifecycle_authority_from(&fixture, 1024),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::CorruptArtifact,
-                    ..
-                }))
-            ),
-            "a length-pin mismatch fails construction eagerly"
-        );
-
-        std::fs::remove_file(&model_path).expect("remove model member");
-        assert!(
-            matches!(
-                lifecycle_authority_from(&fixture, 1024),
-                Err(EmbedError::Runtime(RuntimeFailureV1 {
-                    kind: RuntimeFailureKindV1::CorruptArtifact,
-                    ..
-                }))
-            ),
-            "a missing member fails construction eagerly"
-        );
-
-        #[cfg(unix)]
-        {
-            std::fs::write(fixture.install.path().join("model.real"), b"model")
-                .expect("symlink target");
-            std::os::unix::fs::symlink(fixture.install.path().join("model.real"), &model_path)
-                .expect("symlinked member");
-            assert!(
-                matches!(
-                    lifecycle_authority_from(&fixture, 1024),
-                    Err(EmbedError::Runtime(RuntimeFailureV1 {
-                        kind: RuntimeFailureKindV1::CorruptArtifact,
-                        ..
-                    }))
-                ),
-                "a symlinked member fails construction eagerly"
-            );
-        }
-    }
-
-    /// The removed construction work is exactly one [`read_member_bytes`]
-    /// pass over every member — still the per-session-open verification —
-    /// so construction must do strictly less: it may stat member pins but
-    /// never open one for reading. Proven by operations, not wall clocks:
-    /// the verification pass must return every member's exact pinned bytes
-    /// (impossible without reading all of them), while construction still
-    /// succeeds after member read permission is revoked (any
-    /// construction-time byte read would fail the constructor and this
-    /// test).
-    #[test]
-    fn lifecycle_authority_construction_is_cheaper_than_member_byte_verification() {
-        let fixture = lifecycle_install_fixture(b"model");
-        let authority =
-            lifecycle_authority_from(&fixture, 1024).expect("verified lifecycle authority");
-        for (role, pinned) in [
-            (ArtifactMemberRoleV1::Model, b"model".as_slice()),
-            (ArtifactMemberRoleV1::Tokenizer, b"tokenizer".as_slice()),
-            (ArtifactMemberRoleV1::Config, b"config".as_slice()),
-            (
-                ArtifactMemberRoleV1::SpecialTokensMap,
-                b"special".as_slice(),
-            ),
-            (
-                ArtifactMemberRoleV1::TokenizerConfig,
-                b"tokenizer-config".as_slice(),
-            ),
-        ] {
-            assert_eq!(
-                authority
-                    .runtime_artifact()
-                    .required_member_bytes(role)
-                    .expect("baseline member byte verification"),
-                pinned,
-                "one verification pass must consume every member's bytes"
-            );
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for member in [
-                "model.onnx",
-                "tokenizer.json",
-                "config.json",
-                "special_tokens_map.json",
-                "tokenizer_config.json",
-            ] {
-                std::fs::set_permissions(
-                    fixture.install.path().join(member),
-                    std::fs::Permissions::from_mode(0o000),
-                )
-                .expect("revoke member read permission");
-            }
-            assert!(
-                std::fs::read(fixture.install.path().join("model.onnx")).is_err(),
-                "the fixture requires a test runner whose member reads are deniable"
-            );
-            let unreadable = lifecycle_authority_from(&fixture, 1024).expect(
-                "construction checks structural pins without opening member bytes for reading",
-            );
-            assert!(
-                matches!(
-                    unreadable
-                        .runtime_artifact()
-                        .required_member_bytes(ArtifactMemberRoleV1::Model),
-                    Err(EmbedError::Runtime(RuntimeFailureV1 {
-                        kind: RuntimeFailureKindV1::CorruptArtifact,
-                        ..
-                    }))
-                ),
-                "the byte-verification pass cannot succeed without reading, so the revocation \
-                 that construction tolerates provably blocks the read path"
-            );
-        }
-    }
-
-    #[test]
-    fn batch_constructor_enforces_bounds() {
-        assert!(matches!(
-            BoundedSanitizedTextBatchV1::try_new(vec![], 4, 16),
-            Err(EmbedError::EmptyBatch)
-        ));
-        assert!(matches!(
-            BoundedSanitizedTextBatchV1::try_new(vec!["a".to_string(), "b".to_string()], 1, 16),
-            Err(EmbedError::TooManyTexts {
-                presented: 2,
-                max: 1
-            })
-        ));
-        assert!(matches!(
-            BoundedSanitizedTextBatchV1::try_new(vec!["abcdef".to_string()], 4, 3),
-            Err(EmbedError::BatchBytesExceeded {
-                presented: 6,
-                max: 3
-            })
-        ));
-    }
-
-    #[test]
-    fn echo_dimensions_metric_and_normalization_are_exact() {
-        let runtime = FakeEmbeddingRuntime::new();
-        let authority = authority_with(
-            24,
-            'a',
-            EmbeddingMetricV1::DotProduct,
-            EmbeddingNormalizationV1::L2,
-        );
-        let mut session = runtime
-            .open_session(&authority, &never_cancelled())
-            .expect("session");
-        let vectors = session
-            .embed_batch(&batch(&["echo me"]), &never_cancelled())
-            .expect("embed");
-        assert_eq!(vectors.len(), 1);
-        let v = &vectors[0];
-        assert_eq!(v.values.len(), 24);
-        assert_eq!(v.dimensions, 24);
-        assert_eq!(v.metric, EmbeddingMetricV1::DotProduct);
-        assert_eq!(v.normalization, EmbeddingNormalizationV1::L2);
-        let norm = v.squared_l2_norm().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-5,
-            "L2-normalized vector has unit norm, got {norm}"
-        );
-    }
-
-    #[test]
-    fn unnormalized_echo_stays_raw() {
-        let runtime = FakeEmbeddingRuntime::new();
-        let authority = authority_with(
-            24,
-            'a',
-            EmbeddingMetricV1::Cosine,
-            EmbeddingNormalizationV1::None,
-        );
-        let mut session = runtime
-            .open_session(&authority, &never_cancelled())
-            .expect("session");
-        let vectors = session
-            .embed_batch(&batch(&["raw values"]), &never_cancelled())
-            .expect("embed");
-        assert_eq!(vectors[0].normalization, EmbeddingNormalizationV1::None);
-        assert!(
-            vectors[0].values.iter().all(|v| (-1.0..1.0).contains(v)),
-            "fake raw values stay in [-1, 1)"
-        );
-    }
-
-    #[test]
-    fn cancellation_before_embed_aborts() {
-        let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime
-            .open_session(&authority(8), &never_cancelled())
-            .expect("session");
-        let cancel = ManualCancellation::new();
-        cancel.cancel();
-        let result = session.embed_batch(&batch(&["a", "b"]), &cancel);
-        assert!(matches!(result, Err(EmbedError::Cancelled)));
-        assert_eq!(
-            runtime.counters().texts_embedded.load(Ordering::SeqCst),
-            0,
-            "no text embedded after pre-cancel"
-        );
-    }
-
-    #[test]
-    fn deadline_before_embed_surfaces_typed_expiry_without_inference() {
-        struct ExpiredAuthority;
-
-        impl SemanticExecutionAuthority for ExpiredAuthority {
-            fn interruption(&self) -> Option<SemanticExecutionInterruptionV1> {
-                Some(SemanticExecutionInterruptionV1::DeadlineExceeded)
-            }
-        }
-
-        let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime
-            .open_session(&authority(8), &never_cancelled())
-            .expect("session");
-        let result = session.embed_batch(&batch(&["a", "b"]), &ExpiredAuthority);
-
-        assert_eq!(result, Err(EmbedError::DeadlineExceeded));
-        assert_eq!(
-            runtime.counters().texts_embedded.load(Ordering::SeqCst),
-            0,
-            "expired work must not enter inference"
-        );
-    }
-
-    #[test]
-    fn cancellation_mid_embed_discards_partial_batch() {
-        let runtime = FakeEmbeddingRuntime::new();
-        let mut session = runtime
-            .open_session(&authority(8), &never_cancelled())
-            .expect("session");
-        // First poll (before text 1) passes, second poll cancels.
-        let cancel = ScriptedCancellation::new(1);
-        let result = session.embed_batch(&batch(&["a", "b", "c", "d"]), &cancel);
-        assert!(matches!(result, Err(EmbedError::Cancelled)));
-        assert_eq!(
-            runtime.counters().texts_embedded.load(Ordering::SeqCst),
-            1,
-            "exactly one text embedded before cancellation; no partial batch returned"
-        );
-    }
-
-    #[test]
-    fn session_enforces_its_own_manifest_batch_ceiling() {
-        let runtime = FakeEmbeddingRuntime::new();
-        let mut authority = authority(8);
-        authority.runtime_artifact.max_batch_texts = 1;
-        let mut session = runtime
-            .open_session(&authority, &never_cancelled())
-            .expect("session");
-        let result = session.embed_batch(&batch(&["a", "b"]), &never_cancelled());
-        assert!(matches!(
-            result,
-            Err(EmbedError::TooManyTexts {
-                presented: 2,
-                max: 1
-            })
-        ));
-    }
-
-    #[test]
-    fn vector_validation_rejects_bad_shape_and_nonfinite_values() {
-        let mut v = EmbeddingVectorV1 {
-            values: vec![0.0; 3],
-            dimensions: 4,
-            metric: EmbeddingMetricV1::Cosine,
-            normalization: EmbeddingNormalizationV1::L2,
-        };
-        assert!(matches!(
-            v.validate(),
-            Err(EmbedError::DimensionMismatch {
-                expected: 4,
-                actual: 3
-            })
-        ));
-        v.dimensions = 3;
-        v.values[1] = f32::NAN;
-        assert!(matches!(
-            v.validate(),
-            Err(EmbedError::NonFiniteVectorValue)
-        ));
-        v.values[1] = f32::INFINITY;
-        assert!(matches!(
-            v.validate(),
-            Err(EmbedError::NonFiniteVectorValue)
-        ));
-    }
-
-    #[test]
-    fn open_failure_is_typed_and_disables_nothing_silently() {
-        for kind in [
-            RuntimeFailureKindV1::OutOfMemory,
-            RuntimeFailureKindV1::CorruptArtifact,
-            RuntimeFailureKindV1::RevokedArtifact,
-            RuntimeFailureKindV1::IncompatibleRuntime,
-            RuntimeFailureKindV1::LoadFailed,
-            RuntimeFailureKindV1::EmbedFailed,
-        ] {
-            let runtime = FakeEmbeddingRuntime::new().with_open_failure(kind);
-            let result = runtime.open_session(&authority(8), &never_cancelled());
-            match result {
-                Err(EmbedError::Runtime(failure)) => assert_eq!(failure.kind, kind),
-                other => panic!("expected typed runtime failure, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn compatibility_failure_is_typed() {
-        let runtime = FakeEmbeddingRuntime::new()
-            .with_compatibility_failure(RuntimeFailureKindV1::IncompatibleRuntime);
-        let result = runtime.verify_artifact_compatibility(&authority(8));
-        match result {
-            Err(EmbedError::Runtime(failure)) => {
-                assert_eq!(failure.kind, RuntimeFailureKindV1::IncompatibleRuntime);
-            }
-            other => panic!("expected typed compatibility failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn compatibility_check_consumes_admitted_authority() {
-        let runtime = FakeEmbeddingRuntime::new();
-        runtime
-            .verify_artifact_compatibility(&authority(8))
-            .expect("admitted authority is compatible");
-        assert_eq!(
-            runtime
-                .counters()
-                .compatibility_checks
-                .load(Ordering::SeqCst),
-            1
-        );
-    }
-
-    #[cfg(all(feature = "semantic-fastembed", not(windows)))]
-    #[test]
-    fn real_fastembed_runtime_rejects_unnormalized_projection_before_loading() {
-        let runtime = FastEmbedEmbeddingRuntime;
-        let result = runtime.verify_artifact_compatibility(&authority_with(
-            8,
-            'a',
-            EmbeddingMetricV1::Cosine,
-            EmbeddingNormalizationV1::None,
-        ));
-        assert!(matches!(
-            result,
-            Err(EmbedError::Runtime(RuntimeFailureV1 {
-                kind: RuntimeFailureKindV1::IncompatibleRuntime,
-                ..
-            }))
-        ));
-    }
-}
+mod tests;

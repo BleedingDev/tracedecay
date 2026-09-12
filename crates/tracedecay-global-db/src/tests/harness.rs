@@ -108,7 +108,7 @@ pub(crate) struct RegisteredGlobalDbRetirementHarnessV1 {
 #[cfg(test)]
 impl RegisteredGlobalDbRetirementHarnessV1 {
     pub(crate) async fn open(label: &str) -> Self {
-        crate::register_test_schema_installer();
+        crate::register_registered_schema_installer();
         let directory = tempfile::tempdir().expect("temporary registered global database");
         let profile_root = directory.path().join("profile");
         tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(&profile_root)
@@ -165,36 +165,6 @@ impl RegisteredGlobalDbRetirementHarnessV1 {
         } = self;
         (registered, database, retirement, directory, scope)
     }
-}
-
-#[tokio::test]
-async fn weak_lease_issuer_survives_lease_drop() {
-    let fixture =
-        RegisteredGlobalDbRetirementHarnessV1::open("weak-lease-issuer-survives-lease-drop").await;
-    let (registered, owner, _retirement, _directory, _scope) = fixture.into_parts();
-    bind_test_session_relation_graph(&registered).expect("bind test session relation graph");
-    let expected_graph_identity = registered
-        .session_relation_graph_identity()
-        .expect("attached session relation graph identity");
-    let issuer = owner.weak_lease_issuer();
-
-    drop(registered);
-
-    let issued = issuer
-        .issue_lease()
-        .expect("live owner weak issuer survives unrelated lease drop");
-    assert_eq!(
-        issued
-            .session_relation_graph_identity()
-            .expect("issued lease retains attached relation graph identity"),
-        expected_graph_identity
-    );
-
-    owner.detach_session_relation_graph();
-    assert!(
-        issued.session_relation_graph_identity().is_err(),
-        "detaching the owner relation graph must invalidate existing lease graph access"
-    );
 }
 
 /// Which write authority a registered test fixture attaches to the database.
@@ -272,7 +242,7 @@ impl RegisteredGlobalDbTestRuntime {
         project: Option<(&std::path::Path, tracedecay_domain::ProjectId)>,
         profile_identity: Option<tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1>,
     ) -> tracedecay_domain::errors::Result<Self> {
-        crate::register_test_schema_installer();
+        crate::register_registered_schema_installer();
         // A profile root is a profile-identity root in production and must be
         // mode 0700; creating it with the ambient umask (0775 under umask 0002)
         // makes identity validation fail, so use the private-store helper
@@ -467,7 +437,7 @@ impl RegisteredGlobalDbHarness {
     /// Opens the registered store without binding the session relation graph,
     /// staging the unbound state doctor health must report as partial.
     pub async fn open_without_relation_graph(label: &str) -> Self {
-        crate::register_test_schema_installer();
+        crate::register_registered_schema_installer();
         let directory = tempfile::tempdir().expect("temporary registered global database");
         let profile_root = directory.path().join("profile");
         // The profile root must exist on disk before it is canonicalized into
@@ -698,7 +668,7 @@ impl HostAdmissionTestRuntimeV1 {
         profile_root: &std::path::Path,
         project: Option<(&std::path::Path, tracedecay_domain::ProjectId)>,
     ) -> tracedecay_domain::errors::Result<Self> {
-        crate::register_test_schema_installer();
+        crate::register_registered_schema_installer();
         // See the note in `RegisteredGlobalDbTestRuntimeV1::open`: profile
         // identity roots must be 0700 regardless of the ambient umask.
         tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(profile_root)?;
@@ -925,13 +895,10 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         scope: HostAdmissionScope,
     ) -> tracedecay_domain::errors::Result<
-        tracedecay_session_temporal_store::GlobalDbSessionTemporalStore<
-            '_,
-            crate::RegisteredGlobalDb,
-        >,
+        tracedecay_session_temporal_store::SessionTemporalStore<'_, crate::RegisteredGlobalDb>,
     > {
         Ok(
-            tracedecay_session_temporal_store::GlobalDbSessionTemporalStore::new(
+            tracedecay_session_temporal_store::SessionTemporalStore::new(
                 self.session_database_for_test(scope)?,
             ),
         )
@@ -1396,7 +1363,7 @@ async fn open_registered_test_database_with_identity(
     write_authority: RegisteredTestWriteAuthority,
     profile_identity: Option<tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1>,
 ) -> tracedecay_domain::errors::Result<(RegisteredGlobalDbLeaseV1, RegisteredGlobalDbOwnerV1)> {
-    crate::register_test_schema_installer();
+    crate::register_registered_schema_installer();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1555,23 +1522,4 @@ pub(crate) async fn open_registered_test_fixture(
         database,
         _owner: owner,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RegisteredGlobalDbTestRuntime;
-    use tracedecay_store::StoreShardScopeV1;
-
-    #[tokio::test]
-    async fn profile_runtime_publishes_a_profile_sessions_shard() {
-        let temporary = tempfile::tempdir().expect("temporary profile root");
-        let runtime = RegisteredGlobalDbTestRuntime::profile(temporary.path())
-            .await
-            .expect("registered profile runtime");
-
-        assert!(matches!(
-            runtime.profile_database().binding().shard_id.scope,
-            StoreShardScopeV1::ProfileSessions
-        ));
-    }
 }

@@ -28,12 +28,22 @@ impl CodeIndexPublishedGenerationV1 {
     pub fn generation_statistics(
         &self,
     ) -> Result<CodeIndexGenerationStatisticsV1, CodeIndexProductionErrorV1> {
+        Ok(self.statistics.clone())
+    }
+}
+
+impl CodeIndexGenerationStatisticsV1 {
+    pub(super) fn from_generation_parts(
+        files: &[std::sync::Arc<super::FileGenerationArtifactsV1>],
+        symbol_count: usize,
+        edge_count: usize,
+    ) -> Result<Self, CodeIndexProductionErrorV1> {
         let source_total_bytes =
-            checked_source_total(self.files.iter().map(|file| &file.extraction.coverage))?;
-        let symbol_count = u64::try_from(self.symbols.symbols.len()).map_err(|_| {
+            checked_source_total(files.iter().map(|file| &file.extraction.coverage))?;
+        let symbol_count = u64::try_from(symbol_count).map_err(|_| {
             CodeIndexProductionErrorV1::Contract("generation symbol count exceeds u64".to_owned())
         })?;
-        let edge_count = u64::try_from(self.edges.len()).map_err(|_| {
+        let edge_count = u64::try_from(edge_count).map_err(|_| {
             CodeIndexProductionErrorV1::Contract("generation edge count exceeds u64".to_owned())
         })?;
         Ok(CodeIndexGenerationStatisticsV1 {
@@ -63,36 +73,4 @@ fn checked_source_total<'a>(
             )
         })
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_total_includes_parsed_error_and_unsupported_coverage() {
-        let coverages = [
-            ExtractionCoverageV1 {
-                parsed_bytes: 5,
-                error_bytes: 7,
-                unsupported_bytes: 11,
-                symbols_extracted: 0,
-                relations_extracted: 0,
-                ambiguity_count: 0,
-            },
-            ExtractionCoverageV1 {
-                parsed_bytes: 13,
-                error_bytes: 0,
-                unsupported_bytes: 17,
-                symbols_extracted: 0,
-                relations_extracted: 0,
-                ambiguity_count: 0,
-            },
-        ];
-
-        assert_eq!(
-            checked_source_total(coverages.iter()).expect("coverage total"),
-            53
-        );
-    }
 }

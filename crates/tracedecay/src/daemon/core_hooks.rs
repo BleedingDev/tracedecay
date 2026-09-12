@@ -7,12 +7,12 @@
 use std::path::Path;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{Duration, Instant, timeout_at};
+use tokio::time::{Duration, Instant, timeout};
 use tracedecay_hooks::core_events::{DaemonHookEvent, HOOK_EVENT_METHOD, HookEventNotifyOutcomeV1};
 
 #[cfg(unix)]
 use tracedecay_daemon_identity::connection_for_socket_path;
-use tracedecay_daemon_identity::{DaemonConnection, current_daemon_connection};
+use tracedecay_daemon_identity::{ResolvedDaemonConnection, current_daemon_connection};
 #[cfg(unix)]
 use tracedecay_daemon_protocol::SOCKET_ENV;
 
@@ -41,19 +41,9 @@ pub async fn notify_hook_event(
     let Ok(connection) = connection else {
         return HookEventNotifyOutcomeV1::Unavailable;
     };
-    notify_hook_event_to_connection(project_path, event, connection).await
-}
-
-#[hotpath::measure(label = "daemon.engine.hooks.deliver", future = true)]
-async fn notify_hook_event_to_connection(
-    project_path: &Path,
-    event: DaemonHookEvent,
-    connection: DaemonConnection,
-) -> HookEventNotifyOutcomeV1 {
-    let deadline = Instant::now() + HOOK_EVENT_NOTIFY_TIMEOUT;
-    match timeout_at(
-        deadline,
-        deliver_hook_event_until(project_path, event, connection, deadline),
+    match timeout(
+        HOOK_EVENT_NOTIFY_TIMEOUT,
+        notify_hook_event_to_connection(project_path, event, connection),
     )
     .await
     {
@@ -62,10 +52,20 @@ async fn notify_hook_event_to_connection(
     }
 }
 
+#[hotpath::measure(label = "daemon.engine.hooks.deliver", future = true)]
+async fn notify_hook_event_to_connection(
+    project_path: &Path,
+    event: DaemonHookEvent,
+    connection: ResolvedDaemonConnection,
+) -> HookEventNotifyOutcomeV1 {
+    let deadline = Instant::now() + HOOK_EVENT_NOTIFY_TIMEOUT;
+    deliver_hook_event_until(project_path, event, connection, deadline).await
+}
+
 async fn deliver_hook_event_until(
     project_path: &Path,
     event: DaemonHookEvent,
-    connection: DaemonConnection,
+    connection: ResolvedDaemonConnection,
     deadline: Instant,
 ) -> HookEventNotifyOutcomeV1 {
     let Ok(handshake) = crate::daemon::handshake_for_current_client(

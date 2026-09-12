@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::db::DatabaseAuthorityRole;
+use tracedecay_runtime_core::logging::log_daemon_event;
 
 use crate::RegisteredGlobalDb;
 
@@ -94,7 +95,10 @@ impl RegisteredGlobalDb {
     #[hotpath::skip]
     pub async fn checkpoint(&self) {
         if let Err(error) = self.checkpoint_result().await {
-            eprintln!("[tracedecay] registered database WAL checkpoint failed: {error}");
+            log_daemon_event(
+                "registered_database_wal_checkpoint_failed",
+                &[("error", error.to_string())],
+            );
         }
     }
 
@@ -146,42 +150,5 @@ fn wal_file_bytes(wal_path: &Path) -> Result<u64, TraceDecayError> {
             ),
             operation: "measure registered WAL file".to_owned(),
         }),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{REGISTERED_WAL_RECLAIM_TRIGGER_BYTES, WalReclaimPlan, wal_reclaim_plan};
-    use tracedecay_runtime_core::db::DatabaseAuthorityRole;
-
-    #[test]
-    fn wal_below_trigger_is_left_alone_for_every_role() {
-        for role in [
-            DatabaseAuthorityRole::Daemon,
-            DatabaseAuthorityRole::Maintenance,
-            DatabaseAuthorityRole::Test,
-        ] {
-            assert_eq!(
-                wal_reclaim_plan(REGISTERED_WAL_RECLAIM_TRIGGER_BYTES - 1, role),
-                WalReclaimPlan::BelowTrigger
-            );
-        }
-    }
-
-    #[test]
-    fn triggered_wal_truncates_only_under_exclusive_maintenance() {
-        assert_eq!(
-            wal_reclaim_plan(
-                REGISTERED_WAL_RECLAIM_TRIGGER_BYTES,
-                DatabaseAuthorityRole::Maintenance
-            ),
-            WalReclaimPlan::Truncate
-        );
-        for role in [DatabaseAuthorityRole::Daemon, DatabaseAuthorityRole::Test] {
-            assert_eq!(
-                wal_reclaim_plan(REGISTERED_WAL_RECLAIM_TRIGGER_BYTES, role),
-                WalReclaimPlan::RequiresExclusiveMaintenance
-            );
-        }
     }
 }

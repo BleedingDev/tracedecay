@@ -80,7 +80,10 @@ fn acquire_nofollow_lock(lock_path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create(true)
         .follow(FollowSymlinks::No);
-    let file = directory.open_with(name, &options)?;
+    // Concurrent writers race the first creation of this lock; the shared
+    // helper absorbs the spurious Darwin `ENOENT` the losers are handed.
+    let file =
+        tracedecay_private_fs::capability_dir::open_or_create_with(&directory, name, &options)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -133,7 +136,12 @@ pub(super) fn open_run_ledger_nofollow(
         .append(append)
         .create(create)
         .follow(FollowSymlinks::No);
-    match directory.open_with(name, &options) {
+    let opened = if create {
+        tracedecay_private_fs::capability_dir::open_or_create_with(&directory, name, &options)
+    } else {
+        directory.open_with(name, &options)
+    };
+    match opened {
         Ok(file) => {
             let metadata = file.metadata()?;
             if !metadata.is_file() {
@@ -996,6 +1004,44 @@ fn append_intent_path(dashboard_root: &Path) -> PathBuf {
 #[cfg(test)]
 fn write_append_intent(dashboard_root: &Path, intent: &LedgerAppendIntent) -> Result<()> {
     write_append_intent_with_publisher(dashboard_root, intent, &replace_file_atomically)
+}
+
+/// Leaves `dashboard_root` in the state a first writer holds in the middle of
+/// its first publication: the directory it just created, the exclusive ledger
+/// lock, a durable append intent, and the staged row appended but neither
+/// verified nor cleared. This is [`publish_under_ledger_lock`] stopped one
+/// step before it settles.
+///
+/// Dropping the returned lock releases the writer's exclusion; the append
+/// settles only through [`publish_staged_run_record_exact`], which resumes
+/// under the intent this left behind.
+#[cfg(test)]
+pub(super) fn hold_unsettled_first_append(
+    dashboard_root: &Path,
+    record: &AutomationRunLedgerRecord,
+) -> Result<(ExactRunPublication, std::fs::File)> {
+    let publication = stage_run_record_exact(dashboard_root, record)?;
+    let ledger_path = run_ledger_path(dashboard_root);
+    let lock = acquire_run_ledger_lock(&ledger_path).map_err(TraceDecayError::from)?;
+    let spool = spool_path(dashboard_root, &record.run_id, &publication)?;
+    let mut spool = open_bound_spool(&spool, &record.run_id, &publication)?
+        .ok_or_else(|| config_error("staged exact automation run payload disappeared"))?;
+    write_append_intent(
+        dashboard_root,
+        &LedgerAppendIntent {
+            schema_version: 1,
+            run_id: record.run_id.clone(),
+            pre_append_eof: 0,
+            publication: publication.clone(),
+        },
+    )?;
+    let mut ledger = open_run_ledger_nofollow(&ledger_path, true, true, true, true)
+        .map_err(TraceDecayError::from)?
+        .ok_or_else(|| config_error("automation run ledger disappeared during durable open"))?;
+    copy_exact_payload(&mut spool, &mut ledger, publication.payload_len)?;
+    ledger.write_all(b"\n").map_err(TraceDecayError::from)?;
+    sync_run_ledger_file_and_parent(&ledger_path, &ledger)?;
+    Ok((publication, lock))
 }
 
 fn write_append_intent_with_publisher(

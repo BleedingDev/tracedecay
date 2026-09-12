@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-use tracedecay_agent_hosts::agents::context_scout_v2::{
+use tracedecay_agent_hosts::agents::context_scout::{
     ContextScoutDurableClaimOutcomeV1, ContextScoutDurableStoreOutcomeV1,
-    ContextScoutDurableStoreV1, ContextScoutEvidenceEnvelopeExt, context_scout_delivery_receipt_id,
+    ContextScoutEvidenceEnvelopeExt, context_scout_delivery_receipt_id,
 };
 use tracedecay_contracts::context_scout::{
     ContextScoutAddressV1, ContextScoutCandidateV1, ContextScoutCategoryV1,
@@ -90,6 +90,7 @@ fn configured_model_evidence(marker: u8) -> ContextScoutEvidenceEnvelopeV1 {
                 requested_at: UtcMicros(1),
                 resolved_at: UtcMicros(2),
                 source_generation: Some(generation),
+                code_graph_freshness: None,
                 watermark_digest: Some(digest('e')),
                 freshness: FreshnessState::Current,
             },
@@ -118,8 +119,8 @@ fn configured_model_input_at(
     marker: u8,
     now: UtcMicros,
     delivery_window: ContextScoutDeliveryWindowV1,
-) -> tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutSelectionInputV1 {
-    tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutSelectionInputV1 {
+) -> tracedecay_agent_hosts::agents::context_scout::ContextScoutSelectionInputV1 {
+    tracedecay_agent_hosts::agents::context_scout::ContextScoutSelectionInputV1 {
         address: ContextScoutAddressV1 {
             profile_id: [1; 16],
             provider_id: [2; 16],
@@ -189,7 +190,7 @@ fn configured_model_pin_with_timeout(
     )
     .expect("configuration snapshot");
     ContextScoutConfigurationPinV1::from_current(
-        &tracedecay_configuration::ConfigurationCurrentStateV1 {
+        &tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1 {
             revision_id: revision,
             snapshot,
         },
@@ -203,8 +204,8 @@ fn configured_model_pin() -> ContextScoutConfigurationPinV1 {
 
 async fn test_scout_owner(
     temporary: &tempfile::TempDir,
-) -> Arc<tracedecay_agent_hosts::agents::context_scout_owner::ProjectContextScoutOwnerV1> {
-    tracedecay_store_runtime::register_registered_schema_installer();
+) -> Arc<tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1> {
+    tracedecay_global_db::register_registered_schema_installer();
     let database_path = temporary.path().join("edit-stop-feedback.db");
     let database_authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
         &database_path,
@@ -219,7 +220,7 @@ async fn test_scout_owner(
     .await
     .expect("project database")
     .0;
-    tracedecay_agent_hosts::agents::context_scout_owner::ProjectContextScoutOwnerV1::startup(
+    tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
         database,
         [8; 16],
         UtcMicros(1),
@@ -298,7 +299,7 @@ async fn project_open_edit_stop_and_explicit_feedback_preserve_privacy_and_super
     };
     assert!(matches!(
         owner.cancel(first.work).await,
-        Err(tracedecay_agent_hosts::agents::context_scout_v2::ContextScoutErrorV1::StaleWork)
+        Err(tracedecay_agent_hosts::agents::context_scout::ContextScoutErrorV1::StaleWork)
     ));
 
     let stop = configured_model_input_at(
@@ -593,7 +594,7 @@ async fn stock_disabled_configuration_produces_nothing() {
     )
     .expect("configuration snapshot");
     let pin = ContextScoutConfigurationPinV1::from_current(
-        &tracedecay_configuration::ConfigurationCurrentStateV1 {
+        &tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1 {
             revision_id: revision,
             snapshot,
         },

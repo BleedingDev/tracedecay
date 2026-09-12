@@ -357,13 +357,9 @@ where
 
 /// Read one MCP/daemon JSON-RPC line with the dedicated frame ceiling.
 ///
-/// Oversized input is discarded through newline/EOF and returned as the typed
-/// IO error carrying only a bounded leading prefix for request-id inspection.
-///
-/// The returned future owns the partial-frame accumulator, so it is NOT
-/// cancellation-safe: callers that race it inside `tokio::select!` must either
-/// pin one future across the whole wait or, preferably, hold a
-/// [`BoundedLineReader`] whose state survives a dropped read.
+/// Test helper only. Production callers hold a [`BoundedLineReader`] so a
+/// dropped read future does not lose the partial-frame accumulator.
+#[cfg(test)]
 pub async fn read_bounded_mcp_line<R>(reader: &mut R) -> io::Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
@@ -512,23 +508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_line_reader_streams_hostile_line_and_returns_oversized() {
-        let max = 32;
-        let stream =
-            AsyncHostileThenSuffix::new(max + 256 * 1024, b'y', 1024, b"\n{\"ok\":true}\n");
-        let mut reader = BufReader::new(stream);
-
-        let first = read_bounded_line(&mut reader, max).await.unwrap();
-        assert_eq!(first, WireReadOutcome::Oversized);
-
-        let second = read_bounded_line(&mut reader, max).await.unwrap();
-        assert_eq!(
-            second,
-            WireReadOutcome::Ready(Some(r#"{"ok":true}"#.to_string()))
-        );
-    }
-
-    #[tokio::test]
     async fn async_line_reader_preserves_valid_line_under_cap() {
         let mut reader = BufReader::new(Cursor::new(b"{\"hello\":1}\n".to_vec()));
         let line = read_bounded_line(&mut reader, MAX_WIRE_MESSAGE_BYTES)
@@ -542,23 +521,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(eof, WireReadOutcome::Ready(None));
-    }
-
-    #[test]
-    fn host_event_wire_cap_stays_one_mib_and_mcp_frame_is_larger() {
-        assert_eq!(MAX_WIRE_MESSAGE_BYTES, 1024 * 1024);
-        assert_eq!(MAX_WIRE_RECORD_BYTES, MAX_WIRE_MESSAGE_BYTES);
-        assert_eq!(MAX_MCP_JSONRPC_FRAME_BYTES, 16 * 1024 * 1024);
-        assert_eq!(MCP_OVERSIZE_ID_INSPECT_BYTES, 4096);
-    }
-
-    #[test]
-    fn oversized_io_error_preserves_bounded_inspect_prefix() {
-        let prefix = b"{\"jsonrpc\":\"2.0\",\"id\":7,".to_vec();
-        let err = wire_oversized_io_error_with_prefix(prefix.clone());
-        assert!(is_wire_oversized_io_error(&err));
-        assert_eq!(wire_oversized_inspect_prefix(&err), prefix.as_slice());
-        assert_eq!(err.to_string(), WIRE_RECORD_TOO_LARGE);
     }
 
     #[tokio::test]

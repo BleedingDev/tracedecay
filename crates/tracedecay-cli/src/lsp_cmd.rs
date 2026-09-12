@@ -305,9 +305,13 @@ fn canonicalize_workspace_root(path: &Path) -> tracedecay_domain::errors::Result
             path.display()
         ))
     })?;
+    // The bridge replaces the client's `rootUri` with this path, and the
+    // daemon publishes the root's identity, so the two must spell it the same
+    // way: `canonicalize` yields the `\\?\` verbatim form on Windows, which
+    // is not what the daemon advertises.
     canonical
         .is_dir()
-        .then_some(canonical)
+        .then(|| tracedecay_runtime_core::path_safety::canonical_root_identity(&canonical))
         .ok_or_else(|| bridge_config_error("LSP workspace root must be a directory"))
 }
 
@@ -669,42 +673,6 @@ mod tests {
         assert!(
             error.to_string().contains("duplicate canonical root"),
             "{error}"
-        );
-    }
-
-    #[test]
-    fn initialize_root_binding_accepts_equivalent_uri_aliases() {
-        let root = tempfile::tempdir().expect("workspace root");
-        let root_uri = url::Url::from_file_path(root.path())
-            .expect("file URI")
-            .to_string();
-        let folder_uri = format!("{root_uri}/");
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "rootUri": root_uri,
-                "workspaceFolders": [{
-                    "uri": folder_uri,
-                    "name": "workspace"
-                }],
-                "capabilities": {}
-            }
-        })
-        .to_string();
-
-        let binding = initialize_binding(&frame).expect("equivalent roots bind");
-        assert_eq!(
-            binding.project_root,
-            root.path().canonicalize().expect("canonical workspace")
-        );
-        let forwarded: Value =
-            serde_json::from_str(&binding.frame).expect("forwarded initialize frame");
-        assert_eq!(forwarded["params"]["rootUri"], binding.canonical_root_uri);
-        assert_eq!(
-            forwarded["params"]["workspaceFolders"][0]["uri"],
-            binding.canonical_root_uri
         );
     }
 

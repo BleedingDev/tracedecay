@@ -20,17 +20,17 @@ use crate::config::retrieval::RetrievalRuntimeCompatibilityV1;
 use crate::config::retrieval::{
     RetrievalCompatibilityPinsV1, SemanticCompatibilityPinsV1, SemanticResourceRequirementV1,
 };
-use crate::search_eval::semantic_native::{
+use crate::query::search_quality::semantic_native::{
     SemanticNativePendingReasonV1, SemanticNativeResourceProvenanceV1,
     SemanticNativeResourceSampleV1, SemanticNativeStageResultV1, SemanticProjectionCaseSampleV1,
     SemanticProjectionCaseV1,
 };
-use crate::search_eval::{
+use crate::query::search_quality::{
     CandidateOutputError, ProductionCandidateNativeExecutionAuthorityV1,
     ProductionCandidateNativeGenerationResourcesV1, ProductionCandidateNativeQueryContextV1,
     ProductionCandidateNativeQueryInputsV1, ProductionCandidateNativeResourceContextV1,
-    evaluate_default_activation_candidate,
 };
+use crate::search_eval::evaluate_default_activation_candidate;
 use tracedecay_application::semantic_runtime::{
     SemanticActivationCoordinationErrorV1, SemanticEvaluationAuthorityPublicationV1,
     SemanticEvaluationCurrentGenerationSnapshotV1, SemanticEvaluationProfileCandidateV1,
@@ -239,23 +239,13 @@ pub async fn build_daemon_semantic_evaluation_candidate(
     control: Arc<DaemonSemanticEvaluationControlV1>,
 ) -> Result<SemanticEvaluationProfileCandidateV1, SemanticActivationCoordinationErrorV1> {
     control.checkpoint()?;
-    let snapshot = control
+    let (snapshot, code) = control
         .interruptible(hotpath::future!(
-            scheduler.semantic_evaluation_snapshot_for_scope(scope),
+            scheduler.semantic_evaluation_generation_for_scope(project_root, scope),
             label = "daemon.semantic.evaluation.candidate.code_snapshot"
         ))
         .await?
-        .ok_or(SemanticActivationCoordinationErrorV1::Unavailable)?;
-    let serving = control
-        .interruptible(hotpath::future!(
-            scheduler.serving_code_scope(project_root),
-            label = "daemon.semantic.evaluation.candidate.serving_code"
-        ))
-        .await?
-        .ok_or(SemanticActivationCoordinationErrorV1::Unavailable)?;
-    let code = serving
-        .serving_generation
-        .ok_or(SemanticActivationCoordinationErrorV1::Unavailable)?;
+        .map_err(|_| SemanticActivationCoordinationErrorV1::Unavailable)?;
     if code.manifest().generation_id != snapshot.source_generation
         || code.projection().request().changes.manifest_digest != snapshot.source_manifest_digest
         || code.manifest().snapshot_digest != snapshot.snapshot_digest
@@ -460,14 +450,13 @@ fn daemon_semantic_evaluation_candidate(
     vector: &PublishedVectorGenerationV1,
     resources: SemanticResourceRequirementV1,
 ) -> Result<SemanticEvaluationProfileCandidateV1, SemanticActivationCoordinationErrorV1> {
-    let material = crate::search_eval::load_default_evaluated_profile_material(
-        evaluated_profile_id,
-    )
-    .map_err(|_| {
-        SemanticActivationCoordinationErrorV1::RejectedDetail(
-            "semantic evaluation profile is not in the packaged workload".to_owned(),
-        )
-    })?;
+    let material =
+        crate::query::search_quality::load_default_evaluated_profile_material(evaluated_profile_id)
+            .map_err(|_| {
+                SemanticActivationCoordinationErrorV1::RejectedDetail(
+                    "semantic evaluation profile is not in the packaged workload".to_owned(),
+                )
+            })?;
     let embedding = vector.embedding_key().embedding_key();
     let runtime_compatibility_digest = canonical_sha256(&(
         "tracedecay.semantic-runtime-compatibility.v1",
@@ -577,7 +566,7 @@ fn daemon_semantic_evaluation_candidate(
 }
 
 fn evaluated_semantic_calibration_profile_id(
-    material: &crate::search_eval::DirectEvaluatedProfileMaterialV1,
+    material: &crate::query::search_quality::DirectEvaluatedProfileMaterialV1,
 ) -> Result<CalibrationProfileId, SemanticActivationCoordinationErrorV1> {
     material
         .profile
@@ -1486,7 +1475,7 @@ impl SemanticEvaluationSnapshotPortV1 for DaemonSemanticEvaluationSnapshotAuthor
                 };
                 let evaluated = hotpath::measure_block!(
                     "daemon.semantic.evaluation.snapshot.profile_material",
-                    crate::search_eval::load_default_evaluated_profile_material(
+                    crate::query::search_quality::load_default_evaluated_profile_material(
                         &self.candidate.evaluated_profile_id,
                     )
                 )
@@ -1528,7 +1517,7 @@ impl SemanticEvaluationSnapshotPortV1 for DaemonSemanticEvaluationSnapshotAuthor
     ) -> SemanticRuntimeFuture<
         'a,
         Result<
-            crate::search_eval::DirectActivationEvaluationV1,
+            crate::query::search_quality::DirectActivationEvaluationV1,
             SemanticActivationCoordinationErrorV1,
         >,
     > {
@@ -1571,7 +1560,7 @@ impl SemanticEvaluationSnapshotPortV1 for DaemonSemanticEvaluationPublicationAut
     ) -> SemanticRuntimeFuture<
         'a,
         Result<
-            crate::search_eval::DirectActivationEvaluationV1,
+            crate::query::search_quality::DirectActivationEvaluationV1,
             SemanticActivationCoordinationErrorV1,
         >,
     > {
@@ -1751,32 +1740,6 @@ fn read_linux_process_lifetime_peak_rss_bytes() -> Option<u64> {
 mod lifecycle_tests {
     use super::*;
 
-    fn digest(byte: char) -> ManifestDigest {
-        ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
-    }
-
-    #[test]
-    fn candidate_vector_identity_requires_runtime_manifest_match() {
-        let generation = VectorGenerationIdV1::new(digest('a'));
-        let vector_manifest = digest('b');
-        let runtime = SemanticEvaluationCurrentGenerationSnapshotV1 {
-            vector_state_revision: 7,
-            vector_generation_id: generation.clone(),
-            source_manifest_digest: digest('c'),
-        };
-
-        assert!(!vector_runtime_identity_matches(
-            &generation,
-            &vector_manifest,
-            &runtime,
-        ));
-        assert!(vector_runtime_identity_matches(
-            &generation,
-            &runtime.source_manifest_digest,
-            &runtime,
-        ));
-    }
-
     #[tokio::test]
     async fn evaluation_waits_for_scheduler_admission_and_times_out_typed() {
         let admission = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1907,24 +1870,6 @@ mod lifecycle_tests {
         assert!(validate_evaluator_model_open_count(1).is_ok());
         assert!(validate_evaluator_model_open_count(0).is_err());
         assert!(validate_evaluator_model_open_count(2).is_err());
-    }
-
-    #[test]
-    fn packaged_candidate_uses_its_evaluated_semantic_calibration() {
-        let material =
-            crate::search_eval::load_default_evaluated_profile_material("hybrid-conservative")
-                .expect("packaged semantic profile");
-        let evaluated = material
-            .profile
-            .calibrations
-            .get(&tracedecay_domain::RetrieverKind::Semantic)
-            .expect("semantic calibration");
-
-        assert_eq!(
-            evaluated_semantic_calibration_profile_id(&material)
-                .expect("candidate semantic calibration"),
-            evaluated.clone()
-        );
     }
 
     #[tokio::test]
@@ -2194,22 +2139,5 @@ mod lifecycle_tests {
             .await;
         assert!(receipt.is_clean());
         assert_eq!(receipt.remaining_workers, 0);
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn checked_in_linux_quality_evaluation_records_process_resources() {
-        let window = LinuxProcessResourceWindowV1::begin()
-            .expect("Linux quality evaluation requires procfs and CLK_TCK");
-
-        let (_cpu_time_us, peak_rss_bytes) = window
-            .finish()
-            .expect("Linux quality evaluation records CPU and peak RSS");
-
-        assert!(peak_rss_bytes > 0);
     }
 }

@@ -6,6 +6,8 @@
 //! `application_handler_descriptors` so the descriptor-derived catalog has one
 //! owner every transport can reach.
 
+use std::collections::BTreeSet;
+
 use crate::handlers::BoundApplicationHandler;
 use crate::{
     APPLICATION_ADMINISTRATIVE_PROFILE_ID, APPLICATION_COMPACT_PROFILE_ID,
@@ -19,13 +21,6 @@ use tracedecay_tool_catalog::{
     CatalogValidationError, IdentifierError, ProfileBudget, ProfileDefinition,
     ProfileDefinitionInputV1, ProfileId, ProfileKind, UseCaseId,
 };
-
-// The default profile currently composes 403 shipped bindings. This reviewed
-// ceiling leaves 45 bindings of admission headroom while the eager-profile
-// routing and serialized discovery assertions in the root
-// `product_surface_suite/catalog_composition_contract.rs` suite bound the
-// client-facing cost.
-const DEFAULT_PROFILE_MAXIMUM_BINDINGS: u32 = 448;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CatalogCompositionError {
@@ -156,11 +151,19 @@ pub fn validate_application_catalog(
 fn application_profiles(
     contributions: &[CatalogContributionV1],
 ) -> Result<Vec<ProfileDefinition>, CatalogCompositionError> {
+    let default_maximum_bindings = u32::try_from(profile_binding_count(
+        contributions,
+        APPLICATION_DEFAULT_PROFILE_ID,
+    ))
+    .map_err(|_| CatalogValidationError::InvalidValue {
+        field: "default profile binding budget",
+        reason: "composed binding count exceeds u32",
+    })?;
     [
         (
             APPLICATION_DEFAULT_PROFILE_ID,
             ProfileKind::Default,
-            ProfileBudget::new(DEFAULT_PROFILE_MAXIMUM_BINDINGS, 18_000)?,
+            ProfileBudget::new(default_maximum_bindings, 18_000)?,
             true,
         ),
         (
@@ -193,6 +196,26 @@ fn application_profiles(
         )
     })
     .collect()
+}
+
+fn profile_binding_count(contributions: &[CatalogContributionV1], profile_id: &str) -> usize {
+    let capability_ids = contributions
+        .iter()
+        .flat_map(CatalogContributionV1::capabilities)
+        .filter(|capability| {
+            capability.availability().is_callable()
+                && capability
+                    .profile_eligibility()
+                    .iter()
+                    .any(|eligible| eligible.as_str() == profile_id)
+        })
+        .map(|capability| capability.capability_id())
+        .collect::<BTreeSet<_>>();
+    contributions
+        .iter()
+        .flat_map(CatalogContributionV1::bindings)
+        .filter(|binding| capability_ids.contains(binding.capability_id()))
+        .count()
 }
 
 fn application_profile(
@@ -241,8 +264,6 @@ fn application_profile(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
     use crate::handlers::CanonicalApplicationDispatcher;
     use crate::{ApplicationOperation, ApplicationProblem, RetryDirective, SafeDiagnostic};
@@ -260,13 +281,6 @@ mod tests {
                     && matches!(binding.status(), BindingStatus::Current)
                     && !binding.is_alias()
             })
-            .collect()
-    }
-
-    fn dashboard_operations() -> Vec<String> {
-        current_bindings_on(BindingSurface::Dashboard)
-            .iter()
-            .map(|binding| binding.operation().as_str().to_owned())
             .collect()
     }
 
@@ -392,59 +406,5 @@ mod tests {
                 )
                 .is_none()
         );
-    }
-
-    #[test]
-    fn reviewed_default_budget_admits_the_full_eager_profile() {
-        let snapshot = build_application_catalog_snapshot().expect("application catalog");
-        let profile_id = ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID).expect("profile");
-        let profile = snapshot.profile(&profile_id).expect("default profile");
-        let eager_visible_capabilities =
-            snapshot.visible_capabilities(&profile_id, &BTreeSet::new());
-        let eager_binding_count = eager_visible_capabilities
-            .iter()
-            .flat_map(|capability| capability.binding_ids())
-            .filter_map(|binding_id| snapshot.binding(binding_id))
-            .filter(|binding| profile.enables_surface(binding.surface()))
-            .count();
-
-        assert_eq!(
-            profile.budget().maximum_bindings(),
-            DEFAULT_PROFILE_MAXIMUM_BINDINGS
-        );
-        let expected_binding_count = application_catalog_contributions()
-            .expect("application contributions")
-            .iter()
-            .flat_map(CatalogContributionV1::bindings)
-            .filter(|binding| {
-                profile.includes_capability(binding.capability_id())
-                    && profile.enables_surface(binding.surface())
-            })
-            .count();
-        assert_eq!(eager_binding_count, expected_binding_count);
-        assert!(
-            eager_binding_count <= profile.budget().maximum_bindings() as usize,
-            "the derived eager profile must stay within its reviewed budget"
-        );
-
-        for operation in dashboard_operations() {
-            let operation_name =
-                SurfaceOperationName::new(&operation).expect("surface operation name");
-            let capability = snapshot
-                .resolve_binding(
-                    &profile_id,
-                    BindingSurface::Dashboard,
-                    &operation_name,
-                    1,
-                    &BTreeSet::new(),
-                )
-                .unwrap_or_else(|| panic!("{operation} must resolve from the eager profile"));
-            assert!(
-                eager_visible_capabilities
-                    .iter()
-                    .any(|candidate| candidate.capability_id() == capability.capability_id()),
-                "{operation} must resolve to an eager-visible capability"
-            );
-        }
     }
 }

@@ -615,6 +615,11 @@ pub(super) enum CodexStopSourceBound {
     Sealed(tracedecay_sessions::runtime::codex::SealedJsonlSourceBound),
 }
 
+#[hotpath::measure(future = true, label = "mcp.hook_runtime.ingest")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Transcript ingest is one cancelled-aware write through the capture authority."
+)]
 pub(crate) async fn ingest_transcript_with_cancellation(
     cg: Option<&TraceDecay>,
     args: &Value,

@@ -25,13 +25,6 @@ mod source_authority;
 pub mod test_risk;
 mod verified_query;
 
-pub use tracedecay_code_index::chunks::CodeIndexImportEvidenceV1;
-pub use tracedecay_code_index::graph_projection::{
-    CodeGraphImpactBatchV1, CodeGraphSemanticEdgeV1, CodeGraphSymbolPageV1,
-    CodeGraphSymbolSummaryV1,
-};
-pub use tracedecay_code_index::lineage::LineageSymbolRecordV1;
-
 pub use projection::{
     CodeGraphProjectionReadPort, CodeGraphReadAdmissionFuture, CodeGraphReadAdmissionPort,
     CodeGraphReadAdmissionRequest, CodeGraphReadError, CodeGraphReadFreshnessV1,
@@ -41,9 +34,6 @@ pub use projection::{
 };
 pub use queries::{
     FileAdjacencyScan, GraphQueryManager, NodeMetrics, VerifiedHealthFileAggregateV1,
-};
-pub use source_authority::{
-    CodeGraphSourceAuthorityPort, CodeGraphSourceBindFuture, CodeGraphSourceBindRequest,
 };
 #[cfg(any(test, feature = "test-helpers"))]
 pub use verified_query::admitted_verified_graph_query_port;
@@ -96,7 +86,7 @@ impl SourceReadContext {
 /// fixture entry point can call this unconditionally.
 #[cfg(test)]
 pub(crate) fn register_test_schema_installer() {
-    tracedecay_global_db::register_test_schema_installer();
+    tracedecay_global_db::register_registered_schema_installer();
 }
 
 #[cfg(test)]
@@ -105,42 +95,3 @@ mod verified_query_deadline_tests;
 mod verified_query_source_tests;
 #[cfg(test)]
 mod verified_query_test_support;
-
-#[cfg(test)]
-mod source_read_context_tests {
-    use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
-
-    use super::SourceReadContext;
-
-    #[tokio::test]
-    async fn source_read_context_owns_exact_bound_values() {
-        crate::register_test_schema_installer();
-        let directory = tempfile::tempdir().expect("source read context");
-        let database_path = directory.path().join("source.db");
-        let authority = DatabaseAuthority::acquire_test(&database_path, "source read context")
-            .expect("database authority");
-        let (database, _) = Database::publish_test_runtime(
-            &database_path,
-            &authority,
-            TestDatabaseRuntimeMode::Initialize,
-        )
-        .await
-        .expect("source database");
-        let project_root = directory.path().join("project");
-
-        let source = SourceReadContext::new(
-            project_root.clone(),
-            database.clone(),
-            true,
-            "project.source-context".to_owned(),
-        );
-
-        assert_eq!(source.project_root(), project_root);
-        assert_eq!(
-            source.db().canonical_database_path(),
-            database.canonical_database_path()
-        );
-        assert!(source.is_read_only());
-        assert_eq!(source.project_id(), "project.source-context");
-    }
-}

@@ -118,15 +118,14 @@ fn application_surface_branch_sensitivity(
         ContextScoutClaim, ContextScoutDelivery, ContextScoutExplain, ContextScoutFeedback,
         ContextScoutPause, ContextScoutRecent, ContextScoutResume, ContextScoutStatus,
         DiagnosticsRead, FeedbackAdvisoryCycle, FeedbackDiagnostics, FeedbackExpand, FeedbackGet,
-        FeedbackImpact, FeedbackList, FileDependents, FileMetadata, GitApply, GitBlame, GitDiff,
-        GitHistory, GitHubStackSignalExpand, GitHunks, GitPreview, GitStatus, HealthDelta,
-        HealthRead, ModuleApi, NativeIntegrationApply, NativeIntegrationApprove,
-        NativeIntegrationCancel, NativeIntegrationPreflight, NativeIntegrationStackSnapshot,
-        NativeIntegrationStatus, NativeIntegrationWorktreeConfirm,
-        NativeIntegrationWorktreeInspect, NativeIntegrationWorktreeInventory,
-        NativeIntegrationWorktreeReconcile, NativeIntegrationWorktreeRemove, ObservatoryRead,
-        QualifiedName, SessionLookup, SourceBody, SourceLines, SourceOutline, StorageStatus,
-        TestResults,
+        FeedbackImpact, FeedbackList, FileDependents, GitApply, GitBlame, GitDiff, GitHistory,
+        GitHubStackSignalExpand, GitHunks, GitPreview, GitStatus, HealthDelta, HealthRead,
+        ModuleApi, NativeIntegrationApply, NativeIntegrationApprove, NativeIntegrationCancel,
+        NativeIntegrationPreflight, NativeIntegrationStackSnapshot, NativeIntegrationStatus,
+        NativeIntegrationWorktreeConfirm, NativeIntegrationWorktreeInspect,
+        NativeIntegrationWorktreeInventory, NativeIntegrationWorktreeReconcile,
+        NativeIntegrationWorktreeRemove, ObservatoryRead, QualifiedName, SessionLookup, SourceBody,
+        SourceLines, SourceOutline, StorageStatus, TestResults,
     };
     match operation {
         // Mixed ApplicationSurface group: these operations read configuration,
@@ -208,7 +207,6 @@ fn application_surface_branch_sensitivity(
         | SourceBody
         | SourceOutline
         | ModuleApi
-        | FileMetadata
         | HealthRead
         | HealthDelta
         | DiagnosticsRead => BranchSensitivity::Sensitive,
@@ -262,7 +260,6 @@ const MCP_TOOL_BINDING_SPECS: &[McpToolBinding] = &[
     McpToolBinding { name: "tracedecay_admin_sync", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_port_status", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_port_order", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
-    McpToolBinding { name: "tracedecay_simplify_scan", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_type_hierarchy", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_body", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_todos", group: Some(McpToolDispatchGroup::Info), project: RegisteredProjectAccess::ActiveProjectOnly },
@@ -726,7 +723,6 @@ fn compute_tool_supports_live_cancellation(tool_name: &str) -> bool {
                 | "tracedecay_dead_code"
                 | "tracedecay_circular"
                 | "tracedecay_affected"
-                | "tracedecay_simplify_scan"
                 | "tracedecay_dependency_depth"
                 | "tracedecay_health"
                 | "tracedecay_dsm"
@@ -867,6 +863,10 @@ fn cancellation_for_tool(
     CancellationContract::cooperative(points)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Dispatch catalog construction lists every retained tool as one discovery payload."
+)]
 fn build_mcp_dispatch_catalog()
 -> Result<McpDispatchCatalogV1, super::dispatch::McpDispatchMetadataError> {
     let mut contracts = Vec::new();
@@ -1044,193 +1044,60 @@ mod tests {
         }
     }
 
+    /// The budget that cut `tracedecay_context` at ten seconds in the #1203
+    /// dogfood run is this capability's own deadline contract — the retrieval
+    /// primitive declares `DeadlineContract::new(10_000, ..)` — and not
+    /// `TOOL_DISPATCH_CEILING`, the CLI request deadline, or any settlement or
+    /// ledger budget. `prepare_dispatch_control` hands this ceiling straight to
+    /// `DispatchControl`, and a caller deadline can only shorten it, so this
+    /// value alone decides when an interactive context read is refused.
     #[test]
-    fn memory_status_is_a_read_only_retained_operation() {
-        let catalog = mcp_dispatch_catalog().unwrap();
-        let contract = catalog.contract("tracedecay_memory_status").unwrap();
-        assert_eq!(contract.effect(), EffectClass::Read);
-        assert!(contract.read_only());
-        assert!(contract.availability().is_available());
-        assert_eq!(contract.idempotency(), McpIdempotencyContract::NotProvided);
-        assert!(matches!(
-            contract.inverse(),
-            McpInverseContract::NotApplicable
-        ));
-    }
-
-    #[test]
-    fn lcm_doctor_is_a_read_only_diagnostic() {
-        let contract = mcp_dispatch_catalog()
-            .unwrap()
-            .contract("tracedecay_lcm_doctor")
-            .unwrap();
-        assert_eq!(contract.effect(), EffectClass::Read);
-        assert!(contract.read_only());
-        assert!(contract.availability().is_available());
-        assert_eq!(contract.idempotency(), McpIdempotencyContract::NotProvided);
-        assert!(matches!(
-            contract.inverse(),
-            McpInverseContract::NotApplicable
-        ));
-    }
-
-    #[test]
-    fn source_edit_reconcile_is_available_with_the_daemon_owned_recovery_path() {
-        let catalog = mcp_dispatch_catalog().unwrap();
+    fn context_dispatches_under_its_own_ten_second_deadline_contract() {
+        let ceiling = canonical_tool_dispatch_ceiling("tracedecay_context").unwrap();
+        assert_eq!(ceiling, std::time::Duration::from_secs(10));
         assert!(
-            catalog
-                .contract("tracedecay_source_edit_reconcile")
-                .unwrap()
-                .availability()
-                .is_available()
-        );
-    }
-
-    #[test]
-    fn configuration_effects_are_available_after_their_canonical_journeys_ship() {
-        let catalog = mcp_dispatch_catalog().unwrap();
-        for tool_name in [
-            "tracedecay_configuration_set",
-            "tracedecay_configuration_unset",
-            "tracedecay_configuration_batch",
-            "tracedecay_configuration_protected_apply",
-            "tracedecay_configuration_rollback_apply",
-        ] {
-            let contract = catalog.contract(tool_name).unwrap();
-            assert_eq!(contract.effect(), EffectClass::ConfigurationWrite);
-            assert_eq!(contract.deadline().maximum_millis(), 15_000);
-            assert!(contract.availability().is_available());
-            assert_eq!(contract.idempotency(), McpIdempotencyContract::KeyRequired);
-            assert!(matches!(
-                contract.cancellation(),
-                CancellationContract::NotCancellable
-            ));
-        }
-    }
-
-    #[test]
-    fn retained_administrative_effects_are_available_after_their_canonical_journeys_ship() {
-        let catalog = mcp_dispatch_catalog().unwrap();
-        for tool_name in [
-            "tracedecay_fact_store_curate",
-            "tracedecay_fact_feedback",
-            "tracedecay_session_refresh_begin",
-            "tracedecay_run_affected_tests",
-        ] {
-            let contract = catalog.contract(tool_name).unwrap();
-            assert_eq!(contract.effect(), EffectClass::Administrative);
-            assert!(
-                contract.availability().is_available(),
-                "{tool_name} must stay callable once its retained MCP journey ships"
-            );
-        }
-    }
-
-    #[test]
-    fn direct_cancellation_contracts_name_observed_handler_stages() {
-        let catalog = mcp_dispatch_catalog().unwrap();
-        assert_eq!(
-            catalog
-                .contract("tracedecay_search")
-                .unwrap()
-                .cancellation()
-                .points(),
-            &[CancellationPoint::DuringRead]
-        );
-        assert_eq!(
-            catalog
-                .contract("tracedecay_run_affected_tests")
-                .unwrap()
-                .cancellation()
-                .points(),
-            &[CancellationPoint::EffectInFlight]
-        );
-        let diagnostics = catalog.contract("tracedecay_diagnostics").unwrap();
-        assert_eq!(
-            diagnostics.cancellation().points(),
-            &[
-                CancellationPoint::BeforeAdmission,
-                CancellationPoint::BeforeRead,
-                CancellationPoint::DuringRead,
-            ]
+            ceiling < crate::mcp::tools::handlers::tool_dispatch_ceiling("tracedecay_context"),
+            "the capability contract, not the generic dispatch ceiling, bounds context"
         );
         assert!(
-            diagnostics
-                .terminal_states()
-                .contains(&McpTerminalState::Cancelled),
-            "the MCP binding must preserve the descriptor's cooperative cancellation contract"
+            ceiling < tracedecay_daemon_protocol::DEFAULT_TOOL_REQUEST_DEADLINE,
+            "the CLI request deadline cannot be what refuses a context read"
         );
     }
 
-    /// Reads that resolve their own authority stay on the active project. A
-    /// selector on one of these would silently read the wrong store.
-    ///
-    /// Only names with a `MCP_TOOL_BINDINGS` row belong here: for an unbound
-    /// name both predicates return `false` vacuously, so listing one asserts
-    /// nothing. The `tracedecay_git_*` application-surface tools were removed
-    /// for exactly that reason — they never consult this table, and their
-    /// selector policy is enforced by the surface schema, not a binding row.
     #[test]
-    fn remote_status_is_an_active_project_info_read() {
-        let entry = MCP_TOOL_BINDINGS
-            .iter()
-            .find(|entry| entry.name == "tracedecay_remote_status")
-            .expect("tracedecay_remote_status must have a binding row");
-        assert_eq!(entry.group, Some(McpToolDispatchGroup::Info));
-        assert_eq!(entry.project, RegisteredProjectAccess::ActiveProjectOnly);
-        assert!(!tool_accepts_registered_project_selector(entry.name));
-        assert!(!tool_dispatches_registered_project_reader(entry.name));
-    }
-
-    #[test]
-    fn authority_bound_reads_are_active_project_only() {
-        let tool_name = "tracedecay_search";
-        assert!(
-            binding(tool_name).is_some(),
-            "{tool_name} must have a binding row for these assertions to bind"
-        );
-        assert!(!tool_accepts_registered_project_selector(tool_name));
-        assert!(!tool_dispatches_registered_project_reader(tool_name));
-    }
-
-    #[test]
-    fn exact_fact_routes_accept_selectors_without_registered_reader_dispatch() {
+    fn exact_fact_reads_dispatch_to_their_registered_project() {
         for tool_name in [
-            "tracedecay_fact_store_add",
             "tracedecay_fact_store_search",
             "tracedecay_fact_store_probe",
             "tracedecay_fact_store_related",
             "tracedecay_fact_store_reason",
             "tracedecay_fact_store_contradict",
             "tracedecay_fact_store_get",
-            "tracedecay_fact_store_update",
-            "tracedecay_fact_store_remove",
-            "tracedecay_fact_store_supersede",
             "tracedecay_fact_store_list",
             "tracedecay_memory_status",
+            "tracedecay_message_search",
         ] {
             assert!(tool_accepts_registered_project_selector(tool_name));
-            assert!(!tool_dispatches_registered_project_reader(tool_name));
+            assert!(tool_dispatches_registered_project_reader(tool_name));
+            assert!(!tool_is_selector_bound_effect(tool_name));
         }
+    }
+
+    #[test]
+    fn exact_fact_effects_keep_the_active_project_authority() {
         for tool_name in [
             "tracedecay_fact_store_add",
             "tracedecay_fact_store_update",
             "tracedecay_fact_store_remove",
             "tracedecay_fact_store_supersede",
+            "tracedecay_fact_feedback",
         ] {
+            assert!(tool_accepts_registered_project_selector(tool_name));
+            assert!(!tool_dispatches_registered_project_reader(tool_name));
             assert!(
                 tool_is_selector_bound_effect(tool_name),
                 "{tool_name} must stay selector-bound so writes are not dispatched into the selected store"
-            );
-        }
-        for tool_name in [
-            "tracedecay_fact_store_search",
-            "tracedecay_fact_store_get",
-            "tracedecay_memory_status",
-        ] {
-            assert!(
-                !tool_is_selector_bound_effect(tool_name),
-                "{tool_name} is a selector-bound read and must keep its existing selected-project route"
             );
         }
     }

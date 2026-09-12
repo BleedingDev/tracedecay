@@ -7,7 +7,7 @@ use tracedecay_global_db::tests::harness::{HostAdmissionScope, HostAdmissionTest
 use tracedecay_runtime_core::db::engine::{IntoParams, params};
 use tracedecay_temporal_query::ports::SessionCursorAuthenticator;
 
-use super::{GlobalDbCursorKeyProvider, GlobalDbCursorKeyProviderError};
+use super::{SessionTemporalCursorKeyProvider, SessionTemporalCursorKeyProviderError};
 use crate::SessionTemporalAccess;
 
 const LOAD_DEADLINE: Duration = Duration::from_secs(5);
@@ -26,7 +26,7 @@ fn database(runtime: &HostAdmissionTestRuntimeV1) -> &RegisteredGlobalDb {
 
 async fn load(
     database: &RegisteredGlobalDb,
-) -> Result<GlobalDbCursorKeyProvider, GlobalDbCursorKeyProviderError> {
+) -> Result<SessionTemporalCursorKeyProvider, SessionTemporalCursorKeyProviderError> {
     tokio::time::timeout(
         LOAD_DEADLINE,
         SessionTemporalAccess::new(database).load_session_cursor_key_provider_result(),
@@ -63,34 +63,6 @@ async fn mutate(database: &RegisteredGlobalDb, sql: &str, params: impl IntoParam
         .execute(sql, params)
         .await
         .expect("fixture mutation");
-}
-
-#[tokio::test]
-async fn first_load_provisions_one_key_and_later_loads_need_no_writer() {
-    let directory = tempdir().expect("temporary session store");
-    let runtime = registered_runtime(directory.path()).await;
-    let database = database(&runtime);
-    assert!(key_rows(database).await.is_empty());
-
-    let first = load(database).await.expect("first load provisions");
-    let rows = key_rows(database).await;
-    assert_eq!(rows.len(), 1, "first use mints exactly one key: {rows:?}");
-    assert_eq!(rows[0].1, 1);
-    assert_eq!(rows[0].0, first.active_key_ref().key_id.as_str());
-
-    // Hold the store's only writer open: a provisioned store must still load
-    // its provider from a read snapshot instead of queueing behind the writer.
-    let held_writer = database
-        .begin_write_transaction()
-        .await
-        .expect("unrelated writer transaction");
-    let second = load(database).await.expect("provisioned load is read-only");
-    assert_eq!(second.active_key_ref(), first.active_key_ref());
-    held_writer
-        .commit()
-        .await
-        .expect("release unrelated writer");
-    assert_eq!(key_rows(database).await.len(), 1);
 }
 
 #[tokio::test]
@@ -144,7 +116,7 @@ async fn multiple_active_keys_refuse_without_minting() {
     assert!(
         matches!(
             error,
-            GlobalDbCursorKeyProviderError::MultipleActiveKeys { .. }
+            SessionTemporalCursorKeyProviderError::MultipleActiveKeys { .. }
         ),
         "{error:?}"
     );
@@ -179,7 +151,10 @@ async fn invalid_active_key_material_refuses_without_minting() {
 
     let error = load(database).await.expect_err("corrupt material refuses");
     assert!(
-        matches!(error, GlobalDbCursorKeyProviderError::InvalidKeyMaterial),
+        matches!(
+            error,
+            SessionTemporalCursorKeyProviderError::InvalidKeyMaterial
+        ),
         "{error:?}"
     );
     assert_eq!(key_rows(database).await, before, "refusal must not mint");

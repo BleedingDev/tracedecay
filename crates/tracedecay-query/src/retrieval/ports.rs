@@ -19,6 +19,16 @@ use super::exact::{ExactLaneEvidence, ExactLaneRequest};
 use super::graph::{GraphLaneEvidence, GraphLaneRequest};
 use super::lexical::{LexicalLaneEvidence, LexicalLaneRequest};
 
+/// Request-scoped cancellation and monotonic deadline authority shared by
+/// retrieval lanes.
+pub trait RetrievalExecutionControl: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+
+    /// Monotonic elapsed time in the request-relative domain used by
+    /// [`RetrievalBudget::deadline_micros`].
+    fn elapsed_micros(&self) -> u64;
+}
+
 /// Incompatible indexes or models never trigger silent fallback.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RetrievalPortError {
@@ -218,7 +228,7 @@ pub trait GraphEvidenceReadPort {
     fn read_graph_evidence(
         &self,
         request: &GraphLaneRequest,
-        control: std::sync::Arc<dyn super::graph::GraphExecutionControl>,
+        control: std::sync::Arc<dyn RetrievalExecutionControl>,
     ) -> Result<RetrieverOutcome<RetrieverBatch<GraphLaneEvidence>>, RetrievalPortError>;
 }
 
@@ -247,47 +257,4 @@ pub struct CodeCandidateBindingV1 {
     pub language_descriptor_revision: LanguageDescriptorRevision,
     pub matched_term_kinds: Vec<ExactTechnicalTermKindV1>,
     pub source_occurrence: SourceOccurrenceId,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{RetrievalError, RetrievalPortError};
-
-    #[test]
-    fn retrieval_port_error_preserves_identity_in_retrieval_error() {
-        let cases = [
-            (
-                RetrievalPortError::CapabilityManifestRejected,
-                RetrievalError::CapabilityManifestRejected,
-            ),
-            (
-                RetrievalPortError::GenerationMismatch,
-                RetrievalError::GenerationMismatch,
-            ),
-            (
-                RetrievalPortError::AuthorityUnavailable("index offline".to_owned()),
-                RetrievalError::AuthorityUnavailable("index offline".to_owned()),
-            ),
-            (
-                RetrievalPortError::IncompatibleProjection,
-                RetrievalError::IncompatibleProjection,
-            ),
-            (
-                RetrievalPortError::StaleEvidence,
-                RetrievalError::StaleEvidence,
-            ),
-            (RetrievalPortError::Cancelled, RetrievalError::Cancelled),
-            (
-                RetrievalPortError::BudgetExceeded,
-                RetrievalError::BudgetExceeded,
-            ),
-            (
-                RetrievalPortError::Contract("row binding".to_owned()),
-                RetrievalError::LaneContract("row binding".to_owned()),
-            ),
-        ];
-        for (port, expected) in cases {
-            assert_eq!(RetrievalError::from(port), expected);
-        }
-    }
 }

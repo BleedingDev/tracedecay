@@ -19,20 +19,53 @@ use code_index_task_support::{
 
 const MAX_CONCURRENT_CODE_INDEX_SEARCHES: usize = 1;
 
-struct McpSemanticExecutionControlV1<A> {
+struct McpRetrievalExecutionControlV1<A> {
     started: std::time::Instant,
     admission_provider: A,
     deadline: Option<tracedecay_contracts::Deadline>,
     cancellation: Option<tracedecay_contracts::CancellationSignal>,
 }
 
-impl<A> McpSemanticExecutionControlV1<A> {
+impl<A> McpRetrievalExecutionControlV1<A> {
     fn request_termination(&self) -> Option<code_search::CodeIndexSearchUnavailableReasonV1> {
         mcp_search_request_termination(
             self.deadline.as_ref(),
             self.cancellation.as_ref(),
             tracedecay_contracts::clock::now_micros().0,
         )
+    }
+
+    /// Resolves when this request has settled — the async twin of
+    /// [`Self::request_termination`].
+    ///
+    /// `request_termination` only answers where something asks it, and the
+    /// execution permit is acquired *before* generation resolution, which is
+    /// the one stretch of an admitted search that consults no control at all:
+    /// it parks on the scheduler's mounted map and, when nothing is servable,
+    /// on the in-flight decode. A request that settles inside that window has
+    /// no checkpoint to unwind at, so the single execution permit stayed held
+    /// by work no caller was waiting for, and every following search was
+    /// refused `search_capacity_unavailable` — a refusal the dispatch contract
+    /// advertises as retryable while guaranteeing the retry fails too.
+    /// Awaiting this alongside the execution drops the abandoned work at its
+    /// current await point and releases the permit with it.
+    async fn settled(&self) {
+        let cancelled = async {
+            match self.cancellation.as_ref() {
+                Some(cancellation) => cancellation.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let expired = async {
+            match self.deadline.as_ref() {
+                Some(deadline) => crate::project_reads::sleep_until_deadline(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            () = cancelled => (),
+            () = expired => (),
+        }
     }
 }
 
@@ -53,7 +86,7 @@ pub fn mcp_search_request_termination(
 /// the request itself may have been cancelled or timed out, or the MCP read
 /// route may have been revoked underneath it. `Some` means stop and return.
 fn search_terminated<A: CodeIndexMcpReadAdmissionV1>(
-    control: &McpSemanticExecutionControlV1<A>,
+    control: &McpRetrievalExecutionControlV1<A>,
     admission_provider: &A,
     code_generation: Option<&str>,
 ) -> Option<code_search::CodeIndexSearchOutcomeV1> {
@@ -481,8 +514,8 @@ fn code_index_search_display_bytes(
     .ok_or(tracedecay_query::retrieval::hydrate::HydrationUnavailableV1::Internal)
 }
 
-impl<A: CodeIndexMcpReadAdmissionV1> tracedecay_query::retrieval::semantic::SemanticExecutionControl
-    for McpSemanticExecutionControlV1<A>
+impl<A: CodeIndexMcpReadAdmissionV1> tracedecay_query::retrieval::ports::RetrievalExecutionControl
+    for McpRetrievalExecutionControlV1<A>
 {
     fn is_cancelled(&self) -> bool {
         !self.admission_provider.route_is_registered() || self.request_termination().is_some()
@@ -490,19 +523,6 @@ impl<A: CodeIndexMcpReadAdmissionV1> tracedecay_query::retrieval::semantic::Sema
 
     fn elapsed_micros(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
-    }
-}
-
-impl<A: CodeIndexMcpReadAdmissionV1>
-    tracedecay_query::retrieval::hydrate::HydrationExecutionControlV1
-    for McpSemanticExecutionControlV1<A>
-{
-    fn elapsed_micros(&self) -> u64 {
-        tracedecay_query::retrieval::semantic::SemanticExecutionControl::elapsed_micros(self)
-    }
-
-    fn is_cancelled(&self) -> bool {
-        !self.admission_provider.route_is_registered() || self.request_termination().is_some()
     }
 }
 
@@ -647,7 +667,7 @@ where
                         tracedecay_query::retrieval::semantic::SemanticQueryModeV1::StrictSemantic
                     }
                 };
-                let control = Arc::new(McpSemanticExecutionControlV1 {
+                let control = Arc::new(McpRetrievalExecutionControlV1 {
                     started: std::time::Instant::now(),
                     admission_provider: admission_provider.clone(),
                     deadline,
@@ -680,9 +700,11 @@ where
                             policy,
                         );
                     let runtime = tokio::runtime::Handle::current();
+                    let settlement_control = Arc::clone(&control);
                     let execution = tokio::task::spawn_blocking(move || {
                         let _execution_permit = execution_permit;
                         runtime.block_on(async move {
+                        let work = async move {
                         let Some(revision) = execution_source_revision else {
                             return execution_schedulers
                                 .execute_query_with_semantic(
@@ -780,6 +802,29 @@ where
                             query,
                             semantic,
                         })
+                        };
+                        // The permit follows request settlement, not this
+                        // work's natural completion. `work` is polled first, so
+                        // an unsettled request behaves exactly as before; a
+                        // settled one is dropped where it stands — including
+                        // mid-`mounted.lock()` or mid-decode, the awaits that
+                        // no checkpoint covers — and `_execution_permit` is
+                        // released with the task. `settle_owned_blocking_task`
+                        // below normally names the precise terminal reason
+                        // first; this only keeps the typed state when it did
+                        // not.
+                        tokio::pin!(work);
+                        tokio::select! {
+                            biased;
+                            output = &mut work => output,
+                            () = settlement_control.settled() => Err(
+                                code_index_scheduler::semantic_query_runtime::QuerySemanticSearchExecutionErrorV1::Query(
+                                    code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::Retrieval(
+                                        tracedecay_query::retrieval::RetrievalPortError::Cancelled,
+                                    ),
+                                ),
+                            ),
+                        }
                     })
                     });
                     match hotpath::future!(
@@ -1286,7 +1331,7 @@ mod tests {
         CodeIndexSearchAuthorityV1, CodeIndexSearchModeV1, CodeIndexSearchOutcomeV1,
         CodeIndexSearchRequestV1, CodeIndexSearchUnavailableReasonV1,
     };
-    use tracedecay_session_memory::context::CancellationToken;
+    use tracedecay_runtime_core::cancellation::CancellationToken;
 
     use super::*;
     use crate::mcp_admission::{

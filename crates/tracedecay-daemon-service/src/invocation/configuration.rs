@@ -9,7 +9,9 @@ use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 mod settlement;
 
-use settlement::{configuration_effect, reconcile_configuration_runtime};
+use settlement::{
+    configuration_effect, reconcile_configuration_runtime, refresh_live_configuration_runtime,
+};
 
 #[hotpath::measure(label = "daemon.service.configuration.execute", future = true)]
 pub(super) async fn execute_configuration(
@@ -422,7 +424,10 @@ pub(super) async fn apply_configuration_or_semantic_transition(
     mutation: DirectConfigurationMutation,
     expected_revision: ConfigurationRevisionId,
     now: UtcMicros,
-) -> Result<tracedecay_configuration::ConfigurationMutationReceipt, ConfigurationError> {
+) -> Result<
+    tracedecay_global_db::configuration::contracts::types::ConfigurationMutationReceipt,
+    ConfigurationError,
+> {
     let requested_semantic_profile = semantic_profile_transition(&mutation)?;
     let current = Box::pin(registered.runtime.client().current()).await?;
     let semantic_profile = requested_semantic_profile.filter(|requested| {
@@ -479,6 +484,34 @@ pub(super) async fn apply_configuration_or_semantic_transition(
     if !coordinated_semantic_transition {
         Box::pin(reconcile_configuration_runtime(registered, &receipt, now)).await;
     } else {
+        let refresh = match Box::pin(registered.runtime.client().current()).await {
+            Ok(current) => {
+                refresh_live_configuration_runtime(
+                    registered,
+                    tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1 {
+                        revision_id: current.revision_id().clone(),
+                        snapshot: current.snapshot().clone(),
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = refresh {
+            tracing::warn!(
+                receipt_id = %receipt.receipt_id,
+                error,
+                "semantic configuration committed; live runtime refresh remains pending"
+            );
+            let _ = registered
+                .runtime
+                .record_runtime_activation(
+                    None,
+                    Some("runtime_configuration_activation_failed".to_owned()),
+                    now,
+                )
+                .await;
+        }
         notify_committed_semantic_activation(&registered.semantic_activation_committed);
     }
     Ok(receipt)
@@ -694,14 +727,23 @@ fn configuration_request_authority(
     .map_err(|_| invalid_configuration_request())
 }
 
+pub(super) struct ContextScoutRequestAuthorityV1 {
+    pub receipt: AuthorityReceipt,
+    pub use_case: UseCaseId,
+    pub configuration_digest: ManifestDigest,
+    pub catalog_digest: ManifestDigest,
+    pub privacy_digest: ManifestDigest,
+}
+
 pub(super) fn context_scout_request_authority(
     registered: &RegisteredConfigurationRuntime,
+    current: &tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1,
     request_id: &str,
     operation: ApplicationSurfaceOperation,
     observed_at: UtcMicros,
     deadline: Deadline,
     cancellation: CancellationContext,
-) -> Result<AuthorityReceipt, ApplicationProblem> {
+) -> Result<ContextScoutRequestAuthorityV1, ApplicationProblem> {
     if observed_at >= registered.grants.expires_at {
         return Err(ApplicationProblem::not_found_or_not_authorized(
             RetryDirective::Never,
@@ -711,6 +753,25 @@ pub(super) fn context_scout_request_authority(
         tracedecay_contracts::context_scout::context_scout_surface_operation(operation.as_str())
             .map_err(|_| invalid_configuration_request())?
             .ok_or_else(invalid_configuration_request)?;
+    let catalog = crate::application_surface::application_surface_catalog_ref()
+        .map_err(|_| invalid_configuration_request())?;
+    let manifest = catalog
+        .capability(application_operation.capability_id())
+        .ok_or_else(invalid_configuration_request)?;
+    let catalog_digest = ManifestDigest::new(catalog.digest().to_string())
+        .map_err(|_| invalid_configuration_request())?;
+    let configuration_digest = current.snapshot.effective_behavior_digest.clone();
+    let privacy_digest = canonical_sha256(&(
+        "tracedecay.daemon.context-scout-privacy.v1",
+        manifest.privacy(),
+        manifest.denied_disclosure(),
+        manifest.scope(),
+        &registered.scope,
+        &current.revision_id,
+        &configuration_digest,
+        DisclosureClass::Sensitive,
+    ))
+    .map_err(|_| invalid_configuration_request())?;
     let expires_at = UtcMicros(deadline.expires_at.0.min(registered.grants.expires_at.0));
     let grant = CapabilityGrantSnapshot::new(
         CapabilityGrantId::new(format!("grant.daemon.context-scout.{request_id}"))
@@ -742,7 +803,7 @@ pub(super) fn context_scout_request_authority(
     .map_err(|_| invalid_configuration_request())?;
     let policy_digest = ManifestDigest::new(registered.grants.policy_digest.as_str().to_owned())
         .map_err(|_| invalid_configuration_request())?;
-    AuthorityReceipt::from_context(
+    let receipt = AuthorityReceipt::from_context(
         &context,
         PolicyDecisionRef::new(
             "policy.daemon.context-scout.v1",
@@ -754,7 +815,14 @@ pub(super) fn context_scout_request_authority(
         .map_err(|_| invalid_configuration_request())?,
         observed_at,
     )
-    .map_err(|_| invalid_configuration_request())
+    .map_err(|_| invalid_configuration_request())?;
+    Ok(ContextScoutRequestAuthorityV1 {
+        receipt,
+        use_case: application_operation.use_case_id().clone(),
+        configuration_digest,
+        catalog_digest,
+        privacy_digest,
+    })
 }
 
 pub(super) fn configuration_evidence(

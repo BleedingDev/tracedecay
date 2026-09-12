@@ -28,6 +28,7 @@ pub use recursion::handle_recursion;
 pub use unmounted_files::handle_unmounted_files;
 pub use unsafe_patterns::handle_unsafe_patterns;
 
+use crate::handlers::graph::user_line;
 use crate::{ToolResult, is_ident_byte, line_number_at};
 use crate::{
     effective_path, generic_tool_result, rendered_tool_result, require_object_args,
@@ -38,10 +39,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
+use tracedecay_code_index::graph_projection::CodeGraphSemanticEdgeV1;
+use tracedecay_code_index::lineage::LineageSymbolRecordV1;
 use tracedecay_domain::code_intelligence::NodeKind;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{RelationEdgeKindV1, SymbolOccurrenceId};
-use tracedecay_graph_query::{CodeGraphSemanticEdgeV1, LineageSymbolRecordV1, VerifiedGraphQuery};
+use tracedecay_graph_query::VerifiedGraphQuery;
 
 fn path_is_rust(path: &str) -> bool {
     Path::new(path)

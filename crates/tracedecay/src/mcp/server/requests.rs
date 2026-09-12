@@ -564,6 +564,10 @@ impl McpServer {
     }
 
     #[hotpath::measure(label = "mcp.server.hook_event", future = true)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Hook-event notification is one decode-admit-ack of a host envelope."
+    )]
     pub(crate) async fn handle_hook_event_notification(
         &self,
         params: Option<&Value>,
@@ -1535,6 +1539,10 @@ impl McpServer {
     }
 
     #[hotpath::measure(label = "mcp.server.tools_call", future = true)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The response-gate lease and cancellation registrations are RAII-scoped to the frame and must span dispatch."
+    )]
     pub(crate) async fn handle_tools_call(
         &self,
         id: Value,
@@ -1876,7 +1884,6 @@ mod git_read_control_tests {
             "tracedecay_dead_code",
             "tracedecay_circular",
             "tracedecay_affected",
-            "tracedecay_simplify_scan",
             "tracedecay_dependency_depth",
             "tracedecay_health",
             "tracedecay_dsm",

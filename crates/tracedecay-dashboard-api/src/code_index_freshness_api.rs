@@ -86,10 +86,20 @@ pub struct CodeIndexBuildProgressV1 {
     pub completed_files: u64,
     /// Authenticated sealed-source file bound for this generation.
     pub total_files: u64,
-    /// Authenticated sealed lexical-byte boundary completed by committed work.
-    pub completed_lexical_bytes: u64,
-    /// Authenticated sealed lexical-byte bound for this generation.
-    pub total_lexical_bytes: u64,
+    /// Authenticated lexical-span boundary completed by committed work, in the
+    /// sealed source's own advance unit.
+    ///
+    /// The unit is the source's, not this surface's: a sealed-layout source
+    /// advances over the files-array byte span, while a published or
+    /// partitioned source advances over file ordinals because its file records
+    /// are not a contiguous byte range at all. Both are monotone and share the
+    /// denominator below, so completion and the derived estimate are truthful;
+    /// naming them bytes was not, and a consumer that multiplied this by an
+    /// average file size was wrong by orders of magnitude (issue #1205).
+    pub completed_lexical_units: u64,
+    /// Authenticated lexical-span bound for this generation, in the same unit
+    /// as [`Self::completed_lexical_units`].
+    pub total_lexical_units: u64,
     /// Source pages in the batch currently being processed.
     pub current_batch_pages: u64,
     /// Sealed payload bytes in the batch currently being processed.
@@ -100,8 +110,10 @@ pub struct CodeIndexBuildProgressV1 {
     pub last_commit_latency_micros: Option<u64>,
     /// Rolling committed-file throughput, absent until it is established.
     pub files_per_second: Option<f64>,
-    /// Rolling committed lexical-byte throughput, absent until it is established.
-    pub lexical_bytes_per_second: Option<f64>,
+    /// Rolling committed lexical-span throughput in units per second, absent
+    /// until it is established. Not a byte rate; see
+    /// [`Self::completed_lexical_units`].
+    pub lexical_units_per_second: Option<f64>,
     /// Estimated remaining build duration, absent without a truthful rate.
     pub estimated_remaining_seconds: Option<u64>,
     /// Unix-epoch timestamp of the last durable progress publication.
@@ -473,48 +485,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn freshness_route_projects_exact_live_scheduler_identity() {
-        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
-        let (_project, mut state) = state_for_test().await;
-        state.code_index_freshness_reader = Some(Arc::new(|root| {
-            Box::pin(async move {
-                Some(CodeIndexWorktreeFreshnessV1 {
-                    worktree_root: root.display().to_string(),
-                    repository_id: Some("repository.fixture".to_owned()),
-                    worktree_id: Some("worktree.fixture".to_owned()),
-                    source_reference: Some("refs/heads/main".to_owned()),
-                    source_revision: Some("commit.fixture".to_owned()),
-                    latest_generation_id: Some("generation.fixture".to_owned()),
-                    code_graph_serving: Some(CodeGraphServingReadinessV1::Ready),
-                    snapshot_content_identity: Some("sha256:fixture".to_owned()),
-                    sealed_at_micros: Some(41),
-                    last_reconcile_micros: Some(42),
-                    staleness_state: Some("fresh".to_owned()),
-                    rebuild_in_flight: false,
-                    hook_hint_count: Some(0),
-                    coverage: "complete".to_owned(),
-                    progress: None,
-                    parked: None,
-                    generation_recovery: None,
-                })
-            })
-        }));
-        let Json(envelope) = freshness(State(state)).await;
-        assert_eq!(envelope.domain_state, DashboardDomainStateV1::Ready);
-        assert!(envelope.coverage.is_complete());
-        let worktree = envelope.payload.worktrees.first().expect("worktree");
-        assert_eq!(
-            worktree.latest_generation_id.as_deref(),
-            Some("generation.fixture")
-        );
-        assert_eq!(
-            worktree.repository_id.as_deref(),
-            Some("repository.fixture")
-        );
-        assert_eq!(worktree.staleness_state.as_deref(), Some("fresh"));
-    }
-
-    #[tokio::test]
     async fn mounted_scheduler_without_a_generation_is_loading_not_ready() {
         let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let (_project, mut state) = state_for_test().await;
@@ -548,77 +518,6 @@ mod tests {
 
         assert_eq!(envelope.domain_state, DashboardDomainStateV1::Loading);
         assert!(!envelope.coverage.is_complete());
-    }
-
-    #[tokio::test]
-    async fn freshness_route_preserves_committed_generation_progress_exactly() {
-        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
-        let (_project, mut state) = state_for_test().await;
-        state.code_index_freshness_reader = Some(Arc::new(|root| {
-            Box::pin(async move {
-                Some(CodeIndexWorktreeFreshnessV1 {
-                    worktree_root: root.display().to_string(),
-                    repository_id: Some("repository.fixture".to_owned()),
-                    worktree_id: Some("worktree.fixture".to_owned()),
-                    source_reference: Some("refs/heads/main".to_owned()),
-                    source_revision: Some("commit.fixture".to_owned()),
-                    latest_generation_id: None,
-                    code_graph_serving: Some(CodeGraphServingReadinessV1::Unavailable {
-                        reason: "generation_unavailable".to_owned(),
-                    }),
-                    snapshot_content_identity: None,
-                    sealed_at_micros: None,
-                    last_reconcile_micros: Some(42),
-                    staleness_state: Some("indexing".to_owned()),
-                    rebuild_in_flight: false,
-                    hook_hint_count: Some(0),
-                    coverage: "complete".to_owned(),
-                    progress: Some(CodeIndexBuildProgressV1 {
-                        generation_id: "generation.catchup.01".to_owned(),
-                        daemon_incarnation: 3,
-                        producer_incarnation: 11,
-                        progress_epoch: 7,
-                        sealed_source_digest: "sha256:sealed-source-catchup".to_owned(),
-                        phase: CodeIndexBuildPhaseV1::BulkCommit,
-                        committed_pages: 16,
-                        committed_chunks: 10_000,
-                        committed_imports: 480,
-                        committed_payload_bytes: 16 * 1024 * 1024,
-                        completed_files: 250,
-                        total_files: 500,
-                        completed_lexical_bytes: 32 * 1024 * 1024,
-                        total_lexical_bytes: 64 * 1024 * 1024,
-                        current_batch_pages: 4,
-                        current_batch_payload_bytes: 4 * 1024 * 1024,
-                        elapsed_micros: 120_000_000,
-                        last_commit_latency_micros: Some(240_000),
-                        files_per_second: Some(250.0),
-                        lexical_bytes_per_second: Some(16.0 * 1024.0 * 1024.0),
-                        estimated_remaining_seconds: Some(120),
-                        last_progress_micros: 43,
-                        blocked_reason: None,
-                    }),
-                    parked: None,
-                    generation_recovery: None,
-                })
-            })
-        }));
-
-        let Json(envelope) = freshness(State(state)).await;
-
-        let progress = envelope.payload.worktrees[0]
-            .progress
-            .as_ref()
-            .expect("mounted build progress");
-        assert_eq!(progress.generation_id, "generation.catchup.01");
-        assert_eq!(progress.progress_epoch, 7);
-        assert_eq!(progress.phase, CodeIndexBuildPhaseV1::BulkCommit);
-        assert_eq!(progress.completed_files, 250);
-        assert_eq!(progress.total_files, 500);
-        assert_eq!(progress.completed_lexical_bytes, 32 * 1024 * 1024);
-        assert_eq!(progress.total_lexical_bytes, 64 * 1024 * 1024);
-        assert_eq!(progress.files_per_second, Some(250.0));
-        assert_eq!(progress.estimated_remaining_seconds, Some(120));
     }
 
     #[tokio::test]

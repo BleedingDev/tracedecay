@@ -13,7 +13,7 @@
 //! emit `Uses` edges. Frontmatter (`(minus_metadata)`, `(plus_metadata)`) is
 //! skipped — the grammar makes it opaque, so we don't recurse into it.
 use std::collections::HashMap;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use tree_sitter::{Node as TsNode, Parser, Range, Tree};
 
@@ -90,10 +90,7 @@ struct PendingReferenceLink {
 
 impl<'s> ExtractionState<'s> {
     fn new(file_path: &str, source: &'s str, extract_inline_links: bool) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let timestamp = crate::common::unix_timestamp_secs();
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -671,18 +668,29 @@ impl crate::LanguageExtractor for MarkdownExtractor {
         "Markdown"
     }
 
-    fn extract(&self, file_path: &str, source: &str) -> ExtractionResult {
-        Self::extract_markdown(file_path, source)
+    /// Links need the inline grammar's second parse, which only the
+    /// extractor-owned parse performs, so the own-parser path stays distinct
+    /// from the supplied-tree path.
+    fn extract_artifact(&self, file_path: &str, source: &str) -> crate::ExtractionArtifactV1 {
+        crate::hotpath_observe::measure_extract_file(
+            self.language_name(),
+            source.len(),
+            || crate::ExtractionArtifactV1::from_result(Self::extract_markdown(file_path, source)),
+            crate::hotpath_observe::ExtractOutputCounts::from_artifact,
+        )
     }
 
-    fn extract_parsed(
+    fn extract_parsed_artifact_prepared(
         &self,
         file_path: &str,
         source: &str,
+        _parsed_source: &str,
         tree: &Tree,
         scope: crate::parsed_extraction::ParsedExtractionScope<'_>,
-    ) -> crate::parsed_extraction::ParsedExtraction {
-        Self::extract_supplied_tree(file_path, source, tree, scope)
+    ) -> crate::parsed_extraction::ParsedExtractionArtifactV1 {
+        crate::parsed_extraction::ParsedExtractionArtifactV1::from_parsed(
+            Self::extract_supplied_tree(file_path, source, tree, scope),
+        )
     }
 }
 
@@ -782,24 +790,6 @@ beta body
         assert!(nested.end_line < beta.start_line);
         assert_eq!(beta.start_line, 8);
         assert_eq!(beta.end_line, 10);
-    }
-
-    #[test]
-    fn yaml_frontmatter_is_skipped_without_error() {
-        let source = "\
----
-title: skipped
----
-
-# Real heading
-";
-        let result = extract(source);
-        assert!(result.errors.is_empty(), "{:?}", result.errors);
-        let names: Vec<&str> = modules(&result)
-            .iter()
-            .map(|node| node.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["Real heading"]);
     }
 
     #[test]

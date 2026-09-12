@@ -486,7 +486,7 @@ fn leased_attempt_can_be_cancelled_without_a_provider_route() {
 }
 
 #[test]
-fn resume_fences_open_attempts_and_completes_lost_cancellations() {
+fn resume_fences_open_attempts_without_claiming_provider_relaunch() {
     let (attempts, work, context) = fixture("project.attempt.resume");
     admit_work(&work, &context, "task.attempt.resume");
     let leased =
@@ -572,11 +572,25 @@ fn resume_fences_open_attempts_and_completes_lost_cancellations() {
         .unwrap_err();
     assert_eq!(stale.kind(), ApplicationProblemKind::InvalidRequest);
 
-    // Recovery execution restarts the fenced attempt under the new fence.
-    let restarted = attempts
-        .mark_running(&context, &running_identity, requested_route())
+    // The recovery report is retained state, not authorization to dispatch
+    // the same effect again. Public retry creates a new attempt identity.
+    let retained = attempts
+        .status(
+            &context,
+            &WorkAttemptStatusRequestV1 {
+                task_id: running_identity.task_id().clone(),
+                run_id: running_identity.run_id().clone(),
+                attempt_id: running_identity.attempt_id().clone(),
+            },
+        )
         .unwrap();
-    assert_eq!(restarted.state(), WorkAttemptStateV1::Running);
+    assert_eq!(retained.state(), WorkAttemptStateV1::RecoveryRequired);
+    let reported = report
+        .recovery_required
+        .iter()
+        .find(|attempt| attempt.identity() == &running_identity)
+        .unwrap();
+    assert_eq!(retained.lease(), reported.lease());
 }
 
 #[test]
@@ -589,7 +603,7 @@ fn provider_unavailability_is_a_typed_terminal_journey() {
     );
     let identity = leased.identity().clone();
     let fenced = attempts
-        .mark_provider_unavailable(&context, &identity)
+        .mark_provider_unavailable(&context, &identity, UtcMicros(31))
         .unwrap();
     assert_eq!(fenced.state(), WorkAttemptStateV1::RecoveryRequired);
     let evidence = WorkAttemptEvidenceRecordV1 {
@@ -636,7 +650,7 @@ fn list_page_bounds_are_refused_before_any_topology_read() {
                     page_size,
                     cursor: None,
                 },
-                |_| panic!("an out-of-bounds page size must not resolve the topology"),
+                || panic!("an out-of-bounds page size must not resolve the topology"),
             )
             .unwrap_err();
         assert_eq!(refused.kind(), ApplicationProblemKind::InvalidRequest);
@@ -662,7 +676,7 @@ fn list_pages_attempts_in_stable_order_and_resumes_from_the_cursor() {
                 page_size: 2,
                 cursor: None,
             },
-            |_| Ok(verified_topology("generation.work.list.1", 1)),
+            || Ok(verified_topology("generation.work.list.1", 1)),
         )
         .unwrap();
     let WorkAttemptListV1::Listed {
@@ -698,7 +712,7 @@ fn list_pages_attempts_in_stable_order_and_resumes_from_the_cursor() {
                 page_size: 2,
                 cursor: Some(resume),
             },
-            |_| Ok(verified_topology("generation.work.list.1", 1)),
+            || Ok(verified_topology("generation.work.list.1", 1)),
         )
         .unwrap();
     let WorkAttemptListV1::Listed {
@@ -728,7 +742,7 @@ fn list_of_an_authorized_scope_without_attempts_is_an_explicit_zero_complete_pag
                 page_size: 10,
                 cursor: None,
             },
-            |_| Ok(verified_topology("generation.work.list.zero", 1)),
+            || Ok(verified_topology("generation.work.list.zero", 1)),
         )
         .unwrap();
     let WorkAttemptListV1::Listed {
@@ -756,7 +770,7 @@ fn list_without_any_work_is_a_typed_absent_state() {
                 page_size: 10,
                 cursor: None,
             },
-            |_| Ok(WorkAttemptTopologyStateV1::Absent),
+            || Ok(WorkAttemptTopologyStateV1::Absent),
         )
         .unwrap();
     assert_eq!(listed, WorkAttemptListV1::Absent);
@@ -782,7 +796,7 @@ fn list_cursor_from_a_superseded_topology_generation_is_stale() {
                 page_size: 2,
                 cursor: Some(cursor.clone()),
             },
-            |_| Ok(verified_topology("generation.work.list.new", 1)),
+            || Ok(verified_topology("generation.work.list.new", 1)),
         )
         .unwrap_err();
     assert_eq!(stale.kind(), ApplicationProblemKind::Stale);
@@ -794,7 +808,7 @@ fn list_cursor_from_a_superseded_topology_generation_is_stale() {
                 page_size: 2,
                 cursor: Some(cursor),
             },
-            |_| Ok(WorkAttemptTopologyStateV1::Absent),
+            || Ok(WorkAttemptTopologyStateV1::Absent),
         )
         .unwrap_err();
     assert_eq!(gone.kind(), ApplicationProblemKind::Stale);
@@ -819,7 +833,7 @@ fn list_conceals_foreign_scopes_behind_their_own_typed_states() {
                 page_size: 10,
                 cursor: None,
             },
-            |_| Ok(WorkAttemptTopologyStateV1::Absent),
+            || Ok(WorkAttemptTopologyStateV1::Absent),
         )
         .unwrap();
     assert_eq!(absent, WorkAttemptListV1::Absent);
@@ -833,7 +847,7 @@ fn list_conceals_foreign_scopes_behind_their_own_typed_states() {
                 page_size: 10,
                 cursor: None,
             },
-            |_| Ok(verified_topology("generation.work.list.conceal", 1)),
+            || Ok(verified_topology("generation.work.list.conceal", 1)),
         )
         .unwrap();
     let WorkAttemptListV1::Listed {

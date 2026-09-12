@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracedecay_sessions::admission::HostAdmission;
+use tracedecay_sessions::host_ports::session_review::SessionReviewPort;
 use tracedecay_sessions::runtime::ingest::{IngestAdmissionBinding, SessionIngestAuthority};
 
 use tracedecay_global_db::{
@@ -40,6 +41,10 @@ pub struct GlobalDbSessionIngestAuthority<D> {
             dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
         >,
     >,
+    /// The root-owned post-ingest review scheduler. Only user-global catch-up
+    /// consults it, and refuses to run without it; project and read-only
+    /// callers leave it unset.
+    session_review: Option<SessionReviewPort>,
 }
 
 impl<D> GlobalDbSessionIngestAuthority<D>
@@ -51,6 +56,7 @@ where
             db,
             background_cpu: None,
             original_provenance_resolver: None,
+            session_review: None,
         }
     }
 
@@ -71,6 +77,14 @@ where
         >,
     ) -> Self {
         self.original_provenance_resolver = Some(resolver);
+        self
+    }
+
+    /// Mounts the session review scheduler a user-global catch-up pass
+    /// hands its freshly ingested sessions to.
+    #[must_use]
+    pub const fn with_session_review(mut self, session_review: SessionReviewPort) -> Self {
+        self.session_review = Some(session_review);
         self
     }
 
@@ -172,5 +186,9 @@ where
         );
         roots.extend(self.db().try_list_project_alias_paths().await.ok()?);
         Some(roots)
+    }
+
+    fn session_review(&self) -> Option<SessionReviewPort> {
+        self.session_review
     }
 }

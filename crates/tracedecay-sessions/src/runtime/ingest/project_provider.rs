@@ -112,15 +112,15 @@ fn codex_source_failure_saturates_pass(failure_count: usize, retryable: bool) ->
     retryable || failure_count >= MAX_CODEX_SOURCE_FAILURES_PER_PASS
 }
 
-pub(super) struct ProjectProviderRun<'a> {
-    pub(super) project_root: &'a Path,
-    pub(super) project_id: &'a ProjectId,
-    pub(super) facade: &'a dyn HostAdmission,
-    pub(super) scope: &'a ObservationScopeV1,
-    pub(super) candidate: SessionProvider,
-    pub(super) max_new_bytes: u64,
-    pub(super) cancellation: &'a ObservationCancellation,
-    pub(super) codex_discovery: Option<(&'a codex::CodexDiscoveryHub, &'a str)>,
+pub(in crate::runtime) struct ProjectProviderRun<'a> {
+    pub(in crate::runtime) project_root: &'a Path,
+    pub(in crate::runtime) project_id: &'a ProjectId,
+    pub(in crate::runtime) facade: &'a dyn HostAdmission,
+    pub(in crate::runtime) scope: &'a ObservationScopeV1,
+    pub(in crate::runtime) candidate: SessionProvider,
+    pub(in crate::runtime) max_new_bytes: u64,
+    pub(in crate::runtime) cancellation: &'a ObservationCancellation,
+    pub(in crate::runtime) codex_discovery: Option<(&'a codex::CodexDiscoveryHub, &'a str)>,
 }
 
 pub(super) struct ProjectProviderRunResult {
@@ -178,7 +178,7 @@ impl<'a> ProjectProviderRun<'a> {
     }
 
     #[hotpath::measure(label = "sessions.ingest.project.codex", future = true)]
-    async fn run_codex(self) -> ProviderRunOutcome {
+    pub(in crate::runtime) async fn run_codex(self) -> ProviderRunOutcome {
         let Some(source) = codex::CodexSource::new() else {
             return ProviderRunOutcome::skipped();
         };
@@ -260,7 +260,7 @@ impl<'a> ProjectProviderRun<'a> {
         let mut deferred = discovery.is_truncated();
         let mut frontier_committable = true;
         let mut outcome = ProviderRunOutcome::bounded(TranscriptIngestStats::default(), 0, false);
-        for path in &discovery.paths {
+        for (path_index, path) in discovery.paths.iter().enumerate() {
             if remaining == 0 {
                 deferred = true;
                 frontier_committable = false;
@@ -271,13 +271,13 @@ impl<'a> ProjectProviderRun<'a> {
                 frontier_committable = false;
                 break;
             }
-            match codex::try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation(
+            match codex::try_admit_codex_jsonl_observations_for_project_window(
                 path,
                 self.project_root,
                 self.project_id.clone(),
                 None,
                 self.facade,
-                Some(remaining),
+                remaining,
                 self.cancellation,
             )
             .await
@@ -287,10 +287,17 @@ impl<'a> ProjectProviderRun<'a> {
                     frontier_committable &=
                         !progress.source_deferred && progress.bytes_consumed <= remaining;
                     remaining = remaining.saturating_sub(progress.bytes_consumed);
+                    if progress.bytes_consumed > 0
+                        && (progress.source_deferred
+                            || path_index.saturating_add(1) < discovery.paths.len())
+                    {
+                        deferred = true;
+                        frontier_committable = false;
+                        break;
+                    }
                 }
                 Err(error) => {
-                    if let Some(cancelled) = cancelled_provider_outcome(&error)
-                    {
+                    if let Some(cancelled) = cancelled_provider_outcome(&error) {
                         return cancelled;
                     }
                     let failure = warn_transcript_catch_up_failure(
@@ -788,7 +795,6 @@ async fn ingest_project_claude_observations(
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::runtime::SessionProvider;
     use crate::runtime::claude_observation::{
         ClaudeObservationIngestError, ClaudeObservationIngestStats,
     };
@@ -798,23 +804,10 @@ mod tests {
     use crate::runtime::source::TranscriptIngestError;
 
     use super::{
-        MAX_CODEX_SOURCE_FAILURES_PER_PASS, PROJECT_CATCH_UP_PROVIDERS, ProviderRunOutcome,
-        claude_provider_run_outcome, codex_source_failure_saturates_pass,
-        cursor_composer_run_outcome, merge_cursor_sweep_outcome,
+        MAX_CODEX_SOURCE_FAILURES_PER_PASS, ProviderRunOutcome, claude_provider_run_outcome,
+        codex_source_failure_saturates_pass, cursor_composer_run_outcome,
+        merge_cursor_sweep_outcome,
     };
-
-    #[test]
-    fn project_catch_up_schedules_every_final_host() {
-        for provider in [
-            SessionProvider::Claude,
-            SessionProvider::Codex,
-            SessionProvider::Cursor,
-            SessionProvider::Kimi,
-            SessionProvider::OpenCode,
-        ] {
-            assert!(PROJECT_CATCH_UP_PROVIDERS.contains(&provider));
-        }
-    }
 
     #[test]
     fn codex_source_failures_bound_each_provider_pass() {

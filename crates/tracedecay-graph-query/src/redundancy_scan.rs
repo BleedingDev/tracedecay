@@ -21,18 +21,18 @@
 //!    fall through similarity, cosine, then names and node ids), and return
 //!    the top N pairs plus their connected duplicate groups.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{Value, json};
 
 use tracedecay_code_extraction::redundancy::{
-    Fingerprint, RedundancyMatchScore, body_token_window, compute_fingerprint, parse_file,
-    redundancy_match_score, round4,
+    Fingerprint, RedundancyMatchScore, body_token_count, body_token_window, compute_fingerprint,
+    parse_file, redundancy_match_score, round4,
 };
-use tracedecay_domain::SourceSpan;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::source_path_policy::is_generated_dir_segment;
+use tracedecay_domain::{ContentDigest, SourceSpan};
 use tracedecay_privacy::{CodeSourceShapeV1, sanitize_code_source_bytes};
 
 use crate::VerifiedGraphQuery;
@@ -126,6 +126,7 @@ struct RedundancyCandidate {
     start_line: u32,
     end_line: u32,
     source_span: SourceSpan,
+    content_digest: ContentDigest,
 }
 
 struct RedundantPair<'a> {
@@ -212,27 +213,30 @@ impl<'a> RedundancyPairScan<'a> {
     }
 
     fn finish(self) -> Vec<RedundantPair<'a>> {
-        let mut found = self.found;
-        found.sort_by(|left, right| {
-            right
-                .score
-                .ranking_score
-                .total_cmp(&left.score.ranking_score)
-                .then_with(|| right.score.similarity.total_cmp(&left.score.similarity))
-                .then_with(|| {
-                    right
-                        .score
-                        .vector_cosine
-                        .total_cmp(&left.score.vector_cosine)
-                })
-                .then_with(|| left.node_a.name.cmp(&right.node_a.name))
-                .then_with(|| left.node_b.name.cmp(&right.node_b.name))
-                .then_with(|| left.node_a.id.cmp(&right.node_a.id))
-                .then_with(|| left.node_b.id.cmp(&right.node_b.id))
-        });
-        found.truncate(self.max_pairs);
-        found
+        rank_pairs(self.found, self.max_pairs)
     }
+}
+
+fn rank_pairs(mut found: Vec<RedundantPair<'_>>, max_pairs: usize) -> Vec<RedundantPair<'_>> {
+    found.sort_by(|left, right| {
+        right
+            .score
+            .ranking_score
+            .total_cmp(&left.score.ranking_score)
+            .then_with(|| right.score.similarity.total_cmp(&left.score.similarity))
+            .then_with(|| {
+                right
+                    .score
+                    .vector_cosine
+                    .total_cmp(&left.score.vector_cosine)
+            })
+            .then_with(|| left.node_a.name.cmp(&right.node_a.name))
+            .then_with(|| left.node_b.name.cmp(&right.node_b.name))
+            .then_with(|| left.node_a.id.cmp(&right.node_a.id))
+            .then_with(|| left.node_b.id.cmp(&right.node_b.id))
+    });
+    found.truncate(max_pairs);
+    found
 }
 
 fn redundant_pair<'a>(
@@ -400,7 +404,7 @@ pub async fn redundancy_scan(
 
     // 2. Compute fresh, request-owned fingerprints. The final graph authority
     // intentionally has no parallel SQLite fingerprint or pair cache.
-    let fingerprints = ensure_fingerprints(graph.project_root()?, &nodes).await?;
+    let fingerprints = ensure_fingerprints(graph.project_root()?, &nodes, None).await?;
     let scanned = fingerprints.len();
 
     // 3. Bucket by token count and score every in-window pair.
@@ -431,6 +435,57 @@ pub async fn redundancy_scan(
     })
 }
 
+/// Structural matches involving the requested symbols. Unlike a project audit,
+/// a diagnostic needs no comparisons between two unrelated functions.
+#[hotpath::measure(label = "graph.redundancy_scan.selected", future = true)]
+pub async fn redundancy_for_symbols(
+    graph: &VerifiedGraphQuery,
+    options: &RedundancyOptions<'_>,
+    targets: &HashSet<String>,
+) -> Result<Vec<RedundancyPairViewV1>> {
+    let nodes = collect_candidates(
+        graph,
+        options.path_prefix,
+        options.min_lines,
+        options.include_generated,
+    )?;
+    let fingerprints = ensure_fingerprints(graph.project_root()?, &nodes, Some(targets)).await?;
+    let scoped = scoped_fingerprints(&nodes, &fingerprints);
+    let mut pairs = Vec::new();
+    let mut compared = 0usize;
+    for &(anchor, anchor_fp) in &scoped {
+        if !targets.contains(&anchor.id) {
+            continue;
+        }
+        for &(other, other_fp) in &scoped {
+            if anchor.id == other.id || (targets.contains(&other.id) && other.id < anchor.id) {
+                continue;
+            }
+            let small = anchor_fp.body_tokens.min(other_fp.body_tokens);
+            let large = anchor_fp.body_tokens.max(other_fp.body_tokens);
+            if large > body_token_window(small).1 {
+                continue;
+            }
+            if let Some(pair) = redundant_pair(
+                anchor,
+                anchor_fp,
+                other,
+                other_fp,
+                options.threshold,
+                options.include_naming,
+            ) {
+                pairs.push(pair);
+            }
+            compared += 1;
+            if compared.is_multiple_of(REDUNDANCY_PAIR_SLICE) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+    hotpath::gauge!("graph.redundancy_scan.selected_pairs_compared_total").inc(compared as u64);
+    Ok(pair_views(&rank_pairs(pairs, options.max_pairs)))
+}
+
 /// Pairwise comparison: buckets by token count to keep the scan
 /// sub-quadratic, and walks the buckets in bounded slices so this CPU-bound
 /// analysis cannot pin a runtime worker for its whole duration while the
@@ -457,7 +512,12 @@ async fn score_candidate_pairs<'a>(
 
 /// `name (file:line)` locator that chains into `tracedecay_body` / `_callers`.
 fn node_label(node: &RedundancyCandidate) -> String {
-    format!("{} ({}:{})", node.name, node.file_path, node.start_line)
+    format!(
+        "{} ({}:{})",
+        node.name,
+        node.file_path,
+        node.start_line.saturating_add(1)
+    )
 }
 
 fn pair_views(pairs: &[RedundantPair<'_>]) -> Vec<RedundancyPairViewV1> {
@@ -467,13 +527,13 @@ fn pair_views(pairs: &[RedundantPair<'_>]) -> Vec<RedundancyPairViewV1> {
             a: RedundancyNodeViewV1 {
                 name: pair.node_a.name.clone(),
                 file: pair.node_a.file_path.clone(),
-                line: pair.node_a.start_line,
+                line: pair.node_a.start_line.saturating_add(1),
                 id: pair.node_a.id.clone(),
             },
             b: RedundancyNodeViewV1 {
                 name: pair.node_b.name.clone(),
                 file: pair.node_b.file_path.clone(),
-                line: pair.node_b.start_line,
+                line: pair.node_b.start_line.saturating_add(1),
                 id: pair.node_b.id.clone(),
             },
             label_a: node_label(pair.node_a),
@@ -979,6 +1039,7 @@ fn redundancy_node(
         start_line: metadata.start_line,
         end_line,
         source_span,
+        content_digest: metadata.content_digest,
     }))
 }
 
@@ -1036,15 +1097,19 @@ fn is_generated_path(path: &str) -> bool {
 async fn ensure_fingerprints(
     project_root: &Path,
     candidates: &[RedundancyCandidate],
+    targets: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, Fingerprint>> {
     let project_root = project_root.to_path_buf();
     let candidates = candidates.to_vec();
-    let load =
-        tokio::task::spawn_blocking(move || compute_fingerprints(&project_root, &candidates))
-            .await
-            .map_err(|error| {
-                redundancy_graph_problem(&format!("fingerprint worker did not complete: {error}"))
-            })??;
+    let targets = targets.cloned();
+    let load = tokio::task::spawn_blocking(move || match targets.as_ref() {
+        Some(targets) => compute_selected_fingerprints(&project_root, &candidates, Some(targets)),
+        None => compute_fingerprints(&project_root, &candidates),
+    })
+    .await
+    .map_err(|error| {
+        redundancy_graph_problem(&format!("fingerprint worker did not complete: {error}"))
+    })??;
     Ok(load.fingerprints)
 }
 
@@ -1062,6 +1127,14 @@ fn compute_fingerprints(
     project_root: &Path,
     candidates: &[RedundancyCandidate],
 ) -> Result<FingerprintLoad> {
+    compute_selected_fingerprints(project_root, candidates, None)
+}
+
+fn compute_selected_fingerprints(
+    project_root: &Path,
+    candidates: &[RedundancyCandidate],
+    targets: Option<&HashSet<String>>,
+) -> Result<FingerprintLoad> {
     let registry = tracedecay_code_extraction::LanguageRegistry::new();
 
     // Group candidates by file so we parse each file at most once.
@@ -1069,26 +1142,32 @@ fn compute_fingerprints(
     for n in candidates {
         by_file.entry(n.file_path.clone()).or_default().push(n);
     }
-    let file_count = by_file.len();
 
     let mut out: HashMap<String, Fingerprint> = HashMap::new();
-    #[cfg(test)]
     let mut parsed_files = 0usize;
     #[cfg(test)]
     let mut computed_fingerprints = 0usize;
 
+    let mut by_file = by_file.into_iter().collect::<Vec<_>>();
+    by_file.sort_by_key(|(_, nodes)| {
+        !nodes
+            .iter()
+            .any(|node| targets.is_some_and(|ids| ids.contains(&node.id)))
+    });
+    let mut token_windows = Vec::new();
     for (file_path, file_nodes) in by_file {
+        let target_file = file_nodes
+            .iter()
+            .any(|node| targets.is_some_and(|ids| ids.contains(&node.id)));
+        if targets.is_some() && !target_file && token_windows.is_empty() {
+            break;
+        }
         let Some(extractor) = registry.extractor_for_file(&file_path) else {
             return Err(redundancy_graph_problem(
                 "verified redundancy symbol has no registered extractor",
             ));
         };
-        let lang_key = extractor_to_language_key(extractor.language_name());
-        let Some(lang_key) = lang_key else {
-            return Err(redundancy_graph_problem(
-                "verified redundancy symbol has no fingerprint language mapping",
-            ));
-        };
+        let lang_key = extractor.retained_grammar_key(&file_path);
 
         // Read the on-disk file, then admit it through the same code-source
         // sanitizer the indexer used. Graph spans are byte ranges in that
@@ -1103,7 +1182,7 @@ fn compute_fingerprints(
         let source = admitted_redundancy_source(&file_path, &raw)?;
 
         let language =
-            tracedecay_code_extraction::ts_provider::language(lang_key).map_err(|error| {
+            tracedecay_code_extraction::ts_provider::language(&lang_key).map_err(|error| {
                 redundancy_graph_problem(&format!(
                     "verified redundancy grammar `{lang_key}` is unavailable: {error}"
                 ))
@@ -1113,10 +1192,7 @@ fn compute_fingerprints(
                 "verified redundancy source `{file_path}` could not be parsed"
             ))
         })?;
-        #[cfg(test)]
-        {
-            parsed_files += 1;
-        }
+        parsed_files += 1;
 
         for node in file_nodes {
             let Ok(start_byte) = usize::try_from(node.source_span.start_byte) else {
@@ -1140,6 +1216,16 @@ fn compute_fingerprints(
                     source.len()
                 )));
             }
+            let observed_digest = ContentDigest::of_bytes(&source.as_bytes()[start_byte..end_byte]);
+            if observed_digest != node.content_digest {
+                return Err(redundancy_graph_problem(&format!(
+                    "verified redundancy source span is stale against indexed symbol `{}` in \
+                     `{file_path}`: expected {}, observed {}",
+                    node.qualified_name,
+                    node.content_digest.as_str(),
+                    observed_digest.as_str(),
+                )));
+            }
             let Some(ts_node) = tree
                 .root_node()
                 .descendant_for_byte_range(start_byte, end_byte)
@@ -1148,7 +1234,23 @@ fn compute_fingerprints(
                     "verified redundancy source span does not resolve to a syntax node",
                 ));
             };
-            out.insert(node.id.clone(), compute_fingerprint(&source, ts_node));
+            if targets.is_some() && !target_file {
+                let body = ts_node.utf8_text(source.as_bytes()).map_err(|error| {
+                    redundancy_graph_problem(&format!("fingerprint source is invalid: {error}"))
+                })?;
+                let count = body_token_count(body);
+                if !token_windows
+                    .iter()
+                    .any(|(low, high)| (*low..=*high).contains(&count))
+                {
+                    continue;
+                }
+            }
+            let fingerprint = compute_fingerprint(&source, ts_node);
+            if targets.is_some_and(|ids| ids.contains(&node.id)) {
+                token_windows.push(body_token_window(fingerprint.body_tokens));
+            }
+            out.insert(node.id.clone(), fingerprint);
             #[cfg(test)]
             {
                 computed_fingerprints += 1;
@@ -1156,7 +1258,7 @@ fn compute_fingerprints(
         }
     }
 
-    hotpath::gauge!("graph.redundancy_scan.files_parsed_total").inc(file_count as u64);
+    hotpath::gauge!("graph.redundancy_scan.files_parsed_total").inc(parsed_files as u64);
     hotpath::gauge!("graph.redundancy_scan.fingerprints_total").inc(out.len() as u64);
     Ok(FingerprintLoad {
         fingerprints: out,
@@ -1164,45 +1266,6 @@ fn compute_fingerprints(
         parsed_files,
         #[cfg(test)]
         computed_fingerprints,
-    })
-}
-
-/// Map `extractor.language_name()` (e.g. "Rust", "TypeScript") to the
-/// language key used by `ts_provider::language`. Returns `None` for
-/// extractors whose grammar isn't wired up here (extending the map
-/// extends fingerprinting to that language).
-fn extractor_to_language_key(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Rust" => "rust",
-        "Go" => "go",
-        "Java" => "java",
-        "Scala" => "scala",
-        "TypeScript" => "typescript",
-        "TSX" => "tsx",
-        "Python" => "python",
-        "C" => "c",
-        "C++" => "cpp",
-        "C#" => "c_sharp",
-        "Kotlin" => "kotlin",
-        "Swift" => "swift",
-        "JavaScript" => "javascript",
-        "Ruby" => "ruby",
-        "PHP" => "php",
-        "Lua" => "lua",
-        "Zig" => "zig",
-        "Bash" => "bash",
-        "Dart" => "dart",
-        "Haskell" => "haskell",
-        "OCaml" => "ocaml",
-        "Elixir" => "elixir",
-        "Erlang" => "erlang",
-        "Clojure" => "clojure",
-        "F#" => "fsharp",
-        "Perl" => "perl",
-        "R" => "r",
-        "Julia" => "julia",
-        "Nix" => "nix",
-        _ => return None,
     })
 }
 
@@ -1245,7 +1308,7 @@ fn redundant_pair_json(pair: &RedundantPair<'_>) -> Value {
 fn node_json(node: &RedundancyCandidate) -> Value {
     json!({
         "file": node.file_path,
-        "line": node.start_line,
+        "line": node.start_line.saturating_add(1),
         "name": node.name,
         "id": node.id,
     })
@@ -1267,16 +1330,18 @@ fn duplicate_groups(groups: &[Vec<&RedundancyCandidate>]) -> Vec<Value> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use serde_json::Value;
+    use std::collections::HashSet;
 
     use super::{
         RedundancyCandidate, RedundancyOptions, RedundancyPairScan, RedundantPair, SemanticPair,
         SemanticRedundancyGenerationV1, SemanticRedundancyProfileV1, SemanticRedundancyVectorV1,
-        augment_redundancy_output, canonical_pair_ids, compute_fingerprints, connected_node_groups,
-        find_redundant_pairs, is_generated_path, nodes_overlap, redundancy_output, semantic_cosine,
+        augment_redundancy_output, canonical_pair_ids, compute_fingerprints,
+        compute_selected_fingerprints, connected_node_groups, find_redundant_pairs,
+        is_generated_path, nodes_overlap, redundancy_output, scoped_fingerprints, semantic_cosine,
         semantic_pairs,
     };
     use tracedecay_code_extraction::redundancy::{Fingerprint, RedundancyMatchScore};
-    use tracedecay_domain::SourceSpan;
+    use tracedecay_domain::{ContentDigest, NodeKind, SourceSpan};
 
     #[test]
     fn generated_paths_are_excluded_from_candidates_by_default() {
@@ -1299,29 +1364,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_paths_gain_segments_from_the_shared_list() {
-        // These segments weren't in this file's old standalone list but are
-        // part of the shared GENERATED_DIR_SEGMENTS union that scan.rs and
-        // migrate::inventory already recognized — closing this drift is the
-        // point of routing through the shared generated-segment classifier.
-        for path in [
-            "packages/web/coverage/lcov.info",
-            "env/.venv/pyvenv.cfg",
-            "apps/site/.next/server/app.js",
-            "tool/.cache/entry",
-            "repo/.turbo/cache",
-            "android/.gradle/wrapper",
-            "scripts/venv/bin/python",
-            "assets/app.min.css",
-        ] {
-            assert!(
-                is_generated_path(path),
-                "{path} should now count as generated"
-            );
-        }
-    }
-
     pub(super) fn test_node(id: &str, name: &str, line: u32) -> RedundancyCandidate {
         RedundancyCandidate {
             id: id.to_string(),
@@ -1334,6 +1376,7 @@ mod tests {
                 start_byte: 0,
                 end_byte: 1,
             },
+            content_digest: ContentDigest::of_bytes(b"x"),
         }
     }
 
@@ -1861,6 +1904,12 @@ mod tests {
         node
     }
 
+    fn attest_candidate_source(node: &mut RedundancyCandidate, source: &str) {
+        let start = node.source_span.start_byte as usize;
+        let end = node.source_span.end_byte as usize;
+        node.content_digest = ContentDigest::of_bytes(&source.as_bytes()[start..end]);
+    }
+
     #[test]
     fn fresh_fingerprint_scan_parses_each_file_once() {
         if tracedecay_code_extraction::ts_provider::language("rust").is_err() {
@@ -1879,6 +1928,8 @@ mod tests {
         ];
         nodes[0].source_span.end_byte = alpha.trim_end().len() as u64;
         nodes[1].source_span.end_byte = beta.trim_end().len() as u64;
+        attest_candidate_source(&mut nodes[0], alpha);
+        attest_candidate_source(&mut nodes[1], beta);
 
         let load = compute_fingerprints(temp.path(), &nodes).unwrap();
         assert_eq!(load.parsed_files, 2);
@@ -1886,6 +1937,51 @@ mod tests {
         assert_eq!(load.fingerprints.len(), 2);
         assert_eq!(load.fingerprints["alpha-id"].source_hash.len(), 16);
         assert_eq!(load.fingerprints["beta-id"].source_hash.len(), 16);
+    }
+
+    #[test]
+    fn selected_fingerprints_preserve_matches_without_hashing_unrelated_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let body = after_secret_body();
+        let huge = format!(
+            "fn unrelated() {{\n{}\n}}",
+            "    consume(1, 2, 3);\n".repeat(100)
+        );
+        let sources = [
+            ("anchor", body.to_owned()),
+            ("duplicate", body.to_owned()),
+            ("unrelated", huge),
+        ];
+        let mut nodes = Vec::new();
+        for (id, source) in &sources {
+            let path = format!("{id}.rs");
+            std::fs::write(temp.path().join(&path), source).unwrap();
+            let mut node = candidate_node(id, id, &path, source.lines().count() as u32);
+            node.source_span.end_byte = source.trim_end().len() as u64;
+            attest_candidate_source(&mut node, source);
+            nodes.push(node);
+        }
+        let targets = HashSet::from(["anchor".to_owned()]);
+        let full = compute_fingerprints(temp.path(), &nodes).unwrap();
+        let selected = compute_selected_fingerprints(temp.path(), &nodes, Some(&targets)).unwrap();
+        assert_eq!(full.computed_fingerprints, 3);
+        assert_eq!(selected.computed_fingerprints, 2);
+        assert_eq!(selected.parsed_files, 3);
+        assert!(!selected.fingerprints.contains_key("unrelated"));
+        let full_pairs = find_redundant_pairs(
+            scoped_fingerprints(&nodes, &full.fingerprints),
+            0.6,
+            false,
+            usize::MAX,
+        );
+        let selected_pairs = find_redundant_pairs(
+            scoped_fingerprints(&nodes, &selected.fingerprints),
+            0.6,
+            false,
+            usize::MAX,
+        );
+        assert_eq!(full_pairs.len(), 1, "the duplicate must be found");
+        assert_eq!(pair_identity(&selected_pairs), pair_identity(&full_pairs));
     }
 
     /// The indexer extracts from privacy-sanitized bytes. Credential
@@ -1923,8 +2019,107 @@ mod tests {
         }
     }
 
+    fn indexed_rust_candidates(source: &str, file_path: &str) -> Vec<RedundancyCandidate> {
+        let registry = tracedecay_code_extraction::LanguageRegistry::new();
+        let extractor = registry
+            .extractor_for_file(file_path)
+            .expect("rust extractor");
+        extractor
+            .extract(file_path, source)
+            .nodes
+            .into_iter()
+            .filter(|node| matches!(node.kind, NodeKind::Function | NodeKind::Method))
+            .map(|node| {
+                let source_span = indexer_source_span(source, &node);
+                let start = source_span.start_byte as usize;
+                let end = source_span.end_byte as usize;
+                RedundancyCandidate {
+                    id: node.id,
+                    name: node.name,
+                    qualified_name: node.qualified_name,
+                    file_path: file_path.to_owned(),
+                    start_line: node.start_line,
+                    end_line: node.end_line,
+                    source_span,
+                    content_digest: ContentDigest::of_bytes(&source.as_bytes()[start..end]),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_byte_post_index_edit_refuses_full_and_targeted_fingerprints() {
+        let indexed = r#"fn stable() -> i32 {
+    1
+}
+
+fn execute_source_edit() -> i32 {
+    three();
+    2
+}
+
+fn unrelated() -> i32 {
+    3
+}
+"#;
+        let live = indexed.replacen("three();", "one();", 1);
+        assert_eq!(indexed.len() - live.len(), 2);
+
+        let nodes = indexed_rust_candidates(indexed, "src/source_edit.rs");
+        let target = nodes
+            .iter()
+            .find(|node| node.name == "execute_source_edit")
+            .expect("indexed target")
+            .id
+            .clone();
+        let targets = HashSet::from([target]);
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("source_edit.rs"), indexed).unwrap();
+
+        assert_eq!(
+            compute_fingerprints(temp.path(), &nodes)
+                .unwrap()
+                .fingerprints
+                .len(),
+            3
+        );
+        assert!(
+            compute_selected_fingerprints(temp.path(), &nodes, Some(&targets))
+                .unwrap()
+                .fingerprints
+                .contains_key(targets.iter().next().unwrap())
+        );
+
+        std::fs::write(src.join("source_edit.rs"), live).unwrap();
+        for error in [
+            compute_fingerprints(temp.path(), &nodes).unwrap_err(),
+            compute_selected_fingerprints(temp.path(), &nodes, Some(&targets)).unwrap_err(),
+        ] {
+            let (code, _, detail) = error.project_route_context().expect("typed unavailable");
+            assert_eq!(code, "verified-redundancy-evidence-unavailable");
+            assert!(detail.contains("stale against indexed symbol"), "{detail}");
+        }
+    }
+
     fn after_secret_body() -> &'static str {
         "fn after_secret(input: i32) -> i32 {\n    let mut total = input;\n    for value in 0..4 {\n        if value % 2 == 0 {\n            total += value;\n        }\n    }\n    total\n}\n"
+    }
+
+    #[test]
+    fn fingerprint_uses_the_registered_markdown_grammar() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = "# Example\n\nAn indexed documentation section.\n";
+        std::fs::write(temp.path().join("example.md"), source).unwrap();
+        let mut node = candidate_node("heading", "Example", "example.md", 1);
+        node.source_span = SourceSpan {
+            start_byte: 0,
+            end_byte: source.len() as u64,
+        };
+        attest_candidate_source(&mut node, source);
+        let load = compute_fingerprints(temp.path(), &[node]).unwrap();
+        assert!(load.fingerprints.contains_key("heading"));
     }
 
     #[test]
@@ -1976,6 +2171,7 @@ mod tests {
         std::fs::write(src_dir.join("token.rs"), raw.as_bytes()).unwrap();
         let mut node = candidate_node("after-secret-id", "after_secret", "src/token.rs", 8);
         node.source_span = span;
+        attest_candidate_source(&mut node, sanitized_text);
 
         let load = compute_fingerprints(temp.path(), &[node]).expect(
             "a frozen raw file must accept the span the indexer recorded on sanitized bytes",

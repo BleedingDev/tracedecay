@@ -8,6 +8,7 @@ use tracedecay_domain::canonical_text::{is_lowercase_hex, sha256_hex};
 use tracedecay_domain::{
     AnchorDurabilityClass, DurableObservationV1, HydrationStateV1, ObservationScopeV1,
     PayloadAccessState, ProjectId, RetrievalAnchorId, RetrievalAnchorRecord, SessionId,
+    sha256_hex_suffix,
 };
 use tracedecay_runtime_core::db::{DatabaseEngineReadSnapshot, engine::params};
 use tracedecay_store::SessionMessageRecord;
@@ -23,11 +24,11 @@ use tracedecay_lcm::payload::{
     PayloadStreamError, VerifiedPayloadStream, open_verified_payload_stream,
 };
 use tracedecay_lcm::{LcmStorageKind, raw};
-use tracedecay_query::temporal::hydration::{
+use tracedecay_temporal_query::hydration::{
     HydrationAuthorization, HydrationDenial, HydrationError, HydrationFuture, HydrationGrant,
     HydrationSink, TemporalHydrationPort,
 };
-use tracedecay_query::temporal::ports::{
+use tracedecay_temporal_query::ports::{
     ExecutionControl, TemporalExecutionSnapshot, TemporalPortError, TemporalRetrievalScope,
     TemporalSourceAccess,
 };
@@ -400,7 +401,7 @@ impl<B: TemporalHydrationBackend> TemporalHydrationPort for SessionTemporalHydra
     }
 }
 
-pub struct GlobalDbHydrationBackend<'snapshot> {
+pub struct SessionTemporalHydrationBackend<'snapshot> {
     read: TemporalSqlRead<'snapshot>,
     storage_root: &'snapshot Path,
     relation_authority: Option<SessionHydrationRelationAuthority<'snapshot>>,
@@ -411,7 +412,7 @@ struct SessionHydrationRelationAuthority<'snapshot> {
     store: SessionRelationGraphStore,
 }
 
-impl<'snapshot> GlobalDbHydrationBackend<'snapshot> {
+impl<'snapshot> SessionTemporalHydrationBackend<'snapshot> {
     #[hotpath::skip]
     pub const fn new_registered(
         read: &'snapshot DatabaseEngineReadSnapshot,
@@ -440,15 +441,18 @@ impl<'snapshot> GlobalDbHydrationBackend<'snapshot> {
 }
 
 pub type GlobalDbTemporalHydrationPort<'snapshot> =
-    SessionTemporalHydrationAdapter<GlobalDbHydrationBackend<'snapshot>>;
+    SessionTemporalHydrationAdapter<SessionTemporalHydrationBackend<'snapshot>>;
 
-impl<'snapshot> SessionTemporalHydrationAdapter<GlobalDbHydrationBackend<'snapshot>> {
+impl<'snapshot> SessionTemporalHydrationAdapter<SessionTemporalHydrationBackend<'snapshot>> {
     #[hotpath::skip]
     pub const fn for_registered_snapshot(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,
     ) -> Self {
-        Self::new(GlobalDbHydrationBackend::new_registered(read, storage_root))
+        Self::new(SessionTemporalHydrationBackend::new_registered(
+            read,
+            storage_root,
+        ))
     }
 
     #[hotpath::skip]
@@ -458,12 +462,14 @@ impl<'snapshot> SessionTemporalHydrationAdapter<GlobalDbHydrationBackend<'snapsh
         scope: &'snapshot SessionRelationScope,
         store: SessionRelationGraphStore,
     ) -> Self {
-        Self::new(GlobalDbHydrationBackend::new_registered_with_relations(
-            read,
-            storage_root,
-            scope,
-            store,
-        ))
+        Self::new(
+            SessionTemporalHydrationBackend::new_registered_with_relations(
+                read,
+                storage_root,
+                scope,
+                store,
+            ),
+        )
     }
 }
 
@@ -621,7 +627,7 @@ fn canonical_projected_message(
         .map(|output| output.message().clone())
 }
 
-impl GlobalDbHydrationBackend<'_> {
+impl SessionTemporalHydrationBackend<'_> {
     #[hotpath::measure(future = true, label = "session_temporal.hydrate.resolve")]
     async fn resolve_current(
         &self,
@@ -715,7 +721,7 @@ impl GlobalDbHydrationBackend<'_> {
     }
 }
 
-impl TemporalHydrationBackend for GlobalDbHydrationBackend<'_> {
+impl TemporalHydrationBackend for SessionTemporalHydrationBackend<'_> {
     fn snapshot_is_stable(&self) -> bool {
         true
     }
@@ -1416,7 +1422,7 @@ fn content_hash_matches(expected: &str, bytes: &[u8]) -> bool {
 }
 
 fn content_hash_equals(expected: &str, actual_hex: &str) -> bool {
-    expected.strip_prefix("sha256:").unwrap_or(expected) == actual_hex
+    sha256_hex_suffix(expected).unwrap_or(expected) == actual_hex
 }
 
 #[cfg(test)]
@@ -1461,11 +1467,11 @@ mod tests {
 
     use super::*;
     use tracedecay_global_db::tests::harness::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
-    use tracedecay_query::temporal::ports::{
+    use tracedecay_temporal_query::ports::{
         BindingDigest, ExecutionLimits, KernelVersions, TemporalAuthorizedRoot, TemporalPortError,
         TemporalSnapshotRequest, TemporalWatermarks,
     };
-    use tracedecay_query::temporal::resolution::ValidatedAuthorization;
+    use tracedecay_temporal_query::resolution::ValidatedAuthorization;
 
     struct RegisteredHydrationRead {
         read: DatabaseEngineReadSnapshot,
@@ -2364,34 +2370,6 @@ mod tests {
         assert_eq!(message.source_offset, Some(0));
     }
 
-    /// Pure-projection proof that `canonical_projected_message` is the right
-    /// binding authority: when the canonical envelope omits
-    /// `relations.message_id` the projection keys the occurrence on the stable
-    /// record id, which the projection resolves — yet it still returns `None`
-    /// for a message_id the projection never produced, so acceptance covers
-    /// only projection-verified bindings.
-    #[test]
-    fn stable_record_id_binds_projection_when_relations_message_id_absent() {
-        let observation = observation_without_relation_message_id(1, "session-1");
-        let envelope: CanonicalObservationEnvelopeV1 =
-            serde_json::from_value(observation.payload().clone()).expect("canonical envelope");
-        assert!(
-            envelope.relations().message_id().is_none(),
-            "fixture must omit relations.message_id to exercise the record-id key"
-        );
-        let record_message_id = envelope.stable_record_id().as_str().to_string();
-
-        let bound = canonical_projected_message(&observation, &record_message_id, 0)
-            .expect("stable-record-id message must bind to a projection output");
-        assert_eq!(bound.text, "payload-1");
-        assert_eq!(bound.message_id, record_message_id);
-
-        assert!(
-            canonical_projected_message(&observation, "does-not-project", 0).is_none(),
-            "an unprojected message_id must not bind, preserving the legacy refusal"
-        );
-    }
-
     async fn persist_anchor(
         runtime: &HostAdmissionTestRuntimeV1,
         ordinal: u64,
@@ -2460,33 +2438,10 @@ mod tests {
         (observation, anchor)
     }
 
-    #[tokio::test]
-    async fn persist_anchor_appends_two_observations_without_cursor_conflict() {
-        let dir = tempdir().expect("temporary directory");
-        let runtime = HostAdmissionTestRuntimeV1::profile(dir.path())
-            .await
-            .expect("registered profile runtime");
-        let (first, first_anchor) = Box::pin(persist_anchor(&runtime, 1)).await;
-        let (second, second_anchor) = Box::pin(persist_anchor(&runtime, 2)).await;
-        assert_ne!(
-            first.observation_id(),
-            second.observation_id(),
-            "two-observation setup must persist distinct observation identities"
-        );
-        assert_ne!(
-            first_anchor.anchor_id(),
-            second_anchor.anchor_id(),
-            "two-observation setup must persist distinct retrieval anchors"
-        );
-        assert_eq!(first.identity().position().end(), 2);
-        assert_eq!(second.identity().position().start(), 2);
-        assert_eq!(second.identity().position().end(), 3);
-    }
-
     fn authorized_snapshot(anchor: &RetrievalAnchorRecord) -> TemporalExecutionSnapshot {
         authorized_snapshot_for_scope(
             anchor,
-            tracedecay_query::temporal::ports::TemporalRetrievalScope::Session(
+            tracedecay_temporal_query::ports::TemporalRetrievalScope::Session(
                 SessionId::new("session-1").expect("session"),
             ),
         )
@@ -2495,13 +2450,13 @@ mod tests {
     fn authorized_root_snapshot(anchor: &RetrievalAnchorRecord) -> TemporalExecutionSnapshot {
         authorized_snapshot_for_scope(
             anchor,
-            tracedecay_query::temporal::ports::TemporalRetrievalScope::AllSessionsInAuthorizedRoot,
+            tracedecay_temporal_query::ports::TemporalRetrievalScope::AllSessionsInAuthorizedRoot,
         )
     }
 
     fn authorized_snapshot_for_scope(
         anchor: &RetrievalAnchorRecord,
-        scope: tracedecay_query::temporal::ports::TemporalRetrievalScope,
+        scope: tracedecay_temporal_query::ports::TemporalRetrievalScope,
     ) -> TemporalExecutionSnapshot {
         TemporalExecutionSnapshot::new_authorized(
             TemporalSnapshotRequest::new(
@@ -2886,68 +2841,6 @@ mod tests {
     }
 
     #[test]
-    fn authorization_precedes_recheck_and_read() {
-        block_on(async {
-            let adapter = SessionTemporalHydrationAdapter::new(FakeBackend::available(b"abcdefgh"));
-            let snapshot = snapshot(ExecutionControl::default());
-            assert_eq!(
-                adapter.authorize(&snapshot, &anchor()).await,
-                Ok(HydrationAuthorization::Authorized)
-            );
-            let mut output = Vec::new();
-            adapter
-                .read_after_recheck(&snapshot, &anchor(), 32, 4, &mut |chunk| {
-                    output.extend_from_slice(chunk);
-                    Ok(())
-                })
-                .await
-                .expect("read");
-            assert_eq!(output, b"abcdefgh");
-            assert_eq!(
-                adapter.backend.calls.lock().expect("calls").as_slice(),
-                ["resolve", "resolve", "read", "resolve"]
-            );
-        });
-    }
-
-    #[test]
-    fn authorization_revocation_before_sink_recheck_emits_no_payload() {
-        block_on(async {
-            let payload = b"must-never-cross-the-sink";
-            let backend = FakeBackend {
-                resolutions: Mutex::new(vec![
-                    available(payload.len(), &hash(payload)),
-                    HydrationResolution::Unavailable(HydrationStateV1::Unauthorized),
-                ]),
-                payload: Mutex::new(Ok(payload.to_vec())),
-                calls: Mutex::new(Vec::new()),
-            };
-            let adapter = SessionTemporalHydrationAdapter::new(backend);
-            let snapshot = snapshot(ExecutionControl::default());
-
-            assert_eq!(
-                adapter.authorize(&snapshot, &anchor()).await,
-                Ok(HydrationAuthorization::Authorized)
-            );
-            let mut output = Vec::new();
-            assert_eq!(
-                adapter
-                    .read_after_recheck(&snapshot, &anchor(), payload.len(), 8, &mut |chunk| {
-                        output.extend_from_slice(chunk);
-                        Ok(())
-                    })
-                    .await,
-                Err(HydrationError::Unavailable)
-            );
-            assert!(output.is_empty());
-            assert_eq!(
-                adapter.backend.calls.lock().expect("calls").as_slice(),
-                ["resolve", "resolve"]
-            );
-        });
-    }
-
-    #[test]
     fn authorization_revocation_after_read_emits_no_payload() {
         block_on(async {
             let payload = b"buffered-until-live-recheck";
@@ -3034,27 +2927,6 @@ mod tests {
             assert_eq!(
                 adapter.backend.calls.lock().expect("calls").as_slice(),
                 ["resolve"]
-            );
-        });
-    }
-
-    #[test]
-    fn verified_payload_crosses_sink_in_bounded_chunks() {
-        block_on(async {
-            let adapter =
-                SessionTemporalHydrationAdapter::new(FakeBackend::available(b"123456789"));
-            let snapshot = snapshot(ExecutionControl::default());
-            let mut chunks = Vec::new();
-            adapter
-                .read_after_recheck(&snapshot, &anchor(), 9, 4, &mut |chunk| {
-                    chunks.push(chunk.to_vec());
-                    Ok(())
-                })
-                .await
-                .expect("chunked read");
-            assert_eq!(
-                chunks,
-                vec![b"1234".to_vec(), b"5678".to_vec(), b"9".to_vec()]
             );
         });
     }

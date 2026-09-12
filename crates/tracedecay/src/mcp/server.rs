@@ -811,6 +811,10 @@ impl McpServer {
     }
 
     #[hotpath::measure(label = "mcp.server.construct", future = true)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "MCP server construction binds every injected port into one composed server."
+    )]
     pub(crate) async fn new_with_context(context: McpServerConstructionContext) -> Arc<Self> {
         let McpServerConstructionContext {
             cg,
@@ -1343,6 +1347,12 @@ impl McpServer {
 
     pub(crate) fn project_session_db(&self) -> Option<RegisteredGlobalDbLeaseV1> {
         self.project_session_db.clone()
+    }
+
+    pub(crate) fn background_cpu_authority(
+        &self,
+    ) -> Option<Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>> {
+        self.background_cpu.clone()
     }
 
     #[cfg(feature = "test-transport")]

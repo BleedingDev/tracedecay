@@ -71,8 +71,6 @@ mod remote_protocol;
 pub mod request_cancellation;
 mod shutdown_coordination;
 
-mod multi_root;
-
 pub use callable_code_authorization::{
     DaemonCallableCodeAuthorizationSource, DaemonCodeGraphReadAdmission, GRANT_HORIZON,
     daemon_owned_project_source_access_at, project_open_source_access_authority,
@@ -87,19 +85,20 @@ pub use invocation::{
     retain_lsp_delivery_attempt,
 };
 pub use invocation::{
-    BoundedHookOrchestratorV1, DaemonAdvisoryCycleInvocationFuture,
-    DaemonAdvisoryCycleInvocationOwner, DaemonAdvisoryCycleInvocationPort,
-    DaemonAdvisoryCycleInvocationRequest, DaemonAdvisoryRuntimeRegistrar,
-    DaemonAdvisoryRuntimeRegistrationError, DaemonConfigurationGrantAuthority,
-    DaemonConfigurationRuntimeRegistrar, DaemonContextScoutRuntimeRegistrar,
-    DaemonContextScoutRuntimeRegistrationError, DaemonFeedbackInvocationOwner,
-    DaemonFeedbackRuntimeRegistrar, DaemonFeedbackRuntimeRegistrationError,
-    DaemonInvocationService, DaemonLspInvocationOwner, DaemonLspOwnerRegistrar,
-    DaemonNativeIntegrationRuntimeRegistrar, DaemonPrimitiveRuntimeRegistrar,
-    DaemonPrimitiveRuntimeRegistrationError, DaemonRetainedRuntimeRegistrar,
-    DaemonSemanticOwnerRuntimeRegistrar, DaemonSemanticRuntimeRegistrar,
-    DaemonSemanticRuntimeRegistrationError, DaemonSourceEditOwnerRegistrationError,
-    DaemonWorkProposalRoutingAuthorityV1, DaemonWorkRuntimeRegistrar, HookOrchestrationAdmissionV1,
+    BoundedHookOrchestratorV1, ConfigurationRuntimeRefreshFuture, ConfigurationRuntimeRefreshPort,
+    DaemonAdvisoryCycleInvocationFuture, DaemonAdvisoryCycleInvocationOwner,
+    DaemonAdvisoryCycleInvocationPort, DaemonAdvisoryCycleInvocationRequest,
+    DaemonAdvisoryRuntimeRegistrar, DaemonAdvisoryRuntimeRegistrationError,
+    DaemonConfigurationGrantAuthority, DaemonConfigurationRuntimeRegistrar,
+    DaemonContextScoutRuntimeRegistrar, DaemonContextScoutRuntimeRegistrationError,
+    DaemonFeedbackInvocationOwner, DaemonFeedbackRuntimeRegistrar,
+    DaemonFeedbackRuntimeRegistrationError, DaemonInvocationService, DaemonLspInvocationOwner,
+    DaemonLspOwnerRegistrar, DaemonNativeIntegrationRuntimeRegistrar,
+    DaemonPrimitiveRuntimeRegistrar, DaemonPrimitiveRuntimeRegistrationError,
+    DaemonRetainedRuntimeRegistrar, DaemonSemanticOwnerRuntimeRegistrar,
+    DaemonSemanticRuntimeRegistrar, DaemonSemanticRuntimeRegistrationError,
+    DaemonSourceEditOwnerRegistrationError, DaemonWorkProposalRoutingAuthorityV1,
+    DaemonWorkRuntimeRegistrar, FeedbackCycleRuntimeBuilderV1, HookOrchestrationAdmissionV1,
     HookOrchestrationRequestV1, HookOrchestrationTriggerV1, HookOrchestrationWorkOutcomeV1,
     LSP_WORKSPACE_CAPABILITY_ID_V1, LSP_WORKSPACE_USE_CASE_ID_V1, LspDeliverySettlementAdmissionV1,
     MAX_COALESCED_HOOK_COMPLETIONS, RegisteredCallableCodeRuntime, RegisteredConfigurationRuntime,

@@ -19,11 +19,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::watch;
 use tracedecay_domain::canonical_text::encode_lowercase_hex;
+use tracedecay_domain::sha256_hex_suffix;
 use tracedecay_semantic_contracts::{
     ArtifactMemberPinV1, ArtifactMemberRoleV1, ArtifactPackageMemberV1, ArtifactProfileKindV1,
     DEFAULT_FASTEMBED_MODEL_ID, MODEL_ARTIFACT_MANIFEST_SCHEMA_V1, ModelArtifactManifestPayloadV1,
     ModelArtifactManifestV1, PlatformTargetV1, RerankCompatibilityPinsV1,
-    RerankerArtifactLifecycleStatusV1, ResourceCeilingV1, RuntimeCompatibilityV1,
+    RerankerArtifactLifecycleStatusV1, RuntimeCompatibilityV1,
     SemanticLifecycleVerifiedReadyEventV1, SemanticModelLifecycleStateV1,
     SemanticModelLifecycleStatusV1, SemanticModelRemediationV1, SemanticResourceCeilings,
     Sha256DigestHex, TruncationPolicyV1, UpstreamSourceV1,

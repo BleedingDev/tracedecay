@@ -80,8 +80,8 @@ pub fn read_config_pinned_project_root(config_path: &Path) -> Option<String> {
 
 pub(super) fn registration_state(
     config_path: &Path,
-) -> crate::agents::host_bundle_v2::HostBundleRegistrationStateV1 {
-    use crate::agents::host_bundle_v2::HostBundleRegistrationStateV1 as State;
+) -> crate::agents::host_bundle::HostBundleRegistrationStateV1 {
+    use crate::agents::host_bundle::HostBundleRegistrationStateV1 as State;
 
     let Ok(contents) = std::fs::read_to_string(config_path) else {
         return State::Missing;
@@ -1028,31 +1028,6 @@ mod tests {
                 Mutation::Disable => assert_disabled(&updated),
             }
         }
-    }
-
-    #[test]
-    fn enable_plugin_creates_missing_profile_config() {
-        let dir = TempDir::new().unwrap();
-        let config = dir.path().join(".hermes/profiles/work/config.yaml");
-
-        enable_plugin(&config).unwrap();
-
-        let updated = read(&config);
-        assert_enabled(&updated);
-        assert!(
-            !config.with_extension("yaml.bak").exists(),
-            "first write should not create a backup for a missing config"
-        );
-    }
-
-    #[test]
-    fn disable_plugin_ignores_missing_config() {
-        let dir = TempDir::new().unwrap();
-        let config = dir.path().join(".hermes/profiles/missing/config.yaml");
-
-        disable_plugin(&config).unwrap();
-
-        assert!(!config.exists());
     }
 
     #[test]

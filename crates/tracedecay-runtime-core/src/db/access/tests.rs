@@ -142,25 +142,6 @@ fn profile_project_databases_share_the_profile_scope() {
 }
 
 #[test]
-fn legacy_profile_store_databases_share_the_profile_scope() {
-    let temp = tempfile::tempdir().unwrap();
-    let profile = temp.path().join("profile");
-    let first = profile.join("stores/first/graph.db");
-    let second = profile.join("stores/second/branches/main.db");
-    std::fs::create_dir_all(first.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(second.parent().unwrap()).unwrap();
-
-    let first = DatabaseIdentity::for_path(&first).unwrap();
-    let second = DatabaseIdentity::for_path(&second).unwrap();
-    assert_eq!(
-        first.profile_root,
-        profile.canonicalize().unwrap(),
-        "legacy profile stores must inherit the profile lifecycle fence"
-    );
-    assert_eq!(second.profile_root, first.profile_root);
-}
-
-#[test]
 fn consolidation_authority_is_reserved_for_the_session_snapshots() {
     let temp = tempfile::tempdir().unwrap();
     let profile = temp.path().join("profile");
@@ -305,6 +286,45 @@ fn fallback_scope_is_unambiguous_only_with_one_profile_owner() {
     );
     assert!(fallback_scoped_runtime_role(1, 1).is_err());
     assert!(fallback_scoped_runtime_role(2, 0).is_err());
+}
+
+/// Reproduces the macOS `/var` -> `/private/var` scope-key shape on any unix
+/// host: a daemon enters database scope naming a profile root that does not
+/// exist yet, through a directory that is an alias for somewhere else.
+///
+/// The scope key must already be resolved at registration, because the
+/// identity the lookup presents is resolved after the directory exists.
+#[cfg(unix)]
+#[test]
+fn a_scope_entered_before_its_profile_root_exists_still_matches_the_opened_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let resolved = temporary.path().join("resolved");
+    std::fs::create_dir(&resolved).unwrap();
+    let alias = temporary.path().join("alias");
+    std::os::unix::fs::symlink(&resolved, &alias).unwrap();
+    let profile_root = alias.join("profile");
+
+    let scope = crate::db::enter_daemon_database_scope(&profile_root, 1, "alias scope").unwrap();
+
+    // Only now does the profile root exist, which is what lets the opened
+    // database resolve it to the `resolved` spelling. The identity is fully
+    // canonical, so the expectation must be too: on macOS `tempdir()` itself
+    // is spelled through the `/var` -> `/private/var` alias, and comparing
+    // against `resolved.join("profile")` would fail on spelling alone even
+    // though both name the same directory.
+    std::fs::create_dir(&profile_root).unwrap();
+    let identity = DatabaseIdentity::for_path(&profile_root.join("global.db")).unwrap();
+    assert_eq!(
+        identity.profile_root,
+        resolved.canonicalize().unwrap().join("profile"),
+        "the opened database must resolve the alias to the target directory"
+    );
+    assert_eq!(
+        exact_scoped_runtime_role(&identity.profile_root, "match alias scope").unwrap(),
+        Some(DatabaseAuthorityRole::Daemon),
+        "a scope entered through an alias must match the resolved database identity"
+    );
+    drop(scope);
 }
 
 /// Reproduces the macOS/Windows shape of the isolated-test-path check on any

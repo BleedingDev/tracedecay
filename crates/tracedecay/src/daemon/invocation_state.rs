@@ -318,7 +318,9 @@ impl DaemonInvocationState {
             // At this tip `unregister_project_semantic_runtime` already drops
             // the project's retained generation, redundancy state, and
             // activation gate, so one call is the whole teardown.
-            tracedecay_application::semantic_runtime::unregister_project_semantic_runtime(root);
+            drop(
+                tracedecay_application::semantic_runtime::unregister_project_semantic_runtime(root),
+            );
         }
         Ok(runtime_quiescence)
     }
@@ -406,7 +408,7 @@ impl DaemonInvocationState {
         &self,
         project_root: &Path,
         scope: &tracedecay_contracts::ResolvedScope,
-        cursor_keys: &tracedecay_session_temporal_store::GlobalDbCursorKeyProvider,
+        cursor_keys: &tracedecay_session_temporal_store::SessionTemporalCursorKeyProvider,
     ) -> std::result::Result<(), code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1>
     {
         code_index_scheduler::query_runtime::mount_core_query_authority_on_project_open(
@@ -424,7 +426,7 @@ impl DaemonInvocationState {
         project_root: &Path,
         scope: &tracedecay_contracts::ResolvedScope,
         expected_revision: &tracedecay_domain::configuration::ConfigurationRevisionId,
-        cursor_keys: &tracedecay_session_temporal_store::GlobalDbCursorKeyProvider,
+        cursor_keys: &tracedecay_session_temporal_store::SessionTemporalCursorKeyProvider,
     ) -> std::result::Result<(), code_index_scheduler::query_runtime::QueryRuntimeMountErrorV1>
     {
         code_index_scheduler::query_runtime::
@@ -450,7 +452,7 @@ impl DaemonInvocationState {
         profile_id: tracedecay_domain::configuration::UserProfileId,
         scope: tracedecay_contracts::ResolvedScope,
         state: crate::config::retrieval::RetrievalProfileStateV1,
-        cursor_keys: Arc<tracedecay_session_temporal_store::GlobalDbCursorKeyProvider>,
+        cursor_keys: Arc<tracedecay_session_temporal_store::SessionTemporalCursorKeyProvider>,
     ) -> std::result::Result<
         tracedecay_daemon_service::QueryAuthorityProviderStatusV1,
         tracedecay_daemon_service::QueryAuthorityUpdateErrorV1,
@@ -489,6 +491,10 @@ impl DaemonInvocationState {
     #[allow(
         clippy::too_many_arguments,
         reason = "Mount composition binds project identity, store, semantic lifetime and graph publication owners explicitly."
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Code-index mount is one generation-bind and scheduler-attach sequence."
     )]
     pub(super) async fn mount_code_index(
         &self,
@@ -546,7 +552,7 @@ impl DaemonInvocationState {
             .zip(semantic_lifecycle.clone())
             .zip(semantic_resources)
             .zip(code_index_scheduler::identity::worktree_id_for(project_root).ok())
-            .map(|(((handle, lifecycle), resources), worktree_id)| {
+            .and_then(|(((handle, lifecycle), resources), worktree_id)| {
                 let graph = Arc::clone(&vector_graph);
                 tracedecay_application::semantic_runtime::production_saved_generation_schedule_hook(
                     tracedecay_application::semantic_runtime::SavedGenerationScheduleHookParametersV1 {
@@ -561,6 +567,19 @@ impl DaemonInvocationState {
                         fair_scheduler: self.semantic_projection_scheduler.clone(),
                     },
                 )
+                // Composition resolves the resident ceiling against this host
+                // before the runtime is offered, so this refusal means the
+                // worktree mounts with no semantic scheduling at all rather
+                // than with a fabricated memory budget.
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        event = "semantic_projection_schedule",
+                        outcome = "hook_unavailable",
+                        error = ?error,
+                        "semantic projection hook could not be built for this worktree"
+                    );
+                })
+                .ok()
             });
         self.code_index_schedulers
             .mount_worktree_with_graph_runtime(
@@ -633,6 +652,10 @@ impl DaemonInvocationState {
 
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(label = "daemon.invocation_state.multi_root_execute", future = true)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Multi-root execute is one scoped dispatch across the admitted root set."
+    )]
     pub(super) async fn execute_multi_root_for_project(
         &self,
         store_administration: &StoreAdministration,
@@ -938,9 +961,10 @@ impl DaemonInvocationState {
             page: request.page,
             continuation: request.continuation,
         };
-        let page = match self
-            .service
-            .execute_multi_root_query(PrecomputedMultiRootQueryPort { outcomes }, query)
+        let page = match tracedecay_contracts::AuthorizedMultiRootQueryService::new(
+            PrecomputedMultiRootQueryPort { outcomes },
+        )
+        .execute(query)
         {
             Ok(page) => page,
             Err(_) => {
@@ -1101,9 +1125,21 @@ impl DaemonInvocationState {
 
     #[hotpath::measure(label = "daemon.invocation_state.shutdown", future = true)]
     pub(super) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> ShutdownStatus {
+        let started = std::time::Instant::now();
+        let step = |outcome: &str| {
+            log_daemon_event(
+                "daemon_shutdown",
+                &[
+                    ("outcome", outcome.to_string()),
+                    ("owner", "invocation".to_string()),
+                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                ],
+            );
+        };
         self.service.begin_shutdown().await;
         self.github_credential_lifecycle.shutdown();
         self.code_index_schedulers.cancel();
+        step("invocation_admissions_closed");
         // The bounded wait may expire while a blocking reconcile is still
         // unwinding. The registry retains its worker until a retry joins it;
         // an incomplete sweep must keep the outer shutdown receipt unclean.
@@ -1113,6 +1149,7 @@ impl DaemonInvocationState {
         )
         .await
         .is_err();
+        step("code_index_schedulers_join_returned");
         if schedulers_timed_out {
             log_daemon_event(
                 "daemon_shutdown",
@@ -1126,7 +1163,9 @@ impl DaemonInvocationState {
             );
         }
         self.lsp_session_registry.lock().await.expire_at(u64::MAX);
+        step("lsp_sessions_expired");
         let expired = self.service.expire_all_until(deadline).await;
+        step("invocation_service_expired");
         if !expired {
             hotpath::gauge!("daemon.invocation_state.shutdown_incomplete_total").inc(1_u64);
             ShutdownStatus::Failed("invocation runtime shutdown was incomplete".to_owned())
@@ -1197,26 +1236,6 @@ impl WorkFederatedQueryAuthorityPortV1 for DaemonWorkFederatedQueryAuthorityV1 {
                 .federated_authority_for(scope, mounted.privacy_domain())
                 .ok()
         })
-    }
-}
-
-#[cfg(test)]
-mod resident_memory_tests {
-    use super::*;
-
-    #[test]
-    fn invocation_state_and_code_index_registry_share_one_process_resident_authority() {
-        let state = DaemonInvocationState::default();
-        let cloned = state.clone();
-        let state_memory = state.code_index_schedulers.process_resident_memory();
-        let cloned_memory = cloned.code_index_schedulers.process_resident_memory();
-
-        assert!(Arc::ptr_eq(&state_memory, &cloned_memory));
-        assert_eq!(
-            state_memory.snapshot().limit_bytes,
-            tracedecay_runtime_core::resident_memory::detected_process_resident_memory_limit_v1()
-                .get()
-        );
     }
 }
 

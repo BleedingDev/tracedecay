@@ -1,6 +1,11 @@
 //! Per-subsystem `*RuntimeRegistrar` newtypes and their registration error enums.
 
 use super::*;
+use tracedecay_application::feedback::ProductionFeedbackCyclePartsV1;
+use tracedecay_contracts::AnalyzerAdmittedDiagnosticProviderV1;
+use tracedecay_contracts::diagnostics::FeedbackDiagnosticProviderAdmissionV1;
+use tracedecay_global_db::configuration::contracts::ports::ConfigurationOperationFuture;
+use tracedecay_global_db::configuration::contracts::types::ConfigurationError;
 
 mod lsp;
 pub use lsp::DaemonLspOwnerRegistrar;
@@ -222,14 +227,13 @@ impl ScopeResolutionPort for DaemonConfigurationScopeResolution {
         &'a self,
         actor: &'a AuthorizedActor,
         change: &'a tracedecay_domain::configuration::ProtectedChange,
-    ) -> tracedecay_configuration::ConfigurationOperationFuture<'a, ScopeRevalidationEvidenceV1>
-    {
+    ) -> ConfigurationOperationFuture<'a, ScopeRevalidationEvidenceV1> {
         let allowed = actor.actor_id == self.actor && change.validate().is_ok();
         let evidence = self.evidence.clone();
         Box::pin(async move {
             allowed
                 .then_some(evidence)
-                .ok_or(tracedecay_configuration::ConfigurationError::TargetUnavailable)
+                .ok_or(ConfigurationError::TargetUnavailable)
         })
     }
 
@@ -237,14 +241,13 @@ impl ScopeResolutionPort for DaemonConfigurationScopeResolution {
         &'a self,
         actor: &'a AuthorizedActor,
         plan: &'a tracedecay_domain::configuration::ProtectedChangePlan,
-    ) -> tracedecay_configuration::ConfigurationOperationFuture<'a, ScopeRevalidationEvidenceV1>
-    {
+    ) -> ConfigurationOperationFuture<'a, ScopeRevalidationEvidenceV1> {
         let allowed = actor.actor_id == self.actor && plan.validate().is_ok();
         let evidence = self.evidence.clone();
         Box::pin(async move {
             allowed
                 .then_some(evidence)
-                .ok_or(tracedecay_configuration::ConfigurationError::TargetUnavailable)
+                .ok_or(ConfigurationError::TargetUnavailable)
         })
     }
 }
@@ -387,6 +390,103 @@ pub struct DaemonFeedbackRuntimeRegistrar {
     publication_gate: Option<Arc<DaemonFeedbackPublicationTestGate>>,
 }
 
+#[derive(Clone)]
+pub struct FeedbackCycleRuntimeBuilderV1 {
+    feedback: Arc<FeedbackRuntime>,
+    code_index_schedulers:
+        tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
+}
+
+impl FeedbackCycleRuntimeBuilderV1 {
+    pub fn build(
+        &self,
+        project_root: &Path,
+        database: Database,
+        code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
+        parts: ProductionFeedbackCyclePartsV1,
+    ) -> Result<
+        (Arc<FeedbackCycleRuntime>, Arc<dyn FeedbackCycleRuntimePort>),
+        DaemonFeedbackRuntimeRegistrationError,
+    > {
+        let ProductionFeedbackCyclePartsV1 {
+            policy_context,
+            evidence_horizon,
+            evaluated_at,
+            provider_candidates,
+            affected_tests,
+            operation,
+            graph_operation,
+            tests_operation,
+            lsp_input,
+            proximity,
+            runtime_state,
+            ..
+        } = parts;
+        let policy = PolicyEvaluatorCompositionV1::from_application_catalog()?;
+        let correlation_state = evidence_horizon.routing_state();
+        let correlation_availability = match correlation_state {
+            TruthSourceStateV1::Fresh | TruthSourceStateV1::Partial => {
+                CapabilityAvailabilityV1::Available
+            }
+            TruthSourceStateV1::Stale => CapabilityAvailabilityV1::Stale,
+            TruthSourceStateV1::Unavailable => CapabilityAvailabilityV1::Unavailable,
+            TruthSourceStateV1::Unknown => CapabilityAvailabilityV1::Unknown,
+        };
+        let correlation_policy = operation.evaluate_local_live_policy(
+            &policy,
+            &policy_context,
+            correlation_availability,
+            ScopeMatchV1::Match,
+            correlation_state,
+            CapabilityEffectClassV1::Read,
+            TruthFreshnessRequirementV1::FreshOrPartial,
+            evidence_horizon,
+            evaluated_at,
+        )?;
+        let provider_admissions = provider_candidates
+            .into_iter()
+            .map(|candidate| match candidate {
+                tracedecay_application::feedback::cycle_production::ProductionDiagnosticProviderCandidateV1::Analyzer {
+                    identity,
+                    admission,
+                } => AnalyzerAdmittedDiagnosticProviderV1::evaluate_current_configuration_snapshot(
+                    &policy,
+                    &policy_context,
+                    identity,
+                    admission,
+                )
+                .map(FeedbackDiagnosticProviderAdmissionV1::from),
+                tracedecay_application::feedback::cycle_production::ProductionDiagnosticProviderCandidateV1::StoredPublication(identity) => {
+                    FeedbackDiagnosticProviderAdmissionV1::from_stored_publication(identity)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let observations = self.feedback.observation_port();
+        let runtime = open_feedback_cycle_runtime(
+            database,
+            Arc::clone(&self.feedback),
+            runtime_state,
+            correlation_policy,
+            provider_admissions,
+            project_root.to_path_buf(),
+            code_graph,
+            affected_tests,
+            observations,
+            operation,
+            graph_operation,
+            tests_operation,
+            lsp_input,
+            Some(Arc::new(self.code_index_schedulers.clone())),
+        )?;
+        let production_input = production_proximity_feedback_cycle_input(
+            Arc::clone(&runtime),
+            runtime.lsp_input(),
+            proximity,
+        );
+        Ok((runtime, production_input))
+    }
+}
+
 impl DaemonFeedbackRuntimeRegistrar {
     pub fn new(service: &DaemonInvocationService) -> Self {
         Self {
@@ -467,90 +567,48 @@ impl DaemonFeedbackRuntimeRegistrar {
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[hotpath::skip]
     pub async fn open_cycle_and_register(
         &self,
         project_root: PathBuf,
         database: Database,
-        runtime_state: Arc<dyn FeedbackRuntimeStatePort + Send + Sync>,
-        policy_context: PolicyEvaluationContextV1,
-        evidence_horizon: PolicyEvidenceHorizonV1,
-        evaluated_at: UtcMicros,
-        provider_candidates: Vec<(DiagnosticProviderIdentity, AnalyzerAdmissionInputV1)>,
         code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
-        affected_tests: Arc<dyn AffectedTestsRetrievalPort + Send + Sync>,
-        operation: ApplicationOperation,
-        graph_operation: ApplicationOperation,
-        tests_operation: ApplicationOperation,
-        lsp_input: FeedbackCycleLspInput,
-        proximity: Arc<dyn ProductionFeedbackCycleProximityPortV1>,
+        parts: ProductionFeedbackCyclePartsV1,
     ) -> Result<Arc<FeedbackCycleRuntime>, DaemonFeedbackRuntimeRegistrationError> {
-        let policy = PolicyEvaluatorCompositionV1::from_application_catalog()?;
-        let correlation_state = evidence_horizon.routing_state();
-        let correlation_availability = match correlation_state {
-            TruthSourceStateV1::Fresh | TruthSourceStateV1::Partial => {
-                CapabilityAvailabilityV1::Available
-            }
-            TruthSourceStateV1::Stale => CapabilityAvailabilityV1::Stale,
-            TruthSourceStateV1::Unavailable => CapabilityAvailabilityV1::Unavailable,
-            TruthSourceStateV1::Unknown => CapabilityAvailabilityV1::Unknown,
-        };
-        let correlation_policy = operation.evaluate_local_live_policy(
-            &policy,
-            &policy_context,
-            correlation_availability,
-            ScopeMatchV1::Match,
-            correlation_state,
-            CapabilityEffectClassV1::Read,
-            TruthFreshnessRequirementV1::FreshOrPartial,
-            evidence_horizon,
-            evaluated_at,
-        )?;
-        let provider_admissions = provider_candidates
-            .into_iter()
-            .map(|(identity, input)| {
-                AnalyzerAdmittedDiagnosticProviderV1::evaluate_current_configuration_snapshot(
-                    &policy,
-                    &policy_context,
-                    identity,
-                    input,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let feedback = self
-            .service
-            .feedback_runtime(Some(&project_root))
+        let builder = self
+            .refresh_builder(&project_root)
             .await
             .ok_or(DaemonFeedbackRuntimeRegistrationError::MissingRuntime)?;
-        let observations = feedback.observation_port();
-        let production_lsp_input = Arc::clone(&lsp_input);
-        let runtime = open_feedback_cycle_runtime(
-            database,
-            feedback,
-            runtime_state,
-            correlation_policy,
-            provider_admissions,
-            project_root.clone(),
-            code_graph,
-            affected_tests,
-            observations,
-            operation,
-            graph_operation,
-            tests_operation,
-            lsp_input,
-            Some(Arc::new(self.service.code_index_schedulers.clone())),
-        )?;
-        let production_input = production_proximity_feedback_cycle_input(
-            Arc::clone(&runtime),
-            production_lsp_input,
-            proximity,
-        );
+        let (runtime, production_input) =
+            builder.build(&project_root, database, code_graph, parts)?;
         self.service
             .project_runtimes
             .publish_feedback_cycle_atomically(project_root, Arc::clone(&runtime), production_input)
             .await?;
         Ok(runtime)
+    }
+
+    #[hotpath::skip]
+    pub async fn refresh_builder(
+        &self,
+        project_root: &Path,
+    ) -> Option<FeedbackCycleRuntimeBuilderV1> {
+        let feedback = self.service.feedback_runtime(Some(project_root)).await?;
+        Some(FeedbackCycleRuntimeBuilderV1 {
+            feedback,
+            code_index_schedulers: self.service.code_index_schedulers.clone(),
+        })
+    }
+
+    #[hotpath::skip]
+    pub async fn feedback_router(
+        &self,
+        project_root: &Path,
+    ) -> Option<Arc<SwitchableFeedbackCycleRuntimeV1>> {
+        self.service
+            .project_runtimes
+            .get::<Arc<SwitchableFeedbackCycleRuntimeV1>>(project_root)
+            .await
     }
 }
 
@@ -797,7 +855,7 @@ impl DaemonConfigurationRuntimeRegistrar {
     /// profile `ProfileSessions` configuration is the sole installer; project
     /// registration must never invent or replace process CPU authority.
     pub fn ensure_worker_plan(&self) -> Result<(), TraceDecayError> {
-        tracedecay_code_index::parallelism::installed_worker_status()
+        tracedecay_code_index_runtime::parallelism::installed_worker_status()
             .map(|_| ())
             .ok_or_else(|| TraceDecayError::Config {
                 message: "profile code-index worker plan was not installed during daemon bootstrap"
@@ -996,6 +1054,7 @@ impl DaemonConfigurationRuntimeRegistrar {
                     grants,
                     semantic_operation: Arc::new(OnceLock::new()),
                     semantic_activation_committed: Arc::new(Notify::new()),
+                    feedback_refresh: Arc::new(RwLock::new(None)),
                     semantic_evaluation_workers: Arc::new(
                         tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1::with_scheduler_admission(
                             self.service
@@ -1012,6 +1071,30 @@ impl DaemonConfigurationRuntimeRegistrar {
             let _ = after_registration.send(());
             let _ = allow_return.await;
         }
+        Ok(())
+    }
+
+    pub async fn install_feedback_refresh(
+        &self,
+        project_root: &Path,
+        refresh: Arc<dyn ConfigurationRuntimeRefreshPort>,
+    ) -> Result<(), TraceDecayError> {
+        let registered = self
+            .service
+            .project_runtimes
+            .get::<RegisteredConfigurationRuntime>(project_root)
+            .await
+            .ok_or_else(|| TraceDecayError::Config {
+                message: "feedback configuration refresh requires a registered runtime".to_owned(),
+            })?;
+        let mut slot =
+            registered
+                .feedback_refresh
+                .write()
+                .map_err(|_| TraceDecayError::Config {
+                    message: "feedback configuration refresh authority is unavailable".to_owned(),
+                })?;
+        *slot = Some(refresh);
         Ok(())
     }
 
@@ -1406,24 +1489,17 @@ impl DaemonNativeIntegrationRuntimeRegistrar {
     pub async fn ensure(
         &self,
         database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-        repository_root: PathBuf,
-        project_id: ProjectId,
-        repository_id: tracedecay_domain::RepositoryId,
-        policy_digest: ManifestDigest,
+        target: tracedecay_agent_hosts::native_integration::NativeIntegrationTargetV1,
         observed_at: UtcMicros,
+        analysis: Arc<
+            dyn tracedecay_application::native_integration::NativeIntegrationAnalysisPort,
+        >,
     ) -> Result<
         tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationOwner,
         tracedecay_contracts::NativeIntegrationPortError,
     > {
         self.registry
-            .ensure(
-                database,
-                repository_root,
-                project_id,
-                repository_id,
-                policy_digest,
-                observed_at,
-            )
+            .ensure(database, target, observed_at, analysis)
             .await
     }
 

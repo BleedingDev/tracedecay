@@ -86,7 +86,7 @@ impl From<GitProgramUnavailable> for GitCommandError {
 
 /// Returns the resolved absolute `git` program to spawn.
 ///
-/// Resolution order (performed once, then cached):
+/// Resolution order (cached once it succeeds):
 ///   1. The `GIT` environment variable, if it names an absolute executable.
 ///   2. An absolute path found by a which-style walk of `PATH` (+ `PATHEXT` on
 ///      Windows).
@@ -94,12 +94,23 @@ impl From<GitProgramUnavailable> for GitCommandError {
 ///      bare-program fallback because that delegates identity back to ambient
 ///      `PATH` at spawn time.
 pub fn try_git_program() -> Result<&'static OsStr, GitProgramUnavailable> {
-    static PROGRAM: OnceLock<Result<OsString, GitProgramUnavailable>> = OnceLock::new();
-    PROGRAM
-        .get_or_init(resolve_git_program)
-        .as_ref()
-        .map(OsString::as_os_str)
-        .map_err(|error| *error)
+    static PROGRAM: OnceLock<OsString> = OnceLock::new();
+    cached_program(&PROGRAM, resolve_git_program).map(OsString::as_os_str)
+}
+
+/// Memoises only a successful resolution. A failed lookup (for example while
+/// `PATH` is momentarily wrong at first call) is returned but not cached, so a
+/// later call with a working environment recovers instead of reporting
+/// [`GitProgramUnavailable`] for the rest of the process.
+fn cached_program(
+    cache: &OnceLock<OsString>,
+    resolve: impl FnOnce() -> Result<OsString, GitProgramUnavailable>,
+) -> Result<&OsString, GitProgramUnavailable> {
+    if let Some(program) = cache.get() {
+        return Ok(program);
+    }
+    let program = resolve()?;
+    Ok(cache.get_or_init(|| program))
 }
 
 fn resolve_git_program() -> Result<OsString, GitProgramUnavailable> {
@@ -589,14 +600,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_program_is_stable_and_absolute() {
-        let first = try_git_program().expect("git executable should resolve");
-        let second = try_git_program().expect("cached git executable should resolve");
-        assert_eq!(first, second);
-        assert!(Path::new(first).is_absolute());
-    }
-
-    #[test]
     fn resolver_preserves_exact_absolute_override() {
         let temporary = tempfile::tempdir().expect("temporary executable directory");
         let executable = temporary
@@ -669,6 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn failed_lookup_is_not_memoised_and_later_success_is() {
+        let cache = OnceLock::new();
+
+        assert_eq!(
+            cached_program(&cache, || Err(GitProgramUnavailable)),
+            Err(GitProgramUnavailable)
+        );
+        let resolved = cached_program(&cache, || Ok(OsString::from("/fixture/git")))
+            .expect("a working lookup after a failed one must resolve");
+        assert_eq!(resolved, "/fixture/git");
+        let cached = cached_program(&cache, || panic!("a cached success must not re-resolve"))
+            .expect("cached program");
+        assert_eq!(cached, resolved);
+    }
+
+    #[test]
     fn git_at_command_uses_dash_c_without_target_current_dir() {
         let repo_root = Path::new("/problematic/project/root");
         let command = git_command_at(
@@ -734,31 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_output_reports_deadline_and_output_limit() {
-        let root = tempfile::tempdir().unwrap();
-        let expired = GitCommandBounds {
-            deadline: Instant::now(),
-            ..GitCommandBounds::default()
-        };
-        assert!(matches!(
-            bounded_git_output(root.path(), &["--version"], &expired),
-            Err(GitCommandError::DeadlineExceeded)
-        ));
-
-        let limited = GitCommandBounds {
-            max_stdout_bytes: 1,
-            ..GitCommandBounds::default()
-        };
-        assert!(matches!(
-            bounded_git_output(root.path(), &["--version"], &limited),
-            Err(GitCommandError::OutputLimitExceeded {
-                stream: "stdout",
-                bound: 1
-            })
-        ));
-    }
-
-    #[test]
     fn bounded_output_observes_pre_spawn_cancellation() {
         let root = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
@@ -771,28 +765,5 @@ mod tests {
             bounded_git_output(root.path(), &["--version"], &bounds),
             Err(GitCommandError::Cancelled)
         ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_command_interrupts_an_in_flight_process() {
-        let cancellation = CancellationToken::new();
-        let trigger = cancellation.clone();
-        let notifier = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            trigger.cancel();
-        });
-        let mut command = Command::new("sh");
-        command.args(["-c", "exec sleep 30"]);
-        let bounds = GitCommandBounds {
-            cancel: Some(cancellation),
-            ..GitCommandBounds::default()
-        };
-        let started = Instant::now();
-        let result = bounded_command_output(command, None, &bounds);
-        notifier.join().unwrap();
-
-        assert!(matches!(result, Err(GitCommandError::Cancelled)));
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

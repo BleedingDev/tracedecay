@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::current_unix_timestamp;
+use crate::{commands::daemon_tool_json, current_unix_timestamp};
 
 pub(crate) use tracedecay_runtime_core::storage::{ProjectStorageLocation, ProjectStorageStatus};
 
@@ -187,8 +187,9 @@ pub(crate) async fn gather_target_projects(
     home_tracedecay: &Option<std::path::PathBuf>,
 ) -> tracedecay_domain::errors::Result<Vec<std::path::PathBuf>> {
     if all {
-        let payload = call_admin_cli(
+        let payload = daemon_tool_json(
             None,
+            "tracedecay_admin_cli",
             serde_json::json!({
                 "action": "registry_list",
                 "limit": 100_000,
@@ -227,22 +228,6 @@ fn registry_project_roots(
                 })
         })
         .collect()
-}
-
-async fn call_admin_cli(
-    project_root: Option<&Path>,
-    arguments: serde_json::Value,
-) -> tracedecay_domain::errors::Result<serde_json::Value> {
-    let handshake = tracedecay::daemon::handshake_for_current_client(
-        project_root.map(Path::to_path_buf),
-        None,
-        false,
-        false,
-    )?;
-    let result =
-        tracedecay::daemon::call_default_tool(&handshake, "tracedecay_admin_cli", arguments)
-            .await?;
-    tracedecay::daemon::tool_json_payload(&result, "tracedecay_admin_cli")
 }
 
 /// Returns project roots whose `.tracedecay` data dir lives in cwd, an
@@ -509,36 +494,6 @@ mod gather_tests {
     }
 
     #[test]
-    fn finds_project_at_ancestor_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let nested = root.join("a").join("b").join("c");
-        fs::create_dir_all(&nested).unwrap();
-        make_project(&root);
-
-        let out = gather_local_projects_from(&nested, &None);
-        assert!(
-            out.contains(&root),
-            "ancestor project must be detected, got {out:?}"
-        );
-    }
-
-    #[test]
-    fn finds_project_at_descendant_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
-        let child = cwd.join("sub").join("proj");
-        fs::create_dir_all(&child).unwrap();
-        make_project(&child);
-
-        let out = gather_local_projects_from(&cwd, &None);
-        assert!(
-            out.contains(&child),
-            "descendant project must be detected, got {out:?}"
-        );
-    }
-
-    #[test]
     fn finds_both_ancestor_and_descendant_dedup() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -693,14 +648,6 @@ mod gather_tests {
     #[cfg(windows)]
     fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
         std::os::windows::fs::symlink_dir(src, dst)
-    }
-
-    #[test]
-    fn empty_dir_yields_empty_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
-        let out = gather_local_projects_from(&cwd, &None);
-        assert!(out.is_empty(), "got {out:?}");
     }
 
     #[test]

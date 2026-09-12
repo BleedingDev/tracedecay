@@ -4,12 +4,13 @@
 //! so a root-crate edit no longer relinks a dozen ~700 MiB test binaries.
 
 #![recursion_limit = "256"]
-
+#![allow(clippy::too_many_lines)]
 #[path = "../common/mod.rs"]
 mod common;
 
 mod advisory_runtime_acceptance;
 mod application_production_reachability;
+mod canonical_git_observation_correlation;
 #[allow(clippy::unwrap_used)]
 mod cross_host_handoff_test;
 mod daemon_runtime_acceptance;

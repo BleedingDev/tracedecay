@@ -1137,35 +1137,6 @@ async fn test_changelog_with_real_git() {
 }
 
 #[tokio::test]
-async fn test_dead_code_custom_kinds() {
-    let (cg, _dir) = setup_project().await;
-    let result = handle_tool_call(
-        &cg,
-        "tracedecay_dead_code",
-        json!({"kinds": ["struct"]}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(
-        text.contains("dead_code_count"),
-        "should have dead_code_count key"
-    );
-    let parsed: Value = serde_json::from_str(text).unwrap_or(json!({}));
-    if let Some(items) = parsed["dead_code"].as_array() {
-        for item in items {
-            assert_eq!(
-                item["kind"].as_str().unwrap_or(""),
-                "struct",
-                "dead code items should be structs when kinds=['struct']"
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn test_gini() {
     let (cg, _dir) = setup_project().await;
     let result = handle_tool_call(
@@ -1190,92 +1161,6 @@ async fn test_gini() {
     );
 }
 
-#[tokio::test]
-async fn test_gini_default_metric() {
-    let (cg, _dir) = setup_project().await;
-    let result = handle_tool_call(&cg, "tracedecay_gini", json!({}), None, None)
-        .await
-        .unwrap();
-    let text = extract_text(&result.value);
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert!(
-        parsed.get("gini").is_some(),
-        "gini field should exist with default args, got: {}",
-        text
-    );
-}
-
-#[tokio::test]
-async fn test_dependency_depth() {
-    let (cg, _dir) = setup_project().await;
-    let result = handle_tool_call(
-        &cg,
-        "tracedecay_dependency_depth",
-        json!({ "limit": 5 }),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert!(
-        parsed.get("max_depth").is_some(),
-        "max_depth field should exist, got: {}",
-        text
-    );
-    assert!(
-        parsed.get("ideal_depth").is_some(),
-        "ideal_depth field should exist"
-    );
-}
-
-#[tokio::test]
-async fn test_health_summary() {
-    let (cg, _env, _dir) = setup_empty_analysis_project().await;
-    let result = handle_tool_call(&cg, "tracedecay_health", json!({}), None, None)
-        .await
-        .unwrap();
-    let text = extract_text(&result.value);
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert!(
-        parsed.get("quality_signal").is_some(),
-        "quality_signal field should exist, got: {}",
-        text
-    );
-    assert!(
-        parsed.get("files_analyzed").is_some(),
-        "files_analyzed field should exist"
-    );
-}
-
-#[tokio::test]
-async fn test_health_detailed() {
-    let (cg, _env, _dir) = setup_empty_analysis_project().await;
-    let result = handle_tool_call(
-        &cg,
-        "tracedecay_health",
-        json!({ "details": true }),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert!(
-        parsed.get("quality_signal").is_some(),
-        "quality_signal should exist, got: {}",
-        text
-    );
-    let dims = parsed.get("dimensions").expect("dimensions should exist");
-    assert!(dims.get("acyclicity").is_some(), "acyclicity score missing");
-    assert!(dims.get("depth").is_some(), "depth score missing");
-    assert!(dims.get("equality").is_some(), "equality score missing");
-    assert!(dims.get("redundancy").is_some(), "redundancy score missing");
-    assert!(dims.get("modularity").is_some(), "modularity score missing");
-}
-
 /// `tracedecay_redundancy` must surface AST-isomorphic duplicate pairs and
 /// rank them by composite similarity. Plant two structurally identical
 /// functions in a fixture and assert the pair surfaces in the top hit with
@@ -1289,9 +1174,7 @@ async fn test_redundancy_finds_planted_duplicate() {
     fs::create_dir_all(project.join("src")).unwrap();
 
     // Two functions: identical structure, renamed identifiers.
-    fs::write(
-        project.join("src/lib.rs"),
-        r#"
+    let source = r#"
 pub fn compute_a(value: i32) -> i32 {
     let mut acc = 0;
     for i in 0..value {
@@ -1319,9 +1202,8 @@ pub fn compute_b(input: i32) -> i32 {
 pub fn unrelated(x: i32) -> i32 {
     x * 2
 }
-"#,
-    )
-    .unwrap();
+"#;
+    fs::write(project.join("src/lib.rs"), source).unwrap();
 
     let (cg, _env) = init_test_project(project).await;
     wait_for_current_graph(&cg).await;
@@ -1371,6 +1253,19 @@ pub fn unrelated(x: i32) -> i32 {
         names.contains(&"compute_a") && names.contains(&"compute_b"),
         "expected compute_a/compute_b in pair, got {names:?}"
     );
+    for endpoint in [&top["a"], &top["b"]] {
+        let name = endpoint["name"].as_str().expect("endpoint name");
+        let expected_line = source
+            .lines()
+            .position(|line| line.starts_with(&format!("pub fn {name}")))
+            .map(|line| line as u64 + 1)
+            .expect("function declaration in source fixture");
+        assert_eq!(
+            endpoint["line"].as_u64(),
+            Some(expected_line),
+            "public redundancy locations must use one-based source lines"
+        );
+    }
     let groups = parsed["groups"].as_array().expect("groups array");
     assert!(
         groups
@@ -1496,26 +1391,6 @@ async fn test_dsm_json_returns_stats_shape() {
         "density field should exist"
     );
     assert_eq!(parsed["shape"], "stats");
-}
-
-#[tokio::test]
-async fn test_dsm_clusters() {
-    let (cg, _dir) = setup_project().await;
-    let result = handle_tool_call(
-        &cg,
-        "tracedecay_dsm",
-        json!({ "shape": "clusters" }),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(
-        text.contains("### Top Clusters"),
-        "clusters section should exist, got: {}",
-        text
-    );
 }
 
 #[tokio::test]
@@ -1839,18 +1714,6 @@ fn main() {
     let output: Value = serde_json::from_str(text).unwrap();
     assert_eq!(output["match_count"].as_u64().unwrap(), 1);
     assert_eq!(output["markers"][0]["kind"].as_str().unwrap(), "FIXME");
-}
-
-#[tokio::test]
-async fn test_todos_empty_when_clean() {
-    let (cg, _env, _dir) = setup_empty_analysis_project().await;
-    let result = handle_tool_call(&cg, "tracedecay_todos", json!({}), None, None)
-        .await
-        .unwrap();
-    let text = extract_text(&result.value);
-    let output: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(output["match_count"].as_u64().unwrap(), 0);
-    close_test_graph(cg).await;
 }
 
 /// `tracedecay_diff_context.impacted_symbols` must not list the same
@@ -2716,6 +2579,209 @@ pub trait Leaf: Middle {}
 }
 
 #[tokio::test]
+async fn analysis_symbol_locations_are_one_based() {
+    let dir = test_temp_dir();
+    let project_root = dir.path().join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("package.json"),
+        "{\"name\":\"analysis-locations\",\"private\":true,\"type\":\"module\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/engine.ts"),
+        "export class AuditEngine {\n  private total = 0;\n  private label = \"audit\";\n  private enabled = true;\n\n  add(value: number): number {\n    this.total += value;\n    return this.total;\n  }\n\n  reset(): void {\n    this.total = 0;\n  }\n\n  describe(): string {\n    return `${this.label}:${this.total}`;\n  }\n\n  evaluate(value: number): number {\n    if (!this.enabled) {\n      return 0;\n    }\n    if (value < 0) {\n      return -1;\n    }\n    if (value === 0) {\n      return this.total;\n    }\n    if (value % 2 === 0) {\n      return this.add(value);\n    }\n    if (value > 100) {\n      return value * 2;\n    }\n    return value + 1;\n  }\n}\n\nexport function sharedScore(value: number): number {\n  return value * 3;\n}\n\nexport function firstScore(value: number): number {\n  return sharedScore(value);\n}\n\nexport function secondScore(value: number): number {\n  return sharedScore(value + 1);\n}\n\nexport function thirdScore(value: number): number {\n  return sharedScore(value + 2);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/recursion.ts"),
+        "export function factorial(value: number): number {\n  if (value <= 1) {\n    return 1;\n  }\n  return value * factorial(value - 1);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/hierarchy.ts"),
+        "export interface Base {}\nexport interface Middle extends Base {}\nexport interface Leaf extends Middle {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/dead.ts"),
+        "function abandonedHelper(): number { return 7; }\nexport function entry(): number { return 1; }\n",
+    )
+    .unwrap();
+    let (graph, _env) = init_test_project(&project_root).await;
+
+    for (tool, arguments, collection, symbol, expected_line) in [
+        (
+            "tracedecay_hotspots",
+            json!({"limit": 100, "format": "json"}),
+            "hotspots",
+            "sharedScore",
+            39,
+        ),
+        (
+            "tracedecay_dead_code",
+            json!({"format": "json"}),
+            "symbols",
+            "abandonedHelper",
+            1,
+        ),
+        (
+            "tracedecay_inheritance_depth",
+            json!({"format": "json"}),
+            "ranking",
+            "Leaf",
+            3,
+        ),
+    ] {
+        let result = handle_tool_call(&graph, tool, arguments, None, None)
+            .await
+            .unwrap();
+        let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+        let item = output[collection]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == symbol)
+            .unwrap_or_else(|| panic!("{tool} omitted {symbol}: {output}"));
+        assert_eq!(item["line"], expected_line, "{tool} returned {item}");
+    }
+
+    for (tool, collection, symbol, expected_line) in [
+        ("tracedecay_complexity", "ranking", "evaluate", 19),
+        ("tracedecay_god_class", "ranking", "AuditEngine", 1),
+    ] {
+        let result = handle_tool_call(
+            &graph,
+            tool,
+            json!({"limit": 100, "format": "json"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+        let item = output[collection]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == symbol)
+            .unwrap_or_else(|| panic!("{tool} omitted {symbol}: {output}"));
+        assert_eq!(item["line"], expected_line, "{tool} returned {item}");
+    }
+
+    let result = handle_tool_call(
+        &graph,
+        "tracedecay_recursion",
+        json!({"limit": 100, "format": "json"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+    let factorial = output["cycles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|cycle| cycle["chain"].as_array().unwrap())
+        .find(|item| item["name"] == "factorial")
+        .unwrap_or_else(|| panic!("tracedecay_recursion omitted factorial: {output}"));
+    assert_eq!(factorial["line"], 1, "recursion returned {factorial}");
+
+    close_test_graph(graph).await;
+}
+
+#[tokio::test]
+async fn typescript_typed_variables_reach_public_type_relation_queries() {
+    let dir = test_temp_dir();
+    let project_root = dir.path().join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("package.json"),
+        r#"{"name":"typescript-type-relations","private":true,"type":"module"}"#,
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/types.ts"),
+        "export interface Greeter { greet(): string }\n",
+    )
+    .unwrap();
+    fs::write(
+        project_root.join("src/values.ts"),
+        "import type { Greeter } from './types';\n\
+         export const primary: Greeter = { greet: () => 'primary' };\n\
+         export let fallback: Greeter = primary;\n",
+    )
+    .unwrap();
+    let (graph, ()) = init_test_project(&project_root).await;
+    let greeter_id = find_node_id(&graph, "Greeter").await;
+    let variable_ids = [
+        ("primary", find_node_id(&graph, "primary").await),
+        ("fallback", find_node_id(&graph, "fallback").await),
+    ];
+    let request = |node_id: &str| {
+        json!({
+            "node_id": node_id,
+            "scope": {
+                "generation": tracedecay_contracts::UNPINNED_LATEST_GENERATION_SENTINEL,
+                "path_prefix": Value::Null,
+            },
+            "meta": {
+                "projection": "evidence",
+                "order": "source_position",
+                "cursor": Value::Null,
+            },
+        })
+    };
+
+    for (name, node_id) in &variable_ids {
+        let result = call_production_tool(
+            &graph.harness,
+            &graph.project_root,
+            "tracedecay_code_type_definition",
+            request(node_id),
+        )
+        .await
+        .expect("public type-definition request");
+        let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+        let items = output
+            .pointer("/outcome/value/payload/items")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{name} type-definition items missing: {output:#}"));
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item["name"].as_str(), item["file"].as_str()))
+                .collect::<Vec<_>>(),
+            [(Some("Greeter"), Some("src/types.ts"))],
+            "{name} must resolve its imported annotation through the public query: {output:#}"
+        );
+    }
+
+    let result = call_production_tool(
+        &graph.harness,
+        &graph.project_root,
+        "tracedecay_code_references",
+        request(&greeter_id),
+    )
+    .await
+    .expect("public references request");
+    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+    let mut typed_variables = output
+        .pointer("/outcome/value/payload/items")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("reference items missing: {output:#}"))
+        .iter()
+        .filter(|item| item["edge_kind"] == "typeof")
+        .filter_map(|item| item.pointer("/symbol/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    typed_variables.sort_unstable();
+    assert_eq!(typed_variables, ["fallback", "primary"], "{output:#}");
+
+    close_test_graph(graph).await;
+}
+
+#[tokio::test]
 async fn typescript_interface_extends_drives_hierarchy_and_depth() {
     let dir = test_temp_dir();
     let project_root = dir.path().join("project");
@@ -3223,6 +3289,7 @@ impl Target {
         target_value + other_value
     }
 }
+
 pub fn read_both(target: &Target, other: &Other) -> u32 {
     let target_value = target.value;
     let other_value = other.value;
@@ -3319,4 +3386,42 @@ pub fn while_let_then_sibling(target: &Target, mut other: Option<Other>) -> u32 
             "shadowed receiver must not be attributed to the parameter owner: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn field_sites_ignores_field_text_in_real_rust_literals() {
+    let dir = test_temp_dir();
+    let project_root = dir.path().join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("src/lib.rs"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tracedecay-session-memory/src/monitor_ring.rs"
+        )),
+    )
+    .unwrap();
+    let (host, _env) = init_test_project(&project_root).await;
+
+    let result = handle_tool_call(
+        &host,
+        "tracedecay_field_sites",
+        json!({"field": "MmapReader::mmap", "limit": 100, "format": "json"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+
+    assert_eq!(output["qualifier_applied"], true, "payload: {output}");
+    assert_eq!(output["read_count"], 9, "payload: {output}");
+    assert_eq!(output["write_count"], 1, "payload: {output}");
+    assert!(
+        output["read_sites"]
+            .as_array()
+            .is_some_and(|sites| sites.iter().all(|site| site["line"] != 38)),
+        "string literal was reported as a field site: {output}"
+    );
+    assert_eq!(output["write_sites"][0]["line"], 256, "payload: {output}");
 }

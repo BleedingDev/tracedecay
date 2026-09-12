@@ -17,11 +17,10 @@ use tracedecay_domain::{
     RetrieverOutcome, ScoreDomainId, split_subtokens, technical_tokens,
 };
 
-use super::graph::GraphExecutionControl;
 use super::ports::{
     CodeCandidateBindingV1, LaneBoundEvidence, LaneEvidenceRejections, LexicalPostingReadPort,
-    RetrievalPortError, candidate_checkpoint_prefix, checkpoint_digest, contract_error,
-    lane_bound_evidence, lane_candidate_cap,
+    RetrievalExecutionControl, RetrievalPortError, candidate_checkpoint_prefix, checkpoint_digest,
+    contract_error, lane_bound_evidence, lane_candidate_cap,
 };
 
 mod projection;
@@ -31,16 +30,20 @@ pub use self::projection::{
     CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_MAXIMUM_PAGE_RETAINED_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeExactLexicalArtifactReaderV1,
-    CodeExactProjectionAdapterV1, CodeLexicalArtifactBatchLimitV1,
-    CodeLexicalArtifactBuildProgressV1, CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
+    CodeLexicalArtifactBatchLimitV1, CodeLexicalArtifactBuildProgressV1,
+    CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
     CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
     CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
     CodeLexicalArtifactSectionDigestV1, CodeLexicalArtifactWriterRevisionV1,
-    CodeLexicalImportMembershipWitnessV1, CodeLexicalProjectionAdapterV1,
-    CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
-    CodeLexicalProjectionMetadataV1, LEXICAL_PROJECTION_BUILD_DEADLINE_MICROS_V1,
+    CodeLexicalImportMembershipWitnessV1, CodeLexicalProjectionMetadataV1,
     PreparedCodeLexicalArtifactBatchV1, PreparedCodeLexicalArtifactPageV1,
-    VerifiedCodeLexicalArtifactV1, lexical_projection_build_deadline_micros,
+    VerifiedCodeLexicalArtifactV1, code_lexical_artifact_build_memory_budget_for,
+};
+#[cfg(feature = "search-eval")]
+pub use self::projection::{
+    CodeExactProjectionAdapterV1, CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1,
+    CodeLexicalProjectionBuildV1, LEXICAL_PROJECTION_BUILD_DEADLINE_MICROS_V1,
+    lexical_projection_build_deadline_micros,
 };
 pub use self::routes::{
     LexicalAnchorV1, LexicalRouteErrorV1, LexicalRouteKindV1, LexicalRouteMatchV1,
@@ -247,7 +250,7 @@ pub struct LexicalLaneRequest<'a> {
     /// search execution permit occupied while the remaining rows decode and
     /// score. Cancellation unwinds the scan with
     /// [`RetrievalPortError::Cancelled`] instead of an empty or partial batch.
-    pub control: &'a dyn GraphExecutionControl,
+    pub control: &'a dyn RetrievalExecutionControl,
 }
 
 /// The lexical lane's cooperative cancellation checkpoint.
@@ -257,7 +260,7 @@ pub struct LexicalLaneRequest<'a> {
 /// after the signal. An uncancelled request never observes it, which keeps
 /// candidate order, evidence, and coverage identical to an unchecked scan.
 pub(crate) fn lexical_checkpoint(
-    control: &dyn GraphExecutionControl,
+    control: &dyn RetrievalExecutionControl,
 ) -> Result<(), RetrievalPortError> {
     if control.is_cancelled() {
         return Err(RetrievalPortError::Cancelled);

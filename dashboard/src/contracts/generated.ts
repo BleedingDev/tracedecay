@@ -675,7 +675,7 @@ export const CodeIndexBuildProgressV1Schema = z.object({
   committed_pages: z.number().int().safe().min(0),
   committed_payload_bytes: z.number().int().safe().min(0),
   completed_files: z.number().int().safe().min(0),
-  completed_lexical_bytes: z.number().int().safe().min(0),
+  completed_lexical_units: z.number().int().safe().min(0),
   current_batch_pages: z.number().int().safe().min(0),
   current_batch_payload_bytes: z.number().int().safe().min(0),
   daemon_incarnation: z.number().int().safe().min(0),
@@ -685,13 +685,13 @@ export const CodeIndexBuildProgressV1Schema = z.object({
   generation_id: z.string(),
   last_commit_latency_micros: z.number().int().safe().min(0).nullable(),
   last_progress_micros: z.number().int().safe(),
-  lexical_bytes_per_second: z.number().nullable(),
+  lexical_units_per_second: z.number().nullable(),
   phase: z.lazy(() => CodeIndexBuildPhaseV1Schema),
   producer_incarnation: z.number().int().safe().min(0),
   progress_epoch: z.number().int().safe().min(0),
   sealed_source_digest: z.string(),
   total_files: z.number().int().safe().min(0),
-  total_lexical_bytes: z.number().int().safe().min(0),
+  total_lexical_units: z.number().int().safe().min(0),
 });
 export type CodeIndexBuildProgressV1 = z.infer<typeof CodeIndexBuildProgressV1Schema>;
 
@@ -1744,7 +1744,7 @@ The storage family never reports a silent overage: each subclass names one
 observable retention/size condition Doctor surfaces over canonical size
 observability read models. The set is closed and grows only through a future
 versioned enum, never by widening an existing subclass. */
-export const DoctorStorageFindingKindV1Schema = z.union([z.literal("over_budget_store"), z.literal("orphan_store"), z.literal("incident_debris_present"), z.literal("retention_backlog"), z.literal("table_growth")]);
+export const DoctorStorageFindingKindV1Schema = z.union([z.literal("over_budget_store"), z.literal("orphan_store"), z.literal("incident_debris_present"), z.literal("retention_backlog"), z.literal("table_growth"), z.literal("pending_schema_migration")]);
 export type DoctorStorageFindingKindV1 = z.infer<typeof DoctorStorageFindingKindV1Schema>;
 
 export const DuplicateEffectOutcomeV1Schema = z.enum(["committed", "not_applicable", "prevented", "unknown"]);
@@ -5174,7 +5174,13 @@ export const WorkAttemptReceiptV1Schema = z.object({
 }).strict();
 export type WorkAttemptReceiptV1 = z.infer<typeof WorkAttemptReceiptV1Schema>;
 
-/** What resume-after-restart did to each open attempt. */
+/** What restart recovery did to each open attempt.
+
+This report never claims that a provider resumed. An attempt in
+`recovery_required` remains fenced under its original identity. This report
+does not authorize another launch; an explicit `retry_attempt` must verify
+the exact recovery fence and effect safety before it can atomically admit a
+new identity. */
 export const WorkAttemptRecoveryReportV1Schema = z.object({
   cancelled: z.array(z.lazy(() => WorkAttemptV1Schema)),
   recovery_required: z.array(z.lazy(() => WorkAttemptV1Schema)),
@@ -5616,6 +5622,7 @@ export type WorkExperienceApplicabilityV1 = z.infer<typeof WorkExperienceApplica
 
 export const WorkExperienceCandidateV1Schema = z.object({
   applicability: z.array(z.lazy(() => WorkExperienceApplicabilityV1Schema)),
+  attempt_receipts: z.array(z.lazy(() => WorkAttemptReceiptV1Schema)),
   evidence: z.array(z.lazy(() => TaskEvidenceLinkV1Schema)),
   item: z.lazy(() => WorkItemV1Schema),
 }).strict();
@@ -5886,6 +5893,13 @@ export const WorkflowRunEventKindSchema = z.discriminatedUnion("type", [z.object
 }), z.object({
   type: z.literal("cancelled"),
 }), z.object({
+  planned_attempt: z.lazy(() => WorkAttemptIdentityV1Schema),
+  prior_attempt: z.lazy(() => WorkAttemptIdentityV1Schema),
+  replacement_attempt: z.lazy(() => WorkAttemptIdentityV1Schema),
+  retry_receipt_digest: z.lazy(() => ManifestDigestSchema),
+  step_id: z.lazy(() => WorkflowStepIdSchema),
+  type: z.literal("fan_out_child_retry_rebound"),
+}), z.object({
   attempts: z.array(z.lazy(() => WorkAttemptIdentityV1Schema)),
   step_id: z.lazy(() => WorkflowStepIdSchema),
   type: z.literal("fan_out_children_released"),
@@ -5920,6 +5934,7 @@ export const WorkflowRunGetRequestSchema = z.object({
 export type WorkflowRunGetRequest = z.infer<typeof WorkflowRunGetRequestSchema>;
 
 export const WorkflowRunProjectionSchema = z.object({
+  active_fan_out_attempts: z.record(z.lazy(() => WorkAttemptIdentityV1Schema)),
   definition: z.lazy(() => WorkflowDefinitionSchema),
   fan_out_plans: z.record(z.lazy(() => WorkflowFanOutPlanV1Schema)),
   history: z.array(z.lazy(() => WorkflowRunEventSchema)),
@@ -6798,6 +6813,7 @@ export type WorkRankedRouteV1 = z.infer<typeof WorkRankedRouteV1Schema>;
 export const WorkRecoveryStateV1Schema = z.discriminatedUnion("state", [z.object({
   state: z.literal("fresh"),
 }), z.object({
+  observed_at: z.lazy(() => UtcMicrosSchema),
   reason: z.lazy(() => WorkRestartReasonV1Schema),
   source_attempt_id: z.union([z.lazy(() => AttemptIdSchema), z.null()]),
   state: z.literal("recovery_required"),
@@ -6844,7 +6860,7 @@ export const WorkRetryAttemptOutcomeV1Schema = z.discriminatedUnion("outcome", [
 }).strict()]);
 export type WorkRetryAttemptOutcomeV1 = z.infer<typeof WorkRetryAttemptOutcomeV1Schema>;
 
-export const WorkRetryCauseV1Schema = z.literal("runtime_failure");
+export const WorkRetryCauseV1Schema = z.enum(["restart_recovery_required", "runtime_failure"]);
 export type WorkRetryCauseV1 = z.infer<typeof WorkRetryCauseV1Schema>;
 
 /** A selector into the owning runtime-terminal evidence authority.

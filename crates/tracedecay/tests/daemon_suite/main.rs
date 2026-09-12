@@ -12,6 +12,7 @@
 //! classification, heartbeat staleness) is unit-tested inline in
 //! `src/daemon/git_watch.rs`.
 
+#![allow(clippy::too_many_lines)]
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -22,7 +23,6 @@ mod authentication_refusal_test;
 mod code_index_journey;
 #[cfg(unix)]
 mod dirty_worktree_symbol_reads_test;
-mod fixture_authority_test;
 #[cfg(feature = "test-transport")]
 mod git_watch_test;
 #[cfg(all(unix, feature = "test-transport"))]

@@ -94,8 +94,9 @@ pub use production::{
 };
 pub use production::{
     PreparedProductionSemanticRuntimeCommitV1, PreparedSemanticEvaluationGenerationV1,
-    ProductionSemanticRuntimeV1, SavedCodeGenerationScheduleHookV1,
-    SavedGenerationScheduleHookParametersV1, SemanticCompatibleCurrentGenerationSnapshotV1,
+    ProductionSemanticRuntimeV1, RetiredProjectSemanticRuntimeV1,
+    SavedCodeGenerationScheduleHookV1, SavedGenerationScheduleHookParametersV1,
+    SavedGenerationScheduleOutcomeV1, SemanticCompatibleCurrentGenerationSnapshotV1,
     SemanticEvaluationCurrentGenerationSnapshotV1, SemanticEvaluationLifecycleVerificationV1,
     SemanticEvaluationPublicationLeaseV1, SemanticVectorPublicationLeaseV1,
     SemanticVerifiedEvaluationTargetSnapshotV1, lifecycle_to_runtime_state,

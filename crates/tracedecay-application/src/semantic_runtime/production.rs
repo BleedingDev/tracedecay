@@ -18,7 +18,7 @@ use tracedecay_domain::{
     ProjectionOperationV1, ProjectionReplayReasonV1, QueryFallbackSubpayload, RetrievalAnchorId,
     RetrievalCursorKeyId, RetrieverBatch, RetrieverKind, RetrieverOutcome, ScoreDomainId,
     SemanticSearchIndexKeyV1, SemanticSearchIndexKindV1, SemanticSearchIndexProfileV1,
-    SourceOccurrenceId, VectorGenerationIdV1, WorktreeId, canonical_sha256,
+    SourceOccurrenceId, VectorGenerationIdV1, WorktreeId, canonical_sha256, sha256_hex_suffix,
 };
 use tracedecay_policy::retrieval_selection::{
     RetrievalAvailabilityV1, RetrievalRequirementV1, RetrievalSelectionV1, select_retrieval,
@@ -55,19 +55,18 @@ use tracedecay_graph_db::GraphCancellation;
 use tracedecay_query::retrieval::AuthorizedQueryFallbackV1;
 use tracedecay_query::retrieval::fusion::RetrievalCursorKeyringV1;
 use tracedecay_query::retrieval::graph::production_code_index_freshness;
+use tracedecay_query::retrieval::ports::RetrievalExecutionControl;
 use tracedecay_query::retrieval::ports::{
     CodeCandidateBindingV1, CodeOccurrenceRefV1, RetrievalPortError,
 };
-use tracedecay_query::retrieval::rerank::RerankExecutionControlV1;
 use tracedecay_query::retrieval::semantic::{
     CalibratedSemanticQueryService, CodeSemanticEvidenceV1, CompleteSemanticGenerationV1,
     SemanticAbstentionDispositionV1, SemanticAnnCandidateWindowV1, SemanticAnnCandidatesV1,
     SemanticAnnIndexStateV1, SemanticCalibrationProfileV1, SemanticCodeRetriever,
-    SemanticExecutionControl, SemanticIndexStateV1, SemanticLaneReadinessV1, SemanticLaneRetriever,
-    SemanticQueryDecisionV1, SemanticQueryModeV1, SemanticQueryServiceError,
-    SemanticQueryServiceOutcomeV1, SemanticRetrievalRequestV1, SemanticSearchKindV1,
-    SemanticVectorReadPort, SemanticVectorReadRequestV1, SemanticVectorRecordV1,
-    SemanticVectorScanSummaryV1,
+    SemanticIndexStateV1, SemanticLaneReadinessV1, SemanticLaneRetriever, SemanticQueryDecisionV1,
+    SemanticQueryModeV1, SemanticQueryServiceError, SemanticQueryServiceOutcomeV1,
+    SemanticRetrievalRequestV1, SemanticSearchKindV1, SemanticVectorReadPort,
+    SemanticVectorReadRequestV1, SemanticVectorRecordV1, SemanticVectorScanSummaryV1,
 };
 use tracedecay_query::search_quality::candidate_output::ProductionCandidateSemanticProjectionSourcesV1;
 use tracedecay_query::search_quality::semantic_native::{
@@ -678,10 +677,7 @@ impl ProductionSemanticRuntimeV1 {
     > {
         let artifact = installed_artifact_member_bytes(&self.lifecycle)
             .map_err(|_| SemanticRuntimeBackendErrorV1::Unavailable)?;
-        Ok(evaluation_target_resource_requirement(
-            self.resources,
-            artifact,
-        ))
+        evaluation_target_resource_requirement(self.resources, artifact)
     }
 
     /// Prepare one evaluator generation with authorities retained by the
@@ -719,7 +715,7 @@ impl ProductionSemanticRuntimeV1 {
                 request,
                 generation.chunks().chunks(),
                 embedding_documents(generation),
-                evaluation_projection_resources(execution),
+                evaluation_projection_resources(execution)?,
                 projection_batch_cache.as_ref(),
                 SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
                 Arc::clone(&cancellation),
@@ -789,7 +785,7 @@ impl ProductionSemanticRuntimeV1 {
                 request,
                 &chunks,
                 embedding_documents(generation),
-                evaluation_projection_resources(self.resources),
+                evaluation_projection_resources(self.resources)?,
                 current.projection_batch_cache.as_ref(),
                 SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
                 Arc::clone(&current.cancellation),
@@ -1365,7 +1361,7 @@ impl ProductionSemanticRuntimeV1 {
             request,
             &chunks,
             embedding_documents(generation),
-            evaluation_projection_resources(self.resources),
+            evaluation_projection_resources(self.resources)?,
             projection_batch_cache.as_ref(),
             SemanticEvaluationProjectionBatchCachePolicyV1::ReuseCompletedBatches,
             Arc::clone(cancellation),
@@ -1554,7 +1550,7 @@ impl ProductionSemanticRuntimeV1 {
             semantic_compatibility: lifecycle_verification.compatibility.clone(),
             vector_state_revision: verified.vector_state_revision,
             vector_generation_id: verified.vector_generation_id,
-            configured_resource_ceiling: configured_semantic_resource_ceiling(self.resources),
+            configured_resource_ceiling: configured_semantic_resource_ceiling(self.resources)?,
             lifecycle_verification,
         })
     }
@@ -2320,7 +2316,7 @@ impl ProductionSemanticRuntimeV1 {
         fallback: Arc<QueryFallbackSubpayload>,
     ) -> Result<SemanticQueryServiceOutcomeV1, SemanticQueryServiceError>
     where
-        C: SemanticExecutionControl + Sync,
+        C: RetrievalExecutionControl + Sync,
     {
         if request.code_generation == code_generation.manifest().generation_id
             && request.capability_manifest_digest == code_generation.capability().manifest_digest
@@ -2704,23 +2700,13 @@ struct SemanticEvaluationExecutionControlV1 {
     cancellation: Arc<dyn SemanticEvaluationCancellationV1>,
 }
 
-impl SemanticExecutionControl for SemanticEvaluationExecutionControlV1 {
+impl RetrievalExecutionControl for SemanticEvaluationExecutionControlV1 {
     fn is_cancelled(&self) -> bool {
         self.cancellation.interruption().is_some()
     }
 
     fn elapsed_micros(&self) -> u64 {
         self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-    }
-}
-
-impl RerankExecutionControlV1 for SemanticEvaluationExecutionControlV1 {
-    fn elapsed_micros(&self) -> u64 {
-        self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancellation.interruption().is_some()
     }
 }
 
@@ -2806,7 +2792,7 @@ impl SemanticRuntimeGenerationInspectorV1 for ProductionSemanticRuntimeV1 {
             let artifact_digest = state.artifact_digest();
             let expected_artifact = required.artifact_manifest_digest.as_str();
             if artifact_digest != expected_artifact
-                && expected_artifact.strip_prefix("sha256:") != Some(artifact_digest)
+                && sha256_hex_suffix(expected_artifact) != Some(artifact_digest)
             {
                 return Err(SemanticRuntimeBackendErrorV1::RejectedAt(
                     SemanticRuntimeRefusalV1::at("inspect_generation.artifact_digest"),
@@ -2889,7 +2875,12 @@ fn configured_resource_ceiling_covers(
 ) -> bool {
     configured.max_model_bytes >= required.model_bytes
         && configured.max_tokenizer_bytes >= required.tokenizer_bytes
-        && configured.max_resident_bytes >= required.resident_bytes
+        // An unresolved resident ceiling covers nothing: composition resolves
+        // it against the host before this runtime exists, so `None` here means
+        // no ceiling was ever admitted, not an unbounded one.
+        && configured
+            .max_resident_bytes
+            .is_some_and(|ceiling| ceiling >= required.resident_bytes)
         && configured.max_threads >= required.threads
         && configured.max_concurrent_sessions >= required.max_concurrent_sessions
         && configured.max_batch_size >= required.batch_size
@@ -2899,35 +2890,52 @@ fn configured_resource_ceiling_covers(
 
 fn configured_semantic_resource_ceiling(
     configured: SemanticResourceCeilings,
-) -> crate::config::retrieval::SemanticResourceRequirementV1 {
-    crate::config::retrieval::SemanticResourceRequirementV1 {
+) -> Result<crate::config::retrieval::SemanticResourceRequirementV1, SemanticRuntimeBackendErrorV1>
+{
+    Ok(crate::config::retrieval::SemanticResourceRequirementV1 {
         model_bytes: configured.max_model_bytes,
         tokenizer_bytes: configured.max_tokenizer_bytes,
-        resident_bytes: configured.max_resident_bytes,
+        resident_bytes: resolved_resident_ceiling(configured)?,
         threads: configured.max_threads,
         max_concurrent_sessions: configured.max_concurrent_sessions,
         batch_size: configured.max_batch_size,
         sequence_length: configured.max_sequence_length,
         load_deadline_ms: configured.load_deadline_ms,
-    }
+    })
+}
+
+/// The resident ceiling composition resolved against this host.
+///
+/// Reading it before that resolution is a refusal rather than a substituted
+/// default: every requirement minted from it is compared against a measured
+/// evaluation report, so an invented ceiling would be admitted as evidence.
+fn resolved_resident_ceiling(
+    configured: SemanticResourceCeilings,
+) -> Result<u64, SemanticRuntimeBackendErrorV1> {
+    configured
+        .resolved_max_resident_bytes()
+        .map_err(|_| SemanticRuntimeBackendErrorV1::Unavailable)
 }
 
 fn evaluation_target_resource_requirement(
     configured: SemanticResourceCeilings,
     artifact: InstalledArtifactMemberBytesV1,
-) -> crate::config::retrieval::SemanticResourceRequirementV1 {
-    let mut requirement = configured_semantic_resource_ceiling(configured);
+) -> Result<crate::config::retrieval::SemanticResourceRequirementV1, SemanticRuntimeBackendErrorV1>
+{
+    let mut requirement = configured_semantic_resource_ceiling(configured)?;
     requirement.model_bytes = artifact.model;
     requirement.tokenizer_bytes = artifact.tokenizer;
-    requirement
+    Ok(requirement)
 }
 
 fn evaluation_projection_resources(
     configured: SemanticResourceCeilings,
-) -> SemanticEvaluationProjectionResourcesV1 {
-    SemanticEvaluationProjectionResourcesV1 {
-        memory_ceiling_bytes: configured.max_resident_bytes,
-    }
+) -> Result<SemanticEvaluationProjectionResourcesV1, SemanticRuntimeScheduleFailureV1> {
+    Ok(SemanticEvaluationProjectionResourcesV1 {
+        memory_ceiling_bytes: configured
+            .resolved_max_resident_bytes()
+            .map_err(|_| SemanticRuntimeScheduleFailureV1::Runtime)?,
+    })
 }
 
 fn canonical_exact_flat_search_index_key()
@@ -3041,7 +3049,7 @@ fn lifecycle_artifact_matches(
 ) -> bool {
     let observed = lifecycle_state.artifact_digest();
     observed == expected_artifact.as_str()
-        || expected_artifact.as_str().strip_prefix("sha256:") == Some(observed)
+        || sha256_hex_suffix(expected_artifact.as_str()) == Some(observed)
 }
 
 fn check_evaluation_cancellation(
@@ -3113,7 +3121,7 @@ fn accepted_semantic_resources(
     SemanticResourceCeilings {
         max_model_bytes: accepted.model_bytes,
         max_tokenizer_bytes: accepted.tokenizer_bytes,
-        max_resident_bytes: accepted.resident_bytes,
+        max_resident_bytes: Some(accepted.resident_bytes),
         max_threads: accepted.threads,
         max_concurrent_sessions: accepted.max_concurrent_sessions,
         max_batch_size: accepted.batch_size,
@@ -3990,7 +3998,7 @@ pub fn compose_application_semantic_search<'a, V, C>(
 ) -> Result<SemanticQueryServiceOutcomeV1, SemanticQueryServiceError>
 where
     V: SemanticVectorReadPort,
-    C: SemanticExecutionControl + Sync,
+    C: RetrievalExecutionControl + Sync,
 {
     let ApplicationSemanticSearchParametersV1 {
         handle,
@@ -4056,7 +4064,7 @@ pub async fn compose_project_application_semantic_search<C>(
     fallback: Arc<QueryFallbackSubpayload>,
 ) -> Result<SemanticQueryServiceOutcomeV1, SemanticQueryServiceError>
 where
-    C: SemanticExecutionControl + Sync,
+    C: RetrievalExecutionControl + Sync,
 {
     let Some(runtime) = project_semantic_production_runtime(project_root) else {
         return execute_calibrated_semantic_query(
@@ -4104,7 +4112,7 @@ impl ProductionProjectSemanticSearchBridgeV1 {
         parameters: AuthorizedProjectSemanticSearchParametersV1<'a, C>,
     ) -> SemanticRuntimeFuture<'a, Result<SemanticQueryServiceOutcomeV1, SemanticQueryServiceError>>
     where
-        C: SemanticExecutionControl + Sync + 'a,
+        C: RetrievalExecutionControl + Sync + 'a,
     {
         let AuthorizedProjectSemanticSearchParametersV1 {
             project_root,
@@ -4263,17 +4271,35 @@ pub fn register_project_semantic_runtime(
         .insert(project_root, handle);
 }
 
-/// Drop a retained project semantic handle.
-pub fn unregister_project_semantic_runtime(project_root: &Path) {
-    super::unregister_project_semantic_redundancy_generation(project_root);
-    project_semantic_handles()
+/// Everything a project's semantic unregistration released from the
+/// process-local registries, handed back so the caller decides where it is
+/// freed. The retained code generations and the query runtime cache are
+/// generation-sized; dropping them inside the registry locks (or inline on
+/// the daemon shutdown drain) is what held shutdown past its TERM grace.
+#[must_use = "drop this off the registry locks; it owns generation-sized memory"]
+pub struct RetiredProjectSemanticRuntimeV1 {
+    _generations: Vec<Arc<tracedecay_code_index::production::CodeIndexPublishedGenerationV1>>,
+    _handle: Option<DaemonSemanticRuntimeHandleV1>,
+    _runtime: Option<ProductionSemanticRuntimeV1>,
+}
+
+/// Remove a project's semantic handle, runtime, and redundancy state from the
+/// process-local registries. The removed owners are returned, not dropped.
+pub fn unregister_project_semantic_runtime(project_root: &Path) -> RetiredProjectSemanticRuntimeV1 {
+    let generations = super::unregister_project_semantic_redundancy_generation(project_root);
+    let handle = project_semantic_handles()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(project_root);
-    project_semantic_production_runtimes()
+    let runtime = project_semantic_production_runtimes()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(project_root);
+    RetiredProjectSemanticRuntimeV1 {
+        _generations: generations,
+        _handle: handle,
+        _runtime: runtime,
+    }
 }
 
 pub fn project_semantic_production_runtime(
@@ -4388,13 +4414,68 @@ pub fn project_lifecycle_status(project_path: &Path) -> Option<SemanticModelLife
     None
 }
 
+/// Why a published code generation did or did not enter semantic projection.
+///
+/// Every decline was previously a bare `false` that each caller discarded, so
+/// a daemon whose runtime stopped scheduling sat at `installed` with no record
+/// of why nothing was queued (#753). The runtime's own declines are already
+/// named by `semantic_projection_schedule`; these are the handoff-boundary
+/// reasons that never reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SavedGenerationScheduleOutcomeV1 {
+    /// Semantic projection was queued for this generation.
+    Scheduled,
+    /// No semantic runtime is mounted on this scheduler — never mounted, or
+    /// retired by a remount — so no hook observed the generation at all.
+    RuntimeNotMounted,
+    /// The generation belongs to a different worktree than the mounted runtime.
+    ForeignWorktree,
+    /// The hook was built outside a Tokio runtime, so projection has no
+    /// executor to dispatch onto.
+    NoDispatchRuntime,
+    /// The fair projection scheduler refused the batch (queue capacity,
+    /// cancellation); `semantic_projection_schedule` carries the detail.
+    QueueRefused,
+    /// The hook panicked; the generation remains serving.
+    HookPanicked,
+    /// The code-index scheduler itself could not be reached: the worktree is
+    /// not mounted, or it is shutting down.
+    SchedulerUnavailable,
+    /// The mounted worktree has not sealed a serving generation yet, so there
+    /// is nothing to offer.
+    NoServingGeneration,
+}
+
+impl SavedGenerationScheduleOutcomeV1 {
+    #[must_use]
+    pub fn is_scheduled(self) -> bool {
+        matches!(self, Self::Scheduled)
+    }
+
+    /// Fixed, privacy-safe classification for the diagnostic record.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::RuntimeNotMounted => "runtime_not_mounted",
+            Self::ForeignWorktree => "foreign_worktree",
+            Self::NoDispatchRuntime => "no_dispatch_runtime",
+            Self::QueueRefused => "queue_refused",
+            Self::HookPanicked => "hook_panicked",
+            Self::SchedulerUnavailable => "scheduler_unavailable",
+            Self::NoServingGeneration => "no_serving_generation",
+        }
+    }
+}
+
 /// Hook invoked after a code generation publishes; must not block search.
 ///
 /// The serving owner transfers a shared handle because one decoded generation
 /// can be much larger than its captured source. Semantic retention and queued
 /// projection must clone this `Arc`, never the immutable generation payload.
-pub type SavedCodeGenerationScheduleHookV1 =
-    Arc<dyn Fn(Arc<CodeIndexPublishedGenerationV1>) -> bool + Send + Sync>;
+pub type SavedCodeGenerationScheduleHookV1 = Arc<
+    dyn Fn(Arc<CodeIndexPublishedGenerationV1>) -> SavedGenerationScheduleOutcomeV1 + Send + Sync,
+>;
 
 /// Owned authorities and identities captured by a saved-generation hook.
 pub struct SavedGenerationScheduleHookParametersV1 {
@@ -4416,9 +4497,13 @@ pub struct SavedGenerationScheduleHookParametersV1 {
 /// Artifact admission remains owned by the model lifecycle. Until a complete
 /// compatible artifact is available the background task fails closed without
 /// joining into exact/lexical/graph search.
+///
+/// The resident ceiling is resolved once here rather than per generation: it
+/// is a composition-time fact, and an unresolved one is a typed refusal to
+/// build the hook at all instead of a number invented per batch.
 pub fn production_saved_generation_schedule_hook(
     parameters: SavedGenerationScheduleHookParametersV1,
-) -> SavedCodeGenerationScheduleHookV1 {
+) -> Result<SavedCodeGenerationScheduleHookV1, SemanticRuntimeBackendErrorV1> {
     let SavedGenerationScheduleHookParametersV1 {
         project_root,
         code_index_store_root,
@@ -4430,6 +4515,7 @@ pub fn production_saved_generation_schedule_hook(
         document_composition,
         fair_scheduler,
     } = parameters;
+    let resident_ceiling_bytes = resolved_resident_ceiling(resources)?;
     let runtime = Arc::new(ProductionSemanticRuntimeV1::new_with_code_index_store_root(
         handle,
         graph,
@@ -4444,9 +4530,9 @@ pub fn production_saved_generation_schedule_hook(
         .insert(project_root.clone(), runtime.as_ref().clone());
     // Capture before the synchronous publication hook crosses into spawn_blocking.
     let dispatch_runtime = tokio::runtime::Handle::try_current().ok();
-    Arc::new(move |generation| {
+    Ok(Arc::new(move |generation| {
         if generation.snapshot().worktree.as_ref() != Some(&worktree_id) {
-            return false;
+            return SavedGenerationScheduleOutcomeV1::ForeignWorktree;
         }
         super::register_project_semantic_redundancy_generation(
             project_root.clone(),
@@ -4454,7 +4540,7 @@ pub fn production_saved_generation_schedule_hook(
         );
         let runtime = Arc::clone(&runtime);
         let Some(dispatch_runtime) = dispatch_runtime.clone() else {
-            return false;
+            return SavedGenerationScheduleOutcomeV1::NoDispatchRuntime;
         };
         let queued_bytes = generation
             .chunks()
@@ -4469,7 +4555,7 @@ pub fn production_saved_generation_schedule_hook(
             worktree_id.clone(),
             generation.manifest().generation_id.clone(),
             queued_bytes,
-            resources.max_resident_bytes,
+            resident_ceiling_bytes,
         );
         let project_root = project_root.clone();
         fair_scheduler
@@ -4510,8 +4596,10 @@ pub fn production_saved_generation_schedule_hook(
                     "semantic projection could not be queued for this code generation"
                 );
             })
-            .is_ok()
-    })
+            .map_or(SavedGenerationScheduleOutcomeV1::QueueRefused, |_| {
+                SavedGenerationScheduleOutcomeV1::Scheduled
+            })
+    }))
 }
 
 fn fair_schedule_failure(
@@ -4586,54 +4674,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn configured_capacity_is_only_coverage_not_observed_resource_evidence() {
-        let configured = SemanticResourceCeilings {
-            max_model_bytes: 100,
-            max_tokenizer_bytes: 50,
-            max_resident_bytes: 500,
-            max_threads: 8,
-            max_concurrent_sessions: 2,
-            max_batch_size: 32,
-            max_sequence_length: 512,
-            load_deadline_ms: 30_000,
-        };
-        let accepted = crate::config::retrieval::SemanticResourceRequirementV1 {
-            model_bytes: 80,
-            tokenizer_bytes: 40,
-            resident_bytes: 400,
-            threads: 4,
-            max_concurrent_sessions: 1,
-            batch_size: 16,
-            sequence_length: 256,
-            load_deadline_ms: 20_000,
-        };
-
-        assert!(configured_resource_ceiling_covers(&configured, accepted));
-        assert_eq!(
-            configured_semantic_resource_ceiling(configured),
-            crate::config::retrieval::SemanticResourceRequirementV1 {
-                model_bytes: configured.max_model_bytes,
-                tokenizer_bytes: configured.max_tokenizer_bytes,
-                resident_bytes: configured.max_resident_bytes,
-                threads: configured.max_threads,
-                max_concurrent_sessions: configured.max_concurrent_sessions,
-                batch_size: configured.max_batch_size,
-                sequence_length: configured.max_sequence_length,
-                load_deadline_ms: configured.load_deadline_ms,
-            }
-        );
-        let applied = accepted_semantic_resources(accepted);
-        assert_eq!(applied.max_model_bytes, accepted.model_bytes);
-        assert_eq!(applied.max_tokenizer_bytes, accepted.tokenizer_bytes);
-        assert_eq!(applied.max_resident_bytes, accepted.resident_bytes);
-        assert_eq!(
-            applied.max_concurrent_sessions,
-            accepted.max_concurrent_sessions
-        );
-        assert_ne!(applied.max_resident_bytes, configured.max_resident_bytes);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn blocking_evaluation_drives_async_projection_on_daemon_runtime() {
         let observed = tokio::task::spawn_blocking(|| {
@@ -4663,34 +4703,6 @@ mod tests {
             .await
             .expect("captured runtime dispatch remains live")
             .expect("semantic dispatch reports completion");
-    }
-
-    #[test]
-    fn evaluation_target_uses_exact_artifact_bytes_inside_configured_capacity() {
-        let configured = SemanticResourceCeilings {
-            max_model_bytes: 700,
-            max_tokenizer_bytes: 64,
-            max_resident_bytes: 2_048,
-            max_threads: 8,
-            max_concurrent_sessions: 4,
-            max_batch_size: 32,
-            max_sequence_length: 512,
-            load_deadline_ms: 30_000,
-        };
-
-        let requirement = evaluation_target_resource_requirement(
-            configured,
-            InstalledArtifactMemberBytesV1 {
-                model: 633,
-                tokenizer: 5,
-            },
-        );
-
-        assert_eq!(requirement.model_bytes, 633);
-        assert_eq!(requirement.tokenizer_bytes, 5);
-        assert_eq!(requirement.resident_bytes, configured.max_resident_bytes);
-        assert_eq!(requirement.threads, configured.max_threads);
-        assert!(configured_resource_ceiling_covers(&configured, requirement));
     }
 
     #[test]
@@ -4977,18 +4989,8 @@ mod tests {
             cancellation: Arc::new(DeadlineCancellation),
         };
 
-        assert!(SemanticExecutionControl::is_cancelled(&control));
-        assert!(RerankExecutionControlV1::is_cancelled(&control));
-    }
-
-    #[test]
-    fn published_semantic_candidates_use_the_seated_score_domain() {
-        let domain = published_semantic_candidate_score_domain().expect("score domain");
-        assert_eq!(
-            domain.as_str(),
-            tracedecay_query::retrieval::QUERY_SEMANTIC_EVALUATION_SCORE_DOMAIN_V1
-        );
-        assert_ne!(domain.as_str(), "score.semantic-distance.daemon.v1");
+        assert!(RetrievalExecutionControl::is_cancelled(&control));
+        assert!(RetrievalExecutionControl::is_cancelled(&control));
     }
 
     fn projection_key() -> ProjectionKeyV1 {
@@ -5060,41 +5062,6 @@ mod tests {
             &source,
             &test_digest('e'),
         ));
-    }
-
-    #[test]
-    fn retained_vector_cache_returns_port_without_durable_load() {
-        let source = source_generation('r');
-        let vector = vector_generation('r');
-        let capability = test_digest('f');
-        let port = Arc::new(PublishedSemanticVectorReadPortV1 {
-            generation: vector.clone(),
-            projection_key: projection_key(),
-            search_index_key: search_index_key().clone(),
-            source_generation: source.clone(),
-            capability_manifest_digest: capability.clone(),
-            source_coherence: SemanticSourceCoherenceV1::ExactGeneration,
-            rows: Vec::new(),
-            ann: PublishedSemanticAnnBindingV1::Unavailable(SemanticAnnIndexStateV1::Unsupported),
-        });
-        let cache = Mutex::new(Some(CachedPublishedVectorsV1 {
-            generation: vector.clone(),
-            search_index_key: search_index_key().clone(),
-            source_generation: source.clone(),
-            port: Arc::clone(&port),
-        }));
-
-        let retained = retained_vector_read_port(
-            &cache,
-            &vector,
-            &projection_key(),
-            search_index_key(),
-            &source,
-            &capability,
-        )
-        .expect("exact retained vector port");
-
-        assert!(Arc::ptr_eq(&retained, &port));
     }
 
     fn pointer(vector: char, source: char) -> SemanticGenerationPointerV1 {
@@ -5571,7 +5538,7 @@ mod tests {
             checks: AtomicUsize,
         }
 
-        impl SemanticExecutionControl for CancelAtRuntimeBoundary {
+        impl RetrievalExecutionControl for CancelAtRuntimeBoundary {
             fn is_cancelled(&self) -> bool {
                 self.checks.fetch_add(1, Ordering::SeqCst) != 0
             }
@@ -5852,7 +5819,7 @@ mod tests {
             }
         }
         struct IdleControl;
-        impl SemanticExecutionControl for IdleControl {
+        impl RetrievalExecutionControl for IdleControl {
             fn is_cancelled(&self) -> bool {
                 false
             }
@@ -6116,6 +6083,30 @@ mod tests {
 
         struct DeterministicEncoder;
 
+        /// Fixture tokenizer: one token per whitespace-separated word, capped at the
+        /// admitted truncation length. The double has no model; grouping only needs a
+        /// length that varies with the document and can be predicted from a fixture.
+        impl tracedecay_semantic::projector::CanonicalChunkTokenLengthsV1 for DeterministicEncoder {
+            fn document_token_lengths(
+                &mut self,
+                key: &EmbeddingProjectionKeyV1,
+                chunks: &[&CodeSearchChunkV1],
+            ) -> Result<Vec<usize>, String> {
+                let truncation_length = key.truncation_length as usize;
+                Ok(chunks
+                    .iter()
+                    .map(|chunk| {
+                        chunk
+                            .sanitized_text
+                            .as_str()
+                            .split_whitespace()
+                            .count()
+                            .clamp(1, truncation_length)
+                    })
+                    .collect())
+            }
+        }
+
         impl CanonicalChunkVectorEncoderV1 for DeterministicEncoder {
             fn encode(
                 &mut self,
@@ -6150,6 +6141,7 @@ mod tests {
                 runtime_backend: "fastembed-ort".to_owned(),
                 runtime_build_revision: "ort-source-identity-1".to_owned(),
                 device_class: EmbeddingDeviceClassV1::Cpu,
+                execution_provider: tracedecay_domain::EmbeddingExecutionProviderV1::Cpu,
                 dimensions: 4,
                 metric: EmbeddingMetricV1::Cosine,
                 normalization: EmbeddingNormalizationV1::L2,

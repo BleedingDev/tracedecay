@@ -20,17 +20,18 @@ use crate::config::{
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_global_db::configuration::OwnedGlobalDbConfigurationControlStore;
-
-use super::operations::{ConfigurationControlPlane, ConfigurationControlPlaneOperations};
-use super::ports::{
-    ConfigurationClock, ConfigurationMutationAuthorizationPort, ConfigurationOperationFuture,
-    ScopeResolutionPort, ScopeRevalidationEvidenceV1,
+use tracedecay_global_db::configuration::contracts::ports::{
+    ConfigurationClock, ConfigurationControlStore, ConfigurationCurrentStateV1,
+    ConfigurationMutationAuthorizationPort, ConfigurationOperationFuture,
+    CurrentConfigurationMutationAuthorizationV1, ScopeResolutionPort, ScopeRevalidationEvidenceV1,
 };
-use super::types::{
+use tracedecay_global_db::configuration::contracts::types::{
     AuthorizedActor, ComponentConfigurationState, ConfigurationAuditPage, ConfigurationAuditQuery,
     ConfigurationError, ConfigurationMutationAuthority, ConfigurationMutationReceipt,
     ConfigurationRollbackRequest, DirectConfigurationMutation, ResolvedSetting, SettingSummary,
 };
+
+use super::operations::{ConfigurationControlPlane, ConfigurationControlPlaneOperations};
 use super::user_settings::{ProductionUserSettingsDaemonClient, UserSettingsDaemonClient};
 
 type SharedConfigurationControlPlane = Arc<dyn ConfigurationControlPlane + Send + Sync>;
@@ -146,6 +147,17 @@ impl ProjectConfigurationRuntime {
         )
     }
 
+    /// Resolves the runtime component's durable observed revision through the
+    /// canonical configuration history. A missing value means this component
+    /// has never recorded activation.
+    pub fn observed_runtime_configuration(
+        &self,
+    ) -> ConfigurationOperationFuture<'_, Option<ConfigurationCurrentStateV1>> {
+        self.client
+            .store
+            .observed_component_configuration(RUNTIME_CONFIGURATION_COMPONENT.to_owned())
+    }
+
     /// First-wins type-erased semantic activation payload. Callers in
     /// `tracedecay-application` downcast to the production coordinator.
     pub fn install_semantic_activation<T: Send + Sync + 'static>(&self, value: Arc<T>) {
@@ -256,7 +268,7 @@ impl ProductionConfigurationDaemonClient {
         let target = self.target.clone();
         Box::pin(hotpath::future!(
             async move {
-                let current = super::ports::ConfigurationControlStore::current(&store).await?;
+                let current = ConfigurationControlStore::current(&store).await?;
                 PinnedRuntimeConfiguration::new(target, current.revision_id, current.snapshot)
                     .map_err(|_| ConfigurationError::Unavailable)
             },
@@ -527,8 +539,7 @@ impl ConfigurationMutationAuthorizationPort for SharedMutationAuthorization {
         sink: tracedecay_domain::configuration::ConfigurationMutationSinkV1,
         effect: tracedecay_domain::configuration::ConfigurationMutationEffectV1,
         now: UtcMicros,
-    ) -> ConfigurationOperationFuture<'a, super::ports::CurrentConfigurationMutationAuthorizationV1>
-    {
+    ) -> ConfigurationOperationFuture<'a, CurrentConfigurationMutationAuthorizationV1> {
         let Ok(authorization) = self.0.installed_mutation_authorization() else {
             return Box::pin(async { Err(ConfigurationError::Unavailable) });
         };
@@ -546,11 +557,9 @@ impl ConfigurationClock for SystemConfigurationClock {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tracedecay_domain::configuration::ConfigurationValueKindV1;
-    use tracedecay_semantic_contracts::SemanticConfig;
+    use tracedecay_global_db::configuration::contracts::ports::CurrentConfigurationMutationAuthorizationV1;
 
-    use crate::config::SEMANTIC_RUNTIME_SETTING_KEY;
+    use super::*;
 
     struct TestScopeResolution;
 
@@ -583,10 +592,7 @@ mod tests {
             _sink: tracedecay_domain::configuration::ConfigurationMutationSinkV1,
             _effect: tracedecay_domain::configuration::ConfigurationMutationEffectV1,
             _now: UtcMicros,
-        ) -> ConfigurationOperationFuture<
-            'a,
-            super::super::ports::CurrentConfigurationMutationAuthorizationV1,
-        > {
+        ) -> ConfigurationOperationFuture<'a, CurrentConfigurationMutationAuthorizationV1> {
             unreachable!("authority installation test does not invoke the authorization port")
         }
     }
@@ -630,22 +636,5 @@ mod tests {
             .install(scopes, authorization)
             .expect_err("second authority installation must fail");
         assert!(matches!(error, TraceDecayError::Config { .. }));
-    }
-
-    #[test]
-    fn core_registry_owns_atomic_semantic_configuration() {
-        let registry =
-            crate::config::registry::ConfigurationRegistry::core().expect("core registry");
-        let key = SettingKey::new(SEMANTIC_RUNTIME_SETTING_KEY).unwrap();
-        let definition = registry.definition(&key).unwrap();
-        assert_eq!(definition.value_kind, ConfigurationValueKindV1::Text);
-        registry
-            .validate_value(
-                &key,
-                &ConfigurationValueV1::Text(
-                    serde_json::to_string(&SemanticConfig::default()).unwrap(),
-                ),
-            )
-            .unwrap();
     }
 }

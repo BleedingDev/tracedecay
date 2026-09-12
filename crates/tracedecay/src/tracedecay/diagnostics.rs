@@ -159,6 +159,7 @@ impl TraceDecay {
             self.serving_branch.clone(),
             self.fallback_warning.clone(),
             self.db_path(),
+            None,
         )
     }
 

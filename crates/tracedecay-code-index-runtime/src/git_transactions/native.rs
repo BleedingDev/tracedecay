@@ -9,7 +9,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Serialize;
 use tracedecay_contracts::{
     GitIndexApplyRequestV1, GitIndexPreviewPortResultV1, GitIndexPreviewRequestV1,
     GitIndexTransactionPortError, OperationBudgetUsage, OperationReceipt, OperationTermination,
@@ -23,11 +22,12 @@ use tracedecay_domain::{
     RepositoryIndexStateV1, RepositoryStateSnapshotV1, RepositoryWorkingTreeSnapshotV1,
     RepositoryWorkingTreeStateV1, UtcMicros, WorktreeId, canonical_sha256, parse_hunk_header,
 };
+use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_store::GitIndexTransactionRecordV1;
 
 use crate::git_index_transactions::{
     FixedGitIndexRunner, GIT_INDEX_ADAPTER_REVISION, NativeGitIndexError, NativeIndexLock,
-    ValidatedIndexPatch,
+    PatchDigestMaterial, ValidatedIndexPatch,
 };
 use tracedecay_application::git_intelligence::NativeGitIntelligence;
 
@@ -365,12 +365,12 @@ impl GitIndexPreviewAssembler for DaemonProjectGitIndexPreviewAssembler {
     ) -> Result<MaterializedGitIndexPreview, GitIndexTransactionPortError> {
         let scope = request.context.scope();
         if scope.project_id != self.project_id {
-            // The daemon has no tracing subscriber; its diagnostic channel is
-            // this event line, so anything emitted through tracing here is
-            // unreadable in the process that runs it.
-            eprintln!(
-                "[tracedecay] event=git_index_preview_project_mismatch requested={} mounted={}",
-                scope.project_id, self.project_id
+            log_daemon_event(
+                "git_index_preview_project_mismatch",
+                &[
+                    ("requested", scope.project_id.to_string()),
+                    ("mounted", self.project_id.to_string()),
+                ],
             );
             return Err(GitIndexTransactionPortError::StalePreview);
         }
@@ -459,9 +459,18 @@ impl GitIndexPreviewAssembler for NativeGitIndexPreviewAssembler {
             ) {
                 for (field, recaptured_value) in &recaptured {
                     if requested.get(field) != Some(recaptured_value) {
-                        eprintln!(
-                            "[tracedecay] event=git_index_preview_snapshot_field_changed field={field} recaptured={recaptured_value} requested={:?}",
-                            requested.get(field)
+                        log_daemon_event(
+                            "git_index_preview_snapshot_field_changed",
+                            &[
+                                ("field", field.clone()),
+                                ("recaptured", recaptured_value.to_string()),
+                                (
+                                    "requested",
+                                    requested
+                                        .get(field)
+                                        .map_or_else(|| "absent".to_owned(), ToString::to_string),
+                                ),
+                            ],
                         );
                     }
                 }
@@ -961,12 +970,6 @@ fn check_attr_filter_paths(
         return Err(());
     }
     Ok(filtered)
-}
-
-#[derive(Serialize)]
-struct PatchDigestMaterial<'a> {
-    header: &'a str,
-    body: &'a [String],
 }
 
 fn read_scope_diff(

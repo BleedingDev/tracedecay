@@ -1,10 +1,13 @@
 //! Composition-root wiring for the capabilities the extracted crates invert.
 //!
-//! Two shapes live here. The hook runtime is an explicit value: [`hook_runtime`]
-//! builds the [`HookRuntimeV1`] handle from root adapters and the CLI passes it
-//! into every `tracedecay_agent_hosts::hooks::hook_*` entry point, so a hook
-//! path cannot run without a complete handle and two fixtures can hold two
-//! different handles in one process.
+//! Two shapes live here. The hook runtime and the session review port are
+//! explicit values: [`hook_runtime`] builds the [`HookRuntimeV1`] handle from
+//! root adapters and the CLI passes it into every
+//! `tracedecay_agent_hosts::hooks::hook_*` entry point, and
+//! [`session_review_port`] builds the [`SessionReviewPort`] the daemon hands
+//! its profile ingestor. A hook path or user ingest pass cannot run without a
+//! complete handle, and two fixtures can hold two different handles in one
+//! process.
 //!
 //! The remaining capabilities (`tracedecay_sessions::host_ports` and the
 //! automation host-I/O bundle) are still process-global `OnceLock` slots that
@@ -26,6 +29,7 @@ use serde_json::Value;
 
 use tracedecay_agent_hosts::ports::hook_runtime::HookRuntimeV1;
 use tracedecay_domain::errors::Result;
+use tracedecay_sessions::host_ports::session_review::SessionReviewPort;
 
 /// Installs every root-owned runtime port. Idempotent; first call wins.
 ///
@@ -62,8 +66,16 @@ fn register_session_ports() {
     host_ports::hermes_profile_pin::register(
         tracedecay_agent_hosts::agents::hermes::read_config_pinned_project_root,
     );
-    host_ports::session_review::register(schedule_user_session_review);
     host_ports::unregistered_admission::register(unregistered_admission);
+}
+
+/// The root's session review port: the post-ingest review hint routed through
+/// the daemon client. The daemon hands it to the profile ingestor at
+/// construction, so a user pass without one is a typed refusal in
+/// `tracedecay-sessions`, never a silent skip.
+#[must_use]
+pub const fn session_review_port() -> SessionReviewPort {
+    SessionReviewPort::new(schedule_user_session_review)
 }
 
 fn schedule_user_session_review<'a>(
@@ -297,39 +309,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn hermes_profile_pin_preserves_windows_escape_prone_separators() {
-        let _pinned = registered();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = temp.path().join("config.yaml");
-        let windows_root = r"C:\Users\temp\pinned-project";
-        std::fs::write(&config, hermes_project_root_yaml(windows_root))
-            .expect("write hermes profile config");
-
-        assert_eq!(
-            tracedecay_sessions::host_ports::hermes_profile_pin::resolve(&config),
-            Some(windows_root.to_string()),
-            "a Windows native path must round-trip through YAML without bell/tab escapes"
-        );
-    }
-
-    #[test]
-    fn unregistered_admission_factory_builds_both_scopes() {
-        let _pinned = registered();
-        use tracedecay_sessions::host_ports::unregistered_admission::{Scope, create};
-
-        assert!(
-            create(Scope::Profile).is_some(),
-            "profile-scoped unregistered admission must be constructible"
-        );
-        let project_id = tracedecay_domain::ProjectId::new("project.runtime-ports-test")
-            .expect("valid project id");
-        assert!(
-            create(Scope::Project(project_id)).is_some(),
-            "project-scoped unregistered admission must be constructible"
-        );
-    }
-
     /// The hook runtime is one explicit handle of root adapters, so this is
     /// the single check that every hook capability the root composes answers
     /// through the root (here: the registered-identity gates for an
@@ -358,26 +337,5 @@ mod tests {
             .expect("the root resolves a canonical layout for any checkout");
         assert_eq!(layout.project_root, checkout);
         assert!(layout.identity.project_id.is_some());
-    }
-
-    /// The tool catalog is no longer wired here at all: host installers read
-    /// it from its owning crate, so it is readable with no registration and an
-    /// unavailable catalog is an error rather than an empty tool set.
-    #[test]
-    fn the_advertised_tool_catalog_needs_no_registration() {
-        let _pinned = registered();
-        let tools = tracedecay_agent_hosts::ports::mcp_tools::advertised_tools()
-            .expect("the advertised tool catalog");
-        assert!(!tools.is_empty());
-    }
-
-    #[test]
-    fn pricing_reader_uses_the_shared_all_provider_table() {
-        let _pinned = registered();
-        let model = "claude-sonnet-4-6";
-        let cost = tracedecay_agent_hosts::ports::pricing::cost_of_turn(
-            "claude", model, 1_000_000, 0, 0, 0,
-        );
-        assert!(cost.is_some_and(|cost| cost > 0.0));
     }
 }

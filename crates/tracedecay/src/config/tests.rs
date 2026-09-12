@@ -13,7 +13,9 @@ fn semantic_defaults_cover_the_cataloged_fastembed_model() {
         .expect("default semantic model is cataloged");
     let model_bytes = model.members.get("model").expect("model member").length;
     assert!(config.semantic.resources.max_model_bytes >= model_bytes);
-    assert!(config.semantic.resources.max_resident_bytes >= model_bytes.saturating_mul(2));
+    // The shipped configuration pins no resident ceiling: composition derives
+    // it from the host's admitted process memory.
+    assert_eq!(config.semantic.resources.max_resident_bytes, None);
     assert_eq!(
         config.semantic.resources.max_concurrent_sessions,
         tracedecay_semantic::embedding_parallelism::default_max_concurrent_sessions(),
@@ -421,15 +423,15 @@ mod runtime_configuration_cutover {
     use crate::config::registry::ConfigurationRegistry;
     use crate::config::resolver::{ConfigurationLayerV1, resolve_configuration};
     use crate::config::{
-        PinnedRuntimeConfiguration, RuntimeConfigurationCache, RuntimeConfigurationTarget,
+        DaemonRuntimeConfiguration, RuntimeConfigurationCache, RuntimeConfigurationTarget,
         cached_runtime_configuration, cached_sync_config, cached_telemetry_config,
         install_pinned_runtime_configuration, runtime_configuration_for_layout,
     };
     use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
+    use tracedecay_configuration::ProjectConfigurationRuntime;
     use tracedecay_configuration::TraceDecayConfig;
-    use tracedecay_configuration::{
+    use tracedecay_global_db::configuration::contracts::{
         ConfigurationControlStore, ConfigurationMutationAuthority, DirectConfigurationMutation,
-        ProjectConfigurationRuntime,
     };
 
     fn project_id(value: &str) -> ProjectId {
@@ -462,7 +464,7 @@ mod runtime_configuration_cutover {
         )
         .expect("explicit settings layer resolves")
         .snapshot;
-        let pinned = PinnedRuntimeConfiguration::new(
+        let pinned = DaemonRuntimeConfiguration::new(
             RuntimeConfigurationTarget {
                 project_id,
                 project_root: root.path().to_path_buf(),
@@ -520,7 +522,7 @@ mod runtime_configuration_cutover {
         let revision_id = revision_id("revision.runtime-cache-retarget");
         let cache = RuntimeConfigurationCache::default();
         cache.insert(
-            PinnedRuntimeConfiguration::new(
+            DaemonRuntimeConfiguration::new(
                 RuntimeConfigurationTarget {
                     project_id: project_id.clone(),
                     project_root: first_root.clone(),
@@ -531,7 +533,7 @@ mod runtime_configuration_cutover {
             .expect("first snapshot materializes"),
         );
         cache.insert(
-            PinnedRuntimeConfiguration::new(
+            DaemonRuntimeConfiguration::new(
                 RuntimeConfigurationTarget {
                     project_id: project_id.clone(),
                     project_root: second_root.clone(),

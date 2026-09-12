@@ -339,13 +339,6 @@ fn authority_does_not_report_truncation_at_exact_scan_boundary() {
     assert!(!history.truncated);
 }
 
-fn _assert_send_sync<T: Send + Sync>() {}
-
-#[test]
-fn authority_is_send_sync() {
-    _assert_send_sync::<GitRepositoryAuthority>();
-}
-
 #[test]
 fn authority_distinguishes_detached_unborn_and_unreadable_head() {
     let unborn = Fixture::init("sha1");
@@ -630,13 +623,24 @@ fn authority_reports_shallow_history_as_truncated_evidence() {
         source.commit(&format!("commit {index}"));
     }
     let shallow = tempfile::tempdir().unwrap();
+    // `file://` + a native path is not a URL git can parse: on Windows the
+    // backslashes make the drive letter read as a host. Spell the path
+    // plainly and with URL separators, the same way this fixture writes an
+    // `excludesFile` value.
+    let clone_source_url = format!(
+        "file:///{}",
+        tracedecay_runtime_core::path_safety::plain_host_path(source.path())
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
     let output = Command::new("git")
         .args([
             "clone",
             "--quiet",
             "--depth",
             "1",
-            &format!("file://{}", source.path().display()),
+            &clone_source_url,
             shallow.path().to_str().unwrap(),
         ])
         .output()

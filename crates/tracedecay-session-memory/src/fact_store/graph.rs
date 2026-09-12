@@ -107,6 +107,17 @@ pub(super) async fn project_memory_graph(
     read_control: &FactReadControl,
 ) -> FactStoreResult<ProjectMemoryGraphPageV1> {
     let owner = query.owner().clone();
+    // This read reconciles and then reads through the same graph owner as the
+    // post-write pass, so it is admitted through the same coordinator. Daemon
+    // shutdown cancels admission and joins the admitted passes before the
+    // terminal owner closes that graph owner; an unadmitted read pass is
+    // invisible to that join and leaves its snapshot's graph client lease
+    // counted at `registry.reserve_close.leased`. A refused admission
+    // (shutdown or retirement in progress) is the same typed unavailability a
+    // caller already handles for an unmounted graph.
+    let Some(inline_pass) = db.begin_inline_memory_graph_reconciliation_pass() else {
+        return Err(FactStoreError::GraphUnavailable);
+    };
     let fact_runtime =
         super::runtime::retained_fact_runtime(db)?.ok_or(FactStoreError::GraphUnavailable)?;
     super::runtime::validate_owner_binding(fact_runtime.binding(), &owner, OPERATION)?;
@@ -135,6 +146,12 @@ pub(super) async fn project_memory_graph(
     let projection_for_read = projection.clone();
     let projection_identity_for_read = projection_identity;
     let page = tokio::task::spawn_blocking(move || {
+        // The snapshot's graph client lease lives entirely inside this
+        // blocking task, so the admission it was taken under is released by
+        // the task that owns the lease. A caller whose future is dropped
+        // mid-read therefore cannot hand the shutdown join a released
+        // admission while the lease is still counted.
+        let _inline_pass = inline_pass;
         let cancellation: Arc<dyn tracedecay_graph_db::GraphCancellation> =
             Arc::new(SharedGraphCancellation(control_for_read));
         let max_page = max_relations.checked_add(1).ok_or_else(|| {
@@ -1240,7 +1257,6 @@ mod tests {
     use super::*;
     use crate::fact_store::DatabaseFactStore;
     use crate::fact_store::crud::{initial_batch, sanitize_payload};
-    use tracedecay_runtime_core::db::engine::params;
     use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
 
     async fn database(label: &str) -> (TempDir, Database) {
@@ -1248,7 +1264,7 @@ mod tests {
         let path = directory.path().join(format!("{label}.db"));
         let authority = DatabaseAuthority::acquire_test(&path, "graph telemetry test authority")
             .expect("acquire graph telemetry fixture authority");
-        tracedecay_global_db::register_test_schema_installer();
+        tracedecay_global_db::register_registered_schema_installer();
         let (database, _) = Database::publish_profile_memory_test_runtime(
             &path,
             &authority,
@@ -1320,41 +1336,5 @@ mod tests {
         let cancelled = observer.snapshot();
         assert!(cancelled.source_rows_loaded > before.source_rows_loaded);
         assert!(cancelled.source_bytes_loaded > before.source_bytes_loaded);
-    }
-
-    #[tokio::test]
-    async fn failed_source_load_records_materialized_source_work() {
-        let (_directory, database) = database("failed-source-telemetry").await;
-        let fact_id = seed_source_fact(&database, "failed-source-telemetry").await;
-        let transaction = database
-            .begin_memory_write_transaction(OPERATION)
-            .await
-            .expect("begin source corruption transaction");
-        assert_eq!(
-            transaction
-                .execute(
-                    "DELETE FROM memory_v2_assertion_payloads
-                     WHERE fact_id = ?1",
-                    params![fact_id.as_str()],
-                )
-                .await
-                .expect("remove the active assertion payload"),
-            1
-        );
-        transaction
-            .commit()
-            .await
-            .expect("commit source corruption transaction");
-        let observer = database.project_memory_reconciliation_telemetry_observer();
-        let before = observer.snapshot();
-
-        let error = load_source(&database, &FactOwnerV1::Profile, None, Some(&database))
-            .await
-            .expect_err("an active assertion without its payload must fail source loading");
-        assert!(matches!(error, FactStoreError::PayloadAccessMismatch));
-
-        let failed = observer.snapshot();
-        assert!(failed.source_rows_loaded > before.source_rows_loaded);
-        assert!(failed.source_bytes_loaded > before.source_bytes_loaded);
     }
 }

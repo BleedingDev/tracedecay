@@ -32,7 +32,9 @@ use tracedecay_domain::canonical_text::encode_lowercase_hex;
 #[cfg(test)]
 use tracedecay_domain::canonical_text::encode_tagged_lowercase_hex;
 use tracedecay_domain::canonical_text::{is_lowercase_hex, sha256_hex};
-use tracedecay_domain::{CodeGenerationId, ManifestDigest, UtcMicros, canonical_sha256};
+use tracedecay_domain::{
+    CodeGenerationId, ManifestDigest, UtcMicros, canonical_sha256, sha256_hex_suffix,
+};
 
 mod generation_scan;
 mod generation_transactions;
@@ -52,14 +54,14 @@ pub use locking::{
     try_acquire_code_generation_store_lock,
 };
 pub use scope_roots::{
-    RefusedCodeIndexScopeV1, ScopeRootAuthorityReceiptV1, ScopeRootBindingCleanupReplayV1,
-    ScopeRootCandidateBindingV1, ScopeRootLivenessProofV1, ScopeRootRetentionPlanV1,
-    ScopeRootRetentionReceiptV1, ScopeRootRetentionReportV1, StrandedCodeIndexScopeV1,
-    StrandedScopeRefusalV1, code_index_scope_store_root, code_index_store_root,
-    complete_scope_root_binding_cleanup, execute_scope_root_retention,
+    RefusedCodeIndexScopeV1, SCOPE_ROOT_RECORD_FILE, ScopeRootAuthorityReceiptV1,
+    ScopeRootBindingCleanupReplayV1, ScopeRootCandidateBindingV1, ScopeRootLivenessProofV1,
+    ScopeRootRetentionPlanV1, ScopeRootRetentionReceiptV1, ScopeRootRetentionReportV1,
+    StrandedCodeIndexScopeV1, StrandedScopeRefusalV1, code_index_scope_store_root,
+    code_index_store_root, complete_scope_root_binding_cleanup, execute_scope_root_retention,
     git_worktree_scope_root_inventory, insert_live_root_variants, plan_scope_root_retention,
     plan_scope_root_retention_with_liveness_proof, prepare_scope_root_binding_cleanup,
-    recover_scope_root_binding_cleanup, recover_scope_root_retention,
+    record_scope_root, recover_scope_root_binding_cleanup, recover_scope_root_retention,
     resolve_live_code_index_roots,
 };
 pub use text_artifacts::{
@@ -163,7 +165,6 @@ const SCOPE_BINDING_CLEANUP_INTENT_SCHEMA: &str =
 const SCOPE_ROOT_LIVENESS_PROOF_SCHEMA: &str = "tracedecay.code-index-scope-liveness-proof.v1";
 const MAX_SCOPE_TRANSACTION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SCOPE_BINDING_CLEANUP_INTENT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_SCOPE_ROOTS_PER_INVENTORY: usize = 4_096;
 
 const MAX_GENERATION_METADATA_PREFIX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_BYTES: u64 = 1024 * 1024;
@@ -710,12 +711,6 @@ pub struct CodeGenerationRetentionReportV1 {
     pub text_artifact_receipt: Option<CodeTextArtifactRetentionReceiptV1>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CodeGenerationRetentionObservationV1 {
-    pub superseded_generation_count: u64,
-    pub superseded_generation_bytes: u64,
-}
-
 #[must_use]
 pub fn scoped_code_index_store_root(store_root: &Path, canonical_project_root: &Path) -> PathBuf {
     store_root.join(code_index_scope_hash(canonical_project_root))
@@ -779,25 +774,6 @@ pub fn plan_code_generation_retention_with_verification(
         None,
         &|| false,
     )
-}
-
-#[hotpath::measure(label = "usecases.retention.plan_next")]
-pub fn plan_next_code_generation_retention_cancellable(
-    store_root: &Path,
-    vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<CodeGenerationRetentionPlanV1, CodeGenerationRetentionErrorV1> {
-    let mut plan = plan_code_generation_retention_with_verification_cancellable(
-        store_root,
-        vector_readable_sources,
-        rollback_floor,
-        GenerationDigestVerificationV1::Full,
-        None,
-        is_cancelled,
-    )?;
-    plan.collectable_generations.truncate(1);
-    Ok(plan)
 }
 
 /// Recover any bounded prior apply, then build the next fully verified
@@ -929,9 +905,7 @@ fn plan_code_generation_retention_with_verification_cancellable(
             read_generation_metadata(&path, verification, is_cancelled)?;
         let expected_file = format!(
             "generation-{}.json",
-            raw_state_digest
-                .strip_prefix("sha256:")
-                .unwrap_or(&raw_state_digest)
+            sha256_hex_suffix(&raw_state_digest).unwrap_or(&raw_state_digest)
         );
         if file_name != expected_file {
             return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
@@ -1734,64 +1708,6 @@ fn run_code_generation_retention_cancellable(
     )
 }
 
-#[hotpath::measure(label = "usecases.retention.observe")]
-pub fn observe_code_generation_retention(
-    store_root: &Path,
-) -> Result<CodeGenerationRetentionObservationV1, CodeGenerationRetentionErrorV1> {
-    // A store without a publication pointer is a typed unpublished store, not
-    // an error: every sealed file in it is crash debris and counts as
-    // superseded. Every present pointer goes through the one canonical reader
-    // so corruption reporting cannot drift.
-    let active_pointer = read_optional_active_pointer(store_root)?;
-    if let Some(pointer) = active_pointer.as_ref() {
-        validate_generation_file(&pointer.generation_file)?;
-    }
-    let generations_root = store_root.join(GENERATIONS_DIRECTORY);
-    let entries = match std::fs::read_dir(&generations_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if active_pointer.is_none() {
-                return Ok(CodeGenerationRetentionObservationV1::default());
-            }
-            return Err(CodeGenerationRetentionErrorV1::UnsafeState(
-                "active pointer exists without a generation directory".to_owned(),
-            ));
-        }
-        Err(error) => return Err(storage(error)),
-    };
-    let mut active_present = false;
-    let mut observation = CodeGenerationRetentionObservationV1::default();
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_SCOPE_ROOTS_PER_INVENTORY {
-            return Err(CodeGenerationRetentionErrorV1::UnsafeState(
-                "code-index scope inventory exceeds its bounded authority".to_owned(),
-            ));
-        }
-        let entry = entry.map_err(storage)?;
-        let path = entry.path();
-        let Some(file_name) = generation_file_name(&path) else {
-            continue;
-        };
-        if let Some(pointer) = active_pointer.as_ref()
-            && file_name == pointer.generation_file
-        {
-            active_present = true;
-            continue;
-        }
-        observation.superseded_generation_count =
-            observation.superseded_generation_count.saturating_add(1);
-        observation.superseded_generation_bytes = observation
-            .superseded_generation_bytes
-            .saturating_add(entry.metadata().map_err(storage)?.len());
-    }
-    if active_pointer.is_some() && !active_present {
-        return Err(CodeGenerationRetentionErrorV1::UnsafeState(
-            "active pointer target is missing from the generation directory".to_owned(),
-        ));
-    }
-    Ok(observation)
-}
-
 fn recover_pending_transaction_unlocked(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
@@ -2026,7 +1942,7 @@ fn sha256_file_component<'a>(
     digest: &'a ManifestDigest,
     resource: &str,
 ) -> Result<&'a str, CodeGenerationRetentionErrorV1> {
-    let Some(value) = digest.as_str().strip_prefix("sha256:") else {
+    let Some(value) = sha256_hex_suffix(digest.as_str()) else {
         return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
             "{resource} digest is not SHA-256"
         )));

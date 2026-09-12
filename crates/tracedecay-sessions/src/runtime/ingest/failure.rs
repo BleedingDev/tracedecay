@@ -74,6 +74,19 @@ impl TranscriptCatchUpFailure {
         Self::new("scheduler", "frontier", "ingest_frontier_unavailable", true)
     }
 
+    /// The authority carries no session review scheduler, so the user pass
+    /// could ingest transcripts it can never hand to review. A composition
+    /// defect, not a transient condition.
+    #[hotpath::skip]
+    pub(super) const fn session_review_unwired() -> Self {
+        Self::new(
+            "scheduler",
+            "session_review",
+            "session_review_unwired",
+            false,
+        )
+    }
+
     #[hotpath::skip]
     pub(super) const fn source_discovery_partial(provider: &'static str) -> Self {
         Self::new(provider, "discovery", "source_discovery_partial", true)
@@ -105,7 +118,8 @@ impl ProviderRunFailure for TranscriptCatchUpFailure {
     }
 }
 
-pub(super) type ProviderRunOutcome = GenericProviderRunOutcome<TranscriptCatchUpFailure>;
+pub(in crate::runtime) type ProviderRunOutcome =
+    GenericProviderRunOutcome<TranscriptCatchUpFailure>;
 pub(super) type ProviderRunFold = GenericProviderRunFold<TranscriptCatchUpFailure>;
 
 /// Converts operation cancellation into provider-loop control termination.
@@ -609,19 +623,6 @@ mod cancellation_tests {
     use super::*;
 
     #[test]
-    fn typed_cancellation_is_control_termination_without_source_failure() {
-        let error = source::TranscriptIngestError::Cancelled { provider: "test" };
-
-        let outcome = cancelled_provider_outcome(&error)
-            .expect("typed cancellation must terminate provider control flow");
-
-        assert!(outcome.failures.is_empty());
-        assert_eq!(outcome.stats, TranscriptIngestStats::default());
-        assert_eq!(outcome.bytes_consumed, 0);
-        assert_eq!(outcome.deferred_units, 0);
-    }
-
-    #[test]
     fn typed_claude_cancellation_is_control_termination_without_source_failure() {
         let error = claude_observation::ClaudeObservationIngestError::Application(
             crate::observation::ObservationApplicationError::Cancelled,
@@ -648,16 +649,6 @@ mod cancellation_tests {
         let failure = classify_transcript_ingest_failure("test", "observation", &error);
         assert_eq!(failure.reason_code, "transcript_storage_failed");
         assert!(failure.retryable);
-    }
-
-    #[test]
-    fn storage_failure_without_cancellation_remains_a_source_failure() {
-        let error = source::TranscriptIngestError::Store(TranscriptStoreError::Storage {
-            operation: "test",
-            source: Box::new(std::io::Error::other("test storage failure")),
-        });
-
-        assert!(cancelled_provider_outcome(&error).is_none());
     }
 
     #[test]

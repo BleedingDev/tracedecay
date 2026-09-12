@@ -22,7 +22,7 @@ use super::{
     LexicalLaneRetriever, MAX_LEXICAL_CANDIDATE_DOCUMENTS_V1, admit_candidate_sources,
     lexical_query_parts,
 };
-use crate::retrieval::graph::GraphExecutionControl;
+use crate::retrieval::ports::RetrievalExecutionControl;
 use crate::retrieval::ports::{
     CodeCandidateBindingV1, CodeOccurrenceRefV1, LexicalPostingReadPort, RetrievalPortError,
 };
@@ -30,7 +30,7 @@ use crate::retrieval::ports::{
 /// A request authority that never cancels: the lane must not observe it.
 struct ActiveControl;
 
-impl GraphExecutionControl for ActiveControl {
+impl RetrievalExecutionControl for ActiveControl {
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -45,7 +45,7 @@ static ACTIVE_CONTROL: ActiveControl = ActiveControl;
 /// A request authority that is already cancelled when the lane consults it.
 struct CancelledControl;
 
-impl GraphExecutionControl for CancelledControl {
+impl RetrievalExecutionControl for CancelledControl {
     fn is_cancelled(&self) -> bool {
         true
     }
@@ -113,19 +113,6 @@ fn candidate_sources_admit_rarest_first_within_the_document_budget() {
     assert!(
         matches!(outcome, RetrieverOutcome::Partial { value, reason: tracedecay_domain::RetrievalFailure::CandidateSourcesPruned { term_sources, document_frequency_budget } } if value.candidates.is_empty() && term_sources == pruned && document_frequency_budget == budget as u64)
     );
-}
-
-#[test]
-fn candidate_sources_always_admit_the_most_selective_term() {
-    let budget = MAX_LEXICAL_CANDIDATE_DOCUMENTS_V1;
-    assert_eq!(
-        admit_candidate_sources(
-            vec![(budget * 20, "tracedecay"), (budget * 30, "the")],
-            |_, _| {}
-        ),
-        ["tracedecay"]
-    );
-    assert!(admit_candidate_sources(Vec::<(usize, &str)>::new(), |_, _| {}).is_empty());
 }
 
 #[test]

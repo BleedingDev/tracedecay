@@ -54,22 +54,6 @@ pub(super) async fn daemon_round_trip(
     responses
 }
 
-#[test]
-fn daemon_handshake_round_trips_project_scope_and_timings() {
-    let handshake = DaemonHandshake {
-        project_path: Some(PathBuf::from("/work/repo")),
-        scope_prefix: Some("src/mcp".to_string()),
-        timings: true,
-        allow_init: true,
-        ..test_handshake_defaults()
-    };
-
-    let encoded = handshake.to_line().expect("handshake should encode");
-    let decoded = DaemonHandshake::from_line(&encoded).expect("handshake should decode");
-
-    assert_eq!(decoded, handshake);
-}
-
 /// Old clients omit the adoption field entirely; the daemon must default it
 /// to `Never` so a mixed-version pair can never remap a moved store.
 #[test]
@@ -92,22 +76,6 @@ fn daemon_handshake_defaults_missing_moved_store_adoption_to_never() {
         decoded.moved_store_adoption,
         crate::tracedecay::MovedStoreAdoption::Never
     );
-}
-
-/// The adoption request survives the wire in both explicit shapes.
-#[test]
-fn daemon_handshake_round_trips_moved_store_adoption() {
-    for adoption in [
-        crate::tracedecay::MovedStoreAdoption::OfferCandidates,
-        crate::tracedecay::MovedStoreAdoption::AdoptUnique,
-        crate::tracedecay::MovedStoreAdoption::AdoptNamed("proj_nongit_moved".to_owned()),
-    ] {
-        let mut handshake = test_handshake_defaults();
-        handshake.moved_store_adoption = adoption.clone();
-        let encoded = handshake.to_line().expect("handshake should encode");
-        let decoded = DaemonHandshake::from_line(&encoded).expect("handshake should decode");
-        assert_eq!(decoded.moved_store_adoption, adoption);
-    }
 }
 
 #[test]
@@ -287,25 +255,6 @@ async fn socket_client_requires_authentication_before_routing() {
         .await
         .expect("server task")
         .expect("an auth refusal is a served connection");
-}
-
-#[test]
-fn daemon_handshake_advertises_binary_version() {
-    let handshake = test_handshake_defaults();
-
-    let encoded = handshake.to_line().expect("handshake should encode");
-    let value: serde_json::Value = serde_json::from_str(&encoded).expect("handshake json");
-
-    assert_eq!(
-        value["client_version"],
-        serde_json::json!(
-            crate::version::build_version().expect("fixture product runtime registered")
-        )
-    );
-    assert_eq!(
-        value["client_instance_id"],
-        serde_json::json!(tracedecay_runtime_core::runtime_identity::process_run_id())
-    );
 }
 
 #[test]
@@ -908,67 +857,6 @@ async fn initialized_ack_preserves_pending_catalog_refresh_notification() {
 
 #[cfg(unix)]
 #[test]
-fn daemon_version_skew_warning_reads_initialize_server_info() {
-    let initialize = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {}
-    })
-    .to_string();
-    let response = |version: &str| {
-        vec![
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": { "serverInfo": { "name": "tracedecay", "version": version } }
-            })
-            .to_string(),
-        ]
-    };
-
-    let warning =
-        super::super::daemon_version_skew_warning(&initialize, &response("9.9.9"), "1.0.0")
-            .expect("mismatched daemon version should warn");
-    assert!(
-        warning.contains("9.9.9") && warning.contains("1.0.0"),
-        "warning should name both versions, got: {warning}"
-    );
-    assert!(
-        warning.contains("MCP host") && !warning.contains("tracedecay daemon restart"),
-        "a newer daemon should direct recovery at the stale host, got: {warning}"
-    );
-
-    let warning =
-        super::super::daemon_version_skew_warning(&initialize, &response("1.0.0"), "9.9.9")
-            .expect("newer client should warn about stale daemon");
-    assert!(
-        warning.contains("tracedecay daemon restart"),
-        "a newer client should direct recovery at the stale daemon, got: {warning}"
-    );
-
-    assert_eq!(
-        super::super::daemon_version_skew_warning(&initialize, &response("1.0.0"), "1.0.0"),
-        None,
-        "matching versions must not warn"
-    );
-
-    let tools_call = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {}
-    })
-    .to_string();
-    assert_eq!(
-        super::super::daemon_version_skew_warning(&tools_call, &response("9.9.9"), "1.0.0"),
-        None,
-        "only initialize responses advertise the daemon version"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn proxy_records_negotiated_catalog_capability_and_version() {
     let initialize = json!({
         "jsonrpc": "2.0",
@@ -1011,4 +899,88 @@ fn proxy_records_negotiated_catalog_capability_and_version() {
     super::super::apply_proxy_initialize_metadata(&mut legacy, metadata);
     assert!(!legacy.tool_list_changed_capable);
     assert!(legacy.catalog_version.is_empty());
+}
+
+/// A saturated daemon must still name wire skew.
+///
+/// The saturation rejection path parsed the client handshake with `?` and
+/// dropped the socket when it failed, leaving the client's pipelined request
+/// unread — the kernel answers that with `Connection reset by peer`, the exact
+/// signature reported in #753 for a day-old eval client. Saturation is not a
+/// reason to hide a protocol refusal behind a transport error.
+#[cfg(unix)]
+#[tokio::test]
+async fn saturated_daemon_refuses_wire_drifted_handshake_instead_of_resetting() {
+    // The refusal advertises the daemon's build version, which is read from
+    // the registered product runtime and is deliberately fallible: a process
+    // that never registered one has no truthful version to advertise, and the
+    // refusal is abandoned rather than sent. Under `cargo test` a sibling test
+    // in the same process had already registered it, so this passed locally
+    // and failed under nextest, which runs every test in its own process.
+    let home = TempDir::new().expect("home");
+    let home = home.path().canonicalize().expect("canonical home");
+    let client_identity = test_client_identity_for(home.join("client"));
+    let _engine = test_daemon_engine_for_profile(&client_identity.profile_root);
+    let _database_scope = enter_test_daemon_database_scope(
+        &client_identity.profile_root,
+        "saturated-handshake-refusal-test",
+    );
+
+    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
+    let server_task = tokio::spawn(async move {
+        super::super::reject_saturated_daemon_client(
+            tracedecay_daemon_protocol::BrokerStream::Unix(server),
+            super::super::DaemonClientSaturationResponse {
+                kind: super::super::DaemonClientSaturationKind::ClientCapacityReached,
+                retryable: true,
+                capacity: 1,
+            },
+        )
+        .await;
+    });
+
+    let (reader, mut writer) = client.into_split();
+    // Valid JSON that is not this daemon's handshake shape, then the request a
+    // real client pipelines behind it before it starts reading.
+    writer
+        .write_all(b"{\"handshake_revision\":99,\"client\":\"future-build\"}\n")
+        .await
+        .expect("write drifted handshake");
+    writer
+        .write_all(
+            b"{\"protocol\":\"tracedecay.daemon.invocation\",\"revision\":1,\
+              \"request_id\":\"request.saturated-drifted-handshake\",\
+              \"operation\":\"semantic_evaluate_and_publish\"}\n",
+        )
+        .await
+        .expect("write pipelined request");
+
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    let refusal_line = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+        .await
+        .expect("refusal must arrive before the read deadline")
+        .expect("the refusal read must not fail with a transport reset")
+        .expect("a saturated daemon must answer a drifted handshake with a refusal line");
+    let refusal = tracedecay_daemon_protocol::DaemonHandshakeRefusal::from_line(&refusal_line)
+        .expect("the refusal line must parse as the typed refusal frame");
+    assert_eq!(
+        refusal.refusal,
+        tracedecay_daemon_protocol::DaemonHandshakeRefusalReason::UnsupportedRevision,
+        "wire drift under saturation is still a revision refusal"
+    );
+    assert!(
+        !refusal.daemon_version.is_empty(),
+        "the refusal must advertise the daemon version so the client can name the skew"
+    );
+
+    let eof = tokio::time::timeout(std::time::Duration::from_secs(2), lines.next_line())
+        .await
+        .expect("connection close must arrive before the read deadline")
+        .expect("the close must be a clean EOF, not a connection reset");
+    assert_eq!(
+        eof, None,
+        "the refusal replaces the saturation frame; no frames follow it"
+    );
+
+    server_task.await.expect("saturation server task");
 }

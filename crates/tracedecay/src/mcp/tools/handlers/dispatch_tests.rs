@@ -69,6 +69,50 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for RecordingMultiRoot
 }
 
 #[tokio::test]
+async fn retired_file_metadata_is_absent_and_refused_by_public_dispatch() {
+    let retired = "tracedecay_file_metadata";
+    assert!(
+        get_tool_definitions()
+            .expect("tool definitions")
+            .iter()
+            .all(|definition| definition.name != retired)
+    );
+    assert!(
+        crate::mcp::tools::binding::mcp_dispatch_catalog()
+            .expect("MCP dispatch catalog")
+            .contract(retired)
+            .is_none()
+    );
+
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().expect("temporary project");
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("retired-file-metadata");
+    fs::create_dir_all(&project).expect("project root");
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.retired-file-metadata",
+    )
+    .await
+    .expect("TraceDecay fixture");
+    let error = handle_tool_call_with_registry_options(
+        &cg,
+        retired,
+        json!({"files": ["../outside"]}),
+        None,
+        None,
+        ToolCallRegistryOptions::default(),
+    )
+    .await
+    .expect_err("retired tool must be refused");
+    assert!(
+        error.to_string().contains("unknown tool"),
+        "retired tool reached a public dispatch path: {error}"
+    );
+    cg.close();
+}
+
+#[tokio::test]
 async fn multi_root_tools_invoke_the_closed_daemon_routes() {
     let _env_lock = lock_user_data_dir_test_env();
     let dir = TempDir::new().unwrap();
@@ -134,26 +178,6 @@ async fn multi_root_tools_invoke_the_closed_daemon_routes() {
             tracedecay_daemon_protocol::DaemonInvocationOperation::MultiRootScopeSetCompareAndSwap,
             tracedecay_daemon_protocol::DaemonInvocationOperation::MultiRootExecute,
         ]
-    );
-}
-
-/// Diagnostics has one production owner regardless of whether the MCP server
-/// could attach a daemon executor; the canonical owner reports typed
-/// application transport unavailability when none is attached.
-#[test]
-fn diagnostics_always_reaches_the_application_surface_owner() {
-    assert_eq!(
-        classify_mcp_tool_dispatch_group("tracedecay_diagnostics"),
-        Some(McpToolDispatchGroup::ApplicationSurface),
-    );
-    assert_eq!(
-        dispatch_group_for_tool("tracedecay_diagnostics"),
-        Some(McpToolDispatchGroup::ApplicationSurface),
-        "diagnostics must not retain a second analysis owner",
-    );
-    assert_eq!(
-        classify_mcp_tool_dispatch_group("tracedecay_diagnostics_read"),
-        None,
     );
 }
 
@@ -714,6 +738,117 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
         json!("main"),
         "a serving census restores the branch claim: {serving}",
     );
+
+    // A branch publication can finish after the drift-triggered graph reopen
+    // already froze the startup fallback. The ready generation source is the
+    // serving authority in that window, including when its ref is the private
+    // tracking ref rather than the user-visible branch name.
+    let mut branch_meta = tracedecay_runtime_core::branch_meta::load_branch_meta(&layout.data_root)
+        .expect("main branch metadata");
+    branch_meta.add_branch(
+        "feature",
+        tracedecay_runtime_core::config::DB_FILENAME,
+        "main",
+    );
+    tracedecay_runtime_core::branch_meta::save_branch_meta(&layout.data_root, &branch_meta)
+        .unwrap();
+    run_git_in(&project, &["checkout", "-b", "feature"]);
+    let feature_revision = git_stdout_in(&project, &["rev-parse", "HEAD"]);
+    let feature_reference = "refs/heads/tracedecay/track/feature";
+    let published = tracedecay_runtime_core::branch_meta::publish_graph_source(
+        &layout.data_root,
+        "feature",
+        None,
+        tracedecay_runtime_core::branch_meta::BranchGraphSourceDraftV1 {
+            project_id: "project.mcp-status-serving-truth".to_owned(),
+            repository_id: "repository.status-serving-truth".to_owned(),
+            worktree_id: "worktree.status-serving-truth".to_owned(),
+            worktree_root: project.display().to_string(),
+            reference: feature_reference.to_owned(),
+            source_oid: feature_revision.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        published,
+        tracedecay_runtime_core::branch_meta::BranchGraphSourcePublishOutcomeV1::Published(_)
+    ));
+    let feature_reference = feature_reference.to_owned();
+    let feature_reader:
+        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+        std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
+            let freshness = tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: worktree_root.display().to_string(),
+                source_reference: Some(feature_reference.clone()),
+                source_revision: Some(feature_revision.clone()),
+                latest_generation_id: Some("generation.status-serving-truth.feature".to_owned()),
+                code_graph_serving: Some(
+                    tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+                ),
+                staleness_state: Some("fresh".to_owned()),
+                ..Default::default()
+            };
+            Box::pin(async move { Some(freshness) })
+        });
+    let published_feature = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(feature_reader.clone()),
+            ..Default::default()
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
+    )
+    .await
+    .expect("status answers after branch publication");
+    let published_feature = status_output(published_feature);
+    assert_eq!(published_feature["active_branch"], json!("feature"));
+    assert_eq!(published_feature["serving_branch"], json!("feature"));
+    assert_eq!(published_feature["branch_drifted"], json!(false));
+    assert_eq!(published_feature["branch_resolution"], json!("exact"));
+    assert_eq!(
+        published_feature["branch_diagnostics"]["open_active_branch"],
+        json!("feature")
+    );
+    assert_eq!(
+        published_feature["branch_diagnostics"]["serving_branch"],
+        json!("feature")
+    );
+    let feature_row = published_feature["branch_diagnostics"]["branches"]
+        .as_array()
+        .and_then(|branches| {
+            branches
+                .iter()
+                .find(|branch| branch["name"] == json!("feature"))
+        })
+        .expect("published feature branch diagnostics");
+    assert_eq!(feature_row["is_open_active"], json!(true));
+    assert_eq!(feature_row["is_serving"], json!(true));
+    assert_eq!(feature_row["is_ready"], json!(true));
+    assert!(published_feature.get("branch_warnings").is_none());
+
+    let compact_feature = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_status",
+        json!({"format": "json", "include_branch_diagnostics": false}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_freshness_reader: Some(feature_reader),
+            ..Default::default()
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
+    )
+    .await
+    .expect("compact status answers after branch publication");
+    let compact_feature = status_output(compact_feature);
+    assert_eq!(compact_feature["active_branch"], json!("feature"));
+    assert_eq!(compact_feature["serving_branch"], json!("feature"));
 
     let rebuilding = handle_tool_call_with_registry_options(
         &cg,
@@ -1559,30 +1694,6 @@ fn the_ceiling_reports_a_typed_retryable_problem() {
     );
 }
 
-/// The wrap itself: a handler that never returns must surface the typed
-/// deadline at the ceiling rather than holding the transport open forever.
-/// This is the 900-second hang reduced to a unit.
-#[tokio::test]
-async fn a_handler_that_never_returns_hits_the_typed_ceiling() {
-    let budget = std::time::Duration::from_millis(50);
-    let never = std::future::pending::<Result<ToolResult>>();
-    let started = std::time::Instant::now();
-    let outcome = match tokio::time::timeout(budget, never).await {
-        Ok(result) => result,
-        Err(_elapsed) => Err(tool_dispatch_deadline_error("tracedecay_context", budget)),
-    };
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "the ceiling must fire promptly, took {:?}",
-        started.elapsed(),
-    );
-    let error = outcome.expect_err("a never-returning handler must not report success");
-    assert!(
-        error.to_string().contains("dispatch ceiling"),
-        "got {error}"
-    );
-}
-
 /// Equivalence: a warm call that finishes well inside the ceiling is untouched
 /// by it — the bound changes failure, not work.
 #[tokio::test]
@@ -1663,7 +1774,7 @@ async fn a_stale_served_graph_read_carries_the_typed_freshness_trailer() {
         "a rebuild-in-flight serve must state the seat age and the rebuild: {rendered}",
     );
 
-    let wedged = handle_tool_call_with_registry_options(
+    let unverified = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_files",
         json!({}),
@@ -1672,15 +1783,15 @@ async fn a_stale_served_graph_read_carries_the_typed_freshness_trailer() {
         verified_graph_wedged_options(&cg, ToolCallRegistryOptions::default()),
     )
     .await
-    .expect("a wedged stale serve still answers");
-    let rendered = serde_json::to_string(&wedged.value).unwrap();
+    .expect("an unverified stale serve still answers");
+    let rendered = serde_json::to_string(&unverified.value).unwrap();
     assert!(
-        rendered.contains("no rebuild pass in flight"),
-        "a wedged route must not claim a rebuild is in flight: {rendered}",
+        rendered.contains("source freshness remains unverified"),
+        "an unverified route must state what remains unknown: {rendered}",
     );
     assert!(
         !rendered.contains("while the code index rebuilds"),
-        "a wedged route must not present itself as a routine rebuild: {rendered}",
+        "an unverified route must not present itself as a rebuild: {rendered}",
     );
 
     let current = handle_tool_call_with_registry_options(

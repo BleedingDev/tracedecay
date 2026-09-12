@@ -60,9 +60,6 @@ impl LineRange {
     }
 }
 
-pub fn render_full(source: &str) -> String {
-    source.to_owned()
-}
 pub fn estimate_tokens(s: &str) -> u32 {
     s.chars().count().div_ceil(4).min(u32::MAX as usize) as u32
 }
@@ -392,20 +389,6 @@ mod tests {
         assert_eq!(symbols[0]["line"], 5);
         assert_eq!(symbols[0]["end_line"], 8);
         assert_eq!(symbols[0]["signature"], "fn main()");
-    }
-
-    #[test]
-    fn symbol_context_keeps_symbols_straddling_the_range_edges() {
-        // A one-line read inside `main`'s body still reports `main`.
-        let value = symbol_context_value(&fixture(), FILE, LineRange::parse("6"));
-        let names = value["symbols"]
-            .as_array()
-            .expect("symbol array")
-            .iter()
-            .map(|symbol| symbol["name"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, vec!["main".to_owned()]);
     }
 
     #[test]

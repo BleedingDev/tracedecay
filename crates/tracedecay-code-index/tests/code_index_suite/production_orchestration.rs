@@ -10,6 +10,7 @@ use std::{
 use sha2::{Digest, Sha256};
 use tracedecay_code_extraction::incremental::ParseLimits;
 use tracedecay_code_index::{
+    capabilities::expected_seal_digest,
     chunks::{CodeIndexImportEvidenceV1, ExtractionAdmittedCodeSearchChunkV1, content_digest},
     graph_projection::{
         CODE_GRAPH_PROJECTOR_REVISION, CodeGraphProjectionError,
@@ -34,12 +35,14 @@ use tracedecay_code_index::{
     retained_parse::{RetainedParsePoolLimits, SharedRetainedParsePool},
 };
 use tracedecay_domain::{
-    BranchStackNodeV1, ChunkerRevision, CodeGenerationId, CommitId, FileOccurrenceId, LanguageId,
-    ManifestDigest, PolicyRevisionId, PrivacyDomainId, ProjectId, ProjectionBatchRequestV1,
-    ProjectionKeyV1, ProjectionKindV1, ProjectionOperationV1, ProjectionOutcomeV1,
-    ProviderEvaluationStateV1, RefId, RepositoryDirtyStateV1, RepositoryId, SanitizationReceiptId,
+    ChunkerRevision, CodeGenerationId, CodeGenerationManifestV1, CodeSearchChunkGrainV1, CommitId,
+    EdgeAuthorityV1, ExtractorRevision, FileOccurrenceId, LanguageId, ManifestDigest,
+    PolicyRevisionId, PrivacyDomainId, ProjectId, ProjectionBatchRequestV1, ProjectionKeyV1,
+    ProjectionKindV1, ProjectionOperationV1, ProjectionOutcomeV1, ProviderEvaluationStateV1, RefId,
+    RelationEdgeKindV1, RepositoryDirtyStateV1, RepositoryId, SanitizationReceiptId,
     SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision, SnapshotFileDispositionV1,
-    StackNodeId, TestAttributionEvidenceClassV1, TreeId, UtcMicros, WorktreeId,
+    SymbolOccurrenceId, TestAttributionEvidenceClassV1, TreeId, UtcMicros, WorktreeId,
+    sha256_hex_suffix,
 };
 use tracedecay_graph_db::{GraphDbError, GraphNamespace, GraphProjectorRevision};
 
@@ -384,6 +387,197 @@ pub(super) fn request_with_source(
     request.repository_parse_identity.tree = Some(id::<TreeId>(tree));
     request.changed_files.insert("src/lib.rs".to_owned());
     request
+}
+
+#[test]
+fn cross_file_edges_require_path_binding_evidence() {
+    let sources = [
+        (
+            "file.binding.other-read",
+            "crates/other/src/read.rs",
+            "rust",
+            "pub struct CanonicalAffectedTestsProjectionV1;\n",
+        ),
+        (
+            "file.binding.feedback-mod",
+            "crates/tracedecay-contracts/src/feedback/mod.rs",
+            "rust",
+            "mod read;\npub use read::{CanonicalAffectedTestsProjectionV1, CanonicalFeedbackImpactProjectionV1};\n",
+        ),
+        (
+            "file.binding.feedback-read",
+            "crates/tracedecay-contracts/src/feedback/read.rs",
+            "rust",
+            "pub struct CanonicalAffectedTestsProjectionV1;\npub struct CanonicalFeedbackImpactProjectionV1;\n",
+        ),
+        (
+            "file.binding.model",
+            "dashboard/model.tsx",
+            "typescript",
+            "import { imported } from './target.js';\nexport function str(value: unknown): string { return String(value); }\nexport function local(): string { imported(); return str('x'); }\nexport function shadowed(imported: () => void): void { imported(); }\nexport function locallyShadowed(): void { const imported = () => {}; imported(); }\nexport function arrowShadowed(): void { const run = imported => imported(); run(() => {}); }\nexport function varShadowed(): void { if (true) { var imported = () => {}; } imported(); }\nexport function nestedCapture(): () => void { const imported = () => {}; function inner(): void { imported(); } return inner; }\n",
+        ),
+        (
+            "file.binding.ts-target",
+            "dashboard/target.ts",
+            "typescript",
+            "export function imported() {}\n",
+        ),
+        (
+            "file.binding.caller",
+            "src/caller.rs",
+            "rust",
+            "use crate::target::helper;\npub fn caller(value: &str) { let _ = value; helper(); let _ = crate::target::real(); }\npub fn shadowed(helper: fn()) { helper(); }\npub fn locally_shadowed() { let helper: fn() = || {}; helper(); }\n",
+        ),
+        (
+            "file.binding.target",
+            "src/target.rs",
+            "rust",
+            "pub fn helper() {}\npub fn real() {}\n",
+        ),
+    ];
+    let mut request = request("file.binding.seed", 1_100_000);
+    request.snapshot.files.clear();
+    request.snapshot.sanitization_receipts.clear();
+    request.captured_files.clear();
+    let mut identity = Sha256::new();
+    for (ordinal, (occurrence, path, language, source)) in sources.into_iter().enumerate() {
+        identity.update(path.as_bytes());
+        identity.update([0]);
+        identity.update(source.as_bytes());
+        let file_occurrence_id = id::<FileOccurrenceId>(occurrence);
+        request.snapshot.files.push(SanitizedCodeFileV1 {
+            file_occurrence_id: file_occurrence_id.clone(),
+            logical_path: path.to_owned(),
+            language: Some(id::<LanguageId>(language)),
+            content_digest: content_digest(source.as_bytes()),
+            disposition: SnapshotFileDispositionV1::Present,
+        });
+        request
+            .snapshot
+            .sanitization_receipts
+            .push(id::<SanitizationReceiptId>(&format!(
+                "receipt.binding.{ordinal}"
+            )));
+        request.captured_files.push(CodeIndexCapturedFileV1 {
+            file_occurrence_id,
+            sanitized_bytes: Arc::from(source.as_bytes()),
+            sensitivity_level: tracedecay_domain::SensitivityLevelV1::Public,
+        });
+    }
+    request.snapshot.content_identity = content_digest(&identity.finalize());
+
+    let generation = CodeIndexProductionOwnerV1::new(
+        config(),
+        SharedPublicationStore::default(),
+        ApplyingProjectionSink,
+    )
+    .expect("production owner")
+    .build_and_publish(request, &ActiveControl)
+    .expect("generation publishes");
+    let occurrence = |qualified_name: &str| {
+        generation
+            .symbols()
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == qualified_name)
+            .unwrap_or_else(|| panic!("missing {qualified_name}"))
+            .occurrence
+            .clone()
+    };
+    let caller = occurrence("src/caller.rs::caller");
+    let helper = occurrence("src/target.rs::helper");
+    let real = occurrence("src/target.rs::real");
+    let imported = occurrence("dashboard/target.ts::imported");
+    let str_helper = occurrence("dashboard/model.tsx::str");
+    let local = occurrence("dashboard/model.tsx::local");
+    let ts_shadowed = occurrence("dashboard/model.tsx::shadowed");
+    let ts_locally_shadowed = occurrence("dashboard/model.tsx::locallyShadowed");
+    let ts_arrow_shadowed = occurrence("dashboard/model.tsx::arrowShadowed");
+    let ts_var_shadowed = occurrence("dashboard/model.tsx::varShadowed");
+    let rust_shadowed = occurrence("src/caller.rs::shadowed");
+    let rust_locally_shadowed = occurrence("src/caller.rs::locally_shadowed");
+    let affected_tests = occurrence(
+        "crates/tracedecay-contracts/src/feedback/read.rs::CanonicalAffectedTestsProjectionV1",
+    );
+    let feedback_impact = occurrence(
+        "crates/tracedecay-contracts/src/feedback/read.rs::CanonicalFeedbackImpactProjectionV1",
+    );
+    let incoming = |target: &SymbolOccurrenceId| {
+        generation
+            .edges()
+            .iter()
+            .filter(|edge| &edge.to_occurrence == target)
+            .count()
+    };
+
+    assert_eq!(incoming(&str_helper), 1, "only the same-file call is real");
+    assert_eq!(
+        incoming(&helper),
+        1,
+        "the explicit Rust import remains bound"
+    );
+    assert_eq!(incoming(&real), 1, "the qualified Rust path remains bound");
+    assert_eq!(
+        incoming(&affected_tests),
+        1,
+        "the grouped re-export makes mod.rs a dependent of read.rs",
+    );
+    assert_eq!(incoming(&feedback_impact), 1);
+    assert_eq!(
+        incoming(&imported),
+        1,
+        "only the unshadowed imported call remains bound"
+    );
+    assert!(generation.edges().iter().any(|edge| {
+        edge.from_occurrence == local
+            && edge.to_occurrence == str_helper
+            && edge.kind == RelationEdgeKindV1::Calls
+            && edge.authority == EdgeAuthorityV1::SyntaxExact
+    }));
+    assert!(generation.edges().iter().any(|edge| {
+        edge.from_occurrence == caller
+            && edge.to_occurrence == helper
+            && edge.kind == RelationEdgeKindV1::Calls
+            && edge.authority == EdgeAuthorityV1::NameResolved
+    }));
+    assert!(generation.edges().iter().any(|edge| {
+        edge.from_occurrence == caller
+            && edge.to_occurrence == real
+            && edge.kind == RelationEdgeKindV1::Calls
+            && edge.authority == EdgeAuthorityV1::NameResolved
+    }));
+    assert!(generation.edges().iter().any(|edge| {
+        edge.from_occurrence == local
+            && edge.to_occurrence == imported
+            && edge.kind == RelationEdgeKindV1::Calls
+            && edge.authority == EdgeAuthorityV1::NameResolved
+    }));
+    assert!(
+        !generation
+            .edges()
+            .iter()
+            .any(|edge| { edge.from_occurrence == ts_shadowed && edge.to_occurrence == imported })
+    );
+    assert!(
+        !generation
+            .edges()
+            .iter()
+            .any(|edge| { edge.from_occurrence == rust_shadowed && edge.to_occurrence == helper })
+    );
+    assert!(!generation.edges().iter().any(|edge| {
+        edge.from_occurrence == ts_locally_shadowed && edge.to_occurrence == imported
+    }));
+    assert!(!generation.edges().iter().any(|edge| {
+        edge.from_occurrence == ts_arrow_shadowed && edge.to_occurrence == imported
+    }));
+    assert!(
+        !generation.edges().iter().any(|edge| {
+            edge.from_occurrence == ts_var_shadowed && edge.to_occurrence == imported
+        })
+    );
+    assert!(!generation.edges().iter().any(|edge| {
+        edge.from_occurrence == rust_locally_shadowed && edge.to_occurrence == helper
+    }));
 }
 
 #[test]
@@ -894,6 +1088,104 @@ fn published_generation_serves_current_conservative_test_attribution() {
 }
 
 #[test]
+fn published_generation_attributes_inline_rust_tests_to_called_symbols() {
+    let store = SharedPublicationStore::default();
+    let mut owner = CodeIndexProductionOwnerV1::new(config(), store, ApplyingProjectionSink)
+        .expect("production owner");
+    let generation = owner
+        .build_and_publish(
+            request_with_source(
+                "file.production.inline-test",
+                1_100_000,
+                "commit.production.inline-test",
+                "tree.production.inline-test",
+                r#"pub fn feedback_entry(input: u32) -> u32 {
+    feedback_public_replay_missing_symbol(input)
+}
+
+#[cfg(test)]
+mod tests {
+    fn support_helper() {
+        super::feedback_entry(0);
+    }
+
+    #[test]
+    fn feedback_entry_test() {
+        assert_eq!(super::feedback_entry(1), 1);
+    }
+}
+
+#[test]
+fn root_feedback_entry_test() {
+    assert_eq!(feedback_entry(2), 2);
+}
+"#,
+            ),
+            &ActiveControl,
+        )
+        .expect("test generation publishes");
+    let authority = generation
+        .test_attribution_authority()
+        .expect("attribution authority");
+
+    let read = authority.read_test_attribution(&generation.manifest().generation_id);
+    let join = read.evidence.expect("generation attribution");
+    let inline_test = generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol
+                .qualified_name
+                .ends_with("::tests::feedback_entry_test")
+        })
+        .expect("inline test symbol");
+    let root_test = generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol
+                .qualified_name
+                .ends_with("::root_feedback_entry_test")
+        })
+        .expect("root test symbol");
+    let support_helper = generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|symbol| symbol.qualified_name.ends_with("::tests::support_helper"))
+        .expect("test-module helper symbol");
+    let records = join
+        .records
+        .iter()
+        .filter(|record| {
+            record.attribution.test_occurrence == inline_test.occurrence
+                || record.attribution.test_occurrence == root_test.occurrence
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 2);
+    assert!(
+        join.records
+            .iter()
+            .all(|record| record.attribution.test_occurrence != support_helper.occurrence)
+    );
+    let feedback_entry = generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|symbol| symbol.qualified_name.ends_with("::feedback_entry"))
+        .expect("called production symbol");
+
+    assert!(records.iter().all(|record| {
+        record
+            .attribution
+            .covered_occurrences
+            .contains(&feedback_entry.occurrence)
+    }));
+}
+
+#[test]
 fn production_owner_publishes_complete_generation_and_restores_it_after_restart() {
     let store = SharedPublicationStore::default();
     let mut owner =
@@ -1012,6 +1304,53 @@ fn active_generation_loads_share_the_published_allocation() {
         second.chunks().chunks().as_ptr(),
         "active reads must share the immutable generation instead of cloning its complete indices"
     );
+}
+
+#[test]
+fn sealed_store_drops_whitespace_only_window_chunks() {
+    const FUNCTIONS: usize = 32;
+    let source: String = (0..FUNCTIONS)
+        .map(|index| format!("pub fn symbol_{index}() {{}}\n\n"))
+        .collect();
+    let mut owner = CodeIndexProductionOwnerV1::new(
+        config(),
+        SharedPublicationStore::default(),
+        ApplyingProjectionSink,
+    )
+    .expect("production owner");
+    let generation = owner
+        .build_and_publish(
+            request_with_source(
+                "file.whitespace-window-attribution",
+                1_260_000,
+                "commit.whitespace-window-attribution",
+                "tree.whitespace-window-attribution",
+                &source,
+            ),
+            &ActiveControl,
+        )
+        .expect("whitespace-heavy fixture publishes");
+    let chunks = generation.chunks().chunks();
+    assert!(
+        chunks.iter().all(|chunk| {
+            chunk.anchor.grain != CodeSearchChunkGrainV1::FileWindow
+                || !chunk
+                    .sanitized_text
+                    .as_str()
+                    .chars()
+                    .all(char::is_whitespace)
+        }),
+        "sealed rows must not include whitespace-only FileWindow chunks"
+    );
+    // One-line functions previously minted signature + body + whitespace window
+    // (3N). Attribution keeps signature + body only.
+    assert_eq!(chunks.len(), FUNCTIONS * 2);
+    assert!(
+        chunks.len() < FUNCTIONS * 3,
+        "sealed chunk count must drop below the three-per-function baseline"
+    );
+    let sealed = generation.encode_sealed().expect("generation seals");
+    assert!(!sealed.is_empty(), "sealed store must carry bytes");
 }
 
 #[test]
@@ -2628,38 +2967,6 @@ fn code_shard_slot_key_is_the_sealed_branch_label_not_a_generation_id() {
 }
 
 #[test]
-fn branch_stack_nodes_and_snapshots_derive_the_same_path_free_scope() {
-    let request = request_in_scope(
-        "file.branch-stack.1",
-        1_100_000,
-        "refs/heads/feature",
-        Some("worktree.feature"),
-        "commit.feature.1",
-    );
-    let node = BranchStackNodeV1 {
-        node_id: id::<StackNodeId>("stack-node.feature"),
-        project_id: id("project.fixture"),
-        repository_id: request.snapshot.repository.clone(),
-        reference: request
-            .snapshot
-            .reference
-            .clone()
-            .expect("branch reference"),
-        tip: request
-            .snapshot
-            .source_revision
-            .clone()
-            .expect("branch tip"),
-        worktree_id: request.snapshot.worktree.clone(),
-    };
-
-    assert_eq!(
-        CodeIndexGenerationScopeV1::for_branch_stack_node(&node),
-        CodeIndexGenerationScopeV1::for_snapshot(&request.snapshot)
-    );
-}
-
-#[test]
 fn production_owner_abstains_without_publication_on_cancellation_or_deadline() {
     let store = SharedPublicationStore::default();
     let mut owner =
@@ -2746,10 +3053,12 @@ fn parallel_and_sequential_decodes_are_byte_identical() {
     parallel_equivalence::assert_parallel_and_sequential_decodes_are_byte_identical();
 }
 
+/// Sealing resolves each file's retained cross-file references against the
+/// whole staged file set, one ordered fan-out over the indexing pool. Width
+/// must not change which references bind or where the resulting edges sort.
 #[test]
-#[ignore = "sealed-decode measurement harness; run one width per process, see fn docs"]
-fn sealed_decode_width_probe() {
-    parallel_equivalence::run_sealed_decode_width_probe();
+fn cross_file_resolution_is_width_invariant() {
+    parallel_equivalence::assert_cross_file_resolution_is_width_invariant();
 }
 
 fn partitioned_codec_request(beta_value: u64, sealed_at: i64) -> CodeIndexBuildRequestV1 {
@@ -2907,23 +3216,23 @@ fn partitioned_codec_fixture() -> (
 }
 
 const PARTITIONED_FORMAT_STATE_DIGEST: &str =
-    "sha256:f1741f8ee5b4fec3dfc723e6de9ab9794de3a016f837ef7d1186306e09526abf";
+    "sha256:9a4b5d2f23e4ab7d74e01977c18ae0e42a394e64d79c9f8f0633072d728743bd";
 const PARTITIONED_FORMAT_SEGMENTS: &[(&str, u64)] = &[
     (
-        "sha256:0ae42f3ae5844c46e7fea6cfb07f91e09d6634e8f9c2f1df053d62cc7d7c1f24",
-        8_584,
+        "sha256:4db0d378108aa77b64bc33ab958b3e7167c9dcdfa1f7485803c9ba46dc4bcbf0",
+        7_958,
     ),
     (
-        "sha256:21d54dff99989ad1b91b8254ad1a7c1310fe866755e0c3157153c2ab18951b19",
-        3_856,
+        "sha256:c4188be2888d3542e61f96abb84106df795cdd646f7358dbd23ed2344391838a",
+        3_543,
     ),
     (
-        "sha256:4f03e051764f885e2eb5f3537a2f7d26741f72f936fd6e4dc5ec1fd53a0751da",
-        3_964,
+        "sha256:da48ed86c30e06f7eae795e983a1b943972e971604ff6e2093683b8857d7ceca",
+        3_651,
     ),
     (
-        "sha256:1bfa6399cd1a9f5d06ec697add39064ac1cc4f51dcfc866ba903c62ac3cad476",
-        11_830,
+        "sha256:9aacc4645ff8e7c898401e5ded39b158fef6770ff90987f9471518f661a8f281",
+        10_133,
     ),
 ];
 
@@ -2946,6 +3255,40 @@ fn partitioned_codec_has_stable_bytes_and_round_trips() {
             .collect::<Vec<_>>(),
         PARTITIONED_FORMAT_SEGMENTS,
         "a file or evidence segment changed bytes"
+    );
+    assert_eq!(
+        CodeIndexPublishedGenerationV1::partitioned_text_metadata(&manifest)
+            .expect("partitioned text metadata parses")
+            .expect("revision seven partitioned manifest")
+            .generation_statistics(),
+        expected.generation_statistics().ok().as_ref(),
+        "a freshly sealed manifest carries the generation's own census"
+    );
+
+    // The same revision as a writer produced it before the census existed:
+    // these bytes minus that one field. Text owners still bind against it,
+    // and the census reads as unavailable rather than as a measured zero.
+    let mut pre_census: serde_json::Value =
+        serde_json::from_slice(&manifest).expect("partitioned manifest JSON");
+    pre_census["generation"]
+        .as_object_mut()
+        .expect("generation payload")
+        .remove("statistics")
+        .expect("a fresh manifest carries a census to remove");
+    pre_census["state_digest"] = serde_json::json!(format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&pre_census["generation"]).expect("pre-census payload bytes")
+        ))
+    ));
+    let pre_census = serde_json::to_vec(&pre_census).expect("pre-census manifest bytes");
+    assert_eq!(
+        CodeIndexPublishedGenerationV1::partitioned_text_metadata(&pre_census)
+            .expect("a manifest written without a census still authenticates")
+            .expect("revision seven partitioned manifest")
+            .generation_statistics(),
+        None,
+        "an absent census must read as unavailable, not as a measured zero"
     );
 
     // Decode at width two with three file segments: the third file read must
@@ -3257,10 +3600,7 @@ fn historical_writer_bytes_read_through_both_partitioned_readers() {
                 ..
             } => (digest, offset, length),
         };
-        let name = digest
-            .as_str()
-            .strip_prefix("sha256:")
-            .expect("sha256 segment digest");
+        let name = sha256_hex_suffix(digest.as_str()).expect("sha256 segment digest");
         let bytes = std::fs::read(fixture.join("segments").join(format!("{name}.json")))
             .expect("historical segment bytes");
         let start = usize::try_from(offset).expect("segment offset");
@@ -3456,6 +3796,66 @@ fn partitioned_descriptor_readers_share_validation_without_sharing_authenticatio
 /// content address, so its bytes are never re-encoded, re-hashed or rewritten.
 /// Generation evidence is emitted as bounded authenticated pages in one pack
 /// beside that delta-proportional file publication.
+#[test]
+fn partitioned_encode_rewrites_file_segments_across_extractor_revisions() {
+    let store = SharedPublicationStore::default();
+    let mut owner = CodeIndexProductionOwnerV1::new(config(), store, ApplyingProjectionSink)
+        .expect("revision fixture owner");
+    let parent = owner
+        .build_and_publish(partitioned_codec_request(1, 1_100_000), &ActiveControl)
+        .expect("revision parent generation");
+    let parent_manifest = parent
+        .encode_partitioned_sealed(|_| Ok(()))
+        .expect("revision parent encoding");
+    let mut parent_envelope: serde_json::Value =
+        serde_json::from_slice(&parent_manifest).expect("parent manifest JSON");
+    let mut historical_manifest: CodeGenerationManifestV1 =
+        serde_json::from_value(parent_envelope["generation"]["manifest"].clone())
+            .expect("parent generation manifest");
+    let (_, revision) = historical_manifest
+        .extractor_revisions
+        .iter_mut()
+        .find(|(language, _)| language.as_str() == "rust")
+        .expect("Rust extractor revision");
+    *revision = ExtractorRevision::new("extractor.rust.v3").expect("historical extractor revision");
+    historical_manifest.seal.expected_digest =
+        expected_seal_digest(&historical_manifest).expect("historical manifest seal");
+    parent_envelope["generation"]["manifest"] =
+        serde_json::to_value(historical_manifest).expect("historical manifest JSON");
+    parent_envelope["state_digest"] = serde_json::to_value(
+        sealed_generation_payload_digest(
+            SEALED_GENERATION_FORMAT_REVISION_V1,
+            &parent_envelope["generation"],
+        )
+        .expect("historical envelope digest"),
+    )
+    .expect("historical digest JSON");
+    let historical_parent =
+        serde_json::to_vec(&parent_envelope).expect("historical parent encoding");
+
+    let child = owner
+        .build_and_publish(partitioned_codec_request(2, 1_200_000), &ActiveControl)
+        .expect("revision child generation");
+    let mut published_files = 0;
+    child
+        .encode_partitioned_sealed_with_parent(Some(&historical_parent), |publication| {
+            if matches!(
+                publication,
+                SealedGenerationSegmentPublicationV1::File { .. }
+            ) {
+                published_files += 1;
+            }
+            Ok(())
+        })
+        .expect("revision child encoding");
+
+    assert_eq!(
+        published_files,
+        child.snapshot().files.len(),
+        "no file segment may cross an extractor revision"
+    );
+}
+
 #[test]
 fn partitioned_encode_publishes_only_the_edited_file_segment() {
     let store = SharedPublicationStore::default();

@@ -7,7 +7,8 @@
 mod admin_cli;
 pub(crate) use admin_cli::handle_projectless_admin_cli;
 pub(crate) use hook_runtime::{
-    HookV2AdmissionOutcomeV1, admit_hook_v2_envelope, handle_projectless_hook_runtime,
+    HookV2AdmissionOutcomeV1, admit_hook_v2_envelope,
+    admit_hook_v2_replayed_envelope_with_lifecycle, handle_projectless_hook_runtime,
     hook_v2_pending_work_envelopes, replay_projectless_hermes_host_admission,
 };
 mod admin_project;
@@ -437,6 +438,10 @@ impl<'a> ToolCallRegistryOptions<'a> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Tool-call handling is one registry dispatch match onto the owning handler."
+)]
 pub fn handle_tool_call_with_registry_options<'a>(
     cg: &'a TraceDecay,
     tool_name: &'a str,
@@ -788,31 +793,13 @@ pub fn handle_tool_call_with_registry_options<'a>(
         };
         match result {
             Ok(mut result) => {
-                // The verified-graph open funnel reports serve-old-while-
-                // rebuilding through the one-shot options slot; the answer is
-                // sound for the served generation but may trail the live
-                // worktree, and the response must say so — including whether
-                // a rebuild is actually in motion, so a wedged route serving
-                // days-old answers is visibly wedged, not "rebuilding".
-                if let Some(served) = served_stale_graph_generation.get()
-                    && let Some(content) = result
-                        .value
-                        .get_mut("content")
-                        .and_then(|content| content.as_array_mut())
-                {
-                    let generation = &served.generation;
-                    let age = seated_generation_age_label(served.sealed_at);
-                    let remedy = if served.rebuild_in_flight {
-                        "while the code index rebuilds"
-                    } else {
-                        "with no rebuild pass in flight — the scheduler is not \
-                         replacing this generation"
-                    };
-                    content.push(json!({"type": "text", "text": format!(
-                        "\ncode_graph_freshness: stale — serving the last complete generation \
-                         {generation} (sealed {age} ago) {remedy}; results may trail the \
-                         live worktree"
-                    )}));
+                // The verified-graph open funnel reports a stale serving seat
+                // through the one-shot options slot. The answer is sound for
+                // that generation but may trail the live worktree, so name
+                // whether source movement proved a rebuild or source currency
+                // remains unverified.
+                if let Some(served) = served_stale_graph_generation.get() {
+                    append_code_graph_freshness(&mut result, served);
                 }
                 Ok(result)
             }
@@ -820,6 +807,30 @@ pub fn handle_tool_call_with_registry_options<'a>(
         }
     };
     Box::pin(hotpath::future!(dispatch, label = "mcp.tool_call"))
+}
+
+pub(super) fn append_code_graph_freshness(
+    result: &mut ToolResult,
+    served: &ServedStaleCodeGraphReadV1,
+) {
+    let Some(content) = result
+        .value
+        .get_mut("content")
+        .and_then(|content| content.as_array_mut())
+    else {
+        return;
+    };
+    let generation = &served.generation;
+    let age = seated_generation_age_label(served.sealed_at);
+    let remedy = if served.rebuild_in_flight {
+        "while the code index rebuilds"
+    } else {
+        "while source freshness remains unverified"
+    };
+    content.push(json!({"type": "text", "text": format!(
+        "\ncode_graph_freshness: stale — serving the last complete generation \
+         {generation} (sealed {age} ago) {remedy}; results may trail the live worktree"
+    )}));
 }
 
 /// Coarse human duration between a generation's seal time and now, for the

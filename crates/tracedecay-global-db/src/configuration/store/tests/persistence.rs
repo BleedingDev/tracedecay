@@ -3,15 +3,17 @@
 use super::super::mutation::{
     commit_configuration_transaction, map_store_error, validate_commit_bindings,
 };
+use super::super::read::{current_revision_id_from_executor, read_revision_from_executor};
 use super::super::{
     ActivationDriftV1, AuthorizedActor, ConfigurationControlStore, ConfigurationError,
-    ConfigurationRevisionStore, ConfigurationStoreError, Executor, params,
+    ConfigurationRevisionStore, ConfigurationStoreError, Executor,
+    OwnedGlobalDbConfigurationControlStore, params,
 };
 use super::{
-    ConfigurationAuditEventKindV1, ConfigurationSqlStore, ConfigurationValueV1,
-    GlobalDbConfigurationControlStore, HostAdmissionScope, TestConnection, TransactionBehavior,
-    UtcMicros, control_authority, control_authority_with_key_for_layer, count,
-    direct_project_layer, global_setup, id, protected_commit, root_revision, seed_revision, setup,
+    ConfigurationAuditEventKindV1, ConfigurationValueV1, GlobalDbConfigurationControlStore,
+    HostAdmissionScope, TestConnection, UtcMicros, control_authority,
+    control_authority_with_key_for_layer, count, direct_project_layer, global_setup, id,
+    protected_commit,
 };
 use crate::configuration::contracts::DirectConfigurationMutation;
 use crate::configuration::registry::ConfigurationRegistry;
@@ -20,55 +22,6 @@ use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationIdempotencyKey, ConfigurationLayerIdV1,
     ConfigurationMutationOperationV1, SettingKey, USER_CODE_INDEX_WORKERS_SETTING_KEY,
 };
-
-#[tokio::test]
-async fn canonical_initialization_publishes_one_final_revision_without_legacy_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let profile_root = directory.path().join("profile");
-    let project_root = directory.path().join("project");
-    std::fs::create_dir_all(&project_root).unwrap();
-    let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::project(
-        &profile_root,
-        &project_root,
-        tracedecay_domain::ProjectId::new("project.configuration-initialization").unwrap(),
-    )
-    .await
-    .unwrap();
-    let db = runtime
-        .registered_database(HostAdmissionScope::Project)
-        .unwrap();
-    let store = GlobalDbConfigurationControlStore::new_registered(db);
-    let revision_id = tracedecay_domain::configuration::ConfigurationRevisionId::new(
-        "configuration.revision.initial",
-    )
-    .unwrap();
-    let resolution = resolve_configuration(&ConfigurationRegistry::core().unwrap(), &[]).unwrap();
-
-    store
-        .initialize_canonical(&revision_id, &resolution, UtcMicros(1))
-        .await
-        .unwrap();
-
-    let current = ConfigurationControlStore::current(&store).await.unwrap();
-    assert_eq!(current.revision_id, revision_id);
-    assert_eq!(current.snapshot, resolution.snapshot);
-    let snapshot = db.read_snapshot().await.unwrap();
-    let mut legacy = snapshot
-        .query(
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE name IN (
-                'configuration_migration_receipts',
-                'configuration_migration_quarantine'
-             )",
-            (),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        legacy.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-        0
-    );
-}
 
 #[tokio::test]
 async fn profile_worker_default_is_durable_and_project_registry_excludes_it() {
@@ -241,11 +194,39 @@ async fn activation_failure_preserves_last_working() {
 }
 
 #[tokio::test]
+async fn owned_store_resolves_component_observation_from_revision_history() {
+    let (_directory, runtime, root) = global_setup().await;
+    let lease = runtime
+        .registered_database_lease(HostAdmissionScope::Project)
+        .unwrap();
+    let owned = OwnedGlobalDbConfigurationControlStore::from_registered_project_runtime_db(lease);
+    owned
+        .record_component_activation(
+            "configuration.runtime-cache".to_owned(),
+            Some(root.revision_id.clone()),
+            None,
+            UtcMicros(11),
+        )
+        .await
+        .unwrap();
+
+    let observed = owned
+        .observed_component_configuration("configuration.runtime-cache".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(observed.revision_id, root.revision_id);
+    assert_eq!(observed.snapshot, root.snapshot);
+}
+
+#[tokio::test]
 async fn revision_store_round_trips_typed_snapshot_plan_receipt_and_audit() {
-    let (_directory, connection) = setup().await;
-    let root = root_revision();
-    seed_revision(&connection, &root).await;
-    let store = ConfigurationSqlStore::new(&connection);
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
     let (plan, commit) = protected_commit(&root);
 
     assert_eq!(store.current_revision().await.unwrap(), root);
@@ -294,34 +275,31 @@ async fn revision_store_round_trips_typed_snapshot_plan_receipt_and_audit() {
     );
 
     assert_eq!(
-        store.audit(None, 1).await.unwrap(),
+        ConfigurationRevisionStore::audit(&store, None, 1)
+            .await
+            .unwrap(),
         vec![commit.audit_event.clone()]
     );
     assert!(
-        store
-            .audit(Some(&commit.audit_event.event_id), 1)
+        ConfigurationRevisionStore::audit(&store, Some(&commit.audit_event.event_id), 1)
             .await
             .unwrap()
             .is_empty()
     );
-    assert_eq!(count(&connection, "configuration_revisions").await, 2);
-    assert_eq!(
-        count(&connection, "configuration_mutation_receipts").await,
-        1
-    );
-    assert_eq!(
-        count(&connection, "configuration_change_plan_events").await,
-        2
-    );
-    assert_eq!(count(&connection, "configuration_audit_events").await, 1);
+    let read = db.read_snapshot().await.unwrap();
+    assert_eq!(count(&read, "configuration_revisions").await, 2);
+    assert_eq!(count(&read, "configuration_mutation_receipts").await, 1);
+    assert_eq!(count(&read, "configuration_change_plan_events").await, 2);
+    assert_eq!(count(&read, "configuration_audit_events").await, 1);
 }
 
 #[tokio::test]
 async fn rollback_terminal_event_is_persisted_and_visible_in_audit() {
-    let (_directory, connection) = setup().await;
-    let root = root_revision();
-    seed_revision(&connection, &root).await;
-    let store = ConfigurationSqlStore::new(&connection);
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
     let (plan, mut commit) = protected_commit(&root);
     commit.next_revision.operation_kind = "rollback_apply".to_owned();
     commit.audit_event.event_kind = ConfigurationAuditEventKindV1::RollbackApplied;
@@ -329,7 +307,8 @@ async fn rollback_terminal_event_is_persisted_and_visible_in_audit() {
     store.save_change_plan(&plan).await.unwrap();
     store.commit(commit.clone()).await.unwrap();
 
-    let mut rows = connection
+    let read = db.read_snapshot().await.unwrap();
+    let mut rows = read
         .query(
             "SELECT event_kind
                  FROM configuration_change_plan_events
@@ -348,52 +327,40 @@ async fn rollback_terminal_event_is_persisted_and_visible_in_audit() {
         "rollback_applied"
     );
     assert_eq!(
-        store.audit(None, 1).await.unwrap(),
+        ConfigurationRevisionStore::audit(&store, None, 1)
+            .await
+            .unwrap(),
         vec![commit.audit_event]
     );
 }
 
 #[tokio::test]
 async fn failed_configuration_commit_leaves_no_partial_revision_receipt_or_audit() {
-    let (directory, connection) = setup().await;
-    let root = root_revision();
-    seed_revision(&connection, &root).await;
-    let store = ConfigurationSqlStore::new(&connection);
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
     let (plan, commit) = protected_commit(&root);
     store.save_change_plan(&plan).await.unwrap();
 
     validate_commit_bindings(&commit).unwrap();
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .await
-        .unwrap();
+    let transaction = db.begin_write_transaction().await.unwrap();
     assert!(
         commit_configuration_transaction(&transaction, &commit, true, None)
             .await
             .is_err()
     );
     drop(transaction);
-    drop(connection);
-
-    let connection = TestConnection::open(&directory.path().join("configuration.db"));
-    connection
-        .execute_batch("PRAGMA foreign_keys = ON;")
-        .await
-        .unwrap();
-    assert_eq!(count(&connection, "configuration_revisions").await, 1);
+    let read = db.read_snapshot().await.unwrap();
+    assert_eq!(count(&read, "configuration_revisions").await, 1);
+    assert_eq!(count(&read, "configuration_mutation_receipts").await, 0);
+    assert_eq!(count(&read, "configuration_audit_events").await, 0);
     assert_eq!(
-        count(&connection, "configuration_mutation_receipts").await,
+        count(&read, "configuration_component_activation_events").await,
         0
     );
-    assert_eq!(count(&connection, "configuration_audit_events").await, 0);
-    assert_eq!(
-        count(&connection, "configuration_component_activation_events").await,
-        0
-    );
-    assert_eq!(
-        count(&connection, "configuration_change_plan_events").await,
-        1
-    );
+    assert_eq!(count(&read, "configuration_change_plan_events").await, 1);
 }
 
 /// Byte-exact dump of a store canonically initialized by registry revision 3
@@ -436,8 +403,10 @@ async fn store_carrying_the_retired_default_collection_entry_fails_closed_typed(
         .await
         .unwrap();
 
-    let store = ConfigurationSqlStore::new(&connection);
-    let current = store.current_revision().await;
+    let current_revision_id = current_revision_id_from_executor(&connection)
+        .await
+        .unwrap();
+    let current = read_revision_from_executor(&connection, &current_revision_id).await;
     let Err(ConfigurationStoreError::InvalidData(reason)) = current else {
         panic!("revision-3 snapshot with a retired entry must be invalid data: {current:?}");
     };
@@ -459,9 +428,7 @@ async fn store_carrying_the_retired_default_collection_entry_fails_closed_typed(
 
     // The rollback target read uses the same revision read path and must fail
     // closed the same way instead of resurrecting the retired value.
-    let target = store
-        .read_revision(&id("configuration.revision.root"))
-        .await;
+    let target = read_revision_from_executor(&connection, &id("configuration.revision.root")).await;
     assert!(
         matches!(target, Err(ConfigurationStoreError::InvalidData(_))),
         "rollback-target read of a retired-entry revision must fail closed: {target:?}"
@@ -504,12 +471,12 @@ async fn fresh_stores_resolve_without_the_retired_default_collection_setting() {
         "fresh resolution must not manufacture the retired setting"
     );
 
-    let (_directory, connection) = setup().await;
-    seed_revision(&connection, &root_revision()).await;
-    let current = ConfigurationSqlStore::new(&connection)
-        .current_revision()
-        .await
+    let (_directory, runtime, _root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
         .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
+    let current = store.current_revision().await.unwrap();
     assert!(
         !current.snapshot.effective_values.contains_key(&retired),
         "a canonically initialized revision-4 store must not carry the retired setting"

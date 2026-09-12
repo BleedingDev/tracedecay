@@ -200,6 +200,7 @@ fn semantic_evidence() -> CodeSemanticEvidenceV1 {
         runtime_backend: "onnx.cpu".to_owned(),
         runtime_build_revision: "runtime.canonical-equivalence.v1".to_owned(),
         device_class: EmbeddingDeviceClassV1::Cpu,
+        execution_provider: tracedecay_domain::EmbeddingExecutionProviderV1::Cpu,
         dimensions: 2,
         metric: EmbeddingMetricV1::Cosine,
         normalization: EmbeddingNormalizationV1::L2,
@@ -255,6 +256,10 @@ impl FixtureRecords {
                 start_byte: 21,
                 end_byte: 89,
             },
+            start_line_zero_based: 6,
+            end_line_zero_based: 8,
+            line: 7,
+            end_line: 9,
             signature: Some("pub async fn run_query()".to_owned()),
             is_async: true,
         }

@@ -40,7 +40,7 @@ use tracedecay_global_db::configuration::contracts::ConfigurationCurrentStateV1;
 use tracedecay_semantic_contracts::SemanticConfig;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TraceDecayConfig {
+pub struct RuntimeTraceDecayConfig {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub max_file_size: u64,
@@ -53,11 +53,11 @@ pub struct TraceDecayConfig {
     pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
     pub semantic: SemanticConfig,
-    pub sync: SyncConfig,
-    pub telemetry: TelemetryConfig,
+    pub sync: RuntimeSyncConfig,
+    pub telemetry: RuntimeTelemetryConfig,
 }
 
-impl Default for TraceDecayConfig {
+impl Default for RuntimeTraceDecayConfig {
     fn default() -> Self {
         Self {
             include: Vec::new(),
@@ -72,19 +72,19 @@ impl Default for TraceDecayConfig {
             memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
             semantic: SemanticConfig::default(),
-            sync: SyncConfig::default(),
-            telemetry: TelemetryConfig::default(),
+            sync: RuntimeSyncConfig::default(),
+            telemetry: RuntimeTelemetryConfig::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncConfig {
+pub struct RuntimeSyncConfig {
     pub auto_track_pr_branches: bool,
     pub auto_track_pr_poll_secs: u64,
 }
 
-impl Default for SyncConfig {
+impl Default for RuntimeSyncConfig {
     fn default() -> Self {
         Self {
             auto_track_pr_branches: false,
@@ -94,11 +94,11 @@ impl Default for SyncConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TelemetryConfig {
+pub struct RuntimeTelemetryConfig {
     pub timings: bool,
 }
 
-impl Default for TelemetryConfig {
+impl Default for RuntimeTelemetryConfig {
     fn default() -> Self {
         Self { timings: true }
     }
@@ -123,7 +123,7 @@ pub struct PinnedRuntimeConfiguration {
     target: RuntimeConfigurationTarget,
     revision_id: ConfigurationRevisionId,
     snapshot: Arc<ConfigurationSnapshotV1>,
-    config: TraceDecayConfig,
+    config: RuntimeTraceDecayConfig,
 }
 
 impl PinnedRuntimeConfiguration {
@@ -155,7 +155,7 @@ impl PinnedRuntimeConfiguration {
         &self.snapshot
     }
 
-    pub fn config(&self) -> &TraceDecayConfig {
+    pub fn config(&self) -> &RuntimeTraceDecayConfig {
         &self.config
     }
 
@@ -239,11 +239,13 @@ pub fn cached_pinned_runtime_configuration(
 /// configuration consumer shares. There are no defaults, file reads, or
 /// environment reads: an absent or mistyped required setting is an error.
 #[hotpath::measure(label = "configuration.runtime.materialize")]
-fn runtime_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<TraceDecayConfig> {
+fn runtime_config_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<RuntimeTraceDecayConfig> {
     snapshot.validate().map_err(|error| {
         config_error(format!("invalid resolved configuration snapshot: {error}"))
     })?;
-    Ok(TraceDecayConfig {
+    Ok(RuntimeTraceDecayConfig {
         include: required_string_list(snapshot, INDEX_INCLUDE_SETTING_KEY)?,
         exclude: required_string_list(snapshot, INDEX_EXCLUDE_SETTING_KEY)?,
         max_file_size: required_unsigned(snapshot, INDEX_MAX_FILE_SIZE_SETTING_KEY)?,
@@ -262,7 +264,7 @@ fn runtime_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<Tr
         memory_provider_ncm_observer: memory_provider_ncm_observer_from_snapshot(snapshot)?,
         memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
         semantic: semantic_config_from_snapshot(snapshot)?,
-        sync: SyncConfig {
+        sync: RuntimeSyncConfig {
             auto_track_pr_branches: required_bool(
                 snapshot,
                 SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
@@ -272,7 +274,7 @@ fn runtime_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<Tr
                 SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
             )?,
         },
-        telemetry: TelemetryConfig {
+        telemetry: RuntimeTelemetryConfig {
             timings: required_bool(snapshot, TELEMETRY_TIMINGS_SETTING_KEY)?,
         },
     })

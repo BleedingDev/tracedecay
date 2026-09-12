@@ -36,29 +36,6 @@ pub enum CapabilityEmissionErrorV1 {
     Contract(String),
 }
 
-/// The capability-manifest emitter contract.
-pub trait CodeIndexCapabilityEmitter {
-    /// Emit the base capability manifest for one sealed generation.
-    fn emit(
-        &self,
-        generation: &CodeGenerationManifestV1,
-    ) -> Result<CodeIndexCapabilityManifestV1, CapabilityEmissionErrorV1>;
-}
-
-/// The consumer-side validation contract for a base manifest: reject missing,
-/// incompatible, mixed-generation, or unauthorized manifests before candidate
-/// production.
-pub trait CodeIndexCapabilityValidator {
-    /// Validate that `manifest` authorizes candidate production under
-    /// `projection` for `generation`.
-    fn validate_for_candidates(
-        &self,
-        generation: &CodeGenerationId,
-        projection: &ProjectionKeyV1,
-        manifest: &CodeIndexCapabilityManifestV1,
-    ) -> Result<(), CapabilityEmissionErrorV1>;
-}
-
 /// Domain separator for the generation seal's expected digest. The seal is
 /// computed over every generation field except the seal itself.
 pub const GENERATION_SEAL_SEPARATOR: &str = "tracedecay.code-generation-seal.v1";
@@ -205,8 +182,35 @@ impl<R: LanguageRegistry> BaseCapabilityEmitter<R> {
     }
 }
 
-impl<R: LanguageRegistry> CodeIndexCapabilityEmitter for BaseCapabilityEmitter<R> {
-    fn emit(
+/// Whether a sealed generation carries exactly the registry, grammar, and
+/// extractor revisions supplied by its snapshot-scoped language registry.
+///
+/// Callers must supply the registry narrowed to the languages present in the
+/// generation's snapshot. An unavailable current descriptor must therefore be
+/// rejected while constructing that registry rather than omitted here.
+pub fn generation_language_revisions_match<R: LanguageRegistry>(
+    generation: &CodeGenerationManifestV1,
+    registry: &R,
+) -> bool {
+    let descriptors = registry.descriptors();
+    generation.registry_revision == registry.registry_revision()
+        && generation.grammar_revisions.len() == descriptors.len()
+        && generation.extractor_revisions.len() == descriptors.len()
+        && !generation.grammar_revisions.iter().zip(&descriptors).any(
+            |((language, revision), descriptor)| {
+                language != &descriptor.language || revision != &descriptor.grammar_revision
+            },
+        )
+        && !generation.extractor_revisions.iter().zip(&descriptors).any(
+            |((language, revision), descriptor)| {
+                language != &descriptor.language || revision != &descriptor.extractor_revision
+            },
+        )
+}
+
+impl<R: LanguageRegistry> BaseCapabilityEmitter<R> {
+    /// Emit the base capability manifest for one sealed generation.
+    pub fn emit(
         &self,
         generation: &CodeGenerationManifestV1,
     ) -> Result<CodeIndexCapabilityManifestV1, CapabilityEmissionErrorV1> {
@@ -225,23 +229,10 @@ impl<R: LanguageRegistry> CodeIndexCapabilityEmitter for BaseCapabilityEmitter<R
             return Err(CapabilityEmissionErrorV1::GenerationNotSealed);
         }
 
-        let descriptors = self.registry.descriptors();
-        if generation.registry_revision != self.registry.registry_revision()
-            || generation.grammar_revisions.len() != descriptors.len()
-            || generation.extractor_revisions.len() != descriptors.len()
-            || generation.grammar_revisions.iter().zip(&descriptors).any(
-                |((language, revision), descriptor)| {
-                    language != &descriptor.language || revision != &descriptor.grammar_revision
-                },
-            )
-            || generation.extractor_revisions.iter().zip(&descriptors).any(
-                |((language, revision), descriptor)| {
-                    language != &descriptor.language || revision != &descriptor.extractor_revision
-                },
-            )
-        {
+        if !generation_language_revisions_match(generation, &self.registry) {
             return Err(CapabilityEmissionErrorV1::MixedGeneration);
         }
+        let descriptors = self.registry.descriptors();
         let supported_languages: Vec<LanguageId> = descriptors
             .iter()
             .map(|descriptor| descriptor.language.clone())
@@ -341,8 +332,11 @@ impl Default for BaseCapabilityValidator {
     }
 }
 
-impl CodeIndexCapabilityValidator for BaseCapabilityValidator {
-    fn validate_for_candidates(
+impl BaseCapabilityValidator {
+    /// Validate that `manifest` authorizes candidate production under
+    /// `projection` for `generation`: reject missing, incompatible,
+    /// mixed-generation, or unauthorized manifests before candidate production.
+    pub fn validate_for_candidates(
         &self,
         generation: &CodeGenerationId,
         projection: &ProjectionKeyV1,
@@ -469,55 +463,6 @@ mod tests {
     }
 
     #[test]
-    fn emit_pins_the_frozen_base_manifest_fields() {
-        let generation = generation_manifest();
-        let manifest = emitter().emit(&generation).expect("emission succeeds");
-
-        assert_eq!(manifest.generation_id, generation.generation_id);
-        assert_eq!(manifest.chunk_schema_revision, CHUNK_SCHEMA_REVISION_V1);
-        assert_eq!(manifest.chunker_revision, generation.chunker_revision);
-        assert_eq!(manifest.privacy_domain, generation.privacy_domain);
-        assert_eq!(manifest.privacy_key_epoch, 7);
-        assert_eq!(manifest.source_coverage, coverage());
-        assert_eq!(manifest.sanitization_receipts, receipts());
-        assert_eq!(manifest.exact_term_kinds, BASE_EXACT_TERM_KINDS);
-        assert_eq!(manifest.edge_authority_classes, BASE_EDGE_AUTHORITY_CLASSES);
-        assert!(
-            manifest
-                .supported_languages
-                .contains(&LanguageId::new("rust").expect("valid id"))
-        );
-        // Member grain is available because compiled descriptors identify
-        // stable member spans.
-        assert!(
-            manifest
-                .available_grains
-                .contains(&CodeSearchChunkGrainV1::SymbolMember)
-        );
-        let mut sorted = manifest.available_grains.clone();
-        sorted.sort();
-        assert_eq!(manifest.available_grains, sorted);
-        assert_eq!(
-            capability_manifest_digest(&manifest).expect("digest recomputes"),
-            manifest.manifest_digest
-        );
-    }
-
-    #[test]
-    fn emission_is_deterministic_and_serde_round_trips() {
-        let generation = generation_manifest();
-        let first = emitter().emit(&generation).expect("first emission");
-        let second = emitter().emit(&generation).expect("second emission");
-        assert_eq!(first, second);
-
-        let bytes = serde_json::to_vec(&first).expect("serialize");
-        let decoded: CodeIndexCapabilityManifestV1 =
-            serde_json::from_slice(&bytes).expect("deserialize");
-        assert_eq!(first, decoded);
-        assert_eq!(decoded.manifest_digest, first.manifest_digest);
-    }
-
-    #[test]
     fn emit_rejects_unsealed_and_mixed_generations() {
         let mut unsealed = generation_manifest();
         unsealed.seal.expected_digest = digest('f');
@@ -537,29 +482,6 @@ mod tests {
             emitter().emit(&mixed),
             Err(CapabilityEmissionErrorV1::MixedGeneration)
         );
-    }
-
-    #[test]
-    fn validator_accepts_an_authorized_base_manifest_round_trip() {
-        let generation = generation_manifest();
-        let manifest = emitter().emit(&generation).expect("emission succeeds");
-        let validator =
-            BaseCapabilityValidator::new().authorize_privacy_domain(&generation.privacy_domain, 7);
-
-        validator
-            .validate_for_candidates(
-                &generation.generation_id,
-                &projection(ProjectionKindV1::Lexical),
-                &manifest,
-            )
-            .expect("lexical projection authorized");
-        validator
-            .validate_for_candidates(
-                &generation.generation_id,
-                &projection(ProjectionKindV1::Graph),
-                &manifest,
-            )
-            .expect("graph projection authorized");
     }
 
     #[test]

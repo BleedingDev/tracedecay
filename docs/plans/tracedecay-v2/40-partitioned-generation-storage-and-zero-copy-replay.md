@@ -111,3 +111,70 @@ representation and the replay economics:
   journal contract in Stage 0.
 - Stage 0 does not change `format_revision`; on-disk envelopes stay readable
   both directions across the stage-0 commits.
+
+## Dated amendment (2026-09-12, recorded decision): Stage 2b — shared, compressed segments
+
+**Measured.** For one worktree of a 150 MB / 5,190-file repository the scoped
+store is 4.6 GB: a 2.76 GB text artifact whose term and ngram posting lists are
+stored twice (document-clustered table plus term-leading covering index),
+1.4 GB of per-file segment JSON (8x the source: chunk `sanitized_text` across
+overlapping grains is 1.43x the source and `subtokens` another ~0.6x), and two
+300 MB interactive read bundles. Each linked worktree — including the internal
+`branch-worktrees` the daemon creates for branch tracking — repeats the whole
+stack, and no bytes are shared: 52,463 segment files across nine worktree
+scopes had 52,435 distinct digests because every segment embeds
+`authority.worktree_id`.
+
+**Decision.** Stage 2 keeps its manifest + segment split; Stage 2b changes
+what a segment is and where it lives, under one `format_revision` bump:
+
+1. **Worktree identity leaves the segment.** `authority.worktree_id` and the
+   branch reference move to the generation manifest's file entry. A segment is
+   then a pure function of file content, sanitizer, chunker, and descriptor
+   revisions, so identical files hash identically across worktrees.
+2. **One content store per repository.** Segments and text artifacts live
+   under `code-index-v1/<repository_id>/`; each worktree scope keeps only its
+   generation manifests, pointer, and freshness witness. `FileSegmentPlanV1::
+   Reused` looks up the repository store, so a second checkout of the same
+   commit publishes a manifest and no segment bytes. Retention's mark phase
+   unions every worktree manifest of the repository plus the replay pool
+   before sweeping the shared store; the scope-root record (`scope-root.v1`)
+   already identifies each worktree's root.
+3. **Block-compressed segments with a range index.** `SealedGenerationSegment
+   ReadV1::Range` reads are served today by seeking into the JSON; a compressed
+   segment carries a block table (uncompressed offset → compressed offset) so
+   a range read decompresses one block. `flate2` is already in the workspace;
+   a new dependency needs a measured ratio win over it.
+4. **Text once per file.** A segment stores the sanitized file text once and
+   each chunk carries `source_span` into it; `subtokens` are derived when the
+   text artifact is built, not persisted.
+5. **Text artifact V15.** Stage the posting lists document-clustered as today,
+   then write one term-clustered table at finalization instead of a covering
+   index that duplicates every row. Accept only against the V13/V14 append and
+   probe measurements recorded in `builder.rs`.
+
+6. **Incremental publication records name what changed, not what did not.**
+   Measured later the same day on the head scope of the same repository: the
+   two largest "segments" (344 MB each, one per retained generation) are not
+   file segments at all but the incremental publication record for a
+   generation in which 25 chunks changed and 11 were deleted. The record
+   enumerates the 413,743 *reused* chunk ids three times — as
+   `projection_request.changes.reused` (117 MB), as one `Reused` receipt per
+   chunk in `projection_receipt.receipts` (64 MB), and as 200,504 `unchanged`
+   lineage candidates (163 MB) that each repeat the constant
+   `(prior_generation, current_generation)` pair (49 MB), an identical
+   `prior_digest`/`current_digest` (18 MB), and the same
+   `exact_identity_tuple` / `exact` / empty-alternatives boilerplate. The
+   prior generation's manifest is immutable and digest-addressed, so the
+   reused set is a complement, not a list: the record should carry the
+   changed and deleted sets, the prior manifest digest, and one digest over
+   the ordered reused set for the recovered-digest proof; `unchanged` lineage
+   collapses to the occurrence-id pairs under a segment-level header. On this
+   scope that is ~330 MB of 344 MB per generation, twice per scope, across
+   every worktree scope of the repository. It is a contract change in
+   `tracedecay-domain` (`ChangedCodeChunkSetV1`, `ProjectionReceipt`,
+   `SymbolLineageCandidateV1` persistence) and belongs to this revision.
+
+**Order.** 1 and 2 ship together (they change the same digest); 3, 4, and 6
+can follow within the same revision; 5 is independent. Each step carries the
+dedup or byte figure it changes, measured on the repository above.

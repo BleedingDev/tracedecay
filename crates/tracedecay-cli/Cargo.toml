@@ -16,6 +16,7 @@ include = [
     "/src/**",
     "/tests/**",
     "/dashboard/app-dist/**",
+    "!/src/resources/logo.png",
 ]
 
 [[bin]]
@@ -95,10 +96,10 @@ full = ["tracedecay/full"]
 semantic-fastembed = ["tracedecay/semantic-fastembed"]
 semantic-model2vec = ["tracedecay/semantic-model2vec"]
 # Opt-in GPU execution providers for the embedded FastEmbed/ORT runtime.
-# Still requires `TRACEDECAY_EMBED_EXECUTION_PROVIDER=coreml|cuda` at runtime;
-# compiling the feature in alone changes nothing.
-semantic-gpu-coreml = ["tracedecay/semantic-gpu-coreml"]
+# A compiled provider is selected automatically on its supported platform;
+# `TRACEDECAY_EMBED_EXECUTION_PROVIDER=cpu` opts out.
 semantic-gpu-cuda = ["tracedecay/semantic-gpu-cuda"]
+semantic-gpu-webgpu = ["tracedecay/semantic-gpu-webgpu"]
 test-transport = ["tracedecay/test-transport"]
 lang-dart = ["tracedecay/lang-dart"]
 lang-pascal = ["tracedecay/lang-pascal"]
@@ -158,7 +159,6 @@ flate2 = "1"
 futures-util = "0.3.33"
 hex = "0.4"
 hotpath.workspace = true
-open = "5.3"
 rayon = "1"
 regex = { version = "1.12.3", optional = true }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup"] }

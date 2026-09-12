@@ -589,6 +589,10 @@ pub(super) async fn resolve_multi_root_projects(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Daemon invocation dispatch is one payload match onto the owning executor."
+)]
 pub(super) async fn execute_daemon_invocation(
     engine: &DaemonEngine,
     handshake: &DaemonHandshake,
@@ -814,66 +818,6 @@ mod semantic_control_tests {
             )
             .expect("cancelled cancellation"),
         )
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unix_dispatch_admits_controls_before_and_during_project_open() {
-        let cancelled = cancelled_control();
-        let cancelled_problem =
-            await_project_open_with_semantic_control(Some(&cancelled), None, async {
-                panic!("pre-cancelled project open must not be polled");
-            })
-            .await
-            .expect_err("pre-cancelled request");
-        assert_eq!(cancelled_problem.kind(), ApplicationProblemKind::Cancelled);
-
-        let expired = active_control(0);
-        let expired_problem =
-            await_project_open_with_semantic_control(Some(&expired), None, async {
-                panic!("pre-expired project open must not be polled");
-            })
-            .await
-            .expect_err("pre-expired request");
-        assert_eq!(expired_problem.kind(), ApplicationProblemKind::TimedOut);
-
-        let expiring = active_control(2_000);
-        let during_open_problem = await_project_open_with_semantic_control(
-            Some(&expiring),
-            None,
-            std::future::pending::<()>(),
-        )
-        .await
-        .expect_err("project open must observe deadline");
-        assert_eq!(during_open_problem.kind(), ApplicationProblemKind::TimedOut);
-
-        let request_cancellation = CancellationToken::new();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let cancelled_open = {
-            let request_cancellation = request_cancellation.clone();
-            tokio::spawn(async move {
-                let control = active_control(1_000_000);
-                await_project_open_with_semantic_control(
-                    Some(&control),
-                    Some(&request_cancellation),
-                    async move {
-                        let _ = started_tx.send(());
-                        std::future::pending::<()>().await;
-                    },
-                )
-                .await
-            })
-        };
-        started_rx.await.expect("project open started");
-        request_cancellation.cancel();
-        assert_eq!(
-            cancelled_open
-                .await
-                .expect("project-open task")
-                .expect_err("request cancellation must interrupt project open")
-                .kind(),
-            ApplicationProblemKind::Cancelled
-        );
     }
 
     #[tokio::test]

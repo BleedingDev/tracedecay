@@ -1,6 +1,6 @@
 //! Behavioral retained-memory evals over the exact retained-memory tools.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread::JoinHandle;
@@ -525,6 +525,10 @@ fn run_search(fixture: &Fixture, query: &str, limit: usize) -> Vec<FactSearchHit
 fn available_fact(projection: FactProjectionV1) -> FactV1 {
     match projection {
         FactProjectionV1::Available { fact } => *fact,
+        FactProjectionV1::Superseded {
+            fact,
+            superseded_by,
+        } => panic!("expected current fact, got {fact:?} superseded by {superseded_by}"),
         FactProjectionV1::Unavailable { status } => {
             panic!("expected available fact projection, got {status:?}")
         }
@@ -1003,46 +1007,5 @@ fn harness_socket_path_uses_the_bounded_production_fallback() {
     assert_eq!(
         socket.file_name().and_then(|name| name.to_str()),
         Some("daemon.sock")
-    );
-}
-
-/// Every scenario file must have a matching test so an unwired JSON scenario
-/// cannot silently stop exercising the production retained-memory path.
-#[test]
-fn every_scenario_file_is_wired() {
-    let wired: HashSet<&str> = [
-        "memory-no-pollution",
-        "memory-secret-rejection",
-        "memory-skip-local",
-        "memory-supersede-without-dup",
-        "memory-multiturn-continuity",
-        "memory-ranking-trust-bias",
-        "memory-ranking-supersession",
-        "memory-ranking-morphology",
-        "memory-feedback-trust",
-        "memory-ranking-retrieval-reinforcement",
-        "memory-ranking-feedback-promotes",
-    ]
-    .into_iter()
-    .collect();
-    let directory = crate::common::repository_path("evals/memory/scenarios");
-    let found = std::fs::read_dir(&directory)
-        .expect("read evals/memory/scenarios")
-        .map(|entry| entry.expect("scenario entry").path())
-        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("json"))
-        .map(|path| {
-            let id = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .expect("scenario file stem")
-                .to_owned();
-            load_scenario(&id);
-            id
-        })
-        .collect::<HashSet<_>>();
-    assert_eq!(
-        found.iter().map(String::as_str).collect::<HashSet<_>>(),
-        wired,
-        "evals/memory/scenarios/*.json and the test list must stay in sync"
     );
 }

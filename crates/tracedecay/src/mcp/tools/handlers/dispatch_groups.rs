@@ -1,6 +1,9 @@
 use serde_json::Value;
 use tracedecay_code_index::intake::content_digest;
-use tracedecay_contracts::{ApplicationProblem, ResultContractRef, RetainedSurfaceOperation};
+use tracedecay_contracts::retrieval::{CallableCodeOperationKind, callable_code_operation};
+use tracedecay_contracts::{
+    ApplicationOperation, ApplicationProblem, ResultContractRef, RetainedSurfaceOperation,
+};
 use tracedecay_graph_query::VerifiedGraphQueryRequest;
 use tracedecay_privacy::{CodeSourceShapeV1, sanitize_code_source_bytes};
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
@@ -180,6 +183,21 @@ async fn admitted_graph_query(
     options: &ToolCallRegistryOptions<'_>,
     operation_name: &str,
 ) -> Result<tracedecay_graph_query::VerifiedGraphQuery> {
+    let operation =
+        tracedecay_contracts::retrieval::catalog::primitive_read_operation(operation_name)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("invalid graph read operation: {error}"),
+            })?
+            .ok_or_else(|| TraceDecayError::Config {
+                message: format!("unregistered graph read operation: {operation_name}"),
+            })?;
+    admitted_graph_query_for_operation(options, &operation).await
+}
+
+async fn admitted_graph_query_for_operation(
+    options: &ToolCallRegistryOptions<'_>,
+    operation: &ApplicationOperation,
+) -> Result<tracedecay_graph_query::VerifiedGraphQuery> {
     let Some(port) = options.verified_graph_query_port.as_deref() else {
         return Err(graph_read_unavailable(
             "the exact project verified graph query is not mounted",
@@ -197,21 +215,13 @@ async fn admitted_graph_query(
         .application_cancellation
         .as_ref()
         .ok_or_else(|| graph_read_unavailable("the caller cancellation signal is unavailable"))?;
-    let operation =
-        tracedecay_contracts::retrieval::catalog::primitive_read_operation(operation_name)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("invalid graph read operation: {error}"),
-            })?
-            .ok_or_else(|| TraceDecayError::Config {
-                message: format!("unregistered graph read operation: {operation_name}"),
-            })?;
     // Admission wait is measured apart from handler execution: every
     // graph-backed tool in the graph/info/analysis/git/health groups funnels
     // through this one open, so a slow span here is admission contention or a
     // stale generation, never handler work.
     let query = hotpath::future!(
         port.open(VerifiedGraphQueryRequest::new(
-            &operation,
+            operation,
             request_id,
             deadline,
             cancellation,
@@ -344,6 +354,10 @@ pub(super) async fn dispatch_graph_tools(
     dispatch_graph_tools_inner(tool_name, cg, args, selected_scope_prefix, options).await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Graph-tool dispatch is one name match onto the verified graph ports."
+)]
 fn dispatch_graph_tools_inner<'a>(
     tool_name: &'a str,
     cg: &'a TraceDecay,
@@ -558,7 +572,11 @@ fn dispatch_info_tools_inner<'a>(
                 .await
             }
             "tracedecay_files" => {
-                let graph = admitted_graph_query(cg, &options, "file_metadata").await?;
+                let operation = callable_code_operation(CallableCodeOperationKind::SourceMetadata)
+                    .map_err(|error| TraceDecayError::Config {
+                        message: format!("invalid source metadata operation: {error}"),
+                    })?;
+                let graph = admitted_graph_query_for_operation(&options, &operation).await?;
                 portable_info::handle_files(&graph, args, selected_scope_prefix).await
             }
             "tracedecay_admin_sync" => {
@@ -572,7 +590,6 @@ fn dispatch_info_tools_inner<'a>(
                 let graph = admitted_graph_query(cg, &options, "port_order").await?;
                 portable_info::handle_port_order(&graph, args).await
             }
-            "tracedecay_simplify_scan" => portable_info::handle_simplify_scan().await,
             "tracedecay_type_hierarchy" => {
                 let graph = admitted_graph_query(cg, &options, "code_type_hierarchy").await?;
                 portable_info::handle_type_hierarchy(&graph, args).await
@@ -874,14 +891,7 @@ fn dispatch_git_tools_inner<'a>(
                     let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
                     git::handle_diff_context(&ctx, &graph, args).await
                 }
-                "tracedecay_changelog" => {
-                    git::handle_changelog(
-                        &ctx,
-                        admitted_graph_query(cg, &options, "file_dependents"),
-                        args,
-                    )
-                    .await
-                }
+                "tracedecay_changelog" => git::handle_changelog(&ctx, args).await,
                 "tracedecay_commit_context" => {
                     let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
                     git::handle_commit_context(&ctx, &graph, args).await
@@ -1213,6 +1223,10 @@ pub(super) async fn dispatch_retained_application_tools(
     .await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Retained-application dispatch is one name match onto the application surface."
+)]
 fn dispatch_retained_application_tools_inner<'a>(
     tool_name: &'a str,
     cg: &'a TraceDecay,
@@ -1231,11 +1245,6 @@ fn dispatch_retained_application_tools_inner<'a>(
                 message: error.to_string(),
             })?
             .ok_or_else(|| unknown_tool_error(tool_name))?;
-        // Normalization strips `project_selector`, so the selected project is
-        // read here: a selector-bound retained route is served by the calling
-        // session's own runtime, and only the selector names the project the
-        // retained owner actually opened.
-        let selected_project_id = super::tool_call_support::selected_project_id_argument(&args);
         let normalized = tracedecay_daemon_protocol::separate_application_tool_request(args)
             .map_err(|error| TraceDecayError::Config {
                 message: error.to_string(),
@@ -1261,8 +1270,6 @@ fn dispatch_retained_application_tools_inner<'a>(
             None => application_surface::request_id()?,
         };
         let result_contract = ResultContractRef::from_schema(&binding.result_schema);
-        let selected_scope_contract = result_contract.clone();
-        let selected_scope_request_id = request_id.clone();
         let result = match options.application_invocation_executor {
             Some(executor) => {
                 let (deadline, cancellation) =
@@ -1339,19 +1346,6 @@ fn dispatch_retained_application_tools_inner<'a>(
                 )?),
             )?),
         };
-        let result = match selected_project_id {
-            Some(selected_project_id) => {
-                restate_selected_project_scope(
-                    result,
-                    &selected_project_id,
-                    options.global_db.map(RegisteredGlobalDbLeaseV1::as_ref),
-                    selected_scope_contract,
-                    selected_scope_request_id,
-                )
-                .await?
-            }
-            None => result,
-        };
         hotpath::measure_block!(
             "mcp.retained.render",
             application_surface::render_retained_result(
@@ -1363,71 +1357,6 @@ fn dispatch_retained_application_tools_inner<'a>(
             )
         )
     })
-}
-
-/// Report the exact project a selector-bound retained route was served from.
-///
-/// A selector-bound route stays on the calling session's admitted runtime, so
-/// the daemon resolves the response scope from that session — the admitted
-/// project — even when the retained owner opened the selected project's store
-/// instead. Restating the scope here keeps the envelope truthful about which
-/// project answered.
-///
-/// Only an evidence (read) outcome can be restated: an effect's receipt is
-/// signed over the admitted scope, so a committed effect that somehow named
-/// another project is refused rather than reported under either scope. Any
-/// selector that cannot be resolved to an exact registered scope is refused
-/// the same way, with the indistinguishable disclosure the retained surface
-/// already uses for a foreign selector.
-async fn restate_selected_project_scope(
-    result: tracedecay_contracts::ApplicationResult<
-        tracedecay_contracts::retained_surfaces::RetainedSurfaceResultV1,
-    >,
-    selected_project_id: &str,
-    global_db: Option<&tracedecay_global_db::RegisteredGlobalDb>,
-    contract: ResultContractRef,
-    request_id: tracedecay_contracts::RequestId,
-) -> Result<
-    tracedecay_contracts::ApplicationResult<
-        tracedecay_contracts::retained_surfaces::RetainedSurfaceResultV1,
-    >,
-> {
-    use super::tool_call_support::SelectedProjectScopeV1;
-
-    let mut envelope = match result {
-        Ok(envelope) => envelope,
-        Err(problem) => return Ok(Err(problem)),
-    };
-    let refused = || {
-        retained_problem_envelope(
-            contract.clone(),
-            request_id.clone(),
-            ApplicationProblem::not_found_or_not_authorized(
-                tracedecay_contracts::RetryDirective::Never,
-            ),
-        )
-    };
-    match super::tool_call_support::selected_project_scope(
-        selected_project_id,
-        &envelope.scope,
-        global_db,
-    )
-    .await
-    {
-        SelectedProjectScopeV1::Unchanged => Ok(Ok(envelope)),
-        SelectedProjectScopeV1::Restated(scope) => {
-            if matches!(
-                envelope.outcome,
-                tracedecay_contracts::ApplicationOutcome::Evidence(_)
-            ) {
-                envelope.scope = *scope;
-                Ok(Ok(envelope))
-            } else {
-                Ok(Err(refused()?))
-            }
-        }
-        SelectedProjectScopeV1::Refused => Ok(Err(refused()?)),
-    }
 }
 
 /// Dispatch memory, skill, and analytics tools (`tracedecay_fact_store_add`,

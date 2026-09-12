@@ -7,23 +7,23 @@ use super::schema_contract::{
 };
 use super::{
     configuration, ensure_code_project_primary_root_columns, ensure_parse_offset_columns,
-    ensure_session_parent_columns, ensure_table_columns, git_index_transactions,
-    global_db_operation_error, global_db_operation_message, observability_rollup, observation,
-    observation_projection, project_registry, session_temporal_schema, stack_delivery,
+    ensure_session_parent_columns, git_index_transactions, global_db_operation_error,
+    global_db_operation_message, observability_rollup, observation, observation_projection,
+    project_registry, session_temporal_schema, stack_delivery,
 };
 use tracedecay_runtime_core::{
     db::{
-        Database,
+        Database, DatabaseWriteTransaction,
         engine::{Executor, QueryExecutor},
     },
-    ports::registered_schema::RegisteredSchemaInstallationV1,
+    ports::registered_schema::{
+        RegisteredSchemaInstallationTransactionV1, RegisteredSchemaInstallationV1,
+    },
 };
 use tracedecay_rusqlite_runtime::repository::AUTHORIZED_SCOPE_SET_SCHEMA_V1;
 use tracedecay_rusqlite_runtime::work::{
-    WORK_EVENT_OWNER_SEQUENCE_BACKFILL_V1, WORK_EVENT_OWNER_SEQUENCE_COLUMN,
-    WORK_EVENT_OWNER_SEQUENCE_COLUMN_DDL,
-    WORK_PRODUCT_SCHEMA_V1 as WORK_PRODUCT_GRAPH_JOURNAL_SCHEMA_V1,
-    WORK_SCHEMA_V1 as WORK_EVENT_JOURNAL_SCHEMA_V1,
+    RETIRE_WORK_EVENT_JOURNAL_V1, WORK_PRODUCT_SCHEMA_V1 as WORK_PRODUCT_GRAPH_JOURNAL_SCHEMA_V1,
+    WORK_SCHEMA_V1,
 };
 use tracedecay_rusqlite_runtime::workflow::{
     WORKFLOW_SCHEMA_DEFINITION_DIGEST_V1, WORKFLOW_SCHEMA_IDENTITY_V1, WORKFLOW_SCHEMA_VERSION_V1,
@@ -243,11 +243,6 @@ const TRANSCRIPT_SCHEMA: &str = "
     );
     CREATE INDEX IF NOT EXISTS idx_session_messages_session
         ON session_messages(provider, session_id, ordinal);
-    CREATE INDEX IF NOT EXISTS idx_session_messages_session_activity
-        ON session_messages(
-            provider, session_id, timestamp, ordinal, message_id,
-            kind, tool_names, metadata_json
-        );
     CREATE INDEX IF NOT EXISTS idx_session_messages_timestamp
         ON session_messages(timestamp);
     CREATE INDEX IF NOT EXISTS idx_session_messages_source
@@ -287,6 +282,28 @@ const TRANSCRIPT_SCHEMA: &str = "
             VALUES (NEW.rowid, NEW.text, NEW.role, NEW.kind, NEW.model, NEW.tool_names);
         END;
 ";
+
+/// The activity read fetches a bounded LIMIT of rows per session, so a
+/// covering index buys little there, and copying `metadata_json` (kilobytes
+/// per message) into it doubled the table's footprint: on one store the index
+/// alone was 0.77 GB against 0.66 GB of table. The replacement covers the
+/// ordering columns and lets the scan fetch the blob from the table.
+///
+/// Both statements are store-sized — on a store with 184k messages the build
+/// measured 33 s and dropping the blob-covering predecessor 1 m 54 s — so
+/// neither belongs in the leased schema transaction, where each one outran
+/// the per-statement execution limit and failed every open. They run as
+/// separate independently durable batches on the long-lease migration writer:
+/// the replacement is durable before the predecessor is dropped, an
+/// interrupted migration never redoes a completed statement, and the activity
+/// read uses whichever of the two is present, so no reader waits for this.
+const SESSION_ACTIVITY_INDEX_MIGRATION_SQL: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_session_messages_session_activity_v2
+        ON session_messages(
+            provider, session_id, timestamp, ordinal, message_id, kind, tool_names
+        );",
+    "DROP INDEX IF EXISTS idx_session_messages_session_activity;",
+];
 
 const DELIVERY_SETTLEMENT_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS delivery_fanout_events (
@@ -406,7 +423,18 @@ pub async fn ensure_registered_schema(
             "new registered schema installation was not classified fresh",
         ));
     }
-    ensure_fresh_authority_invariants(installation).await
+    ensure_fresh_authority_invariants(installation).await?;
+    // A fresh store's session table is empty, so the statements that cost a
+    // migration on a populated store cost nothing here: run them and the
+    // store is installed already converged, with the activity index present
+    // for its first read. Nothing can be carrying the retired external-source
+    // tables a fresh install never creates.
+    for sql in SESSION_ACTIVITY_INDEX_MIGRATION_SQL {
+        installation.execute_batch(sql).await.map_err(|error| {
+            global_db_operation_error("install the session activity index", error)
+        })?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -545,30 +573,16 @@ pub async fn ensure_registered_schema_for_admission(
         .await
         .map_err(|error| global_db_operation_error(OPERATION, error))?;
 
-    let admission = install_registered_schema_stages(
-        &transaction,
+    install_and_commit_registered_schema(
+        transaction,
         configuration_fresh.as_ref(),
         temporal_admission,
         workflow_admission,
         force_exhaustive,
+        "commit registered global schema",
+        "roll back registered global schema",
     )
-    .await;
-
-    match admission {
-        Ok(()) => transaction
-            .commit()
-            .await
-            .map_err(|error| global_db_operation_error("commit registered global schema", error))?,
-        Err(error) => {
-            return match transaction.rollback().await {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(global_db_operation_error(
-                    "roll back registered global schema",
-                    std::io::Error::other(format!("{error}; rollback failed: {rollback_error}")),
-                )),
-            };
-        }
-    }
+    .await?;
 
     observation_projection::ensure_observation_projection_performance_indexes(installation)
         .await
@@ -616,6 +630,73 @@ async fn install_registered_schema_stages(
         force_exhaustive,
     ))
     .await
+}
+
+async fn install_and_commit_registered_schema<T>(
+    transaction: T,
+    configuration_fresh: Option<&configuration::FreshConfigurationStoreEvidence>,
+    temporal_admission: session_temporal_schema::SessionTemporalSchemaAdmission,
+    workflow_admission: WorkflowSchemaAdmission,
+    force_exhaustive: bool,
+    commit_operation: &'static str,
+    rollback_operation: &'static str,
+) -> tracedecay_domain::errors::Result<()>
+where
+    T: Executor + Sync + SchemaInstallTransaction,
+{
+    let admission = install_registered_schema_stages(
+        &transaction,
+        configuration_fresh,
+        temporal_admission,
+        workflow_admission,
+        force_exhaustive,
+    )
+    .await;
+    match admission {
+        Ok(()) => transaction.commit().await.map_err(|error| {
+            global_db_operation_error(commit_operation, std::io::Error::other(error))
+        }),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(global_db_operation_error(
+                rollback_operation,
+                std::io::Error::other(format!("{error}; rollback failed: {rollback_error}")),
+            )),
+        },
+    }
+}
+
+trait SchemaInstallTransaction: Sized {
+    fn commit(self) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn rollback(self) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl SchemaInstallTransaction for RegisteredSchemaInstallationTransactionV1<'_> {
+    async fn commit(self) -> Result<(), String> {
+        RegisteredSchemaInstallationTransactionV1::commit(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn rollback(self) -> Result<(), String> {
+        RegisteredSchemaInstallationTransactionV1::rollback(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl SchemaInstallTransaction for DatabaseWriteTransaction<'_> {
+    async fn commit(self) -> Result<(), String> {
+        DatabaseWriteTransaction::commit(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn rollback(self) -> Result<(), String> {
+        DatabaseWriteTransaction::rollback(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 async fn install_registered_schema_stage_sequence(
@@ -716,29 +797,13 @@ async fn install_registered_schema_stage_sequence(
             .map_err(|error| global_db_operation_error("initialize workflow schema", error))?;
     }
     transaction
-        .execute_batch(WORK_EVENT_JOURNAL_SCHEMA_V1)
+        .execute_batch(WORK_SCHEMA_V1)
         .await
-        .map_err(|error| global_db_operation_error("initialize Work event journal", error))?;
-    // A journal created by v0.1.0-beta.37 predates `owner_sequence`; it gains
-    // the column here and the backfill numbers its rows by insertion order.
-    ensure_table_columns(
-        transaction,
-        "work_events_v1",
-        &[(
-            WORK_EVENT_OWNER_SEQUENCE_COLUMN,
-            WORK_EVENT_OWNER_SEQUENCE_COLUMN_DDL,
-        )],
-    )
-    .await
-    .map_err(|error| global_db_operation_error("migrate Work event append order", error))?;
+        .map_err(|error| global_db_operation_error("initialize Work runtime schema", error))?;
     transaction
-        .execute_batch(WORK_EVENT_OWNER_SEQUENCE_BACKFILL_V1)
+        .execute_batch(RETIRE_WORK_EVENT_JOURNAL_V1)
         .await
-        .map_err(|error| global_db_operation_error("backfill Work event append order", error))?;
-    // The Work product graph authority is its own admission stage, not a
-    // continuation of the task journal above: it is owner-scoped rather
-    // than WorkAuthority-scoped, so a store that carries one and not the
-    // other is a legible state, and its failure names itself.
+        .map_err(|error| global_db_operation_error("retire Work event journal", error))?;
     transaction
         .execute_batch(WORK_PRODUCT_GRAPH_JOURNAL_SCHEMA_V1)
         .await
@@ -839,7 +904,12 @@ pub async fn converge_registered_schema(
     convergence: RegisteredSchemaConvergence,
 ) -> tracedecay_domain::errors::Result<()> {
     if convergence.lcm_status_performance_indexes {
-        converge_lcm_status_performance_indexes(database).await?;
+        converge_migration_batches(
+            database,
+            "converge LCM status performance indexes",
+            tracedecay_lcm::schema::LCM_STATUS_PERFORMANCE_INDEX_SQL,
+        )
+        .await?;
     }
     // The invariant pass pages historical authority rows and can legitimately
     // outlive an ordinary open on a large store. The admission phase has
@@ -850,18 +920,23 @@ pub async fn converge_registered_schema(
     converge_registered_schema_on(database, convergence).await
 }
 
-async fn converge_lcm_status_performance_indexes(
+/// Runs one store-sized migration as a sequence of independently durable
+/// batches on the long-lease migration writer.
+///
+/// One batch per statement is what lets an interrupted daemon resume without
+/// redoing the statements that already completed, and the long-lease writer is
+/// what keeps a statement whose cost scales with the store out of a caller's
+/// leased transaction.
+async fn converge_migration_batches(
     database: &Database,
+    operation: &'static str,
+    batches: &[&str],
 ) -> tracedecay_domain::errors::Result<()> {
-    // One independently durable batch per index lets an interrupted daemon
-    // resume without rebuilding indexes that already completed.
-    for sql in tracedecay_lcm::schema::LCM_STATUS_PERFORMANCE_INDEX_SQL {
+    for sql in batches {
         database
-            .execute_authority_revalidated_batch("install LCM status performance index", sql)
+            .execute_authority_revalidated_batch(operation, sql)
             .await
-            .map_err(|error| {
-                global_db_operation_error("converge LCM status performance indexes", error)
-            })?;
+            .map_err(|error| global_db_operation_error(operation, error))?;
     }
     Ok(())
 }
@@ -871,7 +946,32 @@ async fn converge_registered_schema_on(
     database: &Database,
     convergence: RegisteredSchemaConvergence,
 ) -> tracedecay_domain::errors::Result<()> {
+    converge_store_sized_migrations(database).await?;
     ensure_authority_invariants(database, convergence.force_exhaustive, convergence.is_fresh).await
+}
+
+/// Runs the migrations whose cost scales with the store rather than with the
+/// schema.
+///
+/// Installation is cheap idempotent `CREATE ... IF NOT EXISTS` and belongs in
+/// the leased admission transaction. Rebuilding an index or rewriting rows
+/// does not: each of these measured tens of seconds to minutes on a real
+/// store, so inside that transaction they tripped the per-statement execution
+/// limit and made every open of a large store fail. They run here instead —
+/// after the fail-closed admission checks, on the long-lease migration
+/// writer, releasing the writer between units — so admission, retrieval, and
+/// ordinary writes never wait for them.
+#[hotpath::measure(future = true, label = "global_db.schema.persist.converge_migrations")]
+async fn converge_store_sized_migrations(
+    database: &Database,
+) -> tracedecay_domain::errors::Result<()> {
+    converge_migration_batches(
+        database,
+        "migrate the session activity index",
+        SESSION_ACTIVITY_INDEX_MIGRATION_SQL,
+    )
+    .await?;
+    tracedecay_runtime_core::db::migrate_retired_mutation_copy_tables(database).await
 }
 
 /// Synchronously converges an attached existing store's historical schema.
@@ -888,7 +988,12 @@ async fn converge_registered_schema_on(
 pub async fn converge_attached_registered_schema(
     database: &Database,
 ) -> tracedecay_domain::errors::Result<()> {
-    converge_lcm_status_performance_indexes(database).await?;
+    converge_migration_batches(
+        database,
+        "converge LCM status performance indexes",
+        tracedecay_lcm::schema::LCM_STATUS_PERFORMANCE_INDEX_SQL,
+    )
+    .await?;
     let force_exhaustive =
         !authority_invariant_triggers_intact(&database.read_connection()).await?;
     converge_registered_schema_on(
@@ -931,26 +1036,16 @@ pub async fn ensure_attached_registered_schema(
     let transaction = database
         .begin_bulk_write_transaction("install attached registered global database schema")
         .await?;
-    let admission = install_registered_schema_stages(
-        &transaction,
+    install_and_commit_registered_schema(
+        transaction,
         configuration_fresh.as_ref(),
         temporal_admission,
         workflow_admission,
         force_exhaustive,
+        "commit attached registered global schema",
+        "roll back attached registered global schema",
     )
-    .await;
-    match admission {
-        Ok(()) => transaction.commit().await?,
-        Err(error) => {
-            return match transaction.rollback().await {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(global_db_operation_error(
-                    "roll back attached registered global schema",
-                    std::io::Error::other(format!("{error}; rollback failed: {rollback_error}")),
-                )),
-            };
-        }
-    }
+    .await?;
     // Mirror initialization's independently durable index builds: each
     // historical-data index commits on its own so an interrupted later build
     // never rolls back an earlier completed one.

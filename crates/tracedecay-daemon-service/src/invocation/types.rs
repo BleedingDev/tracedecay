@@ -1,7 +1,10 @@
 //! Shared retained-state shapes and small daemon-private types used across the invocation split.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
 use super::*;
-use futures_util::FutureExt;
 use tracedecay_contracts::RegisteredRootLocatorV1;
 
 pub use tracedecay_contracts::HookOrchestrationAdmissionV1;
@@ -116,13 +119,16 @@ impl Default for HookOrchestrationTaskOwnerV1 {
 impl HookOrchestrationTaskOwnerV1 {
     fn reap_finished(&mut self) {
         let tasks = std::mem::take(&mut self.tasks);
-        for task in tasks {
-            if task.is_finished() {
-                if !matches!(task.now_or_never(), Some(Ok(()))) {
-                    self.failed = true;
-                }
-            } else {
+        for mut task in tasks {
+            if !task.is_finished() {
                 self.tasks.push(task);
+                continue;
+            }
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            match Pin::new(&mut task).poll(&mut cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(_)) | Poll::Pending => self.failed = true,
             }
         }
     }
@@ -825,6 +831,16 @@ impl InvocationProjectRuntimeIdentityV1 {
     }
 }
 
+pub type ConfigurationRuntimeRefreshFuture =
+    Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+pub trait ConfigurationRuntimeRefreshPort: Send + Sync {
+    fn refresh(
+        &self,
+        current: tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1,
+    ) -> ConfigurationRuntimeRefreshFuture;
+}
+
 #[derive(Clone)]
 pub struct RegisteredConfigurationRuntime {
     pub(super) runtime: Arc<ProjectConfigurationRuntime>,
@@ -837,6 +853,7 @@ pub struct RegisteredConfigurationRuntime {
     pub(super) semantic_evaluation_workers: Arc<
         tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1,
     >,
+    pub(super) feedback_refresh: Arc<RwLock<Option<Arc<dyn ConfigurationRuntimeRefreshPort>>>>,
 }
 
 impl RegisteredConfigurationRuntime {
@@ -867,6 +884,8 @@ struct LspLeaseTask {
     generation: u64,
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     handle: tokio::task::JoinHandle<()>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    finished: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl LspLeaseTask {
@@ -942,6 +961,8 @@ impl LspLeaseTaskRegistry {
             let task_registry = Arc::downgrade(self);
             let task_session_id = session_id.clone();
             let (start, started) = tokio::sync::oneshot::channel();
+            #[cfg(any(test, feature = "test-helpers"))]
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
             let handle = tokio::spawn(async move {
                 let admitted = tokio::select! {
                     result = started => result.is_ok(),
@@ -956,6 +977,10 @@ impl LspLeaseTaskRegistry {
                 if let Some(task_registry) = task_registry.upgrade() {
                     task_registry.finish(&task_session_id, generation);
                 }
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    let _ = finished_tx.send(());
+                }
             });
             let previous = state.tasks.insert(
                 session_id,
@@ -963,6 +988,8 @@ impl LspLeaseTaskRegistry {
                     generation,
                     cancellation,
                     handle,
+                    #[cfg(any(test, feature = "test-helpers"))]
+                    finished: Some(finished_rx),
                 },
             );
             (previous, start, generation)
@@ -1066,6 +1093,28 @@ impl LspLeaseTaskRegistry {
         match self.state.lock() {
             Ok(state) => state.tasks.len(),
             Err(poisoned) => poisoned.into_inner().tasks.len(),
+        }
+    }
+
+    /// Await every registered lease task's completion signal.
+    ///
+    /// The sender fires after `finish` removes the task, so this does not
+    /// hold `lsp_sessions`. A missing receiver means the lease already ended.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn wait_until_idle(&self) {
+        let receivers = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state
+                .tasks
+                .values_mut()
+                .filter_map(|task| task.finished.take())
+                .collect::<Vec<_>>()
+        };
+        for finished in receivers {
+            let _ = finished.await;
         }
     }
 }

@@ -1,14 +1,33 @@
 use std::fmt::Display;
 
+use crate::exact_sql::{decode_json, encode_json};
 use rusqlite::types::{ToSqlOutput, Type, Value, ValueRef};
 use rusqlite::{OptionalExtension, ToSql};
 use serde::{Serialize, de::DeserializeOwned};
+
 pub(super) fn encode<T: Serialize + ?Sized>(value: &T) -> rusqlite::Result<String> {
-    serde_json::to_string(value).map_err(|error| conversion(error.to_string()))
+    encode_json(value, |error| conversion(error.to_string()))
 }
 
 pub(super) fn decode<T: DeserializeOwned>(value: String) -> rusqlite::Result<T> {
-    serde_json::from_str(&value).map_err(|error| conversion(error.to_string()))
+    decode_json(&value, |error| conversion(error.to_string()))
+}
+
+/// Two persisted encodings agree when they denote the same JSON document. A
+/// row migrated or hydrated in SQL is minified differently from one serde
+/// wrote, so a byte comparison would report a collision on an idempotent
+/// replay of a pre-migration write.
+pub(super) fn same_json(stored: &str, expected: &str) -> bool {
+    if stored == expected {
+        return true;
+    }
+    match (
+        serde_json::from_str::<serde_json::Value>(stored),
+        serde_json::from_str::<serde_json::Value>(expected),
+    ) {
+        (Ok(stored), Ok(expected)) => stored == expected,
+        _ => false,
+    }
 }
 
 pub(super) fn canonical_digest<T: Serialize + ?Sized>(value: &T) -> rusqlite::Result<String> {

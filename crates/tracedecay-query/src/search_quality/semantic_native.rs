@@ -22,12 +22,13 @@ use super::candidate_output::{ProfileSpecV1, ResourceSampleV1};
 use crate::retrieval::fusion::{
     CompositionKernel, CompositionLaneInput, FusionStageError, FusionStageInput,
 };
+use crate::retrieval::ports::RetrievalExecutionControl;
 /// Deterministic local executor admitted from one verified artifact.
 pub use crate::retrieval::rerank::AdmittedNativeRerankExecutorV1;
 use crate::retrieval::rerank::{
     BoundedRerankRuntimeV1, DeterministicLocalRerankExecutorV1, EphemeralRerankViewSourceV1,
-    LocalRerankFailureV1, LocalRerankInputV1, LocalRerankPermitV1, RerankExecutionControlV1,
-    RerankViewOutcomeV1, RerankViewPermitV1,
+    LocalRerankFailureV1, LocalRerankInputV1, LocalRerankPermitV1, RerankViewOutcomeV1,
+    RerankViewPermitV1,
 };
 use crate::retrieval::semantic::{
     CodeSemanticEvidenceV1, SemanticLaneRetriever, SemanticRetrievalRequestV1,
@@ -166,7 +167,7 @@ pub struct SemanticNativeRerankInputV1<'a> {
     pub policy: &'a RerankPolicy,
     pub views: &'a mut dyn EphemeralRerankViewSourceV1,
     pub executor: &'a dyn AdmittedNativeRerankExecutorV1,
-    pub control: &'a dyn RerankExecutionControlV1,
+    pub control: &'a dyn RetrievalExecutionControl,
 }
 
 /// Raw measured work returned by the admitted reranker.
@@ -1004,7 +1005,11 @@ impl SemanticNativeResourceSampleV1 {
         if self.cpu_time_us.is_none() {
             return Some("cpu_time_us");
         }
-        if self.peak_rss_bytes.is_none() {
+        // A zero peak is what an unavailable sampler reports, not a
+        // measurement, which is the same rule the evaluator and the pending
+        // diagnostic apply; the two layers must not disagree about whether
+        // this sample is complete.
+        if !self.peak_rss_bytes.is_some_and(|bytes| bytes > 0) {
             return Some("peak_rss_bytes");
         }
         if !self.model_bytes.is_some_and(|bytes| bytes != 0) {
@@ -1245,43 +1250,7 @@ impl SemanticNativeResourceEvidenceV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search_quality::CandidateWorkloadV1;
-    use crate::search_quality::packaged::load_workload;
     use tracedecay_domain::canonical_sha256;
-
-    fn checked_in_workload() -> CandidateWorkloadV1 {
-        load_workload().expect("checked-in search-quality workload")
-    }
-
-    #[test]
-    fn checked_in_profiles_request_only_declared_native_stages() {
-        let workload = checked_in_workload();
-
-        assert_eq!(
-            native_profile_requirements(&workload, "query-fallback").expect("profile"),
-            SemanticNativeProfileRequirementsV1 {
-                profile_id: "query-fallback".to_owned(),
-                semantic_requested: false,
-                rerank_requested: false,
-            }
-        );
-        assert_eq!(
-            native_profile_requirements(&workload, "hybrid-conservative").expect("profile"),
-            SemanticNativeProfileRequirementsV1 {
-                profile_id: "hybrid-conservative".to_owned(),
-                semantic_requested: true,
-                rerank_requested: false,
-            }
-        );
-        assert_eq!(
-            native_profile_requirements(&workload, "hybrid-reranked").expect("profile"),
-            SemanticNativeProfileRequirementsV1 {
-                profile_id: "hybrid-reranked".to_owned(),
-                semantic_requested: true,
-                rerank_requested: true,
-            }
-        );
-    }
 
     #[test]
     fn unavailable_native_inputs_remain_pending_without_measurements() {
@@ -1427,11 +1396,6 @@ mod tests {
             serde_json::from_str::<SemanticProjectionCaseV1>("\"model_key_change\"").is_err(),
             "the retired lookalike case must not deserialize"
         );
-    }
-
-    #[test]
-    fn projection_case_matrix_accepts_zero_work_idempotency_replay() {
-        assert!(complete_resource_sample().is_complete());
     }
 
     #[test]

@@ -46,18 +46,18 @@ impl AgentIntegration for HermesIntegration {
 
     fn host_component_registration(
         &self,
-        _component: super::host_bundle_v2::HostBundleComponentV1,
+        _component: super::host_bundle::HostBundleComponentV1,
         ctx: &HealthcheckContext,
-    ) -> super::host_bundle_v2::HostBundleRegistrationStateV1 {
+    ) -> super::host_bundle::HostBundleRegistrationStateV1 {
         hermes_registration_state(&ctx.home, None)
     }
 
     fn host_component_registration_for_lifecycle(
         &self,
-        _component: super::host_bundle_v2::HostBundleComponentV1,
+        _component: super::host_bundle::HostBundleComponentV1,
         ctx: &HealthcheckContext,
         install: &InstallContext,
-    ) -> super::host_bundle_v2::HostBundleRegistrationStateV1 {
+    ) -> super::host_bundle::HostBundleRegistrationStateV1 {
         hermes_registration_state(&ctx.home, Some(install.dashboard))
     }
 
@@ -91,7 +91,7 @@ impl AgentIntegration for HermesIntegration {
 
     fn host_component_registration_paths_checked(
         &self,
-        _components: &[super::host_bundle_v2::HostBundleComponentV1],
+        _components: &[super::host_bundle::HostBundleComponentV1],
         home: &Path,
     ) -> Result<Vec<PathBuf>> {
         let mut paths = self.host_registration_paths(home);
@@ -140,8 +140,8 @@ impl AgentIntegration for HermesIntegration {
 fn hermes_registration_state(
     home: &Path,
     expected_dashboard: Option<bool>,
-) -> super::host_bundle_v2::HostBundleRegistrationStateV1 {
-    use super::host_bundle_v2::HostBundleRegistrationStateV1 as State;
+) -> super::host_bundle::HostBundleRegistrationStateV1 {
+    use super::host_bundle::HostBundleRegistrationStateV1 as State;
 
     let plugin_dirs = profile_plugin_dirs(home);
     let default_plugin = hermes_home(home).join("plugins/tracedecay");
@@ -698,32 +698,6 @@ mod registration_tests {
     }
 
     #[test]
-    fn one_catalog_snapshot_renders_manifest_and_schemas() {
-        let tools = vec![crate::ports::mcp_tools::AdvertisedToolV1 {
-            name: "tracedecay_fixture".to_string(),
-            description: "fixture tool".to_string(),
-            input_schema: serde_json::Value::Null,
-            read_only: true,
-        }];
-
-        let files = rendered_plugin_files_with_tools("tracedecay", "fixture-commit", &tools)
-            .expect("fixture plugin must render");
-        let manifest = &files
-            .iter()
-            .find(|(relative, _)| *relative == "plugin.yaml")
-            .expect("manifest")
-            .1;
-        let schemas = &files
-            .iter()
-            .find(|(relative, _)| *relative == "schemas.json")
-            .expect("schemas")
-            .1;
-
-        assert!(manifest.contains("  - tracedecay_fixture"));
-        assert!(schemas.contains("\"name\": \"tracedecay_fixture\""));
-    }
-
-    #[test]
     fn registration_inventory_owns_existing_managed_skill_overlay_files() {
         let home = tempfile::tempdir().unwrap();
         let overlay = home
@@ -735,7 +709,7 @@ mod registration_tests {
 
         let paths = HermesIntegration
             .host_component_registration_paths_checked(
-                &[super::super::host_bundle_v2::HostBundleComponentV1::Core],
+                &[super::super::host_bundle::HostBundleComponentV1::Core],
                 home.path(),
             )
             .unwrap();

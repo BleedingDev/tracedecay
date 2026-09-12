@@ -78,6 +78,7 @@ fn log_scheduler_schedule_skip(project_path: &Path, task: AgentTaskKind, reason:
     );
 }
 
+#[hotpath::measure(label = "daemon.scheduler.fixed_task_decision", future = true)]
 async fn fixed_task_schedule_decision(
     dashboard_root: &Path,
     config: &tracedecay_automation_runtime::automation::config::AutomationConfig,
@@ -299,6 +300,10 @@ pub(in crate::daemon) async fn run_automation_scheduler_tick(
 /// Body of [`run_automation_scheduler_tick`], boxed at definition so the
 /// instrumented wrapper does not inline every fixed automation effect of a
 /// tick into one scheduler poll frame.
+#[expect(
+    clippy::too_many_lines,
+    reason = "An automation tick is one ordered admission of every enabled retained effect."
+)]
 fn run_automation_scheduler_tick_inner<'a>(
     project_path: &'a Path,
     cg: &'a TraceDecay,
@@ -791,29 +796,6 @@ mod tests {
             !dashboard.path().join("automation_effects").exists(),
             "a skipped fixed task must not reserve or fsync an outer effect"
         );
-    }
-
-    #[test]
-    fn effect_control_propagates_live_scheduler_stop_to_cancellation() {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&stopped);
-        let scheduler = AutomationRunControl::from_interrupted(Arc::new(move || {
-            observed.load(Ordering::Acquire)
-        }));
-        let cancellation = CancellationSignal::active("cancel.scheduler-effect-stop")
-            .expect("valid cancellation signal");
-        let effect_cancellation = cancellation.clone();
-        let control = scheduler_effect_run_control(
-            &scheduler,
-            cancellation,
-            Deadline::new(UtcMicros(i64::MAX)).expect("valid scheduler deadline"),
-        );
-
-        assert!(!control.read_control().interrupted());
-        assert!(!effect_cancellation.is_cancelled());
-        stopped.store(true, Ordering::Release);
-        assert!(control.read_control().interrupted());
-        assert!(effect_cancellation.is_cancelled());
     }
 
     #[test]

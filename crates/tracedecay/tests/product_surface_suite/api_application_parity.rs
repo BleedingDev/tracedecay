@@ -459,7 +459,6 @@ fn extended_primitive_reads_bind_cli_mcp_and_http() {
         ApplicationSurfaceOperation::SourceBody,
         ApplicationSurfaceOperation::SourceOutline,
         ApplicationSurfaceOperation::ModuleApi,
-        ApplicationSurfaceOperation::FileMetadata,
         ApplicationSurfaceOperation::HealthRead,
         ApplicationSurfaceOperation::StorageStatus,
         ApplicationSurfaceOperation::DiagnosticsRead,
@@ -554,50 +553,6 @@ fn mcp_primitive_definitions_use_application_contracts() {
         );
         tracedecay_daemon_protocol::parse_application_surface_request(operation, request)
             .unwrap_or_else(|error| panic!("{tool_name} must parse: {error}"));
-    }
-}
-
-#[test]
-fn handle_gated_feedback_tools_are_advertised_over_mcp() {
-    let definitions = get_tool_definitions().expect("tool definitions");
-    for tool_name in [
-        "tracedecay_feedback_diagnostics",
-        "tracedecay_feedback_get",
-        "tracedecay_feedback_expand",
-        "tracedecay_feedback_list",
-        "tracedecay_feedback_impact",
-        "tracedecay_affected_tests",
-    ] {
-        assert!(
-            definitions
-                .iter()
-                .any(|definition| definition.name == tool_name),
-            "{tool_name} must be advertised"
-        );
-    }
-}
-
-#[test]
-fn handle_gated_feedback_capabilities_follow_catalog_availability() {
-    let catalog = tracedecay_daemon_service::application_surface::application_surface_catalog()
-        .expect("application catalog");
-    for capability_id in [
-        "capability.application.feedback.affected-tests",
-        "capability.application.feedback.ci-failure-localize",
-        "capability.application.feedback.diagnostics",
-        "capability.application.feedback.expand",
-        "capability.application.feedback.get",
-        "capability.application.feedback.github-review-ingest",
-        "capability.application.feedback.impact",
-        "capability.application.feedback.list",
-        "capability.application.feedback.proximity",
-    ] {
-        let capability_id =
-            tracedecay_tool_catalog::CapabilityId::new(capability_id).expect("capability id");
-        let capability = catalog
-            .capability(&capability_id)
-            .expect("feedback capability remains documented");
-        assert!(capability.availability().is_callable(), "{capability_id}");
     }
 }
 

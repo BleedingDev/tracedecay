@@ -1,62 +1,24 @@
-use std::{error::Error, fmt::Debug};
+use std::fmt::Debug;
 
 use rusqlite::Connection;
 use tempfile::TempDir;
 use tracedecay_domain::{
     BrainId, CodeGenerationId, LocatorDigest, ProjectId, UserProfileId, UtcMicros,
 };
+use tracedecay_rusqlite_runtime::StorageOperationExecutor;
 use tracedecay_rusqlite_runtime::repository::{
-    ConcreteRepositoryWriteExecutor, RepositoryAttachmentStartError,
-    RepositoryPhysicalAttachmentFactory,
+    ConcreteRepositoryWriteExecutor, RepositoryPhysicalAttachmentFactory,
 };
-use tracedecay_rusqlite_runtime::{OpenedDatabaseFileError, StorageOperationExecutor};
 use tracedecay_store::{
     AdmissionConfigV1, ConsistencyModeV1, DiagnosticReadOperationV1, DiagnosticReadResultV1,
-    OperationPriorityV1, ProjectReadOperationV1, ProjectReadResultV1, RepositoryReadOperationV1,
-    RepositoryReadResultV1, RepositoryWritePayloadV1, RuntimeCancellationIdV1,
-    RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeReadOperationV1,
-    RuntimeReadRequestV1, RuntimeReadResultV1, RuntimeRequestControlV1, RuntimeRequestProbeV1,
+    GENERATION_DIAGNOSTICS_SCHEMA_DDL, OperationPriorityV1, ProjectReadOperationV1,
+    ProjectReadResultV1, RepositoryReadOperationV1, RepositoryReadResultV1,
+    RepositoryWritePayloadV1, RuntimeCancellationIdV1, RuntimeCancellationIdentityV1,
+    RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeReadOperationV1, RuntimeReadRequestV1,
+    RuntimeReadResultV1, RuntimeRequestControlV1, RuntimeRequestProbeV1,
     SanitizedCleanDiagnosticSnapshotV1, StoreIncarnationV1, StoreRuntimeBindingV1, StoreShardIdV1,
     VerifiedStoreLocatorV1,
 };
-
-/// Minimal canonical schema for the diagnostic family, mirroring the
-/// migration-owned tables the executors read and write.
-const DIAGNOSTIC_SCHEMA: &str = "
-    CREATE TABLE generation_diagnostics (
-        diagnostic_anchor TEXT PRIMARY KEY,
-        generation_id TEXT NOT NULL,
-        repository TEXT NOT NULL,
-        worktree TEXT,
-        reference TEXT,
-        source_revision TEXT,
-        file_occurrence_id TEXT NOT NULL,
-        content_digest TEXT NOT NULL,
-        symbol_occurrence_id TEXT,
-        span_start INTEGER NOT NULL,
-        span_end INTEGER NOT NULL,
-        code TEXT NOT NULL,
-        severity TEXT NOT NULL,
-        message TEXT NOT NULL,
-        message_digest TEXT NOT NULL,
-        producer_kind TEXT NOT NULL,
-        producer TEXT NOT NULL,
-        analyzer_revision TEXT NOT NULL,
-        configuration_revision TEXT NOT NULL,
-        sanitization_receipt TEXT,
-        evidence_class TEXT NOT NULL,
-        collected_at INTEGER NOT NULL,
-        record_state TEXT NOT NULL DEFAULT 'current',
-        state_generation TEXT,
-        persisted_at INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE diagnostic_generation_publications (
-        generation_id TEXT PRIMARY KEY,
-        record_state TEXT NOT NULL,
-        state_generation TEXT,
-        published_at INTEGER NOT NULL
-    );
-";
 
 fn id<T>(value: &str) -> T
 where
@@ -130,14 +92,6 @@ fn health_request(binding: StoreRuntimeBindingV1) -> (RuntimeReadRequestV1, Prob
             deadline,
         },
     )
-}
-
-#[test]
-fn repository_attachment_identity_error_preserves_the_public_source() {
-    let source = OpenedDatabaseFileError::Open;
-    let repository = RepositoryAttachmentStartError::Identity(source);
-
-    assert!(repository.source().is_some());
 }
 
 #[test]
@@ -237,7 +191,9 @@ fn repository_read_dispatch_routes_to_the_repository_executor() {
     // executor, then reopen the file through the runtime attachment.
     let generation = CodeGenerationId::new("generation.repository-read").unwrap();
     let mut connection = Connection::open(&path).unwrap();
-    connection.execute_batch(DIAGNOSTIC_SCHEMA).unwrap();
+    connection
+        .execute_batch(GENERATION_DIAGNOSTICS_SCHEMA_DDL)
+        .unwrap();
     {
         let savepoint = connection.savepoint().unwrap();
         let snapshot =

@@ -304,6 +304,32 @@ pub async fn try_admit_codex_jsonl_observations_for_project_with_admission_and_c
         },
         admission,
         max_new_bytes,
+        None,
+        cancellation,
+    )
+    .await
+}
+
+pub(crate) async fn try_admit_codex_jsonl_observations_for_project_window(
+    path: &Path,
+    project_root: &Path,
+    project_id: ProjectId,
+    admission: &dyn HostAdmission,
+    max_new_bytes: u64,
+    cancellation: &ObservationCancellation,
+) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
+    try_admit_codex_jsonl_observations(
+        path,
+        CodexObservationAdmission::Project {
+            root: project_root,
+            project_id,
+        },
+        admission,
+        Some(
+            max_new_bytes
+                .min(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW_BYTES),
+        ),
+        Some(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW),
         cancellation,
     )
     .await
@@ -367,6 +393,7 @@ pub async fn try_admit_codex_jsonl_observations_for_profile_with_admission_and_c
         },
         admission,
         max_new_bytes,
+        None,
         cancellation,
     )
     .await
@@ -538,6 +565,7 @@ async fn replay_advanced_current_user_messages(
         canonical_source.clone(),
         Some((ordinary_source, target.generation())),
         Some(replay_limit),
+        None,
         CodexAdmissionMode::CurrentUserMessageReplay {
             expected_start_cursor: replay_cursor,
             generation: target.generation().generation_id(),
@@ -644,6 +672,7 @@ async fn try_admit_codex_jsonl_observations(
     admission_scope: CodexObservationAdmission<'_>,
     admission: &dyn HostAdmission,
     max_new_bytes: Option<u64>,
+    max_frames: Option<usize>,
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
     try_admit_codex_jsonl_observations_bounded(
@@ -756,6 +785,7 @@ async fn try_admit_codex_jsonl_observations_bounded(
         canonical_source,
         None,
         max_new_bytes,
+        max_frames,
         CodexAdmissionMode::Ordinary,
     )
     .await
@@ -766,6 +796,7 @@ async fn admit_codex_jsonl_page(
     source: ObservationSourceIdentityV1,
     ordinary_identity: Option<(&ObservationSourceIdentityV1, ObservationSourceGenerationV1)>,
     max_new_bytes: Option<u64>,
+    max_frames: Option<usize>,
     mode: CodexAdmissionMode,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
     let CodexAdmissionContext {
@@ -796,6 +827,9 @@ async fn admit_codex_jsonl_page(
     .with_persisted_cursor_update(PersistedCursorUpdate::Replace)
     .with_lazy_shared_frame_preparation()
     .with_cancellation(cancellation.clone());
+    if let Some(max_frames) = max_frames {
+        request = request.with_max_frames(max_frames);
+    }
     if let Some((expected_start_cursor, through)) = mode.replay_window() {
         request = request
             .with_required_start_cursor(expected_start_cursor)
@@ -1056,6 +1090,7 @@ mod replay_boundary_tests {
             ordinary_source.clone(),
             None,
             None,
+            None,
             CodexAdmissionMode::Ordinary,
         )
         .await
@@ -1084,6 +1119,7 @@ mod replay_boundary_tests {
             canonical_source.clone(),
             Some((&ordinary_source, target.generation())),
             Some(usage_line.len() as u64),
+            None,
             CodexAdmissionMode::CurrentUserMessageReplay {
                 expected_start_cursor: stale_start_cursor,
                 generation: target.generation().generation_id(),

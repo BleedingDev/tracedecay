@@ -265,6 +265,10 @@ impl PreparedShutdownOwners {
 }
 
 #[hotpath::measure(label = "daemon.shutdown.phase.join", future = true)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Shutdown-phase join waits out one named owner group under the shared budget."
+)]
 async fn join_shutdown_phase(
     deadline: Instant,
     owners: Vec<(usize, &'static str, Option<String>, ShutdownJoinFactory)>,
@@ -275,6 +279,17 @@ async fn join_shutdown_phase(
         let handle = joins.spawn(async move {
             let _draining = DrainingGauge::arm("daemon.shutdown.owners_draining");
             let started = std::time::Instant::now();
+            log_daemon_event(
+                "daemon_shutdown",
+                &[
+                    ("outcome", "owner_join_start".to_string()),
+                    ("owner", name.to_string()),
+                    (
+                        "since_arm_ms",
+                        super::shutdown_watchdog::shutdown_elapsed_ms().to_string(),
+                    ),
+                ],
+            );
             let join_status = match tokio::time::timeout_at(deadline, join(deadline)).await {
                 Ok(status) => status,
                 Err(_) => ShutdownStatus::TimedOut,
@@ -291,6 +306,10 @@ async fn join_shutdown_phase(
                     ("owner", name.to_string()),
                     ("status", status_label.to_string()),
                     ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                    (
+                        "since_arm_ms",
+                        super::shutdown_watchdog::shutdown_elapsed_ms().to_string(),
+                    ),
                 ],
             );
             let status = match (cancellation_error, join_status) {

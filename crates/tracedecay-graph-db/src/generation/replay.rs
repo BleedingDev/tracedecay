@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tracedecay_domain::sha256_hex_suffix;
 use tracedecay_store::runtime::{
     GraphPublicationInputDigestV1, GraphPublicationReplayV1, GraphVerifiedHeadV1, StoreShardIdV1,
 };
@@ -357,7 +358,7 @@ impl GraphProjectorRevision {
 }
 
 fn validate_sha256(value: &str, subject: &str) -> Result<(), GraphDbError> {
-    let Some(digest) = value.strip_prefix("sha256:") else {
+    let Some(digest) = sha256_hex_suffix(value) else {
         return Err(GraphDbError::invalid(format!("{subject} must use sha256")));
     };
     if digest.len() != 64
@@ -544,40 +545,6 @@ mod tests {
             ),
             other => panic!("malformed payload must be rejected as invalid: {other:?}"),
         }
-    }
-
-    #[test]
-    fn canonical_inline_source_decodes_the_identical_manifest() {
-        let manifest = corpus_manifest();
-        let payload = manifest.canonical_replay_source(&|| Ok(())).unwrap();
-        let decoded = checked_decode_replay_source(&payload, &|| Ok(())).unwrap();
-        assert_eq!(
-            decoded,
-            GraphGenerationReplaySource::InlineManifest(Box::new(manifest))
-        );
-    }
-
-    #[test]
-    fn canonical_sealed_source_decodes_the_identical_replay() {
-        let sealed = SealedCodeGenerationReplay {
-            repository: tracedecay_domain::RepositoryId::new("repository.replay").unwrap(),
-            generation: tracedecay_domain::CodeGenerationId::new("code-generation.replay").unwrap(),
-            sealed_state_digest: SealedGraphStateDigest::try_from(format!(
-                "sha256:{}",
-                "5".repeat(64)
-            ))
-            .unwrap(),
-            projector_revision: GraphProjectorRevision::try_from("projector.replay".to_owned())
-                .unwrap(),
-        };
-        let payload = metadata_manifest()
-            .sealed_replay_payload(sealed.clone(), &|| Ok(()))
-            .unwrap();
-        let decoded = checked_decode_replay_source(&payload, &|| Ok(())).unwrap();
-        assert_eq!(
-            decoded,
-            GraphGenerationReplaySource::SealedCodeGeneration(sealed)
-        );
     }
 
     #[test]

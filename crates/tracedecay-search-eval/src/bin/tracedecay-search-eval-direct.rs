@@ -11,11 +11,13 @@ use tracedecay_daemon_protocol::{
     SEMANTIC_EVALUATION_ISOLATED_DISPATCH_DEADLINE_MICROS,
 };
 use tracedecay_domain::errors::{Result as RuntimeResult, TraceDecayError};
+use tracedecay_query::search_quality::{
+    DirectEvaluationStatusV1, SearchEvalError, write_daemon_native_qualification,
+};
 use tracedecay_search_eval::{
-    DirectEvaluationStatusV1, DirectWorkloadSummaryV1, GenerateCandidateOutputsOptions,
-    SearchEvalError, compare_default_direct, compare_direct, generate_candidate_outputs,
-    root_admitted_corpus_scope, validate_default_activation_workload, validate_direct_workload,
-    write_daemon_native_qualification, write_generate_outputs,
+    DirectWorkloadSummaryV1, GenerateCandidateOutputsOptions, compare_default_direct,
+    compare_direct, generate_candidate_outputs, root_admitted_corpus_scope,
+    validate_default_activation_workload, validate_direct_workload, write_generate_outputs,
 };
 
 #[cfg(feature = "hotpath")]
@@ -401,35 +403,9 @@ mod tests {
         assert_eq!(summary.status, DirectEvaluationStatusV1::Pass);
         assert_eq!(
             summary.workload_digest,
-            "sha256:1eebad21b749533ea0d2c2cb05e8088c059708825324435ed91e62afbeeacd26"
+            "sha256:cc1b479b9f561c7bd76b8e86b7c0d69ab41eccd4d808fa99f96150728fde14cb"
         );
         assert_eq!(summary.profile_count, 3);
-    }
-
-    #[test]
-    fn qualify_native_parses_daemon_owned_profile_and_output_path() {
-        let cli = Cli::try_parse_from([
-            "tracedecay-search-eval",
-            "qualify-native",
-            "--project-root",
-            "project",
-            "--profile",
-            "hybrid-conservative",
-            "--output",
-            "qualification.json",
-        ])
-        .expect("qualify-native arguments parse");
-
-        assert!(matches!(
-            cli.command,
-            Command::QualifyNative {
-                project_root,
-                profile,
-                output,
-            } if project_root == *"project"
-                && profile == "hybrid-conservative"
-                && output == *"qualification.json"
-        ));
     }
 
     #[test]

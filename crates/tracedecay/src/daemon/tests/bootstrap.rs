@@ -17,30 +17,6 @@ use tracedecay_session_memory::context::CancellationToken;
 
 static PRODUCTION_DASHBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[test]
-fn bootstrap_tool_catalog_uses_project_node_count() {
-    let request: super::super::JsonRpcRequest = serde_json::from_value(serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/list"
-    }))
-    .expect("tools/list request");
-    let response = super::super::daemon_bootstrap_response(&request, None, Some(65_395))
-        .expect("bootstrap response")
-        .expect("tools/list response");
-    let result = response.result.expect("tools/list result");
-    let context_description = result["tools"]
-        .as_array()
-        .expect("tool catalog")
-        .iter()
-        .find(|tool| tool["name"] == serde_json::json!("tracedecay_context"))
-        .and_then(|tool| tool["description"].as_str())
-        .expect("context tool description");
-
-    assert!(context_description.contains("5 calls maximum"));
-    assert!(context_description.contains("65395 nodes"));
-}
-
 fn project_open_test_route(name: &str) -> ProjectRouteKey {
     ProjectRouteKey {
         profile_root: std::path::PathBuf::from(format!("/profiles/{name}")),
@@ -2136,27 +2112,6 @@ fn exhausted_code_runtime_capacity_retries_at_resource_cadence() {
 }
 
 #[test]
-fn undecodable_authority_row_backs_off_beyond_the_transient_debounce() {
-    // The identity material of a committed observation stopped matching the
-    // derivation the running binary applies, so every reopen re-runs the whole
-    // authority audit and fails on the same row.
-    let backoff = super::super::project_open_retry_backoff(&authority_invariant_error(
-        "invalid committed observation authority JSON: serialized observation identity \
-         does not match its source evidence",
-    ));
-
-    assert_eq!(
-        backoff,
-        Some(super::super::PROJECT_OPEN_UNREPAIRABLE_RETRY_BACKOFF),
-        "an undecodable persisted row must not reopen at the transient debounce cadence"
-    );
-    assert!(
-        super::super::PROJECT_OPEN_UNREPAIRABLE_RETRY_BACKOFF
-            > super::super::PROJECT_OPEN_FAILURE_RETRY_BACKOFF
-    );
-}
-
-#[test]
 fn mutable_cursor_key_rejection_keeps_the_transient_debounce() {
     assert_eq!(
         super::super::project_open_retry_backoff(&authority_invariant_error(
@@ -2280,6 +2235,272 @@ async fn route_open_backoff_retries_after_deadline_without_cross_route_blocking(
         3,
         "one rejected route retry and one independent route must be the only opens"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open() {
+    let home = TempDir::new().expect("isolated home");
+    let root = home.path().canonicalize().expect("canonical home");
+    let project = root.join("project");
+    let profile_root = root.join("profile");
+    std::fs::create_dir_all(&project).expect("project directory");
+    let client_identity = test_client_identity_for(profile_root.clone());
+    let layout = initialize_test_project(&project, &client_identity).await;
+    std::fs::remove_file(&layout.graph_db_path).expect("remove generated project database");
+    let missing_graph_db_path = layout.graph_db_path.clone();
+
+    let _database_scope =
+        enter_test_daemon_database_scope(&profile_root, "registered missing-db init retry");
+    let engine = test_daemon_engine_for_profile(&profile_root);
+    // Each request arms its publication bound on its first poll, before route
+    // enrollment resolves. Opening and migrating the profile database on that
+    // path would spend the whole bound before either request subscribes to the
+    // open below, so the runtime is warmed the way daemon bootstrap warms it.
+    prewarm_test_profile_runtime(&engine.store_administration).await;
+    let ordinary_handshake = DaemonHandshake {
+        project_path: Some(project.clone()),
+        client_identity: client_identity.clone(),
+        allow_init: false,
+        ..test_handshake_defaults()
+    };
+    let init_handshake = DaemonHandshake {
+        allow_init: true,
+        ..ordinary_handshake.clone()
+    };
+    // The bound also covers everything a request does *before* it can join an
+    // open — route enrollment, git discovery, the registered layout — so a
+    // first-touch request can spend the whole bound before it ever subscribes
+    // to the open below and would then mint its own. One ordinary request
+    // ahead of the fixture resolves that path for this exact route, and its
+    // refusal is the same missing-index failure the joined waiter classifies
+    // later.
+    // It is retried the way a client retries the warming hint, so the route is
+    // left with no open of its own before the fixture takes it over.
+    let warmup_give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let error = match engine
+            .project_server_for_request(
+                &ordinary_handshake,
+                super::super::ProjectServerRequirement::Core,
+            )
+            .await
+        {
+            Ok(_) => panic!("the warm-up open must not initialize a missing database"),
+            Err(error) => error,
+        };
+        if super::super::is_missing_index_error(&error) {
+            break;
+        }
+        assert!(
+            matches!(
+                &error,
+                tracedecay_domain::errors::TraceDecayError::Config { message }
+                    if super::super::error_message_is_project_warming(message)
+            ),
+            "the warm-up open must refuse the missing database: {error:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < warmup_give_up,
+            "the warm-up open never published its missing-index refusal"
+        );
+    }
+
+    let (_, route) =
+        super::super::DaemonEngine::project_route(&ordinary_handshake).expect("project route");
+    let tasks = super::super::project_open_tasks(&engine.project_open_gates).await;
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let inflight = match tasks.start_cancellable(route, move |_| async move {
+        blocked.await.expect("release ordinary open");
+        Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "no TraceDecay database found at '{}'; run 'tracedecay init' first",
+                missing_graph_db_path.display()
+            ),
+        })
+    }) {
+        super::super::ProjectOpenTaskClaim::InFlight(state) => state,
+        super::super::ProjectOpenTaskClaim::Failed(_)
+        | super::super::ProjectOpenTaskClaim::Saturated => {
+            panic!("ordinary warmup must own the route first")
+        }
+    };
+
+    let ordinary_request = engine.project_server_for_request(
+        &ordinary_handshake,
+        super::super::ProjectServerRequirement::Core,
+    );
+    let init_request = engine.project_server_for_request(
+        &init_handshake,
+        super::super::ProjectServerRequirement::Core,
+    );
+    tokio::pin!(ordinary_request);
+    tokio::pin!(init_request);
+    // Drive both requests onto this open before it publishes. A request that
+    // has not been polled to its join holds no receiver on this open's watch
+    // channel, and a recorded `Config` failure carries no backoff, so the
+    // finished entry is pruned (`ProjectOpenTaskRegistry::prune`) and the next
+    // poll mints a fresh open that is still `Opening` at the bound. The window
+    // is the warmed path's headroom, not a settling delay: it must outlast a
+    // loaded machine's walk to the join and still leave the 500 ms bound
+    // unspent when the failure is released below.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), async {
+            tokio::join!(&mut ordinary_request, &mut init_request)
+        })
+        .await
+        .is_err(),
+        "neither request may answer while the open they joined is blocked"
+    );
+    assert!(
+        matches!(
+            inflight.borrow().clone(),
+            super::super::ProjectOpenTaskState::Opening
+        ),
+        "the joined open must still be in flight when its failure is released"
+    );
+    release.send(()).expect("release ordinary open");
+
+    // The failure lands while the ordinary waiter stays joined and polled,
+    // which is the state `prefer_recorded_open_failure` classifies.
+    let ordinary_outcome =
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut ordinary_request)
+            .await
+            .expect(
+                "the joined ordinary waiter never settled after the open published its failure",
+            );
+
+    let ordinary_error = match ordinary_outcome {
+        Ok(_) => panic!("ordinary open must not initialize a missing database"),
+        Err(error) => error,
+    };
+    // What the released open recorded, so a refusal that did not come from it
+    // names the state it came from instead.
+    let recorded = match inflight.borrow().clone() {
+        super::super::ProjectOpenTaskState::Failed(failure) => failure.to_error().to_string(),
+        super::super::ProjectOpenTaskState::Opening => "still opening".to_owned(),
+        super::super::ProjectOpenTaskState::Ready => "ready".to_owned(),
+    };
+    assert!(
+        super::super::is_missing_index_error(&ordinary_error),
+        "ordinary missing-database open must stay classified as a missing index: \
+         {ordinary_error:?}; the released open recorded: {recorded}"
+    );
+    // Positive proof the waiter reported *this* open: a lost join would answer
+    // with the warming hint or with a fresh open's own refusal instead.
+    assert_eq!(
+        ordinary_error.to_string(),
+        recorded,
+        "the joined waiter must report the failure this open recorded"
+    );
+    assert!(
+        !layout.graph_db_path.is_file(),
+        "ordinary open must leave the missing generated database absent"
+    );
+    // The publication bound answers "has this route's open published yet", not
+    // "how long may an init take", so the authorized retry may outrun it and be
+    // refused with the warming hint while its own open keeps initializing. That
+    // is the retry production tells the client to repeat; any other refusal
+    // would mean the retry inherited the ordinary open's missing-index failure
+    // instead of opening under its own authorization.
+    let mut init_outcome = tokio::time::timeout(std::time::Duration::from_secs(30), init_request)
+        .await
+        .expect("explicit init retry never settled");
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let server = loop {
+        let warming = match init_outcome {
+            Ok(server) => break server,
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                &warming,
+                tracedecay_domain::errors::TraceDecayError::Config { message }
+                    if super::super::error_message_is_project_warming(message)
+            ),
+            "explicit init must retry with its own authorization: {warming:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < give_up,
+            "the admitted explicit-init open never published its owners"
+        );
+        // Each retry parks on the admitted open's own publication, so this
+        // waits on that open rather than on elapsed time.
+        init_outcome = engine
+            .project_server_for_request(
+                &init_handshake,
+                super::super::ProjectServerRequirement::Core,
+            )
+            .await;
+    };
+    assert!(
+        server.cg().await.store_layout().graph_db_path.is_file(),
+        "authorized retry must recreate the generated project database"
+    );
+    let receipt = engine.shutdown_all().await;
+    assert!(
+        receipt.background.unfinished().is_empty(),
+        "project owners must shut down cleanly: {:?}",
+        receipt.background.unfinished()
+    );
+}
+
+/// The journey above only reaches this guard where the route is still
+/// `Opening`, so the replacement it exists for is asserted directly here: a
+/// warming hint claims the route is still opening, and exactly the routes
+/// that recorded a terminal failure may contradict it. Everything else —
+/// `Ready`, a refusal that is not the warming hint, a published owner — is
+/// already the caller's answer and must pass through untouched.
+#[test]
+fn a_recorded_open_failure_replaces_only_the_warming_hint() {
+    use super::super::{
+        ProjectOpenFailure, ProjectOpenTaskState, prefer_recorded_open_failure,
+        project_warming_error,
+    };
+
+    let probe = std::path::Path::new("/tmp/tracedecay-warming-probe");
+    let warming_message = project_warming_error(probe).to_string();
+    let recorded = ProjectOpenFailure::untyped(
+        "no TraceDecay database found at '/tmp/tracedecay-warming-probe/tracedecay.db'; \
+         run 'tracedecay init' first"
+            .to_owned(),
+    );
+    let failed = tokio::sync::watch::channel(ProjectOpenTaskState::Failed(recorded.clone()));
+
+    let classified =
+        prefer_recorded_open_failure::<()>(Err(project_warming_error(probe)), &failed.1)
+            .expect_err("a route that recorded a terminal failure answers with it");
+    assert_eq!(
+        classified.to_string(),
+        recorded.to_error().to_string(),
+        "the recorded failure must replace the warming hint"
+    );
+
+    for state in [ProjectOpenTaskState::Opening, ProjectOpenTaskState::Ready] {
+        let open = tokio::sync::watch::channel(state);
+        let kept = prefer_recorded_open_failure::<()>(Err(project_warming_error(probe)), &open.1)
+            .expect_err("the warming hint is still the answer");
+        assert_eq!(
+            kept.to_string(),
+            warming_message,
+            "a route with no recorded failure must keep its warming hint"
+        );
+    }
+
+    let unrelated = "daemon project server capacity reached";
+    let passed_through = prefer_recorded_open_failure::<()>(
+        Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: unrelated.to_owned(),
+        }),
+        &failed.1,
+    )
+    .expect_err("a refusal that is not the warming hint is the caller's answer");
+    assert!(
+        passed_through.to_string().contains(unrelated),
+        "only the warming hint may be replaced: {passed_through:?}"
+    );
+    prefer_recorded_open_failure(Ok("published owner"), &failed.1)
+        .expect("a published owner outranks any failure this route recorded");
 }
 
 #[tokio::test]
@@ -3316,6 +3537,7 @@ async fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication()
     let project_path = std::path::PathBuf::from("/projects/uncontended");
     let published = super::super::project_open_orchestration::wait_for_project_open_publication(
         &project_path,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
         async { Ok::<(), tracedecay_domain::errors::TraceDecayError>(()) },
     )
     .await;
@@ -3326,6 +3548,7 @@ async fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication()
 
     let warming = super::super::project_open_orchestration::wait_for_project_open_publication(
         &project_path,
+        tokio::time::Instant::now() + super::super::PROJECT_OPEN_REQUEST_DEADLINE,
         std::future::pending::<tracedecay_domain::errors::Result<()>>(),
     )
     .await

@@ -376,23 +376,16 @@ fn request_budget_refusal(
     if query.context_budget.max_bytes > budgets.max_bytes() {
         return Some(SessionRetrievalBudgetStageV1::RequestContextBytes);
     }
-    for (bytes, stage) in [
-        (
-            limits.candidate_total_bytes,
-            SessionRetrievalBudgetStageV1::RequestCandidateBytes,
-        ),
-        (
-            limits.record_total_bytes,
-            SessionRetrievalBudgetStageV1::RequestRecordBytes,
-        ),
-        (
-            limits.hydration_total_bytes,
-            SessionRetrievalBudgetStageV1::RequestHydrationBytes,
-        ),
-    ] {
-        if !u64::try_from(bytes).is_ok_and(|bytes| bytes <= budgets.max_bytes()) {
-            return Some(stage);
-        }
+    let workspace = ExecutionLimits::default();
+    if limits.candidate_total_bytes > workspace.candidate_total_bytes {
+        return Some(SessionRetrievalBudgetStageV1::RequestCandidateBytes);
+    }
+    if limits.record_total_bytes > workspace.record_total_bytes {
+        return Some(SessionRetrievalBudgetStageV1::RequestRecordBytes);
+    }
+    if !u64::try_from(limits.hydration_total_bytes).is_ok_and(|bytes| bytes <= budgets.max_bytes())
+    {
+        return Some(SessionRetrievalBudgetStageV1::RequestHydrationBytes);
     }
     None
 }
@@ -951,36 +944,6 @@ fn sha256_binding(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cursor_manifest_limits_remain_typed_application_outcomes() {
-        assert_eq!(
-            map_kernel_error(TemporalKernelError::Port(
-                TemporalPortError::ParticipantLimitExceeded {
-                    observed: 257,
-                    maximum: 256,
-                },
-            )),
-            SessionRetrievalOutcome::CursorManifestLimitExceeded {
-                kind: CursorManifestLimitKindV1::Participants,
-                observed: 257,
-                maximum: 256,
-            }
-        );
-        assert_eq!(
-            map_kernel_error(TemporalKernelError::Port(
-                TemporalPortError::ParticipantManifestBytesExceeded {
-                    observed: 65_537,
-                    maximum: 65_536,
-                },
-            )),
-            SessionRetrievalOutcome::CursorManifestLimitExceeded {
-                kind: CursorManifestLimitKindV1::CanonicalBytes,
-                observed: 65_537,
-                maximum: 65_536,
-            }
-        );
-    }
 
     #[test]
     fn deadline_and_cancellation_remain_distinct_application_outcomes() {

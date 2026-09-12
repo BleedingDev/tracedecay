@@ -15,7 +15,7 @@ use tracedecay_contracts::{
     ResolvedScope,
     retained_surfaces::{AutomationRunRequestV1, AutomationTaskV1},
 };
-use tracedecay_domain::{ActorId, FactOwnerV1, ManifestDigest};
+use tracedecay_domain::{ActorId, FactOwnerV1, ManifestDigest, sha256_hex_suffix};
 use tracedecay_private_fs::framed_log::{
     DirectorySyncPolicy, sync_parent_directory, with_owned_temp_publish,
 };
@@ -1231,7 +1231,10 @@ fn open_lock_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create(true)
         .follow(FollowSymlinks::No);
-    let file = directory.open_with(name, &options)?;
+    // Concurrent settlements race the first creation of this lock; the shared
+    // helper absorbs the spurious Darwin `ENOENT` the losers are handed.
+    let file =
+        tracedecay_private_fs::capability_dir::open_or_create_with(&directory, name, &options)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1686,7 +1689,7 @@ fn validate_admission_shape(admission: &DurableAutomationAdmission) -> Result<()
 }
 
 fn validate_sha256_text(digest: &str) -> Result<()> {
-    let Some(raw) = digest.strip_prefix("sha256:") else {
+    let Some(raw) = sha256_hex_suffix(digest) else {
         return Err(contract_error(
             "automation recovery source digest is not canonical SHA-256",
         ));

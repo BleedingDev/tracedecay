@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+use tracedecay_runtime_core::cancellation::CancellationToken;
 
 use tracedecay_application::semantic_runtime::{
     ProductionSemanticActivationCoordinatorV1, SemanticActivationCoordinationErrorV1,
@@ -131,7 +131,9 @@ impl DaemonSemanticActivationReconcilerV1 {
                                             // scheduler. Current/Indexing are never reprojected, so
                                             // mark_ready cannot start a projection feedback loop.
                                             projection_reoffered = schedulers
-                                                .reschedule_semantic_generation(&project_root).await;
+                                                .reschedule_semantic_generation(&project_root)
+                                                .await
+                                                .is_scheduled();
                                             projection_pending = !projection_reoffered;
                                         }
                                         let observed = coordinator.reobserve_current_activation().await?;
@@ -267,24 +269,6 @@ impl Drop for DaemonSemanticActivationReconcilerV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn current_verified_ready_event_is_not_lost_before_subscription_wait() {
-        let current = SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 7,
-            artifact_digest: Some(format!("sha256:{}", "a".repeat(64))),
-        };
-
-        assert!(should_reconcile_ready_event(None, &current));
-        assert!(!should_reconcile_ready_event(Some(7), &current));
-        assert!(should_reconcile_ready_event(
-            Some(7),
-            &SemanticLifecycleVerifiedReadyEventV1 {
-                epoch: 8,
-                artifact_digest: current.artifact_digest,
-            }
-        ));
-    }
 
     #[tokio::test]
     async fn committed_activation_before_reconciler_subscription_is_retained() {

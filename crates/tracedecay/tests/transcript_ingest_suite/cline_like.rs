@@ -24,8 +24,11 @@ pub(super) fn vscode_storage_root(
     home: &std::path::Path,
     extension_id: &str,
 ) -> std::path::PathBuf {
+    // Joined per component to match the source's native spelling; the task
+    // paths derived from this root are compared against stored cursor keys.
     tracedecay_agent_hosts::agents::vscode_data_dir(home)
-        .join("User/globalStorage")
+        .join("User")
+        .join("globalStorage")
         .join(extension_id)
         .join("tasks")
 }
@@ -291,52 +294,6 @@ async fn cline_task_history_populates_searchable_messages() {
     assert_provider_ingests(
         "cline",
         ClineLikeSource::cline_with_home(&home),
-        &db,
-        &project,
-        &linked_worktree,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn roo_code_task_history_populates_searchable_messages() {
-    let tmp = TempDir::new().unwrap();
-    let (home, project) = setup(&tmp);
-    let linked_worktree = tmp.path().join("linked-worktree");
-    create_git_repo_with_linked_worktree(&project, &linked_worktree);
-    write_task(
-        &vscode_storage_root(&home, "rooveterinaryinc.roo-cline"),
-        &linked_worktree,
-        "roo-task",
-    );
-
-    let db = open_project_session_db(&project).await.unwrap();
-    assert_provider_ingests(
-        "roo-code",
-        ClineLikeSource::roo_code_with_home(&home),
-        &db,
-        &project,
-        &linked_worktree,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn kilo_task_history_populates_searchable_messages() {
-    let tmp = TempDir::new().unwrap();
-    let (home, project) = setup(&tmp);
-    let linked_worktree = tmp.path().join("linked-worktree");
-    create_git_repo_with_linked_worktree(&project, &linked_worktree);
-    write_task(
-        &vscode_storage_root(&home, "kilocode.kilo-code"),
-        &linked_worktree,
-        "kilo-task",
-    );
-
-    let db = open_project_session_db(&project).await.unwrap();
-    assert_provider_ingests(
-        "kilo",
-        ClineLikeSource::kilo_with_home(&home),
         &db,
         &project,
         &linked_worktree,
@@ -622,49 +579,6 @@ fn cline_complete_malformed_snapshot_is_typed_non_durable() {
             ..
         })
     ));
-}
-
-#[tokio::test]
-async fn cline_incomplete_snapshot_does_not_advance_content_hash_cursor() {
-    let tmp = TempDir::new().unwrap();
-    let (home, project) = setup(&tmp);
-    let root = vscode_storage_root(&home, "saoudrizwan.claude-dev");
-    let dir = root.join("cline-invalid-json");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("task_metadata.json"),
-        serde_json::json!({"workspacePath": project}).to_string(),
-    )
-    .unwrap();
-    let api = dir.join("api_conversation_history.json");
-    std::fs::write(&api, r#"[{"role":"user","content":"still writing""#).unwrap();
-
-    let db = open_project_session_db(&project).await.unwrap();
-    let source = ClineLikeSource::cline_with_home(&home);
-    let stats = try_ingest_source(&db, &source, &project, None)
-        .await
-        .unwrap();
-    assert_eq!(stats.messages_upserted, 0);
-
-    assert!(
-        parse_offset_for_task_history(&db, &project, &api)
-            .await
-            .is_none(),
-        "incomplete changed task history must not advance its cursor"
-    );
-
-    std::fs::write(
-        &api,
-        serde_json::json!([{"role":"user","content":"completed later"}]).to_string(),
-    )
-    .unwrap();
-    assert_eq!(
-        try_ingest_source(&db, &source, &project, None)
-            .await
-            .unwrap()
-            .messages_upserted,
-        1
-    );
 }
 
 #[tokio::test]

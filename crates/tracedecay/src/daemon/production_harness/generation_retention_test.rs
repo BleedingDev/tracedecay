@@ -166,7 +166,7 @@ async fn set_project_setting(
     key: &str,
     value: tracedecay_domain::configuration::ConfigurationValueV1,
     idempotency_scope: &str,
-) -> crate::config::PinnedRuntimeConfiguration {
+) -> crate::config::DaemonRuntimeConfiguration {
     let graph = harness.server(project).expect("project server").cg().await;
     let configuration = graph
         .configuration_runtime()
@@ -215,7 +215,7 @@ async fn set_project_setting(
         .current()
         .await
         .expect("committed configuration");
-    let root_view = crate::config::PinnedRuntimeConfiguration::from_runtime(observed.clone())
+    let root_view = crate::config::DaemonRuntimeConfiguration::from_runtime(observed.clone())
         .expect("root runtime layers policy over the same committed pin");
     assert_eq!(root_view.config().semantic, observed.config().semantic);
     drop(graph);
@@ -232,12 +232,13 @@ fn admitted_embedding() -> AdmittedEmbeddingProjectionKeyV1 {
         document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
         pooling: EmbeddingPoolingV1::Mean,
         truncation_side: EmbeddingTruncationSideV1::Right,
-        truncation_length: 512,
+        truncation_length: 4096,
         inference_batch_size: 8,
         inference_batch_bytes: 16 * 1024,
         runtime_backend: "fastembed-ort".to_owned(),
         runtime_build_revision: "runtime.maintenance-retention.v1".to_owned(),
         device_class: EmbeddingDeviceClassV1::Cpu,
+        execution_provider: tracedecay_domain::EmbeddingExecutionProviderV1::Cpu,
         dimensions: 2,
         metric: EmbeddingMetricV1::Cosine,
         normalization: EmbeddingNormalizationV1::L2,
@@ -1088,6 +1089,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
                 .as_ref(),
             &code_store_root,
             &canonical_root,
+            graph.db(),
         )
         .await,
         DoctorStorageFamilyReadV1::ObservedIncomplete { .. }
@@ -1262,6 +1264,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
             .as_ref(),
         &code_store_root,
         &canonical_root,
+        restarted_graph.db(),
     )
     .await;
     let DoctorStorageFamilyReadV1::ObservedIncomplete { findings, reason } = doctor else {

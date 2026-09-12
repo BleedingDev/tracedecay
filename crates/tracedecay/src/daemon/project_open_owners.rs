@@ -18,6 +18,9 @@ use tracedecay_domain::{ProjectId, UtcMicros, canonical_sha256};
 
 use super::DaemonInvocationState;
 use crate::mcp::McpServer;
+use tracedecay_agent_hosts::native_integration::{
+    DaemonNativeIntegrationAnalysisV1, NativeIntegrationTargetV1,
+};
 use tracedecay_application::lsp_runtime::DaemonLspSessionFactory;
 use tracedecay_application::primitives::admitted_root_uri_for_project;
 use tracedecay_application::semantic_runtime::{
@@ -198,6 +201,10 @@ pub(super) async fn register_project_open_retained_owner(
 
 /// Registers code-index-independent owners for one newly inserted project.
 #[hotpath::measure(label = "daemon.project.owners.register", future = true)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Production owner registration is one ordered phase list for a project open."
+)]
 pub(super) async fn register_project_open_production_owners(
     invocation: &DaemonInvocationState,
     git_transactions: &DaemonGitIndexTransactionServiceRegistry,
@@ -267,7 +274,8 @@ pub(super) async fn register_project_open_production_owners(
         elapsed_ms = owner_registration_started.elapsed().as_millis(),
     );
     owner_phase_started = Instant::now();
-    let scout_configuration = tracedecay_configuration::ConfigurationCurrentStateV1 {
+    let scout_configuration =
+        tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1 {
         revision_id: configuration.revision_id().clone(),
         snapshot: configuration.snapshot().clone(),
     };
@@ -349,8 +357,6 @@ pub(super) async fn register_project_open_production_owners(
             &access,
         )
         .await?;
-    let work_evidence_retrieval =
-        server.work_evidence_retrieval(&scope, invocation.work_federated_query_authority())?;
     let configuration_profile_id = server
         .profile_identity()
         .ok_or_else(|| TraceDecayError::Config {
@@ -382,16 +388,24 @@ pub(super) async fn register_project_open_production_owners(
     // policy identity. Non-Git projects advertise no native mutation
     // authority; the handler keeps answering the typed unavailable result.
     let native_owner = if let Some(repository_root) = repository_root {
+        let analysis = Arc::new(DaemonNativeIntegrationAnalysisV1::new(
+            invocation.code_index_schedulers.clone(),
+            scope.clone(),
+            tokio::runtime::Handle::current(),
+        ));
         let native_owner = hotpath::future!(
             async {
                 let native_owner = native_integration
                     .ensure(
                         session_db.clone(),
-                        repository_root,
-                        scope.project_id.clone(),
-                        scope.repository_id.clone(),
-                        configuration_policy_digest.clone(),
+                        NativeIntegrationTargetV1 {
+                            repository_root,
+                            project_id: scope.project_id.clone(),
+                            repository_id: scope.repository_id.clone(),
+                            policy_digest: configuration_policy_digest.clone(),
+                        },
                         now_micros(),
+                        analysis,
                     )
                     .await
                     .map_err(|error| TraceDecayError::Config {
@@ -422,16 +436,6 @@ pub(super) async fn register_project_open_production_owners(
             message: format!("project-open Work grant is invalid: {error}"),
         }
     })?;
-    let work_authority = tracedecay_domain::WorkAuthority::new(
-        scope.project_id.clone(),
-        scope.repository_id.clone(),
-        scope.worktree_id.clone(),
-        requester.clone(),
-        work_grant.digest.clone(),
-    )
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("project-open Work authority is invalid: {error}"),
-    })?;
     let work_topology_policy =
         tracedecay_configuration::config::topology::resolved_work_topology_policy(
             configuration.snapshot(),
@@ -440,15 +444,6 @@ pub(super) async fn register_project_open_production_owners(
             message: format!("project-open work topology policy is unavailable: {error}"),
         })?
         .clone();
-    let work_proposal_routing = DaemonWorkProposalRoutingAuthorityV1::mount(
-        scope.clone(),
-        configuration.revision_id().clone(),
-        configuration.snapshot(),
-        &access.configuration_digest,
-    )
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("project-open Work proposal routing is unavailable: {error}"),
-    })?;
     // Project-open has no authenticated GitHub response or persisted source
     // record. It mounts policy and delivery only; the review refresh owner is
     // the sole producer of canonical provider observations and anchors.
@@ -487,8 +482,30 @@ pub(super) async fn register_project_open_production_owners(
             );
         }
     }
-    hotpath::future!(
-        async {
+    if let Some(work_grant) = work_grant {
+        let work_authority = tracedecay_domain::WorkAuthority::new(
+            scope.project_id.clone(),
+            scope.repository_id.clone(),
+            scope.worktree_id.clone(),
+            requester.clone(),
+            work_grant.digest.clone(),
+        )
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open Work authority is invalid: {error}"),
+        })?;
+        let work_proposal_routing = DaemonWorkProposalRoutingAuthorityV1::mount(
+            scope.clone(),
+            &configuration,
+            &access.configuration_digest,
+            &work_grant,
+        )
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open Work proposal routing is unavailable: {error}"),
+        })?;
+        let work_evidence_retrieval =
+            server.work_evidence_retrieval(&scope, invocation.work_federated_query_authority())?;
+        hotpath::future!(
+            async {
             invocation
                 .work_runtime_registrar()
                 .register(
@@ -527,10 +544,11 @@ pub(super) async fn register_project_open_production_owners(
                 });
             }
             Ok::<_, TraceDecayError>(())
-        },
-        label = "daemon.project.open.owners.work"
-    )
-    .await?;
+            },
+            label = "daemon.project.open.owners.work"
+        )
+        .await?;
+    }
     tracing::info!(
         event = "project_open_owner_phase",
         project = %project_root.display(),
@@ -712,6 +730,11 @@ pub(super) async fn register_project_open_production_owners(
     crate::daemon::hook_v2_replay_consumer::register_hook_v2_replay_consumer(
         Arc::clone(&graph),
         delivery_settlements,
+        session_db.clone(),
+        server.background_cpu_authority().ok_or_else(|| TraceDecayError::Config {
+            message: "project-open hook replay requires the daemon background CPU authority"
+                .to_owned(),
+        })?,
     );
 
     // At-rest privacy remediation is bounded background work after fail-closed
@@ -794,6 +817,10 @@ pub(super) async fn register_project_open_production_owners(
 }
 
 #[hotpath::measure(label = "daemon.project.activate.semantic", future = true)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Semantic configuration owners are registered as one catalog-and-runtime bind."
+)]
 async fn register_semantic_configuration_owners(
     invocation: &DaemonInvocationState,
     project_root: &Path,
@@ -801,7 +828,7 @@ async fn register_semantic_configuration_owners(
     graph: &Arc<crate::tracedecay::TraceDecay>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     scope: ResolvedScope,
-    configuration: &tracedecay_configuration::ConfigurationCurrentStateV1,
+    configuration: &tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1,
 ) -> Result<()> {
     // Registration joins configuration and activation state; callers retain only its pending handle.
     Box::pin(async move {

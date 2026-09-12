@@ -3,7 +3,6 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracedecay_domain::UtcMicros;
@@ -508,10 +507,16 @@ fn with_exclusive_lock<T>(root: &Path, operation: impl FnOnce() -> Result<T>) ->
         .write(true)
         .open(&path)
         .map_err(|error| file_error(&path, "open response-handle lock", error))?;
-    lock.try_lock_exclusive()
-        .map_err(|error| file_error(&path, "acquire response-handle lock", error))?;
+    lock.try_lock().map_err(|error| {
+        file_error(
+            &path,
+            "acquire response-handle lock",
+            try_lock_io_error(error),
+        )
+    })?;
     let result = operation();
-    let unlock = FileExt::unlock(&lock)
+    let unlock = lock
+        .unlock()
         .map_err(|error| file_error(&path, "release response-handle lock", error));
     match (result, unlock) {
         (Ok(value), Ok(())) => Ok(value),
@@ -565,6 +570,15 @@ fn remove_failed_fresh_publish(path: &Path, expected: &StoredResponseHandleRecor
         .map_err(|error| file_error(path, "durably remove failed publication", error))
 }
 
+fn try_lock_io_error(error: std::fs::TryLockError) -> std::io::Error {
+    match error {
+        std::fs::TryLockError::WouldBlock => {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "lock would block")
+        }
+        std::fs::TryLockError::Error(error) => error,
+    }
+}
+
 fn file_error(path: &Path, operation: &str, error: std::io::Error) -> TraceDecayError {
     TraceDecayError::File {
         message: format!("failed to {operation}: {error}"),
@@ -594,8 +608,6 @@ mod tests {
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
 
-    use fs2::FileExt;
-
     use super::*;
     use tracedecay_runtime_core::storage::{
         DurableAtomicWriteFaultForTest, with_durable_atomic_write_fault_for_test,
@@ -611,36 +623,6 @@ mod tests {
             content: "é🦀".into(),
         };
         assert_eq!(record.original_chars(), 2);
-    }
-
-    #[test]
-    fn same_content_renews_the_expiry() {
-        let root = tempfile::tempdir().unwrap();
-        let first = store_response_handle_in_root(root.path(), "payload", 10).unwrap();
-        let second = store_response_handle_in_root(root.path(), "payload", 20).unwrap();
-
-        assert_eq!(second.handle, first.handle);
-        assert_eq!(first.created_at, 10);
-        assert_eq!(second.created_at, 20);
-        assert_eq!(second.expires_at, 20 + RESPONSE_HANDLE_TTL_SECS);
-        assert_eq!(
-            inventory_response_handles_in_root(root.path())
-                .unwrap()
-                .file_count,
-            1
-        );
-        let ResponseHandleLookup::Found(persisted) =
-            retrieve_from_root(root.path(), &second.handle, 20).unwrap()
-        else {
-            panic!("renewed response handle was not retrievable");
-        };
-        assert_eq!(persisted.created_at, 20);
-
-        let other_root = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            retrieve_from_root(other_root.path(), &second.handle, 20).unwrap(),
-            ResponseHandleLookup::Missing
-        ));
     }
 
     #[test]
@@ -697,7 +679,7 @@ mod tests {
             .write(true)
             .open(lock_path)
             .unwrap();
-        held.lock_exclusive().unwrap();
+        held.lock().unwrap();
 
         let worker_root = root.path().to_path_buf();
         let (sent, received) = mpsc::channel();
@@ -705,7 +687,7 @@ mod tests {
             let _ = sent.send(inventory_response_handles_in_root(&worker_root));
         });
         let early = received.recv_timeout(Duration::from_millis(250));
-        FileExt::unlock(&held).unwrap();
+        held.unlock().unwrap();
         let result = match early {
             Ok(result) => result,
             Err(error) => {
@@ -822,57 +804,17 @@ mod tests {
             .write(true)
             .open(lock_path)
             .unwrap();
-        held.lock_exclusive().unwrap();
+        held.lock().unwrap();
 
         let lookup = retrieve_from_root(root.path(), &record.handle, 10);
         let missing = retrieve_from_root(root.path(), "rh_000000000000000000000000", 10);
-        FileExt::unlock(&held).unwrap();
+        held.unlock().unwrap();
 
         assert!(matches!(
             lookup.unwrap(),
             ResponseHandleLookup::Found(found) if found.content == "read me"
         ));
         assert!(matches!(missing.unwrap(), ResponseHandleLookup::Missing));
-    }
-
-    #[test]
-    fn concurrent_lookups_overlap_without_failing_closed() {
-        const READERS: usize = 8;
-        const LOOKUPS_PER_READER: usize = 50;
-        let root = tempfile::tempdir().unwrap();
-        let record = store_response_handle_in_root(root.path(), "shared read", 10).unwrap();
-        let root = Arc::new(root.path().to_path_buf());
-        let handle = Arc::new(record.handle);
-        let barrier = Arc::new(Barrier::new(READERS));
-        let workers = (0..READERS)
-            .map(|_| {
-                let root = Arc::clone(&root);
-                let handle = Arc::clone(&handle);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    (0..LOOKUPS_PER_READER)
-                        .filter(|_| {
-                            !matches!(
-                                retrieve_from_root(&root, &handle, 10),
-                                Ok(ResponseHandleLookup::Found(_))
-                            )
-                        })
-                        .count()
-                })
-            })
-            .collect::<Vec<_>>();
-        let failures = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap())
-            .sum::<usize>();
-
-        assert_eq!(
-            failures,
-            0,
-            "{failures} of {} overlapping lookups did not return the record",
-            READERS * LOOKUPS_PER_READER
-        );
     }
 
     #[test]

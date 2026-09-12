@@ -5,9 +5,9 @@ use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{ManifestDigest, UtcMicros};
 
 use crate::config::retrieval::{
-    AcceptedRetrievalProfileV1, RetrievalProfileCasV1, RetrievalProfileCommitMetadataV1,
-    RetrievalProfileMutationCapabilityV1, RetrievalProfileStateSnapshotV1, RetrievalProfileStateV1,
-    RetrievalRuntimeCompatibilityV1,
+    AcceptedRetrievalProfileV1, RetrievalProfileActivationErrorV1, RetrievalProfileCasV1,
+    RetrievalProfileCommitMetadataV1, RetrievalProfileMutationCapabilityV1,
+    RetrievalProfileStateSnapshotV1, RetrievalProfileStateV1, RetrievalRuntimeCompatibilityV1,
 };
 use crate::semantic_runtime::{
     CommittedRetrievalProfileStateV1, SemanticActivationCommandV1, SemanticActivationReceiptV1,
@@ -16,8 +16,10 @@ use crate::semantic_runtime::{
     SemanticLinkedTransitionV1, SemanticRetrievalConfigurationPortV1, SemanticRollbackCommandV1,
     SemanticRuntimeFuture,
 };
-use tracedecay_configuration::{ConfigurationMutationAuthority, DirectConfigurationMutation};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_global_db::configuration::contracts::types::{
+    ConfigurationError, ConfigurationMutationAuthority, DirectConfigurationMutation,
+};
 use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
 
 #[derive(Clone)]
@@ -192,34 +194,18 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
         .await
         .map_err(|error| {
             let outcome = match &error {
-                tracedecay_configuration::ConfigurationError::TargetUnavailable => {
-                    "target_unavailable"
-                }
-                tracedecay_configuration::ConfigurationError::AuthorizedTargetAmbiguous => {
-                    "target_ambiguous"
-                }
-                tracedecay_configuration::ConfigurationError::RevisionConflict => {
-                    "revision_conflict"
-                }
-                tracedecay_configuration::ConfigurationError::PlanExpired => "plan_expired",
-                tracedecay_configuration::ConfigurationError::PlanStale => "plan_stale",
-                tracedecay_configuration::ConfigurationError::PolicyWideningForbidden => {
-                    "policy_widening_forbidden"
-                }
-                tracedecay_configuration::ConfigurationError::ProjectlessProfileRequired => {
-                    "projectless_profile_required"
-                }
-                tracedecay_configuration::ConfigurationError::IdempotencyConflict => {
-                    "idempotency_conflict"
-                }
-                tracedecay_configuration::ConfigurationError::MutationAuthorityRejected => {
-                    "mutation_authority_rejected"
-                }
-                tracedecay_configuration::ConfigurationError::Validation(_) => "validation",
-                tracedecay_configuration::ConfigurationError::ResetRequired { .. } => {
-                    "reset_required"
-                }
-                tracedecay_configuration::ConfigurationError::Unavailable => "unavailable",
+                ConfigurationError::TargetUnavailable => "target_unavailable",
+                ConfigurationError::AuthorizedTargetAmbiguous => "target_ambiguous",
+                ConfigurationError::RevisionConflict => "revision_conflict",
+                ConfigurationError::PlanExpired => "plan_expired",
+                ConfigurationError::PlanStale => "plan_stale",
+                ConfigurationError::PolicyWideningForbidden => "policy_widening_forbidden",
+                ConfigurationError::ProjectlessProfileRequired => "projectless_profile_required",
+                ConfigurationError::IdempotencyConflict => "idempotency_conflict",
+                ConfigurationError::MutationAuthorityRejected => "mutation_authority_rejected",
+                ConfigurationError::Validation(_) => "validation",
+                ConfigurationError::ResetRequired { .. } => "reset_required",
+                ConfigurationError::Unavailable => "unavailable",
             };
             tracing::warn!(
                 event = "semantic_configuration_preview_failure",
@@ -227,12 +213,10 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
                 "semantic configuration preview did not produce a commit"
             );
             match error {
-                tracedecay_configuration::ConfigurationError::RevisionConflict => {
+                ConfigurationError::RevisionConflict => {
                     SemanticConfigurationBackendErrorV1::Conflict
                 }
-                tracedecay_configuration::ConfigurationError::Unavailable => {
-                    SemanticConfigurationBackendErrorV1::Unavailable
-                }
+                ConfigurationError::Unavailable => SemanticConfigurationBackendErrorV1::Unavailable,
                 _ => SemanticConfigurationBackendErrorV1::Rejected,
             }
         })?;
@@ -280,7 +264,7 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
                     now,
                 ),
             )
-            .map_err(|_| SemanticConfigurationBackendErrorV1::Rejected)?;
+            .map_err(transition_refusal("stage_activation.state_activate"))?;
         let transition = SemanticConfigurationTransitionV1::activation(
             base_configuration,
             result_configuration,
@@ -342,9 +326,7 @@ impl ProductionSemanticRetrievalConfigurationStoreV1 {
                     now,
                 ),
             )
-            .map_err(|_| {
-                SemanticConfigurationBackendErrorV1::RejectedAt("stage_rollback.state_rollback")
-            })?;
+            .map_err(transition_refusal("stage_rollback.state_rollback"))?;
         let transition = SemanticConfigurationTransitionV1::rollback(
             base_configuration,
             result_configuration,
@@ -569,12 +551,10 @@ impl SemanticRetrievalConfigurationPortV1 for ProductionSemanticRetrievalConfigu
             )
             .await
             .map_err(|error| match error {
-                tracedecay_configuration::ConfigurationError::RevisionConflict => {
+                ConfigurationError::RevisionConflict => {
                     SemanticConfigurationBackendErrorV1::Conflict
                 }
-                tracedecay_configuration::ConfigurationError::Unavailable => {
-                    SemanticConfigurationBackendErrorV1::Unavailable
-                }
+                ConfigurationError::Unavailable => SemanticConfigurationBackendErrorV1::Unavailable,
                 _ => SemanticConfigurationBackendErrorV1::RejectedAt(
                     "commit_linked_transition.central_commit",
                 ),
@@ -785,6 +765,25 @@ struct StoredState {
 struct PreparedCentralCommit {
     authority: ConfigurationMutationAuthority,
     mutation: DirectConfigurationMutation,
+}
+
+/// Classify a refused staged transition.
+///
+/// The scope compare-and-swap is the only guard left between a caller's read
+/// of the profile state and this stage, so a concurrent transition on this
+/// same scope surfaces as `CasConflict`. That is a lost race, not a malformed
+/// request: it stays a typed refusal but keeps the retryable `Conflict`
+/// classification the pre-scope-CAS revision guard used to give it. Every
+/// other refusal names its stage and remains non-retryable.
+fn transition_refusal(
+    stage: &'static str,
+) -> impl Fn(RetrievalProfileActivationErrorV1) -> SemanticConfigurationBackendErrorV1 {
+    move |error| match error {
+        RetrievalProfileActivationErrorV1::CasConflict => {
+            SemanticConfigurationBackendErrorV1::Conflict
+        }
+        _ => SemanticConfigurationBackendErrorV1::RejectedAt(stage),
+    }
 }
 
 fn current_activation_from_stored(

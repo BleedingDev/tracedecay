@@ -33,6 +33,7 @@ use tracedecay_graph_db::GraphConflictContextV1;
 use tracedecay_application::code_index::{
     DaemonCodeIndexControlV1, ProductionCodeIndexOwnerV1, open_production_code_index_owner_v1,
 };
+use tracedecay_application::semantic_runtime::SavedGenerationScheduleOutcomeV1;
 use tracedecay_domain::{
     ChunkerRevision, CodeGenerationId, CodeGenerationSourceCommitmentsV1, ComponentRevision,
     ContentDigest, ExactAdmissionRuleRevision, FileOccurrenceId, ManifestDigest, PolicyRevisionId,
@@ -40,7 +41,7 @@ use tracedecay_domain::{
     ProjectionOperationV1, ProjectionOutcomeV1, RepositoryDirtyStateV1, RepositoryId,
     RetrievalBudget, RetrieverBatch, RetrieverOutcome, SanitizationReceiptId, SanitizedCodeFileV1,
     SanitizedCodeSnapshotV1, SanitizerRevision, ScoreDomainId, SnapshotFileDispositionV1, TreeId,
-    WorktreeId, canonical_sha256,
+    WorktreeId, canonical_sha256, sha256_hex_suffix,
 };
 use tracedecay_private_fs::{
     framed_log::DirectorySyncPolicy, make_private_directory, open_private_file,
@@ -99,7 +100,7 @@ use crate::{
             CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
             CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
             CodeLexicalProjectionMetadataV1, LexicalLane, LexicalLaneEvidence, LexicalLaneRequest,
-            LexicalLaneRetriever,
+            LexicalLaneRetriever, code_lexical_artifact_build_memory_budget_for,
         },
         ports::RetrievalPortError,
     },
@@ -132,61 +133,30 @@ const SUPERSEDED_RECONCILE_RETRY_BACKOFF: Duration = Duration::from_millis(75);
 /// reconciliation re-checks gix truth before serving. Git-mediated changes are
 /// caught immediately by the tier-1 metadata check regardless of this bound.
 const DEFAULT_STALENESS_THRESHOLD: Duration = Duration::from_secs(30);
-/// Positive busy-read source-currency proofs (stat sweep plus sealed-digest
-/// comparison) may be reused only within this bound. Git metadata drift and
-/// scheduler epoch advances invalidate immediately; raw out-of-band writes are
-/// therefore stale for at most this interval.
-const BUSY_WITNESS_MEMO_INTERVAL: Duration = if cfg!(any(test, feature = "test-helpers")) {
-    Duration::from_millis(50)
-} else {
-    Duration::from_secs(1)
-};
 const MAX_DURABLE_PUBLICATION_POINTER_BYTES: u64 = 512 * 1024;
 const DURABLE_GENERATION_IO_CHUNK_BYTES_V1: usize = 64 * 1024;
 /// Page bounds for streaming one sealed generation into the durable lexical
 /// text artifact. One page is one bounded unit of background build progress.
 const TEXT_ARTIFACT_PAGE_CHUNKS_V1: usize = 128;
 const TEXT_ARTIFACT_PAGE_BYTES_V1: usize = 4 * 1024 * 1024;
-/// Measured on a 4379-file corpus with `journal_mode=DELETE`: each
-/// `query.artifact.batch.sqlite` transaction pays a fixed commit cost
-/// (journal fsync + page-cache flush) independent of its row count, and
-/// postings inserts alone were 73-76% of that phase (~212-245s of a ~7min
-/// batch phase). Doubling the page/work caps here roughly halves the number
-/// of commits paid for the same corpus while staying far inside both the
-/// 2M-row prepared-batch cap and the 1536MiB
-/// `CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1` ledger (see
-/// `TEXT_ARTIFACT_BATCH_BYTES_V1` below for the unchanged byte bound that
-/// still caps any single batch regardless of this page count).
-///
-/// Re-measured on this repository's 4925-file checkout (2.6GiB staging
-/// artifact, ~3900 committed pages, one `tracedecay status` sample every 10s
-/// through a `scripts/ci-pr-dogfood-smoke.sh` run) before raising anything
-/// further: the per-transaction cost is not fully fixed. At a constant
-/// 64-page batch `last_commit_latency_micros` rose from 567ms at 64 committed
-/// pages to 4881ms at 2006 in a `dev`-profile binary, and from 861ms at 115
-/// pages to ~1686ms at 3678 in a `release` binary -- with `journal_mode=DELETE`
-/// and a 64MiB page cache, each commit journals and re-flushes every
-/// posting/exact index page the batch dirtied, and that page set widens as the
-/// B-trees outgrow the cache. Even so the whole batch phase was only ~66s of
-/// the 262s source phase (release) / ~118s of 403s (dev), so raising the page
-/// cap again is worth at most a tenth of one phase and was deliberately not
-/// done here. Both timings are dwarfed by the code-graph activation that
-/// strict readiness also requires, which is where the dogfood budget actually
-/// goes. Whoever does raise it must raise the caller hint with it
-/// (`registry::TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1`): the sealed source
-/// offers `min(hint, TEXT_ARTIFACT_BATCH_PAGES_V1)` pages, so a stale hint
-/// silently keeps the old batch size. Offering more pages is otherwise safe by
-/// construction -- [`CodeLexicalArtifactBuilderV1::prepare_admissible_page_prefix`]
-/// returns an accepted prefix clamped against the row cap and the memory
-/// ledger, so the cap is an upper offer, never a reservation.
-const TEXT_ARTIFACT_BATCH_PAGES_V1: usize = 64;
-const TEXT_ARTIFACT_BATCH_BYTES_V1: usize = 64 * 1024 * 1024;
+const TEXT_ARTIFACT_BASE_BATCH_PAGES_V1: usize = 64;
+const TEXT_ARTIFACT_BASE_BATCH_BYTES_V1: usize = 64 * 1024 * 1024;
+const TEXT_ARTIFACT_MAXIMUM_BATCH_SCALE_V1: usize = 8;
 /// One synchronous activation advances only this many page/finalization
 /// operations. Larger caller hints are clamped so work accounting cannot
-/// overflow and every expensive loop retains cancellation checkpoints.
-/// Doubled alongside `TEXT_ARTIFACT_BATCH_PAGES_V1` (see its comment) so one
-/// wake can still commit two full-sized batches under the raised page cap.
-const TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1: usize = 128;
+/// overflow and every expensive loop retains cancellation checkpoints. The
+/// runtime narrows this ceiling to two host-sized batches, preserving 128
+/// operations at the 1.5 GiB floor.
+const TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1: usize =
+    2 * TEXT_ARTIFACT_BASE_BATCH_PAGES_V1 * TEXT_ARTIFACT_MAXIMUM_BATCH_SCALE_V1;
+
+fn text_artifact_source_batch_limits(build_memory_budget: usize) -> (usize, usize, usize) {
+    let scale = (build_memory_budget / CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1)
+        .clamp(1, TEXT_ARTIFACT_MAXIMUM_BATCH_SCALE_V1);
+    let pages = TEXT_ARTIFACT_BASE_BATCH_PAGES_V1 * scale;
+    let bytes = TEXT_ARTIFACT_BASE_BATCH_BYTES_V1 * scale;
+    (pages, bytes, pages * 2)
+}
 /// Cancellation-checkpoint cadence for a wake parked behind another wake's
 /// corpus-sized verified head open. The parked wake re-checks its typed
 /// cancellation state at this interval, so shutdown or supersession surfaces
@@ -216,12 +186,7 @@ static CODE_INDEX_GENERATION_DECODES_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "hotpath")]
 static CODE_INDEX_GENERATION_DECODE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
-pub fn scoped_code_index_store_root(store_root: &Path, canonical_project_root: &Path) -> PathBuf {
-    tracedecay_code_index_retention::code_index_generations::scoped_code_index_store_root(
-        store_root,
-        canonical_project_root,
-    )
-}
+pub use tracedecay_code_index_retention::code_index_generations::scoped_code_index_store_root;
 
 /// How the scheduler is hinted about changes.
 ///
@@ -776,14 +741,11 @@ impl TemporaryEvidencePackV1 {
                 "sealed evidence pack does not match its commit identity",
             ));
         }
-        let digest_hex = segment_digest
-            .as_str()
-            .strip_prefix("sha256:")
-            .ok_or_else(|| {
-                DaemonCodeIndexPublicationStoreV1::unavailable(
-                    "sealed evidence pack digest is not sha256",
-                )
-            })?;
+        let digest_hex = sha256_hex_suffix(segment_digest.as_str()).ok_or_else(|| {
+            DaemonCodeIndexPublicationStoreV1::unavailable(
+                "sealed evidence pack digest is not sha256",
+            )
+        })?;
         let final_path = root.join(format!("segment-{digest_hex}.json"));
         match final_path.symlink_metadata() {
             Ok(metadata) => {
@@ -927,6 +889,13 @@ impl DaemonCodeIndexPublicationStoreV1 {
         std::fs::create_dir_all(&segments_root)?;
         let _store_lock = acquire_code_generation_store_lock(store_root)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        // Scope reconciliation only sees this directory's hash; the record
+        // lets it collect the scope as soon as the checkout is deleted rather
+        // than after the stranding age.
+        tracedecay_code_index_retention::code_index_generations::record_scope_root(
+            store_root,
+            project_root,
+        )?;
         Self::remove_abandoned_evidence_packs(&segments_root)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(Self {
@@ -1086,9 +1055,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
         digest: &ManifestDigest,
         bytes: &[u8],
     ) -> Result<(), CodeIndexPublicationStoreErrorV1> {
-        let digest_hex = digest
-            .as_str()
-            .strip_prefix("sha256:")
+        let digest_hex = sha256_hex_suffix(digest.as_str())
             .ok_or_else(|| Self::unavailable("sealed segment digest is not sha256"))?;
         let expected_digest = digest.as_str();
         if Self::state_digest(bytes) != expected_digest {
@@ -1471,7 +1438,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
                 "sealed generation segment range exceeds its manifest identity".to_owned(),
             ));
         }
-        let digest_hex = digest.as_str().strip_prefix("sha256:").ok_or_else(|| {
+        let digest_hex = sha256_hex_suffix(digest.as_str()).ok_or_else(|| {
             CodeIndexProductionErrorV1::Contract("sealed segment digest is not sha256".to_owned())
         })?;
         let path = self
@@ -1529,7 +1496,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
                 "sealed generation segment range exceeds its manifest identity".to_owned(),
             ));
         }
-        let digest_hex = digest.strip_prefix("sha256:").ok_or_else(|| {
+        let digest_hex = sha256_hex_suffix(digest).ok_or_else(|| {
             CodeIndexProductionErrorV1::Contract("sealed segment digest is not sha256".to_owned())
         })?;
         let path = self
@@ -1845,10 +1812,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
     ) -> Result<Option<Arc<CodeIndexPublishedGenerationV1>>, CodeIndexPublicationStoreErrorV1> {
         let expected_file = format!(
             "generation-{}.json",
-            entry
-                .state_digest
-                .strip_prefix("sha256:")
-                .unwrap_or(&entry.state_digest)
+            sha256_hex_suffix(&entry.state_digest).unwrap_or(&entry.state_digest)
         );
         if entry.generation_file != expected_file {
             return Err(Self::corruption(
@@ -2464,9 +2428,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                 .set(generation_size.saturating_add(referenced_segment_bytes));
             let generation_file = format!(
                 "generation-{}.json",
-                state_digest
-                    .strip_prefix("sha256:")
-                    .unwrap_or(&state_digest)
+                sha256_hex_suffix(&state_digest).unwrap_or(&state_digest)
             );
             let generation_path = self.generations_root.join(&generation_file);
             match generation_path.symlink_metadata() {
@@ -3054,7 +3016,7 @@ fn try_publish_build_progress(
 struct CodeIndexCommittedProgressSampleV1 {
     observed_at: Instant,
     completed_files: u64,
-    completed_lexical_bytes: u64,
+    completed_lexical_units: u64,
 }
 
 struct CodeIndexBuildProgressStateV1 {
@@ -3073,7 +3035,7 @@ impl CodeIndexBuildProgressStateV1 {
     fn observe_committed(&mut self, sample: CodeIndexCommittedProgressSampleV1) {
         if self.committed_samples.back().is_some_and(|previous| {
             previous.completed_files == sample.completed_files
-                && previous.completed_lexical_bytes == sample.completed_lexical_bytes
+                && previous.completed_lexical_units == sample.completed_lexical_units
         }) {
             return;
         }
@@ -3087,7 +3049,7 @@ impl CodeIndexBuildProgressStateV1 {
         u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
-    fn rates_and_eta(&self, total_lexical_bytes: u64) -> (Option<f64>, Option<f64>, Option<u64>) {
+    fn rates_and_eta(&self, total_lexical_units: u64) -> (Option<f64>, Option<f64>, Option<u64>) {
         let Some(previous) = self.committed_samples.front() else {
             return (None, None, None);
         };
@@ -3109,20 +3071,20 @@ impl CodeIndexBuildProgressStateV1 {
             .checked_sub(previous.completed_files)
             .filter(|delta| *delta > 0)
             .map(|delta| delta as f64 / elapsed_seconds);
-        let lexical_bytes_per_second = current
-            .completed_lexical_bytes
-            .checked_sub(previous.completed_lexical_bytes)
+        let lexical_units_per_second = current
+            .completed_lexical_units
+            .checked_sub(previous.completed_lexical_units)
             .filter(|delta| *delta > 0)
             .map(|delta| delta as f64 / elapsed_seconds);
-        let estimated_remaining_seconds = lexical_bytes_per_second.and_then(|lexical_rate| {
-            let remaining = total_lexical_bytes.saturating_sub(current.completed_lexical_bytes);
+        let estimated_remaining_seconds = lexical_units_per_second.and_then(|lexical_rate| {
+            let remaining = total_lexical_units.saturating_sub(current.completed_lexical_units);
             let estimate = (remaining as f64 / lexical_rate).ceil();
             (estimate.is_finite() && estimate >= 0.0 && estimate <= u64::MAX as f64)
                 .then_some(estimate as u64)
         });
         (
             files_per_second,
-            lexical_bytes_per_second,
+            lexical_units_per_second,
             estimated_remaining_seconds,
         )
     }
@@ -3767,83 +3729,7 @@ impl DaemonCodeTextArtifactStoreV1 {
         identity: &DurableSealedCodeGenerationIdentityV1,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<VerifiedSealedLexicalPageSourceV1<File>, RetrievalPortError> {
-        DaemonCodeIndexPublicationStoreV1::validate_generation_file(&identity.locator)
-            .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-        let path = self.publication.generations_root.join(&identity.locator);
-        let metadata = path.symlink_metadata().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                RetrievalPortError::AuthorityUnavailable(
-                    "durable sealed lexical source is missing".to_owned(),
-                )
-            } else {
-                text_artifact_unavailable(error)
-            }
-        })?;
-        if !metadata.file_type().is_file() || metadata.len() != identity.size_bytes {
-            return Err(RetrievalPortError::Contract(
-                "durable sealed lexical source identity is corrupt".to_owned(),
-            ));
-        }
-        let file = File::open(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                RetrievalPortError::AuthorityUnavailable(
-                    "durable sealed lexical source disappeared before open".to_owned(),
-                )
-            } else {
-                text_artifact_unavailable(error)
-            }
-        })?;
-        match VerifiedSealedLexicalPageSourceV1::open_content_addressed(
-            file,
-            identity.size_bytes,
-            identity.digest.clone(),
-            TEXT_ARTIFACT_PAGE_CHUNKS_V1,
-            TEXT_ARTIFACT_PAGE_BYTES_V1,
-            control,
-        ) {
-            Ok(source) => Ok(source),
-            Err(CodeIndexProductionErrorV1::Contract(message))
-                if message.contains("format revision is incompatible") =>
-            {
-                let manifest_bytes = std::fs::read(&path).map_err(text_artifact_unavailable)?;
-                if DaemonCodeIndexPublicationStoreV1::state_digest(&manifest_bytes)
-                    != identity.digest.as_str()
-                {
-                    return Err(RetrievalPortError::Contract(
-                        "partitioned sealed lexical manifest digest does not verify".to_owned(),
-                    ));
-                }
-                let manifest = File::open(path).map_err(text_artifact_unavailable)?;
-                let publication = self.publication.clone();
-                let source_identity = identity.clone();
-                VerifiedSealedLexicalPageSourceV1::open_partitioned_sealed(
-                    manifest,
-                    &manifest_bytes,
-                    identity.digest.clone(),
-                    move |digest, expected_size, buffer| {
-                        publication.read_retained_partitioned_segment(
-                            &source_identity,
-                            SealedGenerationSegmentReadV1::Whole {
-                                digest,
-                                size_bytes: expected_size,
-                            },
-                            buffer,
-                        )
-                    },
-                    TEXT_ARTIFACT_PAGE_CHUNKS_V1,
-                    TEXT_ARTIFACT_PAGE_BYTES_V1,
-                )
-                .map_err(map_sealed_page_source_error)
-                .and_then(|source| {
-                    source.ok_or_else(|| {
-                        RetrievalPortError::Contract(
-                            "partitioned sealed lexical source is incompatible".to_owned(),
-                        )
-                    })
-                })
-            }
-            Err(error) => Err(map_sealed_page_source_error(error)),
-        }
+        self.open_sealed_source_with_progress(identity, control, |_, _| {})
     }
 
     fn open_sealed_source_with_progress<F>(
@@ -3864,61 +3750,44 @@ impl DaemonCodeTextArtifactStoreV1 {
                 "durable sealed lexical source identity is corrupt".to_owned(),
             ));
         }
-        let file = File::open(&path).map_err(text_artifact_unavailable)?;
-        match VerifiedSealedLexicalPageSourceV1::open_content_addressed_with_progress(
-            file,
-            identity.size_bytes,
+        checkpoint_text_artifact_control(control)?;
+        progress(0, identity.size_bytes);
+        let manifest_bytes = std::fs::read(&path).map_err(text_artifact_unavailable)?;
+        checkpoint_text_artifact_control(control)?;
+        if DaemonCodeIndexPublicationStoreV1::state_digest(&manifest_bytes)
+            != identity.digest.as_str()
+        {
+            return Err(RetrievalPortError::Contract(
+                "partitioned sealed lexical manifest digest does not verify".to_owned(),
+            ));
+        }
+        progress(identity.size_bytes, identity.size_bytes);
+        let manifest = File::open(path).map_err(text_artifact_unavailable)?;
+        let publication = self.publication.clone();
+        let source_identity = identity.clone();
+        VerifiedSealedLexicalPageSourceV1::open_partitioned_sealed(
+            manifest,
+            &manifest_bytes,
             identity.digest.clone(),
+            move |digest, expected_size, buffer| {
+                publication.read_retained_partitioned_segment(
+                    &source_identity,
+                    SealedGenerationSegmentReadV1::Whole {
+                        digest,
+                        size_bytes: expected_size,
+                    },
+                    buffer,
+                )
+            },
             TEXT_ARTIFACT_PAGE_CHUNKS_V1,
             TEXT_ARTIFACT_PAGE_BYTES_V1,
-            control,
-            &mut progress,
-        ) {
-            Ok(source) => Ok(source),
-            Err(CodeIndexProductionErrorV1::Contract(message))
-                if message.contains("format revision is incompatible") =>
-            {
-                progress(0, identity.size_bytes);
-                let manifest_bytes = std::fs::read(&path).map_err(text_artifact_unavailable)?;
-                if DaemonCodeIndexPublicationStoreV1::state_digest(&manifest_bytes)
-                    != identity.digest.as_str()
-                {
-                    return Err(RetrievalPortError::Contract(
-                        "partitioned sealed lexical manifest digest does not verify".to_owned(),
-                    ));
-                }
-                progress(identity.size_bytes, identity.size_bytes);
-                let manifest = File::open(&path).map_err(text_artifact_unavailable)?;
-                let publication = self.publication.clone();
-                let source_identity = identity.clone();
-                VerifiedSealedLexicalPageSourceV1::open_partitioned_sealed(
-                    manifest,
-                    &manifest_bytes,
-                    identity.digest.clone(),
-                    move |digest, expected_size, buffer| {
-                        publication.read_retained_partitioned_segment(
-                            &source_identity,
-                            SealedGenerationSegmentReadV1::Whole {
-                                digest,
-                                size_bytes: expected_size,
-                            },
-                            buffer,
-                        )
-                    },
-                    TEXT_ARTIFACT_PAGE_CHUNKS_V1,
-                    TEXT_ARTIFACT_PAGE_BYTES_V1,
-                )
-                .map_err(map_sealed_page_source_error)
-                .and_then(|source| {
-                    source.ok_or_else(|| {
-                        RetrievalPortError::Contract(
-                            "partitioned sealed lexical source is incompatible".to_owned(),
-                        )
-                    })
-                })
-            }
-            Err(error) => Err(map_sealed_page_source_error(error)),
-        }
+        )
+        .map_err(map_sealed_page_source_error)?
+        .ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "partitioned sealed lexical source is incompatible".to_owned(),
+            )
+        })
     }
 
     /// Durably publish one finalized staging artifact: content-address it,
@@ -3940,19 +3809,20 @@ impl DaemonCodeTextArtifactStoreV1 {
             // a plan made before the descriptor was attached.
             let lock = acquire_code_generation_store_lock(&self.store_root)
                 .map_err(text_artifact_unavailable)?;
-            let (artifact_hex, artifact_size_bytes) = hotpath::measure_block!(
+            let (artifact_sha256, artifact_size_bytes) = hotpath::measure_block!(
                 "query.artifact.store.state_digest",
-                sha256_private_file_hex_and_size(staging_path, control)
+                sha256_private_file_and_size(staging_path, control)
             )?;
             #[cfg(feature = "hotpath")]
             hotpath::gauge!("query.artifact.store.digest_bytes").set(artifact_size_bytes);
             let descriptor = DurableCodeTextArtifactDescriptorV1 {
                 generation_id: generation_id.clone(),
-                artifact_file: format!("text-artifact-{artifact_hex}.bin"),
-                artifact_digest: ManifestDigest::from_sha256_bytes(
-                    &hex::decode(&artifact_hex).map_err(text_artifact_unavailable)?,
-                )
-                .map_err(text_artifact_unavailable)?,
+                artifact_file: format!(
+                    "text-artifact-{}.bin",
+                    encode_lowercase_hex(&artifact_sha256)
+                ),
+                artifact_digest: ManifestDigest::from_sha256_bytes(&artifact_sha256)
+                    .map_err(text_artifact_unavailable)?,
                 artifact_size_bytes,
             };
             let final_path = artifacts_root.join(&descriptor.artifact_file);
@@ -3962,9 +3832,9 @@ impl DaemonCodeTextArtifactStoreV1 {
                     // object contains the named bytes. Verify the stable destination
                     // before withdrawing staging evidence; a symlink, non-regular
                     // object, truncated file, or same-name collision fails closed.
-                    let (existing_hex, existing_size_bytes) = hotpath::measure_block!(
+                    let (existing_sha256, existing_size_bytes) = hotpath::measure_block!(
                         "query.artifact.store.dedupe_compare",
-                        sha256_private_file_hex_and_size(&final_path, control)
+                        sha256_private_file_and_size(&final_path, control)
                     )?;
                     if existing_size_bytes != artifact_size_bytes {
                         return Err(RetrievalPortError::Contract(
@@ -3972,7 +3842,7 @@ impl DaemonCodeTextArtifactStoreV1 {
                                 .to_owned(),
                         ));
                     }
-                    if existing_hex != artifact_hex {
+                    if existing_sha256 != artifact_sha256 {
                         return Err(RetrievalPortError::Contract(
                             "existing code text artifact contains different bytes".to_owned(),
                         ));
@@ -4463,19 +4333,32 @@ impl LatestCodeTextGenerationV1 {
         observe_committed: bool,
     ) -> Result<(), RetrievalPortError> {
         let source_cursor = build.source.cursor();
-        match progress.next_cursor.as_ref() {
-            Some(cursor) if cursor == source_cursor => {}
-            None if progress.next_page_ordinal == 0
-                && progress.completed_chunks == 0
-                && progress.completed_payload_bytes == 0
-                && progress.completed_imports == 0
-                && source_cursor.next_page_ordinal() == 0 => {}
-            _ => {
-                return Err(RetrievalPortError::Contract(
-                    "text-artifact progress does not match the accepted sealed-source cursor"
-                        .to_owned(),
-                ));
-            }
+        match build.source_receipt.as_ref() {
+            // A completed source mints one terminal read that emits no record
+            // and only normalizes the exhausted file position, so its live
+            // cursor sits one file rollover beyond the last durably accepted
+            // page whenever that page filled exactly at a file's last record.
+            // The completion receipt is the accepted-source authority from
+            // here on — the same one the builder seals the artifact against —
+            // and it binds the source state digest, the page count, every
+            // emitted counter, and both digest chains.
+            Some(receipt) => receipt
+                .verify_completion(progress.next_cursor.as_ref())
+                .map_err(map_sealed_page_source_error)?,
+            None => match progress.next_cursor.as_ref() {
+                Some(cursor) if cursor == source_cursor => {}
+                None if progress.next_page_ordinal == 0
+                    && progress.completed_chunks == 0
+                    && progress.completed_payload_bytes == 0
+                    && progress.completed_imports == 0
+                    && source_cursor.next_page_ordinal() == 0 => {}
+                _ => {
+                    return Err(RetrievalPortError::Contract(
+                        "text-artifact progress does not match the accepted sealed-source cursor"
+                            .to_owned(),
+                    ));
+                }
+            },
         }
         if progress.next_page_ordinal != source_cursor.next_page_ordinal()
             || progress.completed_chunks != source_cursor.emitted_chunks()
@@ -4487,11 +4370,11 @@ impl LatestCodeTextGenerationV1 {
             ));
         }
         let completed_files = build.source.completed_files();
-        let completed_lexical_bytes = build
+        let completed_lexical_units = build
             .source
-            .completed_lexical_bytes()
+            .completed_lexical_units()
             .map_err(map_sealed_page_source_error)?;
-        let total_lexical_bytes = build.source.total_lexical_bytes();
+        let total_lexical_units = build.source.total_lexical_units();
         let observed_at = Instant::now();
         let observed_micros = now_micros().0;
         let last_commit_latency_micros = last_commit_latency_micros.or_else(|| {
@@ -4512,18 +4395,18 @@ impl LatestCodeTextGenerationV1 {
             state.observe_committed(CodeIndexCommittedProgressSampleV1 {
                 observed_at,
                 completed_files,
-                completed_lexical_bytes,
+                completed_lexical_units,
             });
             #[cfg(feature = "hotpath")]
             {
                 hotpath::gauge!("query.artifact.progress.committed_pages")
                     .set(progress.next_page_ordinal);
-                hotpath::gauge!("query.artifact.progress.committed_lexical_bytes")
-                    .set(completed_lexical_bytes);
+                hotpath::gauge!("query.artifact.progress.committed_lexical_units")
+                    .set(completed_lexical_units);
             }
         }
-        let (files_per_second, lexical_bytes_per_second, estimated_remaining_seconds) =
-            state.rates_and_eta(total_lexical_bytes);
+        let (files_per_second, lexical_units_per_second, estimated_remaining_seconds) =
+            state.rates_and_eta(total_lexical_units);
         let snapshot = CodeIndexBuildProgressV1 {
             generation_id: self.metadata.manifest().generation_id.as_str().to_owned(),
             daemon_incarnation: self.text_progress_daemon_incarnation,
@@ -4537,14 +4420,14 @@ impl LatestCodeTextGenerationV1 {
             committed_payload_bytes: progress.completed_payload_bytes,
             completed_files,
             total_files: build.source.total_files(),
-            completed_lexical_bytes,
-            total_lexical_bytes,
+            completed_lexical_units,
+            total_lexical_units,
             current_batch_pages,
             current_batch_payload_bytes,
             elapsed_micros: state.elapsed_micros(),
             last_commit_latency_micros,
             files_per_second,
-            lexical_bytes_per_second,
+            lexical_units_per_second,
             estimated_remaining_seconds,
             last_progress_micros: observed_micros,
             blocked_reason: None,
@@ -4583,14 +4466,14 @@ impl LatestCodeTextGenerationV1 {
             committed_payload_bytes: artifact.total_payload_bytes(),
             completed_files: source.total_files(),
             total_files: source.total_files(),
-            completed_lexical_bytes: source.total_lexical_bytes(),
-            total_lexical_bytes: source.total_lexical_bytes(),
+            completed_lexical_units: source.total_lexical_units(),
+            total_lexical_units: source.total_lexical_units(),
             current_batch_pages: 0,
             current_batch_payload_bytes: 0,
             elapsed_micros,
             last_commit_latency_micros: None,
             files_per_second: None,
-            lexical_bytes_per_second: None,
+            lexical_units_per_second: None,
             estimated_remaining_seconds: None,
             last_progress_micros: now_micros().0,
             blocked_reason: None,
@@ -4791,10 +4674,14 @@ impl LatestCodeTextGenerationV1 {
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<TextHeadOpenOutcomeV1, RetrievalPortError> {
         let store = &self.text_artifact_store;
-        hotpath::gauge!("query.artifact.build_memory_budget_bytes")
-            .set(CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1);
-        hotpath::gauge!("query.artifact.source_batch_pages_max").set(TEXT_ARTIFACT_BATCH_PAGES_V1);
-        hotpath::gauge!("query.artifact.source_batch_bytes_max").set(TEXT_ARTIFACT_BATCH_BYTES_V1);
+        let build_memory_budget = code_lexical_artifact_build_memory_budget_for(
+            store.resident_memory.snapshot().limit_bytes,
+        );
+        let (source_batch_pages, source_batch_bytes, _) =
+            text_artifact_source_batch_limits(build_memory_budget);
+        hotpath::gauge!("query.artifact.build_memory_budget_bytes").set(build_memory_budget);
+        hotpath::gauge!("query.artifact.source_batch_pages_max").set(source_batch_pages);
+        hotpath::gauge!("query.artifact.source_batch_bytes_max").set(source_batch_bytes);
         let generation_id = self.metadata.manifest().generation_id.clone();
         if let Some(descriptor) = store.published_descriptor(&generation_id)? {
             // Durable-head reopen: a restart serves the published
@@ -4857,23 +4744,20 @@ impl LatestCodeTextGenerationV1 {
         let build_reservation = store.reserve_resident_memory(
             &generation_id,
             "code-text-artifact-build",
-            CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+            build_memory_budget,
         )?;
         let sealed_identity = store.sealed_identity(&generation_id)?;
-        let sealed_hex = sealed_identity
-            .digest
-            .as_str()
-            .strip_prefix("sha256:")
-            .ok_or_else(|| {
-                RetrievalPortError::Contract(
-                    "durable sealed lexical source digest is not SHA-256".to_owned(),
-                )
-            })?;
+        let sealed_hex = sha256_hex_suffix(sealed_identity.digest.as_str()).ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "durable sealed lexical source digest is not SHA-256".to_owned(),
+            )
+        })?;
         let artifacts_root = code_text_artifacts_root(store.store_root());
         ensure_private_text_artifacts_root(&artifacts_root)?;
         let staging_path = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
         let mut source = self.take_preopened_source_or_open(&sealed_identity, control)?;
-        let builder_budget = text_artifact_builder_budget(source.staging_window_bytes())?;
+        let builder_budget =
+            text_artifact_builder_budget(build_memory_budget, source.staging_window_bytes())?;
         let metadata = self.text_projection_metadata()?;
         let mut builder = if staging_path.exists() {
             match CodeLexicalArtifactBuilderV1::open_or_resume_with_memory_budget_and_control(
@@ -5016,18 +4900,23 @@ impl LatestCodeTextGenerationV1 {
                 "code-index text artifact build state is missing".to_owned(),
             ));
         };
-        let mut remaining = maximum_work.min(TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1);
+        let build_memory_budget = code_lexical_artifact_build_memory_budget_for(
+            store.resident_memory.snapshot().limit_bytes,
+        );
+        let (source_batch_pages, source_batch_bytes, source_work_limit) =
+            text_artifact_source_batch_limits(build_memory_budget);
+        let mut remaining = maximum_work.min(source_work_limit);
         while remaining > 0 && artifact_build.source_receipt.is_none() {
-            let maximum_batch_pages = remaining.clamp(1, TEXT_ARTIFACT_BATCH_PAGES_V1);
+            let maximum_batch_pages = remaining.clamp(1, source_batch_pages);
             let bounds = VerifiedSealedLexicalPageBatchBoundsV1::new(
                 maximum_batch_pages,
-                TEXT_ARTIFACT_BATCH_BYTES_V1,
+                source_batch_bytes,
             )
             .map_err(map_sealed_page_source_error)?;
             #[cfg(feature = "hotpath")]
-            let completed_lexical_bytes_before = artifact_build
+            let completed_lexical_units_before = artifact_build
                 .source
-                .completed_lexical_bytes()
+                .completed_lexical_units()
                 .map_err(map_sealed_page_source_error)?;
             self.publish_text_progress_phase(CodeIndexBuildPhaseV1::SourceScan, 0, 0);
             let mut durable_progress = None;
@@ -5152,13 +5041,13 @@ impl LatestCodeTextGenerationV1 {
                     )?;
                     #[cfg(feature = "hotpath")]
                     {
-                        let committed_lexical_bytes = artifact_build
+                        let committed_lexical_units = artifact_build
                             .source
-                            .completed_lexical_bytes()
+                            .completed_lexical_units()
                             .map_err(map_sealed_page_source_error)?
-                            .saturating_sub(completed_lexical_bytes_before);
-                        hotpath::gauge!("query.artifact.batch.committed_lexical_bytes_total")
-                            .inc(committed_lexical_bytes);
+                            .saturating_sub(completed_lexical_units_before);
+                        hotpath::gauge!("query.artifact.batch.committed_lexical_units_total")
+                            .inc(committed_lexical_units);
                         if let Some(latency_micros) = commit_latency_micros {
                             hotpath::gauge!("query.artifact.progress.latest_commit_latency_micros")
                                 .set(latency_micros);
@@ -5596,19 +5485,11 @@ struct SourceFreshnessFenceStateV1 {
     /// The stat signature (negative cache) and sealed file digests (proof)
     /// the last completed reconcile established; `None` until one has.
     source_witness: Option<ReconciledSourceWitnessV1>,
-    ignored_source_admissions: Vec<CodeIndexIgnoredSourceAdmissionV1>,
     staleness_threshold: Duration,
     verified_against_source: bool,
     freshness_unknown: bool,
     reconciled_without_generation: bool,
     reconciled_source_epoch: u64,
-    busy_witness_memo: Option<BusyWitnessMemoV1>,
-}
-
-#[derive(Clone)]
-struct BusyWitnessMemoV1 {
-    checked_at: Instant,
-    verdict: bool,
 }
 
 impl SourceFreshnessFenceV1 {
@@ -5618,13 +5499,11 @@ impl SourceFreshnessFenceV1 {
                 git_metadata: identity::GitMetadataFingerprintV1::default(),
                 last_reconciled_at: Instant::now(),
                 source_witness: None,
-                ignored_source_admissions: Vec::new(),
                 staleness_threshold,
                 verified_against_source: false,
                 freshness_unknown: true,
                 reconciled_without_generation: false,
                 reconciled_source_epoch: 0,
-                busy_witness_memo: None,
             })),
             last_reconciled_at_micros: Arc::new(AtomicI64::new(0)),
             source_epoch,
@@ -5642,20 +5521,17 @@ impl SourceFreshnessFenceV1 {
         &self,
         git_metadata: identity::GitMetadataFingerprintV1,
         source_witness: Option<ReconciledSourceWitnessV1>,
-        ignored_source_admissions: &[CodeIndexIgnoredSourceAdmissionV1],
         reconciled_without_generation: bool,
     ) {
         let micros = now_micros().0;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.git_metadata = git_metadata;
         state.source_witness = source_witness;
-        state.ignored_source_admissions = ignored_source_admissions.to_vec();
         state.freshness_unknown = false;
         state.last_reconciled_at = Instant::now();
         state.verified_against_source = true;
         state.reconciled_without_generation = reconciled_without_generation;
         state.reconciled_source_epoch = self.source_epoch.load(Ordering::Acquire);
-        state.busy_witness_memo = None;
         self.last_reconciled_at_micros
             .store(micros, Ordering::Release);
     }
@@ -5683,11 +5559,28 @@ impl SourceFreshnessFenceV1 {
             .reconciled_without_generation
     }
 
+    /// Whether canonical source input has advanced beyond the last completed
+    /// proof. An expired proof alone leaves the epochs equal: its background
+    /// pass is verification, not evidence that a replacement is being built.
+    fn source_change_pending(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.source_epoch.load(Ordering::Acquire) != state.reconciled_source_epoch
+    }
+
     fn ready_without_stat(&self, project_root: &Path, shutting_down: &AtomicBool) -> bool {
+        let state = self.snapshot();
+        self.snapshot_is_recently_verified(&state, project_root, shutting_down)
+    }
+
+    fn snapshot_is_recently_verified(
+        &self,
+        state: &SourceFreshnessFenceStateV1,
+        project_root: &Path,
+        shutting_down: &AtomicBool,
+    ) -> bool {
         if shutting_down.load(Ordering::Acquire) {
             return false;
         }
-        let state = self.snapshot();
         state.verified_against_source
             && self.source_epoch.load(Ordering::Acquire) == state.reconciled_source_epoch
             && !identity::GitMetadataFingerprintV1::capture(project_root)
@@ -5695,59 +5588,19 @@ impl SourceFreshnessFenceV1 {
             && state.last_reconciled_at.elapsed() < state.staleness_threshold
     }
 
-    fn exact_source_is_ready(&self, project_root: &Path, shutting_down: &AtomicBool) -> bool {
-        if shutting_down.load(Ordering::Acquire) {
-            return false;
-        }
-        let state = self.snapshot();
-        if state.freshness_unknown
-            || self.source_epoch.load(Ordering::Acquire) != state.reconciled_source_epoch
-            || identity::GitMetadataFingerprintV1::capture(project_root)
-                .differs_from(&state.git_metadata)
-        {
-            return false;
-        }
-        if let Some(memo) = state.busy_witness_memo
-            && memo.checked_at.elapsed() < BUSY_WITNESS_MEMO_INTERVAL
-        {
-            return memo.verdict;
-        }
-        // Stat equality is only the negative cache; the witness settles
-        // currency against the sealed file digests.
-        let matches = state.source_witness.as_ref().is_some_and(|witness| {
-            witness.matches_worktree(
-                project_root,
-                &state.ignored_source_admissions,
-                shutting_down,
-            )
-        });
-        let source_still_matches = self.source_epoch.load(Ordering::Acquire)
-            == state.reconciled_source_epoch
-            && !identity::GitMetadataFingerprintV1::capture(project_root)
-                .differs_from(&state.git_metadata);
-        let mut current = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if source_still_matches
-            && current.reconciled_source_epoch == state.reconciled_source_epoch
-            && current.git_metadata == state.git_metadata
-        {
-            current.busy_witness_memo = Some(BusyWitnessMemoV1 {
-                checked_at: Instant::now(),
-                verdict: matches,
-            });
-        }
-        drop(current);
-        if matches && source_still_matches {
-            self.refresh_monotonic_clock(false);
-        }
-        matches && source_still_matches
-    }
-
     fn source_currency_witness_for(
         &self,
         generation_id: &CodeGenerationId,
+        snapshot_content_identity: &ContentDigest,
     ) -> Option<ServingSourceWitnessV1> {
         let state = self.snapshot();
-        if !state.verified_against_source || state.source_witness.is_none() {
+        if !state.verified_against_source
+            || !state.source_witness.as_ref().is_some_and(|witness| {
+                witness
+                    .content_manifest
+                    .describes_snapshot(snapshot_content_identity)
+            })
+        {
             return None;
         }
         Some(ServingSourceWitnessV1 {
@@ -5755,32 +5608,23 @@ impl SourceFreshnessFenceV1 {
         })
     }
 
-    /// Whether the sealed source `snapshot_content_identity` names is the one
-    /// the last completed reconcile verified and the live worktree still
-    /// carries it. Judged from source truth alone — the fence never waits on
-    /// the scheduler mutex — so a query can answer "current" while the worker
-    /// owns a pass that is re-observing an unchanged tree or seating optional
-    /// graph work. A pass that published a successor moves this identity the
-    /// moment it marks reconciled, so the superseded owner is never called
-    /// current in the window before its serving slot is swapped.
-    fn serves_current_source(
+    /// Whether the last bounded source proof still admits this exact sealed
+    /// snapshot without walking the worktree. Once that proof ages out, reads
+    /// report the retained owner stale and let the canonical worker renew it.
+    fn serves_recently_verified_source(
         &self,
         snapshot_content_identity: &ContentDigest,
         project_root: &Path,
         shutting_down: &AtomicBool,
     ) -> bool {
-        let describes_snapshot = {
-            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.verified_against_source
-                && state.source_witness.as_ref().is_some_and(|witness| {
-                    witness
-                        .content_manifest
-                        .describes_snapshot(snapshot_content_identity)
-                })
-        };
-        describes_snapshot
-            && (self.ready_without_stat(project_root, shutting_down)
-                || self.exact_source_is_ready(project_root, shutting_down))
+        let state = self.snapshot();
+        state.verified_against_source
+            && state.source_witness.as_ref().is_some_and(|witness| {
+                witness
+                    .content_manifest
+                    .describes_snapshot(snapshot_content_identity)
+            })
+            && self.snapshot_is_recently_verified(&state, project_root, shutting_down)
     }
 }
 
@@ -5798,6 +5642,11 @@ enum FreshnessProbeVerdictV1 {
     /// Git metadata or the sealed-digest witness proves the worktree moved
     /// since the last reconcile.
     Moved,
+}
+
+enum RetainedTextGenerationRestoreV1 {
+    Servable(LatestCodeTextGenerationV1),
+    Refused(VerifiedSealedTextGenerationMetadataV1),
 }
 
 pub struct CodeIndexWorktreeSchedulerV1 {
@@ -6055,10 +5904,9 @@ impl CodeIndexWorktreeSchedulerV1 {
             repository: repository_id.clone(),
             sanitizer_revision,
             policy_revision: id::<PolicyRevisionId>("policy.daemon.v1")?,
-            // V3 retains unresolved per-file references and derives
-            // conservative cross-file edges at generation sealing. V2
-            // artifacts remain decodable, but cannot be reused as a current
-            // graph because they never recorded that evidence.
+            // A persisted generation whose chunker revision does not match
+            // is a typed rebuild, not a silent reuse. V2 artifacts remain
+            // decodable but never recorded unresolved per-file references.
             chunker_revision: id::<ChunkerRevision>(DAEMON_CODE_INDEX_CHUNKER_REVISION)?,
             privacy_domain: id::<PrivacyDomainId>("privacy.local-code-index")?,
             privacy_key_epoch: 1,
@@ -6333,30 +6181,49 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     /// Schedule semantics only after the registry has activated and published
     /// this exact generation as serving state.
+    ///
+    /// Every outcome is typed and recorded. This is the one boundary a sealed
+    /// generation crosses on its way to projection, and a bare `false` here
+    /// left an operator with a runtime parked at `installed` and no evidence
+    /// of why later generations never re-triggered projection (#753).
     pub fn schedule_semantic_generation(
         &self,
         generation: Arc<CodeIndexPublishedGenerationV1>,
-    ) -> bool {
-        let Some(schedule) = self.semantic_schedule.as_ref() else {
-            return false;
-        };
+    ) -> SavedGenerationScheduleOutcomeV1 {
         let generation_id = generation.manifest().generation_id.clone();
-        match catch_unwind(AssertUnwindSafe(|| {
+        let Some(schedule) = self.semantic_schedule.as_ref() else {
+            return Self::record_semantic_schedule_outcome(
+                &generation_id,
+                SavedGenerationScheduleOutcomeV1::RuntimeNotMounted,
+            );
+        };
+        let outcome = match catch_unwind(AssertUnwindSafe(|| {
             hotpath::measure_block!(
                 "code_index.semantic_generation_handoff",
                 schedule(generation)
             )
         })) {
-            Ok(scheduled) => scheduled,
-            Err(_) => {
-                tracing::warn!(
-                    event = "code_index_semantic_schedule_panicked",
-                    generation = %generation_id,
-                    "code-index semantic scheduling panicked; the generation remains serving"
-                );
-                false
-            }
+            Ok(outcome) => outcome,
+            Err(_) => SavedGenerationScheduleOutcomeV1::HookPanicked,
+        };
+        Self::record_semantic_schedule_outcome(&generation_id, outcome)
+    }
+
+    /// Name every non-scheduled handoff so silence never stands in for a
+    /// reason. A scheduled handoff is reported by the runtime itself.
+    fn record_semantic_schedule_outcome(
+        generation_id: &CodeGenerationId,
+        outcome: SavedGenerationScheduleOutcomeV1,
+    ) -> SavedGenerationScheduleOutcomeV1 {
+        if !outcome.is_scheduled() {
+            tracing::warn!(
+                event = "code_index_semantic_schedule_declined",
+                outcome = outcome.as_str(),
+                generation = %generation_id,
+                "code-index did not hand this generation to semantic projection"
+            );
         }
+        outcome
     }
 
     #[cfg(test)]
@@ -6435,11 +6302,27 @@ impl CodeIndexWorktreeSchedulerV1 {
         generation: &CodeIndexPublishedGenerationV1,
     ) -> CodeIndexGenerationCompatibilityV1 {
         let compatibility = generation.compatibility_with(&self.production_config);
+        self.observe_compatibility(&generation.manifest().generation_id, compatibility)
+    }
+
+    fn observe_retained_text_compatibility(
+        &self,
+        metadata: &VerifiedSealedTextGenerationMetadataV1,
+    ) -> CodeIndexGenerationCompatibilityV1 {
+        let compatibility = metadata.manifest_compatibility_with(&self.production_config);
+        self.observe_compatibility(&metadata.manifest().generation_id, compatibility)
+    }
+
+    fn observe_compatibility(
+        &self,
+        generation_id: &CodeGenerationId,
+        compatibility: CodeIndexGenerationCompatibilityV1,
+    ) -> CodeIndexGenerationCompatibilityV1 {
         let next = if compatibility.is_reusable() {
             None
         } else {
             Some(CodeIndexGenerationRecoveryV1 {
-                incompatible_generation_id: generation.manifest().generation_id.as_str().to_owned(),
+                incompatible_generation_id: generation_id.as_str().to_owned(),
                 incompatibilities: compatibility
                     .incompatibilities()
                     .iter()
@@ -6467,7 +6350,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 ),
                 None if observed.is_some() => tracing::info!(
                     event = "code_index_generation_configuration_recovered",
-                    generation_id = %generation.manifest().generation_id,
+                    generation_id = %generation_id,
                     "the compatible replacement generation is now active"
                 ),
                 None => {}
@@ -6882,6 +6765,9 @@ impl CodeIndexWorktreeSchedulerV1 {
         {
             return Ok(None);
         }
+        let retained_is_reusable = self
+            .observe_retained_text_compatibility(metadata)
+            .is_reusable();
         let witness = RestoreFreshnessWitnessV1::load(&self.store_root);
         if witness.as_ref().is_some_and(|witness| {
             witness.generation_id != metadata.manifest().generation_id.as_str()
@@ -6913,7 +6799,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         // generation's sealed file digests; its matching stat signature is
         // the negative cache that lets a moved tree skip the byte comparison.
         let source_manifest = SourceContentManifestV1::for_snapshot(metadata.snapshot());
-        if !has_hints
+        if retained_is_reusable
+            && !has_hints
             && let Some(witness) = witness.as_ref()
             && witness.git_metadata_signature == sampled_metadata.stable_signature()
             && witness.stat_signature == sampled_sweep.signature
@@ -6940,10 +6827,10 @@ impl CodeIndexWorktreeSchedulerV1 {
             )));
         }
 
-        // Witness did not prove a quiet tree. Graph-on remounts fall through
-        // to `reconcile_now` so the successor rebuild reuses the sealed
-        // generation instead of extracting the whole worktree on this path.
-        if !rebuild_changed_source_without_decode {
+        // A compatible generation whose witness did not prove a quiet tree
+        // falls through to the full graph-on reconcile. An incompatible
+        // lightweight owner rebuilds here without decoding the retained graph.
+        if retained_is_reusable && !rebuild_changed_source_without_decode {
             return Ok(None);
         }
 
@@ -6998,7 +6885,11 @@ impl CodeIndexWorktreeSchedulerV1 {
         if control.is_cancelled() {
             return Ok(None);
         }
-        if captured.snapshot.reference != metadata.snapshot().reference
+        let rebuild_incompatible_generation = !self
+            .observe_retained_text_compatibility(metadata)
+            .is_reusable();
+        if rebuild_incompatible_generation
+            || captured.snapshot.reference != metadata.snapshot().reference
             || captured.snapshot.source_revision != metadata.snapshot().source_revision
             || captured.snapshot.content_identity != metadata.snapshot().content_identity
         {
@@ -7069,6 +6960,15 @@ impl CodeIndexWorktreeSchedulerV1 {
                     &control,
                 )?
             };
+            if !self
+                .observe_generation_compatibility(&generation)
+                .is_reusable()
+            {
+                return Err(CodeIndexSchedulerErrorV1::Identity(
+                    "newly published generation is incompatible with its production owner"
+                        .to_owned(),
+                ));
+            }
             Self::finish_snapshot_build_memory(&mut captured.retained_reservations)?;
             self.retained_snapshot_bytes = std::mem::take(&mut captured.retained_bytes);
             self._retained_snapshot_memory = std::mem::take(&mut captured.retained_reservations);
@@ -7237,7 +7137,7 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// This authenticates the complete sealed content address and only decodes
     /// its bounded manifest/snapshot header. Graph, record-index, attribution,
     /// and semantic owners retain the full-generation decode path.
-    pub fn servable_retained_text_generation(&mut self) -> Option<LatestCodeTextGenerationV1> {
+    fn restore_retained_text_generation(&mut self) -> Option<RetainedTextGenerationRestoreV1> {
         if self.shutting_down.load(Ordering::Acquire) {
             return None;
         }
@@ -7321,14 +7221,14 @@ impl CodeIndexWorktreeSchedulerV1 {
                                 committed_payload_bytes: 0,
                                 completed_files: 0,
                                 total_files: 0,
-                                completed_lexical_bytes: scanned,
-                                total_lexical_bytes: total,
+                                completed_lexical_units: scanned,
+                                total_lexical_units: total,
                                 current_batch_pages: 0,
                                 current_batch_payload_bytes: 0,
                                 elapsed_micros,
                                 last_commit_latency_micros: None,
                                 files_per_second: None,
-                                lexical_bytes_per_second: None,
+                                lexical_units_per_second: None,
                                 estimated_remaining_seconds: None,
                                 last_progress_micros: now_micros().0,
                                 blocked_reason: None,
@@ -7365,6 +7265,15 @@ impl CodeIndexWorktreeSchedulerV1 {
             text_control.retire();
             return None;
         }
+        let compatibility = self.observe_retained_text_compatibility(&metadata);
+        if !compatibility.may_serve_while_rebuilding() {
+            text_control.retire();
+            self.request_background_reconcile();
+            return Some(RetainedTextGenerationRestoreV1::Refused(metadata));
+        }
+        if !compatibility.is_reusable() {
+            self.request_background_reconcile();
+        }
         if self
             .publication
             .read_publication_pointer()
@@ -7377,30 +7286,39 @@ impl CodeIndexWorktreeSchedulerV1 {
             return None;
         }
         let metadata = Arc::new(metadata);
-        Some(LatestCodeTextGenerationV1 {
-            metadata,
-            sealed_format_revision,
-            query_owners: Arc::new(OnceLock::new()),
-            graph_activation: Arc::new(RwLock::new(CodeGraphActivationStateV1::Pending)),
-            text_projection_build: Arc::new(CodeTextProjectionStateV1::new()),
-            text_projection_failed: Arc::new(AtomicBool::new(false)),
-            text_control,
-            text_progress_state,
-            text_progress_slot: Arc::clone(&self.build_progress),
-            text_progress_owner_epoch,
-            text_progress_daemon_incarnation: self.progress_daemon_incarnation,
-            text_progress_producer_incarnation: self.progress_producer_incarnation,
-            text_artifact_store,
-            preopened_source: Arc::new(hotpath::mutex!(
-                Mutex::new(preopened_source),
-                label = "query.artifact.preopened_retained_source"
-            )),
-            publication_binding: Some(Arc::new(DurableActiveSealedGenerationBindingV1 {
-                generation_id,
-                generation_file: pointer.generation_file,
-                state_digest: ManifestDigest::new(pointer.state_digest).ok()?,
-            })),
-        })
+        Some(RetainedTextGenerationRestoreV1::Servable(
+            LatestCodeTextGenerationV1 {
+                metadata,
+                sealed_format_revision,
+                query_owners: Arc::new(OnceLock::new()),
+                graph_activation: Arc::new(RwLock::new(CodeGraphActivationStateV1::Pending)),
+                text_projection_build: Arc::new(CodeTextProjectionStateV1::new()),
+                text_projection_failed: Arc::new(AtomicBool::new(false)),
+                text_control,
+                text_progress_state,
+                text_progress_slot: Arc::clone(&self.build_progress),
+                text_progress_owner_epoch,
+                text_progress_daemon_incarnation: self.progress_daemon_incarnation,
+                text_progress_producer_incarnation: self.progress_producer_incarnation,
+                text_artifact_store,
+                preopened_source: Arc::new(hotpath::mutex!(
+                    Mutex::new(preopened_source),
+                    label = "query.artifact.preopened_retained_source"
+                )),
+                publication_binding: Some(Arc::new(DurableActiveSealedGenerationBindingV1 {
+                    generation_id,
+                    generation_file: pointer.generation_file,
+                    state_digest: ManifestDigest::new(pointer.state_digest).ok()?,
+                })),
+            },
+        ))
+    }
+
+    pub fn servable_retained_text_generation(&mut self) -> Option<LatestCodeTextGenerationV1> {
+        match self.restore_retained_text_generation()? {
+            RetainedTextGenerationRestoreV1::Servable(generation) => Some(generation),
+            RetainedTextGenerationRestoreV1::Refused(_) => None,
+        }
     }
 
     /// Canonical active publication generation id for tests that must observe
@@ -7743,7 +7661,6 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.freshness_fence.mark_reconciled(
             metadata,
             source_witness,
-            &self.ignored_source_admissions,
             reconciled_without_generation,
         );
     }
@@ -7753,12 +7670,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         metadata: identity::GitMetadataFingerprintV1,
         source_witness: Option<ReconciledSourceWitnessV1>,
     ) {
-        self.freshness_fence.mark_reconciled(
-            metadata,
-            source_witness,
-            &self.ignored_source_admissions,
-            false,
-        );
+        self.freshness_fence
+            .mark_reconciled(metadata, source_witness, false);
     }
 
     /// Record the restore-time freshness witness for the current active
@@ -7894,9 +7807,10 @@ impl CodeIndexWorktreeSchedulerV1 {
     fn source_currency_witness_for(
         &self,
         generation_id: &CodeGenerationId,
+        snapshot_content_identity: &ContentDigest,
     ) -> Option<ServingSourceWitnessV1> {
         self.freshness_fence
-            .source_currency_witness_for(generation_id)
+            .source_currency_witness_for(generation_id, snapshot_content_identity)
     }
 
     /// A cheap stat-level (path, mtime, size) signature of the present source
@@ -8541,8 +8455,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 self.identity.head_tree(),
             )
         {
-            let captured = self
-                .capture_exact_git_tree_snapshot(
+            match self.capture_exact_git_tree_snapshot(
                     &git_tree_capture::ExactGitTreeSourceV1 {
                         reference: reference.clone(),
                         revision: revision.clone(),
@@ -8552,27 +8465,33 @@ impl CodeIndexWorktreeSchedulerV1 {
                         deadline: None,
                         cancellation: None,
                     },
-                )
-                .map_err(|reason| match reason {
-                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled => {
-                        cancelled_code_index_reconcile()
-                    }
-                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable => {
-                        CodeIndexSchedulerErrorV1::SnapshotMemoryCapacityUnavailable
-                    }
-                    _ => CodeIndexSchedulerErrorV1::Git(format!(
+                ) {
+                Ok(captured) => {
+                    *self
+                        .active_snapshot_changed_paths
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+                        captured.snapshot.content_identity.clone(),
+                        captured.changed_paths.clone(),
+                    ));
+                    return Ok(captured);
+                }
+                Err(
+                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+                ) => {}
+                Err(
+                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled,
+                ) => return Err(cancelled_code_index_reconcile()),
+                Err(
+                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable,
+                ) => return Err(CodeIndexSchedulerErrorV1::SnapshotMemoryCapacityUnavailable),
+                Err(reason) => {
+                    return Err(CodeIndexSchedulerErrorV1::Git(format!(
                         "immutable HEAD-tree capture failed: {}",
                         reason.as_str()
-                    )),
-                })?;
-            *self
-                .active_snapshot_changed_paths
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
-                captured.snapshot.content_identity.clone(),
-                captured.changed_paths.clone(),
-            ));
-            return Ok(captured);
+                    )));
+                }
+            }
         }
         let source_revision = (self.ignored_source_admissions.is_empty()
             && classification.changes().is_empty())
@@ -8905,6 +8824,40 @@ fn file_occurrence_id(
     ))
 }
 
+fn omitted_file_occurrence_id(
+    repository: &RepositoryId,
+    worktree: &WorktreeId,
+    logical_path: &str,
+    digest: &ContentDigest,
+    disposition: SnapshotFileDispositionV1,
+) -> Result<FileOccurrenceId, CodeIndexSchedulerErrorV1> {
+    let disposition = match disposition {
+        SnapshotFileDispositionV1::Ignored => "ignored",
+        SnapshotFileDispositionV1::Binary => "binary",
+        SnapshotFileDispositionV1::Generated => "generated",
+        SnapshotFileDispositionV1::UnsupportedLanguage => "unsupported_language",
+        SnapshotFileDispositionV1::Present
+        | SnapshotFileDispositionV1::Deleted
+        | SnapshotFileDispositionV1::Renamed => {
+            return Err(CodeIndexSchedulerErrorV1::Identity(
+                "omitted file occurrence requires an omitted disposition".to_owned(),
+            ));
+        }
+    };
+    id(&format!(
+        "file.daemon.omitted.{}",
+        sha256_hex(
+            format!(
+                "{}\0{}\0{logical_path}\0{}\0{disposition}",
+                repository.as_str(),
+                worktree.as_str(),
+                digest.as_str(),
+            )
+            .as_bytes()
+        )
+    ))
+}
+
 /// The one central exact-admission authority every serving owner installs.
 fn exact_serving_authority() -> Result<CentralExactAdmissionAuthorityV1, RetrievalPortError> {
     Ok(CentralExactAdmissionAuthorityV1::new(
@@ -8943,10 +8896,10 @@ fn snapshot_content_identity(
 /// Cancellation is checked before opening and after every bounded read, so a
 /// shutdown or superseding generation cannot strand publication in a
 /// corpus-sized uninterruptible hash.
-fn sha256_private_file_hex_and_size(
+fn sha256_private_file_and_size(
     path: &Path,
     control: &dyn CodeIndexExecutionControlV1,
-) -> Result<(String, u64), RetrievalPortError> {
+) -> Result<([u8; 32], u64), RetrievalPortError> {
     checkpoint_text_artifact_control(control)?;
     let named_metadata = path.symlink_metadata().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -9001,10 +8954,7 @@ fn sha256_private_file_hex_and_size(
             "code text artifact named file changed while hashing".to_owned(),
         ));
     }
-    Ok((
-        encode_lowercase_hex(&hasher.finalize()),
-        file_metadata.len(),
-    ))
+    Ok((hasher.finalize().into(), file_metadata.len()))
 }
 
 fn ensure_private_text_artifacts_root(path: &Path) -> Result<(), RetrievalPortError> {
@@ -9078,8 +9028,11 @@ fn checkpoint_text_artifact_control(
 /// retained decode window and the `SQLite` builder. Each component fitting the
 /// ceiling independently is insufficient because both remain live while a
 /// page is admitted.
-fn text_artifact_builder_budget(source_window_bytes: usize) -> Result<usize, RetrievalPortError> {
-    CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1
+fn text_artifact_builder_budget(
+    build_memory_budget: usize,
+    source_window_bytes: usize,
+) -> Result<usize, RetrievalPortError> {
+    build_memory_budget
         .checked_sub(source_window_bytes)
         .filter(|remaining| *remaining > 0)
         .ok_or(RetrievalPortError::BudgetExceeded)
@@ -9101,6 +9054,10 @@ mod cadence;
 mod classification;
 mod freshness_witness;
 mod git_tree_capture;
+pub use git_tree_capture::{
+    ExactGitTreeSourceV1, NativeCandidateGenerationBindingsV1, NativeCandidateGenerationIdentityV1,
+    NativeCandidateGenerationSourcesV1,
+};
 mod graph_activation;
 pub mod identity;
 pub mod ignored_dependencies;
@@ -9134,5 +9091,8 @@ pub use ignored_dependencies::{
 };
 pub use registry::CodeIndexSchedulerRegistryV1;
 pub use registry::watch_ingress::GitStateChangeRequestV1;
-pub use registry::{ServingGenerationInstallationOutcomeV1, ServingGenerationRollbackOutcomeV1};
+pub use registry::{
+    ScopedFeedbackDocumentIdentityV1, ServingGenerationInstallationOutcomeV1,
+    ServingGenerationRollbackOutcomeV1, feedback_document_identity_from_generation,
+};
 pub type CodeIndexGenerationPublishedV1 = registry::CodeIndexGenerationPublishedV1;

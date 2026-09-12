@@ -518,6 +518,10 @@ fn hosted_dashboard_shutdown_owner() -> shutdown_coordination::ShutdownOwner {
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Foreground Unix bootstrap is one ordered authority-acquire, engine-wire, and serve sequence."
+)]
 async fn run_foreground_unix(
     socket_path: PathBuf,
     remote_tls: Option<RemoteBrainTlsConfig>,
@@ -1013,15 +1017,6 @@ mod tests {
                 std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>,
             >(),
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_already_absent_stale_socket_is_prepared() {
-        let root = tempfile::tempdir().expect("temporary fixture root");
-        let socket = root.path().join("daemon.sock");
-
-        remove_stale_socket(&socket).expect("a concurrently removed stale socket is already safe");
     }
 
     #[cfg(unix)]

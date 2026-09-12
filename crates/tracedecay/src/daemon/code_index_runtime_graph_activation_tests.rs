@@ -388,7 +388,15 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
         store.path(),
         &fixture.path().canonicalize().expect("canonical fixture"),
     );
-    let (scope, seeded_generation_id, latest, replay_binding, repository_id, worktree_id) = {
+    let (
+        scope,
+        seeded_generation_id,
+        seeded_statistics,
+        latest,
+        replay_binding,
+        repository_id,
+        worktree_id,
+    ) = {
         let mut scheduler = scheduler(
             &fixture,
             scoped_store.clone(),
@@ -403,6 +411,10 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
             .code_graph_replay_binding(&latest.generation().manifest().generation_id)
             .expect("seed graph replay binding");
         let snapshot = latest.generation().snapshot();
+        let statistics = latest
+            .generation()
+            .generation_statistics()
+            .expect("seed generation statistics");
         let repository_id = snapshot.repository.clone();
         let worktree_id = snapshot.worktree.clone().expect("worktree identity");
         (
@@ -414,6 +426,7 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
             )
             .expect("resolved scope"),
             latest.generation().manifest().generation_id.clone(),
+            statistics,
             latest,
             replay_binding,
             repository_id,
@@ -705,7 +718,7 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
         .await
         .expect("settled restart graph read");
     assert_eq!(settled_read.freshness(), CodeGraphReadFreshnessV1::Current);
-    if corrupt_graph || dirty_before_restart {
+    let seated_census = if corrupt_graph || dirty_before_restart {
         // A decoded census is a strictly later state than the text-serving
         // head this case already settled on: `latest_complete_ready_decoded_*`
         // abstains — returning no decoded owner at all — while a reconcile
@@ -716,31 +729,53 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
         let census_deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let settled_census = census().await;
-            if matches!(
-                settled_census,
+            // Freshness alone would anchor the later lock-held comparison to
+            // whatever generation happened to decode first. The seated head is
+            // already pinned above: repairing a corrupt retained graph keeps
+            // the seeded identity, while a dirty checkout rebuilds into a
+            // successor, so the census must carry that same identity.
+            let seats_the_settled_generation = match &settled_census {
                 GenerationCensusSnapshot::Observed {
+                    generation_id,
                     freshness: GenerationCensusServingFreshness::Current,
                     ..
-                }
-            ) {
-                break;
+                } if corrupt_graph => generation_id.as_str() == seeded_generation_id.as_str(),
+                GenerationCensusSnapshot::Observed {
+                    generation_id,
+                    freshness: GenerationCensusServingFreshness::Current,
+                    ..
+                } => generation_id.as_str() != seeded_generation_id.as_str(),
+                _ => false,
+            };
+            if seats_the_settled_generation {
+                break settled_census;
             }
             assert!(
                 std::time::Instant::now() <= census_deadline,
-                "the rebuilt successor never published a current decoded census: \
-                 {settled_census:?}"
+                "no current decoded census for the settled generation \
+                 (corrupt_graph={corrupt_graph}, dirty_before_restart={dirty_before_restart}, \
+                 seeded={seeded_generation_id:?}): {settled_census:?}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     } else {
         let settled_census = census().await;
-        assert!(matches!(
+        assert_eq!(
             settled_census,
-            GenerationCensusSnapshot::Unavailable {
-                reason: GenerationCensusUnavailableReason::SealedGenerationCensusInvalid,
-            }
-        ));
-    }
+            GenerationCensusSnapshot::Observed {
+                generation_id: seeded_generation_id.as_str().to_owned(),
+                freshness: GenerationCensusServingFreshness::Current,
+                statistics:
+                    tracedecay_session_memory::runtime_telemetry::GenerationCensusStatistics {
+                        source_total_bytes: seeded_statistics.source_total_bytes,
+                        symbol_count: seeded_statistics.symbol_count,
+                        edge_count: seeded_statistics.edge_count,
+                    },
+            },
+            "clean restart must retain the exact authenticated generation census"
+        );
+        settled_census
+    };
 
     let scheduler = registry
         .scheduler_handle(fixture.path())
@@ -837,12 +872,274 @@ async fn restart_status_case(corrupt_graph: bool, dirty_before_restart: bool) {
         graph_read.freshness(),
         CodeGraphReadFreshnessV1::LastCompleteStale { .. }
     ));
-    assert!(matches!(
-        census_snapshot,
-        GenerationCensusSnapshot::Unavailable {
-            reason: GenerationCensusUnavailableReason::SealedGenerationCensusInvalid,
+    // After a dirty restart the seated head is the rebuilt successor, not
+    // the recovered seed. A lock-held tip move must keep serving that seated
+    // generation as LastCompleteStale with the same decoded statistics.
+    match (&census_snapshot, &seated_census) {
+        (
+            GenerationCensusSnapshot::Observed {
+                generation_id,
+                freshness: GenerationCensusServingFreshness::LastCompleteStale { .. },
+                statistics,
+            },
+            GenerationCensusSnapshot::Observed {
+                generation_id: seated_id,
+                statistics: seated_statistics,
+                ..
+            },
+        ) if generation_id == seated_id && statistics == seated_statistics => {}
+        (other, seated) => panic!(
+            "seated-graph census while the scheduler lock is held: {other:?}; seated={seated:?}"
+        ),
+    }
+}
+
+/// A restart must seat the retained verified graph head while its text owner
+/// is still projecting, and answer symbol-graph identity from that retained
+/// manifest instead of refusing until the lexical artifact finishes.
+///
+/// The operator journey behind this: a daemon restarted onto a store whose
+/// lexical artifact had not finished its finalization index build. The graph
+/// seat waited behind that build (377 s measured on a 5,181-file corpus; 15+
+/// minutes on the reporter's store) even though verified-head recovery costs
+/// seconds, and for the whole window `code_symbol_search` refused with
+/// `lsp-code-index-generation-unavailable` while code-generation retention
+/// degraded on an incomplete vector census (issue #1244).
+///
+/// The fixture seeds a generation *without* building its text artifact, so the
+/// restart must project one, and holds that projection at its first advance.
+/// Everything asserted below happens while it is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_seats_the_retained_graph_while_its_text_owner_still_projects() {
+    use tracedecay_application::lsp_runtime::LspCodeIndexProjectionIdentityPort;
+
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let canonical_fixture = fixture.path().canonicalize().expect("canonical fixture");
+    let store = TempDir::new().expect("store root");
+    let scoped_store = scoped_code_index_store_root(store.path(), &canonical_fixture);
+    let (scope, seeded_generation_id, latest, replay_binding, repository_id, worktree_id) = {
+        let mut scheduler = scheduler(
+            &fixture,
+            scoped_store.clone(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("seed generation"));
+        let latest = scheduler.latest_complete().expect("seeded generation");
+        // Deliberately no `production_query_owners()` here: the restart below
+        // must find a retained owner whose lexical artifact still has to be
+        // built, which is the operator's shape.
+        let replay_binding = scheduler
+            .code_graph_replay_binding(&latest.generation().manifest().generation_id)
+            .expect("seed graph replay binding");
+        let snapshot = latest.generation().snapshot();
+        let repository_id = snapshot.repository.clone();
+        let worktree_id = snapshot.worktree.clone().expect("worktree identity");
+        (
+            ResolvedScope::new(
+                test_project_id(),
+                repository_id.clone(),
+                worktree_id.clone(),
+                snapshot.reference.clone(),
+            )
+            .expect("resolved scope"),
+            latest.generation().manifest().generation_id.clone(),
+            latest,
+            replay_binding,
+            repository_id,
+            worktree_id,
+        )
+    };
+
+    let profile = TempDir::new().expect("profile root");
+    let profile_root = profile.path().join("profile");
+    let project_id = test_project_id();
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        fixture.path(),
+        project_id.as_str(),
+    )
+    .expect("project enrollment");
+    let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+        .expect("profile identity");
+    let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
+        &profile_root,
+        95,
+        "retained graph seat while text warms",
+    )
+    .expect("daemon database scope");
+    let graph_runtime = Arc::new(
+        DaemonSessionRuntimeRegistryV1::open(identity)
+            .await
+            .expect("graph runtime registry"),
+    );
+    let project_database = graph_runtime
+        .project_memory(project_id.clone(), [fixture.path().to_path_buf()])
+        .await
+        .expect("writable project database");
+    crate::test_support::host_admission::await_bound_graph_runtime(
+        &project_database,
+        "bind graph projection before restart",
+    )
+    .await
+    .expect("bound project graph runtime");
+    let retained = graph_runtime
+        .retain_code_graph_runtime(
+            project_id.clone(),
+            repository_id,
+            worktree_id,
+            latest.generation().snapshot().reference.clone(),
+            latest.generation().manifest().generation_id.clone(),
+            Arc::clone(&project_database),
+            replay_binding,
+            Some(latest.generation_handle()),
+        )
+        .await
+        .expect("retain seeded graph runtime");
+    drop(
+        retained
+            .publish_verified_snapshot(
+                latest.generation(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .expect("publish graph head before restart"),
+    );
+    drop(retained);
+    drop(latest);
+    graph_runtime
+        .shutdown_memory_graph_reconciliation_tasks()
+        .await
+        .expect("stop graph runtime before restart");
+    drop(project_database);
+    drop(graph_runtime);
+
+    let restarted_identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("restart profile identity");
+    let graph_runtime = Arc::new(
+        DaemonSessionRuntimeRegistryV1::open(restarted_identity)
+            .await
+            .expect("restarted graph runtime registry"),
+    );
+    let project_database = graph_runtime
+        .project_memory(project_id.clone(), [fixture.path().to_path_buf()])
+        .await
+        .expect("restarted writable project database");
+    crate::test_support::host_admission::await_bound_graph_runtime(
+        &project_database,
+        "bind restarted graph projection",
+    )
+    .await
+    .expect("bound restarted project graph runtime");
+
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    let (projecting, release_projection) = registry
+        .pause_next_retained_text_projection(canonical_fixture.clone())
+        .await;
+    let (recovered, release_successor) = registry
+        .pause_next_retained_graph_recovery_before_successor(canonical_fixture.clone())
+        .await;
+    registry
+        .mount_worktree_with_graph_runtime(
+            project_id,
+            fixture.path(),
+            store.path().to_path_buf(),
+            None,
+            graph_runtime.code_graph_seat_port(),
+            project_database,
+            CodeGraphActivationPolicyV1::Enabled,
+            None,
+        )
+        .await
+        .expect("mount restarted retained generation");
+
+    tokio::time::timeout(Duration::from_secs(20), projecting)
+        .await
+        .expect("the restart never started projecting its retained text owner")
+        .expect("retained text projection gate dropped before observation");
+    // The seat must not wait for the projection this gate is holding.
+    tokio::time::timeout(Duration::from_secs(20), recovered)
+        .await
+        .expect("the retained graph head did not recover while its text owner was projecting")
+        .expect("retained graph recovery gate dropped before observation");
+
+    assert!(
+        registry
+            .latest_text_serving_for_root(&canonical_fixture)
+            .await
+            .is_none(),
+        "the gate must still be holding exact and lexical serving: without that, this journey \
+         would prove nothing about seating ahead of the text build"
+    );
+    let identity_owner = registry
+        .retained_text_owner_for_root(&canonical_fixture)
+        .await
+        .expect("a warming text owner still answers identity reads");
+    assert_eq!(
+        identity_owner.metadata().manifest().generation_id,
+        seeded_generation_id,
+        "the restart must recover the pre-restart generation, not a successor"
+    );
+    assert!(
+        identity_owner.interactive_graph_store().is_ok(),
+        "the recovered verified head must serve graph reads while text still projects"
+    );
+    let symbol_graph_identity = registry
+        .current_identity(canonical_fixture.clone(), None)
+        .await
+        .expect("symbol-graph identity must resolve from the retained manifest");
+    assert_eq!(
+        symbol_graph_identity.code_generation_id, seeded_generation_id,
+        "symbol-graph identity must name the retained generation"
+    );
+    let port = project_code_graph_projection_read_port(
+        registry.clone(),
+        fixture.path().to_path_buf(),
+        scope.clone(),
+    );
+    let warming_context = graph_request_context(scope.clone(), "retained-seat-while-text-warms");
+    let warming_read = port
+        .open(CodeGraphReadRequest::from_context(
+            &warming_context,
+            now_micros(),
+        ))
+        .await
+        .expect("the recovered graph must serve while its text owner projects");
+    assert_eq!(
+        warming_read.generation(),
+        &seeded_generation_id,
+        "graph reads must name the retained generation"
+    );
+
+    release_projection
+        .send(())
+        .expect("release the held text projection");
+    release_successor
+        .send(())
+        .expect("release the successor after the seat observation");
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(ready) = registry
+            .latest_text_serving_for_root(&canonical_fixture)
+            .await
+        {
+            assert_eq!(
+                ready.metadata().manifest().generation_id,
+                seeded_generation_id,
+                "the released projection must finish the retained generation's own artifact"
+            );
+            break;
         }
-    ));
+        assert!(
+            std::time::Instant::now() <= ready_deadline,
+            "the released text projection never reached exact and lexical readiness"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    registry.shutdown().await;
+    graph_runtime
+        .shutdown_memory_graph_reconciliation_tasks()
+        .await
+        .expect("join graph reconciliation tasks");
 }
 
 fn graph_request_context(scope: ResolvedScope, suffix: &str) -> RequestContext {

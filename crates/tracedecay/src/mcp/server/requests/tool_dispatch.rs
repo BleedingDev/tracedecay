@@ -254,6 +254,10 @@ impl McpServer {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(feature = "memory-provider-host"), allow(clippy::let_and_return))]
     #[hotpath::skip]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Tool dispatch is one registry match onto the owning handler future."
+    )]
     pub(super) async fn execute_tool_dispatch(
         &self,
         cg: &TraceDecay,

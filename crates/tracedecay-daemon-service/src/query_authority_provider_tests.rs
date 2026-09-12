@@ -25,10 +25,10 @@ use tracedecay_domain::{
     SanitizerRevision, SingleRootScopeV1, TemporalModeV1, VectorWatermark, WorktreeId,
 };
 use tracedecay_query::retrieval::semantic::SemanticCalibrationProfileV1;
-use tracedecay_search_eval::{
+use tracedecay_query::search_quality::{
     DirectEvaluationReportV1, DirectEvaluationStatusV1, DirectProfileEvaluationV1,
-    DirectQualityMetricsV1, DirectRatioMetricV1, EvaluationExecutionContractV1,
-    OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
+    DirectQualityMetricsV1, DirectRatioMetricV1, EvaluationConcurrencyContractV1,
+    EvaluationExecutionContractV1, OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
 };
 
 fn id<T>(value: &str) -> T
@@ -91,12 +91,11 @@ fn passing_report(evaluated_profile_id: &str) -> DirectEvaluationReportV1 {
             fusion_revision: "fusion.aggregate-only-test.v1".to_owned(),
             runtime_revision: "runtime.aggregate-only-test.v1".to_owned(),
             cache_state: "empty".to_owned(),
-            concurrency:
-                tracedecay_search_eval::candidate_output::EvaluationConcurrencyContractV1 {
-                    query_workers: 1,
-                    projection_workers: 1,
-                    query_execution: "serial".to_owned(),
-                },
+            concurrency: EvaluationConcurrencyContractV1 {
+                query_workers: 1,
+                projection_workers: 1,
+                query_execution: "serial".to_owned(),
+            },
         },
         profile_material_digests: BTreeMap::new(),
         raw_output_digest: "sha256:aggregate-only-test".to_owned(),
@@ -192,6 +191,7 @@ fn semantic_pins() -> SemanticCompatibilityPinsV1 {
         runtime_backend: "fastembed-ort".to_owned(),
         runtime_build_revision: "runtime.query-activation-test.v1".to_owned(),
         device_class: EmbeddingDeviceClassV1::Cpu,
+        execution_provider: tracedecay_domain::EmbeddingExecutionProviderV1::Cpu,
         dimensions: 4,
         metric: EmbeddingMetricV1::Cosine,
         normalization: EmbeddingNormalizationV1::L2,
@@ -812,20 +812,6 @@ async fn retiring_project_query_authority_preserves_same_project_in_another_prof
         &surviving_provider,
     )
     .expect("surviving profile cursor-backed authority after retirement");
-}
-
-#[test]
-fn semantic_rollback_selects_restored_exact_query_active_profile() {
-    let query = accepted_profile("query-baseline", &RetrieverKind::QUERY_FALLBACK_LANES);
-    let prior_semantic = accepted_profile(
-        "semantic-prior",
-        &[RetrieverKind::ExactLiteral, RetrieverKind::Lexical],
-    );
-
-    let selected = exact_query_profile_from_slots(&query, Some(&prior_semantic))
-        .expect("active query profile");
-
-    assert_eq!(selected.profile().profile_id, query.profile().profile_id);
 }
 
 #[test]

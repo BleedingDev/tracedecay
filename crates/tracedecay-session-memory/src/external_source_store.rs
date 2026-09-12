@@ -18,6 +18,7 @@ use tracedecay_domain::{
     SourceProviderEnvelopeV1, SourceRefetchStrategyV1, SourceRefreshCauseV1,
     SourceRefreshReceiptV1, SourceSnapshotIdV1, SourceWholeRootStageV1, UtcMicros,
     canonical_sha256, cline_task_native_observation_id, prove_cline_native_source_transition,
+    sha256_hex_suffix,
 };
 use tracedecay_store::{
     ExternalSourceReadOperationV1, ExternalSourceReadResultV1, RepositoryOperationEnvelopeV1,
@@ -31,7 +32,9 @@ use tracedecay_store::{
 use tracedecay_contracts::request_identity::{
     LogicalEffectIdempotencyDomain, derive_logical_effect_idempotency,
 };
-use tracedecay_runtime_core::db::DatabaseRuntimeClientV1;
+use tracedecay_runtime_core::{
+    db::DatabaseRuntimeClientV1, shard_runtime::registry::StoreRuntimeRegistryFailure,
+};
 
 #[derive(Debug, Error)]
 pub enum RuntimeExternalSourceErrorV1 {
@@ -39,8 +42,24 @@ pub enum RuntimeExternalSourceErrorV1 {
     Admission(#[from] SourceCaptureAdmissionErrorV1),
     #[error("external source commit is invalid: {0}")]
     Invalid(String),
-    #[error("external source runtime is unavailable")]
-    Unavailable,
+    #[error(
+        "external source runtime rejected {admission_bytes}-byte commit for {commit_count} source observations: {outcome:?}"
+    )]
+    SubmitRejected {
+        outcome: Box<RuntimeSubmitOutcomeV1>,
+        admission_bytes: u64,
+        commit_count: usize,
+    },
+    #[error("external source runtime {phase} dispatch failed: {failure:?}")]
+    Dispatch {
+        phase: &'static str,
+        failure: Box<StoreRuntimeRegistryFailure>,
+    },
+    #[error("external source runtime {phase} read was unavailable: {coverage:?}")]
+    ReadUnavailable {
+        phase: &'static str,
+        coverage: Box<RuntimeReadCoverageV1>,
+    },
     #[error("external source idempotency key conflicts with a prior command")]
     IdempotencyConflict,
 }
@@ -442,12 +461,14 @@ impl RuntimeExternalSourceStore {
                     tracedecay_store::OperationPriorityV1::Background,
                 )?
             };
+            let admission_bytes = request.envelope().metadata.admission_bytes;
+            let commit_count = pending_commits.len();
             let probe = Arc::new(ExternalSourceRuntimeProbe::from_control(request.control()));
             match self
                 .runtime
                 .dispatch_submit(request, probe)
                 .await
-                .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?
+                .map_err(|failure| dispatch_error("host observation commit", failure))?
             {
                 RuntimeSubmitOutcomeV1::Committed { .. }
                 | RuntimeSubmitOutcomeV1::CommittedAfterCancellation { .. }
@@ -455,7 +476,13 @@ impl RuntimeExternalSourceStore {
                 RuntimeSubmitOutcomeV1::IdempotencyConflict { .. } => {
                     return Err(RuntimeExternalSourceErrorV1::IdempotencyConflict);
                 }
-                _ => return Err(RuntimeExternalSourceErrorV1::Unavailable),
+                outcome => {
+                    return Err(RuntimeExternalSourceErrorV1::SubmitRejected {
+                        outcome: Box::new(outcome),
+                        admission_bytes,
+                        commit_count,
+                    });
+                }
             }
         }
         let mut projection_pending = std::collections::BTreeMap::new();
@@ -471,8 +498,9 @@ impl RuntimeExternalSourceStore {
         settled
             .into_iter()
             .map(|settled| {
-                let (binding, receipt) =
-                    settled.ok_or(RuntimeExternalSourceErrorV1::Unavailable)?;
+                let (binding, receipt) = settled.ok_or_else(|| {
+                    invalid("host observation commit did not settle every requested receipt")
+                })?;
                 Ok(
                     if projection_pending.get(&binding).copied().unwrap_or(false) {
                         RuntimeSourceCaptureOutcomeV1::ProjectionPending(receipt)
@@ -493,7 +521,7 @@ impl RuntimeExternalSourceStore {
             .await?
             .into_iter()
             .next()
-            .ok_or(RuntimeExternalSourceErrorV1::Unavailable)
+            .ok_or_else(|| invalid("host observation commit returned no capture outcome"))
     }
 
     /// The daemon-owned host-admission drain invokes this bounded operation;
@@ -693,12 +721,12 @@ impl RuntimeExternalSourceStore {
         let outcome = self
             .runtime
             .dispatch_read(request, &probe)
-            .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?;
+            .map_err(|failure| dispatch_error("host observation", failure))?;
         if !matches!(
             outcome.coverage(),
             RuntimeReadCoverageV1::Latest { .. } | RuntimeReadCoverageV1::Complete { .. }
         ) {
-            return Err(RuntimeExternalSourceErrorV1::Unavailable);
+            return Err(read_unavailable("host observation", outcome.coverage()));
         }
         match outcome.value() {
             Some(RuntimeReadResultV1::Repository {
@@ -707,9 +735,13 @@ impl RuntimeExternalSourceStore {
                 tracedecay_store::ProjectReadResultV1::Observation(
                     tracedecay_store::ObservationReadResultV1::Observation(row),
                 ) => Ok(row.as_ref().as_ref().map(|row| row.observation.clone())),
-                _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+                _ => Err(invalid(
+                    "host observation read returned a mismatched result",
+                )),
             },
-            _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+            _ => Err(invalid(
+                "host observation read returned a mismatched result",
+            )),
         }
     }
 
@@ -728,12 +760,12 @@ impl RuntimeExternalSourceStore {
         let outcome = self
             .runtime
             .dispatch_read(request, &probe)
-            .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?;
+            .map_err(|failure| dispatch_error("commit receipt", failure))?;
         if !matches!(
             outcome.coverage(),
             RuntimeReadCoverageV1::Latest { .. } | RuntimeReadCoverageV1::Complete { .. }
         ) {
-            return Err(RuntimeExternalSourceErrorV1::Unavailable);
+            return Err(read_unavailable("commit receipt", outcome.coverage()));
         }
         match outcome.value() {
             Some(RuntimeReadResultV1::Repository {
@@ -742,7 +774,7 @@ impl RuntimeExternalSourceStore {
                         receipt,
                     )),
             }) => Ok(receipt.as_ref().map(|receipt| receipt.as_ref().clone())),
-            _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+            _ => Err(invalid("commit receipt read returned a mismatched result")),
         }
     }
 
@@ -757,12 +789,12 @@ impl RuntimeExternalSourceStore {
         let outcome = self
             .runtime
             .dispatch_read(request, &probe)
-            .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?;
+            .map_err(|failure| dispatch_error("pending projection", failure))?;
         if !matches!(
             outcome.coverage(),
             RuntimeReadCoverageV1::Latest { .. } | RuntimeReadCoverageV1::Complete { .. }
         ) {
-            return Err(RuntimeExternalSourceErrorV1::Unavailable);
+            return Err(read_unavailable("pending projection", outcome.coverage()));
         }
         match outcome.value() {
             Some(RuntimeReadResultV1::Repository {
@@ -771,7 +803,9 @@ impl RuntimeExternalSourceStore {
                         ExternalSourceReadResultV1::PendingProjection(pending),
                     ),
             }) => Ok(pending.as_ref().map(|pending| pending.as_ref().clone())),
-            _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+            _ => Err(invalid(
+                "pending projection read returned a mismatched result",
+            )),
         }
     }
 
@@ -794,7 +828,7 @@ impl RuntimeExternalSourceStore {
             .runtime
             .dispatch_submit(request, probe)
             .await
-            .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?
+            .map_err(|failure| dispatch_error("projection commit", failure))?
         {
             RuntimeSubmitOutcomeV1::Committed { .. }
             | RuntimeSubmitOutcomeV1::CommittedAfterCancellation { .. }
@@ -802,7 +836,11 @@ impl RuntimeExternalSourceStore {
             RuntimeSubmitOutcomeV1::IdempotencyConflict { .. } => {
                 Err(RuntimeExternalSourceErrorV1::IdempotencyConflict)
             }
-            _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+            outcome => Err(RuntimeExternalSourceErrorV1::SubmitRejected {
+                outcome: Box::new(outcome),
+                admission_bytes: serialized_len(&projection)?,
+                commit_count: 1,
+            }),
         }
     }
 
@@ -817,12 +855,12 @@ impl RuntimeExternalSourceStore {
         let outcome = self
             .runtime
             .dispatch_read(request, &probe)
-            .map_err(|_| RuntimeExternalSourceErrorV1::Unavailable)?;
+            .map_err(|failure| dispatch_error("source state", failure))?;
         if !matches!(
             outcome.coverage(),
             RuntimeReadCoverageV1::Latest { .. } | RuntimeReadCoverageV1::Complete { .. }
         ) {
-            return Err(RuntimeExternalSourceErrorV1::Unavailable);
+            return Err(read_unavailable("source state", outcome.coverage()));
         }
         match outcome.value() {
             Some(RuntimeReadResultV1::Repository {
@@ -835,7 +873,7 @@ impl RuntimeExternalSourceStore {
                 result:
                     RepositoryReadResultV1::ExternalSource(ExternalSourceReadResultV1::State(None)),
             }) => Ok(None),
-            _ => Err(RuntimeExternalSourceErrorV1::Unavailable),
+            _ => Err(invalid("source state read returned a mismatched result")),
         }
     }
 }
@@ -1073,7 +1111,7 @@ fn runtime_control(
 }
 
 fn digest_suffix(digest: &str) -> Result<&str, RuntimeExternalSourceErrorV1> {
-    digest.strip_prefix("sha256:").ok_or_else(|| {
+    sha256_hex_suffix(digest).ok_or_else(|| {
         RuntimeExternalSourceErrorV1::Invalid(
             "external source runtime digest is not canonical SHA-256".to_owned(),
         )
@@ -1134,6 +1172,26 @@ impl tracedecay_store::RuntimeRequestProbeV1 for ExternalSourceRuntimeProbe {
 
 fn invalid(error: impl std::fmt::Display) -> RuntimeExternalSourceErrorV1 {
     RuntimeExternalSourceErrorV1::Invalid(error.to_string())
+}
+
+fn dispatch_error(
+    phase: &'static str,
+    failure: StoreRuntimeRegistryFailure,
+) -> RuntimeExternalSourceErrorV1 {
+    RuntimeExternalSourceErrorV1::Dispatch {
+        phase,
+        failure: Box::new(failure),
+    }
+}
+
+fn read_unavailable(
+    phase: &'static str,
+    coverage: &RuntimeReadCoverageV1,
+) -> RuntimeExternalSourceErrorV1 {
+    RuntimeExternalSourceErrorV1::ReadUnavailable {
+        phase,
+        coverage: Box::new(coverage.clone()),
+    }
 }
 
 fn host_external_source_projector() -> Result<ComponentVersion, RuntimeExternalSourceErrorV1> {

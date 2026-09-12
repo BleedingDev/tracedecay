@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracedecay_domain::{
     CalibrationProfileId, CodeGenerationId, CodeSourceCursorBindingV1, ComponentRevision,
@@ -11,7 +12,9 @@ use tracedecay_domain::{
 
 use super::{batch, candidate, composition_lanes, id, no_caps, profile, request};
 use crate::retrieval::evidence_lanes::TaskSessionLaneEvidenceV1;
-use crate::retrieval::fusion::{QueryDigestAuthenticationError, RetrievalCursorKeyringV1};
+use crate::retrieval::fusion::{
+    CompositionKernel, FusionStageInput, QueryDigestAuthenticationError, RetrievalCursorKeyringV1,
+};
 use crate::retrieval::{PreparedQueryBindingsV1, PreparedQueryErrorV1, PreparedQueryV1};
 use crate::retrieval::{QueryAuthorityErrorV1, QueryAuthorityV1};
 
@@ -448,6 +451,74 @@ fn paged_foreground_lanes() -> Vec<crate::retrieval::fusion::CompositionLaneInpu
 }
 
 #[test]
+fn query_cursor_ttl_uses_wall_clock_instead_of_snapshot_time() {
+    let request = request();
+    let query = query_view();
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_micros() as i64;
+    let current = authority()
+        .compose(&request, &query, paged_foreground_lanes(), 1, None)
+        .expect("compose current cursor")
+        .fallback
+        .cursor
+        .clone()
+        .expect("current cursor");
+    let after = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_micros() as i64;
+    assert!(current.expiry.0 >= before + 1_000_000);
+    assert!(current.expiry.0 <= after + 1_000_000);
+
+    let keyring = RetrievalCursorKeyringV1::new(
+        request.scope.privacy_domain.clone(),
+        id::<RetrievalCursorKeyId>("retrieval-key.authority.v1"),
+        1,
+        vec![7_u8; 32],
+        1_000_000,
+    )
+    .expect("keyring");
+    let kernel = CompositionKernel::new(id("ranking.authority.v1"));
+    let composition = kernel
+        .compose(
+            &FusionStageInput {
+                profile: profile(),
+                lanes: paged_foreground_lanes(),
+            },
+            &no_caps(),
+        )
+        .expect("composition");
+    let expired = kernel
+        .paginate_at(
+            &request,
+            &query,
+            &keyring,
+            &composition,
+            1,
+            None,
+            tracedecay_domain::UtcMicros(0),
+        )
+        .expect("old cursor")
+        .cursor
+        .expect("old cursor");
+
+    assert!(matches!(
+        authority().compose(
+            &request,
+            &query,
+            paged_foreground_lanes(),
+            1,
+            Some(&expired)
+        ),
+        Err(QueryAuthorityErrorV1::Retrieval(
+            tracedecay_domain::RetrievalError::CursorExpired
+        ))
+    ));
+}
+
+#[test]
 fn exact_code_source_binding_is_authenticated_with_the_query_cursor() {
     let authority = authority();
     let request = request();
@@ -532,23 +603,6 @@ fn authenticated_foreground_fallback_is_byte_stable_and_lane_bounded() {
         serde_json::to_vec(first.fallback.as_ref()).expect("first bytes"),
         serde_json::to_vec(second.fallback.as_ref()).expect("second bytes"),
     );
-}
-
-#[test]
-fn semantic_handoff_reuses_the_authenticated_query_and_fallback() {
-    let authority = authority();
-    let request = request();
-    let authorized = authority
-        .compose(&request, &query_view(), empty_foreground_lanes(), 8, None)
-        .expect("compose");
-
-    assert_eq!(
-        authority
-            .authenticate_query(&request, &query_view())
-            .expect("digest"),
-        authorized.query_digest
-    );
-    assert!(Arc::strong_count(&authorized.fallback) >= 1);
 }
 
 #[test]

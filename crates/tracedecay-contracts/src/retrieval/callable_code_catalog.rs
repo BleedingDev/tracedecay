@@ -1,17 +1,18 @@
 use schemars::JsonSchema;
 use tracedecay_tool_catalog::{
-    ApplicationSurfaceOperation, AuthorityRequirement, AvailabilityContract, BindingId,
-    BindingStatus, BindingSurface, CancellationContract, CancellationPoint, CapabilityId,
-    CapabilityManifestInputV1, CapabilityManifestV1, CatalogContributionInputV1,
-    CatalogContributionV1, ContributionId, DeadlineBehavior, DeadlineContract,
-    DeniedDisclosurePolicy, EffectClass, ExecutableSchemaAuthority, IdempotencyContract,
+    ApplicationSurfaceOperation, AvailabilityContract, BindingId, BindingStatus, BindingSurface,
+    CancellationContract, CancellationPoint, CapabilityId, CapabilityManifestV1,
+    CatalogContributionInputV1, CatalogContributionV1, ContributionId, DeadlineBehavior,
+    DeadlineContract, DeniedDisclosurePolicy, EffectClass, ExecutableSchemaAuthority,
     LifecycleClass, PaginationContract, PrivacyClass, ProfileId, ProtocolRevisionRange,
-    ReceiptContract, ReconciliationContract, RevalidationContract, RevalidationPoint,
-    RoutingContractV1, SchemaId, SchemaRef, ScopeDimension, ScopeRequirement, StreamingContract,
-    SurfaceBindingInputV1, SurfaceBindingV1, SurfaceOperationName, TerminalState,
-    TerminalStateContract, UseCaseId,
+    RevalidationContract, RevalidationPoint, RoutingContractV1, SchemaId, SchemaRef,
+    ScopeDimension, ScopeRequirement, StreamingContract, SurfaceBindingInputV1, SurfaceBindingV1,
+    SurfaceOperationName, TerminalState, TerminalStateContract, UseCaseId,
 };
 
+use crate::capability_manifest::{
+    ApplicationCapabilityManifestInput, application_capability_manifest,
+};
 use crate::current_application_bindings;
 use crate::error::ApplicationContractError;
 use crate::handlers::{ApplicationHandlerDescriptor, ApplicationOperation};
@@ -81,7 +82,7 @@ pub fn callable_code_handler_descriptors()
 -> Result<Vec<ApplicationHandlerDescriptor>, ApplicationContractError> {
     CallableCodeOperationKind::ALL
         .into_iter()
-        .filter(|kind| canonical_surface_equivalent(*kind).is_none())
+        .filter(|kind| !is_internal_only(*kind) && canonical_surface_equivalent(*kind).is_none())
         .map(|kind| {
             let surface_operation = reachable_surface_operation(kind).ok_or(
                 ApplicationContractError::Inconsistent {
@@ -108,7 +109,7 @@ pub fn callable_code_catalog_contribution()
     let mut bindings = Vec::with_capacity(27);
     for kind in CallableCodeOperationKind::ALL
         .into_iter()
-        .filter(|kind| canonical_surface_equivalent(*kind).is_none())
+        .filter(|kind| !is_internal_only(*kind) && canonical_surface_equivalent(*kind).is_none())
     {
         let operation =
             reachable_surface_operation(kind).ok_or(ApplicationContractError::Inconsistent {
@@ -146,17 +147,12 @@ pub fn callable_code_catalog_contribution()
         }
         capabilities.push(code_query_capability(kind, binding_ids)?);
     }
-    debug_assert_eq!(
-        capabilities.len() + CANONICAL_SURFACE_EQUIVALENT_COUNT,
-        CALLABLE_CODE_OPERATION_COUNT
-    );
-    let contribution = CatalogContributionV1::new(CatalogContributionInputV1 {
-        contribution_id: ContributionId::new("contribution.application.callable-code-query")?,
-        depends_on: Vec::new(),
+    let contribution = CatalogContributionV1::new(CatalogContributionInputV1::new(
+        ContributionId::new("contribution.application.callable-code-query")?,
+        Vec::new(),
         capabilities,
-        retrieval_primitives: Vec::new(),
         bindings,
-    })?;
+    ))?;
     let schemas = callable_code_executable_schemas(&contribution)?;
     Ok(contribution.with_executable_schemas(schemas)?)
 }
@@ -250,8 +246,6 @@ where
     )?)
 }
 
-const CANONICAL_SURFACE_EQUIVALENT_COUNT: usize = 9;
-
 /// Existing canonical application surfaces own these semantics. Keeping the
 /// mapping here prevents the callable-code catalog from advertising a second
 /// capability, kernel, or transport operation for the same query.
@@ -265,7 +259,6 @@ fn canonical_surface_equivalent(kind: CallableCodeOperationKind) -> Option<&'sta
         CallableCodeOperationKind::Callers => Some("code_callers"),
         CallableCodeOperationKind::Impact => Some("feedback_impact"),
         CallableCodeOperationKind::ModuleApi => Some("module_api"),
-        CallableCodeOperationKind::SourceMetadata => Some("file_metadata"),
         CallableCodeOperationKind::ExactOccurrence
         | CallableCodeOperationKind::PhraseSearch
         | CallableCodeOperationKind::Callees
@@ -274,8 +267,13 @@ fn canonical_surface_equivalent(kind: CallableCodeOperationKind) -> Option<&'sta
         | CallableCodeOperationKind::Declaration
         | CallableCodeOperationKind::Definition
         | CallableCodeOperationKind::TypeDefinition
-        | CallableCodeOperationKind::References => None,
+        | CallableCodeOperationKind::References
+        | CallableCodeOperationKind::SourceMetadata => None,
     }
+}
+
+fn is_internal_only(kind: CallableCodeOperationKind) -> bool {
+    kind == CallableCodeOperationKind::SourceMetadata
 }
 
 fn reachable_surface_operation(kind: CallableCodeOperationKind) -> Option<&'static str> {
@@ -326,60 +324,58 @@ fn code_query_capability(
 ) -> Result<CapabilityManifestV1, ApplicationContractError> {
     let operation = kind.as_str();
     let readable_name = operation.replace('_', " ");
-    Ok(CapabilityManifestV1::new(CapabilityManifestInputV1 {
-        capability_id: code_query_capability_id(kind)?,
-        use_case_id: UseCaseId::new(format!(
-            "use-case.application.code-query.{}",
-            operation.replace('_', "-")
-        ))?,
-        routing: RoutingContractV1::new(
-            1,
-            format!("Query {readable_name}"),
-            format!(
-                "Invoke the generation-bound query {readable_name} query without replacing its owning kernel."
-            ),
-            // Keep examples distinct from primitive-read fixtures ("Read …").
-            vec![format!("Query indexed {readable_name}")],
-        )?,
-        request_schema: callable_code_request_schema(kind)?,
-        result_schema: callable_code_result_schema(kind)?,
-        effect: EffectClass::Read,
-        scope: code_query_scope()?,
-        authority: AuthorityRequirement::CapabilityGrantWithRevalidation,
-        denied_disclosure: DeniedDisclosurePolicy::Indistinguishable,
-        privacy: PrivacyClass::ScopedMetadata,
-        lifecycle: LifecycleClass::Resumable,
-        streaming: StreamingContract::Unsupported,
-        cancellation: CancellationContract::cooperative(vec![
-            CancellationPoint::BeforeAdmission,
-            CancellationPoint::BeforeRead,
-            CancellationPoint::DuringRead,
-        ])?,
-        deadline: DeadlineContract::new(10_000, DeadlineBehavior::ReturnOperationReceipt)?,
-        pagination: Some(PaginationContract::new(10, 1_000, 15 * 60 * 1_000)?),
-        idempotency: IdempotencyContract::NotRequired,
-        inverse: tracedecay_tool_catalog::InverseContract::NotApplicable,
-        authority_revalidation: RevalidationContract::required(vec![
-            RevalidationPoint::Authority,
-            RevalidationPoint::Scope,
-            RevalidationPoint::Policy,
-            RevalidationPoint::Configuration,
-        ])?,
-        reconciliation: ReconciliationContract::NotRequired,
-        receipt: ReceiptContract::Operation,
-        terminal_states: TerminalStateContract::new(vec![
-            TerminalState::Completed,
-            TerminalState::Cancelled,
-            TerminalState::TimedOut,
-            TerminalState::Failed,
-            TerminalState::Unavailable,
-            TerminalState::Partial,
-        ])?,
-        availability: AvailabilityContract::Available,
-        binding_ids,
-        profile_eligibility: vec![ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID)?],
-        required_features: Vec::new(),
-    })?)
+    Ok(application_capability_manifest(
+        ApplicationCapabilityManifestInput {
+            capability_id: code_query_capability_id(kind)?,
+            use_case_id: UseCaseId::new(format!(
+                "use-case.application.code-query.{}",
+                operation.replace('_', "-")
+            ))?,
+            routing: RoutingContractV1::new(
+                1,
+                format!("Query {readable_name}"),
+                format!(
+                    "Invoke the generation-bound query {readable_name} query without replacing its owning kernel."
+                ),
+                // Keep examples distinct from primitive-read fixtures ("Read …").
+                vec![format!("Query indexed {readable_name}")],
+            )?,
+            request_schema: callable_code_request_schema(kind)?,
+            result_schema: callable_code_result_schema(kind)?,
+            effect: EffectClass::Read,
+            scope: code_query_scope()?,
+            denied_disclosure: DeniedDisclosurePolicy::Indistinguishable,
+            privacy: PrivacyClass::ScopedMetadata,
+            lifecycle: LifecycleClass::Resumable,
+            streaming: StreamingContract::Unsupported,
+            cancellation: CancellationContract::cooperative(vec![
+                CancellationPoint::BeforeAdmission,
+                CancellationPoint::BeforeRead,
+                CancellationPoint::DuringRead,
+            ])?,
+            deadline: DeadlineContract::new(10_000, DeadlineBehavior::ReturnOperationReceipt)?,
+            pagination: Some(PaginationContract::new(10, 1_000, 15 * 60 * 1_000)?),
+            inverse: None,
+            authority_revalidation: RevalidationContract::required(vec![
+                RevalidationPoint::Authority,
+                RevalidationPoint::Scope,
+                RevalidationPoint::Policy,
+                RevalidationPoint::Configuration,
+            ])?,
+            terminal_states: TerminalStateContract::new(vec![
+                TerminalState::Completed,
+                TerminalState::Cancelled,
+                TerminalState::TimedOut,
+                TerminalState::Failed,
+                TerminalState::Unavailable,
+                TerminalState::Partial,
+            ])?,
+            availability: AvailabilityContract::Available,
+            binding_ids,
+            profile_eligibility: vec![ProfileId::new(APPLICATION_DEFAULT_PROFILE_ID)?],
+            required_features: Vec::new(),
+        },
+    )?)
 }
 
 fn code_query_scope() -> Result<ScopeRequirement, ApplicationContractError> {
@@ -389,53 +385,4 @@ fn code_query_scope() -> Result<ScopeRequirement, ApplicationContractError> {
         ScopeDimension::Worktree,
         ScopeDimension::Resource,
     ])?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_surface_equivalents_are_explicit_and_unique() {
-        let equivalents: Vec<_> = CallableCodeOperationKind::ALL
-            .into_iter()
-            .filter_map(|kind| {
-                canonical_surface_equivalent(kind).map(|operation| (kind, operation))
-            })
-            .collect();
-
-        assert_eq!(
-            equivalents,
-            vec![
-                (
-                    CallableCodeOperationKind::SymbolSearch,
-                    "code_symbol_search",
-                ),
-                (CallableCodeOperationKind::QualifiedName, "qualified_name"),
-                (
-                    CallableCodeOperationKind::SignatureSearch,
-                    "code_signature_search",
-                ),
-                (
-                    CallableCodeOperationKind::Implementations,
-                    "code_implementations",
-                ),
-                (
-                    CallableCodeOperationKind::TypeHierarchy,
-                    "code_type_hierarchy",
-                ),
-                (CallableCodeOperationKind::Callers, "code_callers"),
-                (CallableCodeOperationKind::Impact, "feedback_impact"),
-                (CallableCodeOperationKind::ModuleApi, "module_api"),
-                (CallableCodeOperationKind::SourceMetadata, "file_metadata"),
-            ]
-        );
-        let mut operation_names: Vec<_> = equivalents
-            .iter()
-            .map(|(_, operation)| *operation)
-            .collect();
-        operation_names.sort_unstable();
-        operation_names.dedup();
-        assert_eq!(operation_names.len(), CANONICAL_SURFACE_EQUIVALENT_COUNT);
-    }
 }

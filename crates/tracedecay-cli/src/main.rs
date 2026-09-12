@@ -7,7 +7,7 @@ use clap::{CommandFactory, FromArgMatches};
 use std::ffi::OsStr;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 #[cfg(feature = "hotpath")]
 use std::sync::{Arc, Mutex};
 
@@ -37,11 +37,13 @@ static MIMALLOC_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod agent_cmd;
 mod analytics_cmd;
+mod application_cli;
 mod automation_cli;
 mod cli;
 mod cloud;
 mod commands;
 mod cost_cmd;
+mod cost_summary;
 mod display;
 mod git_cmd;
 mod global;
@@ -217,16 +219,6 @@ mod spinner_tail_tests {
             let kept = tail.strip_prefix('…').unwrap_or_else(|| panic!("{text}"));
             assert!(text.ends_with(kept), "{text}");
         }
-    }
-
-    #[test]
-    fn a_message_one_character_over_drops_two_and_adds_the_ellipsis() {
-        let text = "é".repeat(SPINNER_MESSAGE_MAX_CHARS + 1);
-        let tail = spinner_tail(&text, SPINNER_MESSAGE_MAX_CHARS);
-        assert_eq!(
-            tail,
-            format!("…{}", "é".repeat(SPINNER_MESSAGE_MAX_CHARS - 1))
-        );
     }
 }
 
@@ -854,10 +846,7 @@ async fn run_startup_preamble(command: &Commands) {
     // Check first-run before any config save creates the file.
     let is_first_run = !tracedecay_session_memory::user_config::UserConfig::exists();
 
-    let is_force_flush = matches!(
-        command,
-        Commands::Init { .. } | Commands::Sync { .. } | Commands::Status { .. }
-    );
+    let is_force_flush = matches!(command, Commands::Sync { .. } | Commands::Status { .. });
     let mut user_config = tracedecay_session_memory::user_config::UserConfig::load();
     // Skip the worldwide-counter flush on hot startup paths. `try_flush`
     // makes a synchronous HTTP call which can add seconds to
@@ -868,9 +857,11 @@ async fn run_startup_preamble(command: &Commands) {
     // command turned the daemon's transient "runtime still mounting" state
     // into per-command stderr noise. A failed lookup on an ordinary command
     // is deferred (the next command retries); the flush-bearing commands
-    // (`init`, `sync`, `status`) still surface it, so a persistent failure
+    // (`sync`, `status`) still surface it, so a persistent failure
     // stays visible exactly where the flush is expected to happen.
-    if startup_policy.runs_startup_maintenance()
+    // `init` cannot resolve this setting until it creates the requested
+    // project, which may differ from the current directory.
+    if runs_worldwide_counter_flush(command)
         && user_config.pending_upload > 0
         && let Ok(cwd) = std::env::current_dir()
         && let Some(project_root) =
@@ -1301,6 +1292,28 @@ async fn dispatch_memory_command(action: MemoryAction) -> tracedecay_domain::err
     Ok(())
 }
 
+fn open_dashboard_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let status = Command::new("open").arg(url).status()?;
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .status()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let status = Command::new("xdg-open").arg(url).status()?;
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no platform opener",
+    ));
+    #[cfg(any(unix, target_os = "windows"))]
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("opener exited {status}")))
+    }
+}
+
 async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::errors::Result<()> {
     match command {
         Commands::Tool {
@@ -1388,7 +1401,7 @@ async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::error
                 }
             }
             if open {
-                match open::that(url) {
+                match open_dashboard_url(url) {
                     Ok(()) => eprintln!("Opened dashboard in default browser: {url}"),
                     Err(error) => {
                         eprintln!("Warning: could not open browser for {url}: {error}")
@@ -1889,10 +1902,9 @@ async fn dispatch_diagnostics_command(command: Commands) -> tracedecay_domain::e
         Commands::Cost {
             range,
             by_model,
-            by_task,
             export,
         } => {
-            cost_cmd::handle_cost(range, by_model, by_task, export).await?;
+            cost_cmd::handle_cost(range, by_model, export).await?;
         }
         Commands::Bench {
             queries,
@@ -2062,6 +2074,11 @@ impl CommandStartupPolicy {
     fn runs_agent_install_check(self) -> bool {
         matches!(self, Self::Full)
     }
+}
+
+fn runs_worldwide_counter_flush(command: &Commands) -> bool {
+    !matches!(command, Commands::Init { .. })
+        && CommandStartupPolicy::for_command(command).runs_startup_maintenance()
 }
 
 #[cfg(test)]

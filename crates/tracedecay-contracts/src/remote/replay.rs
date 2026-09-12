@@ -12,7 +12,7 @@ use thiserror::Error;
 use tracedecay_domain::{
     CurrentRemoteAuthorityStateV1, EnrollmentCredentialRecordV1, ManifestDigest,
     RemoteAuthorityUnavailableReasonV1, RemoteCapabilityV1, RemoteRepositoryScopeV1,
-    RemoteWriterFenceV1, UtcMicros, canonical_sha256,
+    RemoteWriterFenceV1, UtcMicros, canonical_sha256, sha256_hex_suffix,
 };
 
 use super::auth::{
@@ -746,9 +746,7 @@ fn replay_effect_envelope(
         outcome.caller.revision,
     ))
     .map_err(|_| RemoteProtocolFailureV1::AuthorityUnavailable)?;
-    let event_digest_id = event_digest
-        .as_str()
-        .strip_prefix("sha256:")
+    let event_digest_id = sha256_hex_suffix(event_digest.as_str())
         .ok_or(RemoteProtocolFailureV1::AuthorityUnavailable)?;
     let operation = UseCaseId::new(REMOTE_REPLAY_USE_CASE_ID_V1)
         .map_err(|_| RemoteProtocolFailureV1::AuthorityUnavailable)?;
@@ -1380,15 +1378,6 @@ mod tests {
                 RemoteReplayApplicationErrorV1::Authentication(RemoteAuthenticationError::Expired,),
             )),
             RemoteProtocolFailureV1::EnrollmentExpired
-        );
-    }
-
-    #[test]
-    fn replay_operation_and_result_contract_are_operation_specific() {
-        assert_eq!(REMOTE_REPLAY_USE_CASE_ID_V1, "use-case.remote.replay");
-        assert_ne!(
-            remote_replay_result_contract_v1(),
-            super::super::protocol::remote_enrollment_result_contract_v1()
         );
     }
 

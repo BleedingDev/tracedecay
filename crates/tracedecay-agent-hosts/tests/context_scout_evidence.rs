@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use tracedecay_agent_hosts::agents::context_scout_v2::{
+use tracedecay_agent_hosts::agents::context_scout::{
     ContextScoutDecisionV1, ContextScoutEvidenceEnvelopeExt, ContextScoutLimitsV1,
     ContextScoutSelectionInputV1, ContextScoutSuppressionV1, select_deterministic_context_scout,
 };
@@ -127,6 +127,7 @@ fn source_receipt(
             requested_at: UtcMicros(100),
             resolved_at: UtcMicros(110),
             source_generation: Some(id("generation.scout.1")),
+            code_graph_freshness: None,
             watermark_digest: Some(digest('e')),
             freshness: match contribution_state {
                 RetrieverContributionState::Stale => FreshnessState::Stale,

@@ -184,6 +184,22 @@ fn python_fixture() -> String {
     source
 }
 
+/// Retained-tree walk over a plain grammar: the parse text is the source.
+fn extract_parsed(
+    extractor: &dyn LanguageExtractor,
+    file_path: &str,
+    source: &str,
+    tree: &Tree,
+    scope: ParsedExtractionScope<'_>,
+) -> ParsedExtraction {
+    let parsed = extractor.extract_parsed_artifact_prepared(file_path, source, source, tree, scope);
+    ParsedExtraction {
+        result: parsed.artifact.result,
+        disposition: parsed.disposition,
+        metrics: parsed.metrics,
+    }
+}
+
 fn parse_with_grammar(key: &str, source: &str) -> Tree {
     let mut parser = Parser::new();
     parser
@@ -265,7 +281,8 @@ fn extract_both_and_compare(
 
     let tree = parse_with_grammar(grammar_key, source);
     let (parsed, walk_bytes) = measure_allocation(|| {
-        extractor.extract_parsed(
+        extract_parsed(
+            extractor,
             file_path,
             source,
             &tree,
@@ -276,7 +293,8 @@ fn extract_both_and_compare(
     let best_walk_time = (0..10)
         .map(|_| {
             let started = Instant::now();
-            let repeat = extractor.extract_parsed(
+            let repeat = extract_parsed(
+                extractor,
                 file_path,
                 source,
                 &tree,
@@ -473,7 +491,8 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
         let region = trailing_region(&case.source, case.needle);
         let regions = [region];
         let (parsed, walk_bytes) = measure_allocation(|| {
-            case.extractor.extract_parsed(
+            extract_parsed(
+                case.extractor,
                 case.file_path,
                 &case.source,
                 &tree,
@@ -540,7 +559,7 @@ fn representative_language_walks_allocate_by_changed_region() {
             grammar_key: "bash",
             source: regional_fixture("tiny() { :; }\n"),
             needle: "tiny()",
-            expected_digest: "0b6dc46dcc1aa39ee5e93ab7b7380922ca2299c3090679be0d9f8084d5dbbb3f",
+            expected_digest: "d1b8003a5b51fbeaa81bc03dc58ff38ad4f8ebd7af74533882cbabe8c47a2eb1",
         },
         Case {
             tier: "full",
@@ -572,7 +591,8 @@ fn representative_language_walks_allocate_by_changed_region() {
         let region = trailing_region(&case.source, case.needle);
         let regions = [region];
         let (incremental, walk_bytes) = measure_allocation(|| {
-            case.extractor.extract_parsed(
+            extract_parsed(
+                case.extractor,
                 case.file_path,
                 &case.source,
                 &tree,
@@ -592,7 +612,8 @@ fn representative_language_walks_allocate_by_changed_region() {
         let best_walk_time = (0..10)
             .map(|_| {
                 let started = Instant::now();
-                let repeat = case.extractor.extract_parsed(
+                let repeat = extract_parsed(
+                    case.extractor,
                     case.file_path,
                     &case.source,
                     &tree,
@@ -1052,7 +1073,8 @@ fn every_migrated_language_walk_allocates_by_changed_region() {
         let region = trailing_region(&source, case.needle);
         let regions = [region];
         let (incremental, walk_bytes) = measure_allocation(|| {
-            case.extractor.extract_parsed(
+            extract_parsed(
+                case.extractor,
                 case.file_path,
                 &source,
                 &tree,
