@@ -454,6 +454,20 @@ fn retained_text_projection_gate() -> &'static Mutex<BTreeMap<PathBuf, RetainedT
 }
 
 #[cfg(test)]
+struct PublishedTextProjectionGateV1 {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+fn published_text_projection_gate()
+-> &'static Mutex<BTreeMap<PathBuf, PublishedTextProjectionGateV1>> {
+    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, PublishedTextProjectionGateV1>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
 struct ExistingSemanticScheduleReplacementGateV1 {
     project_root: PathBuf,
     entered: tokio::sync::oneshot::Sender<()>,
@@ -1602,6 +1616,44 @@ impl CodeIndexSchedulerRegistryV1 {
     }
 
     #[cfg(test)]
+    pub async fn pause_next_published_text_projection(
+        &self,
+        project_root: PathBuf,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, entered_observed) = tokio::sync::oneshot::channel();
+        let (released, release) = tokio::sync::oneshot::channel();
+        let mut gates = published_text_projection_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            gates
+                .insert(
+                    project_root.clone(),
+                    PublishedTextProjectionGateV1 { entered, release },
+                )
+                .is_none(),
+            "one published text projection gate per worktree: {}",
+            project_root.display()
+        );
+        (entered_observed, released)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_published_text_projection_gate(project_root: &Path) {
+        let gate = published_text_projection_gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(project_root);
+        if let Some(gate) = gate {
+            let _ = gate.entered.send(());
+            let _ = gate.release.await;
+        }
+    }
+
+    #[cfg(test)]
     pub async fn observe_next_existing_semantic_schedule_replacement(
         &self,
         project_root: PathBuf,
@@ -2697,7 +2749,12 @@ impl CodeIndexSchedulerRegistryV1 {
         shutting_down: Arc<AtomicBool>,
         convergence_park: Arc<RwLock<Option<CodeIndexConvergenceParkedV1>>>,
         installed: Option<Arc<RwLock<Option<LatestCodeTextGenerationV1>>>>,
+        #[cfg(test)] project_root: PathBuf,
     ) -> PublishedTextProjectionOutcomeV1 {
+        #[cfg(test)]
+        if installed.is_none() {
+            Self::wait_for_published_text_projection_gate(&project_root).await;
+        }
         let mut advances = 0_usize;
         while text.text_serving_needs_work() {
             if shutting_down.load(Ordering::Acquire) {
@@ -3754,8 +3811,15 @@ impl CodeIndexSchedulerRegistryV1 {
                     retained_text_projection = Some(tokio::spawn(async move {
                         #[cfg(any(test, feature = "test-helpers"))]
                         Self::wait_for_retained_text_projection_gate(&gated_root).await;
-                        Self::drive_text_projection(latest, shutting_down, park, Some(installed))
-                            .await
+                        Self::drive_text_projection(
+                            latest,
+                            shutting_down,
+                            park,
+                            Some(installed),
+                            #[cfg(test)]
+                            gated_root,
+                        )
+                        .await
                     }));
                 } else if let Some(latest) = text_generation
                     && latest.text_serving_needs_work()
@@ -4172,6 +4236,8 @@ impl CodeIndexSchedulerRegistryV1 {
                                 Arc::clone(&worker_shutting_down),
                                 Arc::clone(&worker_convergence_park),
                                 None,
+                                #[cfg(test)]
+                                worker_project_root.clone(),
                             )));
                     } else if graph_text
                         .as_ref()
@@ -4701,10 +4767,52 @@ impl CodeIndexSchedulerRegistryV1 {
                             PublishedTextProjectionOutcomeV1::Unfinished
                         }
                     };
-                    // Source and text work are over for this pass either way.
-                    drop(reconcile_pass.take());
                     match outcome {
-                        PublishedTextProjectionOutcomeV1::Finished => {}
+                        PublishedTextProjectionOutcomeV1::Finished => {
+                            // Large text projections can outlive the bounded
+                            // source proof established before publication. The
+                            // serving swap must bind to source truth observed
+                            // after that work, otherwise an exact current
+                            // generation seats without a witness and every
+                            // readiness read schedules another identical Noop.
+                            let proof_is_current = graph_text.as_ref().is_some_and(|text| {
+                                worker_source_freshness.serves_recently_verified_source(
+                                    &text.metadata().snapshot().content_identity,
+                                    &worker_project_root,
+                                    &worker_shutting_down,
+                                )
+                            });
+                            if !proof_is_current && let Some(text) = graph_text.as_ref() {
+                                let scheduler = Arc::clone(&worker_scheduler);
+                                let shutting_down = Arc::clone(&worker_shutting_down);
+                                let metadata = text.metadata().clone();
+                                let renewed = tokio::task::spawn_blocking(move || {
+                                    Self::lock_scheduler_unless_shutting_down(
+                                        &scheduler,
+                                        &shutting_down,
+                                    )?
+                                    .reconcile_retained_text_generation_with(&metadata, false)
+                                })
+                                .await;
+                                match renewed {
+                                    Ok(Ok(Some(CodeIndexReconcileOutcomeV1::Noop(_)))) => {}
+                                    Ok(Ok(Some(_))) | Ok(Ok(None)) => tracing::info!(
+                                        event = "code_index_post_projection_source_unverified",
+                                        "source moved while text projection ran; the completed generation may only take a stale seat"
+                                    ),
+                                    Ok(Err(error)) => tracing::warn!(
+                                        event = "code_index_post_projection_source_verification_failed",
+                                        error = %error,
+                                        "source verification after text projection failed; the completed generation may only take a stale seat"
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        event = "code_index_post_projection_source_verification_task_failed",
+                                        error = %error,
+                                        "source verification after text projection did not complete; the completed generation may only take a stale seat"
+                                    ),
+                                }
+                            }
+                        }
                         PublishedTextProjectionOutcomeV1::Shutdown => {
                             tracing::info!(
                                 event = "code_index_worker_shutdown_observed",
@@ -4728,6 +4836,11 @@ impl CodeIndexSchedulerRegistryV1 {
                             worker_wake.notify_one();
                         }
                     }
+                    // Keep the pass lifetime around the post-projection source
+                    // proof so concurrent reads attribute their single wake as
+                    // a follow-up to this owner. The swap below takes its own
+                    // nested guard and publishes the witness before either
+                    // lifetime becomes idle.
                 }
                 if let Ok((Ok(_), Some(latest), _)) = &result {
                     let scheduler = Arc::clone(&worker_scheduler);
@@ -4944,6 +5057,10 @@ impl CodeIndexSchedulerRegistryV1 {
                         }
                     }
                 }
+                // The source proof and serving witness are now published as
+                // one lifecycle. Optional receipts and semantic scheduling do
+                // not keep source verification in flight.
+                drop(reconcile_pass.take());
                 if let Ok((Ok(outcome), _, _)) = &result {
                     // A pass that ran to a terminal outcome proves neither the
                     // panicking input nor the capacity contention is still
