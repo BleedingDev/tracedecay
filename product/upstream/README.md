@@ -18,6 +18,25 @@ the checked-out product head. The marker before the SHA is the anchored floor
 pin the sync train rewrites; no other prose in this directory may quote the
 floor.
 
+## Native restoration source reference
+
+The Native restoration review uses immutable b3
+(`b3b43410e47115056f2066449aafa1822bbb6049`) as its source and behavior
+reference. b3 is the upstream side of the current product merge; it is not a
+new accepted floor and does not change the pinned-floor marker above. The
+complete Native implementation and the existing shared host/storage
+extensions are inventoried in
+[`../architecture/native-original-source-inventory.md`](../architecture/native-original-source-inventory.md).
+
+The review records current repository paths after upstream moves, including
+the fact-store implementation under `tracedecay-session-memory`, the public
+operation catalog under `tracedecay-contracts`, the retained route under
+`tracedecay-store-runtime`, and privacy/maintenance crates. Product metadata
+continues to own the historical floor and archival receipts. Native provider
+restoration remains planned until its source, parity, scope, restart, and
+host-extension checks pass; this reference does not authorize a sync train or
+rewrite staged provider-state bytes.
+
 ## Verify
 
 ```bash

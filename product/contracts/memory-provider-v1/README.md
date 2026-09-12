@@ -32,6 +32,27 @@ A registration records `recall_scope_bindings`: `exact_coding_scope`, `checkout_
 
 Resolution requires exact provider identity, accepted registration revision, compatible adapter contract, all mandatory capabilities, every explicitly required known capability, exact TraceDecay scope, a live deadline, and live cancellation. There is no implicit fallback and no successful empty resolution.
 
+## Canonical Native context delivery
+
+Automatic model context uses the canonical `memory_matches` route at the host
+boundary. The host/composition owner executes that route once, then may pass a
+`NativeContextDeliveryMarker` from the provider API to the context compiler.
+The marker is bound to the selected provider identity, accepted registration
+revision, exact scope digest, canonical request digest, and canonical
+contribution digest. The compiler verifies those bindings before accepting the
+already-delivered contribution against the trusted host/composition decision,
+so it does not issue a second Native query. The constructor and private fields
+only assemble data; they do not grant authorization.
+
+This marker is host registration/composition metadata, not a provider result or
+wire capability. Provider payloads, descriptors, display names, and provider
+local receipts cannot create or widen it. A generic provider `Recall` remains a
+read-only advisory operation. Explicit retained fact `Search` continues to use
+the original owner-bound retrieval recording command and its retrieval receipt
+when that direct search returns hits; that telemetry is not added to automatic
+context reads. No new generic operation or capability is implied by the
+once-delivered route.
+
 ## Reserved provider slots
 
 - `tracedecay.native` is declared but remains gated by parity work.

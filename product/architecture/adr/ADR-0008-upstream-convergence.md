@@ -9,6 +9,16 @@ The product starts from the immutable TraceDecay V2 PR #707 floor while Zack's u
 
 `product/upstream/patch-footprint-policy.json` defines initial quantitative caps, allowed touch points, forbidden zones, dependency directions, and the convergence-map contract.
 
+For the Native restoration review, the source/behavior reference is the
+immutable b3 commit (`b3b43410e47115056f2066449aafa1822bbb6049`) already
+present as the upstream side of the product merge. This review reference is
+separate from the canonical historical August floor recorded by
+`product/upstream/tracedecay-v2-pr707.json` and `pr707-floor.json`.
+Those floor metadata files, their archival receipts, and their pinned SHA
+remain unchanged. The b3 reference resolves the source identity question for
+Native restoration; it does not advance the accepted floor or authorize an
+upstream sync train.
+
 ## Decision
 
 Keep product-owned implementation additive wherever possible. Every intentional edit to an existing upstream-owned file requires exactly one active entry in `product/upstream/convergence-map.json` before the bead closes. The entry names the allowed touch point, rationale, semantic invariants, executable verification, owning beads, line budget, and rebase/removal plan.
@@ -27,6 +37,29 @@ Advance the accepted upstream floor only through an isolated sync train:
 8. never force-update the released product branch.
 
 External lessons are source-linked by repository, commit, license, extracted invariant, neutral tests, target capability, implementation bead, and rejection rationale where applicable.
+
+The Native source audit applies the same distinction to moved paths. Current
+fact-store implementation paths under `tracedecay-session-memory/src/fact_store`,
+the retained route under `tracedecay-store-runtime`, the public operation
+catalog under `tracedecay-contracts`, and privacy/maintenance crates are
+recorded by their current repository paths. Existing shared host and storage
+extensions remain mapped product behavior. The restoration lane keeps status
+planned until its exact source and behavioral evidence is accepted; prose or
+metadata must not imply that the staged substitute was migrated or that the
+new provider surface is already parity-complete.
+
+The expanded audit also records the shared privacy detector, maintenance,
+runtime-composition, retained-owner, and hook live-origin paths. The exact
+`-sha256-<64 lowercase hex>` suffix peeling in the privacy detector is an
+original shared algorithm delta: Native memory hygiene and LCM sanitization
+callers cannot be described as unchanged until that algorithm is restored
+exactly or isolated behind a reviewed product boundary. Maintenance changes
+that defer unseated/offline vector deletion and hold the writer freeze through
+blocking deletion remain a shared retention-safety extension outside the
+Native memory/LCM lifecycle. Hook-origin and terminal changes remain a shared
+sealed-admission extension preserving canonical locator, session, cursor,
+provenance, cancellation, and no-write deferral. None of these dispositions
+authorizes a provider-owned fact store or an alternate Native authority.
 
 ## Consequences
 

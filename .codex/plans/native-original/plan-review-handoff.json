@@ -1,0 +1,32 @@
+{
+  "graph_id": "native-original-plan-review-20260911",
+  "selection_hash": "0f7cdb3cf4",
+  "snapshot_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-plan-review-20260911/snapshot.json",
+  "state_dir": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-plan-review-20260911",
+  "plan_count": 4,
+  "edge_count": 4,
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-close.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-draft.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-fidelity.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-graph.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "rnp-draft",
+      "target": "rnp-fidelity"
+    },
+    {
+      "source": "rnp-draft",
+      "target": "rnp-graph"
+    },
+    {
+      "source": "rnp-fidelity",
+      "target": "rnp-close"
+    },
+    {
+      "source": "rnp-graph",
+      "target": "rnp-close"
+    }
+  ]
+}

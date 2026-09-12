@@ -22,11 +22,25 @@ project/profile authority or make repository, worktree, branch, or session
 fields new Native fact owners.
 
 Native retrieval has an explicit telemetry write. Provider recall is a bounded,
-read-only projection and must not increment Native retrieval telemetry. Native
-currently exposes a current projection, not a historical or interval-indexed
-projection. Generic provider feedback, contradiction, maintenance, correction,
-and deletion similarly have no lossless mapping to the existing Native
-operations. In particular, provider feedback must not mutate Native trust.
+read-only projection and must not increment Native retrieval telemetry. Within
+the generic advisory provider contract, Native recall is projected only in its
+current mode; generic `as_of`, interval, and history requests have no lossless
+mapping. This restriction applies to that advisory provider projection. The
+original typed Native historical, session, LCM, and mutation routes remain
+available at their existing boundaries with their existing effect and failure
+semantics. Generic provider feedback, contradiction, maintenance, correction,
+and deletion similarly have no lossless mapping to those Native operations. In
+particular, provider feedback must not mutate Native trust.
+
+The fixed restoration reference for the complete Native implementation is b3
+(`b3b43410e47115056f2066449aafa1822bbb6049`), the upstream side of the
+product merge. The audited product head also contains shared host, provenance,
+cursor, transcript, configuration, storage, privacy, maintenance, and
+provider-composition extensions. Those extensions remain in place and are
+tracked separately from the original Native implementation; they are not
+evidence that Native has been replaced by a provider wrapper. The exhaustive
+path and hunk disposition is recorded in
+[`native-original-source-inventory.md`](../native-original-source-inventory.md).
 
 ## Decision
 
@@ -52,14 +66,41 @@ Parity goldens compare these semantic fields:
   invalid-request, and equivalent fail-closed outcomes, with no committed
   effect and no Native state change.
 
-Current recall is the only temporal mode projected by the Native adapter.
-`as_of`, `interval`, and `history` requests remain explicitly
-`capability_unsupported`; the adapter never relabels a current projection as a
-historical answer. Recall remains read-only and does not record Native retrieval
-telemetry. A direct Native feedback or maintenance result is not reclassified
-as provider success: generic feedback, contradiction, maintenance, correction,
-and delete remain capability-unsupported because no lossless mapping exists,
-and provider feedback may not mutate Native trust.
+For generic provider advisory recall, current recall is the only temporal mode
+projected by the Native adapter. `as_of`, `interval`, and `history` requests
+remain explicitly `capability_unsupported`; the adapter never relabels a
+current projection as a historical answer. This does not narrow or replace the
+original typed Native historical/session/LCM retrieval or fact/session/LCM
+mutation routes, which remain available with their original behavior and
+typed failures. Provider recall remains read-only and does not record Native
+retrieval telemetry. A direct Native feedback or maintenance result is not
+reclassified as provider success: generic provider feedback, contradiction,
+maintenance, correction, and delete remain capability-unsupported because no
+lossless mapping exists, and provider feedback may not mutate Native trust.
+
+The parity surface covers the complete supported Native operation set at its
+original typed boundary. It does not narrow Native to recall or use the
+provider envelope as a substitute for Native fact, session, LCM, feedback,
+maintenance, privacy, receipt, or recovery behavior. Direct typed routes remain
+available and retain their original effect and failure semantics. A generic
+control that does not name one of those typed operations returns a typed
+`capability_unsupported` outcome with no effect; it is not reported as a
+missing Native operation, silently approximated with current recall, or
+converted into a fabricated success.
+
+The staged Native substitute at
+`provider-state/native/staged-observations-v1.sqlite3` is outside this parity
+authority. Restoration retires its Native construction/read/write path while
+leaving the existing file and SQLite sidecars untouched. No staged row,
+provider-local receipt, generation, scorer, or replay cursor participates in
+Native parity or recovery. This decision remains planned until the independent
+source, parity, restart, scope, and host-extension checks pass.
+
+Automatic context delivery has one canonical `memory_matches` settlement. For
+each eligible selected Native provider, the context compiler makes exactly one
+eligible Native advisory invocation and delivers that result once; output
+deduplication or merging must not trigger another eligible Native provider
+invocation.
 
 The golden comparator explicitly excludes transport/readiness IDs and timing
 from semantic golden comparison. This includes provider instance,
@@ -77,9 +118,10 @@ them in an operation envelope.
   making provider envelope identity appear to be Native authority.
 - Read-only provider recall cannot perturb ranking through retrieval counters,
   so repeated parity runs are stable with respect to telemetry.
-- Unsupported temporal and lifecycle operations are observable, typed, and
-  fail closed instead of being approximated or silently routed to another
-  operation.
+- Unsupported temporal and lifecycle operations in the generic provider
+  contract are observable, typed, and fail closed instead of being
+  approximated or silently routed to another operation; original typed Native
+  routes retain their own behavior.
 - Goldens remain stable across provider instances and runs while contract
   validation still covers identity, readiness, limits, deadline, and
   cancellation fields.
@@ -96,10 +138,12 @@ them in an operation envelope.
 - **Record Native retrieval telemetry during provider recall.** Rejected because
   provider recall is read-only; adding a retrieval write would change Native
   state and ranking behavior merely by selecting the adapter route.
-- **Approximate historical/interval recall or unsupported lifecycle operations
-  with current search, feedback, maintenance, correction, contradiction, or
-  delete.** Rejected because there is no lossless mapping and an approximation
-  would misrepresent validity or effect semantics.
+- **Approximate historical/interval recall in the generic advisory provider
+  contract, or approximate unsupported lifecycle operations with current
+  search, feedback, maintenance, correction, contradiction, or delete.**
+  Rejected because there is no lossless mapping and an approximation would
+  misrepresent validity or effect semantics; the original typed Native routes
+  remain available at their own boundaries.
 - **Allow provider feedback to update Native trust.** Rejected because Native
   trust transitions require the owner-bound Native feedback authority and a
   settled Native operation, not an advisory provider signal.
@@ -114,9 +158,10 @@ them in an operation envelope.
    provenance, and current validity.
 3. Provider recall is read-only and never increments Native retrieval
    telemetry, trust, fact lineage, or any other Native write projection.
-4. Historical, `as_of`, interval, and history requests are typed
-   `capability_unsupported`; a current projection is never presented as a
-   historical answer.
+4. In the generic advisory provider contract, `as_of`, interval, and history
+   requests are typed `capability_unsupported`; a current projection is never
+   presented as a historical answer, while original typed Native
+   historical/session/LCM retrieval remains available at its own boundary.
 5. Generic feedback, contradiction, maintenance, correction, and delete are
    typed capability-unsupported when no lossless mapping exists; provider
    feedback cannot mutate Native trust.
@@ -126,6 +171,9 @@ them in an operation envelope.
    contract data but are excluded from semantic golden equality.
 8. Fixed fixture, scope, Native state, request semantics, and limits produce
    deterministic semantic goldens.
+9. Automatic context emits one canonical `memory_matches` settlement per
+   eligible selected Native provider and never performs an extra eligible
+   Native provider invocation for deduplication or output merging.
 
 ## Verification
 
@@ -142,8 +190,12 @@ Executable evidence:
 The parity suite must assert both positive semantic equality and negative
 no-effect behavior. It must verify that provider recall leaves retrieval
 telemetry unchanged, rejects scope mismatches, preserves current validity,
-classifies unsupported temporal/lifecycle requests, and does not convert a
-provider envelope or feedback signal into Native trust or canonical mutation.
+classifies unsupported temporal/lifecycle requests only in the generic
+advisory provider contract, preserves the original typed Native
+historical/session/LCM/mutation routes, enforces one canonical
+`memory_matches` delivery with no extra eligible Native provider invocation,
+and does not convert a provider envelope or feedback signal into Native trust
+or canonical mutation.
 
 ## Review triggers
 

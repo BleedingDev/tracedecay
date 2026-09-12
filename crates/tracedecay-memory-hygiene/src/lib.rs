@@ -150,6 +150,11 @@ const _: () = assert!(
 /// but not in scope: the upstream definition is private to its module.
 const REDACTED_SENSITIVE_FIELD: &str = "[TraceDecay redacted: sensitive field]";
 
+const CLAUDE_PROVIDER_ID: &str = "claude";
+const CLAUDE_OBSERVATION_SOURCE_PREFIX: &str = "tracedecay-claude-observation-source-v1-sha256-";
+const TRUSTED_HISTORY_PLACEHOLDER_PREFIX: &str = "td-trusted-source-v1-";
+const TRUSTED_HISTORY_PLACEHOLDER_ATTEMPTS: usize = 4096;
+
 /// Why an observation could not be admitted at all.
 ///
 /// These are failures of the pipeline or of the payload's shape. They are
@@ -189,6 +194,10 @@ pub enum HygieneError {
     /// change. Fail closed rather than mint a receipt nothing explains.
     #[error("sanitized bytes differ from source bytes with no attributed finding")]
     UnattributedRedaction,
+    /// A trusted history source field could not be projected and restored
+    /// without ambiguity. The typed entry point fails closed in this case.
+    #[error("trusted Claude history source projection failed: {0}")]
+    TrustedHistoryProjection(&'static str),
     /// The extension set violated the provider observation boundary.
     #[error("observation extensions violate the provider boundary: {0}")]
     ExtensionBoundary(ApiError),
@@ -249,6 +258,43 @@ pub enum ObservationAdmission {
     },
 }
 
+/// A Claude observation source identifier whose provider and complete structural
+/// digest shape have been validated at the host boundary.
+///
+/// This type carries no authorization by itself. A caller must obtain it only
+/// after validating the canonical history source and its grant; the sanitizer
+/// uses it solely to project the two typed history source fields it recognizes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedClaudeObservationSourceIdV1(String);
+
+impl TrustedClaudeObservationSourceIdV1 {
+    /// Validates the exact Claude provider and source-id format.
+    ///
+    /// The source id must contain the complete pinned prefix followed by 64
+    /// lowercase hexadecimal characters. No suffix, case folding, or arbitrary
+    /// digest-shaped value is accepted. The constructor proves syntax only;
+    /// history authorization remains the caller's responsibility.
+    #[must_use]
+    pub fn from_validated_source(provider: &str, source_key: &str) -> Option<Self> {
+        let digest = source_key.strip_prefix(CLAUDE_OBSERVATION_SOURCE_PREFIX)?;
+        if provider != CLAUDE_PROVIDER_ID
+            || digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return None;
+        }
+        Some(Self(source_key.to_owned()))
+    }
+
+    /// Returns the validated source identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The admitted pipeline.
 ///
 /// One sanitizer instance carries one policy revision. Every receipt it mints
@@ -271,6 +317,165 @@ enum PayloadDecision {
         source_payload_sha256: String,
         findings: Vec<HygieneFindingV1>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct TrustedHistoryProjection {
+    payload: Value,
+    fields: Vec<TrustedHistoryField>,
+}
+
+#[derive(Clone, Debug)]
+struct TrustedHistoryField {
+    path: String,
+    original: String,
+    placeholder: String,
+}
+
+impl TrustedHistoryProjection {
+    fn new(
+        source_payload: &Value,
+        trusted_source: &TrustedClaudeObservationSourceIdV1,
+    ) -> Result<Self, HygieneError> {
+        let source_bytes = canonical_payload_bytes(source_payload)?;
+        let mut payload = source_payload.clone();
+        let mut fields = Vec::new();
+
+        const SOURCE_IDENTITY_PARENT: &str = "/source_identity/original_source/source";
+        const SOURCE_IDENTITY_PATH: &str = "/source_identity/original_source/source/source_key";
+        validate_trusted_source_field(source_payload, SOURCE_IDENTITY_PARENT, trusted_source)?;
+        let placeholder = collision_free_placeholder(&source_bytes, fields.len())?;
+        replace_projected_value(
+            &mut payload,
+            SOURCE_IDENTITY_PATH,
+            trusted_source.as_str(),
+            &placeholder,
+        )?;
+        fields.push(TrustedHistoryField {
+            path: SOURCE_IDENTITY_PATH.to_owned(),
+            original: trusted_source.as_str().to_owned(),
+            placeholder,
+        });
+
+        let sources = source_payload
+            .pointer("/history_grant/sources")
+            .and_then(Value::as_array)
+            .ok_or(HygieneError::TrustedHistoryProjection(
+                "history grant sources are missing",
+            ))?;
+        let mut matching_grant_fields = 0usize;
+        for index in 0..sources.len() {
+            let parent = format!("/history_grant/sources/{index}/attribution/source");
+            let path = format!("{parent}/source_key");
+            let source_key = source_payload
+                .pointer(&path)
+                .and_then(Value::as_str)
+                .ok_or(HygieneError::TrustedHistoryProjection(
+                    "history grant source key is missing or non-scalar",
+                ))?;
+            if source_key != trusted_source.as_str() {
+                continue;
+            }
+            validate_trusted_source_field(source_payload, &parent, trusted_source)?;
+            matching_grant_fields = matching_grant_fields.saturating_add(1);
+            if matching_grant_fields > 1 {
+                return Err(HygieneError::TrustedHistoryProjection(
+                    "history grant repeats the trusted source field",
+                ));
+            }
+            let placeholder = collision_free_placeholder(&source_bytes, fields.len())?;
+            replace_projected_value(&mut payload, &path, trusted_source.as_str(), &placeholder)?;
+            fields.push(TrustedHistoryField {
+                path,
+                original: trusted_source.as_str().to_owned(),
+                placeholder,
+            });
+        }
+        if matching_grant_fields == 0 {
+            return Err(HygieneError::TrustedHistoryProjection(
+                "history grant does not contain the trusted source field",
+            ));
+        }
+
+        Ok(Self { payload, fields })
+    }
+
+    fn payload(&self) -> &Value {
+        &self.payload
+    }
+
+    fn restore(&self, sanitized: &mut Value) -> Result<(), HygieneError> {
+        for field in &self.fields {
+            let Some(value) = sanitized.pointer_mut(&field.path) else {
+                return Err(HygieneError::TrustedHistoryProjection(
+                    "trusted source placeholder path disappeared",
+                ));
+            };
+            if value.as_str() != Some(field.placeholder.as_str()) {
+                return Err(HygieneError::TrustedHistoryProjection(
+                    "trusted source placeholder changed during sanitization",
+                ));
+            }
+            *value = Value::String(field.original.clone());
+        }
+        Ok(())
+    }
+}
+
+fn validate_trusted_source_field(
+    payload: &Value,
+    parent: &str,
+    trusted_source: &TrustedClaudeObservationSourceIdV1,
+) -> Result<(), HygieneError> {
+    let provider_path = format!("{parent}/canonical_provider_id");
+    let provider = payload.pointer(&provider_path).and_then(Value::as_str);
+    if provider != Some(CLAUDE_PROVIDER_ID) {
+        return Err(HygieneError::TrustedHistoryProjection(
+            "trusted source provider is not Claude",
+        ));
+    }
+    let source_path = format!("{parent}/source_key");
+    if payload.pointer(&source_path).and_then(Value::as_str) != Some(trusted_source.as_str()) {
+        return Err(HygieneError::TrustedHistoryProjection(
+            "trusted source key does not match the validated identity",
+        ));
+    }
+    Ok(())
+}
+
+fn replace_projected_value(
+    payload: &mut Value,
+    path: &str,
+    expected: &str,
+    placeholder: &str,
+) -> Result<(), HygieneError> {
+    let Some(value) = payload.pointer_mut(path) else {
+        return Err(HygieneError::TrustedHistoryProjection(
+            "trusted source field path is missing",
+        ));
+    };
+    if value.as_str() != Some(expected) {
+        return Err(HygieneError::TrustedHistoryProjection(
+            "trusted source field changed before projection",
+        ));
+    }
+    *value = Value::String(placeholder.to_owned());
+    Ok(())
+}
+
+fn collision_free_placeholder(source_bytes: &[u8], ordinal: usize) -> Result<String, HygieneError> {
+    for attempt in 0..TRUSTED_HISTORY_PLACEHOLDER_ATTEMPTS {
+        let candidate = format!("{TRUSTED_HISTORY_PLACEHOLDER_PREFIX}{ordinal}-{attempt}");
+        if !source_bytes
+            .windows(candidate.len())
+            .any(|window| window == candidate.as_bytes())
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(HygieneError::TrustedHistoryProjection(
+        "could not allocate a collision-free source placeholder",
+    ))
 }
 
 impl ObservationSanitizer {
@@ -347,6 +552,32 @@ impl ObservationSanitizer {
         payload: &Value,
         extensions: &[OwnedOpaqueExtension],
     ) -> Result<ObservationAdmission, HygieneError> {
+        self.admit_observation_inner(payload, extensions, None)
+    }
+
+    /// Runs a validated Claude history envelope through a path-bound source
+    /// projection before the unchanged strict hygiene pipeline.
+    ///
+    /// The typed source id is accepted only for the two canonical history
+    /// source-field paths. The original envelope remains borrowed and is used
+    /// for the source and sanitized receipt digests after the fields are
+    /// verified and restored. Opaque extensions always use strict admission.
+    pub fn admit_observation_with_trusted_history_source(
+        &self,
+        payload: &Value,
+        extensions: &[OwnedOpaqueExtension],
+        trusted_source: &TrustedClaudeObservationSourceIdV1,
+    ) -> Result<ObservationAdmission, HygieneError> {
+        let projection = TrustedHistoryProjection::new(payload, trusted_source)?;
+        self.admit_observation_inner(payload, extensions, Some(&projection))
+    }
+
+    fn admit_observation_inner(
+        &self,
+        payload: &Value,
+        extensions: &[OwnedOpaqueExtension],
+        trusted_projection: Option<&TrustedHistoryProjection>,
+    ) -> Result<ObservationAdmission, HygieneError> {
         if !transient::corpus_is_available() {
             return Err(HygieneError::TransientCorpusUnavailable);
         }
@@ -355,8 +586,22 @@ impl ObservationSanitizer {
         let maximum_probes = self.policy.signals().maximum_detector_probes_per_payload();
         let mut classification_budget = ProbeBudget::new(maximum_probes);
         let mut transient_budget = ProbeBudget::new(maximum_probes);
-        let root =
-            self.sanitize_payload(payload, &mut classification_budget, &mut transient_budget)?;
+        let root = match trusted_projection {
+            Some(projection) => self.sanitize_payload_inner(
+                projection.payload(),
+                payload,
+                Some(projection),
+                &mut classification_budget,
+                &mut transient_budget,
+            )?,
+            None => self.sanitize_payload_inner(
+                payload,
+                payload,
+                None,
+                &mut classification_budget,
+                &mut transient_budget,
+            )?,
+        };
         let mut findings = match &root {
             PayloadDecision::Admitted { findings, .. }
             | PayloadDecision::Withheld { findings, .. } => findings.clone(),
@@ -480,7 +725,24 @@ impl ObservationSanitizer {
         classification_budget: &mut ProbeBudget,
         transient_budget: &mut ProbeBudget,
     ) -> Result<PayloadDecision, HygieneError> {
-        let source_bytes = canonical_payload_bytes(payload)?;
+        self.sanitize_payload_inner(
+            payload,
+            payload,
+            None,
+            classification_budget,
+            transient_budget,
+        )
+    }
+
+    fn sanitize_payload_inner(
+        &self,
+        scan_payload: &Value,
+        source_payload: &Value,
+        trusted_projection: Option<&TrustedHistoryProjection>,
+        classification_budget: &mut ProbeBudget,
+        transient_budget: &mut ProbeBudget,
+    ) -> Result<PayloadDecision, HygieneError> {
+        let source_bytes = canonical_payload_bytes(source_payload)?;
         let maximum = self.policy.max_canonical_bytes();
         if source_bytes.len() > maximum {
             return Err(HygieneError::PayloadTooLarge { maximum });
@@ -488,7 +750,13 @@ impl ObservationSanitizer {
         let source_payload_sha256 = sha256_hex(&source_bytes);
         let mut found = Vec::new();
         let mut segments = Vec::new();
-        self.classify_value(payload, 0, &mut segments, &mut found, classification_budget)?;
+        self.classify_value(
+            scan_payload,
+            0,
+            &mut segments,
+            &mut found,
+            classification_budget,
+        )?;
         canonicalize(&mut found);
         if withheld_reason(&found).is_some() {
             return Ok(PayloadDecision::Withheld {
@@ -497,7 +765,7 @@ impl ObservationSanitizer {
             });
         }
 
-        let mut sanitized = match sanitize_memory_fact_payload(payload.clone()) {
+        let mut sanitized = match sanitize_memory_fact_payload(scan_payload.clone()) {
             Ok(MemoryFactSanitizationV1::Durable {
                 payload: durable, ..
             }) => durable,
@@ -519,9 +787,12 @@ impl ObservationSanitizer {
                 });
             }
         };
+        if let Some(projection) = trusted_projection {
+            projection.restore(&mut sanitized)?;
+        }
         found.extend(attribute_sanitizer_output(
             &self.policy,
-            payload,
+            source_payload,
             &sanitized,
         )?);
         apply_transient_redactions(
@@ -984,15 +1255,26 @@ mod tests {
 
     use super::*;
 
+    const STRUCTURAL_SOURCE_ID: &str = concat!(
+        "tracedecay-claude-observation-source-v1-sha256-",
+        "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6"
+    );
+
+    fn trusted_source() -> Result<TrustedClaudeObservationSourceIdV1, HygieneError> {
+        TrustedClaudeObservationSourceIdV1::from_validated_source(
+            CLAUDE_PROVIDER_ID,
+            STRUCTURAL_SOURCE_ID,
+        )
+        .ok_or(HygieneError::TrustedHistoryProjection(
+            "test source id must satisfy the pinned Claude format",
+        ))
+    }
+
     fn history_envelope_with_structural_source_id() -> Value {
-        let source_id = concat!(
-            "tracedecay-claude-observation-source-v1-sha256-",
-            "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6"
-        );
         let source = json!({
-            "provider": "claude",
+            "canonical_provider_id": "claude",
             "session_id": "fixture-session",
-            "source_key": source_id,
+            "source_key": STRUCTURAL_SOURCE_ID,
             "observation_id": format!("sha256:{}", "1".repeat(64)),
         });
         json!({
@@ -1011,10 +1293,11 @@ mod tests {
     fn structural_digest_source_metadata_is_admitted_with_full_envelope_receipt()
     -> Result<(), HygieneError> {
         let envelope = history_envelope_with_structural_source_id();
+        let trusted_source = trusted_source()?;
         let canonical = canonical_payload_bytes(&envelope)?;
         let expected = sha256_hex(&canonical);
-        let ObservationAdmission::Admitted { sanitized, receipt } =
-            ObservationSanitizer::new()?.admit_observation(&envelope, &[])?
+        let ObservationAdmission::Admitted { sanitized, receipt } = ObservationSanitizer::new()?
+            .admit_observation_with_trusted_history_source(&envelope, &[], &trusted_source)?
         else {
             panic!("innocent message and structural source metadata must be admitted");
         };
@@ -1028,6 +1311,144 @@ mod tests {
             sha256_hex(&canonical_payload_bytes(&envelope["canonical_payload"])?),
             "the receipt binds the whole delivered envelope, including source metadata"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn strict_admission_withholds_the_raw_claude_source_id() -> Result<(), HygieneError> {
+        let envelope = history_envelope_with_structural_source_id();
+        let sanitizer = ObservationSanitizer::new()?;
+        assert!(
+            sanitizer
+                .classify(&envelope)?
+                .iter()
+                .any(|finding| finding.class() == HygieneClass::HighEntropyToken)
+        );
+        assert!(matches!(
+            sanitizer.admit_observation(&envelope, &[])?,
+            ObservationAdmission::Withheld {
+                reason: WithheldReason::SecretRejected,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_source_constructor_rejects_every_noncanonical_shape() {
+        let digest = "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6";
+        let prefix = "tracedecay-claude-observation-source-v1-sha256-";
+        let invalid = [
+            ("codex", format!("{prefix}{digest}")),
+            ("claude", format!("{prefix}{}", digest.to_ascii_uppercase())),
+            ("claude", format!("{prefix}{}", &digest[..63])),
+            ("claude", format!("{prefix}{digest}0")),
+            ("claude", format!("{prefix}{}g", &digest[..63])),
+            ("claude", format!("{prefix}{digest}-tail")),
+            ("claude", format!("{prefix}{digest}-sha256-{digest}")),
+            ("claude", format!("-sha256-{digest}")),
+        ];
+        for (provider, source_key) in invalid {
+            assert!(
+                TrustedClaudeObservationSourceIdV1::from_validated_source(provider, &source_key)
+                    .is_none(),
+                "invalid trusted source shape was accepted: {provider}/{source_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_history_projection_is_collision_free_and_restores_fields() -> Result<(), HygieneError>
+    {
+        let mut envelope = history_envelope_with_structural_source_id();
+        envelope["collision_a"] = json!("td-trusted-source-v1-0-0");
+        envelope["collision_b"] = json!("td-trusted-source-v1-1-0");
+        let trusted_source = trusted_source()?;
+        let projection = TrustedHistoryProjection::new(&envelope, &trusted_source)?;
+        assert_eq!(
+            projection
+                .payload()
+                .pointer("/source_identity/original_source/source/source_key")
+                .and_then(Value::as_str),
+            Some("td-trusted-source-v1-0-1")
+        );
+        assert_eq!(
+            projection
+                .payload()
+                .pointer("/history_grant/sources/0/attribution/source/source_key")
+                .and_then(Value::as_str),
+            Some("td-trusted-source-v1-1-1")
+        );
+        let mut restored = projection.payload().clone();
+        projection.restore(&mut restored)?;
+        assert_eq!(restored, envelope);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_history_does_not_exempt_matching_content_or_high_entropy_suffixes()
+    -> Result<(), HygieneError> {
+        let trusted_source = trusted_source()?;
+        let sanitizer = ObservationSanitizer::new()?;
+        let high_entropy_prefix = "Qm9vZ2llV29vZ2llMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A4OTc2NTQzMjE";
+        for content in [
+            STRUCTURAL_SOURCE_ID.to_owned(),
+            format!("{high_entropy_prefix}-sha256-{}", "a".repeat(64)),
+        ] {
+            let mut envelope = history_envelope_with_structural_source_id();
+            envelope["canonical_payload"]["content"] = json!(content);
+            assert!(matches!(
+                sanitizer.admit_observation_with_trusted_history_source(
+                    &envelope,
+                    &[],
+                    &trusted_source,
+                )?,
+                ObservationAdmission::Withheld {
+                    reason: WithheldReason::SecretRejected,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_history_rejects_wrong_provider_and_duplicate_grant_fields()
+    -> Result<(), HygieneError> {
+        let trusted_source = trusted_source()?;
+        let sanitizer = ObservationSanitizer::new()?;
+
+        let mut wrong_provider = history_envelope_with_structural_source_id();
+        wrong_provider["source_identity"]["original_source"]["source"]["canonical_provider_id"] =
+            json!("codex");
+        assert!(matches!(
+            sanitizer.admit_observation_with_trusted_history_source(
+                &wrong_provider,
+                &[],
+                &trusted_source,
+            ),
+            Err(HygieneError::TrustedHistoryProjection(_))
+        ));
+
+        let mut duplicate = history_envelope_with_structural_source_id();
+        let duplicate_source = duplicate["history_grant"]["sources"][0].clone();
+        let Some(sources) = duplicate
+            .pointer_mut("/history_grant/sources")
+            .and_then(Value::as_array_mut)
+        else {
+            return Err(HygieneError::TrustedHistoryProjection(
+                "test history grant sources are missing",
+            ));
+        };
+        sources.push(duplicate_source);
+        assert!(matches!(
+            sanitizer.admit_observation_with_trusted_history_source(
+                &duplicate,
+                &[],
+                &trusted_source,
+            ),
+            Err(HygieneError::TrustedHistoryProjection(_))
+        ));
         Ok(())
     }
 

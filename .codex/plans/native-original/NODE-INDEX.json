@@ -1,0 +1,391 @@
+[
+  {
+    "id": "rn-contract",
+    "title": "Make the product interface fit complete original Native",
+    "dependencies": [
+      "rn-source-docs"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-memory-provider-api/** (excluding Cargo manifests)",
+      "product/contracts/memory-provider-v1/**; generated outputs only inside this directory or the owned provider-API crate",
+      ".codex/plans/native-original/execution-results/native-operation-routes.md",
+      ".codex/plans/native-original/execution-results/contract-outputs.md",
+      "Known generated outputs: product/contracts/memory-provider-v1/{generated/rust/manifest.json,generated/rust/memory_provider_v1.rs,goldens/fixtures.jsonl,goldens/manifest.json}; generator/checker scripts read-only"
+    ]
+  },
+  {
+    "id": "rn-reference",
+    "title": "Build the independent original Native comparison runner",
+    "dependencies": [],
+    "mode": "write-capable",
+    "ownership": [
+      "scripts/product/native-original/** except cases/**"
+    ]
+  },
+  {
+    "id": "rn-source-docs",
+    "title": "Correct Native identity and architecture documentation",
+    "dependencies": [],
+    "mode": "write-capable",
+    "ownership": [
+      "product/upstream/** (metadata/documentation only)",
+      "product/architecture/native-memory-surface-map.md",
+      "product/architecture/native-memory-surface-map.json",
+      "product/architecture/adr/ADR-0010-native-provider-parity-projection.md",
+      "product/architecture/adr/ADR-0008-upstream-convergence.md (stale-reference clarification only)",
+      "product/architecture/native-original-source-inventory.md"
+    ]
+  },
+  {
+    "id": "rn-cases-facts",
+    "title": "Author original fact behavior comparison cases",
+    "dependencies": [
+      "rn-reference",
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "scripts/product/native-original/cases/facts/**"
+    ]
+  },
+  {
+    "id": "rn-cases-sessions",
+    "title": "Author original session and LCM comparison cases",
+    "dependencies": [
+      "rn-reference",
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "scripts/product/native-original/cases/sessions/**"
+    ]
+  },
+  {
+    "id": "rn-cases-state",
+    "title": "Author saved-state and owner isolation comparison cases",
+    "dependencies": [
+      "rn-reference",
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "scripts/product/native-original/cases/state/**"
+    ]
+  },
+  {
+    "id": "rn-native-port",
+    "title": "Make the Native wrapper delegate without staged semantics",
+    "dependencies": [
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-memory-provider-native/** except Cargo manifests"
+    ]
+  },
+  {
+    "id": "rn-fabric",
+    "title": "Preserve routing guarantees for the restored Native boundary",
+    "dependencies": [
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-memory-fabric/** except Cargo manifests"
+    ]
+  },
+  {
+    "id": "rn-registry",
+    "title": "Register Native and NCM with truthful independent capabilities",
+    "dependencies": [
+      "rn-native-port"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-memory-provider-registry/** except Cargo manifests"
+    ]
+  },
+  {
+    "id": "rn-native-bridge",
+    "title": "Replace the staged Native backend with original service delegation",
+    "dependencies": [
+      "rn-native-port"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+      "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs (remove added implementation)",
+      "At most one new adjacent native_original_bridge.rs if delegation cannot fit the existing module"
+    ]
+  },
+  {
+    "id": "rn-session-delivery",
+    "title": "Retire Native staged acknowledgements in the host observation journey",
+    "dependencies": [
+      "rn-native-port",
+      "rn-privacy-restore"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
+    ]
+  },
+  {
+    "id": "rn-host-context",
+    "title": "Deliver original Native context once through its original host path",
+    "dependencies": [
+      "rn-native-port"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
+      "crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs"
+    ]
+  },
+  {
+    "id": "rn-native-tests",
+    "title": "Replace substitute-backed Native tests with original behavior checks",
+    "dependencies": [
+      "rn-native-port",
+      "rn-native-bridge"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
+      "crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs",
+      "crates/tracedecay/src/daemon/retained_owner/native_original_state_tests.rs (new if needed)"
+    ]
+  },
+  {
+    "id": "rn-host-fixtures",
+    "title": "Prepare real Claude and Codex Native comparison journeys",
+    "dependencies": [
+      "rn-reference",
+      "rn-contract"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs",
+      "scripts/product/native-original/cases/hosts/**"
+    ]
+  },
+  {
+    "id": "rn-ncm-tests",
+    "title": "Preserve NCM behavior while Native is restored",
+    "dependencies": [],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-memory-provider-ncm/tests/**",
+      "product/ncm/spec/CONTRACT.md (Replay operation row only)"
+    ]
+  },
+  {
+    "id": "rn-composition",
+    "title": "Connect the reviewed Native services and remove staged mount assumptions",
+    "dependencies": [
+      "rn-native-bridge",
+      "rn-registry",
+      "rn-session-delivery",
+      "rn-host-context",
+      "rn-native-tests"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay/src/daemon/project_composition.rs",
+      "crates/tracedecay/src/daemon/retained_owner.rs"
+    ]
+  },
+  {
+    "id": "rn-build",
+    "title": "Integrate shared manifests and verify both actual runtimes",
+    "dependencies": [
+      "rn-composition",
+      "rn-fabric",
+      "rn-host-fixtures",
+      "rn-ncm-tests",
+      "rn-reference",
+      "rn-build-reference",
+      "rn-restore-anchor",
+      "rn-map-checker",
+      "rn-privacy-audit",
+      "rn-privacy-restore"
+    ],
+    "mode": "write-capable and build owner",
+    "ownership": [
+      "Cargo.toml and Cargo.lock",
+      "Cargo.toml in the product provider/API/fabric/registry/CLI/application crates only when a reviewed dependency is required",
+      "Test-owned build logs and binary inventory under target/task-scratch/native-original/candidate-build/"
+    ]
+  },
+  {
+    "id": "rn-verify-facts",
+    "title": "Verify complete fact behavior against untouched b3",
+    "dependencies": [
+      "rn-build",
+      "rn-cases-facts"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/facts/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-verify-sessions",
+    "title": "Verify original sessions and LCM against untouched b3",
+    "dependencies": [
+      "rn-build",
+      "rn-cases-sessions"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/sessions/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-verify-state",
+    "title": "Verify cutover leaves original and legacy saved state intact",
+    "dependencies": [
+      "rn-build",
+      "rn-cases-state"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/state/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-verify-claude",
+    "title": "Verify original Native through real Claude delivery",
+    "dependencies": [
+      "rn-build"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/claude/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-verify-codex",
+    "title": "Verify original Native through real Codex delivery",
+    "dependencies": [
+      "rn-build"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/codex/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-verify-ncm",
+    "title": "Verify NCM still works with shared canonical services",
+    "dependencies": [
+      "rn-build"
+    ],
+    "mode": "verification-only",
+    "ownership": [
+      "target/task-scratch/native-original/ncm/ (test data/results only)"
+    ]
+  },
+  {
+    "id": "rn-review-fidelity",
+    "title": "Independently review full original Native fidelity",
+    "dependencies": [
+      "rn-verify-facts",
+      "rn-verify-sessions",
+      "rn-verify-state",
+      "rn-verify-claude",
+      "rn-verify-codex",
+      "rn-verify-ncm",
+      "rn-source-docs"
+    ],
+    "mode": "read-only review",
+    "ownership": [
+      ".codex/plans/native-original/execution-results/fidelity-review.md"
+    ]
+  },
+  {
+    "id": "rn-review-integration",
+    "title": "Independently review integration, data safety and graph completion",
+    "dependencies": [
+      "rn-verify-facts",
+      "rn-verify-sessions",
+      "rn-verify-state",
+      "rn-verify-claude",
+      "rn-verify-codex",
+      "rn-verify-ncm"
+    ],
+    "mode": "read-only review",
+    "ownership": [
+      ".codex/plans/native-original/execution-results/integration-review.md"
+    ]
+  },
+  {
+    "id": "rn-close",
+    "title": "Accept the complete restored Native implementation",
+    "dependencies": [
+      "rn-review-fidelity",
+      "rn-review-integration"
+    ],
+    "mode": "root orchestration and review only",
+    "ownership": [
+      "Plan statuses, graph snapshot, operator log and final user-facing result"
+    ]
+  },
+  {
+    "id": "rn-build-reference",
+    "title": "Build untouched original Native while product work runs",
+    "dependencies": [
+      "rn-source-docs"
+    ],
+    "mode": "build owner; original source read-only",
+    "ownership": [
+      "A clean detached b3 worktree under the repository .worktrees/ and its repo-local build/test artifacts",
+      "target/task-scratch/native-original/reference-build/ (logs and binary inventory only)"
+    ]
+  },
+  {
+    "id": "rn-restore-anchor",
+    "title": "Restore the original retrieval-anchor authority exactly",
+    "dependencies": [
+      "rn-source-docs"
+    ],
+    "mode": "write-capable; exact original restoration only",
+    "ownership": [
+      "crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs (restore the sole b3-to-head method difference only)"
+    ]
+  },
+  {
+    "id": "rn-privacy-audit",
+    "title": "Audit original privacy algorithm drift",
+    "dependencies": [],
+    "mode": "read-only reviewer",
+    "ownership": [
+      ".codex/plans/native-original/execution-results/privacy-isolation-design.md"
+    ]
+  },
+  {
+    "id": "rn-map-checker",
+    "title": "Correct Native map checker source drift",
+    "dependencies": [],
+    "mode": "write-capable",
+    "ownership": [
+      "scripts/product/check-native-memory-surface-map.py",
+      "tests/product_native_memory_surface_map_test.py"
+    ]
+  },
+  {
+    "id": "rn-privacy-restore",
+    "title": "Restore original privacy with typed product history admission",
+    "dependencies": [
+      "rn-privacy-audit"
+    ],
+    "mode": "write-capable",
+    "ownership": [
+      "crates/tracedecay-privacy/src/detector_kernel.rs (exact b3 restoration only)",
+      "crates/tracedecay-memory-hygiene/src/lib.rs and at most one private adjacent module",
+      "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs (privacy seam only; before rn-session-delivery)",
+      ".codex/plans/native-original/execution-results/privacy-restoration.md"
+    ]
+  }
+]

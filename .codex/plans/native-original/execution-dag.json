@@ -1,0 +1,1362 @@
+{
+  "generated_at": "2026-09-10T22:38:06.927107+00:00",
+  "graph_id": "native-original-execution-20260911",
+  "plan_set_hash": "f583566d3e",
+  "selection_hash": "a22a65832e",
+  "plan_count": 28,
+  "edge_count": 55,
+  "plans_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution",
+  "selected_globs": [
+    "*.plan.md"
+  ],
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build-reference.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-facts.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-sessions.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-state.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-close.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-composition.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-contract.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-fabric.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-context.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-fixtures.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-bridge.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-port.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-tests.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-tests.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-reference.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-registry.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-restore-anchor.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-fidelity.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-integration.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-session-delivery.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-claude.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-codex.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-facts.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-ncm.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-sessions.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-state.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "rn-reference",
+      "target": "rn-cases-facts"
+    },
+    {
+      "source": "rn-reference",
+      "target": "rn-cases-sessions"
+    },
+    {
+      "source": "rn-reference",
+      "target": "rn-cases-state"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-native-port"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-fabric"
+    },
+    {
+      "source": "rn-native-port",
+      "target": "rn-registry"
+    },
+    {
+      "source": "rn-native-port",
+      "target": "rn-native-bridge"
+    },
+    {
+      "source": "rn-native-port",
+      "target": "rn-session-delivery"
+    },
+    {
+      "source": "rn-native-port",
+      "target": "rn-host-context"
+    },
+    {
+      "source": "rn-native-port",
+      "target": "rn-native-tests"
+    },
+    {
+      "source": "rn-reference",
+      "target": "rn-host-fixtures"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-host-fixtures"
+    },
+    {
+      "source": "rn-native-bridge",
+      "target": "rn-composition"
+    },
+    {
+      "source": "rn-registry",
+      "target": "rn-composition"
+    },
+    {
+      "source": "rn-session-delivery",
+      "target": "rn-composition"
+    },
+    {
+      "source": "rn-host-context",
+      "target": "rn-composition"
+    },
+    {
+      "source": "rn-native-tests",
+      "target": "rn-composition"
+    },
+    {
+      "source": "rn-composition",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-fabric",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-host-fixtures",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-ncm-tests",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-reference",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-facts"
+    },
+    {
+      "source": "rn-cases-facts",
+      "target": "rn-verify-facts"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-sessions"
+    },
+    {
+      "source": "rn-cases-sessions",
+      "target": "rn-verify-sessions"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-state"
+    },
+    {
+      "source": "rn-cases-state",
+      "target": "rn-verify-state"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-claude"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-codex"
+    },
+    {
+      "source": "rn-build",
+      "target": "rn-verify-ncm"
+    },
+    {
+      "source": "rn-verify-facts",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-sessions",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-state",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-claude",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-codex",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-ncm",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-source-docs",
+      "target": "rn-review-fidelity"
+    },
+    {
+      "source": "rn-verify-facts",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-verify-sessions",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-verify-state",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-verify-claude",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-verify-codex",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-verify-ncm",
+      "target": "rn-review-integration"
+    },
+    {
+      "source": "rn-review-fidelity",
+      "target": "rn-close"
+    },
+    {
+      "source": "rn-review-integration",
+      "target": "rn-close"
+    },
+    {
+      "source": "rn-reference",
+      "target": "rn-build-reference"
+    },
+    {
+      "source": "rn-native-bridge",
+      "target": "rn-native-tests"
+    },
+    {
+      "source": "rn-build-reference",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-source-docs",
+      "target": "rn-contract"
+    },
+    {
+      "source": "rn-source-docs",
+      "target": "rn-restore-anchor"
+    },
+    {
+      "source": "rn-restore-anchor",
+      "target": "rn-build"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-cases-facts"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-cases-sessions"
+    },
+    {
+      "source": "rn-contract",
+      "target": "rn-cases-state"
+    }
+  ],
+  "plans": [
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build-reference.plan.md",
+      "slug": "rn-build-reference",
+      "name": "rn-build-reference",
+      "overview": "Build untouched original Native while product work runs. Reuse the result for final differential verification.",
+      "todos": [
+        {
+          "id": "rn-build-reference-done",
+          "content": "Build untouched original Native while product work runs and publish the verified reference artifacts.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build.plan.md",
+      "slug": "rn-build",
+      "name": "rn-build",
+      "overview": "Integrate shared manifests and verify both actual runtimes. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-build-done",
+          "content": "Integrate shared manifests and verify both actual runtimes and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-facts.plan.md",
+      "slug": "rn-cases-facts",
+      "name": "rn-cases-facts",
+      "overview": "Author original fact behavior comparison cases. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-cases-facts-done",
+          "content": "Author original fact behavior comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-sessions.plan.md",
+      "slug": "rn-cases-sessions",
+      "name": "rn-cases-sessions",
+      "overview": "Author original session and LCM comparison cases. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-cases-sessions-done",
+          "content": "Author original session and LCM comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-state.plan.md",
+      "slug": "rn-cases-state",
+      "name": "rn-cases-state",
+      "overview": "Author saved-state and owner isolation comparison cases. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-cases-state-done",
+          "content": "Author saved-state and owner isolation comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-close.plan.md",
+      "slug": "rn-close",
+      "name": "rn-close",
+      "overview": "Accept the complete restored Native implementation. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-close-done",
+          "content": "Accept the complete restored Native implementation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-composition.plan.md",
+      "slug": "rn-composition",
+      "name": "rn-composition",
+      "overview": "Connect the reviewed Native services and remove staged mount assumptions. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-composition-done",
+          "content": "Connect the reviewed Native services and remove staged mount assumptions and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-contract.plan.md",
+      "slug": "rn-contract",
+      "name": "rn-contract",
+      "overview": "Make the product interface fit complete original Native. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-contract-done",
+          "content": "Make the product interface fit complete original Native and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-fabric.plan.md",
+      "slug": "rn-fabric",
+      "name": "rn-fabric",
+      "overview": "Preserve routing guarantees for the restored Native boundary. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-fabric-done",
+          "content": "Preserve routing guarantees for the restored Native boundary and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-context.plan.md",
+      "slug": "rn-host-context",
+      "name": "rn-host-context",
+      "overview": "Deliver original Native context once through its original host path. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-host-context-done",
+          "content": "Deliver original Native context once through its original host path and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-fixtures.plan.md",
+      "slug": "rn-host-fixtures",
+      "name": "rn-host-fixtures",
+      "overview": "Prepare real Claude and Codex Native comparison journeys. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-host-fixtures-done",
+          "content": "Prepare real Claude and Codex Native comparison journeys and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-bridge.plan.md",
+      "slug": "rn-native-bridge",
+      "name": "rn-native-bridge",
+      "overview": "Replace the staged Native backend with original service delegation. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-native-bridge-done",
+          "content": "Replace the staged Native backend with original service delegation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-port.plan.md",
+      "slug": "rn-native-port",
+      "name": "rn-native-port",
+      "overview": "Make the Native wrapper delegate without staged semantics. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-native-port-done",
+          "content": "Make the Native wrapper delegate without staged semantics and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-tests.plan.md",
+      "slug": "rn-native-tests",
+      "name": "rn-native-tests",
+      "overview": "Replace substitute-backed Native tests with original behavior checks. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-native-tests-done",
+          "content": "Replace substitute-backed Native tests with original behavior checks and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-tests.plan.md",
+      "slug": "rn-ncm-tests",
+      "name": "rn-ncm-tests",
+      "overview": "Preserve NCM behavior while Native is restored. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-ncm-tests-done",
+          "content": "Preserve NCM behavior while Native is restored and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-reference.plan.md",
+      "slug": "rn-reference",
+      "name": "rn-reference",
+      "overview": "Build the independent original Native comparison runner. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-reference-done",
+          "content": "Build the independent original Native comparison runner and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-registry.plan.md",
+      "slug": "rn-registry",
+      "name": "rn-registry",
+      "overview": "Register Native and NCM with truthful independent capabilities. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-registry-done",
+          "content": "Register Native and NCM with truthful independent capabilities and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-restore-anchor.plan.md",
+      "slug": "rn-restore-anchor",
+      "name": "rn-restore-anchor",
+      "overview": "Restore the pre-existing retrieval-anchor optimization to the exact b3 implementation without changing other original or shared host code.",
+      "todos": [
+        {
+          "id": "rn-restore-anchor-done",
+          "content": "Restore the original full-history latest-disposition implementation and return exact source-equality evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-fidelity.plan.md",
+      "slug": "rn-review-fidelity",
+      "name": "rn-review-fidelity",
+      "overview": "Independently review full original Native fidelity. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-review-fidelity-done",
+          "content": "Independently review full original Native fidelity and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-integration.plan.md",
+      "slug": "rn-review-integration",
+      "name": "rn-review-integration",
+      "overview": "Independently review integration, data safety and graph completion. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-review-integration-done",
+          "content": "Independently review integration, data safety and graph completion and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-session-delivery.plan.md",
+      "slug": "rn-session-delivery",
+      "name": "rn-session-delivery",
+      "overview": "Retire Native staged acknowledgements in the host observation journey. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-session-delivery-done",
+          "content": "Retire Native staged acknowledgements in the host observation journey and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
+      "slug": "rn-source-docs",
+      "name": "rn-source-docs",
+      "overview": "Correct Native identity and architecture documentation. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-source-docs-done",
+          "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-claude.plan.md",
+      "slug": "rn-verify-claude",
+      "name": "rn-verify-claude",
+      "overview": "Verify original Native through real Claude delivery. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-claude-done",
+          "content": "Verify original Native through real Claude delivery and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-codex.plan.md",
+      "slug": "rn-verify-codex",
+      "name": "rn-verify-codex",
+      "overview": "Verify original Native through real Codex delivery. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-codex-done",
+          "content": "Verify original Native through real Codex delivery and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-facts.plan.md",
+      "slug": "rn-verify-facts",
+      "name": "rn-verify-facts",
+      "overview": "Verify complete fact behavior against untouched b3. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-facts-done",
+          "content": "Verify complete fact behavior against untouched b3 and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-ncm.plan.md",
+      "slug": "rn-verify-ncm",
+      "name": "rn-verify-ncm",
+      "overview": "Verify NCM still works with shared canonical services. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-ncm-done",
+          "content": "Verify NCM still works with shared canonical services and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-sessions.plan.md",
+      "slug": "rn-verify-sessions",
+      "name": "rn-verify-sessions",
+      "overview": "Verify original sessions and LCM against untouched b3. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-sessions-done",
+          "content": "Verify original sessions and LCM against untouched b3 and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-state.plan.md",
+      "slug": "rn-verify-state",
+      "name": "rn-verify-state",
+      "overview": "Verify cutover leaves original and legacy saved state intact. Preserve the complete original b3 Native implementation and its operation boundaries.",
+      "todos": [
+        {
+          "id": "rn-verify-state-done",
+          "content": "Verify cutover leaves original and legacy saved state intact and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "rn-ncm-tests",
+      "plan_name": "rn-ncm-tests",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-tests.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-ncm-tests-done",
+          "content": "Preserve NCM behavior while Native is restored and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-reference",
+      "plan_name": "rn-reference",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-reference.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-reference-done",
+          "content": "Build the independent original Native comparison runner and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-source-docs",
+      "plan_name": "rn-source-docs",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-source-docs-done",
+          "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-build",
+      "plan_name": "rn-build",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-composition",
+        "rn-fabric",
+        "rn-host-fixtures",
+        "rn-ncm-tests",
+        "rn-reference",
+        "rn-build-reference",
+        "rn-restore-anchor"
+      ],
+      "active": [
+        {
+          "id": "rn-build-done",
+          "content": "Integrate shared manifests and verify both actual runtimes and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-build-reference",
+      "plan_name": "rn-build-reference",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build-reference.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-reference"
+      ],
+      "active": [
+        {
+          "id": "rn-build-reference-done",
+          "content": "Build untouched original Native while product work runs and publish the verified reference artifacts.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-cases-facts",
+      "plan_name": "rn-cases-facts",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-facts.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-reference",
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-cases-facts-done",
+          "content": "Author original fact behavior comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-cases-sessions",
+      "plan_name": "rn-cases-sessions",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-sessions.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-reference",
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-cases-sessions-done",
+          "content": "Author original session and LCM comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-cases-state",
+      "plan_name": "rn-cases-state",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-cases-state.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-reference",
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-cases-state-done",
+          "content": "Author saved-state and owner isolation comparison cases and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-close",
+      "plan_name": "rn-close",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-close.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-review-fidelity",
+        "rn-review-integration"
+      ],
+      "active": [
+        {
+          "id": "rn-close-done",
+          "content": "Accept the complete restored Native implementation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-composition",
+      "plan_name": "rn-composition",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-composition.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-bridge",
+        "rn-registry",
+        "rn-session-delivery",
+        "rn-host-context",
+        "rn-native-tests"
+      ],
+      "active": [
+        {
+          "id": "rn-composition-done",
+          "content": "Connect the reviewed Native services and remove staged mount assumptions and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-contract",
+      "plan_name": "rn-contract",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-contract.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-source-docs"
+      ],
+      "active": [
+        {
+          "id": "rn-contract-done",
+          "content": "Make the product interface fit complete original Native and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-fabric",
+      "plan_name": "rn-fabric",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-fabric.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-fabric-done",
+          "content": "Preserve routing guarantees for the restored Native boundary and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-host-context",
+      "plan_name": "rn-host-context",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-context.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-port"
+      ],
+      "active": [
+        {
+          "id": "rn-host-context-done",
+          "content": "Deliver original Native context once through its original host path and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-host-fixtures",
+      "plan_name": "rn-host-fixtures",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-host-fixtures.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-reference",
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-host-fixtures-done",
+          "content": "Prepare real Claude and Codex Native comparison journeys and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-native-bridge",
+      "plan_name": "rn-native-bridge",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-bridge.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-port"
+      ],
+      "active": [
+        {
+          "id": "rn-native-bridge-done",
+          "content": "Replace the staged Native backend with original service delegation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-native-port",
+      "plan_name": "rn-native-port",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-port.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-contract"
+      ],
+      "active": [
+        {
+          "id": "rn-native-port-done",
+          "content": "Make the Native wrapper delegate without staged semantics and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-native-tests",
+      "plan_name": "rn-native-tests",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-native-tests.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-port",
+        "rn-native-bridge"
+      ],
+      "active": [
+        {
+          "id": "rn-native-tests-done",
+          "content": "Replace substitute-backed Native tests with original behavior checks and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-registry",
+      "plan_name": "rn-registry",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-registry.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-port"
+      ],
+      "active": [
+        {
+          "id": "rn-registry-done",
+          "content": "Register Native and NCM with truthful independent capabilities and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-restore-anchor",
+      "plan_name": "rn-restore-anchor",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-restore-anchor.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-source-docs"
+      ],
+      "active": [
+        {
+          "id": "rn-restore-anchor-done",
+          "content": "Restore the original full-history latest-disposition implementation and return exact source-equality evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-review-fidelity",
+      "plan_name": "rn-review-fidelity",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-fidelity.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-verify-facts",
+        "rn-verify-sessions",
+        "rn-verify-state",
+        "rn-verify-claude",
+        "rn-verify-codex",
+        "rn-verify-ncm",
+        "rn-source-docs"
+      ],
+      "active": [
+        {
+          "id": "rn-review-fidelity-done",
+          "content": "Independently review full original Native fidelity and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-review-integration",
+      "plan_name": "rn-review-integration",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-review-integration.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-verify-facts",
+        "rn-verify-sessions",
+        "rn-verify-state",
+        "rn-verify-claude",
+        "rn-verify-codex",
+        "rn-verify-ncm"
+      ],
+      "active": [
+        {
+          "id": "rn-review-integration-done",
+          "content": "Independently review integration, data safety and graph completion and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-session-delivery",
+      "plan_name": "rn-session-delivery",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-session-delivery.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-native-port"
+      ],
+      "active": [
+        {
+          "id": "rn-session-delivery-done",
+          "content": "Retire Native staged acknowledgements in the host observation journey and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-claude",
+      "plan_name": "rn-verify-claude",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-claude.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-claude-done",
+          "content": "Verify original Native through real Claude delivery and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-codex",
+      "plan_name": "rn-verify-codex",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-codex.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-codex-done",
+          "content": "Verify original Native through real Codex delivery and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-facts",
+      "plan_name": "rn-verify-facts",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-facts.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build",
+        "rn-cases-facts"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-facts-done",
+          "content": "Verify complete fact behavior against untouched b3 and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-ncm",
+      "plan_name": "rn-verify-ncm",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-ncm.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-ncm-done",
+          "content": "Verify NCM still works with shared canonical services and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-sessions",
+      "plan_name": "rn-verify-sessions",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-sessions.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build",
+        "rn-cases-sessions"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-sessions-done",
+          "content": "Verify original sessions and LCM against untouched b3 and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-verify-state",
+      "plan_name": "rn-verify-state",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-verify-state.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "rn-build",
+        "rn-cases-state"
+      ],
+      "active": [
+        {
+          "id": "rn-verify-state-done",
+          "content": "Verify cutover leaves original and legacy saved state intact and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    }
+  ],
+  "errors": [],
+  "warnings": [],
+  "graph_source": "explicit",
+  "snapshot_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-20260911/snapshot.json",
+  "state_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-20260911/snapshot.json",
+  "state_dir": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-20260911"
+}

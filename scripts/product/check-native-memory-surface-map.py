@@ -98,12 +98,28 @@ EXPECTED_DERIVED_SURFACES = {
     "automatic_fact_and_automation_views",
 }
 
+EXPECTED_CATALOG_OPERATION_MARKERS = {
+    "fact_store_curate": 'Self::FactStoreCurate => "fact_store_curate"',
+    "fact_store_add": 'Self::FactStoreAdd => "fact_store_add"',
+    "fact_store_search": 'Self::FactStoreSearch => "fact_store_search"',
+    "fact_store_probe": 'Self::FactStoreProbe => "fact_store_probe"',
+    "fact_store_related": 'Self::FactStoreRelated => "fact_store_related"',
+    "fact_store_reason": 'Self::FactStoreReason => "fact_store_reason"',
+    "fact_store_contradict": 'Self::FactStoreContradict => "fact_store_contradict"',
+    "fact_store_get": 'Self::FactStoreGet => "fact_store_get"',
+    "fact_store_update": 'Self::FactStoreUpdate => "fact_store_update"',
+    "fact_store_remove": 'Self::FactStoreRemove => "fact_store_remove"',
+    "fact_store_list": 'Self::FactStoreList => "fact_store_list"',
+    "fact_feedback": 'Self::FactFeedback => "fact_feedback"',
+    "memory_status": 'Self::MemoryStatus => "memory_status"',
+}
+
 SOURCE_MARKERS = {
     "crates/tracedecay-session-memory/src/memory/mod.rs": [
         "memory_application_for_db",
         "pub struct MemoryApplication",
     ],
-    "crates/tracedecay-runtime-core/src/store/memory/mod.rs": [
+    "crates/tracedecay-session-memory/src/fact_store/mod.rs": [
         "pub struct DatabaseFactStore",
         "impl ProjectMemoryFactStore",
         "schedule_project_memory_graph_reconciliation",
@@ -112,15 +128,16 @@ SOURCE_MARKERS = {
         "project_memory_owner",
         "project_memory_application",
     ],
-    "crates/tracedecay/src/daemon/retained_owner/memory.rs": [
+    "crates/tracedecay-store-runtime/src/retained_memory.rs": [
         "DirectRetainedMemoryPortV1",
         "RetainedMemoryExecutionPortV1",
     ],
-    "crates/tracedecay-application/src/retained_surfaces.rs": [
+    "crates/tracedecay-contracts/src/retained_surfaces.rs": [
         "FactStoreAdd",
         "FactStoreSearch",
         "FactFeedback",
         "MemoryStatus",
+        'OperationId::new(format!("operation.application.{}", operation.as_str()))?',
     ],
     "crates/tracedecay-cli/src/tool_command.rs": [
         "tracedecay_fact_store_add",
@@ -128,9 +145,19 @@ SOURCE_MARKERS = {
         "tracedecay_memory_status",
     ],
     "crates/tracedecay-sdk/src/operations.rs": [
-        "operation.application.fact_store_add",
-        "operation.application.fact_feedback",
-        "operation.application.memory_status",
+        'include!(concat!(env!("OUT_DIR"), "/operations.rs"));',
+    ],
+    "crates/tracedecay-sdk/src/codegen.rs": [
+        "fn canonical_application_registry()",
+        "Ok(sdk_executable_binding_registry()?)",
+    ],
+    "crates/tracedecay-sdk/build.rs": [
+        "codegen::render_rust_operations_source()",
+    ],
+    "crates/tracedecay-contracts/src/sdk_catalog.rs": [
+        "pub fn sdk_executable_binding_registry()",
+        "let mounted = mounted_executable_binding_registries()?",
+        "for contribution in application_catalog_contributions()?",
     ],
     "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs": [
         "execute_retained_memory_curator",
@@ -240,20 +267,16 @@ def validate_paths(repo: Path, document: dict[str, Any], errors: list[str]) -> N
             if marker not in text:
                 errors.append(f"{raw} is missing expected production marker {marker!r}")
 
-    retained = repo / "crates/tracedecay-application/src/retained_surfaces.rs"
+    retained = repo / "crates/tracedecay-contracts/src/retained_surfaces.rs"
     cli = repo / "crates/tracedecay-cli/src/tool_command.rs"
-    sdk = repo / "crates/tracedecay-sdk/src/operations.rs"
-    if retained.is_file() and cli.is_file() and sdk.is_file():
+    if retained.is_file() and cli.is_file():
         retained_text = retained.read_text(encoding="utf-8")
         cli_text = cli.read_text(encoding="utf-8")
-        sdk_text = sdk.read_text(encoding="utf-8")
         for operation in sorted(EXPECTED_OPERATIONS):
-            if f'"{operation}"' not in retained_text:
+            if EXPECTED_CATALOG_OPERATION_MARKERS[operation] not in retained_text:
                 errors.append(f"retained catalog does not expose {operation}")
             if f"tracedecay_{operation}" not in cli_text:
                 errors.append(f"dynamic CLI does not own tracedecay_{operation}")
-            if f"operation.application.{operation}" not in sdk_text:
-                errors.append(f"SDK descriptor is missing operation.application.{operation}")
 
 
 def validate_authorities(document: dict[str, Any], errors: list[str]) -> dict[str, dict[str, Any]]:

@@ -120,3 +120,20 @@ Provider order has no cross-provider authority. Fixed request, state generation,
 ## Final context ownership
 
 The provider cannot inject context or select the final pack. TraceDecay alone validates, normalizes, deduplicates, budgets, formats, explains, and assembles candidates beneath current code, curated rules, accepted Native facts, and admitted session evidence.
+
+For the automatic Native context path, the host/composition owner runs the
+canonical `memory_matches` contribution once and supplies a
+`NativeContextDeliveryMarker` from the provider API. The marker carries the
+selected registration identity and revision, exact scope digest, canonical
+request digest, and canonical contribution digest. TraceDecay verifies those
+bindings and both host-computed digests against the trusted registration /
+composition decision before reusing the delivered contribution; it must not
+issue another Native query for the same request. Constructing the marker is
+data assembly, not authorization. The marker is trusted host metadata and has
+no provider payload, descriptor, display-name, or provider-local receipt input.
+
+This once-delivered rule is separate from generic provider `Recall`, which is a
+read-only advisory operation. Direct retained fact `Search` retains the
+original read followed by retrieval telemetry and its owner-bound receipt when
+it returns hits. Automatic context reads do not gain that explicit-search
+effect, and no generic capability is added for either route.

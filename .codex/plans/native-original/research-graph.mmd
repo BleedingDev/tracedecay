@@ -1,0 +1,40 @@
+flowchart TD
+  subgraph plan_rn_audit_adapter["rn-audit-adapter"]
+    plan_rn_audit_adapter_todo_1["audit-adapter (pending)\nProduce native-adapter.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_data["rn-audit-data"]
+    plan_rn_audit_data_todo_1["audit-data (pending)\nProduce saved-data.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_delivery["rn-audit-delivery"]
+    plan_rn_audit_delivery_todo_1["audit-delivery (pending)\nProduce host-delivery.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_facts["rn-audit-facts"]
+    plan_rn_audit_facts_todo_1["audit-facts (pending)\nProduce native-facts.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_interface["rn-audit-interface"]
+    plan_rn_audit_interface_todo_1["audit-interface (pending)\nProduce core-interface.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_ncm["rn-audit-ncm"]
+    plan_rn_audit_ncm_todo_1["audit-ncm (pending)\nProduce ncm-boundary.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_review["rn-audit-review"]
+    plan_rn_audit_review_todo_1["review-evidence-and-author-graph (pending)\nResolve evidence conflicts, pin the original behavior boundary and validate the final execution plans and Luna Max handoffs."]
+  end
+  subgraph plan_rn_audit_sessions["rn-audit-sessions"]
+    plan_rn_audit_sessions_todo_1["audit-sessions (pending)\nProduce native-sessions.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_source["rn-audit-source"]
+    plan_rn_audit_source_todo_1["audit-source (pending)\nProduce source-baseline.md with source-backed findings and bounded implementation ownership."]
+  end
+  subgraph plan_rn_audit_verification["rn-audit-verification"]
+    plan_rn_audit_verification_todo_1["audit-verification (pending)\nProduce verification.md with source-backed findings and bounded implementation ownership."]
+  end
+  plan_rn_audit_adapter_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_data_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_delivery_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_facts_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_interface_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_ncm_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_sessions_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_source_todo_1 --> plan_rn_audit_review_todo_1
+  plan_rn_audit_verification_todo_1 --> plan_rn_audit_review_todo_1

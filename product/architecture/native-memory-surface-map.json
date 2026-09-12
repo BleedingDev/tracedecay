@@ -2,7 +2,16 @@
   "schema_version": 1,
   "bead_id": "tdmem-0103",
   "title": "TraceDecay V2 Native memory production surface map",
-  "scope": "Coding-agent memory paths on feat/pluggable-memory-providers-v2; provider behavior is unchanged.",
+  "scope": "Coding-agent memory paths on feat/pluggable-memory-providers-v2; Native restoration reference is b3 and provider behavior remains planned. The public_operations list is limited to the 13 retained explicit-fact/memory catalog operations; complete original typed session/LCM/refresh/supersede/background route coverage is in execution-results/native-operation-routes.md from rn-contract.",
+  "source_baseline": {
+    "original_reference": "b3b43410e47115056f2066449aafa1822bbb6049",
+    "audited_product_head": "571daf3a9612e5247443e4da3a107b542686c1ef",
+    "inventory": "product/architecture/native-original-source-inventory.md",
+    "inventory_counts": { "modified_paths": 57, "added_paths": 28, "hunks": 278 },
+    "status": "planned_until_behavioral_verification",
+    "staged_substitute": "provider-state/native/staged-observations-v1.sqlite3 remains stale and untouched; Native does not read, migrate, replay, or reset it",
+    "exact_restoration": "rn-restore-anchor restores crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs to b3 byte-for-byte"
+  },
   "invariants": [
     "FactOwnerV1 is the immutable scope key for every Native fact read and write.",
     "Explicit facts have one canonical writer: the owner-bound Native fact authority.",
@@ -24,9 +33,9 @@
       "read_authority": "The same owner-bound Native store; reads never discover a different path per request.",
       "source_paths": [
         "crates/tracedecay-session-memory/src/memory/mod.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
+        "crates/tracedecay-session-memory/src/fact_store/mod.rs",
         "crates/tracedecay/src/tracedecay/facts.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "prohibited": [
         "provider writes to canonical fact tables",
@@ -47,8 +56,8 @@
       "read_authority": "Native feedback history/status queries over the same store",
       "source_paths": [
         "crates/tracedecay-session-memory/src/memory/project_memory.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-session-memory/src/fact_store/mod.rs",
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "prohibited": [
         "external provider directly changing Native trust",
@@ -67,7 +76,7 @@
       "write_owner": "Daemon automation effect/runner and Native automatic-fact application",
       "read_authority": "Automation receipt and run-ledger readers",
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/automation_run_receipts.rs",
+        "crates/tracedecay-session-memory/src/fact_store/automation_run_receipts.rs",
         "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs",
         "crates/tracedecay/src/daemon/automation_effect.rs"
       ],
@@ -109,7 +118,7 @@
       "write_owner": "Derived graph publication/reconciliation triggered after canonical writes",
       "read_authority": "Generation-pinned relation graph readers",
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay-session-memory/src/fact_store/graph.rs",
         "crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs"
       ],
       "rebuildable": true,
@@ -130,9 +139,9 @@
       "write_owner": "Native store projection code",
       "read_authority": "ProjectMemoryFactStore search/probe/reason/contradiction queries",
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/scoring.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/projection.rs"
+        "crates/tracedecay-session-memory/src/fact_store/search.rs",
+        "crates/tracedecay-session-memory/src/fact_store/scoring.rs",
+        "crates/tracedecay-session-memory/src/fact_store/projection.rs"
       ],
       "rebuildable": true,
       "prohibited": [
@@ -152,7 +161,7 @@
       "write_owner": "None; calculated from authoritative stores and projections",
       "read_authority": "Native memory status/dashboard read APIs",
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/status.rs",
+        "crates/tracedecay-session-memory/src/fact_store/status.rs",
         "crates/tracedecay-dashboard-api/src/memory_api.rs",
         "crates/tracedecay-dashboard-api/src/memory_service"
       ],
@@ -181,7 +190,7 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": true,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
         "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs"
@@ -205,10 +214,10 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": true,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Adds one explicit project/profile fact through the owner-bound memory application."
     },
@@ -229,12 +238,12 @@
       "read_authority": "native_search_projection",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
-      "notes": "Ranks authorized facts using canonical rows plus rebuildable search/graph projections."
+      "notes": "Ranks authorized facts using canonical rows plus rebuildable search/graph projections; canonical_mutation=false only excludes canonical fact mutation. A direct retained nonempty Search still writes the original retrieval telemetry/receipt, while generic automatic reads do not."
     },
     {
       "id": "fact_store_probe",
@@ -253,10 +262,10 @@
       "read_authority": "native_search_projection",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Bounded probe over authorized Native facts."
     },
@@ -277,10 +286,10 @@
       "read_authority": "native_relation_graph",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Uses the verified relation graph as an advisory expansion over canonical facts."
     },
@@ -301,10 +310,10 @@
       "read_authority": "native_search_projection",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Returns supporting Native facts; result is advisory and owner-scoped."
     },
@@ -325,10 +334,10 @@
       "read_authority": "native_search_projection",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Finds bounded contradictions without mutating canonical facts."
     },
@@ -349,10 +358,10 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Reads one owner-validated fact."
     },
@@ -373,10 +382,10 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": true,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Appends an owner-scoped update and lineage receipt."
     },
@@ -397,10 +406,10 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": true,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Appends an owner-scoped removal/tombstone and lineage receipt."
     },
@@ -421,10 +430,10 @@
       "read_authority": "native_explicit_fact_log",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Lists authorized facts with deterministic pagination."
     },
@@ -445,10 +454,10 @@
       "read_authority": "native_feedback_log",
       "canonical_mutation": true,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Records scoped feedback and the resulting trust transition through the same Native store."
     },
@@ -469,10 +478,10 @@
       "read_authority": "native_status_projection",
       "canonical_mutation": false,
       "source_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay-cli/src/tool_command.rs",
         "crates/tracedecay-sdk/src/operations.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs"
+        "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Inspects counts, trust bands, algebra metadata, and feedback funnel as a derived read model."
     }
@@ -484,8 +493,8 @@
       "effect": "mixed",
       "entry": "DirectRetainedMemoryPortV1",
       "source_paths": [
-        "crates/tracedecay/src/daemon/retained_owner/memory.rs",
-        "crates/tracedecay/src/daemon/retained_owner/memory_target.rs",
+        "crates/tracedecay-store-runtime/src/retained_memory.rs",
+        "crates/tracedecay-store-runtime/src/retained_memory/target.rs",
         "crates/tracedecay-session-memory/src/memory_mutation.rs"
       ],
       "write_owner": "native_explicit_fact_log or native_feedback_log",
@@ -530,7 +539,7 @@
       "entry": "session reflector / automatic fact add",
       "source_paths": [
         "crates/tracedecay-session-memory/src/memory/project_memory.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/automatic_facts",
+        "crates/tracedecay-session-memory/src/fact_store/automatic_facts",
         "crates/tracedecay-automation-runtime/src/automation/automatic_facts.rs",
         "crates/tracedecay/tests/automation_runner_test/session_reflector.rs"
       ],
@@ -577,7 +586,7 @@
       "entry": "search/probe/related/reason plus retrieval tracking",
       "source_paths": [
         "crates/tracedecay-session-memory/src/memory/project_memory.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
+        "crates/tracedecay-session-memory/src/fact_store/search.rs",
         "crates/tracedecay-session-memory/src/memory_tracking.rs"
       ],
       "write_owner": "native_feedback_log for access/retrieval telemetry only",
@@ -591,9 +600,9 @@
       "effect": "write",
       "entry": "daemon-owned at-rest privacy rescan",
       "source_paths": [
-        "crates/tracedecay/src/daemon/privacy_remediation.rs",
+        "crates/tracedecay-privacy/src/privacy_remediation.rs",
         "crates/tracedecay-session-memory/src/memory/privacy_remediation.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/privacy_purge.rs"
+        "crates/tracedecay-session-memory/src/fact_store/privacy_purge.rs"
       ],
       "write_owner": "native_explicit_fact_log",
       "read_authority": "native_explicit_fact_log and session_observation_store",
@@ -606,8 +615,8 @@
       "effect": "write",
       "entry": "daemon store maintenance and retention",
       "source_paths": [
-        "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
-        "crates/tracedecay/src/daemon/store_maintenance/graph_replay.rs",
+        "crates/tracedecay-maintenance/src/store_maintenance/mod.rs",
+        "crates/tracedecay-maintenance/src/store_maintenance/graph_replay.rs",
         "crates/tracedecay/src/daemon/maintenance.rs"
       ],
       "write_owner": "retained Native database/runtime owners",
@@ -621,8 +630,8 @@
       "effect": "write",
       "entry": "post-commit graph publication and daemon reconciliation tasks",
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/mod.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay-session-memory/src/fact_store/mod.rs",
+        "crates/tracedecay-session-memory/src/fact_store/graph.rs",
         "crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs"
       ],
       "write_owner": "native_relation_graph",
@@ -638,7 +647,7 @@
       "source_paths": [
         "crates/tracedecay-sdk/src/operations.rs",
         "crates/tracedecay-sdk/src/client.rs",
-        "crates/tracedecay-application/src/retained_surfaces.rs"
+        "crates/tracedecay-contracts/src/retained_surfaces.rs"
       ],
       "write_owner": "none; transport only",
       "read_authority": "daemon retained application route",
@@ -653,7 +662,7 @@
       "rebuildable": true,
       "canonical": false,
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/graph.rs",
+        "crates/tracedecay-session-memory/src/fact_store/graph.rs",
         "crates/tracedecay-dashboard-api/src/memory_service/graph.rs"
       ]
     },
@@ -663,8 +672,8 @@
       "rebuildable": true,
       "canonical": false,
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/search.rs",
-        "crates/tracedecay-runtime-core/src/store/memory/scoring.rs"
+        "crates/tracedecay-session-memory/src/fact_store/search.rs",
+        "crates/tracedecay-session-memory/src/fact_store/scoring.rs"
       ]
     },
     {
@@ -673,7 +682,7 @@
       "rebuildable": true,
       "canonical": false,
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/projection.rs",
+        "crates/tracedecay-session-memory/src/fact_store/projection.rs",
         "crates/tracedecay-dashboard-api/src/memory_service/projection.rs"
       ]
     },
@@ -693,7 +702,7 @@
       "rebuildable": true,
       "canonical": false,
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/status.rs",
+        "crates/tracedecay-session-memory/src/fact_store/status.rs",
         "crates/tracedecay-dashboard-api/src/memory_api.rs"
       ]
     },
@@ -703,8 +712,8 @@
       "rebuildable": true,
       "canonical": false,
       "source_paths": [
-        "crates/tracedecay-runtime-core/src/store/memory/automatic_facts",
-        "crates/tracedecay-runtime-core/src/store/memory/automation_run_receipts.rs"
+        "crates/tracedecay-session-memory/src/fact_store/automatic_facts",
+        "crates/tracedecay-session-memory/src/fact_store/automation_run_receipts.rs"
       ]
     }
   ],
@@ -775,7 +784,7 @@
       "invasiveness": "medium",
       "recommendation": "required_product_composition_mount",
       "mount_paths": [
-        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs",
         "crates/tracedecay/src/daemon/project_composition.rs",
         "crates/tracedecay/src/daemon/retained_owner.rs"
       ],
@@ -797,7 +806,7 @@
       "recommendation": "rejected",
       "mount_paths": [
         "crates/tracedecay-store/src/memory",
-        "crates/tracedecay-runtime-core/src/store/memory/mod.rs"
+        "crates/tracedecay-session-memory/src/fact_store/mod.rs"
       ],
       "allowed_side_effects": [],
       "prohibited_side_effects": [

@@ -34,6 +34,7 @@ pub mod contract;
 
 mod advisory;
 mod advisory_admission;
+mod context_delivery;
 mod hygiene;
 
 pub use advisory::{
@@ -46,6 +47,11 @@ pub use advisory::{
 pub use advisory_admission::{
     AdvisoryAdmissionAuthority, AdvisoryAdmissionError, AdvisoryCallBinding,
     CurrentAdvisoryAdmission, CurrentRestoreAdmission, MAX_ADVISORY_ADMISSION_SOURCES,
+};
+
+pub use context_delivery::{
+    NATIVE_CONTEXT_DELIVERY_OPERATION_ID, NATIVE_CONTEXT_DELIVERY_ROUTE_ID,
+    NativeContextDeliveryMarker,
 };
 
 pub use hygiene::{
@@ -228,6 +234,9 @@ pub enum ApiError {
     SanitizationRedactedPayloadUnmodified,
     /// A persisted sanitization receipt could not be parsed back.
     MalformedSanitizationReceiptJson(&'static str),
+    /// A once-delivered Native context marker did not match the host-selected
+    /// registration, exact scope, or canonical request.
+    NativeContextDeliveryBindingMismatch(&'static str),
 }
 
 impl fmt::Display for ApiError {
@@ -403,6 +412,10 @@ impl fmt::Display for ApiError {
                     "sanitization receipt json is malformed at {part}"
                 )
             }
+            Self::NativeContextDeliveryBindingMismatch(field) => write!(
+                formatter,
+                "once-delivered Native context marker does not match host binding {field}"
+            ),
         }
     }
 }

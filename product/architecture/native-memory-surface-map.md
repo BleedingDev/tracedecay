@@ -2,11 +2,11 @@
 
 Bead: `tdmem-0103`
 
-Machine-readable authority: [`native-memory-surface-map.json`](./native-memory-surface-map.json).
+Machine-readable authority: [`native-memory-surface-map.json`](./native-memory-surface-map.json). The exhaustive b3-to-head hunk ledger is [`native-original-source-inventory.md`](./native-original-source-inventory.md).
 
 ## Scope
 
-This map covers production memory behavior used by coding agents on `feat/pluggable-memory-providers-v2`. It records the current Native implementation before a provider boundary changes runtime behavior.
+This map covers production memory behavior used by coding agents on `feat/pluggable-memory-providers-v2`. The fixed Native restoration reference is b3 (`b3b43410e47115056f2066449aafa1822bbb6049`), while the audited product head is `571daf3a9612e5247443e4da3a107b542686c1ef`. The provider boundary remains planned until its behavioral gates pass.
 
 The governing rules are:
 
@@ -15,6 +15,15 @@ The governing rules are:
 3. Session observations and LCM history are separate canonical domains. They are evidence, not accepted explicit facts.
 4. Search scores, FHRR vectors, trust summaries, dashboard payloads, and the Grafeo relation graph are derived and rebuildable.
 5. External cognitive-provider recall is advisory. It cannot silently mutate Native facts or current-code truth.
+
+## Baseline and restoration status
+
+- **Original Native reference:** b3 (`b3b43410e47115056f2066449aafa1822bbb6049`), the upstream side of the product merge. The complete `tracedecay-session-memory/src/fact_store/**`, `src/memory/**`, LCM, store/memory contracts, memory-v2, and facts authorities are the original implementation and remain protected.
+- **Product extensions:** existing host admission, provenance, cursor, transcript, configuration, storage, privacy, maintenance, and provider-composition changes are retained as separate extensions. They are not claimed to be byte-identical to b3.
+- **Shared privacy exception:** the direct Native and LCM source files have no scoped hunks, but their sanitization reaches the changed `tracedecay-privacy::detector_kernel::looks_high_entropy_token` algorithm. Its exact `-sha256-<64 lowercase hex>` suffix peeling is an escalated original algorithm delta; Native memory hygiene and LCM callers remain unaccepted until that algorithm is restored exactly or isolated behind a reviewed product boundary.
+- **Exact restoration:** `crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs` has one authorized b3 restoration, owned by rn-restore-anchor. No adapter may replace an original Native algorithm.
+- **Staged substitute:** `provider-state/native/staged-observations-v1.sqlite3` and its sidecars are provider-local stale bytes. Removing the staged Native route leaves them untouched and does not read, migrate, replay, or reset them.
+- **Verification status:** planned. The map records required checks; it does not claim that the restoration or parity suites have passed.
 
 ## Authority matrix
 
@@ -31,9 +40,9 @@ The governing rules are:
 Primary ownership code:
 
 - `crates/tracedecay-session-memory/src/memory/mod.rs`
-- `crates/tracedecay-runtime-core/src/store/memory/mod.rs`
+- `crates/tracedecay-session-memory/src/fact_store/mod.rs`
 - `crates/tracedecay/src/tracedecay/facts.rs`
-- `crates/tracedecay/src/daemon/retained_owner/memory.rs`
+- `crates/tracedecay-store-runtime/src/retained_memory.rs`
 
 ## Public production entry points
 
@@ -55,15 +64,28 @@ The retained application catalog is the operation authority. HTTP, MCP, dynamic 
 | `fact_feedback` | Administrative | `/application/retained/fact_feedback` | `tracedecay_fact_feedback` | `tracedecay tool fact_feedback` | Native feedback authority |
 | `memory_status` | Read | `/application/retained/memory_status` | `tracedecay_memory_status` | `tracedecay tool memory_status` | Derived Native status projection |
 
+The machine-readable `public_operations` list in
+`native-memory-surface-map.json` is intentionally limited to these 13 retained
+explicit-fact/memory catalog operations. It is not a complete
+list of the original typed session, LCM, refresh, supersede, or background
+operations. Complete original route coverage is recorded in
+`execution-results/native-operation-routes.md` from rn-contract; do not expand
+this list or duplicate that route catalog here.
+
+`canonical_mutation=false` means that an operation does not mutate canonical
+fact state; it does not mean that the operation has no telemetry effect. A
+direct retained nonempty `fact_store_search` writes the original retrieval
+telemetry/receipt, whereas generic automatic reads do not.
+
 SDK operation IDs are `operation.application.<operation>` and use the generated descriptors in `crates/tracedecay-sdk/src/operations.rs`.
 
 Transport and dispatch ownership:
 
-1. `crates/tracedecay-application/src/retained_surfaces.rs` defines catalog operations, schemas, effects, deadlines, terminal states, and public HTTP bindings.
+1. `crates/tracedecay-contracts/src/retained_surfaces.rs` defines catalog operations, schemas, effects, deadlines, terminal states, and public HTTP bindings.
 2. `crates/tracedecay-cli/src/tool_command.rs` resolves dynamic CLI names through the same catalog and daemon route.
 3. MCP resolves the same named bindings through the root MCP dispatcher.
 4. `crates/tracedecay-sdk/src/operations.rs` and `client.rs` invoke the daemon-owned HTTP binding.
-5. `crates/tracedecay/src/daemon/retained_owner/memory.rs` selects the exact project/profile authority and executes the memory application.
+5. `crates/tracedecay-store-runtime/src/retained_memory.rs` selects the exact project/profile authority and executes the memory application.
 
 ## Call paths
 
@@ -79,7 +101,6 @@ HTTP | MCP | CLI | SDK
   → append-only fact, lineage, provenance, durable receipt
   → derived graph publication/reconciliation trigger
 ```
-
 Stable logical operation identity is derived before retriable writes. Deadline, cancellation, commit admission, terminal outcome, and reconciliation remain explicit.
 
 ### Search/probe/related/reason/contradict/list/get
@@ -125,11 +146,11 @@ Session-reflector/automatic-fact paths may promote evidence only through idempot
 
 ### Privacy and maintenance
 
-- `crates/tracedecay/src/daemon/privacy_remediation.rs` performs bounded, receipt-backed quarantine/purge against retained Native/session authorities after admission.
-- `crates/tracedecay/src/daemon/store_maintenance/` owns repair, replay, retention, and store lifecycle work.
+- `crates/tracedecay-privacy/src/privacy_remediation.rs` performs bounded, receipt-backed quarantine/purge against retained Native/session authorities after admission.
+- `crates/tracedecay-maintenance/src/store_maintenance/` owns repair, replay, retention, and store lifecycle work.
 - `crates/tracedecay-store-runtime/src/session_registry/memory_graph_reconciliation_tasks.rs` owns cancellation, shutdown, and retirement of rebuildable graph workers.
 
-These are Native administrative responsibilities, not cognitive-provider extension points.
+These are Native administrative responsibilities, not cognitive-provider extension points. Provider controls with no lossless Native mapping use typed `capability_unsupported`; generic unmatched controls do not become fake Native operations.
 
 ## Canonical versus generated/derived
 

@@ -1040,6 +1040,29 @@ fn namespace_isolates_worktree_branch_and_session() {
 }
 
 #[test]
+fn namespace_isolates_profile_project_repository_and_resolved_scope_digest() {
+    let original = scope();
+    let mut changed_profile = original.clone();
+    changed_profile.profile_id = "profile-b".to_owned();
+    let mut changed_project = original.clone();
+    changed_project.project_id = "project-b".to_owned();
+    let mut changed_repository = original.clone();
+    changed_repository.repository_identity = "repository-b".to_owned();
+    let mut changed_resolved_scope = original.clone();
+    changed_resolved_scope.resolved_scope_digest = format!("sha256:{PROVIDER_RECEIPT_SHA}");
+    let values = [
+        NcmNamespace::from_exact_scope(&original),
+        NcmNamespace::from_exact_scope(&changed_profile),
+        NcmNamespace::from_exact_scope(&changed_project),
+        NcmNamespace::from_exact_scope(&changed_repository),
+        NcmNamespace::from_exact_scope(&changed_resolved_scope),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(values.len(), 5);
+}
+
+#[test]
 fn handshake_exposes_only_namespace_to_surface_and_reattaches_scope() {
     let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
     let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");

@@ -74,7 +74,8 @@ use tracedecay_domain::{
 use tracedecay_memory_hygiene::{
     AdvisoryMetadataAdmissionV1, AdvisoryMetadataFieldV1, AdvisoryTextAdmissionV1,
     AdvisoryTextHardener, AdvisoryTextWithheldReasonV1, AdvisoryTrustTierV1, HygieneError,
-    ObservationAdmission, ObservationSanitizer, UNTRUSTED_BOUNDARY_LABEL, canonical_payload_bytes,
+    ObservationAdmission, ObservationSanitizer, TrustedClaudeObservationSourceIdV1,
+    UNTRUSTED_BOUNDARY_LABEL, canonical_payload_bytes,
 };
 use tracedecay_memory_observation::{
     AdapterFailureV1, AdmissionDecisionV1, AdmittedObservationV1, AttemptRefusalCategoryV1,
@@ -1146,7 +1147,7 @@ impl CanonicalObservationAdmissionAdapterV1 {
             SESSION_MESSAGE_PAYLOAD_CONTRACT,
             &message_payload,
         );
-        if let Some(history) = history {
+        let trusted_history_source = if let Some(history) = history {
             let attribution = super::provider_history::validate_history_record(history, stored)
                 .map_err(AdmissionAdapterError::History)?;
             envelope["source_identity"] = serde_json::json!({
@@ -1155,7 +1156,13 @@ impl CanonicalObservationAdmissionAdapterV1 {
             });
             envelope["history_grant"] = super::provider_history::history_grant_json(history)
                 .map_err(AdmissionAdapterError::History)?;
-        }
+            TrustedClaudeObservationSourceIdV1::from_validated_source(
+                attribution.source.canonical_provider_id.as_str(),
+                &attribution.source.source_key,
+            )
+        } else {
+            None
+        };
         // A settled record whose *shape* hygiene will not walk — nested or
         // sized beyond the ceilings the store itself never lets a record reach
         // — has been classified as nothing, so it is withheld under a typed
@@ -1163,9 +1170,13 @@ impl CanonicalObservationAdmissionAdapterV1 {
         // cursor on evidence the host already settled and repeat on every
         // open. Every other hygiene error stays a refusal, because a detector
         // fault must keep failing closed and a caller bug must stay visible.
-        let admission = context
-            .sanitizer
-            .admit_observation(&envelope, &[])
+        let admission_result = match trusted_history_source.as_ref() {
+            Some(trusted_source) => context
+                .sanitizer
+                .admit_observation_with_trusted_history_source(&envelope, &[], trusted_source),
+            None => context.sanitizer.admit_observation(&envelope, &[]),
+        };
+        let admission = admission_result
             .or_else(|error| {
                 let terminal = context
                     .sanitizer

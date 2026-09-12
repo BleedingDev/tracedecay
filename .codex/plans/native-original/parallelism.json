@@ -1,0 +1,54 @@
+{
+  "topological_waves": [
+    [
+      "rn-ncm-tests",
+      "rn-reference",
+      "rn-source-docs"
+    ],
+    [
+      "rn-build-reference",
+      "rn-contract",
+      "rn-restore-anchor"
+    ],
+    [
+      "rn-cases-facts",
+      "rn-cases-sessions",
+      "rn-cases-state",
+      "rn-fabric",
+      "rn-host-fixtures",
+      "rn-native-port"
+    ],
+    [
+      "rn-host-context",
+      "rn-native-bridge",
+      "rn-registry",
+      "rn-session-delivery"
+    ],
+    [
+      "rn-native-tests"
+    ],
+    [
+      "rn-composition"
+    ],
+    [
+      "rn-build"
+    ],
+    [
+      "rn-verify-claude",
+      "rn-verify-codex",
+      "rn-verify-facts",
+      "rn-verify-ncm",
+      "rn-verify-sessions",
+      "rn-verify-state"
+    ],
+    [
+      "rn-review-fidelity",
+      "rn-review-integration"
+    ],
+    [
+      "rn-close"
+    ]
+  ],
+  "maximum_independent_nodes": 12,
+  "longest_dependency_chain_nodes": 10
+}

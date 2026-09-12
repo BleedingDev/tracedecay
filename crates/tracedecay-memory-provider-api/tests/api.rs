@@ -11,12 +11,12 @@ use tracedecay_memory_provider_api::{
     ApiError, CancellationToken, CanonicalPayload, CommittedEffectEvidence,
     CommittedEffectEvidenceParts, FallbackDirective, HandshakeRequest, HandshakeRequestParts,
     HandshakeResponse, MAX_COMMITTED_EFFECT_ITEM_REF_BYTES, MAX_COMMITTED_EFFECT_ITEM_REFS,
-    MemoryProvider, OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX, OperationControl, OwnedExactScope,
-    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
-    PayloadSanitizationReceiptParts, PinnedFallbackPolicy, ProviderCall, ProviderCallParts,
-    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, SanitizationDisposition,
-    TerminalRecord, UNKNOWN_EFFECT_RECONCILIATION_ACTION, WithheldReason,
-    empty_opaque_extensions_digest, opaque_extensions_digest,
+    MemoryProvider, NativeContextDeliveryMarker, OBSERVATION_HYGIENE_RECEIPT_ID_PREFIX,
+    OperationControl, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId,
+    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, PinnedFallbackPolicy,
+    ProviderCall, ProviderCallParts, ProviderDescriptor, ProviderLimits, ProviderOperation,
+    ProviderReply, SanitizationDisposition, TerminalRecord, UNKNOWN_EFFECT_RECONCILIATION_ACTION,
+    WithheldReason, empty_opaque_extensions_digest, opaque_extensions_digest,
 };
 
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -2304,4 +2304,98 @@ fn withheld_reasons_and_dispositions_have_stable_wire_spellings() {
     );
     assert_eq!(WithheldReason::from_wire("accepted"), None);
     assert_eq!(WithheldReason::from_wire("payload_too_large"), None);
+}
+
+#[test]
+fn native_context_delivery_marker_is_bound_to_host_registration_and_request() -> Result<(), ApiError>
+{
+    let provider = provider_id()?;
+    let exact_scope = scope()?;
+    let marker = NativeContextDeliveryMarker::from_host_registration(
+        provider.clone(),
+        9,
+        &exact_scope,
+        DIGEST,
+        ALT_DIGEST,
+    )?;
+
+    assert_eq!(
+        marker.route_id(),
+        "tracedecay.memory.native.context-delivery.v1"
+    );
+    assert_eq!(marker.operation_id(), "memory_matches");
+    assert_eq!(marker.selected_provider_id(), &provider);
+    assert_eq!(marker.registration_revision(), 9);
+    assert_eq!(
+        marker.exact_scope_sha256(),
+        exact_scope.exact_scope_sha256()
+    );
+    assert_eq!(marker.canonical_request_sha256(), DIGEST);
+    assert_eq!(marker.canonical_contribution_sha256(), ALT_DIGEST);
+    marker.verify_for(&provider, 9, &exact_scope, DIGEST, ALT_DIGEST)?;
+
+    let other_provider = OwnedProviderId::new("other.provider")?;
+    assert_eq!(
+        marker.verify_for(&other_provider, 9, &exact_scope, DIGEST, ALT_DIGEST),
+        Err(ApiError::NativeContextDeliveryBindingMismatch(
+            "selected_provider_id"
+        ))
+    );
+    assert_eq!(
+        marker.verify_for(&provider, 10, &exact_scope, DIGEST, ALT_DIGEST),
+        Err(ApiError::NativeContextDeliveryBindingMismatch(
+            "registration_revision"
+        ))
+    );
+
+    let mut other_scope = exact_scope.clone();
+    other_scope.branch_identity = "refs/heads/release".to_owned();
+    assert_eq!(
+        marker.verify_for(&provider, 9, &other_scope, DIGEST, ALT_DIGEST),
+        Err(ApiError::NativeContextDeliveryBindingMismatch(
+            "exact_scope_sha256"
+        ))
+    );
+    assert_eq!(
+        marker.verify_for(&provider, 9, &exact_scope, ALT_DIGEST, ALT_DIGEST),
+        Err(ApiError::NativeContextDeliveryBindingMismatch(
+            "canonical_request_sha256"
+        ))
+    );
+    assert_eq!(
+        marker.verify_for(&provider, 9, &exact_scope, DIGEST, DIGEST),
+        Err(ApiError::NativeContextDeliveryBindingMismatch(
+            "canonical_contribution_sha256"
+        ))
+    );
+    Ok(())
+}
+
+#[test]
+fn native_context_delivery_marker_requires_canonical_digests_and_revision() -> Result<(), ApiError>
+{
+    let exact_scope = scope()?;
+    assert_eq!(
+        NativeContextDeliveryMarker::from_host_registration(
+            provider_id()?,
+            0,
+            &exact_scope,
+            DIGEST,
+            ALT_DIGEST,
+        ),
+        Err(ApiError::InvalidRegistrationRevision)
+    );
+    assert_eq!(
+        NativeContextDeliveryMarker::from_host_registration(
+            provider_id()?,
+            1,
+            &exact_scope,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ALT_DIGEST,
+        ),
+        Err(ApiError::InvalidSha256(
+            "native_context.canonical_request_sha256"
+        ))
+    );
+    Ok(())
 }

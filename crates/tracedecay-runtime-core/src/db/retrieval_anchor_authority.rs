@@ -509,34 +509,10 @@ impl RetrievalAnchorDispositionStore for super::Database {
         Output = RetrievalAnchorStoreResult<Option<RetrievalAnchorDispositionRecordV1>>,
     > + Send {
         async move {
-            let owner_text = owner_json(owner).map_err(store_error)?;
-            let connection = self.read_connection();
-            let mut rows = connection
-                .query(
-                    "SELECT record_json FROM retrieval_anchor_dispositions
-                     WHERE anchor_id = ?1 AND owner_json = ?2
-                     ORDER BY sequence DESC LIMIT 1",
-                    params![anchor_id.as_str(), owner_text.as_str()],
-                )
+            self.retrieval_anchor_disposition_history(owner, anchor_id)
                 .await
-                .map_err(|error| store_error(database_error(error)))?;
-            let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| store_error(database_error(error)))?
-            else {
-                return Ok(None);
-            };
-            let json = row
-                .get::<String>(0)
-                .map_err(|error| store_error(database_error(error)))?;
-            let record: RetrievalAnchorDispositionRecordV1 =
-                serde_json::from_str(&json).map_err(|error| store_error(database_error(error)))?;
-            record.validate()?;
-            if record.anchor_id() != anchor_id || record.owner() != owner {
-                return Err(RetrievalAnchorStoreError::Unavailable);
-            }
-            Ok(Some(record))
+                .map(|history| history.into_iter().last())
+                .map_err(store_error)
         }
     }
 

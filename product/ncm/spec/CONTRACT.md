@@ -62,7 +62,7 @@ the provider id.
 | DeleteBySource | fence → rebuild excluding revoked sources → atomic publish + epoch bump | yes | as Observe |
 | SnapshotExport | versioned export (state + capsules + epoch; **not** the revocation authority) | no | – |
 | SnapshotRestore | verify identity, apply current revocations (refuse/strip revoked sources), epoch bump | yes | as Observe |
-| Replay | typed `Unsupported` in v1 | – | – |
+| Replay | canonical page replay: apply admitted observations; fence blocked sources and rebuild; report duplicates, conflicts, gaps and partial progress | yes for applied observations, blocked-source fences/rebuilds and page receipts; a retained no-change page is read-only | page key + canonical page digest; each delivery key + item digest; same key/digest returns the retained receipt, otherwise `Conflict` |
 
 Idempotency row = `(namespace, idempotency_key) → (payload_sha256, receipt, commit_seq)`.
 Same key + same digest ⇒ replay receipt, zero effect. Same key + different digest ⇒ `Conflict`.

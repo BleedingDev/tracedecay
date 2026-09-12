@@ -1,0 +1,191 @@
+{
+  "id": "fact-search-after-independent-seed",
+  "classification": "original_native",
+  "description": "Seed one explicit fact through each public route, then search it and inspect the durable result after a fresh process.",
+  "project_root": "project",
+  "profile_root": "profile",
+  "state_root": "state",
+  "fixtures": {
+    "seed": "The comparison runner must seed original and product independently; no database or receipt is copied between sides.",
+    "identity_mapping": "fact_id is a side-local generated identity and is consumed through an explicit output binding."
+  },
+  "side_setup": {
+    "original": [
+      {
+        "id": "seed-fact",
+        "route": "fact_store_add",
+        "entrypoint": "cli_tool",
+        "request": {
+          "content": "Native comparison fixture: explicit fact seed",
+          "category": "decision"
+        },
+        "output_bindings": {
+          "fact_id": "/result/fact/id"
+        }
+      }
+    ],
+    "product": [
+      {
+        "id": "seed-fact",
+        "route": "fact_store_add",
+        "entrypoint": "cli_tool",
+        "request": {
+          "content": "Native comparison fixture: explicit fact seed",
+          "category": "decision"
+        },
+        "output_bindings": {
+          "fact_id": "/result/fact/id"
+        }
+      }
+    ]
+  },
+  "composition_proof": {
+    "original": {
+      "id": "prove-original-native",
+      "route": "memory_status",
+      "entrypoint": "cli_tool",
+      "request": {},
+      "required_json_pointers": [
+        "/memory/owner/kind",
+        "/memory/algebra/name"
+      ],
+      "equals": {
+        "/memory/owner/kind": "project",
+        "/memory/algebra/name": "amari_fhrr"
+      }
+    },
+    "product": {
+      "checks": [
+        {
+          "id": "prove-product-native-selection",
+          "route": "configuration_get",
+          "entrypoint": "cli_tool",
+          "request": {
+            "key": "memory.provider_recall_routing.v1"
+          },
+          "required_json_pointers": [
+            "/outcome/value/payload/effective_value/value"
+          ],
+          "equals": {
+            "/outcome/value/payload/effective_value/value": "{\"active_provider\":\"tracedecay.native\",\"fallback\":null,\"degradation\":null}"
+          }
+        },
+        {
+          "id": "prove-product-native-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {},
+          "required_json_pointers": [
+            "/memory/owner/kind",
+            "/memory/algebra/name"
+          ],
+          "equals": {
+            "/memory/owner/kind": "project",
+            "/memory/algebra/name": "amari_fhrr"
+          }
+        }
+      ]
+    }
+  },
+  "lifecycle": {
+    "require_owned_close": true,
+    "close": {
+      "original": {
+        "mode": "process_exit"
+      },
+      "product": {
+        "mode": "process_exit"
+      }
+    },
+    "reopen": {
+      "original": {
+        "mode": "action",
+        "action": {
+          "id": "reopen-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {}
+        }
+      },
+      "product": {
+        "mode": "action",
+        "action": {
+          "id": "reopen-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {}
+        }
+      }
+    }
+  },
+  "actions": [
+    {
+      "id": "search-seeded-fact",
+      "route": "fact_store_search",
+      "entrypoint": "cli_tool",
+      "request": {
+        "query": "Native comparison fixture",
+        "limit": 10
+      },
+      "comparison": {
+        "semantic_json_pointers": [
+          "/result/owner",
+          "/result/hits",
+          "/result/next_after",
+          "/result/graph_coverage",
+          "/result/retrieval_telemetry"
+        ],
+        "required_json_pointers": [
+          "/result/hits",
+          "/result/retrieval_telemetry"
+        ]
+      },
+      "checkpoints": {
+        "before": {
+          "id": "before-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {}
+        },
+        "after": {
+          "id": "after-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {}
+        },
+        "reopened": {
+          "id": "reopened-status",
+          "route": "memory_status",
+          "entrypoint": "cli_tool",
+          "request": {}
+        }
+      }
+    },
+    {
+      "id": "get-seeded-fact",
+      "route": "fact_store_get",
+      "entrypoint": "cli_tool",
+      "request": {
+        "id": "${bindings.fact_id}"
+      },
+      "comparison": {
+        "semantic_json_pointers": [
+          "/result/fact/content",
+          "/result/fact/category",
+          "/result/trust_history"
+        ],
+        "required_json_pointers": [
+          "/result/fact/content",
+          "/result/trust_history"
+        ],
+        "identity_mappings": [
+          {
+            "name": "seed_fact_id",
+            "original_pointer": "/result/fact/id",
+            "product_pointer": "/result/fact/id"
+          }
+        ]
+      }
+    }
+  ]
+}

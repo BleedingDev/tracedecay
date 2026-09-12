@@ -1,0 +1,5 @@
+# rn-restore-anchor — root acceptance
+
+Exact sole-method restoration accepted 2026-09-11. Root reviewed full diff and independently ran git diff --exit-code b3b43410e47115056f2066449aafa1822bbb6049 -- crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs: empty, exit0. Whole file equals b3 blob d976e2a23c19441a60412420a1db5e68f7ccc5ca. Original full disposition history is read/validated before selecting its last record; no alternate optimization remains.
+
+Worker supplied existing focused runtime-core filters: db::retrieval_anchor_authority::tests::{disposition_replay_survives_restart_without_resurrection,deletion_tombstones_reverse_lineage_for_every_derivative_kind,retained_direct_evidence_keeps_a_derivative_servable,only_active_direct_evidence_can_serve_a_derivative,production_authority_preserves_history_and_suppresses_superseded_sources}. Execution deferred to designated build owner; no Cargo run in this node. Facts comparison fixtures derive expected behavior independently from b3.
