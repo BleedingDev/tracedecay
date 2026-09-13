@@ -39,3 +39,17 @@ Depends on rn-acceptance-matrix; gates rn-semantic-fix. Return a concrete transi
 ## Current dependency contract
 
 Prerequisites: rn-acceptance-matrix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+
+## Fixture lane update
+
+The exact JinaEmbeddingsV2BaseCode fixture for revision
+`516f4baf13dec4ddddda8631e019b5737c8bc250` has been acquired with the
+project-supported `tests/distribution/fastembed/prepare_fixture.py` contract
+and validated with `validate_fixture.py`. It is isolated at
+`target/test-profile/readiness/semantic/diagnose/jina-516f4baf13dec4ddddda8631e019b5737c8bc250`.
+The complete lengths, SHA-256 values, commands, and absolute root are in
+`execution-results/semantic-diagnosis.md` and the adjacent
+`target/.../fixture-verification.json` artifact. The dynamic todo remains
+pending until a designated candidate build/runtime owner uses this fixture to
+run acquisition, activation, strict serving, and restart evidence with offline
+runtime flags.

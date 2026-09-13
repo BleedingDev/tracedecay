@@ -91,12 +91,53 @@ The checked-in manifest is metadata, not a payload. It pins:
 - upstream https://huggingface.co/jinaai/jina-embeddings-v2-base-code,
   Apache-2.0
 
-The five payload members are absent from the checkout and from the inspected
-Hugging Face cache. The only ordinary user-cache model found was the
+Before this fixture lane ran, the five payload members were absent from the
+checkout and from the inspected Hugging Face cache. The only ordinary
+user-cache model found was the
 476 MB sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 tree.
 The separately inventoried 465 MB NCM MiniLM tree is also ineligible: neither
 model is the cataloged Jina FastEmbed artifact and neither can prove strict
-Jina semantic acceptance. No cache was changed and no download was attempted.
+Jina semantic acceptance. That pre-provisioning diagnosis did not change a
+cache or attempt a download.
+
+## Exact fixture provisioning evidence
+
+The exact real fixture is now materialized at:
+
+    target/test-profile/readiness/semantic/diagnose/jina-516f4baf13dec4ddddda8631e019b5737c8bc250
+
+The fixture was acquired with the checked-in preparation contract, which
+fetches each member from the immutable Hugging Face revision into a staging
+directory, verifies its declared length and SHA-256, and atomically renames
+the completed directory into place:
+
+    python3 -S -B tests/distribution/fastembed/prepare_fixture.py \
+      tests/distribution/fastembed \
+      target/test-profile/readiness/semantic/diagnose/jina-516f4baf13dec4ddddda8631e019b5737c8bc250
+
+The checked-in validator passed with `768 8192`:
+
+    python3 -S -B tests/distribution/fastembed/validate_fixture.py \
+      target/test-profile/readiness/semantic/diagnose/jina-516f4baf13dec4ddddda8631e019b5737c8bc250
+
+Independent `stat` and `shasum -a 256` verification produced these exact
+member values:
+
+| Role | Relative path | Length | SHA-256 |
+| --- | --- | ---: | --- |
+| model | model.onnx | 641517466 | `63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b` |
+| tokenizer | tokenizer.json | 2561316 | `b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5` |
+| config | config.json | 1216 | `e426aa684c7f9a95c5f020aa855faf93a24f065f5fad0c9e17b124670cabdea6` |
+| special_tokens_map | special_tokens_map.json | 280 | `06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f` |
+| tokenizer_config | tokenizer_config.json | 493 | `f477aeb15ff9f78d3c1ddf2361d2b0b8b20cf55220f839f29a37f3a18efddd89` |
+
+All five members and `fixture.json` are regular files; the fixture directory
+contains no symlinks. The machine-readable verification record, including the
+manifest hash and exact absolute fixture root, is at
+`target/test-profile/readiness/semantic/diagnose/jina-516f4baf13dec4ddddda8631e019b5737c8bc250/fixture-verification.json`.
+The fixture is ready for the designated candidate build/runtime owner. It
+must be passed through `TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE` and used
+with `CARGO_NET_OFFLINE=true HF_HUB_OFFLINE=1` during runtime acceptance.
 
 ## Transition trace
 
@@ -333,16 +374,20 @@ Public MCP does not serialize that exact-flat evidence or all of those pinned
 generation fields, so a semantic status and contribution alone are
 insufficient evidence of the true serving route.
 
-No dynamic run of validation-015 was possible in this diagnosis because the
-current candidate binary and verified Jina fixture are absent. The
-reproduce-semantic-states plan todo remains pending.
+No dynamic run of validation-015 was assigned to this no-Cargo fixture lane.
+The verified Jina fixture is now available at the isolated root above; the
+reproduce-semantic-states plan todo remains pending until the designated
+build/runtime owner runs the fresh, provisioned, activated, and restart cases
+against an executable whose source identity is captured for the run.
 
 ## Plan status
 
-- reproduce-semantic-states: pending — no current candidate binary,
-  materialized verified Jina fixture, isolated provisioned profile, restart,
-  or true semantic result was available. The old smoke is pre-acquisition and
-  has no current source identity.
+- reproduce-semantic-states: pending — the exact verified Jina fixture is now
+  materialized at the isolated readiness root above, but no candidate runtime
+  execution, isolated provisioned profile, restart, or true semantic result
+  was assigned to this lane. The old smoke is pre-acquisition and has no
+  current source identity; the dynamic cases remain assigned to the
+  build/runtime owner.
 - trace-semantic-activation: complete — the observed pre-acquisition chain
   and every downstream source guard through authority mount/restart/true
   evidence are recorded; the dynamic stages are explicitly blocked.
