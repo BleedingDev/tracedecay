@@ -4,13 +4,13 @@ overview: "Reproduce intermittent NCM recall with stage-by-stage evidence"
 todos:
   - id: recover-original-misses
     content: "Recover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope."
-    status: pending
+    status: completed
   - id: trace-first-loss
     content: "Reproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data."
     status: pending
   - id: add-failing-regression
     content: "Reduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline."
-    status: pending
+    status: completed
 isProject: false
 ---
 
