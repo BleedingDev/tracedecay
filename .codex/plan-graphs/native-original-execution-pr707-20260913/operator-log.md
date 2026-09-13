@@ -66,3 +66,26 @@
 | Semantic smoke receipts | `/root/semantic_smoke_receipt_scout` | read-only | supports diagnose | running | Correlate observed timeline |
 | Native operation-map checker | `/root/native_operation_map_checker` | read-only | supports matrix | complete | Corrected 570 public/internal routes and missing operations |
 | Pilot setup | `/root/pilot_setup_scout` | read-only | supports release | complete | Mapped isolated profile, readiness, and rollback contract |
+
+## Wave 2 lanes
+
+Launched from accepted checkpoint `f6d9bdf7073de9a25994b71e638fc1ff6013e4b0`. All lanes use `gpt-5.6-luna` with `reasoning_effort=max`, remain leaf agents, share the single active branch/worktree, and may not commit or push.
+
+| Lane | Agent | Owner / write scope | Status |
+| --- | --- | --- | --- |
+| rn-ncm-reproduce | `/root/rn_ncm_reproduce_owner` | Three new reproduction tests plus `execution-results/ncm-recall-reproduction.md` | running |
+| rn-semantic-diagnose | `/root/rn_semantic_diagnose_owner` | `execution-results/semantic-diagnosis.md` and isolated diagnose artifacts | running |
+| rn-source-docs | `/root/rn_source_docs_owner` | Nine exact architecture/upstream documentation files from the node plan | running |
+| rn-reference | `/root/rn_reference_owner` | Five exact Native runner/contract files plus detached 570 reference verification | running |
+| NCM failure artifacts | `/root/ncm_exact_failure_artifact_analyst` | read-only | running |
+| NCM instance proof | `/root/ncm_once_lock_reproduction_designer` | read-only | running |
+| NCM byte budget | `/root/ncm_byte_budget_reproduction_designer` | read-only | running |
+| NCM readiness race | `/root/ncm_readiness_race_scout` | read-only | running |
+| NCM replay/ACK | `/root/ncm_replay_ack_scout` | read-only | running |
+| Semantic fixture inventory | `/root/semantic_fixture_inventory_scout` | read-only | running |
+| Semantic cleanup call graph | `/root/semantic_cleanup_callgraph_scout` | read-only | running |
+| Semantic CLI setup | `/root/semantic_cli_setup_scout` | read-only | running |
+| Semantic true-serving oracle | `/root/semantic_true_serving_oracle_scout` | read-only | running |
+| Reference runner review | `/root/reference_runner_contract_reviewer` | read-only | running |
+| Source documentation review | `/root/source_docs_route_checker` | read-only | running |
+| Wave 2 scope checker | `/root/wave2_scope_conflict_checker` | read-only | running |
