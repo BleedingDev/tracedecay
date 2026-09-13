@@ -4,7 +4,7 @@ overview: "Build untouched original Native while product work runs. Reuse the re
 todos:
   - id: rn-build-reference-done
     content: "Build untouched original Native while product work runs and publish the verified reference artifacts."
-    status: pending
+    status: completed
 isProject: false
 ---
 
@@ -54,3 +54,7 @@ Read ../execution-results/reference-build-requirements.md. Build package tracede
 ## Current dependency contract
 
 Prerequisites: rn-source-docs. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+
+## Accepted execution result
+
+The independent original Native build is complete and accepted by root review. Cargo Hauler ticket `cc-1448` exited `0` after `21m20s` from the clean detached `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` checkout. The binary, version, source/tree identity, feature set, isolated test-profile, warning inventory and hashed build log are recorded in [reference-build-result.md](../execution-results/reference-build-result.md). The artifact bundle remains under the detached checkout's repo-local `target` directory for reuse by `rn-reference` and `rn-build`; the active checkout contains only older diagnostics at its similarly named scratch path.
