@@ -435,6 +435,7 @@ async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: 
         .expect("map stored recall fixture fact projection");
     match projection {
         FactProjectionV1::Available { fact } => fact.as_ref().clone(),
+        FactProjectionV1::Superseded { fact, .. } => fact.as_ref().clone(),
         FactProjectionV1::Unavailable { .. } => {
             panic!("recall fixture fact must remain available")
         }
@@ -1525,6 +1526,7 @@ async fn native_observe_verifies_real_store_without_writing() {
         super::memory_mapping::projection(applied.fact()).expect("map stored fact projection");
     let expected_fact = match &expected_public {
         FactProjectionV1::Available { fact } => fact.as_ref().clone(),
+        FactProjectionV1::Superseded { fact, .. } => fact.as_ref().clone(),
         FactProjectionV1::Unavailable { .. } => {
             panic!("real-store fixture fact must remain available")
         }
@@ -2594,6 +2596,7 @@ async fn fact_promotion_and_unaccepted_kinds_write_no_staged_row() {
         .expect("map stored fact projection")
     {
         FactProjectionV1::Available { fact } => fact.as_ref().clone(),
+        FactProjectionV1::Superseded { fact, .. } => fact.as_ref().clone(),
         FactProjectionV1::Unavailable { .. } => {
             panic!("regression fixture fact must remain available")
         }

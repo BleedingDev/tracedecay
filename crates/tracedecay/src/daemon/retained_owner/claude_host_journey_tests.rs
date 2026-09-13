@@ -1034,7 +1034,7 @@ fn deployed_hook_invocation(hooks: &Value, event: &str) -> Option<(String, Vec<S
 #[test]
 fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_disturbing_operator_state()
  {
-    use tracedecay_agent_hosts::agents::host_bundle_v2::HostBundleComponentV1;
+    use tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1;
     use tracedecay_agent_hosts::agents::{
         AgentIntegration, ClaudeIntegration, InstallContext, NonInteractiveInstallOutcome,
         UpdatePluginOutcome,
