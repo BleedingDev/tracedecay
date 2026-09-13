@@ -126,6 +126,21 @@ pub(crate) fn read(
     }))
 }
 
+/// Returns the original source object authenticated by the common capsule.
+/// Selection metadata lives outside that capsule and therefore must never be
+/// treated as proof of the source or observation identity on its own.
+pub(crate) fn authenticated_original_source(provenance: &Value) -> Result<Value, String> {
+    let capsule = provenance
+        .get("common_capsule")
+        .ok_or_else(|| "source binding lacks retained original evidence".to_owned())?;
+    let retained = decode_capsule(capsule)?
+        .ok_or_else(|| "source binding lacks decoded original evidence".to_owned())?;
+    retained
+        .get("original_source")
+        .cloned()
+        .ok_or_else(|| "source binding lacks original attribution".to_owned())
+}
+
 pub(crate) fn read_text(
     namespace: &str,
     actual: &SourceId,

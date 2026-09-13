@@ -82,6 +82,30 @@ impl NcmEngine {
         if payload["expected_generation"].as_u64() != Some(generation) {
             return EngineReply::rejected(RejectReason::IdempotencyConflict, generation);
         }
+        // A retained inspection target is resolved once against the provider's
+        // durable capsule journal. The derived stable reference and bound source
+        // are private runtime filters; the opaque host locator remains in the
+        // surface request for adapter reconstruction.
+        let effective_payload = match payload
+            .get("target")
+            .filter(|target| target.get("retained_source_locator").is_some())
+        {
+            Some(target) => {
+                let (capsule, _provenance, stable) =
+                    match super::control::resolve_retained_source_locator_with_reference(
+                        namespace, handle, target, deadline, started,
+                    ) {
+                        Ok(value) => value,
+                        Err(reply) => return reply,
+                    };
+                let mut effective = payload.clone();
+                effective["source"] = json!(capsule.source_id.0);
+                effective["stable_memory_ref"] = json!(stable);
+                Some(effective)
+            }
+            None => None,
+        };
+        let payload = effective_payload.as_ref().unwrap_or(payload);
         if action == "inspection" && payload["view"] == "capability_status" {
             if let Err(reply) = read_live(handle) {
                 return reply;

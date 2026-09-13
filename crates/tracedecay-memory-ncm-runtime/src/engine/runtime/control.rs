@@ -500,6 +500,12 @@ fn resolve_target(
     deadline: Deadline,
     started: Instant,
 ) -> Result<(StoredCapsule, Value), EngineReply> {
+    if target.get("retained_source_locator").is_some() {
+        let (capsule, provenance, _stable) = resolve_retained_source_locator_with_reference(
+            namespace, handle, target, deadline, started,
+        )?;
+        return Ok((capsule, provenance));
+    }
     let stable = target["stable_memory_ref"]
         .as_str()
         .ok_or_else(|| invalid("missing stable target", handle.commit_seq))?;
@@ -593,6 +599,246 @@ fn resolve_target(
             return Err(invalid("stable target is unknown", handle.commit_seq));
         }
     }
+}
+
+/// Resolves a post-reopen target without accepting the host's opaque locator as
+/// a provider stable reference. The provider derives the observation identity
+/// from the fresh canonical source at projection time, then proves one and only
+/// one durable capsule carries that identity and the same retained source
+/// binding before deriving its stable reference internally.
+pub(super) fn resolve_retained_source_locator_with_reference(
+    namespace: &str,
+    handle: &NamespaceHandle,
+    target: &Value,
+    deadline: Deadline,
+    started: Instant,
+) -> Result<(StoredCapsule, Value, String), EngineReply> {
+    if target.get("stable_memory_ref").is_some() {
+        return Err(invalid(
+            "mixed retained and stable target references",
+            handle.commit_seq,
+        ));
+    }
+    let _locator = target["retained_source_locator"]
+        .as_str()
+        .filter(|value| {
+            !value.trim().is_empty()
+                && value.trim() == *value
+                && value.len() <= 1024
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| invalid("missing retained source locator", handle.commit_seq))?;
+    let observation_identity = target["observation_identity"]
+        .as_str()
+        .filter(|value| valid_digest(value))
+        .ok_or_else(|| invalid("missing retained observation identity", handle.commit_seq))?;
+    let source = target["source"]
+        .as_str()
+        .filter(|value| valid_digest(value))
+        .ok_or_else(|| invalid("missing retained source binding", handle.commit_seq))?;
+    let legacy_source = target["legacy_source"]
+        .as_str()
+        .filter(|value| valid_digest(value))
+        .ok_or_else(|| invalid("missing retained legacy source binding", handle.commit_seq))?;
+    let source_identity_sha256 = target["source_identity_sha256"]
+        .as_str()
+        .filter(|value| valid_digest(value))
+        .ok_or_else(|| invalid("missing retained source identity", handle.commit_seq))?;
+    // Keep the opaque handle part of the validated target boundary even though
+    // its provider-local meaning is intentionally not interpreted here.
+    let mut after = 0;
+    let mut scanned = 0_u64;
+    let mut found: Option<(StoredCapsule, Value, String)> = None;
+    loop {
+        if remaining_deadline(deadline, started).remaining_ms == 0 {
+            return Err(EngineReply::new(
+                Outcome::Cancelled,
+                handle.commit_seq,
+                Value::Null,
+            ));
+        }
+        let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
+        let capsules = handle
+            .store
+            .capsule_page(None, after, limit)
+            .map_err(|error| store_reply(error, handle.commit_seq))?;
+        let complete = capsules.len() < limit as usize;
+        for capsule in capsules {
+            if remaining_deadline(deadline, started).remaining_ms == 0 {
+                return Err(EngineReply::new(
+                    Outcome::Cancelled,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            if scanned == 1_000_000 {
+                return Err(EngineReply::new(
+                    Outcome::BudgetExceeded,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            if capsule.record_id.0 <= after {
+                return Err(EngineReply::new(
+                    Outcome::Corrupt,
+                    handle.commit_seq,
+                    Value::Null,
+                ));
+            }
+            after = capsule.record_id.0;
+            scanned += 1;
+            if capsule.status != CapsuleStatus::Valid {
+                continue;
+            }
+            let provenance: Value = serde_json::from_str(&capsule.provenance)
+                .map_err(|error| invalid(&error.to_string(), handle.commit_seq))?;
+            if provenance
+                .pointer("/selection/observation_identity")
+                .and_then(Value::as_str)
+                != Some(observation_identity)
+            {
+                continue;
+            }
+            if provenance
+                .pointer("/selection/source_identity_sha256")
+                .and_then(Value::as_str)
+                != Some(source_identity_sha256)
+            {
+                return Err(invalid(
+                    "retained source identity differs",
+                    handle.commit_seq,
+                ));
+            }
+            let (expected_observation_identity, expected_source_identity) =
+                recompute_retained_selection_identities(namespace, &provenance)
+                    .map_err(|reason| invalid(&reason, handle.commit_seq))?;
+            if expected_observation_identity != observation_identity {
+                return Err(invalid(
+                    "retained observation identity differs",
+                    handle.commit_seq,
+                ));
+            }
+            if expected_source_identity != source_identity_sha256 {
+                return Err(invalid(
+                    "retained source identity differs",
+                    handle.commit_seq,
+                ));
+            }
+            let binding = crate::source_binding::read(namespace, &capsule.source_id, &provenance)
+                .map_err(|reason| invalid(&reason, handle.commit_seq))?
+                .ok_or_else(|| invalid("retained source binding is absent", handle.commit_seq))?;
+            if binding
+                .full_source_id
+                .as_ref()
+                .map(|value| value.0.as_str())
+                != Some(source)
+                || binding.legacy_source_id.0 != legacy_source
+            {
+                return Err(invalid(
+                    "retained source binding differs",
+                    handle.commit_seq,
+                ));
+            }
+            let digest = provenance
+                .pointer("/common_capsule/sha256")
+                .and_then(Value::as_str)
+                .filter(|value| valid_digest(value))
+                .ok_or_else(|| invalid("retained capsule digest", handle.commit_seq))?;
+            let derived_stable = stable_reference(namespace, capsule.record_id.0, digest);
+            if found
+                .replace((capsule, provenance, derived_stable))
+                .is_some()
+            {
+                return Err(invalid(
+                    "retained source locator is ambiguous",
+                    handle.commit_seq,
+                ));
+            }
+        }
+        if complete {
+            break;
+        }
+    }
+    let Some((capsule, provenance, derived_stable)) = found else {
+        return Err(invalid(
+            "retained source locator is unknown",
+            handle.commit_seq,
+        ));
+    };
+    Ok((capsule, provenance, derived_stable))
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn retained_identity_string<'a>(value: &'a Value, reason: &str) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 1024
+                && value.trim() == *value
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(|| reason.to_owned())
+}
+
+fn recompute_retained_selection_identities(
+    namespace: &str,
+    provenance: &Value,
+) -> Result<(String, String), String> {
+    let original = crate::source_binding::authenticated_original_source(provenance)?;
+    let source = original
+        .get("source")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "retained original source is invalid".to_owned())?;
+    let canonical_provider_id = retained_identity_string(
+        source
+            .get("canonical_provider_id")
+            .ok_or_else(|| "retained provider identity is missing".to_owned())?,
+        "retained provider identity is invalid",
+    )?;
+    let canonical_session_id = retained_identity_string(
+        source
+            .get("canonical_session_id")
+            .ok_or_else(|| "retained session identity is missing".to_owned())?,
+        "retained session identity is invalid",
+    )?;
+    let observation_id = retained_identity_string(
+        source
+            .get("observation_id")
+            .ok_or_else(|| "retained observation identity is missing".to_owned())?,
+        "retained observation identity is invalid",
+    )?;
+    let origin_scope = original
+        .get("origin_scope")
+        .ok_or_else(|| "retained original scope is missing".to_owned())?;
+    let source_identity_input = serde_json::to_string(&json!({
+        "source": source,
+        "origin_scope": origin_scope,
+    }))
+    .map_err(|_| "retained source identity encoding".to_owned())?;
+    let source_identity = crate::source_binding::opaque_id(
+        namespace,
+        b"source-target",
+        &source_identity_input,
+    );
+    let observation_identity_input = serde_json::to_string(&json!([
+        canonical_provider_id,
+        canonical_session_id,
+        observation_id,
+    ]))
+    .map_err(|_| "retained observation identity encoding".to_owned())?;
+    let observation_identity = crate::source_binding::opaque_id(
+        namespace,
+        b"observation-identity",
+        &observation_identity_input,
+    );
+    Ok((observation_identity, source_identity))
 }
 
 #[allow(clippy::too_many_arguments)]

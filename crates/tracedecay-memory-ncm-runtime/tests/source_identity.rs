@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use tempfile::TempDir;
+use tracedecay_memory_ncm_core::types::AlgorithmIdentity;
 use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
@@ -21,6 +22,7 @@ use tracedecay_memory_ncm_runtime::ports::{
     Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder,
 };
 use tracedecay_memory_ncm_runtime::snapshot::{self, RestoreRequest};
+use tracedecay_memory_ncm_runtime::store::{Event, StoredCapsule};
 
 const DEADLINE: Deadline = Deadline {
     remaining_ms: u64::MAX,
@@ -243,6 +245,66 @@ fn export(engine: &NcmEngine) -> Vec<u8> {
         .into_vec()
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SnapshotLengthsForTampering {
+    kernel_state_bytes: u64,
+    capsules_bytes: u64,
+    events_bytes: u64,
+    capsule_count: u64,
+    event_count: u64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SnapshotContentForTampering {
+    format: String,
+    namespace: String,
+    algorithm: AlgorithmIdentity,
+    projection_sha256: String,
+    encoder_model: String,
+    encoder_artifact_sha256: String,
+    seed: u64,
+    config_json: String,
+    epoch: u64,
+    commit_seq: u64,
+    tick: u64,
+    kernel_state: String,
+    capsules: Vec<StoredCapsule>,
+    events: Vec<Event>,
+    lengths: SnapshotLengthsForTampering,
+}
+
+fn tamper_snapshot_selection(
+    engine: &NcmEngine,
+    capsule_index: usize,
+    fields: &[(&str, &str)],
+) -> Vec<u8> {
+    tamper_snapshot_selections(engine, &[(capsule_index, fields)])
+}
+
+fn tamper_snapshot_selections(
+    engine: &NcmEngine,
+    rows: &[(usize, &[(&str, &str)])],
+) -> Vec<u8> {
+    let mut envelope: Value = serde_json::from_slice(&export(engine)).unwrap();
+    for (capsule_index, fields) in rows {
+        let provenance = envelope["capsules"][*capsule_index]["provenance"]
+            .as_str()
+            .unwrap();
+        let mut provenance: Value = serde_json::from_str(provenance).unwrap();
+        for (field, value) in *fields {
+            provenance["selection"][*field] = json!(value);
+        }
+        envelope["capsules"][*capsule_index]["provenance"] =
+            json!(serde_json::to_string(&provenance).unwrap());
+    }
+
+    let mut content = envelope.clone();
+    content.as_object_mut().unwrap().remove("content_sha256");
+    let content: SnapshotContentForTampering = serde_json::from_value(content).unwrap();
+    envelope["content_sha256"] = json!(digest(&serde_json::to_vec(&content).unwrap()));
+    serde_json::to_vec(&envelope).unwrap()
+}
+
 fn record_ids(engine: &NcmEngine) -> Vec<u64> {
     let snapshot: Value = serde_json::from_slice(&export(engine)).unwrap();
     snapshot["capsules"]
@@ -251,6 +313,31 @@ fn record_ids(engine: &NcmEngine) -> Vec<u64> {
         .iter()
         .map(|capsule| capsule["record_id"].as_u64().unwrap())
         .collect()
+}
+
+fn retained_target(source: CommonSource<'_>, observation: &ObserveRequest) -> Value {
+    json!({
+        "retained_source_locator": "recall-memory-ref-v1:opaque-handle",
+        "observation_identity": observation.provenance["selection"]["observation_identity"],
+        "source": source.full_id().0,
+        "legacy_source": source.legacy_id().0,
+        "source_identity_sha256": observation.provenance["selection"]["source_identity_sha256"]
+    })
+}
+
+fn retained_feedback(generation: u64, target: Value, key: &str) -> Value {
+    json!({
+        "action": "feedback",
+        "idempotency_key": digest(key.as_bytes()),
+        "expected_generation": generation,
+        "target": target,
+        "signal": "ignored",
+        "weight": 0.0,
+        "outcome_receipt": "opaque-outcome",
+        "occurred_at": 123,
+        "evidence_digest": digest(b"retained-locator-evidence"),
+        "target_digest": digest(b"retained-locator-target")
+    })
 }
 
 fn delete(engine: &NcmEngine, source: CommonSource<'_>, key: &str, targeted: bool) -> EngineReply {
@@ -846,6 +933,290 @@ fn aliased_control_target_requires_original_binding_while_old_raw_target_remains
     let accepted = live.common_control(&namespace(), control, DEADLINE);
     assert_eq!(accepted.outcome, Outcome::Success, "{accepted:?}");
     assert_eq!(accepted.state_generation, before.state_generation + 1);
+}
+
+#[test]
+fn retained_source_locator_resolves_by_observation_identity_and_binding_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let observation = A.observation("retained-target", "retained control content", true);
+    let seeded = observe(&live, observation.clone());
+    let expected_generation = seeded.state_generation;
+    let target = json!({
+        "retained_source_locator": "recall-memory-ref-v1:opaque-handle",
+        "observation_identity": observation.provenance["selection"]["observation_identity"],
+        "source": A.full_id().0,
+        "legacy_source": A.legacy_id().0,
+        "source_identity_sha256": observation.provenance["selection"]["source_identity_sha256"]
+    });
+    drop(live);
+
+    let reopened = engine(&directory);
+    let before = inspect(&reopened);
+    assert_eq!(before.state_generation, expected_generation);
+    let control = json!({
+        "action": "feedback",
+        "idempotency_key": digest(b"retained-locator-control"),
+        "expected_generation": before.state_generation,
+        "target": target,
+        "signal": "ignored",
+        "weight": 0.0,
+        "outcome_receipt": "opaque-outcome",
+        "occurred_at": 123,
+        "evidence_digest": digest(b"retained-locator-evidence"),
+        "target_digest": digest(b"retained-locator-target")
+    });
+    let accepted = reopened.common_control(&namespace(), control, DEADLINE);
+    assert_eq!(accepted.outcome, Outcome::Success, "{accepted:?}");
+    assert_eq!(accepted.state_generation, before.state_generation + 1);
+
+    let after = inspect(&reopened);
+    let mut mismatched = json!({
+        "action": "feedback",
+        "idempotency_key": digest(b"retained-locator-mismatch"),
+        "expected_generation": after.state_generation,
+        "target": {
+            "retained_source_locator": "recall-memory-ref-v1:opaque-handle",
+            "observation_identity": observation.provenance["selection"]["observation_identity"],
+            "source": "01".repeat(32),
+            "legacy_source": A.legacy_id().0,
+            "source_identity_sha256": observation.provenance["selection"]["source_identity_sha256"]
+        },
+        "signal": "ignored",
+        "weight": 0.0,
+        "outcome_receipt": "opaque-outcome",
+        "occurred_at": 123,
+        "evidence_digest": digest(b"retained-locator-evidence"),
+        "target_digest": digest(b"retained-locator-target")
+    });
+    let rejected = reopened.common_control(&namespace(), mismatched.clone(), DEADLINE);
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "retained source binding differs".to_owned()
+        ))
+    );
+    assert_eq!(inspect(&reopened), after);
+
+    mismatched["target"]["observation_identity"] = json!("02".repeat(32));
+    mismatched["idempotency_key"] = json!(digest(b"retained-locator-unknown"));
+    let unknown = reopened.common_control(&namespace(), mismatched, DEADLINE);
+    assert_eq!(
+        unknown.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "retained source locator is unknown".to_owned()
+        ))
+    );
+    assert_eq!(inspect(&reopened), after);
+}
+
+#[test]
+fn retained_source_locator_rejects_mixed_stable_reference_without_state_change() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let observation = A.observation("retained-mixed", "mixed retained target", true);
+    observe(&live, observation.clone());
+    let before = inspect(&live);
+    let mut target = retained_target(A, &observation);
+    target["stable_memory_ref"] = json!(format!("ncm-memory:{}", "e".repeat(32)));
+
+    let rejected = live.common_control(
+        &namespace(),
+        retained_feedback(before.state_generation, target, "retained-mixed-control"),
+        DEADLINE,
+    );
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "mixed retained and stable target references".to_owned()
+        ))
+    );
+    assert_eq!(rejected.state_generation, before.state_generation);
+    assert_eq!(inspect(&live), before);
+}
+
+#[test]
+fn retained_source_locator_rejects_ambiguous_active_capsules_after_provenance_tamper() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let first = A.observation("retained-ambiguous-first", "first ambiguous target", true);
+    observe(&live, first.clone());
+    observe(
+        &live,
+        A.observation("retained-ambiguous-second", "second ambiguous target", true),
+    );
+
+    // Restore accepts the durable capsule after the provenance field is
+    // changed, but the runtime must fail closed when the locator now names two
+    // active rows with the same canonical observation identity and binding.
+    let tampered = tamper_snapshot_selection(
+        &live,
+        1,
+        &[
+            (
+                "observation_identity",
+                first.provenance["selection"]["observation_identity"]
+                    .as_str()
+                    .unwrap(),
+            ),
+            (
+                "source_identity_sha256",
+                first.provenance["selection"]["source_identity_sha256"]
+                    .as_str()
+                    .unwrap(),
+            ),
+        ],
+    );
+    let restored = snapshot::restore(
+        &live,
+        &namespace(),
+        RestoreRequest {
+            idempotency_key: "retained-ambiguous-restore".to_owned(),
+            bytes: tampered,
+        },
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+
+    let before = inspect(&live);
+    let rejected = live.common_control(
+        &namespace(),
+        retained_feedback(
+            before.state_generation,
+            retained_target(A, &first),
+            "retained-ambiguous-control",
+        ),
+        DEADLINE,
+    );
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "retained observation identity differs".to_owned()
+        ))
+    );
+    assert_eq!(rejected.state_generation, before.state_generation);
+    assert_eq!(inspect(&live), before);
+}
+
+#[test]
+fn retained_source_locator_rejects_swapped_same_lineage_selection_metadata() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let first = A.observation("retained-swapped-first", "first swapped target", true);
+    let second = A.observation("retained-swapped-second", "second swapped target", true);
+    observe(&live, first.clone());
+    observe(&live, second.clone());
+
+    // Both rows share one canonical source binding. Swap only the selection
+    // observation identities so the target for the first observation would
+    // otherwise resolve uniquely to the second row.
+    let tampered = tamper_snapshot_selections(
+        &live,
+        &[
+            (
+                0,
+                &[
+                    (
+                        "observation_identity",
+                        second.provenance["selection"]["observation_identity"]
+                            .as_str()
+                            .unwrap(),
+                    ),
+                    (
+                        "source_identity_sha256",
+                        second.provenance["selection"]["source_identity_sha256"]
+                            .as_str()
+                            .unwrap(),
+                    ),
+                ],
+            ),
+            (
+                1,
+                &[
+                    (
+                        "observation_identity",
+                        first.provenance["selection"]["observation_identity"]
+                            .as_str()
+                            .unwrap(),
+                    ),
+                    (
+                        "source_identity_sha256",
+                        first.provenance["selection"]["source_identity_sha256"]
+                            .as_str()
+                            .unwrap(),
+                    ),
+                ],
+            ),
+        ],
+    );
+    let restored = snapshot::restore(
+        &live,
+        &namespace(),
+        RestoreRequest {
+            idempotency_key: "retained-swapped-restore".to_owned(),
+            bytes: tampered,
+        },
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+
+    let before = inspect(&live);
+    let rejected = live.common_control(
+        &namespace(),
+        retained_feedback(
+            before.state_generation,
+            retained_target(A, &first),
+            "retained-swapped-control",
+        ),
+        DEADLINE,
+    );
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "retained observation identity differs".to_owned()
+        ))
+    );
+    assert_eq!(rejected.state_generation, before.state_generation);
+    assert_eq!(inspect(&live), before);
+}
+
+#[test]
+fn retained_source_locator_rejects_provenance_identity_tamper() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let observation = A.observation("retained-provenance-tamper", "tampered provenance", true);
+    observe(&live, observation.clone());
+    let tampered =
+        tamper_snapshot_selection(&live, 0, &[("source_identity_sha256", &"f".repeat(64))]);
+    let restored = snapshot::restore(
+        &live,
+        &namespace(),
+        RestoreRequest {
+            idempotency_key: "retained-provenance-tamper-restore".to_owned(),
+            bytes: tampered,
+        },
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+
+    let before = inspect(&live);
+    let rejected = live.common_control(
+        &namespace(),
+        retained_feedback(
+            before.state_generation,
+            retained_target(A, &observation),
+            "retained-provenance-tamper-control",
+        ),
+        DEADLINE,
+    );
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "retained source identity differs".to_owned()
+        ))
+    );
+    assert_eq!(rejected.state_generation, before.state_generation);
+    assert_eq!(inspect(&live), before);
 }
 
 #[test]
