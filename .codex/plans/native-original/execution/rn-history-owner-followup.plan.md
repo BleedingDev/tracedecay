@@ -21,3 +21,7 @@ cc1424 compile evidence reports `transcript_source_home`, `background_cpu` and `
 ## Stop condition
 
 Return concrete symbols/fields, consumed/not-consumed conclusion, exact gap owner and acceptance assertion. Do not implement the fix in this node.
+
+## Current dependency contract
+
+Prerequisites: rn-source-docs, rn-contract, rn-integration-readiness. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

@@ -49,3 +49,7 @@ Stop condition: Return the original build result and inventory. A missing public
 ## Reviewed build requirements
 
 Read ../execution-results/reference-build-requirements.md. Build package tracedecay-cli, binary tracedecay, default production features plus test-transport. Do not enable product-only memory-provider-host on b3. Do not execute comparisons until rn-reference is accepted. No invented flags or original source modifications.
+
+## Current dependency contract
+
+Prerequisites: rn-source-docs. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

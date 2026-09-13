@@ -1,22 +1,28 @@
 {
   "graph_id": "native-original-execution-pr707-20260913",
-  "plan_set_hash": "20bb2dd27a",
-  "selection_hash": "08ad7a0ca9",
-  "plan_count": 33,
-  "edge_count": 71,
+  "plan_set_hash": "5befc5f407",
+  "selection_hash": "1752917f10",
+  "plan_count": 40,
+  "edge_count": 88,
   "topological_waves": [
     [
+      "rn-acceptance-matrix",
       "rn-integration-readiness",
-      "rn-ncm-tests",
+      "rn-restore-anchor"
+    ],
+    [
+      "rn-ncm-reproduce",
       "rn-reference",
-      "rn-restore-anchor",
+      "rn-semantic-diagnose",
       "rn-source-docs"
     ],
     [
       "rn-build-reference",
       "rn-contract",
       "rn-map-checker",
-      "rn-privacy-audit"
+      "rn-ncm-recall-fix",
+      "rn-privacy-audit",
+      "rn-semantic-fix"
     ],
     [
       "rn-cases-facts",
@@ -25,6 +31,7 @@
       "rn-history-owner-followup",
       "rn-host-fixtures",
       "rn-native-port",
+      "rn-ncm-tests",
       "rn-privacy-restore"
     ],
     [
@@ -48,6 +55,7 @@
       "rn-verify-codex",
       "rn-verify-facts",
       "rn-verify-ncm",
+      "rn-verify-semantic",
       "rn-verify-sessions",
       "rn-verify-state"
     ],
@@ -56,9 +64,12 @@
       "rn-review-integration"
     ],
     [
+      "rn-release-readiness"
+    ],
+    [
       "rn-close"
     ]
   ],
-  "maximum_independent_nodes": 18,
-  "longest_dependency_chain_nodes": 10
+  "longest_dependency_chain_nodes": 12,
+  "scheduling_note": "Eligibility only; keep one branch and one focus, assign only useful disjoint scopes."
 }

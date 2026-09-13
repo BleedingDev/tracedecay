@@ -67,3 +67,7 @@ Stop once the assigned outcome and checks are complete. Root reviews scope and e
 ## Historical privacy scope and active gate
 
 The earlier b3-to-571 detector restoration and typed Claude history admission record remain historical. Under active 570, detector equality is already proven; rn-privacy-audit and rn-privacy-restore review the typed history seam without another detector write. Generic admission, original Native and LCM privacy stay unchanged. `observation_journey.rs` remains ordered behind the active privacy gate before rn-session-delivery.
+
+## Readiness extension and host precedence
+
+Read READINESS-PLAN.md. Its NCM causal-repair and semantic lifecycle/setup nodes are the precise exceptions to older blanket preservation wording. All other protected code remains protected. Current AGENTS.md takes precedence over historical model-routing/host instructions: remain in Codex, use available native models/tools, and never launch another agent CLI without an explicit user request. Plan authoring starts no workers. Later implementation uses one branch, one designated Cargo owner, scoped assignments and reviewed commit/push checkpoints.

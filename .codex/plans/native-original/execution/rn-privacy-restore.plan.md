@@ -34,3 +34,7 @@ Own only .codex/plans/native-original/execution-results/privacy-restoration-5700
 ## Operator Guidance
 
 Root launches this gate after rn-privacy-audit and rn-integration-readiness. Root reviews status and releases rn-session-delivery only after acceptance. Return exact paths, checks, unresolved questions and next owner. Do not claim product build or Native parity.
+
+## Current dependency contract
+
+Prerequisites: rn-privacy-audit. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

@@ -14,7 +14,7 @@ isProject: false
 
 Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
 
-Model: gpt-5.6-luna. Reasoning: max. Spawn with fork_turns=none and a bounded handoff. You are a leaf; no subagents. You are not alone in the codebase: preserve peers' edits, never revert/reformat/stage them, and send cross-scope needs to root.
+Execution host: Codex. Use an available Codex-native execution/review agent when assigned; adapt unavailable model preferences within Codex. You are a leaf; no child agents or cross-host agent CLI launches. Preserve peers' edits and send cross-scope needs to the lead.
 
 Mode: write-capable and build owner.
 Prerequisites: rn-privacy-audit, rn-map-checker, rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor, rn-integration-readiness, rn-history-owner-followup. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910. Reuse the same designated build execution agent and verified reference artifacts from rn-build-reference; rebuild the reference only if its recorded inputs changed.
@@ -59,3 +59,16 @@ Root launches this node from the saved execution graph only when its predecessor
 Return: node ID; exact changed paths and reasons; diff; verification commands and actual results; build tickets if applicable; protected-behavior evidence; unresolved dependencies/failures with exact next owner. Do not claim an unrun check passed.
 
 Stop condition: Return tested artifacts and actual results. Failed builds remain incomplete; root assigns bounded fixes to owners. No push, merge, release or live settings/data action.
+
+## Current dependency contract
+
+Prerequisites: rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor, rn-map-checker, rn-privacy-audit, rn-privacy-restore, rn-history-owner-followup, rn-integration-readiness, rn-semantic-fix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+
+## Actual artifact gates
+
+The executable belongs to `tracedecay-cli`, not the `tracedecay` library. Discover tests first and submit these pinned build targets through the single broker owner:
+
+- `cargo build --locked -p tracedecay-cli --bin tracedecay --features memory-provider-host,semantic-fastembed`
+- `cargo build --locked -p tracedecay-memory-ncm-runtime --bin tracedecay-ncm-worker --features real-encoder`
+
+Retain default production features. Compile the independent unmodified 570 reference with its actual manifest/CLI surface and record how its original operations map to the candidate; never pretend the reference has product-only CLI/API commands. Run required CI-equivalent aggregate checks from the current repository, not only the root library check. Models and semantic calibration/artifacts must be provisioned and hashed in isolated profiles before the respective acceptance runs. Earlier cc1434 is a successful baseline executable build, not proof of future modified sources.

@@ -34,7 +34,7 @@ No push, merge, release, global install, runtime user-data action or unassigned 
 ## Steps
 
 1. Review independent findings and all unresolved coverage/results. Assign each required correction back to its execution owner and rerun only affected dependent checks.
-2. Confirm complete original code/behavior, real Native context delivery, unchanged NCM internals and safe saved-state cutover. Do not accept partial/full claims interchangeably.
+2. Confirm complete original code/behavior, real Native context delivery, the reviewed NCM causal repair and preserved model/state contracts and safe saved-state cutover. Do not accept partial/full claims interchangeably.
 3. Mark execution nodes complete only after their reviewed outcomes exist. Update docs through their writer for final behavior/results; root does not patch product code.
 4. Report changed behavior, verification and material limitations in plain English. Commit/push/release only within separate existing user authorization; this plan alone does not request them.
 
@@ -42,7 +42,7 @@ No push, merge, release, global install, runtime user-data action or unassigned 
 
 - No required original operation, host verification, review blocker or aggregate failure remains.
 - Final docs accurately distinguish full Native, shared canonical services and the separate NCM result.
-- Root remained orchestrator/reviewer; all execution/review agents used Luna Max.
+- Root reviewed scoped execution diffs; all orchestration stayed in Codex with available native agents.
 
 ## Operator Guidance
 
@@ -51,3 +51,7 @@ Root launches this node from the saved execution graph only when its predecessor
 Return: node ID; exact changed paths and reasons; diff; verification commands and actual results; build tickets if applicable; protected-behavior evidence; unresolved dependencies/failures with exact next owner. Do not claim an unrun check passed.
 
 Stop condition: Complete only when all required work is actually accepted. Otherwise leave the specific nodes incomplete and continue bounded corrections.
+
+## Current dependency contract
+
+Prerequisites: rn-review-fidelity, rn-review-integration, rn-release-readiness. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

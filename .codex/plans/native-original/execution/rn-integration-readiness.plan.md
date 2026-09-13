@@ -21,3 +21,7 @@ Re-run only the designated current integration checks after the assigned build-o
 ## Stop condition
 
 Return the current blocker/owner and concrete next command, or a root-reviewable readiness result. Do not edit code or Cargo files.
+
+## Current dependency contract
+
+Prerequisites: None. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

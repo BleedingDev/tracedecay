@@ -34,3 +34,7 @@ Own only .codex/plans/native-original/execution-results/privacy-audit-57006f60.m
 ## Operator Guidance
 
 Root launches after rn-source-docs and rn-integration-readiness are accepted. Root reviews the gate before releasing the privacy-dependent host lane. Return exact unresolved caller and assertion owners; do not claim product build success.
+
+## Current dependency contract
+
+Prerequisites: rn-source-docs. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

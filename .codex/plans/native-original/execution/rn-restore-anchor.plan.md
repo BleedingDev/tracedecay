@@ -34,3 +34,7 @@ Own only .codex/plans/native-original/execution-results/restore-anchor-57006f60.
 ## Operator Guidance
 
 Root has reviewed the current equality proof; this node is complete for the active 570 baseline. Root retains status ownership and must reopen it only if a later candidate changes the blob.
+
+## Current dependency contract
+
+Prerequisites: None. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.

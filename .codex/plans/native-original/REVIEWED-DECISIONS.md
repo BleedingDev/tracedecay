@@ -47,7 +47,7 @@ Leave persisted staged files and sidecars untouched. Preserve canonical facts, s
 
 ## Verification and authority
 
-Compare a separately built, unmodified b3 reference with restored Native through corresponding production entry points and equivalent isolated state. Mocks or two paths sharing the changed backend cannot establish original equivalence. Compare relevant public results and semantic state/receipts, including reopen, scope and failure behavior; not physical SQLite/WAL bytes or every table.
+Compare a separately built, unmodified 570 reference with restored Native through corresponding production entry points and equivalent isolated state. Mocks or two paths sharing the changed backend cannot establish original equivalence. Compare relevant public results and semantic state/receipts, including reopen, scope and failure behavior; not physical SQLite/WAL bytes or every table.
 
 Require original source preservation, complete behavior coverage and real host delivery. Native/NCM conformance and usefulness are separate findings. Preserve the earlier intermittent NCM result; no tuning or unproved fix.
 
@@ -58,3 +58,7 @@ Execution authorized by the user on 2026-09-11: execute the validated plans now.
 ## Historical privacy restoration record and active gate
 
 The earlier b3-to-571 acceptance of `crates/tracedecay-privacy/src/detector_kernel.rs` and the typed Claude history source-field design remain historical. Under active 570, the detector blobs already match (`9ce4488a34c5bd121d43c35c33f1daf925ab38ba`); rn-privacy-audit and rn-privacy-restore therefore perform read-only current seam review before rn-session-delivery. Generic admission, original Native and LCM privacy stay unchanged. `observation_journey.rs` remains ordered behind the active privacy gate.
+
+## Current user-directed readiness scope
+
+The latest request requires a plan to complete Native/NCM verification, repair intermittent NCM recall and make semantic retrieval operational. READINESS-PLAN.md and the explicit new node scopes supersede preservation-only instructions that would leave NCM misses permanently unresolved. Only a demonstrated, reviewed causal NCM bug repair is permitted; model/ranking tuning, namespace changes, migrations and unrelated features remain excluded. Semantic code-search lifecycle/setup repair does not authorize changes to original Native fact/session/LCM algorithms. Planning launches no implementation agents. Stay in Codex and use available native models/tools; no other agent CLI may be launched without an explicit cross-host request.

@@ -1,4 +1,11 @@
 flowchart TD
+  subgraph plan_rn_acceptance_matrix["rn-acceptance-matrix"]
+    plan_rn_acceptance_matrix_todo_1["inventory-required-operations (pending)\nMap every supported Native operation, NCM mode and semantic serving state to a production route and executable case."]
+    plan_rn_acceptance_matrix_todo_2["freeze-acceptance-oracles (pending)\nFreeze expected outcomes, negative controls, artifact identities and run counts before implementation."]
+    plan_rn_acceptance_matrix_todo_1 --> plan_rn_acceptance_matrix_todo_2
+    plan_rn_acceptance_matrix_todo_3["publish-missing-coverage (pending)\nPublish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted."]
+    plan_rn_acceptance_matrix_todo_2 --> plan_rn_acceptance_matrix_todo_3
+  end
   subgraph plan_rn_build_reference["rn-build-reference"]
     plan_rn_build_reference_todo_1["rn-build-reference-done (pending)\nBuild untouched original Native while product work runs and publish the verified reference artifacts."]
   end
@@ -50,6 +57,20 @@ flowchart TD
   subgraph plan_rn_native_tests["rn-native-tests"]
     plan_rn_native_tests_todo_1["rn-native-tests-done (pending)\nReplace substitute-backed Native tests with original behavior checks and return the required reviewable evidence."]
   end
+  subgraph plan_rn_ncm_recall_fix["rn-ncm-recall-fix"]
+    plan_rn_ncm_recall_fix_todo_1["repair-causal-seam (pending)\nImplement the smallest correction at the demonstrated first loss and preserve durable ordering, scope and provenance."]
+    plan_rn_ncm_recall_fix_todo_2["prove-regression-and-recovery (pending)\nShow the pinned reproducer failing before and passing after; verify restart, cancellation, replay and budget boundaries."]
+    plan_rn_ncm_recall_fix_todo_1 --> plan_rn_ncm_recall_fix_todo_2
+    plan_rn_ncm_recall_fix_todo_3["review-ncm-fix (pending)\nReview diff, latency and state/model compatibility; deliver the exact fix and affected verification filters."]
+    plan_rn_ncm_recall_fix_todo_2 --> plan_rn_ncm_recall_fix_todo_3
+  end
+  subgraph plan_rn_ncm_reproduce["rn-ncm-reproduce"]
+    plan_rn_ncm_reproduce_todo_1["recover-original-misses (pending)\nRecover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope."]
+    plan_rn_ncm_reproduce_todo_2["trace-first-loss (pending)\nReproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data."]
+    plan_rn_ncm_reproduce_todo_1 --> plan_rn_ncm_reproduce_todo_2
+    plan_rn_ncm_reproduce_todo_3["add-failing-regression (pending)\nReduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline."]
+    plan_rn_ncm_reproduce_todo_2 --> plan_rn_ncm_reproduce_todo_3
+  end
   subgraph plan_rn_ncm_tests["rn-ncm-tests"]
     plan_rn_ncm_tests_todo_1["rn-ncm-tests-done (pending)\nPreserve NCM behavior while Native is restored and return the required reviewable evidence."]
   end
@@ -65,6 +86,13 @@ flowchart TD
   subgraph plan_rn_registry["rn-registry"]
     plan_rn_registry_todo_1["rn-registry-done (pending)\nRegister Native and NCM with truthful independent capabilities and return the required reviewable evidence."]
   end
+  subgraph plan_rn_release_readiness["rn-release-readiness"]
+    plan_rn_release_readiness_todo_1["check-complete-evidence (pending)\nRequire complete Native reference parity, repaired NCM recall and provisioned semantic retrieval with no uncovered required row."]
+    plan_rn_release_readiness_todo_2["repeat-integrated-acceptance (pending)\nRun three consecutive integrated acceptance passes on the same reviewed source and artifact identities with fresh profiles."]
+    plan_rn_release_readiness_todo_1 --> plan_rn_release_readiness_todo_2
+    plan_rn_release_readiness_todo_3["prepare-isolated-pilot (pending)\nPublish one tested Codex-native trial configuration, data isolation, rollback instructions and remaining optional limitations."]
+    plan_rn_release_readiness_todo_2 --> plan_rn_release_readiness_todo_3
+  end
   subgraph plan_rn_restore_anchor["rn-restore-anchor"]
     plan_rn_restore_anchor_todo_1["rn-restore-anchor-done (completed)\nRecord current 570-to-candidate diff and blob proof for retrieval-anchor authority; current equality proof is complete."]
   end
@@ -73,6 +101,20 @@ flowchart TD
   end
   subgraph plan_rn_review_integration["rn-review-integration"]
     plan_rn_review_integration_todo_1["rn-review-integration-done (pending)\nIndependently review integration, data safety and graph completion and return the required reviewable evidence."]
+  end
+  subgraph plan_rn_semantic_diagnose["rn-semantic-diagnose"]
+    plan_rn_semantic_diagnose_todo_1["reproduce-semantic-states (pending)\nReproduce fresh-profile, provisioned-profile and restart behavior using the real CLI and strict semantic requests."]
+    plan_rn_semantic_diagnose_todo_2["trace-semantic-activation (pending)\nTrace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition."]
+    plan_rn_semantic_diagnose_todo_1 --> plan_rn_semantic_diagnose_todo_2
+    plan_rn_semantic_diagnose_todo_3["freeze-semantic-fix-case (pending)\nPublish the responsible setup or code seam, negative controls and failing acceptance case before repair."]
+    plan_rn_semantic_diagnose_todo_2 --> plan_rn_semantic_diagnose_todo_3
+  end
+  subgraph plan_rn_semantic_fix["rn-semantic-fix"]
+    plan_rn_semantic_fix_todo_1["repair-semantic-transition (pending)\nRepair the diagnosed acquisition, projection, calibration, activation or setup path with a focused failing regression."]
+    plan_rn_semantic_fix_todo_2["preserve-semantic-failure-contract (pending)\nVerify missing/corrupt/mismatched artifacts and cancellation remain truthful while valid provisioning reaches ready."]
+    plan_rn_semantic_fix_todo_1 --> plan_rn_semantic_fix_todo_2
+    plan_rn_semantic_fix_todo_3["document-semantic-setup (pending)\nProvide tested online and offline setup/recovery steps and actionable status for an isolated profile."]
+    plan_rn_semantic_fix_todo_2 --> plan_rn_semantic_fix_todo_3
   end
   subgraph plan_rn_session_delivery["rn-session-delivery"]
     plan_rn_session_delivery_todo_1["rn-session-delivery-done (pending)\nRetire Native staged acknowledgements in the host observation journey and return the required reviewable evidence."]
@@ -92,16 +134,29 @@ flowchart TD
   subgraph plan_rn_verify_ncm["rn-verify-ncm"]
     plan_rn_verify_ncm_todo_1["rn-verify-ncm-done (pending)\nVerify NCM still works with shared canonical services and return the required reviewable evidence."]
   end
+  subgraph plan_rn_verify_semantic["rn-verify-semantic"]
+    plan_rn_verify_semantic_todo_1["verify-real-semantic-results (pending)\nRun frozen paraphrase/negative-control queries through actual CLI/MCP and assert real semantic participation and expected relevance."]
+    plan_rn_verify_semantic_todo_2["verify-semantic-lifecycle (pending)\nVerify fresh setup, cold/warm/restart, source update and artifact failure/recovery under bounded deadlines."]
+    plan_rn_verify_semantic_todo_1 --> plan_rn_verify_semantic_todo_2
+    plan_rn_verify_semantic_todo_3["publish-semantic-evidence (pending)\nRecord exact generations, model/calibration identities, query modes, results and latency; leave any missing case incomplete."]
+    plan_rn_verify_semantic_todo_2 --> plan_rn_verify_semantic_todo_3
+  end
   subgraph plan_rn_verify_sessions["rn-verify-sessions"]
     plan_rn_verify_sessions_todo_1["rn-verify-sessions-done (pending)\nVerify original sessions and LCM against untouched upstream 570 and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_state["rn-verify-state"]
     plan_rn_verify_state_todo_1["rn-verify-state-done (pending)\nVerify cutover leaves original and legacy saved state intact and return the required reviewable evidence."]
   end
+  plan_rn_acceptance_matrix_todo_3 --> plan_rn_ncm_reproduce_todo_1
+  plan_rn_acceptance_matrix_todo_3 --> plan_rn_ncm_tests_todo_1
+  plan_rn_acceptance_matrix_todo_3 --> plan_rn_reference_todo_1
+  plan_rn_acceptance_matrix_todo_3 --> plan_rn_semantic_diagnose_todo_1
+  plan_rn_acceptance_matrix_todo_3 --> plan_rn_source_docs_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_claude_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_codex_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_facts_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_ncm_todo_1
+  plan_rn_build_todo_1 --> plan_rn_verify_semantic_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_sessions_todo_1
   plan_rn_build_todo_1 --> plan_rn_verify_state_todo_1
   plan_rn_build_reference_todo_1 --> plan_rn_build_todo_1
@@ -136,6 +191,8 @@ flowchart TD
   plan_rn_native_port_todo_1 --> plan_rn_registry_todo_1
   plan_rn_native_port_todo_1 --> plan_rn_session_delivery_todo_1
   plan_rn_native_tests_todo_1 --> plan_rn_composition_todo_1
+  plan_rn_ncm_recall_fix_todo_3 --> plan_rn_ncm_tests_todo_1
+  plan_rn_ncm_reproduce_todo_3 --> plan_rn_ncm_recall_fix_todo_1
   plan_rn_ncm_tests_todo_1 --> plan_rn_build_todo_1
   plan_rn_privacy_audit_todo_1 --> plan_rn_build_todo_1
   plan_rn_privacy_audit_todo_1 --> plan_rn_privacy_restore_todo_1
@@ -147,9 +204,15 @@ flowchart TD
   plan_rn_reference_todo_1 --> plan_rn_cases_state_todo_1
   plan_rn_reference_todo_1 --> plan_rn_host_fixtures_todo_1
   plan_rn_registry_todo_1 --> plan_rn_composition_todo_1
+  plan_rn_release_readiness_todo_3 --> plan_rn_close_todo_1
   plan_rn_restore_anchor_todo_1 --> plan_rn_build_todo_1
   plan_rn_review_fidelity_todo_1 --> plan_rn_close_todo_1
+  plan_rn_review_fidelity_todo_1 --> plan_rn_release_readiness_todo_1
   plan_rn_review_integration_todo_1 --> plan_rn_close_todo_1
+  plan_rn_review_integration_todo_1 --> plan_rn_release_readiness_todo_1
+  plan_rn_semantic_diagnose_todo_3 --> plan_rn_semantic_fix_todo_1
+  plan_rn_semantic_fix_todo_3 --> plan_rn_build_todo_1
+  plan_rn_semantic_fix_todo_3 --> plan_rn_verify_semantic_todo_1
   plan_rn_session_delivery_todo_1 --> plan_rn_composition_todo_1
   plan_rn_source_docs_todo_1 --> plan_rn_build_reference_todo_1
   plan_rn_source_docs_todo_1 --> plan_rn_contract_todo_1
@@ -165,6 +228,9 @@ flowchart TD
   plan_rn_verify_facts_todo_1 --> plan_rn_review_integration_todo_1
   plan_rn_verify_ncm_todo_1 --> plan_rn_review_fidelity_todo_1
   plan_rn_verify_ncm_todo_1 --> plan_rn_review_integration_todo_1
+  plan_rn_verify_semantic_todo_3 --> plan_rn_release_readiness_todo_1
+  plan_rn_verify_semantic_todo_3 --> plan_rn_review_fidelity_todo_1
+  plan_rn_verify_semantic_todo_3 --> plan_rn_review_integration_todo_1
   plan_rn_verify_sessions_todo_1 --> plan_rn_review_fidelity_todo_1
   plan_rn_verify_sessions_todo_1 --> plan_rn_review_integration_todo_1
   plan_rn_verify_state_todo_1 --> plan_rn_review_fidelity_todo_1

@@ -1,8 +1,10 @@
 # Restore complete original Native
 
+Current implementation scope: [Complete Native/NCM and semantic readiness](READINESS-PLAN.md). This supersedes preservation-only NCM caveats with a causal repair and verification chain.
+
 This plan keeps the original Native memory implementation and adapts our product around it. Native includes facts, retrieval tracking, trust and lifecycle behavior, sessions, temporal retrieval and LCM. NCM remains a separate selectable provider.
 
-**Status: active bounded reassessment.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 33 nodes and 71 edges; all are pending except the current retrieval-anchor equality gate.
+**Status: active bounded reassessment.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 40 nodes and 88 edges; all are pending except the current retrieval-anchor equality gate.
 
 ## The implementation decision
 
@@ -18,9 +20,9 @@ This plan keeps the original Native memory implementation and adapts our product
 
 ## Parallel execution
 
-The [execution graph](execution-graph.mmd) contains **33 nodes and 71 dependency edges**. The current frontier is rn-integration-readiness, rn-reference, rn-source-docs and rn-ncm-tests. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent branch or worktree launch is implied.
+The [execution graph](execution-graph.mmd) contains **40 nodes and 88 dependency edges**. The current frontier is rn-acceptance-matrix and rn-integration-readiness. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent branch or worktree launch is implied.
 
-Every subagent uses **GPT-5.6 Luna, Max reasoning**. Root only orchestrates and reviews. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
+Use available Codex-native execution agents for scoped implementation; root assigns ownership and reviews changes before pushing. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
 
 1. Process integration readiness, the independent comparison runner, source inventory/documentation and NCM regression preparation from the current frontier. Readiness and source inventory release their gated successors; the anchor equality gate is already complete.
 2. Start the original reference build as soon as the runner is ready. When the runner and contracts are ready, launch three fixture lanes and host fixtures; contracts also release the Native wrapper and fabric work.
@@ -52,8 +54,8 @@ The reference build overlaps implementation. Manifests and the shared Cargo sche
 | [rn-ncm-tests](execution/rn-ncm-tests.plan.md) | Preserve NCM behavior while Native is restored |
 | [rn-composition](execution/rn-composition.plan.md) | Connect the reviewed Native services and remove staged mount assumptions |
 | [rn-build](execution/rn-build.plan.md) | Integrate shared manifests and verify both actual runtimes |
-| [rn-verify-facts](execution/rn-verify-facts.plan.md) | Verify complete fact behavior against untouched b3 |
-| [rn-verify-sessions](execution/rn-verify-sessions.plan.md) | Verify original sessions and LCM against untouched b3 |
+| [rn-verify-facts](execution/rn-verify-facts.plan.md) | Verify complete fact behavior against untouched 570 |
+| [rn-verify-sessions](execution/rn-verify-sessions.plan.md) | Verify original sessions and LCM against untouched 570 |
 | [rn-verify-state](execution/rn-verify-state.plan.md) | Verify cutover leaves original and legacy saved state intact |
 | [rn-verify-claude](execution/rn-verify-claude.plan.md) | Verify original Native through real Claude delivery |
 | [rn-verify-codex](execution/rn-verify-codex.plan.md) | Verify original Native through real Codex delivery |
@@ -64,9 +66,17 @@ The reference build overlaps implementation. Manifests and the shared Cargo sche
 | [rn-close](execution/rn-close.plan.md) | Accept the complete restored Native implementation |
 | [rn-build-reference](execution/rn-build-reference.plan.md) | Build untouched original Native while product work runs |
 
+| [rn-acceptance-matrix](execution/rn-acceptance-matrix.plan.md) | Freeze complete operation coverage and acceptance oracles |
+| [rn-ncm-reproduce](execution/rn-ncm-reproduce.plan.md) | Identify the first loss behind intermittent recall |
+| [rn-ncm-recall-fix](execution/rn-ncm-recall-fix.plan.md) | Repair the demonstrated recall failure |
+| [rn-semantic-diagnose](execution/rn-semantic-diagnose.plan.md) | Trace artifact, projection and calibration readiness |
+| [rn-semantic-fix](execution/rn-semantic-fix.plan.md) | Repair the demonstrated semantic lifecycle or setup gap |
+| [rn-verify-semantic](execution/rn-verify-semantic.plan.md) | Prove strict semantic retrieval and recovery |
+| [rn-release-readiness](execution/rn-release-readiness.plan.md) | Require three consecutive integrated passes and pilot instructions |
+
 ## Start or resume
 
-Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the Luna handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 71 edges and exact active paths.
+Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the scoped handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 88 edges and exact active paths.
 
 From the execution worktree:
 
@@ -81,6 +91,6 @@ The helper calls the installed plan-graph CLI with the exact selection; it does 
 
 A source diff alone cannot establish full Native behavior. The original reference and product must use equivalent isolated inputs at matching production boundaries. Preserve scores/order, provenance, effects, receipts and original failure outcomes. Check the entire original operation map, including background responsibilities; unknown or unreachable original coverage cannot be counted as success.
 
-Native equivalence and NCM usefulness are separate results. The earlier intermittent NCM recall remains an explicit caveat; the separate owner has root-accepted rc13 pin/compile and 16-oracle model evidence (maximum difference `2.09e-7`), while rn-ncm-tests remains pending for namespace/replay regression and final handoff. Product integration checks remain in progress after cc1429/cc1430/cc1431/cc1432; cc1432 is a focused locked compile result, not aggregate Native parity or product-build acceptance.
+The actual CLI build and isolated daemon/index smoke passed at `276ded8fa`. Complete Native parity remains unverified, intermittent NCM recall remains unresolved, and semantic search reported `calibration_unavailable` with `artifact_unavailable` in the daemon log. The readiness plan requires causal diagnosis and repair plus repeated production-path verification before closure; historical model-oracle and compile evidence does not satisfy these gates.
 
 [Research reports](evidence/) support the decisions. The research graph and plan-review graph are excluded from the runnable execution selection.

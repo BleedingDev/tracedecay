@@ -18,7 +18,9 @@
   {
     "id": "rn-reference",
     "title": "Refresh the independent original Native comparison runner for 570",
-    "dependencies": [],
+    "dependencies": [
+      "rn-acceptance-matrix"
+    ],
     "mode": "write-capable",
     "ownership": [
       "scripts/product/native-original/** except cases/**"
@@ -27,7 +29,9 @@
   {
     "id": "rn-source-docs",
     "title": "Refresh Native identity and architecture documentation for 570",
-    "dependencies": [],
+    "dependencies": [
+      "rn-acceptance-matrix"
+    ],
     "mode": "write-capable",
     "ownership": [
       "product/upstream/** (metadata/documentation only)",
@@ -178,7 +182,10 @@
   {
     "id": "rn-ncm-tests",
     "title": "Preserve NCM behavior while Native is restored",
-    "dependencies": [],
+    "dependencies": [
+      "rn-acceptance-matrix",
+      "rn-ncm-recall-fix"
+    ],
     "mode": "write-capable",
     "ownership": [
       "crates/tracedecay-memory-provider-ncm/tests/**",
@@ -215,8 +222,9 @@
       "rn-map-checker",
       "rn-privacy-audit",
       "rn-privacy-restore",
+      "rn-history-owner-followup",
       "rn-integration-readiness",
-      "rn-history-owner-followup"
+      "rn-semantic-fix"
     ],
     "mode": "write-capable and build owner",
     "ownership": [
@@ -304,7 +312,8 @@
       "rn-verify-claude",
       "rn-verify-codex",
       "rn-verify-ncm",
-      "rn-source-docs"
+      "rn-source-docs",
+      "rn-verify-semantic"
     ],
     "mode": "read-only review",
     "ownership": [
@@ -320,7 +329,8 @@
       "rn-verify-state",
       "rn-verify-claude",
       "rn-verify-codex",
-      "rn-verify-ncm"
+      "rn-verify-ncm",
+      "rn-verify-semantic"
     ],
     "mode": "read-only review",
     "ownership": [
@@ -332,7 +342,8 @@
     "title": "Accept the complete restored Native implementation",
     "dependencies": [
       "rn-review-fidelity",
-      "rn-review-integration"
+      "rn-review-integration",
+      "rn-release-readiness"
     ],
     "mode": "root orchestration and review only",
     "ownership": [
@@ -417,6 +428,84 @@
     "mode": "read-only bounded validation and fix design",
     "ownership": [
       ".codex/plans/native-original/execution-results/history-owner-validation.md"
+    ]
+  },
+  {
+    "id": "rn-acceptance-matrix",
+    "title": "Define complete Native, NCM and semantic acceptance coverage",
+    "mode": "read-only planning/verification",
+    "ownership": [
+      "See execution/rn-acceptance-matrix.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": []
+  },
+  {
+    "id": "rn-ncm-recall-fix",
+    "title": "Repair the demonstrated NCM recall failure without weakening its contract",
+    "mode": "write-capable",
+    "ownership": [
+      "See execution/rn-ncm-recall-fix.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-ncm-reproduce"
+    ]
+  },
+  {
+    "id": "rn-ncm-reproduce",
+    "title": "Reproduce intermittent NCM recall with stage-by-stage evidence",
+    "mode": "write-capable",
+    "ownership": [
+      "See execution/rn-ncm-reproduce.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-acceptance-matrix"
+    ]
+  },
+  {
+    "id": "rn-release-readiness",
+    "title": "Establish repeatable Native/NCM/semantic readiness for an isolated trial",
+    "mode": "read-only planning/verification",
+    "ownership": [
+      "See execution/rn-release-readiness.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-review-fidelity",
+      "rn-review-integration",
+      "rn-verify-semantic"
+    ]
+  },
+  {
+    "id": "rn-semantic-diagnose",
+    "title": "Locate why semantic acquisition or serving remains unavailable",
+    "mode": "read-only planning/verification",
+    "ownership": [
+      "See execution/rn-semantic-diagnose.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-acceptance-matrix"
+    ]
+  },
+  {
+    "id": "rn-semantic-fix",
+    "title": "Restore semantic readiness and recovery at the diagnosed boundary",
+    "mode": "write-capable",
+    "ownership": [
+      "See execution/rn-semantic-fix.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-semantic-diagnose"
+    ]
+  },
+  {
+    "id": "rn-verify-semantic",
+    "title": "Prove real semantic retrieval without lexical fallback masking failure",
+    "mode": "read-only planning/verification",
+    "ownership": [
+      "See execution/rn-verify-semantic.plan.md: Constraints for exact owned paths and output reports."
+    ],
+    "dependencies": [
+      "rn-semantic-fix",
+      "rn-build"
     ]
   }
 ]

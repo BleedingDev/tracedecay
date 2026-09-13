@@ -1,9 +1,9 @@
 {
   "graph_id": "native-original-execution-pr707-20260913",
-  "plan_set_hash": "20bb2dd27a",
-  "selection_hash": "08ad7a0ca9",
-  "plan_count": 33,
-  "edge_count": 71,
+  "plan_set_hash": "5befc5f407",
+  "selection_hash": "1752917f10",
+  "plan_count": 40,
+  "edge_count": 88,
   "errors": [],
   "warnings": [],
   "snapshot_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json",
