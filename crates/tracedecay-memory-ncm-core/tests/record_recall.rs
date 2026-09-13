@@ -443,6 +443,87 @@ fn recall_budget_truncates_candidate_prefix_without_truncating_text() {
 }
 
 #[test]
+fn recall_budget_skips_oversized_ranked_candidate_and_keeps_later_fits() {
+    let fitting_values = ["fits-a", "fits-b"];
+    let shared_key = "shared-key";
+    let mut config = config();
+    config.max_recall_bytes = fitting_values
+        .iter()
+        .map(|value| shared_key.len() + value.len())
+        .sum();
+    let mut records = RecordTable::new(&config);
+    let oversized = records
+        .insert(record_input(
+            "source-oversized",
+            shared_key,
+            &"oversized-ranked-candidate-".repeat(128),
+            0,
+        ))
+        .expect("oversized candidate remains within record budget");
+    let fitting = fitting_values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            records
+                .insert(record_input(
+                    &format!("source-fitting-{index}"),
+                    shared_key,
+                    value,
+                    0,
+                ))
+                .expect("fitting candidate")
+        })
+        .collect::<Vec<_>>();
+
+    let mut stm = MemoryCenters::new(config.stm.clone(), 53).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 54).expect("LTM");
+    let mut support = Support::new(&config);
+    let params = WriteParams::for_layer(&config, tracedecay_memory_ncm_core::types::Layer::Stm);
+    let key = unit(STM_DIM, 0, 1.0);
+    let ltm_key = unit(LTM_DIM, 0, 1.0);
+    for record in std::iter::once(oversized).chain(fitting.iter().copied()) {
+        write_record(&mut stm, &key, &ltm_key, record, &params, &mut support);
+    }
+
+    let (found, truncated, margin_satisfied) = candidates(
+        recall(
+            &key,
+            &ltm_key,
+            &unit(CONTEXT_DIM, 0, 1.0),
+            &stm,
+            &ltm,
+            0.0,
+            &records,
+            &support,
+            &RecallPolicy::default(),
+            4,
+        )
+        .expect("recall"),
+    );
+    assert!(truncated);
+    assert!(margin_satisfied);
+    assert_eq!(
+        found
+            .iter()
+            .map(|candidate| candidate.record_id)
+            .collect::<Vec<_>>(),
+        fitting
+    );
+    assert_eq!(
+        found
+            .iter()
+            .map(|candidate| candidate.key_text.len() + candidate.value_text.len())
+            .sum::<usize>(),
+        config.max_recall_bytes
+    );
+    assert!(
+        !found
+            .iter()
+            .any(|candidate| candidate.record_id == oversized)
+    );
+}
+
+#[test]
 fn deleted_records_are_never_returned() {
     let config = config();
     let source = SourceId("source".to_owned());

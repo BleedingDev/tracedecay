@@ -1,8 +1,8 @@
 //! Deterministic reproductions for the historical NCM recall loss.
 //!
 //! The test keeps the production configuration shape and uses only the named
-//! hash encoder test double. It is deliberately red until core recall scans
-//! past an oversized ranked candidate.
+//! hash encoder test double. It fails on the old break behavior and passes when
+//! core recall scans past an oversized ranked candidate.
 
 #![allow(
     clippy::expect_used,
@@ -68,7 +68,7 @@ fn request(sequence: u64, value: &str) -> ObserveRequest {
         provenance: json!({
             "reproduction": "ncm-recall-byte-budget-v1",
             "source_sequence": sequence,
-            "query": "what did the quicksilver retry budget change record, down to the obsidian-ledger-tail note?"
+            "query": "shared-recall-key"
         }),
         deadline: DEADLINE,
     };
@@ -120,9 +120,7 @@ fn oversized_ranked_candidate_must_not_hide_a_later_fitting_candidate() {
     let recalled = engine.recall(
         NAMESPACE,
         RecallRequest {
-            query_text:
-                "what did the quicksilver retry budget change record, down to the obsidian-ledger-tail note?"
-                    .to_owned(),
+            query_text: "shared-recall-key".to_owned(),
             top_k: 16,
             deadline: DEADLINE,
         },
@@ -130,16 +128,6 @@ fn oversized_ranked_candidate_must_not_hide_a_later_fitting_candidate() {
     assert_eq!(recalled.outcome, Outcome::Success, "{recalled:?}");
 
     let values = candidate_values(&recalled.payload);
-    assert!(
-        values.contains(&"fits-sequence-3"),
-        "a lower-ranked fitting candidate must survive the oversized sequence-2 candidate; got {values:?}"
-    );
-    assert!(
-        values.contains(&"fits-sequence-4"),
-        "all fitting historical candidates should remain eligible; got {values:?}"
-    );
-    assert!(
-        values.contains(&"fits-sequence-5"),
-        "all fitting historical candidates should remain eligible; got {values:?}"
-    );
+    assert_eq!(values, FITTING_VALUES.to_vec());
+    assert_eq!(recalled.payload["Candidates"]["truncated"], true);
 }

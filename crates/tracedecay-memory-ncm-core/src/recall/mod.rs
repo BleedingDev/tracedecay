@@ -236,7 +236,11 @@ pub fn recall(
             .ok_or(CoreError::BudgetExceeded("recall text"))?;
         if next_bytes > records.max_recall_bytes() {
             truncated = true;
-            break;
+            // A high-ranked candidate can be too large for the remaining
+            // reply budget while a lower-ranked candidate still fits. Keep
+            // scanning the bounded ranked set so one oversized row cannot
+            // hide every later admissible row.
+            continue;
         }
         text_bytes = next_bytes;
         selected.push(hydrate_candidate(candidate, record, stm_mass, ltm_mass));
