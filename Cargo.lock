@@ -6410,6 +6410,7 @@ name = "tracedecay-daemon-service"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
  "hotpath",
