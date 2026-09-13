@@ -76,3 +76,27 @@ documentation clarification. It does not add a wire field, capability, or
 canonical JSON contract member. Therefore none of the four generated outputs
 is regenerated or changed by `rn-contract`; the two `--check` commands above
 remain the required zero-drift verification.
+
+## Verification record
+
+The inventory above was captured before invocation. At moving composition head
+`2fa7374cf612cc41f140a2cd7d4fc4452b7e79e5`, both authoritative checks completed
+with exit code 0 and no generated-file changes:
+
+```text
+python3 scripts/product/generate-memory-provider-rust.py --repo . --check
+ok: true
+manifest_sha256: 1c3e874ac8d1d9b78db8912691763414bea0f4a7772471ad69000469e793e5ec
+output_sha256: 0748e388b1064e2ffc7c8716b0467b7afaa40306aa4b37e7ba10f751a00689f4
+
+python3 scripts/product/generate-memory-provider-goldens.py --repo . --check
+ok: true
+fixture_count: 25
+fixtures_sha256: a733d1f385f73b5c8faaf6414738e2573df9466488dde59edbb96c90cc7b0958
+manifest_sha256: 4b85288f376cd9eac99c3bc7bda3cb5a9c1c5287d818d441becd3ae0a6c4c1c7
+```
+
+The Python environment emitted its pre-existing `distutils-precedence.pth`
+warning before each result; it did not affect either check. The generated Rust
+bindings and golden fixtures remain unchanged because this node changed only
+runtime/documentation boundary text.

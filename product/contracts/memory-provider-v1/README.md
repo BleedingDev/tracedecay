@@ -28,7 +28,7 @@ A syntactically valid unknown capability is decoded as `OpaqueMemoryProviderCapa
 
 ## Fail-closed resolution
 
-A registration records `recall_scope_bindings`: `exact_coding_scope`, `checkout_observations`, `project_facts`, and `profile_facts`. Providers cannot self-declare authorization; admission receives it with the admitted call. Native is authorized for all four: facts retain their project/profile owner binding, and staged session observations use a checkout claim requiring the same profile, project, repository, worktree and branch, with empty candidate session/digest fields. Original session and scope digests remain provenance on the immutable exact-scope row. NCM remains authorized only for `exact_coding_scope`. Request/response scope and host citation authority remain exact.
+A registration records `recall_scope_bindings`: `exact_coding_scope`, `checkout_observations`, `project_facts`, and `profile_facts`. Providers cannot self-declare authorization; admission receives it with the admitted call. The selected Native candidate is declared for all four: facts retain their project/profile owner binding, while `checkout_observations` is a provider-local staged candidate projection requiring the same profile, project, repository, worktree and branch, with empty candidate session/digest fields. That staged projection is not canonical session/LCM authority; original session and scope digests remain provenance on the immutable exact-scope row. NCM remains authorized only for `exact_coding_scope`. Request/response scope and host citation authority remain exact.
 
 Resolution requires exact provider identity, accepted registration revision, compatible adapter contract, all mandatory capabilities, every explicitly required known capability, exact TraceDecay scope, a live deadline, and live cancellation. There is no implicit fallback and no successful empty resolution.
 
@@ -52,6 +52,54 @@ the original owner-bound retrieval recording command and its retrieval receipt
 when that direct search returns hits; that telemetry is not added to automatic
 context reads. No new generic operation or capability is implied by the
 once-delivered route.
+
+## Original Native application routes
+
+The generic provider operation and capability catalogs do not replace the
+typed routes in the complete upstream 570 Native surface. The public
+[Native memory surface map](../../architecture/native-memory-surface-map.md)
+anchors the owner and effect decisions; an internal parity handoff records
+the complete caller, receipt, and current-composition evidence. This contract
+does not depend on that internal planning artifact.
+The boundary decisions are:
+
+- `fact_store_curate` is the retained administrative application operation.
+  It is a canonical mutation (`canonical_mutation=true`). The current retained
+  curator performs pre-mutation automation admission reservation, applies
+  accepted reviewed mutations through the Native explicit-fact authority, and
+  then settles the outer automation effect-ledger and terminal run receipt
+  before reporting success. Any downstream Native composition must preserve
+  that reservation → mutation → outer-settlement order. It is distinct from
+  the lower-level curation transaction.
+- Direct retained `fact_store_search` preserves nonempty retrieval telemetry
+  and its owner-bound receipt. Probe and reason remain read-only; related uses
+  the retained `RecordRetrieval` access lease for inline derived-graph
+  reconciliation, but its semantic query does not call explicit retrieval
+  tracking and does not promise the Search receipt. Automatic context remains
+  read-only. Generic `Recall` does not stand in for any of these owner-bound
+  Native routes.
+- `session_lookup` uses
+  `DaemonSessionLookupPrimitiveV1` →
+  `SessionApplicationRetrievalPortV1::retrieve_admitted`; it is distinct from
+  retained `MessageSearch`. `SessionsFor` and `Workflows` are project-only
+  routes, with profile authority returning typed unsupported.
+- `recent_sessions`, `session_providers`, and `session_replay_slice` remain
+  internal `RegisteredGlobalDb`/`SessionStoreAccess` queries because they have
+  no `RetainedLcmRequestV1` or `DirectRetainedLcmPortV1` binding. `lcm_compress`
+  and its lifecycle helpers remain daemon-internal mounted-authority work;
+  no public alias is added.
+
+Provider-local `ProviderOperation::SnapshotExport`,
+`ProviderOperation::SnapshotRestore`, `ProviderOperation::DeleteBySource`,
+`ProviderOperation::Maintenance`, `ProviderOperation::Replay`,
+`ProviderOperation::Inspection`, `ProviderOperation::Feedback`,
+`ProviderOperation::Correction`, and `ProviderOperation::Observe` have no
+exact Native equivalent at this boundary. They remain provider-local; when the
+selected Native composition cannot serve one, it returns typed
+unsupported/refused rather than becoming a Native alias. `Observe` is provider
+observation acceptance and does not stand for canonical host/session ingest.
+NCM is a separate reserved provider slot and cannot satisfy Native fact,
+session, LCM, or context routes.
 
 ## Reserved provider slots
 
