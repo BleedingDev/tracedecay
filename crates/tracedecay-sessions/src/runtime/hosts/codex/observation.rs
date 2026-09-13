@@ -314,6 +314,7 @@ pub(crate) async fn try_admit_codex_jsonl_observations_for_project_window(
     path: &Path,
     project_root: &Path,
     project_id: ProjectId,
+    session_id: Option<&str>,
     admission: &dyn HostAdmission,
     max_new_bytes: u64,
     cancellation: &ObservationCancellation,
@@ -323,6 +324,7 @@ pub(crate) async fn try_admit_codex_jsonl_observations_for_project_window(
         CodexObservationAdmission::Project {
             root: project_root,
             project_id,
+            session_id,
         },
         admission,
         Some(
@@ -680,6 +682,7 @@ async fn try_admit_codex_jsonl_observations(
         admission_scope,
         admission,
         max_new_bytes,
+        max_frames,
         cancellation,
         None,
     )
@@ -705,6 +708,7 @@ pub async fn try_admit_codex_jsonl_observations_for_project_through_sealed_sourc
         },
         admission,
         max_new_bytes,
+        None,
         cancellation,
         Some(bound),
     )
@@ -716,6 +720,7 @@ async fn try_admit_codex_jsonl_observations_bounded(
     admission_scope: CodexObservationAdmission<'_>,
     admission: &dyn HostAdmission,
     max_new_bytes: Option<u64>,
+    max_frames: Option<usize>,
     cancellation: &ObservationCancellation,
     sealed_source: Option<&SealedJsonlSourceBound>,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
@@ -1228,6 +1233,7 @@ mod replay_boundary_tests {
                 sealed_source: None,
             },
             ordinary_source,
+            None,
             None,
             None,
             CodexAdmissionMode::Ordinary,

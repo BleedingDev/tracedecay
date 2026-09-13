@@ -435,7 +435,7 @@ pub(super) fn verify_observation_authority(
             },
         )
         .optional()?;
-    let Some((availability, capture, anchor_id, owner, origin_json)) = stored.as_ref() else {
+    let Some((_, capture, _, _, origin_json)) = stored.as_ref() else {
         return Err(invalid("observation repository provenance collision"));
     };
     let retained_origin = origin_json

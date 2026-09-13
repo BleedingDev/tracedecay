@@ -942,7 +942,7 @@ async fn dispatch_decoded_with_required_work<T>(
         elapsed_us(started),
     );
     let Ok(context_scout_address) = admission.take_context_scout_address() else {
-        return unavailable();
+        return (unavailable(), required_result);
     };
     let feedback_notice = admission.take_feedback_notice();
     let github_stack_signal_available = admission.take_github_stack_signal_available();
@@ -1000,7 +1000,7 @@ async fn dispatch_decoded_with_required_work<T>(
                 github_stack_signal_available,
             ) {
                 Ok(guidance) => guidance,
-                Err(_) => return unavailable(),
+                Err(_) => return (unavailable(), required_result),
             };
             HookDispatch::Handled {
                 guidance,
