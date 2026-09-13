@@ -697,6 +697,57 @@ fn handshake_preserves_exact_scope_and_request_identity() {
 }
 
 #[test]
+fn handshake_rejects_unknown_and_undeclared_required_capabilities_before_port_contact() {
+    for (required_capability, declared_capabilities) in [
+        ("feedback.record.v1", &[][..]),
+        (
+            "vendor.future-capability.v7",
+            &["vendor.future-capability.v7"][..],
+        ),
+    ] {
+        let port = Arc::new(MockNativePort::new(
+            NATIVE_PROVIDER_ID,
+            declared_capabilities,
+        ));
+        let provider = NativeProvider::new(port.clone()).expect("adapter");
+        let mut request = handshake(NATIVE_PROVIDER_ID);
+        request
+            .required_capabilities
+            .insert(OwnedVersionedId::new(required_capability).expect("required capability"));
+        let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+        let response = provider.handshake(&request);
+
+        assert_eq!(
+            response.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
+        assert_eq!(
+            response.terminal.diagnostic_id(),
+            Some("native.required_capability_missing")
+        );
+        assert_eq!(
+            response.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(
+            port.counters.descriptor.load(Ordering::Relaxed),
+            descriptor_calls
+        );
+        assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 0);
+        assert_eq!(port.counters.operation_calls(ProviderOperation::Health), 0);
+        assert_eq!(port.descriptor.state_generation, 7);
+        assert!(response.descriptor.is_none());
+        assert!(
+            port.last_handshake
+                .lock()
+                .expect("handshake lock")
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn invalid_handshake_envelopes_fail_before_native_contact() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
@@ -1072,6 +1123,60 @@ fn undeclared_optional_operations_are_unsupported_without_port_contact() {
         descriptor_calls
     );
     assert!(port.last_call.lock().expect("last call lock").is_none());
+}
+
+#[test]
+fn invoke_rejects_unknown_and_undeclared_required_capabilities_before_port_contact() {
+    for (required_capability, declared_capabilities) in [
+        ("feedback.record.v1", &[][..]),
+        (
+            "vendor.future-capability.v7",
+            &["vendor.future-capability.v7"][..],
+        ),
+    ] {
+        let port = Arc::new(MockNativePort::new(
+            NATIVE_PROVIDER_ID,
+            declared_capabilities,
+        ));
+        let provider = NativeProvider::new(port.clone()).expect("adapter");
+        let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Recall);
+        request
+            .required_capabilities
+            .insert(OwnedVersionedId::new(required_capability).expect("required capability"));
+        let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+        let reply = provider.invoke(&request);
+
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.required_capability_missing")
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state_generation_before(),
+            Some(request.expected_state_generation)
+        );
+        assert_eq!(
+            reply.terminal.committed_effect().state_generation_after(),
+            Some(request.expected_state_generation)
+        );
+        assert_eq!(reply.state_generation, request.expected_state_generation);
+        assert_eq!(
+            port.counters.descriptor.load(Ordering::Relaxed),
+            descriptor_calls
+        );
+        for operation in all_provider_operations() {
+            assert_eq!(port.counters.operation_calls(operation), 0);
+        }
+        assert!(port.last_call.lock().expect("last call lock").is_none());
+    }
 }
 
 #[test]

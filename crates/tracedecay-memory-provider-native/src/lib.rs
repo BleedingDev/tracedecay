@@ -24,6 +24,7 @@
 //! of an accepted observation belongs entirely to the application port behind
 //! this boundary. Staging a session message opens no store in this crate.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde_json::Value;
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, ProviderCall,
+    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, OwnedVersionedId, ProviderCall,
     ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
 
@@ -363,6 +364,15 @@ impl NativeProvider {
         }
     }
 
+    fn supports_required_capabilities(
+        descriptor: &ProviderDescriptor,
+        required: &BTreeSet<OwnedVersionedId>,
+    ) -> bool {
+        required
+            .iter()
+            .all(|capability| descriptor.supports(capability.as_str()))
+    }
+
     fn reject(
         &self,
         call: &ProviderCall,
@@ -546,6 +556,13 @@ impl MemoryProvider for NativeProvider {
                 "native.provider_id_mismatch",
             );
         }
+        if !Self::supports_required_capabilities(&self.descriptor, &request.required_capabilities) {
+            return self.reject_handshake(
+                request,
+                TerminalCode::CapabilityUnsupported,
+                "native.required_capability_missing",
+            );
+        }
         if self.refresh_descriptor().is_none() {
             return self.reject_handshake(
                 request,
@@ -583,6 +600,13 @@ impl MemoryProvider for NativeProvider {
                 call,
                 TerminalCode::CapabilityUnsupported,
                 "native.capability_unsupported",
+            );
+        }
+        if !Self::supports_required_capabilities(&self.descriptor, &call.required_capabilities) {
+            return self.reject(
+                call,
+                TerminalCode::CapabilityUnsupported,
+                "native.required_capability_missing",
             );
         }
         if let Some(rejection) = self.validate_payload_contract(call) {
