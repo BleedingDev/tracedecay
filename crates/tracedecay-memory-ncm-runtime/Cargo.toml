@@ -25,8 +25,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
-# Real native inference (contract §9). Same pinned fork/features as tracedecay-semantic.
-fastembed = { version = "=5.17.3", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+# Real native inference (contract §9). Keep this synchronized with the
+# published FastEmbed/ORT runtime used by tracedecay-semantic.
+fastembed = { version = "=6.0.3", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
 
 [features]
 # Production shape. Lanes that do not touch inference build with `--no-default-features`

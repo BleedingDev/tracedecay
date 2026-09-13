@@ -5837,11 +5837,7 @@ name = "tracedecay"
 version = "0.1.0-beta.37"
 dependencies = [
  "axum",
- "base64 0.22.1",
- "cap-fs-ext",
- "cap-std",
  "chrono",
- "clap",
  "constant_time_eq",
  "criterion",
  "dirs",
