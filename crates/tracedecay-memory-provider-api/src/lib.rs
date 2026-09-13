@@ -21,9 +21,8 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -81,6 +80,43 @@ const INTERNAL_FAILURE_OPERATION_ID: &str = "tracedecay.internal-failure.operati
 const INTERNAL_FAILURE_DIAGNOSTIC_ID: &str = "tracedecay.memory.provider.internal-failure.v1";
 const INVALID_EXACT_SCOPE_SHA256: &str =
     "ef2d127de37b942baad06145e54b0c6195a6ef9e5a3124a29e1d5074f6604f12";
+
+fn deadline_duration(remaining_millis: u64) -> Duration {
+    if remaining_millis == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_millis(remaining_millis.saturating_sub(1))
+        .checked_add(Duration::from_nanos(1))
+        .unwrap_or(Duration::MAX)
+}
+
+fn saturating_instant_add(start: Instant, duration: Duration) -> Instant {
+    // There is no portable public `Instant::MAX`. If a platform cannot
+    // represent the requested finite budget, fail closed at the operation
+    // start rather than wrapping or accidentally extending the deadline.
+    start.checked_add(duration).unwrap_or(start)
+}
+
+fn classify_snapshot(
+    cancellation_at: Option<Instant>,
+    now: Instant,
+    deadline_at: Instant,
+    live_remaining_millis: Option<u64>,
+) -> Result<u64, TerminalCode> {
+    if let Some(cancellation_at) = cancellation_at {
+        // Compare the event itself, never a possibly stale `now` observation.
+        // Equality is intentionally cancellation-wins for a zero-budget tie.
+        return if cancellation_at <= deadline_at {
+            Err(TerminalCode::Cancelled)
+        } else {
+            Err(TerminalCode::DeadlineExceeded)
+        };
+    }
+    if now >= deadline_at {
+        return Err(TerminalCode::DeadlineExceeded);
+    }
+    live_remaining_millis.ok_or(TerminalCode::DeadlineExceeded)
+}
 
 /// Stable API validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -516,6 +552,10 @@ impl OwnedVersionedId {
     }
 
     /// Returns the canonical versioned identity.
+    ///
+    /// Syntactically valid IDs outside the generated capability catalog are
+    /// retained verbatim. Catalog membership is checked separately by
+    /// [`ProviderDescriptor::supports`].
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -629,7 +669,7 @@ impl OwnedExactScope {
 
 /// Thread-safe cooperative cancellation signal.
 #[derive(Clone, Debug, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<Mutex<Option<Instant>>>);
 
 impl CancellationToken {
     /// Creates a live cancellation token.
@@ -638,24 +678,49 @@ impl CancellationToken {
         Self::default()
     }
 
-    /// Marks the token cancelled. Repeated cancellation is idempotent.
+    /// Marks the token cancelled and retains the first monotonic cancellation
+    /// event. Repeated cancellation is idempotent.
+    ///
+    /// The lock/store of the first timestamp is the cancellation linearization
+    /// point. Losing clones observe the same stored event and cannot publish a
+    /// sampled timestamp of their own.
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.is_none() {
+            *state = Some(Instant::now());
+        }
     }
 
     /// Returns whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.cancelled_at().is_some()
+    }
+
+    fn cancelled_at(&self) -> Option<Instant> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .copied()
     }
 }
 
 /// Live deadline and cancellation budget for one provider operation.
+///
+/// The wire snapshot retains the absolute UTC deadline and the remaining
+/// budget, while terminal preflight decisions use the monotonic deadline and
+/// the first monotonic cancellation event. If both are terminal, the earlier
+/// event wins.
 #[derive(Clone, Debug)]
 pub struct OperationControl {
     deadline_utc_micros: i64,
     remaining_millis: u64,
     budget_started_at: Instant,
+    deadline_at: Instant,
     cancellation: CancellationToken,
 }
 
@@ -680,30 +745,37 @@ impl OperationControl {
                 u64::try_from(remaining_micros / 1_000).ok()
             })
             .unwrap_or(0);
+        let remaining_millis = remaining_millis.min(wall_remaining_millis);
+        let deadline_at =
+            saturating_instant_add(budget_started_at, deadline_duration(remaining_millis));
         Self {
             deadline_utc_micros,
-            remaining_millis: remaining_millis.min(wall_remaining_millis),
+            remaining_millis,
             budget_started_at,
+            deadline_at,
             cancellation,
         }
     }
 
     /// Returns an immutable wire snapshot or a terminal preflight failure.
     pub fn snapshot(&self) -> Result<RequestControl, TerminalCode> {
-        if self.cancellation.is_cancelled() {
-            Err(TerminalCode::Cancelled)
-        } else if self.absolute_deadline_elapsed() {
-            Err(TerminalCode::DeadlineExceeded)
-        } else {
-            let Some(remaining_millis) = self.live_remaining_millis() else {
-                return Err(TerminalCode::DeadlineExceeded);
-            };
-            Ok(RequestControl {
-                deadline_utc_micros: self.deadline_utc_micros,
-                remaining_millis,
-                cancellation: CancellationState::Live,
-            })
-        }
+        // The mutex read is the cancellation linearization point. A concurrent
+        // cancel after this read belongs to a later snapshot, so read it first
+        // and only then sample the monotonic deadline/budget clock.
+        let cancellation_at = self.cancellation.cancelled_at();
+        let now = Instant::now();
+        let live_remaining_millis = self.live_remaining_millis_at(now);
+        let remaining_millis = classify_snapshot(
+            cancellation_at,
+            now,
+            self.deadline_at,
+            live_remaining_millis,
+        )?;
+        Ok(RequestControl {
+            deadline_utc_micros: self.deadline_utc_micros,
+            remaining_millis,
+            cancellation: CancellationState::Live,
+        })
     }
 
     /// Returns the shared live cancellation token.
@@ -724,17 +796,12 @@ impl OperationControl {
         self.remaining_millis
     }
 
-    fn absolute_deadline_elapsed(&self) -> bool {
-        let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-            return true;
-        };
-        let now_micros = i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX);
-        self.deadline_utc_micros <= now_micros
-    }
-
-    fn live_remaining_millis(&self) -> Option<u64> {
-        let elapsed_nanos = self.budget_started_at.elapsed().as_nanos();
-        let elapsed_millis = if elapsed_nanos == 0 {
+    fn elapsed_millis_at(&self, now: Instant) -> u64 {
+        let elapsed_nanos = now
+            .checked_duration_since(self.budget_started_at)
+            .unwrap_or_default()
+            .as_nanos();
+        if elapsed_nanos == 0 {
             0
         } else {
             elapsed_nanos
@@ -742,14 +809,25 @@ impl OperationControl {
                 .checked_div(1_000_000)
                 .and_then(|value| u64::try_from(value).ok())
                 .unwrap_or(u64::MAX)
-        };
+        }
+    }
+
+    fn live_remaining_millis_at(&self, now: Instant) -> Option<u64> {
         self.remaining_millis
-            .checked_sub(elapsed_millis)
+            .checked_sub(self.elapsed_millis_at(now))
             .filter(|remaining| *remaining > 0)
     }
 }
 
-/// Provider operation routed by one versioned capability.
+/// Generic provider operation routed by one versioned capability.
+///
+/// This enum deliberately does not model the original Native application
+/// routes. Native fact search, `FactStoreCurate`, session lookup, retained
+/// `MessageSearch`, `SessionsFor`, `Workflows`, and LCM operations remain
+/// typed TraceDecay-owned application/retained ports. In particular,
+/// [`Self::Recall`] is a read-only advisory provider query and cannot be used
+/// as an alias for an owner-bound Native route. Unsupported generic controls
+/// remain typed unsupported/refused at composition boundaries.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ProviderOperation {
     /// Read-only compatible handshake.
@@ -758,7 +836,10 @@ pub enum ProviderOperation {
     Health,
     /// Idempotent provider-local observation acceptance.
     Observe,
-    /// Advisory provider recall.
+    /// Read-only advisory provider recall.
+    ///
+    /// This does not carry the explicit retained fact `Search` retrieval
+    /// telemetry or stand for the once-delivered Native context route.
     Recall,
     /// Provider-local feedback recording.
     Feedback,
@@ -936,7 +1017,13 @@ pub struct ProviderDescriptor {
     pub protocol_major: u16,
     /// Compatible provider protocol minor.
     pub protocol_minor: u16,
-    /// Real declared capabilities.
+    /// Real declared capability IDs.
+    ///
+    /// The runtime descriptor intentionally stores the ID projection only.
+    /// Syntactically valid unknown IDs survive this projection verbatim, while
+    /// the registry DTO's `canonical_payload` remains owned by its transport
+    /// boundary and is not represented by this type. Unknown IDs stay inert
+    /// until the generated catalog accepts them.
     pub capabilities: BTreeSet<OwnedVersionedId>,
     /// Finite provider ceilings.
     pub limits: ProviderLimits,
@@ -1009,12 +1096,18 @@ impl ProviderDescriptor {
         Ok(())
     }
 
-    /// Returns whether this descriptor declares one capability.
+    /// Returns whether this descriptor declares one known capability.
+    ///
+    /// Syntactically valid capabilities outside the generated catalog remain
+    /// in [`Self::capabilities`] for opaque wire round trips, but are inert:
+    /// they never count as support or satisfy required-capability selection.
     #[must_use]
     pub fn supports(&self, capability_id: &str) -> bool {
-        self.capabilities
-            .iter()
-            .any(|capability| capability.as_str() == capability_id)
+        is_known_capability(capability_id)
+            && self
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == capability_id)
     }
 
     /// Requires the explicitly declared complete advisory profile. Legacy
@@ -1029,6 +1122,12 @@ impl ProviderDescriptor {
         }
         Ok(())
     }
+}
+
+fn is_known_capability(capability_id: &str) -> bool {
+    contract::CAPABILITIES
+        .iter()
+        .any(|capability| capability.capability_id == capability_id)
 }
 
 /// Canonical payload bytes bound to their verified digest.
@@ -1258,6 +1357,11 @@ pub struct ProviderCall {
     /// Canonical operation payload.
     pub payload: CanonicalPayload,
     /// Required capabilities, including the operation capability.
+    ///
+    /// Envelope validation checks these IDs for syntax and presence of the
+    /// operation capability. Provider admission must check every ID with
+    /// [`ProviderDescriptor::supports`]; an unknown but syntactically valid ID
+    /// remains in the envelope so selection can return typed unsupported.
     pub required_capabilities: BTreeSet<OwnedVersionedId>,
     /// Opaque extensions.
     pub extensions: Vec<OwnedOpaqueExtension>,
@@ -2942,4 +3046,241 @@ pub trait MemoryProvider: Send + Sync + 'static {
 
     /// Executes one capability-routed provider operation.
     fn invoke(&self, call: &ProviderCall) -> ProviderReply;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn test_limits() -> ProviderLimits {
+        ProviderLimits {
+            request_bytes: 1_024,
+            response_bytes: 2_048,
+            observation_batch_items: 8,
+            recall_candidates: 16,
+            concurrent_operations: 2,
+            operation_millis: 500,
+            snapshot_bytes: 4_096,
+            inspection_items: 64,
+        }
+    }
+
+    fn test_scope() -> Result<OwnedExactScope, ApiError> {
+        OwnedExactScope::new(
+            "profile-1",
+            "project-1",
+            "repo-1",
+            "worktree-1",
+            "refs/heads/main",
+            "session-1",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+    }
+
+    #[test]
+    fn unknown_capability_id_projection_round_trips_opaquely_but_cannot_satisfy_selection()
+    -> Result<(), ApiError> {
+        let unknown = OwnedVersionedId::new("vendor.future-capability.v7")?;
+        let descriptor = ProviderDescriptor::new(
+            OwnedProviderId::new("test.provider")?,
+            "a".repeat(64),
+            "state.v1",
+            0,
+            [
+                OwnedVersionedId::new("provider.health.v1")?,
+                OwnedVersionedId::new("observation.accept.v1")?,
+                OwnedVersionedId::new("recall.query.v1")?,
+                unknown.clone(),
+            ],
+            test_limits(),
+        )?;
+
+        let wire_capabilities = descriptor
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let decoded_capabilities: BTreeSet<OwnedVersionedId> = wire_capabilities
+            .iter()
+            .map(|capability| {
+                // `ProviderDescriptor` carries only the registry wire ID
+                // projection. Validate that projection through the generated
+                // DTO identity, then own it again without semantic rewriting.
+                let wire_id =
+                    CapabilityId::new(capability).map_err(ApiError::InvalidVersionedId)?;
+                OwnedVersionedId::new(wire_id.as_str())
+            })
+            .collect::<Result<_, _>>()?;
+
+        assert_eq!(decoded_capabilities, descriptor.capabilities);
+        assert!(descriptor.capabilities.contains(&unknown));
+        assert!(!is_known_capability(unknown.as_str()));
+        assert!(!descriptor.supports(unknown.as_str()));
+
+        let request = HandshakeRequest::new(HandshakeRequestParts {
+            provider_id: OwnedProviderId::new("test.provider")?,
+            registration_revision: 1,
+            exact_scope: test_scope()?,
+            request_id: "unknown-selection".to_owned(),
+            required_capabilities: vec![unknown.clone()],
+            host_limits: test_limits(),
+            control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+            challenge_nonce: [0; 32],
+        })?;
+
+        assert_eq!(request.required_capabilities, BTreeSet::from([unknown]));
+        assert!(
+            !request
+                .required_capabilities
+                .iter()
+                .all(|capability| descriptor.supports(capability.as_str()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_timestamp_is_singleton_across_clones_and_racers() -> Result<(), String> {
+        const RACERS: usize = 16;
+
+        let cancellation = CancellationToken::new();
+        let control = OperationControl::new(i64::MAX, 1_000, cancellation.clone());
+        let barrier = Arc::new(Barrier::new(RACERS.saturating_add(1)));
+        let mut handles = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let barrier = Arc::clone(&barrier);
+            let cancellation = cancellation.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                cancellation.cancel();
+                cancellation.cancelled_at()
+            }));
+        }
+        barrier.wait();
+
+        let mut timestamps = Vec::with_capacity(RACERS);
+        for handle in handles {
+            timestamps.push(
+                handle
+                    .join()
+                    .map_err(|_| "cancellation racer panicked".to_owned())?,
+            );
+        }
+        let first_timestamp = timestamps
+            .first()
+            .copied()
+            .flatten()
+            .ok_or_else(|| "cancellation winner did not publish a timestamp".to_owned())?;
+
+        assert!(
+            timestamps
+                .iter()
+                .all(|timestamp| *timestamp == Some(first_timestamp))
+        );
+        assert_eq!(cancellation.cancelled_at(), Some(first_timestamp));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(control.clone().snapshot(), Err(TerminalCode::Cancelled));
+        assert_eq!(control.snapshot(), Err(TerminalCode::Cancelled));
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_before_deadline_wins() {
+        let cancellation = CancellationToken::new();
+        let control = OperationControl::new(i64::MAX, 100, cancellation.clone());
+
+        cancellation.cancel();
+
+        assert_eq!(control.snapshot(), Err(TerminalCode::Cancelled));
+    }
+
+    #[test]
+    fn deadline_before_cancellation_wins() {
+        let cancellation = CancellationToken::new();
+        let control = OperationControl::new(i64::MAX, 0, cancellation.clone());
+
+        cancellation.cancel();
+
+        assert_eq!(control.snapshot(), Err(TerminalCode::DeadlineExceeded));
+    }
+
+    #[test]
+    fn terminal_classifier_ignores_stale_clock_when_cancellation_is_recorded() {
+        let start = Instant::now();
+        let deadline = saturating_instant_add(start, Duration::from_millis(2));
+        let before_deadline = saturating_instant_add(start, Duration::from_millis(1));
+        let after_deadline = saturating_instant_add(start, Duration::from_millis(3));
+
+        // A stale pre-mutex clock sample must not turn a post-deadline
+        // cancellation into Cancelled.
+        assert_eq!(
+            classify_snapshot(Some(after_deadline), before_deadline, deadline, Some(1)),
+            Err(TerminalCode::DeadlineExceeded)
+        );
+        // A stale post-deadline clock sample must not override a cancellation
+        // event that the mutex read recorded before the deadline.
+        assert_eq!(
+            classify_snapshot(Some(before_deadline), after_deadline, deadline, None),
+            Err(TerminalCode::Cancelled)
+        );
+        assert_eq!(
+            classify_snapshot(Some(deadline), after_deadline, deadline, None),
+            Err(TerminalCode::Cancelled)
+        );
+        assert_eq!(
+            classify_snapshot(None, after_deadline, deadline, None),
+            Err(TerminalCode::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn exact_and_zero_deadlines_fail_closed() -> Result<(), String> {
+        let zero = OperationControl::new(i64::MAX, 0, CancellationToken::new());
+        assert_eq!(zero.snapshot(), Err(TerminalCode::DeadlineExceeded));
+
+        let now_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_owned())
+            .and_then(|elapsed| {
+                i64::try_from(elapsed.as_micros())
+                    .map_err(|_| "system clock does not fit the wire deadline".to_owned())
+            })?;
+        let exact = OperationControl::new(now_micros, 100, CancellationToken::new());
+        assert_eq!(exact.remaining_millis(), 0);
+        assert_eq!(exact.snapshot(), Err(TerminalCode::DeadlineExceeded));
+        Ok(())
+    }
+
+    #[test]
+    fn deadline_offset_and_live_budget_share_submillisecond_boundary() {
+        assert_eq!(deadline_duration(0), Duration::ZERO);
+        assert_eq!(deadline_duration(1), Duration::from_nanos(1));
+        assert_eq!(deadline_duration(2), Duration::from_nanos(1_000_001));
+
+        let control = OperationControl::new(i64::MAX, 2, CancellationToken::new());
+        let start = control.budget_started_at;
+        assert_eq!(control.live_remaining_millis_at(start), Some(2));
+        assert_eq!(
+            control
+                .live_remaining_millis_at(saturating_instant_add(start, Duration::from_millis(1),)),
+            Some(1)
+        );
+        let deadline = saturating_instant_add(start, deadline_duration(2));
+        assert_eq!(control.deadline_at, deadline);
+        assert_eq!(control.live_remaining_millis_at(deadline), None);
+    }
+
+    #[test]
+    fn deadline_budget_overflow_saturates_without_reopening_budget() {
+        let maximum_duration = deadline_duration(u64::MAX);
+        let expected_duration = Duration::from_millis(u64::MAX.saturating_sub(1))
+            .checked_add(Duration::from_nanos(1))
+            .unwrap_or(Duration::MAX);
+        assert_eq!(maximum_duration, expected_duration);
+
+        let control = OperationControl::new(i64::MAX, u64::MAX, CancellationToken::new());
+
+        assert!(control.deadline_at >= control.budget_started_at);
+        assert!(control.snapshot().is_ok());
+    }
 }
