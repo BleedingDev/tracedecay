@@ -101,7 +101,12 @@ pub struct DispatchPolicyV1 {
     pub lease_duration_micros: i64,
     /// Maximum rows one round leases.
     pub batch_max_items: u32,
-    /// Maximum queue bytes one round leases.
+    /// Maximum sum of [`crate::AdmittedObservationV1::queue_bytes`] one round leases.
+    /// The cap is hard for a round containing multiple rows. If the first
+    /// eligible row in source order exceeds it on its own, the journal leases
+    /// that row as a singleton and admits no other row in that round; this
+    /// bounded exception prevents an eligible queue from looking empty because
+    /// the lease API has no typed oversized result.
     pub batch_max_bytes: u64,
     /// How long one provider attempt may run before its control deadline
     /// elapses. Never longer than the lease: an attempt that outlives its lease

@@ -840,6 +840,20 @@ fn record_unsettled_attempt_in_transaction(
     })
 }
 
+/// Returns the byte weight charged to a delivery round.
+///
+/// This mirrors [`crate::AdmittedObservationV1::queue_bytes`]: the canonical
+/// payload and every opaque extension are part of the bytes the journal admits
+/// and the provider receives. Keeping the calculation at the lease boundary
+/// prevents a large extension from bypassing the round's byte bound merely
+/// because its payload is small.
+fn leased_queue_bytes(item: &LeasedObservationV1) -> u64 {
+    let extensions = item.extensions.iter().fold(0_usize, |total, extension| {
+        total.saturating_add(extension.canonical_payload.len())
+    });
+    u64::try_from(item.payload.bytes.len().saturating_add(extensions)).unwrap_or(u64::MAX)
+}
+
 impl ObservationJournalReaderV1 for SqliteObservationJournal {
     fn lease_pending(
         &self,
@@ -898,6 +912,14 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                  ORDER BY d.source_sequence, d.idempotency_key \
                  LIMIT ?5"
             );
+            // Scan the bounded queue rather than only the item budget. A row
+            // that does not fit the remaining byte budget is left pending so
+            // a later, smaller row can backfill this batch. The retention
+            // policy bounds the scan, while `max_items` still bounds the
+            // number of claims this call can make.
+            let scan_limit =
+                i64::try_from(policy.max_queue_items.max(u64::from(request.max_items)))
+                    .unwrap_or(i64::MAX);
             let mut candidates: Vec<(LeasedObservationV1, DeliveryStateV1, u32)> = Vec::new();
             {
                 let mut statement = transaction.prepare(&select)?;
@@ -906,10 +928,14 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                     registration,
                     request.now_unix_micros,
                     request.exact_scope_sha256.as_deref(),
-                    i64::from(request.max_items),
+                    scan_limit,
                 ])?;
                 let mut leased_bytes: u64 = 0;
                 while let Some(row) = rows.next()? {
+                    if candidates.len() >= usize::try_from(request.max_items).unwrap_or(usize::MAX)
+                    {
+                        break;
+                    }
                     let state = DeliveryStateV1::from_wire(&row.get::<_, String>(29)?)?;
                     let lease_expires = request
                         .now_unix_micros
@@ -921,14 +947,24 @@ impl ObservationJournalReaderV1 for SqliteObservationJournal {
                         request.now_unix_micros,
                         lease_expires,
                     )?;
-                    let weight = u64::try_from(item.payload.bytes.len()).unwrap_or(u64::MAX);
-                    if !candidates.is_empty()
-                        && leased_bytes.saturating_add(weight) > request.max_bytes
-                    {
+                    let consumed = item.attempt_number.saturating_sub(1);
+                    let weight = leased_queue_bytes(&item);
+                    if candidates.is_empty() && weight > request.max_bytes {
+                        // `max_bytes` is a hard aggregate bound whenever the
+                        // batch has more than one row. A single row larger
+                        // than the bound is an explicit exception: this API
+                        // has no typed blocked result, and returning an empty
+                        // vector would make an eligible queue look quiescent
+                        // forever. Choose the oldest row first so the
+                        // exception preserves source order; its normal
+                        // receipt, retry, and lease-reap paths still apply.
+                        candidates.push((item, state, consumed));
                         break;
                     }
+                    if leased_bytes.saturating_add(weight) > request.max_bytes {
+                        continue;
+                    }
                     leased_bytes = leased_bytes.saturating_add(weight);
-                    let consumed = item.attempt_number.saturating_sub(1);
                     candidates.push((item, state, consumed));
                 }
             }

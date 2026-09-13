@@ -44,7 +44,12 @@ pub struct LeaseRequestV1 {
     pub lease_duration_micros: i64,
     /// Maximum rows to lease.
     pub max_items: u32,
-    /// Maximum queue bytes to lease.
+    /// Maximum sum of [`crate::AdmittedObservationV1::queue_bytes`] to lease in one
+    /// call. The cap is hard for a batch containing multiple rows. If the
+    /// first eligible row in source order exceeds it on its own, the journal
+    /// leases that row as a singleton and admits no other row in that call;
+    /// this bounded exception prevents an eligible queue from looking empty
+    /// because this API has no typed oversized result.
     pub max_bytes: u64,
 }
 
@@ -73,6 +78,9 @@ impl LeaseRequestV1 {
         }
         if self.max_items == 0 {
             return Err(ObservationJournalError::ValueOutOfRange { field: "max_items" });
+        }
+        if self.max_bytes == 0 {
+            return Err(ObservationJournalError::ValueOutOfRange { field: "max_bytes" });
         }
         Ok(())
     }

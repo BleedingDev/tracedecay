@@ -17,7 +17,7 @@ use std::fmt::{self, Display, Formatter};
 
 use support::{
     Builder, INSTANCE, LEASE, MINUTE, PROVENANCE_DIGEST, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND,
-    T0, TestResult, journal, lease_request, policy,
+    T0, TestResult, applied_receipt, extension, journal, lease_request, policy, stream_key,
 };
 
 use tracedecay_memory_observation::{
@@ -26,9 +26,9 @@ use tracedecay_memory_observation::{
     DispatchRequestV1, DrainStopV1, JournalInspectionFilterV1, JournalInspectionRowV1,
     LeasedObservationV1, ObservationCommittedEffectV1, ObservationDeliveryReceiptV1,
     ObservationDispatchPortV1, ObservationIdempotencyKeyV1, ObservationJournalError,
-    ObservationJournalReaderV1, ObservationOutcomeV1, ProviderDeliveryAdapterV1,
-    ProviderEffectSummaryV1, RetentionPolicyV1, RetryBackoffV1, SourceSequenceV1,
-    SqliteObservationJournal,
+    ObservationJournalReaderV1, ObservationOutcomeV1, ObservationRecoveryPortV1,
+    ProviderDeliveryAdapterV1, ProviderEffectSummaryV1, RecoveryTargetKeyV1, RecoveryTimeBudgetV1,
+    RetentionPolicyV1, RetryBackoffV1, SourceSequenceV1, SqliteObservationJournal,
 };
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
@@ -189,6 +189,20 @@ fn row_at(
         .into_iter()
         .find(|row| row.source_sequence == SourceSequenceV1(sequence))
         .ok_or_else(|| format!("no delivery row at sequence {sequence}").into())
+}
+
+fn recovery_target() -> Result<RecoveryTargetKeyV1, Box<dyn Error>> {
+    Ok(RecoveryTargetKeyV1 {
+        provider_id: PROVIDER.to_owned(),
+        registration_revision: 4,
+        stream: stream_key(support::STREAM)?,
+    })
+}
+
+fn recovery_budget() -> RecoveryTimeBudgetV1 {
+    RecoveryTimeBudgetV1 {
+        remaining_micros: 30 * SECOND,
+    }
 }
 
 /// A caller clock that stands still unless a test advances it, so a drain's
@@ -534,6 +548,18 @@ fn a_drain_without_a_round_bound_is_refused_before_leasing() -> TestResult {
     Ok(())
 }
 
+/// Direct lease callers receive the same non-zero byte-budget contract as the
+/// runtime policy: zero cannot mean "lease the first oversized singleton".
+#[test]
+fn a_zero_byte_lease_request_is_refused_by_direct_validation() -> TestResult {
+    let mut request = lease_request(T0, 1);
+    request.max_bytes = 0;
+    match request.validate() {
+        Err(ObservationJournalError::ValueOutOfRange { field: "max_bytes" }) => Ok(()),
+        other => Err(format!("zero max_bytes was not refused: {other:?}").into()),
+    }
+}
+
 /// Both drain bounds are part of the policy the journal validates, so a mount
 /// cannot configure a dispatcher that never yields or that cannot fit a single
 /// attempt.
@@ -829,6 +855,311 @@ fn a_byte_bounded_drain_that_hits_its_round_bound_reports_pending_work() -> Test
         }),
         "the journal really does still hold eligible rows"
     );
+    Ok(())
+}
+
+/// A row that fits must not stop the ordered scan at the first later row that
+/// exceeds the remaining byte budget: smaller eligible rows after it backfill
+/// the same bounded batch.
+#[test]
+fn an_over_budget_row_after_a_fit_is_skipped_to_backfill_later_rows() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    for (sequence, body) in [(1, "x"), (2, "oversized"), (3, "x"), (4, "x")] {
+        let body = if sequence == 2 {
+            body.repeat(32)
+        } else {
+            body.to_owned()
+        };
+        store.append_admitted(
+            &Builder {
+                body,
+                ..Builder::at_sequence(sequence)
+            }
+            .build()?,
+        )?;
+    }
+
+    let mut request = lease_request(T0, 2);
+    request.max_bytes = 4;
+    let leased = store.lease_pending(&request)?;
+
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.source_sequence)
+            .collect::<Vec<_>>(),
+        vec![SourceSequenceV1(1), SourceSequenceV1(3)]
+    );
+    assert_eq!(row_at(&store, 2)?.state, DeliveryStateV1::Pending);
+    assert_eq!(row_at(&store, 4)?.state, DeliveryStateV1::Pending);
+    for item in leased {
+        assert_eq!(
+            row_at(&store, item.source_sequence.0)?.state,
+            DeliveryStateV1::Leased
+        );
+    }
+    Ok(())
+}
+
+/// The oldest eligible row gets a singleton lease when it exceeds the batch
+/// byte bound. This is the explicit API exception: the aggregate bound is
+/// hard for multi-row batches, but returning no row would make this queue look
+/// quiescent forever because `LeaseRequestV1` has no typed blocked result.
+#[test]
+fn an_oversized_prefix_is_leased_as_an_ordered_singleton() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    let oversized = Builder {
+        body: "oversized".repeat(32),
+        ..Builder::at_sequence(1)
+    }
+    .build()?;
+    assert!(oversized.queue_bytes() > 4);
+    store.append_admitted(&oversized)?;
+    for sequence in 2..=3 {
+        store.append_admitted(
+            &Builder {
+                body: "x".to_owned(),
+                ..Builder::at_sequence(sequence)
+            }
+            .build()?,
+        )?;
+    }
+
+    let mut request = lease_request(T0, BATCH);
+    request.max_bytes = 4;
+    let leased = store.lease_pending(&request)?;
+
+    assert_eq!(leased.len(), 1);
+    assert_eq!(leased[0].source_sequence, SourceSequenceV1(1));
+    assert_eq!(row_at(&store, 1)?.state, DeliveryStateV1::Leased);
+    assert_eq!(row_at(&store, 2)?.state, DeliveryStateV1::Pending);
+    assert_eq!(row_at(&store, 3)?.state, DeliveryStateV1::Pending);
+    Ok(())
+}
+
+/// Extension bytes are part of `AdmittedObservationV1::queue_bytes()`, even
+/// when the canonical payload itself fits the dispatch budget.
+#[test]
+fn extension_bytes_count_toward_the_dispatch_budget() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    let extended = Builder {
+        body: "x".to_owned(),
+        extensions: vec![extension("test.extension.v1", "12345")?],
+        ..Builder::at_sequence(2)
+    }
+    .build()?;
+    assert_eq!(extended.queue_bytes(), 6);
+    for sequence in 1..=3 {
+        let admitted = if sequence == 2 {
+            extended.clone()
+        } else {
+            Builder {
+                body: "x".to_owned(),
+                ..Builder::at_sequence(sequence)
+            }
+            .build()?
+        };
+        store.append_admitted(&admitted)?;
+    }
+
+    let mut request = lease_request(T0, 3);
+    request.max_bytes = 4;
+    let leased = store.lease_pending(&request)?;
+
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.source_sequence)
+            .collect::<Vec<_>>(),
+        vec![SourceSequenceV1(1), SourceSequenceV1(3)]
+    );
+    assert_eq!(row_at(&store, 2)?.state, DeliveryStateV1::Pending);
+    Ok(())
+}
+
+/// Fitting arrivals must not starve an oversized prefix. Once the prefix is
+/// the oldest eligible row, each bounded round gives it progress and normal
+/// retry accounting still advances its attempt number.
+#[test]
+fn continuous_fitting_arrivals_cannot_starve_an_oversized_prefix() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    store.append_admitted(
+        &Builder {
+            body: "oversized".repeat(32),
+            ..Builder::at_sequence(1)
+        }
+        .build()?,
+    )?;
+
+    for (sequence, expected_attempt) in [(2, 1), (3, 2), (4, 3)] {
+        store.append_admitted(
+            &Builder {
+                body: "x".to_owned(),
+                ..Builder::at_sequence(sequence)
+            }
+            .build()?,
+        )?;
+        let mut request = lease_request(T0, BATCH);
+        request.max_bytes = 4;
+        let leased = store.lease_pending(&request)?;
+        assert_eq!(leased.len(), 1);
+        assert_eq!(leased[0].source_sequence, SourceSequenceV1(1));
+        assert_eq!(leased[0].attempt_number, expected_attempt);
+        let lease_id = leased[0].lease_id.clone();
+        store.release_lease(&lease_id, T0)?;
+    }
+
+    assert_eq!(row_at(&store, 1)?.state, DeliveryStateV1::Pending);
+    assert_eq!(row_at(&store, 1)?.attempt_number, 3);
+    for sequence in 2..=4 {
+        assert_eq!(row_at(&store, sequence)?.state, DeliveryStateV1::Pending);
+    }
+    Ok(())
+}
+
+/// A fitting suffix may be acknowledged before an oversized middle row, but
+/// the durable watermark remains at the contiguous prefix until that row is
+/// eventually acknowledged.
+#[test]
+fn acknowledging_a_skipped_prefix_closes_the_watermark_gap() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    for (sequence, body) in [(1, "x"), (2, "oversized"), (3, "x")] {
+        let body = if sequence == 2 {
+            body.repeat(32)
+        } else {
+            body.to_owned()
+        };
+        store.append_admitted(
+            &Builder {
+                body,
+                ..Builder::at_sequence(sequence)
+            }
+            .build()?,
+        )?;
+    }
+
+    let mut request = lease_request(T0, 3);
+    request.max_bytes = 4;
+    let leased = store.lease_pending(&request)?;
+    assert_eq!(
+        leased
+            .iter()
+            .map(|item| item.source_sequence)
+            .collect::<Vec<_>>(),
+        vec![SourceSequenceV1(1), SourceSequenceV1(3)]
+    );
+    store.record_attempt(&applied_receipt(&leased[0], T0))?;
+    store.record_attempt(&applied_receipt(&leased[1], T0))?;
+
+    let state = store.recovery_state(&recovery_target()?, recovery_budget())?;
+    assert_eq!(
+        state.and_then(|state| state.acknowledged.map(|position| position.sequence)),
+        Some(SourceSequenceV1(1))
+    );
+
+    let mut request = lease_request(T0, 1);
+    request.max_bytes = 4;
+    let prefix = store.lease_pending(&request)?;
+    assert_eq!(prefix.len(), 1);
+    assert_eq!(prefix[0].source_sequence, SourceSequenceV1(2));
+    store.record_attempt(&applied_receipt(&prefix[0], T0))?;
+
+    assert_eq!(
+        store
+            .recovery_state(&recovery_target()?, recovery_budget())?
+            .and_then(|state| state.acknowledged.map(|position| position.sequence)),
+        Some(SourceSequenceV1(3))
+    );
+    Ok(())
+}
+
+/// An oversized singleton is still ordinary deliverable work for a bounded
+/// drain: it must be delivered and settled before the empty round proves
+/// quiescence.
+#[test]
+fn an_oversized_singleton_is_drained_without_false_quiescence() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    store.append_admitted(
+        &Builder {
+            body: "oversized".repeat(32),
+            ..Builder::at_sequence(1)
+        }
+        .build()?,
+    )?;
+
+    let byte_bound = 4;
+    let policy_under_test = DispatchPolicyV1 {
+        batch_max_bytes: byte_bound,
+        ..dispatch_policy()
+    };
+    let request = DispatchRequestV1 {
+        lease: {
+            let mut lease = lease_request(T0, BATCH);
+            lease.max_bytes = byte_bound;
+            lease
+        },
+        retry_backoff: RetryBackoffV1::of(&policy()),
+        attempt_budget_micros: ATTEMPT_BUDGET,
+    };
+    let wake = DeliveryWakeV1::new();
+    let provider = ApplyingProvider::new(T0);
+    let delivery = DeliveryRuntimeV1::new(&store, &provider, &wake);
+    let report = delivery.drain(
+        &request,
+        &policy_under_test.drain_bounds(&policy(), T0)?,
+        || T0,
+    )?;
+
+    assert_eq!(report.rounds, 2);
+    assert_eq!(report.totals.leased, 1);
+    assert_eq!(report.totals.receipts_recorded, 1);
+    assert_eq!(report.stop, DrainStopV1::Quiesced);
+    assert!(!report.more_work_pending());
+    assert_eq!(row_at(&store, 1)?.state, DeliveryStateV1::Acknowledged);
+    Ok(())
+}
+
+/// The singleton exception follows the same retry and expiry paths as every
+/// other lease: explicit release delays the next attempt, and reclaiming an
+/// expired lease does not reuse its consumed attempt number.
+#[test]
+fn an_oversized_singleton_retries_and_reclaims_with_attempt_progress() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let store = journal(&directory.path().join("journal.sqlite3"))?;
+    store.append_admitted(
+        &Builder {
+            body: "oversized".repeat(32),
+            ..Builder::at_sequence(1)
+        }
+        .build()?,
+    )?;
+
+    let mut request = lease_request(T0, 1);
+    request.max_bytes = 4;
+    let first = store.lease_pending(&request)?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].attempt_number, 1);
+    store.release_lease(&first[0].lease_id, T0 + SECOND)?;
+
+    assert!(store.lease_pending(&request)?.is_empty());
+    request.now_unix_micros = T0 + SECOND;
+    let second = store.lease_pending(&request)?;
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].attempt_number, 2);
+
+    let expired_at = T0 + SECOND + LEASE;
+    assert_eq!(store.reap_expired_leases(expired_at, 8)?, 1);
+    assert_eq!(row_at(&store, 1)?.state, DeliveryStateV1::Pending);
+    request.now_unix_micros = expired_at;
+    let third = store.lease_pending(&request)?;
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].attempt_number, 3);
     Ok(())
 }
 
