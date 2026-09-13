@@ -287,6 +287,56 @@ fixture preparation, so runtime acquisition cannot silently download.
   must be found through strict semantic evidence and absent from the lexical
   ablation control. A ready state or fallback-only answer is insufficient.
 
+## True-serving oracle from the active checkout
+
+The smallest checked-in semantic candidate is
+tests/fixtures/search_quality/query-semantic-candidate-workload-v1.json:735-751:
+
+- query id: validation-015
+- query: what stops an old login token from authorizing another request
+- allowed scope: context_eval
+- target anchor: context_eval::auth_session::validate_session
+- target literal: pub fn validate_session
+
+The target implementation is the session-expiry check in
+tests/fixtures/context_eval_project/src/auth/session.rs. The frozen lexical
+baseline is known to miss validation-015 at the target symbol/anchor level
+(the search-evaluation regression expects validation-015 among the failed
+queries at crates/tracedecay-search-eval/src/report_tests.rs:84-91). A likely
+lexical distractor is the authentication/login path, including
+auth::login::authenticate, with nearby session construction and token symbols
+also sharing query words.
+
+This is a semantic candidate oracle, not a zero-overlap lexical-ablation
+case. The query's words such as login, token, and request occur elsewhere in
+the fixture corpus, so whole-document lexical overlap is expected. The
+claim to prove is target recovery through the semantic lane after lexical
+baseline miss, with generation and evidence identity pinned.
+
+Once the isolated provisioning ticket is unblocked, issue the strict MCP
+search equivalent to the shipped CLI request:
+
+    tracedecay_search({
+      "query": "what stops an old login token from authorizing another request",
+      "limit": 10,
+      "format": "json",
+      "semantic_mode": "strict_semantic"
+    })
+
+Require status unavailable before activation, then after activation require
+semantic.status == complete, the target
+context_eval::auth_session::validate_session in results, and a candidate
+contribution whose retriever is semantic. Pair that public MCP result with the
+retained exact-flat oracle row carrying CodeSemanticEvidenceV1 and the pinned
+code-generation, projection, vector-generation, and capability identities.
+Public MCP does not serialize that exact-flat evidence or all of those pinned
+generation fields, so a semantic status and contribution alone are
+insufficient evidence of the true serving route.
+
+No dynamic run of validation-015 was possible in this diagnosis because the
+current candidate binary and verified Jina fixture are absent. The
+reproduce-semantic-states plan todo remains pending.
+
 ## Plan status
 
 - reproduce-semantic-states: pending — no current candidate binary,
