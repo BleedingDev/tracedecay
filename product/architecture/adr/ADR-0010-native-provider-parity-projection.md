@@ -32,14 +32,21 @@ semantics. Generic provider feedback, contradiction, maintenance, correction,
 and deletion similarly have no lossless mapping to those Native operations. In
 particular, provider feedback must not mutate Native trust.
 
-The fixed restoration reference for the complete Native implementation is b3
-(`b3b43410e47115056f2066449aafa1822bbb6049`), the upstream side of the
-product merge. The audited product head also contains shared host, provenance,
+The fixed restoration reference for the complete Native implementation is
+immutable upstream 570
+(`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`). The older b3 commit
+(`b3b43410e47115056f2066449aafa1822bbb6049`) is the upstream side of the
+historical product merge, and the August audit head 571
+(`571daf3a9612e5247443e4da3a107b542686c1ef`) remains historical evidence.
+Neither historical label replaces the active 570 baseline or the accepted
+August sync floor recorded in product/upstream metadata. The audited product
+head also contains shared host, provenance,
 cursor, transcript, configuration, storage, privacy, maintenance, and
 provider-composition extensions. Those extensions remain in place and are
 tracked separately from the original Native implementation; they are not
-evidence that Native has been replaced by a provider wrapper. The exhaustive
-path and hunk disposition is recorded in
+evidence that Native has been replaced by a provider wrapper. Exact LCM
+algorithm and schema parity is compared with 570. The exhaustive path and
+hunk disposition is recorded in
 [`native-original-source-inventory.md`](../native-original-source-inventory.md).
 
 ## Decision
@@ -83,7 +90,25 @@ original typed boundary. It does not narrow Native to recall or use the
 provider envelope as a substitute for Native fact, session, LCM, feedback,
 maintenance, privacy, receipt, or recovery behavior. Direct typed routes remain
 available and retain their original effect and failure semantics. A generic
-control that does not name one of those typed operations returns a typed
+`session_lookup` is one of those public typed operations. It is dispatched by
+`DaemonSessionLookupPrimitiveV1` through
+`SessionApplicationRetrievalPortV1::retrieve_admitted` and remains distinct
+from retained `MessageSearch`. Retained `SessionsFor` and `Workflows` are
+project-authority-only; profile authority returns typed unsupported. The
+lower-level `recent_sessions`, `session_providers`, and `session_replay_slice`
+queries use `RegisteredGlobalDb`/`SessionStoreAccess` and are absent from
+`RetainedLcmRequestV1` and `DirectRetainedLcmPortV1`, so they do not become
+public CLI/MCP operations. `lcm_compress` is daemon-internal mounted LCM
+lifecycle work; `preflight` and `session_boundary` are retired or
+daemon-internal helpers, not public CLI/MCP operations.
+
+`RetainedSurfaceOperation::FactStoreCurate` is the explicit retained
+automation route. It executes through `RetainedAutomationExecutionPortV1` and
+its automation effect ledger/receipt before reviewed changes settle through
+the Native fact authority; the lower-level curation method is not a substitute
+for this route.
+
+A generic control that does not name one of those typed operations returns a typed
 `capability_unsupported` outcome with no effect; it is not reported as a
 missing Native operation, silently approximated with current recall, or
 converted into a fabricated success.
@@ -94,7 +119,13 @@ authority. Restoration retires its Native construction/read/write path while
 leaving the existing file and SQLite sidecars untouched. No staged row,
 provider-local receipt, generation, scorer, or replay cursor participates in
 Native parity or recovery. This decision remains planned until the independent
-source, parity, restart, scope, and host-extension checks pass.
+source, parity, restart, scope, and host-extension checks pass. Documentation
+of these routes is not implementation-complete evidence.
+
+Hermes inline ingestion currently has no canonical observation bridge into
+session/LCM admission. It remains an integration gap owned by
+`rn-session-delivery` and `rn-host-fixtures`; no parity claim may treat its
+payload as canonical Native evidence or silently staged data.
 
 Automatic context delivery has one canonical `memory_matches` settlement. For
 each eligible selected Native provider, the context compiler makes exactly one

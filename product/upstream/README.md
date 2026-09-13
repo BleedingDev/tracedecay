@@ -11,31 +11,40 @@ and every isolated train uses the strict
 - `pinned_floor.sha` is the exact commit the product branch was created from.
 - `observed_pull_request.head_sha` is only a dated observation of moving PR #707.
 
-The current pinned floor is
+The accepted August sync floor is
 <!-- pinned-floor -->`5749e4fcfe268e17bd19a0e6ef90c646f7b37289`.
 The verifier requires that commit to exist locally and remain an ancestor of
 the checked-out product head. The marker before the SHA is the anchored floor
 pin the sync train rewrites; no other prose in this directory may quote the
 floor.
 
+The active Native source and behavior baseline is immutable upstream commit
+`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`. This is a restoration baseline,
+not an accepted sync-floor update. The pinned August floor above remains the
+product sync contract, while the older b3 and August audit labels below are
+retained as historical evidence.
+
 ## Native restoration source reference
 
-The Native restoration review uses immutable b3
-(`b3b43410e47115056f2066449aafa1822bbb6049`) as its source and behavior
-reference. b3 is the upstream side of the current product merge; it is not a
-new accepted floor and does not change the pinned-floor marker above. The
-complete Native implementation and the existing shared host/storage
-extensions are inventoried in
+The Native restoration review uses immutable upstream 570
+(`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`) as its source and behavior
+reference. The older b3 commit
+(`b3b43410e47115056f2066449aafa1822bbb6049`) and the August audit remain
+historical labels; neither is the active Native baseline or a new accepted
+floor. The complete Native implementation and the existing shared
+host/storage extensions are inventoried in
 [`../architecture/native-original-source-inventory.md`](../architecture/native-original-source-inventory.md).
 
 The review records current repository paths after upstream moves, including
 the fact-store implementation under `tracedecay-session-memory`, the public
 operation catalog under `tracedecay-contracts`, the retained route under
 `tracedecay-store-runtime`, and privacy/maintenance crates. Product metadata
-continues to own the historical floor and archival receipts. Native provider
-restoration remains planned until its source, parity, scope, restart, and
-host-extension checks pass; this reference does not authorize a sync train or
-rewrite staged provider-state bytes.
+continues to own the historical sync floor and archival receipts. Native
+provider restoration remains planned until its source, parity, scope, restart,
+and host-extension checks pass; this reference does not authorize a sync train
+or rewrite staged provider-state bytes. Exact LCM algorithm and schema parity
+is measured against 570. Hermes inline ingestion still lacks a canonical
+observation bridge and remains an integration gap.
 
 ## Verify
 

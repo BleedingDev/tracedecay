@@ -2,15 +2,25 @@
   "schema_version": 1,
   "bead_id": "tdmem-0103",
   "title": "TraceDecay V2 Native memory production surface map",
-  "scope": "Coding-agent memory paths on feat/pluggable-memory-providers-v2; Native restoration reference is b3 and provider behavior remains planned. The public_operations list is limited to the 13 retained explicit-fact/memory catalog operations; complete original typed session/LCM/refresh/supersede/background route coverage is in execution-results/native-operation-routes.md from rn-contract.",
+  "scope": "Coding-agent memory paths on feat/pluggable-memory-providers-v2; active Native restoration reference is immutable upstream 570 and provider behavior remains planned. The public_operations list remains limited to the 13 retained explicit-fact/memory catalog operations; session/application routes, lower-level queries, daemon-internal LCM lifecycle, and integration gaps are recorded in the additional route sections below. Complete original typed session/LCM/refresh/supersede/background route coverage is in execution-results/native-operation-routes.md from rn-contract.",
+  "native_baseline": {
+    "active_reference": "57006f60cb45bcee8487e73a40d4fad1a12ee2b6",
+    "status": "active_source_and_behavior_baseline",
+    "historical_references": {
+      "b3_merge_side": "b3b43410e47115056f2066449aafa1822bbb6049",
+      "august_audited_product_head": "571daf3a9612e5247443e4da3a107b542686c1ef",
+      "accepted_august_sync_floor": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
+    },
+    "parity_scope": "Preserve exact Native fact/session/LCM algorithms and schemas from 570. Documentation does not claim restoration or behavioral gates complete."
+  },
   "source_baseline": {
-    "original_reference": "b3b43410e47115056f2066449aafa1822bbb6049",
-    "audited_product_head": "571daf3a9612e5247443e4da3a107b542686c1ef",
+    "original_reference": "57006f60cb45bcee8487e73a40d4fad1a12ee2b6",
+    "audited_product_head": "9c36fe6d62d25b47c39e4c78723e252e4cb1b597",
     "inventory": "product/architecture/native-original-source-inventory.md",
-    "inventory_counts": { "modified_paths": 57, "added_paths": 28, "hunks": 278 },
+    "inventory_counts": { "modified_paths": 29, "added_paths": 27, "hunks": 192 },
     "status": "planned_until_behavioral_verification",
     "staged_substitute": "provider-state/native/staged-observations-v1.sqlite3 remains stale and untouched; Native does not read, migrate, replay, or reset it",
-    "exact_restoration": "rn-restore-anchor restores crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs to b3 byte-for-byte"
+    "exact_restoration": "rn-restore-anchor restores crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs to 570 byte-for-byte"
   },
   "invariants": [
     "FactOwnerV1 is the immutable scope key for every Native fact read and write.",
@@ -195,7 +205,7 @@
         "crates/tracedecay-sdk/src/operations.rs",
         "crates/tracedecay/src/daemon/dashboard_automation/retained_curator.rs"
       ],
-      "notes": "Launches the durable Memory Curator automation; accepted mutations still settle through the Native fact authority."
+      "notes": "RetainedSurfaceOperation::FactStoreCurate launches the durable Memory Curator through RetainedAutomationExecutionPortV1; automation admission and the effect ledger/receipt settle before accepted mutations enter the Native fact authority. This route is distinct from the lower-level ProjectMemoryFactStore curation transaction."
     },
     {
       "id": "fact_store_add",
@@ -484,6 +494,153 @@
         "crates/tracedecay-store-runtime/src/retained_memory.rs"
       ],
       "notes": "Inspects counts, trust bands, algebra metadata, and feedback funnel as a derived read model."
+    }
+  ],
+  "public_session_operations": [
+    {
+      "id": "session_lookup",
+      "operation": "ApplicationSurfaceOperation::SessionLookup",
+      "public_name": "session_lookup",
+      "route": "DaemonSessionLookupPrimitiveV1 -> SessionApplicationRetrievalPortV1::retrieve_admitted",
+      "authority": "project",
+      "effect_class": "read",
+      "canonical_mutation": false,
+      "distinct_from": "RetainedSurfaceOperation::MessageSearch; session_lookup is exact-session retrieval, not retained message search",
+      "invariants": [
+        "Stable session identity and pagination are preserved.",
+        "Cancellation, scope admission, and typed no-effect outcomes are preserved.",
+        "The read does not create a mutation receipt."
+      ],
+      "source_paths": [
+        "crates/tracedecay-tool-catalog/src/operation.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/primitive.rs",
+        "crates/tracedecay-application/src/primitives/runtime.rs"
+      ],
+      "status": "route_documented; behavioral verification pending",
+      "owner": "rn-verify-sessions"
+    },
+    {
+      "id": "sessions_for",
+      "operation": "RetainedSurfaceOperation::SessionsFor",
+      "route": "DirectRetainedSessionPortV1::execute_sessions_for",
+      "authority": "project only",
+      "profile_behavior": "typed unsupported",
+      "effect_class": "read",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-session-runtime/src/retained/session.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs"
+      ],
+      "status": "route_documented; behavioral verification pending",
+      "owner": "rn-verify-sessions"
+    },
+    {
+      "id": "workflows",
+      "operation": "RetainedSurfaceOperation::Workflows",
+      "route": "DirectRetainedSessionPortV1::execute_workflows",
+      "authority": "project only",
+      "profile_behavior": "typed unsupported",
+      "effect_class": "read",
+      "canonical_mutation": false,
+      "source_paths": [
+        "crates/tracedecay-session-runtime/src/retained/session.rs",
+        "crates/tracedecay-contracts/src/retained_surfaces.rs"
+      ],
+      "status": "route documented; behavioral verification pending",
+      "owner": "rn-verify-sessions"
+    }
+  ],
+  "lower_level_queries": [
+    {
+      "id": "recent_sessions",
+      "query": "query::session::recent_sessions",
+      "route": "RegisteredGlobalDb / SessionStoreAccess",
+      "public_binding": false,
+      "retained_lcm_presence": "absent from RetainedLcmRequestV1 and DirectRetainedLcmPortV1",
+      "classification": "lower_level_query",
+      "source_paths": [
+        "crates/tracedecay-lcm/src/query/session.rs",
+        "crates/tracedecay-sessions/src/runtime/store_access/transcript.rs"
+      ],
+      "status": "documented; no public alias authorized",
+      "owner": "rn-verify-state"
+    },
+    {
+      "id": "session_providers",
+      "query": "query::session::session_providers",
+      "route": "RegisteredGlobalDb / SessionStoreAccess",
+      "public_binding": false,
+      "retained_lcm_presence": "absent from RetainedLcmRequestV1 and DirectRetainedLcmPortV1",
+      "classification": "lower_level_query",
+      "source_paths": [
+        "crates/tracedecay-lcm/src/query/session.rs",
+        "crates/tracedecay-sessions/src/runtime/store_access/transcript.rs"
+      ],
+      "status": "documented; no public alias authorized",
+      "owner": "rn-verify-state"
+    },
+    {
+      "id": "session_replay_slice",
+      "query": "query::session::session_replay_slice",
+      "route": "RegisteredGlobalDb / SessionStoreAccess",
+      "public_binding": false,
+      "retained_lcm_presence": "absent from RetainedLcmRequestV1 and DirectRetainedLcmPortV1",
+      "classification": "lower_level_query",
+      "source_paths": [
+        "crates/tracedecay-lcm/src/query/session.rs",
+        "crates/tracedecay-sessions/src/runtime/store_access/transcript.rs"
+      ],
+      "status": "documented; no public alias authorized",
+      "owner": "rn-verify-state"
+    }
+  ],
+  "daemon_internal_operations": [
+    {
+      "id": "lcm_compress",
+      "classification": "daemon_internal",
+      "route": "mounted LCM authority -> lcm_effects / lcm_summarization / lcm_summary_convergence",
+      "public_cli_mcp": false,
+      "source_paths": [
+        "crates/tracedecay-lcm/src/compression.rs"
+      ],
+      "parity_requirement": "Preserve exact 570 LCM algorithm, schema, lifecycle, raw-range, summary, retry, and receipt behavior.",
+      "status": "daemon route documented; implementation verification pending",
+      "owner": "rn-verify-state"
+    },
+    {
+      "id": "preflight",
+      "classification": "retired_or_daemon_internal",
+      "public_cli_mcp": false,
+      "route": "compression lifecycle helper only when mounted by daemon authority; no public binding",
+      "source_paths": [
+        "crates/tracedecay-lcm/src/compression.rs"
+      ],
+      "status": "classified; no public operation authorized",
+      "owner": "rn-verify-state"
+    },
+    {
+      "id": "session_boundary",
+      "classification": "retired_or_daemon_internal",
+      "public_cli_mcp": false,
+      "route": "compression lifecycle helper only when mounted by daemon authority; no public binding",
+      "source_paths": [
+        "crates/tracedecay-lcm/src/compression.rs"
+      ],
+      "status": "classified; no public operation authorized",
+      "owner": "rn-verify-state"
+    }
+  ],
+  "integration_gaps": [
+    {
+      "id": "hermes_inline_ingestion",
+      "classification": "integration_gap",
+      "status": "unresolved",
+      "description": "Hermes inline ingestion has no canonical observation bridge into session/LCM admission. Its host payload cannot be treated as canonical Native evidence or silently staged.",
+      "required_action": "Connect Hermes inline events to canonical observation admission or return typed unsupported/deferred while preserving source, privacy, scope, cursor, and receipt invariants.",
+      "owners": [
+        "rn-session-delivery",
+        "rn-host-fixtures"
+      ]
     }
   ],
   "internal_entry_points": [

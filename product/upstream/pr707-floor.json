@@ -3,7 +3,7 @@
   "schema_version": 1,
   "authority": "derived-receipt",
   "canonical_metadata": "product/upstream/tracedecay-v2-pr707.json",
-  "canonical_metadata_blob_sha": "7ca707663c56031605824ff6b4f78f025fb12d9c",
+  "canonical_metadata_blob_sha": "000d2195c1f59f5118f94ce882ca60847f6e1426",
   "source_repository": "ScriptedAlchemy/tracedecay",
   "pull_request": 707,
   "product_repository": "BleedingDev/tracedecay",

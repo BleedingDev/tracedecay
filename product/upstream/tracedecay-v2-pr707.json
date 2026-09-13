@@ -18,6 +18,17 @@
     "selection_basis": "PR #707 head codex/tracedecay-total-redesign-plan-reopened observed on 2026-09-02; advanced by the tdmem-1208 sync train from the previous floor 08fbe33a.",
     "must_be_ancestor_of_product_head": true
   },
+  "native_restoration_reference": {
+    "sha": "57006f60cb45bcee8487e73a40d4fad1a12ee2b6",
+    "selected_at": "2026-09-13T00:00:00Z",
+    "status": "active_native_source_and_behavior_baseline",
+    "relationship_to_pinned_floor": "independent restoration reference; does not advance or replace the accepted August sync floor",
+    "historical_references": {
+      "b3_merge_side": "b3b43410e47115056f2066449aafa1822bbb6049",
+      "audited_august_product_head": "571daf3a9612e5247443e4da3a107b542686c1ef"
+    },
+    "parity_scope": "Preserve exact Native fact/session/LCM algorithm and schema behavior from 570; implementation and behavioral gates remain planned."
+  },
   "observed_pull_request": {
     "retrieved_at": "2026-09-07",
     "state": "open",

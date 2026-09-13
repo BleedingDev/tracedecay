@@ -9,15 +9,16 @@ The product starts from the immutable TraceDecay V2 PR #707 floor while Zack's u
 
 `product/upstream/patch-footprint-policy.json` defines initial quantitative caps, allowed touch points, forbidden zones, dependency directions, and the convergence-map contract.
 
-For the Native restoration review, the source/behavior reference is the
-immutable b3 commit (`b3b43410e47115056f2066449aafa1822bbb6049`) already
-present as the upstream side of the product merge. This review reference is
+For the Native restoration review, the active source/behavior reference is
+immutable upstream 570 (`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`). The
+immutable b3 commit (`b3b43410e47115056f2066449aafa1822bbb6049`) remains the
+upstream side of the historical product merge. This review reference is
 separate from the canonical historical August floor recorded by
 `product/upstream/tracedecay-v2-pr707.json` and `pr707-floor.json`.
-Those floor metadata files, their archival receipts, and their pinned SHA
-remain unchanged. The b3 reference resolves the source identity question for
-Native restoration; it does not advance the accepted floor or authorize an
-upstream sync train.
+Their archival receipts and pinned sync SHA remain unchanged; the metadata now
+also records the independent 570 restoration reference. The b3 reference resolves the source identity question for
+the historical merge only; 570 resolves the active Native identity. Neither
+reference advances the accepted floor or authorizes an upstream sync train.
 
 ## Decision
 

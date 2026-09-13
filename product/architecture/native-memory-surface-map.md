@@ -2,11 +2,19 @@
 
 Bead: `tdmem-0103`
 
-Machine-readable authority: [`native-memory-surface-map.json`](./native-memory-surface-map.json). The exhaustive b3-to-head hunk ledger is [`native-original-source-inventory.md`](./native-original-source-inventory.md).
+Machine-readable authority: [`native-memory-surface-map.json`](./native-memory-surface-map.json). The exhaustive 570-to-execution-head hunk ledger is [`native-original-source-inventory.md`](./native-original-source-inventory.md).
 
 ## Scope
 
-This map covers production memory behavior used by coding agents on `feat/pluggable-memory-providers-v2`. The fixed Native restoration reference is b3 (`b3b43410e47115056f2066449aafa1822bbb6049`), while the audited product head is `571daf3a9612e5247443e4da3a107b542686c1ef`. The provider boundary remains planned until its behavioral gates pass.
+This map covers production memory behavior used by coding agents on
+`feat/pluggable-memory-providers-v2`. The active Native restoration reference
+is immutable upstream 570
+(`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`). The older b3
+(`b3b43410e47115056f2066449aafa1822bbb6049`) merge-side label and the August
+audited product head
+(`571daf3a9612e5247443e4da3a107b542686c1ef`) remain historical evidence. The
+accepted August sync floor is tracked separately in product/upstream metadata.
+The provider boundary remains planned until its behavioral gates pass.
 
 The governing rules are:
 
@@ -18,12 +26,13 @@ The governing rules are:
 
 ## Baseline and restoration status
 
-- **Original Native reference:** b3 (`b3b43410e47115056f2066449aafa1822bbb6049`), the upstream side of the product merge. The complete `tracedecay-session-memory/src/fact_store/**`, `src/memory/**`, LCM, store/memory contracts, memory-v2, and facts authorities are the original implementation and remain protected.
-- **Product extensions:** existing host admission, provenance, cursor, transcript, configuration, storage, privacy, maintenance, and provider-composition changes are retained as separate extensions. They are not claimed to be byte-identical to b3.
-- **Shared privacy exception:** the direct Native and LCM source files have no scoped hunks, but their sanitization reaches the changed `tracedecay-privacy::detector_kernel::looks_high_entropy_token` algorithm. Its exact `-sha256-<64 lowercase hex>` suffix peeling is an escalated original algorithm delta; Native memory hygiene and LCM callers remain unaccepted until that algorithm is restored exactly or isolated behind a reviewed product boundary.
-- **Exact restoration:** `crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs` has one authorized b3 restoration, owned by rn-restore-anchor. No adapter may replace an original Native algorithm.
+- **Original Native reference:** 570 (`57006f60cb45bcee8487e73a40d4fad1a12ee2b6`). The complete `tracedecay-session-memory/src/fact_store/**`, `src/memory/**`, LCM, store/memory contracts, memory-v2, and facts authorities are the original implementation and remain protected. Exact LCM algorithm and schema parity is measured against this commit.
+- **Historical labels:** b3 (`b3b43410e47115056f2066449aafa1822bbb6049`) is the upstream side of the older product merge and 571 (`571daf3a9612e5247443e4da3a107b542686c1ef`) is the August audit head. They remain useful historical evidence and are not the active Native baseline.
+- **Product extensions:** existing host admission, provenance, cursor, transcript, configuration, storage, privacy, maintenance, and provider-composition changes are retained as separate extensions. They are not claimed to be byte-identical to 570.
+- **Historical privacy finding:** the direct Native and LCM source files have no scoped 570-to-current hunks, and the active 570 detector comparison is recorded separately. The exact `-sha256-<64 lowercase hex>` suffix peeling was an escalated b3-to-August audit delta; retain its privacy regression evidence without relabeling it as an active 570 source change.
+- **Exact restoration:** `crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs` has one authorized 570 restoration, owned by rn-restore-anchor. No adapter may replace an original Native algorithm.
 - **Staged substitute:** `provider-state/native/staged-observations-v1.sqlite3` and its sidecars are provider-local stale bytes. Removing the staged Native route leaves them untouched and does not read, migrate, replay, or reset them.
-- **Verification status:** planned. The map records required checks; it does not claim that the restoration or parity suites have passed.
+- **Verification status:** planned. The map records required checks; it does not claim that restoration or parity suites have passed. Hermes inline ingestion has no canonical observation bridge and is an unresolved integration gap.
 
 ## Authority matrix
 
@@ -50,7 +59,7 @@ The retained application catalog is the operation authority. HTTP, MCP, dynamic 
 
 | Operation | Effect | HTTP | MCP | CLI | Canonical owner/read authority |
 |---|---|---|---|---|---|
-| `fact_store_curate` | Administrative | `/application/retained/fact_store_curate` | `tracedecay_fact_store_curate` | `tracedecay tool fact_store_curate` | Memory Curator may settle reviewed changes only through Native explicit-fact authority |
+| `fact_store_curate` | Administrative | `/application/retained/fact_store_curate` | `tracedecay_fact_store_curate` | `tracedecay tool fact_store_curate` | `RetainedSurfaceOperation::FactStoreCurate` → `RetainedAutomationExecutionPortV1` → Memory Curator; effect-ledger/receipt settlement still enters Native explicit-fact authority |
 | `fact_store_add` | Administrative | `/application/retained/fact_store_add` | `tracedecay_fact_store_add` | `tracedecay tool fact_store_add` | Native explicit-fact authority |
 | `fact_store_search` | Read | `/application/retained/fact_store_search` | `tracedecay_fact_store_search` | `tracedecay tool fact_store_search` | Canonical facts plus rebuildable search projection |
 | `fact_store_probe` | Read | `/application/retained/fact_store_probe` | `tracedecay_fact_store_probe` | `tracedecay tool fact_store_probe` | Canonical facts plus rebuildable search projection |
@@ -78,6 +87,57 @@ direct retained nonempty `fact_store_search` writes the original retrieval
 telemetry/receipt, whereas generic automatic reads do not.
 
 SDK operation IDs are `operation.application.<operation>` and use the generated descriptors in `crates/tracedecay-sdk/src/operations.rs`.
+
+## Public session and application operations
+
+`session_lookup` is a public application operation with its own exact-session
+route. `DaemonSessionLookupPrimitiveV1` dispatches through the application
+runtime to `SessionApplicationRetrievalPortV1::retrieve_admitted`; it is
+distinct from retained `MessageSearch`, which is the bounded message-query
+operation. Session lookup preserves project authority, stable identity and
+pagination, cancellation, and typed no-effect outcomes, and does not create a
+mutation receipt.
+
+`SessionsFor` and `Workflows` remain project-authority-only retained session
+operations. `DirectRetainedSessionPortV1::execute_sessions_for` and
+`execute_workflows` reject profile authority with typed unsupported behavior;
+they are not aliases for `session_lookup` and must not widen the provider
+boundary.
+
+The route anchors are `crates/tracedecay-tool-catalog/src/operation.rs`,
+`crates/tracedecay-session-runtime/src/session_retrieval/primitive.rs`,
+`crates/tracedecay-application/src/primitives/runtime.rs`, and
+`crates/tracedecay-session-runtime/src/retained/session.rs`.
+
+## Lower-level session and LCM queries
+
+`recent_sessions`, `session_providers`, and `session_replay_slice` are
+lower-level `RegisteredGlobalDb` / `SessionStoreAccess` queries. They are
+implemented for internal retrieval work but are absent from
+`RetainedLcmRequestV1` and `DirectRetainedLcmPortV1`; there is no public
+CLI/MCP/HTTP/SDK binding for them. Their lower-level implementation is not
+evidence for a retained public route, and no alias should be added merely to
+make a parity row pass. The current query anchor is
+`crates/tracedecay-lcm/src/query/session.rs`, with store access under
+`crates/tracedecay-sessions/src/runtime/store_access/transcript.rs`.
+
+`lcm_compress` is daemon-internal LCM lifecycle work routed through the mounted
+LCM authority and its `lcm_effects`, `lcm_summarization`, and
+`lcm_summary_convergence` services. `preflight` and `session_boundary` are
+retired or daemon-internal symbols, not public CLI/MCP operations. The
+compression implementation is under `crates/tracedecay-lcm/src/compression.rs`.
+All three classifications preserve the original LCM algorithm and schema
+parity contract against 570 without inventing public bindings.
+
+## Integration gap
+
+Hermes inline ingestion currently has no canonical observation bridge into
+session/LCM admission. A Hermes host payload must therefore remain an explicit
+integration gap: it cannot be treated as canonical Native evidence or silently
+staged as a provider observation. Owner `rn-session-delivery` with
+`rn-host-fixtures` must connect it to canonical observation admission or return
+a typed unsupported/deferred outcome while preserving source, privacy, cursor,
+scope, and receipt invariants.
 
 Transport and dispatch ownership:
 
