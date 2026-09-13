@@ -20222,7 +20222,7 @@
       "surface": "recall",
       "operation": "oversized higher-ranked candidate does not suppress a lower-ranked candidate that fits",
       "reference_route": "57006f60cb45bcee8487e73a40d4fad1a12ee2b checkout plus frozen synthetic recall fixture :: high-ranked oversize candidate followed by lower-ranked fitting candidate",
-      "candidate_route": "crates/tracedecay-memory-provider-ncm/src/common/selection.rs and common.rs :: candidate reconstruction under max_recall_bytes",
+      "candidate_route": "crates/tracedecay-memory-ncm-core/src/recall/mod.rs :: candidate scan under max_recall_bytes, ordered by runtime selection in crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs",
       "effect": "apply exclusions and ranking deterministically, skip an oversized candidate, continue scanning, and return the next eligible candidate that fits without exceeding max_recall_bytes",
       "oracle_kind": "independent_real_worker_conformance",
       "oracle": {
@@ -20261,8 +20261,8 @@
         "rn-ncm-recall-fix"
       ],
       "source_evidence": [
-        "crates/tracedecay-memory-provider-ncm/src/common/selection.rs",
-        "crates/tracedecay-memory-provider-ncm/src/common.rs"
+        "crates/tracedecay-memory-ncm-core/src/recall/mod.rs",
+        "crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs"
       ],
       "composition_reached": {
         "value": null,
