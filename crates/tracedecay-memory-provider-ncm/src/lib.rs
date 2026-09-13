@@ -283,6 +283,107 @@ impl NcmSurfaceCall {
     }
 }
 
+/// Stage at which an opt-in recall diagnostic was captured.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NcmRecallDiagnosticStage {
+    /// Candidate rows exactly as returned by the worker surface.
+    Worker,
+    /// Candidate rows after the adapter validated and reconstructed them.
+    Reconstructed,
+    /// A valid recall reply was reconstructed with partial coverage.
+    PartialReply,
+    /// The caller cancelled after the surface had already returned.
+    PostDispatchCancellation,
+    /// The caller deadline elapsed after the surface had already returned.
+    PostDispatchDeadline,
+    /// The adapter could not reconstruct the worker reply.
+    ReconstructionFailure,
+}
+
+/// Bounded, redacted evidence for comparing worker recall with adapter output.
+///
+/// The event deliberately contains no query, content, source, or candidate
+/// identifiers. Identity fields are caller-keyed, namespace-bound HMAC
+/// digests, and the two vectors of per-candidate values are capped at the
+/// provider's recall limit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NcmRecallDiagnosticEvent {
+    /// Capture stage.
+    pub stage: NcmRecallDiagnosticStage,
+    /// Caller-keyed digest of the existing host request identity, omitted when
+    /// no redaction key was supplied.
+    pub request_id_sha256: Option<String>,
+    /// Caller-keyed digest of the existing host operation identity, omitted
+    /// when no redaction key was supplied.
+    pub operation_id_sha256: Option<String>,
+    /// Caller-keyed digest of the recall query text, omitted when no
+    /// redaction key was supplied.
+    pub query_sha256: Option<String>,
+    /// Caller-keyed, namespace-bound digest of the admitted exact coding
+    /// scope, omitted when no redaction key was supplied.
+    pub exact_scope_sha256: Option<String>,
+    /// Derived NCM namespace digest used as the diagnostic key context. It is
+    /// omitted when no redaction key was supplied.
+    pub namespace_sha256: Option<String>,
+    /// Caller-keyed, namespace-bound digest of the proved provider instance
+    /// identity, omitted when no redaction key was supplied.
+    pub provider_instance_sha256: Option<String>,
+    /// Provider state generation observed at capture.
+    pub state_generation: u64,
+    /// Number of candidates reported at this stage.
+    pub candidate_count: u64,
+    /// One-based ranks for the bounded candidate sample.
+    pub candidate_ranks: Vec<u64>,
+    /// Observed content byte counts aligned with `candidate_ranks`.
+    pub candidate_content_bytes: Vec<u64>,
+    /// Candidates excluded by the request or adapter.
+    pub excluded_count: u64,
+    /// Candidates truncated or omitted by a limit.
+    pub truncated_count: u64,
+    /// Candidates with incomplete validity/source evidence.
+    pub unknown_count: u64,
+    /// Candidates with no content bytes.
+    pub empty_content_count: u64,
+    /// Adjacent candidates whose finite scores tie exactly.
+    pub score_tie_count: u64,
+    /// Adjacent finite score margins at or below one millionth.
+    pub score_margin_below_epsilon_count: u64,
+    /// Remaining candidate slots at the request limit.
+    pub remaining_candidate_slots: u64,
+    /// Remaining content bytes after budget-eligible candidates at the request limit.
+    pub remaining_content_bytes: u64,
+}
+
+/// Opt-in sink for bounded, redacted recall diagnostics.
+///
+/// The adapter never installs a sink by default. A sink is intended for an
+/// explicitly owned test or diagnostic run and is best effort: sink failures
+/// cannot change the provider reply.
+pub trait NcmRecallDiagnosticSink: Send + Sync {
+    /// Receives one redacted recall-stage event.
+    fn record(&self, event: NcmRecallDiagnosticEvent);
+}
+
+/// Caller-owned secret used to MAC diagnostic identity fields.
+///
+/// The key is retained only by the adapter and is never included in a
+/// diagnostic event. A caller that cannot provide a secret can pass `None` to
+/// `with_recall_diagnostic_sink`; reversible fingerprints are then omitted.
+#[derive(Clone)]
+pub struct NcmRecallDiagnosticKey([u8; 32]);
+
+impl NcmRecallDiagnosticKey {
+    /// Wraps a caller-owned 256-bit secret without copying it into an event.
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 /// Licensed NCM behavior surface supplied after the M6 surface audit and
 /// topology decision.
 ///
@@ -361,6 +462,8 @@ pub struct NcmProviderAdapter {
     surface: Arc<dyn NcmCognitiveSurface>,
     readiness: RwLock<ReadinessState>,
     admission_authority: Option<Arc<dyn AdvisoryAdmissionAuthority>>,
+    recall_diagnostic_sink: Option<Arc<dyn NcmRecallDiagnosticSink>>,
+    recall_diagnostic_key: Option<NcmRecallDiagnosticKey>,
 }
 
 impl NcmProviderAdapter {
@@ -378,6 +481,8 @@ impl NcmProviderAdapter {
             surface,
             readiness: RwLock::new(ReadinessState::default()),
             admission_authority: None,
+            recall_diagnostic_sink: None,
+            recall_diagnostic_key: None,
         })
     }
 
@@ -389,6 +494,20 @@ impl NcmProviderAdapter {
         authority: Arc<dyn AdvisoryAdmissionAuthority>,
     ) -> Self {
         self.admission_authority = Some(authority);
+        self
+    }
+
+    /// Installs an explicitly owned, best-effort sink for redacted recall
+    /// stage diagnostics. The default adapter has no sink and emits nothing.
+    /// Passing `None` records only non-identifying counts and metrics.
+    #[must_use]
+    pub fn with_recall_diagnostic_sink(
+        mut self,
+        sink: Arc<dyn NcmRecallDiagnosticSink>,
+        key: Option<NcmRecallDiagnosticKey>,
+    ) -> Self {
+        self.recall_diagnostic_sink = Some(sink);
+        self.recall_diagnostic_key = key;
         self
     }
 
@@ -1368,6 +1487,18 @@ impl MemoryProvider for NcmProviderAdapter {
         }
         let mut reply = self.surface.invoke(&surface_call);
         if let Err(code) = call.control.snapshot() {
+            if call.operation == ProviderOperation::Recall {
+                common::emit_recall_post_dispatch_control_diagnostic(
+                    call,
+                    &readiness.provider_instance_id,
+                    &reply,
+                    code,
+                    self.recall_diagnostic_sink.as_deref(),
+                    self.recall_diagnostic_key
+                        .as_ref()
+                        .map(NcmRecallDiagnosticKey::as_bytes),
+                );
+            }
             return if call.operation.mutates_provider_state() {
                 Self::surface_contract_failure(call, &surface_call, &reply)
             } else {
@@ -1434,11 +1565,15 @@ impl MemoryProvider for NcmProviderAdapter {
                     reply.terminal.terminal_code(),
                     TerminalCode::Success | TerminalCode::SuccessZeroResults
                 )
-                && common::reconstruct_recall(
+                && common::reconstruct_recall_with_diagnostics(
                     call,
                     &readiness.provider_instance_id,
                     &mut reply,
                     current_admission.as_ref(),
+                    self.recall_diagnostic_sink.as_deref(),
+                    self.recall_diagnostic_key
+                        .as_ref()
+                        .map(NcmRecallDiagnosticKey::as_bytes),
                 )
                 .is_none()
             {

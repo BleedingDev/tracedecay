@@ -2,6 +2,7 @@
 //! only this adapter reconstructs host-facing source and scope claims.
 
 use std::collections::BTreeSet;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chrono::DateTime;
 use serde_json::{Value, json};
@@ -16,7 +17,10 @@ use tracedecay_memory_provider_api::{
     RecordedValidity, SourceAttribution,
 };
 
-use crate::{NcmNamespace, hex_digest, opaque_surface_id};
+use crate::{
+    NcmNamespace, NcmRecallDiagnosticEvent, NcmRecallDiagnosticSink, NcmRecallDiagnosticStage,
+    digest_field, hex_digest, opaque_surface_id,
+};
 
 mod lifecycle;
 mod portability;
@@ -502,6 +506,28 @@ fn decode_capsule(provenance: &Value) -> Option<Value> {
     decode_named_capsule(provenance, "common_capsule")
 }
 
+/// Diagnostic-only capsule decoder that checks the serialized byte count
+/// before allocating a temporary byte vector. The normal reconstruction path
+/// keeps its existing decoder and validation behavior.
+fn decode_capsule_bounded(provenance: &Value, maximum_bytes: usize) -> Option<Value> {
+    let capsule = provenance.get("common_capsule")?;
+    if capsule["version"] != 1 {
+        return None;
+    }
+    let encoded = capsule["bytes"].as_array()?;
+    if encoded.len() > maximum_bytes {
+        return None;
+    }
+    let bytes = encoded
+        .iter()
+        .map(|item| u8::try_from(item.as_u64()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if capsule["sha256"].as_str()? != hex_digest(&Sha256::digest(&bytes)) {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
 fn decode_named_capsule(provenance: &Value, name: &str) -> Option<Value> {
     let capsule = provenance.get(name)?;
     if capsule["version"] != 1 {
@@ -604,11 +630,55 @@ pub(crate) fn reconstruct_observation(
     Some(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn reconstruct_recall(
     call: &ProviderCall,
     instance: &str,
     reply: &mut ProviderReply,
     admission: Option<&CurrentAdvisoryAdmission>,
+) -> Option<()> {
+    reconstruct_recall_with_diagnostics(call, instance, reply, admission, None, None)
+}
+
+pub(crate) fn reconstruct_recall_with_diagnostics(
+    call: &ProviderCall,
+    instance: &str,
+    reply: &mut ProviderReply,
+    admission: Option<&CurrentAdvisoryAdmission>,
+    diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
+    diagnostic_key: Option<&[u8; 32]>,
+) -> Option<()> {
+    let result = reconstruct_recall_inner(
+        call,
+        instance,
+        reply,
+        admission,
+        diagnostic_sink,
+        diagnostic_key,
+    );
+    if result.is_none()
+        && let Some(sink) = diagnostic_sink
+    {
+        emit_recall_diagnostic(
+            Some(sink),
+            diagnostic_for_reconstruction_failure(
+                call,
+                instance,
+                reply.state_generation,
+                diagnostic_key,
+            ),
+        );
+    }
+    result
+}
+
+fn reconstruct_recall_inner(
+    call: &ProviderCall,
+    instance: &str,
+    reply: &mut ProviderReply,
+    admission: Option<&CurrentAdvisoryAdmission>,
+    diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
+    diagnostic_key: Option<&[u8; 32]>,
 ) -> Option<()> {
     let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
     let query = temporal(&request["temporal_query"])?;
@@ -618,6 +688,23 @@ pub(crate) fn reconstruct_recall(
     let max_candidates = budgets["maximum_candidates"].as_u64()?.min(16) as usize;
     let max_content = budgets["maximum_candidate_content_bytes"].as_u64()?;
     let max_total = budgets["maximum_total_content_bytes"].as_u64()?;
+    if let Some(sink) = diagnostic_sink {
+        emit_recall_diagnostic(
+            Some(sink),
+            diagnostic_for_worker(
+                call,
+                instance,
+                &request,
+                &worker,
+                rows,
+                max_candidates,
+                max_total,
+                admission,
+                reply.state_generation,
+                diagnostic_key,
+            ),
+        );
+    }
     let mut candidates = Vec::new();
     let mut total = 0_u64;
     let mut truncated = worker["common_recall"]["truncated"].as_bool()?;
@@ -703,12 +790,7 @@ pub(crate) fn reconstruct_recall(
             continue;
         }
         let content_limit = max_content.min(max_total.saturating_sub(total));
-        let mut boundary = usize::try_from(content_limit)
-            .unwrap_or(usize::MAX)
-            .min(content.len());
-        while !content.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
+        let boundary = utf8_budget_boundary(content, content_limit);
         if boundary < content.len() {
             truncated = true;
             truncated_items += 1;
@@ -720,20 +802,10 @@ pub(crate) fn reconstruct_recall(
         // Exclusions above use the complete retained content; this digest
         // describes exactly the UTF-8 excerpt emitted under the caller's budget.
         let emitted_digest = hex_digest(&Sha256::digest(emitted_content.as_bytes()));
-        let score = row["activation"].as_f64()?;
-        if !score.is_finite() {
-            return None;
-        }
-        let mut wire_validity = original["validity"].clone();
-        if let Some(patch) = row
-            .pointer("/provenance/control/validity_patch")
-            .and_then(Value::as_object)
-        {
-            for (field, value) in patch {
-                wire_validity[field] = value.clone();
-            }
-        }
-        let validity = validity(&wire_validity)?;
+        let score = validated_worker_activation(row)?;
+        let (wire_validity, validity) = patched_worker_validity(original, row)?;
+        let score_upper_bound =
+            validated_worker_score_upper_bound(&worker["common_recall"]["score_upper_bound"])?;
         let at = query
             .as_of_utc_nanos
             .unwrap_or(query.evaluation_time_utc_nanos);
@@ -775,7 +847,7 @@ pub(crate) fn reconstruct_recall(
             "content": emitted_content, "content_ref": null, "content_sha256": emitted_digest,
             "native_score": {"score_domain_id": "ncm.rbf_activation.v1", "score_domain_version": 1,
                 "raw_value": (score as f32).to_string(), "direction": "higher_is_better", "declared_minimum": "0",
-                "declared_maximum": (worker["common_recall"]["score_upper_bound"].as_f64()? as f32).to_string(), "calibration_state": "uncalibrated",
+                "declared_maximum": (score_upper_bound as f32).to_string(), "calibration_state": "uncalibrated",
                 "semantics": "Peak intensity-weighted RBF activation across supporting NCM centers", "components": {}},
             "confidence": row.pointer("/confidence/Uncalibrated").cloned().unwrap_or(Value::Null),
             "exact_scope_identity": candidate_scope,
@@ -840,6 +912,29 @@ pub(crate) fn reconstruct_recall(
         "ordering": {"provider_order": "deterministic_native_score_then_candidate_id_within_one_score_domain", "tie_breaker": "candidate_id_lexicographic_utf8"},
         "terminal": {"code": code.as_wire()}, "warnings": warnings
     });
+    if let Some(sink) = diagnostic_sink {
+        emit_recall_diagnostic(
+            Some(sink),
+            diagnostic_for_reconstructed(
+                call,
+                instance,
+                &request,
+                &value,
+                max_candidates,
+                max_total,
+                reply.state_generation,
+                if partial {
+                    NcmRecallDiagnosticStage::PartialReply
+                } else {
+                    NcmRecallDiagnosticStage::Reconstructed
+                },
+                excluded,
+                truncated_items,
+                unknown,
+                diagnostic_key,
+            ),
+        );
+    }
     let bytes = serde_json::to_vec(&value).ok()?;
     reply.payload = Some(
         CanonicalPayload::new(
@@ -861,4 +956,1219 @@ pub(crate) fn reconstruct_recall(
     )
     .ok()?;
     Some(())
+}
+
+const RECALL_DIAGNOSTIC_MAX_ITEMS: usize = 16;
+const RECALL_DIAGNOSTIC_MAX_CAPSULE_BYTES: usize = 131_072;
+const RECALL_DIAGNOSTIC_REQUEST_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.request.v1\0";
+const RECALL_DIAGNOSTIC_OPERATION_DOMAIN: &[u8] =
+    b"tracedecay.ncm.recall-diagnostic.operation.v1\0";
+const RECALL_DIAGNOSTIC_QUERY_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.query.v1\0";
+const RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN: &[u8] =
+    b"tracedecay.ncm.recall-diagnostic.exact-scope.v1\0";
+const RECALL_DIAGNOSTIC_INSTANCE_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.instance.v1\0";
+
+struct RecallDiagnosticAccumulator {
+    candidate_count: u64,
+    admitted_candidate_count: u64,
+    candidate_ranks: Vec<u64>,
+    candidate_content_bytes: Vec<u64>,
+    total_content_bytes: u64,
+    empty_content_count: u64,
+    previous_score: Option<f64>,
+    score_tie_count: u64,
+    score_margin_below_epsilon_count: u64,
+}
+
+impl RecallDiagnosticAccumulator {
+    fn new() -> Self {
+        Self {
+            candidate_count: 0,
+            admitted_candidate_count: 0,
+            candidate_ranks: Vec::with_capacity(RECALL_DIAGNOSTIC_MAX_ITEMS),
+            candidate_content_bytes: Vec::with_capacity(RECALL_DIAGNOSTIC_MAX_ITEMS),
+            total_content_bytes: 0,
+            empty_content_count: 0,
+            previous_score: None,
+            score_tie_count: 0,
+            score_margin_below_epsilon_count: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        rank: usize,
+        content_bytes: usize,
+        budgeted_content_bytes: usize,
+        score: Option<f64>,
+    ) {
+        self.candidate_count = self.candidate_count.saturating_add(1);
+        if budgeted_content_bytes > 0 {
+            self.admitted_candidate_count = self.admitted_candidate_count.saturating_add(1);
+        }
+        let content_bytes = u64::try_from(content_bytes).unwrap_or(u64::MAX);
+        self.total_content_bytes = self
+            .total_content_bytes
+            .saturating_add(u64::try_from(budgeted_content_bytes).unwrap_or(u64::MAX));
+        if content_bytes == 0 {
+            self.empty_content_count = self.empty_content_count.saturating_add(1);
+        }
+        if self.candidate_ranks.len() < RECALL_DIAGNOSTIC_MAX_ITEMS {
+            self.candidate_ranks
+                .push(u64::try_from(rank).unwrap_or(u64::MAX));
+            self.candidate_content_bytes.push(content_bytes);
+        }
+        if let Some(score) = score.filter(|score| score.is_finite()) {
+            if let Some(previous) = self.previous_score {
+                let margin = (previous - score).abs();
+                if margin == 0.0 {
+                    self.score_tie_count = self.score_tie_count.saturating_add(1);
+                }
+                if margin <= 0.000_001 {
+                    self.score_margin_below_epsilon_count =
+                        self.score_margin_below_epsilon_count.saturating_add(1);
+                }
+            }
+            self.previous_score = Some(score);
+        }
+    }
+
+    fn finish(
+        self,
+        call: &ProviderCall,
+        instance: &str,
+        request: &Value,
+        stage: NcmRecallDiagnosticStage,
+        state_generation: u64,
+        diagnostic_key: Option<&[u8; 32]>,
+        max_candidates: usize,
+        max_total: u64,
+        excluded_count: u64,
+        truncated_count: u64,
+        unknown_count: u64,
+    ) -> NcmRecallDiagnosticEvent {
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let remaining_candidate_slots = u64::try_from(max_candidates)
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.admitted_candidate_count);
+        NcmRecallDiagnosticEvent {
+            stage,
+            request_id_sha256: diagnostic_digest(
+                diagnostic_key,
+                &namespace,
+                RECALL_DIAGNOSTIC_REQUEST_DOMAIN,
+                call.request_id.as_bytes(),
+            ),
+            operation_id_sha256: diagnostic_digest(
+                diagnostic_key,
+                &namespace,
+                RECALL_DIAGNOSTIC_OPERATION_DOMAIN,
+                call.operation_id.as_bytes(),
+            ),
+            query_sha256: diagnostic_digest(
+                diagnostic_key,
+                &namespace,
+                RECALL_DIAGNOSTIC_QUERY_DOMAIN,
+                request["query"].as_str().unwrap_or_default().as_bytes(),
+            ),
+            exact_scope_sha256: diagnostic_digest(
+                diagnostic_key,
+                &namespace,
+                RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN,
+                call.exact_scope.exact_scope_sha256().as_bytes(),
+            ),
+            namespace_sha256: diagnostic_key.map(|_| namespace.as_str().to_owned()),
+            provider_instance_sha256: diagnostic_digest(
+                diagnostic_key,
+                &namespace,
+                RECALL_DIAGNOSTIC_INSTANCE_DOMAIN,
+                instance.as_bytes(),
+            ),
+            state_generation,
+            candidate_count: self.candidate_count,
+            candidate_ranks: self.candidate_ranks,
+            candidate_content_bytes: self.candidate_content_bytes,
+            excluded_count,
+            truncated_count,
+            unknown_count,
+            empty_content_count: self.empty_content_count,
+            score_tie_count: self.score_tie_count,
+            score_margin_below_epsilon_count: self.score_margin_below_epsilon_count,
+            remaining_candidate_slots,
+            remaining_content_bytes: max_total.saturating_sub(self.total_content_bytes),
+        }
+    }
+}
+
+fn diagnostic_digest(
+    key: Option<&[u8; 32]>,
+    namespace: &NcmNamespace,
+    domain: &[u8],
+    value: &[u8],
+) -> Option<String> {
+    let key = key?;
+    let mut key_block = [0_u8; 64];
+    key_block[..key.len()].copy_from_slice(key);
+
+    let mut inner_pad = [0_u8; 64];
+    let mut outer_pad = [0_u8; 64];
+    for index in 0..key_block.len() {
+        inner_pad[index] = key_block[index] ^ 0x36;
+        outer_pad[index] = key_block[index] ^ 0x5c;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(domain);
+    digest_field(&mut inner, namespace.as_str().as_bytes());
+    digest_field(&mut inner, value);
+    let inner_result = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_result);
+    Some(hex_digest(&outer.finalize()))
+}
+
+fn emit_recall_diagnostic(
+    sink: Option<&dyn NcmRecallDiagnosticSink>,
+    event: NcmRecallDiagnosticEvent,
+) {
+    if let Some(sink) = sink {
+        let _ = catch_unwind(AssertUnwindSafe(|| sink.record(event)));
+    }
+}
+
+fn utf8_budget_boundary(content: &str, content_limit: u64) -> usize {
+    let mut boundary = usize::try_from(content_limit)
+        .unwrap_or(usize::MAX)
+        .min(content.len());
+    while !content.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn validated_worker_activation(row: &Value) -> Option<f64> {
+    let score = row["activation"].as_f64()?;
+    score.is_finite().then_some(score)
+}
+
+fn validated_worker_score_upper_bound(value: &Value) -> Option<f64> {
+    let score_upper_bound = value.as_f64()?;
+    score_upper_bound.is_finite().then_some(score_upper_bound)
+}
+
+fn patched_worker_validity(original: &Value, row: &Value) -> Option<(Value, RecordedValidity)> {
+    let mut wire_validity = original["validity"].clone();
+    if let Some(patch) = row
+        .pointer("/provenance/control/validity_patch")
+        .and_then(Value::as_object)
+    {
+        for (field, value) in patch {
+            wire_validity[field] = value.clone();
+        }
+    }
+    let validity = validity(&wire_validity)?;
+    Some((wire_validity, validity))
+}
+
+fn worker_budgeted_content_bytes(
+    call: &ProviderCall,
+    request: &Value,
+    row: &Value,
+    score_upper_bound: Option<f64>,
+    max_candidates: usize,
+    max_content: u64,
+    max_total: u64,
+    admission: Option<&CurrentAdvisoryAdmission>,
+    accepted_candidates: usize,
+    accepted_content_bytes: u64,
+) -> Option<usize> {
+    if accepted_candidates >= max_candidates || accepted_content_bytes >= max_total {
+        return Some(0);
+    }
+    validated_worker_activation(row)?;
+    let content = row["value_text"].as_str()?;
+    let (retained, source) = authorized_worker_row(call, row, admission)?;
+    if row["key_text"] != retained["projection"]["key_text"]
+        || row["value_text"] != retained["projection"]["value_text"]
+    {
+        return Some(0);
+    }
+    let source_refs = retained["source_refs"].as_array()?;
+    let maximum_source_refs = request["budgets"]["maximum_source_refs_per_candidate"].as_u64()?;
+    if source_refs.len() as u64 > maximum_source_refs
+        || source_refs.iter().any(|item| string(item).is_none())
+    {
+        return Some(0);
+    }
+    let stable = row["stable_memory_ref"].as_str()?;
+    let candidate_id = row["candidate_id"].as_str()?;
+    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+    if stable
+        != stable_reference(
+            &namespace,
+            row["record_id"].as_u64()?,
+            row["provenance"]["common_capsule"]["sha256"].as_str()?,
+        )
+    {
+        return Some(0);
+    }
+    let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+    let mut candidate_digest = Sha256::new();
+    for field in [request_token.as_bytes(), stable.as_bytes()] {
+        candidate_digest.update((field.len() as u64).to_be_bytes());
+        candidate_digest.update(field);
+    }
+    let expected_candidate_id =
+        format!("ncm-candidate:{}", hex_digest(&candidate_digest.finalize()));
+    if candidate_id != expected_candidate_id {
+        return Some(0);
+    }
+    let content_digest = hex_digest(&Sha256::digest(content.as_bytes()));
+    let excluded = [
+        ("stable_memory_refs", stable),
+        ("trace_refs", stable),
+        ("candidate_ids", candidate_id),
+        ("observation_ids", source.source.observation_id.as_str()),
+        ("content_sha256", content_digest.as_str()),
+    ]
+    .iter()
+    .any(|(name, value)| {
+        request["exclusions"][*name]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
+    }) || source_refs
+        .iter()
+        .filter_map(Value::as_str)
+        .chain(std::iter::once(source.source.source_key.as_str()))
+        .any(|source_ref| {
+            request["exclusions"]["source_refs"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(source_ref)))
+        });
+    if excluded {
+        return Some(0);
+    }
+    let content_limit = max_content.min(max_total.saturating_sub(accepted_content_bytes));
+    let boundary = utf8_budget_boundary(content, content_limit);
+    if boundary == 0 {
+        return Some(0);
+    }
+    score_upper_bound?;
+    patched_worker_validity(&retained["original_source"], row)?;
+    Some(boundary)
+}
+
+fn diagnostic_for_worker(
+    call: &ProviderCall,
+    instance: &str,
+    request: &Value,
+    worker: &Value,
+    rows: &[Value],
+    max_candidates: usize,
+    max_total: u64,
+    admission: Option<&CurrentAdvisoryAdmission>,
+    state_generation: u64,
+    diagnostic_key: Option<&[u8; 32]>,
+) -> NcmRecallDiagnosticEvent {
+    let mut summary = RecallDiagnosticAccumulator::new();
+    let mut budgeted_total = 0_u64;
+    let mut budgeted_candidates = 0_usize;
+    let mut budget_available = max_candidates > 0 && max_total > 0;
+    let max_content = request["budgets"]["maximum_candidate_content_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    let score_upper_bound =
+        validated_worker_score_upper_bound(&worker["common_recall"]["score_upper_bound"]);
+    for (index, row) in rows.iter().enumerate() {
+        // Keep the scalar budget accounting exact across excluded or invalid
+        // rows that precede the first eligible candidate. Each inspected row
+        // is decoded through the bounded capsule path; once either budget is
+        // saturated, later rows need no decoding at all.
+        let budgeted_content_bytes = if budget_available && score_upper_bound.is_some() {
+            worker_budgeted_content_bytes(
+                call,
+                request,
+                row,
+                score_upper_bound,
+                max_candidates,
+                max_content,
+                max_total,
+                admission,
+                budgeted_candidates,
+                budgeted_total,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        if budgeted_content_bytes > 0 {
+            budgeted_candidates = budgeted_candidates.saturating_add(1);
+            budgeted_total = budgeted_total
+                .saturating_add(u64::try_from(budgeted_content_bytes).unwrap_or(u64::MAX));
+        }
+        budget_available = budgeted_candidates < max_candidates && budgeted_total < max_total;
+        summary.push(
+            index.saturating_add(1),
+            row["value_text"].as_str().map_or(0, str::len),
+            budgeted_content_bytes,
+            validated_worker_activation(row),
+        );
+    }
+    summary.finish(
+        call,
+        instance,
+        request,
+        NcmRecallDiagnosticStage::Worker,
+        state_generation,
+        diagnostic_key,
+        max_candidates,
+        max_total,
+        worker["common_recall"]["excluded_items"]
+            .as_u64()
+            .unwrap_or(0),
+        worker["common_recall"]["truncated_items"]
+            .as_u64()
+            .or_else(|| {
+                worker["common_recall"]["truncated"]
+                    .as_bool()
+                    .is_some_and(|value| value)
+                    .then_some(1)
+            })
+            .unwrap_or(0),
+        worker["common_recall"]["unknown_items"]
+            .as_u64()
+            .unwrap_or(0),
+    )
+}
+
+fn diagnostic_for_reconstructed(
+    call: &ProviderCall,
+    instance: &str,
+    request: &Value,
+    value: &Value,
+    max_candidates: usize,
+    max_total: u64,
+    state_generation: u64,
+    stage: NcmRecallDiagnosticStage,
+    excluded_count: u64,
+    truncated_count: u64,
+    unknown_count: u64,
+    diagnostic_key: Option<&[u8; 32]>,
+) -> NcmRecallDiagnosticEvent {
+    let mut summary = RecallDiagnosticAccumulator::new();
+    if let Some(candidates) = value["candidates"].as_array() {
+        for (index, candidate) in candidates.iter().enumerate() {
+            summary.push(
+                index.saturating_add(1),
+                candidate["content"].as_str().map_or(0, str::len),
+                candidate["content"].as_str().map_or(0, str::len),
+                candidate["native_score"]["raw_value"]
+                    .as_str()
+                    .and_then(|score| score.parse::<f64>().ok()),
+            );
+        }
+    }
+    summary.finish(
+        call,
+        instance,
+        request,
+        stage,
+        state_generation,
+        diagnostic_key,
+        max_candidates,
+        max_total,
+        excluded_count,
+        truncated_count,
+        unknown_count,
+    )
+}
+
+fn diagnostic_for_reconstruction_failure(
+    call: &ProviderCall,
+    instance: &str,
+    state_generation: u64,
+    diagnostic_key: Option<&[u8; 32]>,
+) -> NcmRecallDiagnosticEvent {
+    let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
+    let max_candidates = request["budgets"]["maximum_candidates"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(RECALL_DIAGNOSTIC_MAX_ITEMS as u64) as usize;
+    let max_total = request["budgets"]["maximum_total_content_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    RecallDiagnosticAccumulator::new().finish(
+        call,
+        instance,
+        &request,
+        NcmRecallDiagnosticStage::ReconstructionFailure,
+        state_generation,
+        diagnostic_key,
+        max_candidates,
+        max_total,
+        0,
+        0,
+        0,
+    )
+}
+
+/// Emits a typed recall diagnostic when the caller control terminal is
+/// observed after the surface has already returned.
+pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
+    call: &ProviderCall,
+    instance: &str,
+    reply: &ProviderReply,
+    code: TerminalCode,
+    diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
+    diagnostic_key: Option<&[u8; 32]>,
+) {
+    let Some(sink) = diagnostic_sink else {
+        return;
+    };
+    let stage = match code {
+        TerminalCode::Cancelled => NcmRecallDiagnosticStage::PostDispatchCancellation,
+        TerminalCode::DeadlineExceeded => NcmRecallDiagnosticStage::PostDispatchDeadline,
+        _ => return,
+    };
+    emit_recall_diagnostic(
+        Some(sink),
+        diagnostic_for_control_terminal(
+            call,
+            instance,
+            reply.state_generation,
+            stage,
+            diagnostic_key,
+        ),
+    );
+}
+
+fn diagnostic_for_control_terminal(
+    call: &ProviderCall,
+    instance: &str,
+    state_generation: u64,
+    stage: NcmRecallDiagnosticStage,
+    diagnostic_key: Option<&[u8; 32]>,
+) -> NcmRecallDiagnosticEvent {
+    let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
+    let max_candidates = request["budgets"]["maximum_candidates"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(RECALL_DIAGNOSTIC_MAX_ITEMS as u64) as usize;
+    let max_total = request["budgets"]["maximum_total_content_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    RecallDiagnosticAccumulator::new().finish(
+        call,
+        instance,
+        &request,
+        stage,
+        state_generation,
+        diagnostic_key,
+        max_candidates,
+        max_total,
+        0,
+        0,
+        0,
+    )
+}
+
+fn authorized_worker_row(
+    call: &ProviderCall,
+    row: &Value,
+    admission: Option<&CurrentAdvisoryAdmission>,
+) -> Option<(Value, SourceAttribution)> {
+    let retained = decode_capsule_bounded(&row["provenance"], RECALL_DIAGNOSTIC_MAX_CAPSULE_BYTES)?;
+    let source = attribution(&retained["original_source"])?;
+    if scope(&retained["delivery_scope"])? != call.exact_scope {
+        return None;
+    }
+    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+    validate_source_binding(
+        &namespace,
+        &source,
+        &row["provenance"],
+        row["source"].as_str()?,
+    )?;
+    if let OriginScopeEvidence::Recorded { scope, .. } = &source.origin_scope
+        && scope != &call.exact_scope
+        && !history_source_admitted(&source, admission)
+    {
+        return None;
+    }
+    Some((retained, source))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod recall_diagnostic_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use tracedecay_memory_provider_api::{
+        CancellationToken, OperationControl, OwnedProviderId, OwnedVersionedId, ProviderCallParts,
+        ProviderOperation,
+    };
+
+    struct RecordingSink(Mutex<Vec<NcmRecallDiagnosticEvent>>);
+
+    const DIAGNOSTIC_KEY: [u8; 32] = [0xa5; 32];
+    // Independent Python hashlib/hmac computation for DIAGNOSTIC_KEY, the
+    // diagnostic-session namespace, and the query domain/value below.
+    const EXPECTED_QUERY_HMAC: &str =
+        "e29bafe7d4f7c2f22380f931bc8e3381989c5d46b53178dee215ba7cc5d661e1";
+
+    impl NcmRecallDiagnosticSink for RecordingSink {
+        fn record(&self, event: NcmRecallDiagnosticEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn exact_scope_with_session(session: &str) -> OwnedExactScope {
+        OwnedExactScope::new(
+            "profile",
+            "project",
+            "repository",
+            "worktree",
+            "master",
+            session,
+            format!("sha256:{}", "ab".repeat(32)),
+        )
+        .unwrap()
+    }
+
+    fn exact_scope() -> OwnedExactScope {
+        exact_scope_with_session("diagnostic-session")
+    }
+
+    fn call_for_scope(scope: OwnedExactScope) -> ProviderCall {
+        let value = json!({"query":"private query marker", "budgets": {"maximum_candidates": 4, "maximum_total_content_bytes": 8192}});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Recall,
+            provider_id: OwnedProviderId::new(crate::NCM_PROVIDER_ID).unwrap(),
+            registration_revision: 1,
+            ready_receipt_sha256: "11".repeat(32),
+            exact_scope: scope,
+            request_id: "private request marker".to_owned(),
+            operation_id: "private operation marker".to_owned(),
+            expected_state_generation: 7,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, 60_000, CancellationToken::new()),
+            payload: CanonicalPayload::new(
+                OwnedVersionedId::new("tracedecay.memory.provider.recall.v1").unwrap(),
+                bytes.clone(),
+                hex_digest(&Sha256::digest(&bytes)),
+            )
+            .unwrap(),
+            required_capabilities: vec![OwnedVersionedId::new("recall.query.v1").unwrap()],
+            extensions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn call() -> ProviderCall {
+        call_for_scope(exact_scope())
+    }
+
+    fn original_source(call: &ProviderCall, sequence: u64) -> Value {
+        json!({
+            "source": {
+                "canonical_provider_id": "claude",
+                "canonical_session_id": "private-session",
+                "source_key": format!("private-source-{sequence}"),
+                "stable_record_id": format!("private-record-{sequence}"),
+                "observation_id": format!("private-observation-{sequence}"),
+                "source_revision": format!("private-revision-{sequence}"),
+                "content_sha256": "cd".repeat(32)
+            },
+            "origin_scope": {
+                "state": "recorded",
+                "exact_scope_identity": scope_value(&call.exact_scope),
+                "authority_ref": "private-authority"
+            },
+            "source_sequence": sequence,
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "ingested_at": "2026-01-01T00:00:00Z",
+            "validity": {
+                "valid_from": "2026-01-01T00:00:00Z",
+                "valid_until": null,
+                "superseded_at": null,
+                "superseded_by": null,
+                "revoked_at": null
+            }
+        })
+    }
+
+    fn worker_row(call: &ProviderCall, sequence: u64, content: &str, activation: f64) -> Value {
+        let original = original_source(call, sequence);
+        let source = attribution(&original).unwrap();
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let binding = source_binding(&namespace, &source).unwrap();
+        let retained = json!({
+            "original_source": original,
+            "delivery_scope": scope_value(&call.exact_scope),
+            "projection": {"key_text": content, "value_text": content},
+            "source_refs": [format!("private-ref-{sequence}")]
+        });
+        let retained_bytes = serde_json::to_vec(&retained).unwrap();
+        let capsule_digest = hex_digest(&Sha256::digest(&retained_bytes));
+        let stable = stable_reference(&namespace, sequence, &capsule_digest);
+        let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+        let mut candidate_digest = Sha256::new();
+        for field in [request_token.as_bytes(), stable.as_bytes()] {
+            candidate_digest.update((field.len() as u64).to_be_bytes());
+            candidate_digest.update(field);
+        }
+        let candidate_id = format!("ncm-candidate:{}", hex_digest(&candidate_digest.finalize()));
+        json!({
+            "record_id": sequence,
+            "source": binding.source_id,
+            "stable_memory_ref": stable,
+            "candidate_id": candidate_id,
+            "key_text": content,
+            "value_text": content,
+            "activation": activation,
+            "provenance": {
+                "source_binding": binding.provenance(),
+                "common_capsule": {
+                    "version": 1,
+                    "bytes": retained_bytes,
+                    "sha256": capsule_digest
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn diagnostic_sink_localizes_four_worker_rows_to_two_reconstructed_rows() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 8192,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let rows = (2..=5)
+            .map(|sequence| {
+                worker_row(
+                    &call,
+                    sequence,
+                    &format!("private content marker {sequence}"),
+                    1.0 - (sequence as f64 / 100.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        let worker = json!({
+            "common_recall": {
+                "candidates": rows,
+                "excluded_items": 0,
+                "truncated_items": 0,
+                "unknown_items": 0,
+                "score_upper_bound": 1.0
+            }
+        });
+        let raw = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        let reconstructed = json!({
+            "candidates": [
+                {"content":"private content marker 4", "native_score":{"raw_value":"0.96"}, "provenance":{"original_sources":[original_source(&call, 4)]}},
+                {"content":"private content marker 5", "native_score":{"raw_value":"0.95"}, "provenance":{"original_sources":[original_source(&call, 5)]}}
+            ]
+        });
+        let post = diagnostic_for_reconstructed(
+            &call,
+            "private-provider-instance",
+            &request,
+            &reconstructed,
+            4,
+            8192,
+            7,
+            NcmRecallDiagnosticStage::Reconstructed,
+            0,
+            0,
+            0,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        emit_recall_diagnostic(Some(sink.as_ref()), raw.clone());
+        emit_recall_diagnostic(Some(sink.as_ref()), post.clone());
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.as_slice(), [raw.clone(), post.clone()]);
+        assert_eq!(raw.stage, NcmRecallDiagnosticStage::Worker);
+        assert_eq!(raw.candidate_count, 4);
+        assert_eq!(raw.candidate_ranks, [1, 2, 3, 4]);
+        assert_eq!(post.stage, NcmRecallDiagnosticStage::Reconstructed);
+        assert_eq!(post.candidate_count, 2);
+        assert_eq!(post.candidate_ranks, [1, 2]);
+        assert_eq!(raw.state_generation, post.state_generation);
+        assert_eq!(raw.request_id_sha256, post.request_id_sha256);
+        assert_eq!(raw.query_sha256, post.query_sha256);
+        assert_eq!(
+            raw.remaining_content_bytes,
+            8192 - raw.candidate_content_bytes.iter().sum::<u64>()
+        );
+        assert_eq!(
+            post.remaining_content_bytes,
+            8192 - post.candidate_content_bytes.iter().sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn diagnostic_event_contains_digests_and_counts_but_no_private_values() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 8192,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let rows = vec![worker_row(&call, 91_000_007, "private content marker", 0.5)];
+        let worker = json!({"common_recall":{"candidates":rows,"excluded_items":1,"truncated_items":2,"unknown_items":3,"score_upper_bound":1.0}});
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        let debug = format!("{event:?}");
+        for private_value in [
+            "private query marker",
+            "private content marker",
+            "private request marker",
+            "private operation marker",
+            "private-source-91000007",
+            "private-record-91000007",
+            "private-observation-91000007",
+            "private-provider-instance",
+            "91000007",
+        ] {
+            assert!(
+                !debug.contains(private_value),
+                "diagnostic leaked {private_value}"
+            );
+        }
+        for digest in [
+            &event.request_id_sha256,
+            &event.operation_id_sha256,
+            &event.query_sha256,
+            &event.exact_scope_sha256,
+            &event.provider_instance_sha256,
+        ] {
+            let digest = digest.as_ref().expect("keyed digest");
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert_eq!(event.excluded_count, 1);
+        assert_eq!(event.truncated_count, 2);
+        assert_eq!(event.unknown_count, 3);
+    }
+
+    #[test]
+    fn diagnostic_identity_is_unlinkable_across_scopes() {
+        let call_a = call_for_scope(exact_scope_with_session("diagnostic-session-a"));
+        let call_b = call_for_scope(exact_scope_with_session("diagnostic-session-b"));
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 8192,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let worker_a = json!({"common_recall":{"candidates":[worker_row(
+            &call_a,
+            91_000_007,
+            "private content marker",
+            0.5
+        )],"score_upper_bound":1.0}});
+        let worker_b = json!({"common_recall":{"candidates":[worker_row(
+            &call_b,
+            91_000_007,
+            "private content marker",
+            0.5
+        )],"score_upper_bound":1.0}});
+        let event_a = diagnostic_for_worker(
+            &call_a,
+            "private-provider-instance",
+            &request,
+            &worker_a,
+            worker_a["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        let event_b = diagnostic_for_worker(
+            &call_b,
+            "private-provider-instance",
+            &request,
+            &worker_b,
+            worker_b["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_ne!(event_a.namespace_sha256, event_b.namespace_sha256);
+        assert_ne!(event_a.request_id_sha256, event_b.request_id_sha256);
+        assert_ne!(event_a.operation_id_sha256, event_b.operation_id_sha256);
+        assert_ne!(event_a.query_sha256, event_b.query_sha256);
+        assert_ne!(event_a.exact_scope_sha256, event_b.exact_scope_sha256);
+        assert_ne!(
+            event_a.provider_instance_sha256,
+            event_b.provider_instance_sha256
+        );
+        for event in [event_a, event_b] {
+            let debug = format!("{event:?}");
+            assert!(!debug.contains("private query marker"));
+            assert!(!debug.contains("private content marker"));
+            assert!(!debug.contains("91000007"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_key_is_required_for_reversible_identity_fingerprints() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 8192,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let rows = vec![worker_row(&call, 17, "private content marker", 0.5)];
+        let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            None,
+        );
+        assert!(event.request_id_sha256.is_none());
+        assert!(event.operation_id_sha256.is_none());
+        assert!(event.query_sha256.is_none());
+        assert!(event.exact_scope_sha256.is_none());
+        assert!(event.namespace_sha256.is_none());
+        assert!(event.provider_instance_sha256.is_none());
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("private query marker"));
+        assert!(!debug.contains("private content marker"));
+    }
+
+    fn namespace_keyed_public_hmac(namespace: &str, domain: &[u8], value: &[u8]) -> String {
+        let mut key_block = [0_u8; 64];
+        key_block[..namespace.len()].copy_from_slice(namespace.as_bytes());
+        let mut inner_pad = [0_u8; 64];
+        let mut outer_pad = [0_u8; 64];
+        for index in 0..key_block.len() {
+            inner_pad[index] = key_block[index] ^ 0x36;
+            outer_pad[index] = key_block[index] ^ 0x5c;
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        inner.update(domain);
+        digest_field(&mut inner, value);
+        let inner_result = inner.finalize();
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner_result);
+        hex_digest(&outer.finalize())
+    }
+
+    #[test]
+    fn diagnostic_query_fingerprint_is_not_a_dictionary_recoverable_sha256() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 8192,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let rows = vec![worker_row(&call, 18, "private content marker", 0.5)];
+        let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            8192,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        assert_eq!(event.namespace_sha256.as_deref(), Some(namespace.as_str()));
+        assert_eq!(event.query_sha256.as_deref(), Some(EXPECTED_QUERY_HMAC));
+
+        let wrong_key = [0xa6; 32];
+        let wrong_key_digest = diagnostic_digest(
+            Some(&wrong_key),
+            &namespace,
+            RECALL_DIAGNOSTIC_QUERY_DOMAIN,
+            b"private query marker",
+        )
+        .expect("wrong-key digest");
+        assert_ne!(wrong_key_digest, EXPECTED_QUERY_HMAC);
+
+        let public_namespace_digest = namespace_keyed_public_hmac(
+            namespace.as_str(),
+            RECALL_DIAGNOSTIC_QUERY_DOMAIN,
+            b"private query marker",
+        );
+        assert_ne!(public_namespace_digest, EXPECTED_QUERY_HMAC);
+
+        let mut plain = Sha256::new();
+        plain.update(RECALL_DIAGNOSTIC_QUERY_DOMAIN);
+        digest_field(
+            &mut plain,
+            event
+                .namespace_sha256
+                .as_deref()
+                .expect("keyed namespace")
+                .as_bytes(),
+        );
+        digest_field(&mut plain, b"private query marker");
+        let plain = hex_digest(&plain.finalize());
+        assert_ne!(event.query_sha256.as_deref(), Some(plain.as_str()));
+    }
+
+    #[test]
+    fn worker_diagnostic_uses_the_reconstruction_utf8_budget_boundary() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidate_content_bytes": 2,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let content = "aéclair";
+        assert_eq!(utf8_budget_boundary(content, 2), 1);
+        let rows = vec![worker_row(&call, 19, content, 0.5)];
+        let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            2,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_eq!(event.candidate_content_bytes, [content.len() as u64]);
+        assert_eq!(event.remaining_content_bytes, 1);
+    }
+
+    #[test]
+    fn worker_remaining_budget_ignores_excluded_and_overbudget_row_content_bytes() {
+        let call = call();
+        let excluded_content = "x".repeat(128);
+        let overbudget_content = "y".repeat(128);
+        let retained_content = "kept";
+        let excluded = worker_row(&call, 91_000_007, &excluded_content, 0.9);
+        let mut overbudget = worker_row(&call, 91_000_008, &overbudget_content, 0.8);
+        let mut overbudget_retained = decode_capsule(&overbudget["provenance"]).unwrap();
+        overbudget_retained["source_refs"] = json!(["private-ref-a", "private-ref-b"]);
+        let overbudget_bytes = serde_json::to_vec(&overbudget_retained).unwrap();
+        let overbudget_digest = hex_digest(&Sha256::digest(&overbudget_bytes));
+        overbudget["provenance"]["common_capsule"]["bytes"] = json!(overbudget_bytes);
+        overbudget["provenance"]["common_capsule"]["sha256"] = json!(overbudget_digest);
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let overbudget_stable = stable_reference(&namespace, 91_000_008, &overbudget_digest);
+        overbudget["stable_memory_ref"] = json!(overbudget_stable);
+        let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+        let mut candidate_digest = Sha256::new();
+        for field in [request_token.as_bytes(), overbudget_stable.as_bytes()] {
+            candidate_digest.update((field.len() as u64).to_be_bytes());
+            candidate_digest.update(field);
+        }
+        overbudget["candidate_id"] = json!(format!(
+            "ncm-candidate:{}",
+            hex_digest(&candidate_digest.finalize())
+        ));
+        let excluded_stable = excluded["stable_memory_ref"].as_str().unwrap().to_owned();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidates": 4,
+                "maximum_candidate_content_bytes": 128,
+                "maximum_source_refs_per_candidate": 1
+            },
+            "exclusions": {
+                "stable_memory_refs": [excluded_stable],
+                "candidate_ids": [],
+                "source_refs": [],
+                "trace_refs": [],
+                "observation_ids": [],
+                "content_sha256": []
+            }
+        });
+        let rows = vec![
+            excluded,
+            overbudget,
+            worker_row(&call, 91_000_009, retained_content, 0.7),
+        ];
+        let worker = json!({
+            "common_recall": {
+                "candidates": rows,
+                "excluded_items": 1,
+                "truncated_items": 1,
+                "unknown_items": 0,
+                "score_upper_bound": 1.0
+            }
+        });
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            4,
+            64,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_eq!(event.candidate_content_bytes, [128, 128, 4]);
+        assert_eq!(
+            event.remaining_content_bytes,
+            64 - retained_content.len() as u64
+        );
+    }
+
+    #[test]
+    fn worker_remaining_budget_streams_past_the_sample_for_invalid_rows() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidates": 1,
+                "maximum_candidate_content_bytes": 64,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let mut rows = (0..17)
+            .map(|sequence| {
+                let mut row = worker_row(&call, sequence, "invalid", 0.9);
+                row["provenance"] = json!({});
+                row
+            })
+            .collect::<Vec<_>>();
+        rows.push(worker_row(&call, 17, "kept", 0.8));
+        let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            1,
+            64,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_eq!(event.candidate_count, 18);
+        assert_eq!(event.candidate_ranks.len(), 16);
+        assert_eq!(event.remaining_candidate_slots, 0);
+        assert_eq!(event.remaining_content_bytes, 60);
+    }
+
+    #[test]
+    fn worker_budget_admission_matches_reconstruction_validation() {
+        let call = call();
+        let request = json!({
+            "query": "private query marker",
+            "budgets": {
+                "maximum_candidates": 1,
+                "maximum_candidate_content_bytes": 64,
+                "maximum_source_refs_per_candidate": 1
+            }
+        });
+        let mut missing_activation = worker_row(&call, 20, "missing", 0.9);
+        missing_activation["activation"] = Value::Null;
+        let mut invalid_patch = worker_row(&call, 21, "patched", 0.8);
+        invalid_patch["provenance"]["control"] = json!({
+            "validity_patch": {"valid_from": "not-an-rfc3339-instant"}
+        });
+        let valid = worker_row(&call, 22, "valid", 0.7);
+        let worker = json!({
+            "common_recall": {
+                "candidates": [missing_activation, invalid_patch, valid],
+                "score_upper_bound": 1.0
+            }
+        });
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &worker,
+            worker["common_recall"]["candidates"].as_array().unwrap(),
+            1,
+            64,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_eq!(event.candidate_count, 3);
+        assert_eq!(event.remaining_candidate_slots, 0);
+        assert_eq!(event.remaining_content_bytes, 59);
+
+        let invalid_upper_bound = json!({
+            "common_recall": {
+                "candidates": [worker_row(&call, 23, "valid", 0.7)],
+                "score_upper_bound": "1.0"
+            }
+        });
+        let event = diagnostic_for_worker(
+            &call,
+            "private-provider-instance",
+            &request,
+            &invalid_upper_bound,
+            invalid_upper_bound["common_recall"]["candidates"]
+                .as_array()
+                .unwrap(),
+            1,
+            64,
+            None,
+            7,
+            Some(&DIAGNOSTIC_KEY),
+        );
+        assert_eq!(event.remaining_candidate_slots, 1);
+        assert_eq!(event.remaining_content_bytes, 64);
+    }
 }
