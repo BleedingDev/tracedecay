@@ -4,7 +4,7 @@ overview: "Build untouched original Native while product work runs. Reuse the re
 todos:
   - id: rn-build-reference-done
     content: "Build untouched original Native while product work runs and publish the verified reference artifacts."
-    status: in_progress
+    status: pending
 isProject: false
 ---
 
@@ -12,15 +12,15 @@ isProject: false
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md. Worktree for orchestration: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2. Original baseline: b3b43410e47115056f2066449aafa1822bbb6049. Use exact workdir for every command.
+Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md. Worktree for orchestration: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6. Use exact workdir for every command.
 
 Model gpt-5.6-luna, reasoning max, fork_turns=none, no child agents. You are not alone; preserve peer files. Prerequisite: rn-source-docs accepted by root and the root-reviewed reference-build requirements below. Runner completion is not required to compile the independently known original binary. Mode: build owner; original source read-only. Read ../evidence/source-baseline.md and ../evidence/verification.md plus ../execution-results/reference-build-requirements.md.
 
-Reference checkout: `/Users/satan/side/experiments/tracedecay/.worktrees/native-original-reference-b3`. Create it only if absent; if it exists, verify its HEAD and clean source rather than resetting or deleting it. Reference process/data roots remain test-owned and separate from operator data.
+Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/native-original-reference-57006f60`. Create it only if absent; if it exists, verify its HEAD and clean source rather than resetting or deleting it. Reference process/data roots remain test-owned and separate from operator data.
 
 ## Ownership and Constraints
 
-- A clean detached b3 worktree under the repository .worktrees/ and its repo-local build/test artifacts
+- A clean detached 570 worktree under the repository .worktrees/ and its repo-local build/test artifacts
 - target/task-scratch/native-original/reference-build/ (logs and binary inventory only)
 
 Original/product source, manifests and runtime user data are read-only. This node and rn-build share one named Cargo execution owner; no other lane submits builds. Do not patch the original checkout to make it compatible with the comparison. No pushes, merges, installs, global settings or operator database access.
@@ -28,14 +28,14 @@ Original/product source, manifests and runtime user data are read-only. This nod
 ## Steps
 
 1. Act as the same designated Cargo owner later reused for rn-build. Read cargo-hauler instructions and attach to any matching broker ticket before scheduling work.
-2. Create or reuse the detached b3b43410e47115056f2066449aafa1822bbb6049 reference checkout without modifying its source, manifests or generated files. Confirm source identity and the runner's exact CLI/MCP/feature needs.
+2. Create or reuse the detached 57006f60cb45bcee8487e73a40d4fad1a12ee2b6 reference checkout without modifying its source, manifests or generated files. Confirm source identity and the runner's exact CLI/MCP/feature needs.
 3. Build the actual original runtime with the checkout's repo-local target and test-profile data, while disjoint product implementation and fixture authors continue. Use /fast fallback only for observed target contention, never arbitrary duplicate targets.
 4. Use fresh diagnostics before checks or diagnose captured build output. Keep complete ticket/log evidence; stop a genuinely stuck build only by broker ticket, never by PID.
 5. Publish original binary digests, source/feature identity, commands and test-owned process prerequisites. Do not run product comparisons or label original help output as behavioral parity.
 
 ## Acceptance Checklist
 
-- Reference source and original manifests remain exactly at b3.
+- Reference source and original manifests remain exactly at 570.
 - The actual reference binary is built and its identity/features are usable by rn-reference.
 - One designated broker owner retains the ticket/artifacts for rn-build without duplicate compilation.
 

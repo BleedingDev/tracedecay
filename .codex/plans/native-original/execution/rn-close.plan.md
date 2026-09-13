@@ -1,6 +1,6 @@
 ---
 name: rn-close
-overview: "Accept the complete restored Native implementation. Preserve the complete original b3 Native implementation and its operation boundaries."
+overview: "Accept the complete restored Native implementation. Preserve the complete original upstream Native implementation from 570 and its operation boundaries."
 todos:
   - id: rn-close-done
     content: "Accept the complete restored Native implementation and return the required reviewable evidence."
@@ -12,12 +12,12 @@ isProject: false
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
+Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
 
 This node belongs to root and is not spawned as a subagent. Root only orchestrates and reviews; any remaining implementation or documentation correction goes to its named gpt-5.6-luna / max execution owner. Preserve all peer work.
 
 Mode: root orchestration and review only.
-Prerequisites: rn-review-fidelity, rn-review-integration. Every named predecessor must be accepted by root before dependent work starts. Original baseline: b3b43410e47115056f2066449aafa1822bbb6049; audited product head: 571daf3a9612e5247443e4da3a107b542686c1ef.
+Prerequisites: rn-review-fidelity, rn-review-integration. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
 
 Read these reports under ../evidence/: All evidence reports and execution outputs. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 

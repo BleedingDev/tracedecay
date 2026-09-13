@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-13T01:05:08.907493+00:00",
+  "generated_at": "2026-09-13T01:10:24.514601+00:00",
   "graph_id": "native-original-execution-pr707-20260913",
   "plan_set_hash": "20bb2dd27a",
   "selection_hash": "08ad7a0ca9",
@@ -1615,8 +1615,5 @@
   ],
   "errors": [],
   "warnings": [],
-  "graph_source": "explicit",
-  "snapshot_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json",
-  "state_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json",
-  "state_dir": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913"
+  "graph_source": "explicit"
 }

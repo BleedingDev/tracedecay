@@ -3,7 +3,8 @@
     "id": "rn-contract",
     "title": "Make the product interface fit complete original Native",
     "dependencies": [
-      "rn-source-docs"
+      "rn-source-docs",
+      "rn-integration-readiness"
     ],
     "mode": "write-capable",
     "ownership": [
@@ -16,7 +17,7 @@
   },
   {
     "id": "rn-reference",
-    "title": "Build the independent original Native comparison runner",
+    "title": "Refresh the independent original Native comparison runner for 570",
     "dependencies": [],
     "mode": "write-capable",
     "ownership": [
@@ -25,7 +26,7 @@
   },
   {
     "id": "rn-source-docs",
-    "title": "Correct Native identity and architecture documentation",
+    "title": "Refresh Native identity and architecture documentation for 570",
     "dependencies": [],
     "mode": "write-capable",
     "ownership": [
@@ -54,7 +55,8 @@
     "title": "Author original session and LCM comparison cases",
     "dependencies": [
       "rn-reference",
-      "rn-contract"
+      "rn-contract",
+      "rn-history-owner-followup"
     ],
     "mode": "write-capable",
     "ownership": [
@@ -77,7 +79,8 @@
     "id": "rn-native-port",
     "title": "Make the Native wrapper delegate without staged semantics",
     "dependencies": [
-      "rn-contract"
+      "rn-contract",
+      "rn-integration-readiness"
     ],
     "mode": "write-capable",
     "ownership": [
@@ -88,7 +91,8 @@
     "id": "rn-fabric",
     "title": "Preserve routing guarantees for the restored Native boundary",
     "dependencies": [
-      "rn-contract"
+      "rn-contract",
+      "rn-integration-readiness"
     ],
     "mode": "write-capable",
     "ownership": [
@@ -124,7 +128,8 @@
     "title": "Retire Native staged acknowledgements in the host observation journey",
     "dependencies": [
       "rn-native-port",
-      "rn-privacy-restore"
+      "rn-privacy-restore",
+      "rn-history-owner-followup"
     ],
     "mode": "write-capable",
     "ownership": [
@@ -209,7 +214,9 @@
       "rn-restore-anchor",
       "rn-map-checker",
       "rn-privacy-audit",
-      "rn-privacy-restore"
+      "rn-privacy-restore",
+      "rn-integration-readiness",
+      "rn-history-owner-followup"
     ],
     "mode": "write-capable and build owner",
     "ownership": [
@@ -220,7 +227,7 @@
   },
   {
     "id": "rn-verify-facts",
-    "title": "Verify complete fact behavior against untouched b3",
+    "title": "Verify complete fact behavior against untouched upstream 570",
     "dependencies": [
       "rn-build",
       "rn-cases-facts"
@@ -232,7 +239,7 @@
   },
   {
     "id": "rn-verify-sessions",
-    "title": "Verify original sessions and LCM against untouched b3",
+    "title": "Verify original sessions and LCM against untouched upstream 570",
     "dependencies": [
       "rn-build",
       "rn-cases-sessions"
@@ -334,40 +341,42 @@
   },
   {
     "id": "rn-build-reference",
-    "title": "Build untouched original Native while product work runs",
+    "title": "Build untouched upstream 570 Native while product work runs",
     "dependencies": [
       "rn-source-docs"
     ],
     "mode": "build owner; original source read-only",
     "ownership": [
-      "A clean detached b3 worktree under the repository .worktrees/ and its repo-local build/test artifacts",
+      "A clean detached 570 worktree under the repository .worktrees/ and its repo-local build/test artifacts",
       "target/task-scratch/native-original/reference-build/ (logs and binary inventory only)"
     ]
   },
   {
     "id": "rn-restore-anchor",
-    "title": "Restore the original retrieval-anchor authority exactly",
-    "dependencies": [
-      "rn-source-docs"
-    ],
-    "mode": "write-capable; exact original restoration only",
+    "title": "Record current retrieval-anchor equality against upstream 570",
+    "dependencies": [],
+    "mode": "read-only current-baseline verification",
     "ownership": [
-      "crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs (restore the sole b3-to-head method difference only)"
+      ".codex/plans/native-original/execution-results/restore-anchor-57006f60.md (blob/diff proof only)"
     ]
   },
   {
     "id": "rn-privacy-audit",
-    "title": "Audit original privacy algorithm drift",
-    "dependencies": [],
-    "mode": "read-only reviewer",
+    "title": "Audit current 570 privacy and typed history seams",
+    "dependencies": [
+      "rn-source-docs"
+    ],
+    "mode": "read-only current-baseline reviewer",
     "ownership": [
-      ".codex/plans/native-original/execution-results/privacy-isolation-design.md"
+      ".codex/plans/native-original/execution-results/privacy-audit-57006f60.md"
     ]
   },
   {
     "id": "rn-map-checker",
-    "title": "Correct Native map checker source drift",
-    "dependencies": [],
+    "title": "Revalidate Native map checker source drift",
+    "dependencies": [
+      "rn-source-docs"
+    ],
     "mode": "write-capable",
     "ownership": [
       "scripts/product/check-native-memory-surface-map.py",
@@ -376,16 +385,38 @@
   },
   {
     "id": "rn-privacy-restore",
-    "title": "Restore original privacy with typed product history admission",
+    "title": "Revalidate current privacy with typed product history admission",
     "dependencies": [
       "rn-privacy-audit"
     ],
-    "mode": "write-capable",
+    "mode": "read-only current-baseline gate",
     "ownership": [
       "crates/tracedecay-privacy/src/detector_kernel.rs (exact b3 restoration only)",
       "crates/tracedecay-memory-hygiene/src/lib.rs and at most one private adjacent module",
       "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs (privacy seam only; before rn-session-delivery)",
-      ".codex/plans/native-original/execution-results/privacy-restoration.md"
+      ".codex/plans/native-original/execution-results/privacy-restoration-57006f60.md"
+    ]
+  },
+  {
+    "id": "rn-integration-readiness",
+    "title": "Gate current PR707 integration readiness",
+    "dependencies": [],
+    "mode": "read-only readiness gate",
+    "ownership": [
+      ".codex/plans/native-original/execution-results/pr707-integration-readiness.md"
+    ]
+  },
+  {
+    "id": "rn-history-owner-followup",
+    "title": "Validate history-owner ResolvedScope propagation",
+    "dependencies": [
+      "rn-source-docs",
+      "rn-contract",
+      "rn-integration-readiness"
+    ],
+    "mode": "read-only bounded validation and fix design",
+    "ownership": [
+      ".codex/plans/native-original/execution-results/history-owner-validation.md"
     ]
   }
 ]

@@ -2,6 +2,10 @@
 
 This file is shared context for future implementation assignments. It does not start implementation. Read the assigned `.plan.md`, its exact handoff, and the reviewed decisions before editing.
 
+## Active PR707 reassessment context
+
+The active branch/worktree is `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`, with unmodified upstream reference `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` and candidate metadata `1fe250fed7ca615f1dfdcd580befeb276328e910`. The b3/571 audit and b3 reference checkout remain historical. Keep one continuous focus on this worktree; do not create a recovery branch or relabel historical evidence.
+
 ## Model and roles
 
 Every execution, test and review subagent uses `gpt-5.6-luna` with `reasoning_effort=max` and a fresh, bounded handoff. Root only orchestrates, reviews evidence and diffs, resolves conflicts and updates the graph. Root does not fill implementation gaps by editing product code. A named execution owner performs each approved correction and integration edit. Agents are leaves: do not spawn more agents.
@@ -14,7 +18,7 @@ Preserve original operations at matching boundaries. An original operation that 
 
 The original memory algorithms and their storage/ownership rules are protected. Our adapter and modular core must fit them. A missing common feature is an explicit feature difference, never a new Native implementation, an empty successful reply or silently substituted behavior. Host cancellation and privacy controls must remain correct without inventing different Native internals.
 
-Read SOURCE-BOUNDARY.md. The exact original restoration in rn-restore-anchor is one of the two permitted exact original-file restorations; all other original implementation code remains protected. Shared host extensions already present at the audited product head must remain intact. The build owner is shared by rn-build-reference and rn-build; both nodes may submit their assigned broker work.
+Read SOURCE-BOUNDARY.md. The active rn-restore-anchor node is a completed read-only 570/candidate equality gate; it does not authorize an original-file write. All original implementation code remains protected. Shared host extensions already present at the audited product head must remain intact. The build owner is shared by rn-build-reference and rn-build; both nodes may submit their assigned broker work.
 
 ## Before editing
 
@@ -60,6 +64,6 @@ A failure outside your ownership is a handoff: report the exact error, file, com
 
 Stop once the assigned outcome and checks are complete. Root reviews scope and evidence before marking the graph node complete or releasing dependent writers.
 
-## Accepted privacy restoration scope
+## Historical privacy scope and active gate
 
-Root accepted rn-privacy-audit: rn-privacy-restore also restores `crates/tracedecay-privacy/src/detector_kernel.rs` completely and exactly to b3. Product-only typed Claude history source-field admission is defined in execution-results/privacy-isolation-design.md; generic admission, original Native and LCM privacy stay unchanged. This is the second exact original-file restoration, not authorization for new original implementation. observation_journey.rs privacy edits complete before rn-session-delivery edits that file.
+The earlier b3-to-571 detector restoration and typed Claude history admission record remain historical. Under active 570, detector equality is already proven; rn-privacy-audit and rn-privacy-restore review the typed history seam without another detector write. Generic admission, original Native and LCM privacy stay unchanged. `observation_journey.rs` remains ordered behind the active privacy gate before rn-session-delivery.

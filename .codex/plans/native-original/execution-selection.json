@@ -1,5 +1,5 @@
 {
-  "plans_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution",
+  "plans_root": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution",
   "glob": "*.plan.md",
   "depends": [
     "rn-reference:rn-cases-facts",
@@ -52,7 +52,6 @@
     "rn-native-bridge:rn-native-tests",
     "rn-build-reference:rn-build",
     "rn-source-docs:rn-contract",
-    "rn-source-docs:rn-restore-anchor",
     "rn-restore-anchor:rn-build",
     "rn-contract:rn-cases-facts",
     "rn-contract:rn-cases-sessions",
@@ -61,8 +60,20 @@
     "rn-privacy-audit:rn-build",
     "rn-privacy-audit:rn-privacy-restore",
     "rn-privacy-restore:rn-build",
-    "rn-privacy-restore:rn-session-delivery"
+    "rn-privacy-restore:rn-session-delivery",
+    "rn-source-docs:rn-map-checker",
+    "rn-integration-readiness:rn-contract",
+    "rn-integration-readiness:rn-native-port",
+    "rn-integration-readiness:rn-fabric",
+    "rn-source-docs:rn-privacy-audit",
+    "rn-source-docs:rn-history-owner-followup",
+    "rn-contract:rn-history-owner-followup",
+    "rn-integration-readiness:rn-history-owner-followup",
+    "rn-history-owner-followup:rn-cases-sessions",
+    "rn-history-owner-followup:rn-session-delivery",
+    "rn-history-owner-followup:rn-build",
+    "rn-integration-readiness:rn-build"
   ],
-  "graph_id": "native-original-execution-20260911",
-  "state_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs"
+  "graph_id": "native-original-execution-pr707-20260913",
+  "state_root": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs"
 }

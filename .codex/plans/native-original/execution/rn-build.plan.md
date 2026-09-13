@@ -1,6 +1,6 @@
 ---
 name: rn-build
-overview: "Integrate shared manifests and verify both actual runtimes. Preserve the complete original b3 Native implementation and its operation boundaries."
+overview: "Integrate shared manifests and verify both actual runtimes. Preserve the complete original upstream Native implementation from 570 and its operation boundaries."
 todos:
   - id: rn-build-done
     content: "Integrate shared manifests and verify both actual runtimes and return the required reviewable evidence."
@@ -12,16 +12,16 @@ isProject: false
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
+Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
 
 Model: gpt-5.6-luna. Reasoning: max. Spawn with fork_turns=none and a bounded handoff. You are a leaf; no subagents. You are not alone in the codebase: preserve peers' edits, never revert/reformat/stage them, and send cross-scope needs to root.
 
 Mode: write-capable and build owner.
-Prerequisites: rn-privacy-audit, rn-map-checker, rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor. Every named predecessor must be accepted by root before dependent work starts. Original baseline: b3b43410e47115056f2066449aafa1822bbb6049; audited product head: 571daf3a9612e5247443e4da3a107b542686c1ef. Reuse the same designated build execution agent and verified reference artifacts from rn-build-reference; rebuild the reference only if its recorded inputs changed.
+Prerequisites: rn-privacy-audit, rn-map-checker, rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor, rn-integration-readiness, rn-history-owner-followup. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910. Reuse the same designated build execution agent and verified reference artifacts from rn-build-reference; rebuild the reference only if its recorded inputs changed.
 
 Read these reports under ../evidence/: verification.md, source-baseline.md, ncm-boundary.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
-Reference checkout: `/Users/satan/side/experiments/tracedecay/.worktrees/native-original-reference-b3`. Create it only if absent; if it exists, verify its HEAD and clean source rather than resetting or deleting it. Reference process/data roots remain test-owned and separate from operator data.
+Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/native-original-reference-57006f60`. Create it only if absent; if it exists, verify its HEAD and clean source rather than resetting or deleting it. Reference process/data roots remain test-owned and separate from operator data.
 
 ## Ownership and Constraints
 
@@ -39,12 +39,12 @@ No push, merge, release, global install, runtime user-data action or unassigned 
 
 1. Collect reviewed dependency requests; apply only necessary product manifest/lock changes. Do not change original engine manifests or upgrade dependencies. All other source fixes go back to their named execution owners.
 2. Read the cargo-hauler skill. Check hauler status --session native-original-execution before each Cargo submission and attach to matching in-flight work. Use fresh TraceDecay diagnostics before compiler checks; diagnose captured failures. Never kill Cargo by PID.
-3. Verify and reuse the clean detached b3 reference worktree and artifacts from rn-build-reference. Build the restored product with the actual required features, repo-local target/test-profile defaults and isolated state. Use /fast fallback only on proven target contention. Do not repeat the original build without changed inputs.
+3. Verify and reuse the clean detached 570 reference worktree and artifacts from rn-build-reference. Build the restored product with the actual required features, repo-local target/test-profile defaults and isolated state. Use /fast fallback only on proven target contention. Do not repeat the original build without changed inputs.
 4. Run focused affected package tests, real nonvacuous filters and required repository checks. Preserve full error logs/tickets and actual executed-test evidence. Run the required aggregate check once the candidate is coherent; broaden only for unresolved concerns.
 5. Publish tested binary paths/digests, exact features, revisions, tickets and commands for the parallel verification nodes. Reference and product must be independently built; no relabelled same executable.
 6. If a correction changes a public seam, root re-releases affected dependent owners and required checks. Do not locally patch their code or weaken assertions.
 
-Required source verification: consume `product/architecture/native-original-source-inventory.md` and ../SOURCE-BOUNDARY.md. Compare the final candidate to b3 across the complete protected surface and to the audited product baseline for retained host extensions. The restored retrieval-anchor file must equal b3 exactly. Every remaining hunk needs its reviewed classification; new original algorithm/authority/schema/lifecycle changes fail the check.
+Required source verification: consume `product/architecture/native-original-source-inventory.md` and ../SOURCE-BOUNDARY.md. Compare the final candidate to 570 across the complete protected surface and to the audited product baseline for retained host extensions. The retrieval-anchor file must equal the active 570 blob exactly. Every remaining hunk needs its reviewed classification; new original algorithm/authority/schema/lifecycle changes fail the check.
 
 ## Acceptance Checklist
 

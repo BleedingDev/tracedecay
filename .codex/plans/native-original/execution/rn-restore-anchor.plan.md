@@ -1,41 +1,36 @@
 ---
 name: rn-restore-anchor
-overview: "Restore the pre-existing retrieval-anchor optimization to the exact b3 implementation without changing other original or shared host code."
+overview: "Revalidate retrieval-anchor source equality against the unmodified PR707 baseline; preserve the completed no-op result when the blobs match."
 todos:
   - id: rn-restore-anchor-done
-    content: "Restore the original full-history latest-disposition implementation and return exact source-equality evidence."
+    content: "Record current 570-to-candidate diff and blob proof for retrieval-anchor authority; current equality proof is complete."
     status: completed
 isProject: false
 ---
 
-# Restore the original retrieval-anchor authority exactly
+# Revalidate retrieval-anchor equality against upstream 570
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md and ../SOURCE-BOUNDARY.md. Worktree: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2; set it explicitly for every command. Reference: b3b43410e47115056f2066449aafa1822bbb6049. Prerequisite: root has accepted rn-source-docs and its exact source inventory.
-
-Model gpt-5.6-luna, reasoning max, fork_turns=none, no child agents. You are not alone: preserve peer edits. This is a narrowly authorized restoration of original bytes, not permission to improve original code.
+Read ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md and ../SOURCE-BOUNDARY.md. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Active original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; execution candidate: 1fe250fed7ca615f1dfdcd580befeb276328e910. The b3-to-571 restoration result is historical. This is a read-only gate; no Cargo, source edits or child agents.
 
 ## Ownership and Constraints
 
-Own only `crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs`, and only its pre-existing b3-to-head method difference. No new helpers, optimized query, tests inside original code, manifests or storage changes. No Cargo; rn-build owns scheduling.
+Own only .codex/plans/native-original/execution-results/restore-anchor-57006f60.md. Read the current crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs blob without changing it. Do not resurrect the old b3 method lane, add an optimization, or overwrite the historical restore-anchor.md report.
 
 ## Steps
 
-1. Re-read the file and compare it to b3. Confirm the sole difference is the current latest-row SQL implementation around the retrieval disposition store method. If additional changes exist, stop and send the exact diff to root.
-2. Restore that method to the exact b3 source: call `self.retrieval_anchor_disposition_history(owner, anchor_id)`, await it, select the last returned record and map the original store error. Do not emulate the behavior with another implementation.
-3. Verify the entire owned file now matches b3. Preserve original tests; send rn-build the exact restoration and useful existing test filters. Facts fixtures derive their expected anchor behavior independently from b3 and SOURCE-BOUNDARY.md; they do not consume this node's implementation output.
-4. Return the exact restoration diff, source-equality command/result and build needs. Leave shared directory interruption, Codex, privacy and cursor improvements untouched.
+1. From the active worktree, run git diff --exit-code 57006f60cb45bcee8487e73a40d4fad1a12ee2b6 1fe250fed7ca615f1dfdcd580befeb276328e910 -- crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs and record the actual exit code.
+2. Record git rev-parse 57006f60cb45bcee8487e73a40d4fad1a12ee2b6:crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs and the candidate blob. The expected shared blob is d976e2a23c19441a60412420a1db5e68f7ccc5ca.
+3. Root has supplied an empty diff and matching blobs. Preserve that current proof in the owned result; if a later candidate differs, stop and return the exact diff and a new owner request to root. Do not edit the source in this gate.
+4. Keep ordinary/missing/invalid-history behavior in later external cases; source equality is necessary evidence, not a runtime parity claim.
 
 ## Acceptance Checklist
 
-- The owned file is byte-identical to b3 after restoration.
-- No original source was changed beyond restoring this identified difference.
-- External comparison coverage includes original latest/history outcomes, including no-record and relevant invalid-history behavior where the original boundary exposes them.
-- A performance difference is reported honestly, never fixed by reintroducing a different original implementation.
+- The active result contains current commands, exit codes and both blob IDs.
+- Equality with upstream 570 is recorded and this node is complete for the current candidate.
+- No historical b3 acceptance is relabeled as current and no code file is changed.
 
 ## Operator Guidance
 
-This node can run alongside disjoint contract, fixture and host work after the source inventory is reviewed. The product build depends on its accepted result. Root reviews the restoration before accepting it.
-
-Return node ID, exact diff, source comparison, relevant test filters and any unexpected divergence. Stop when the exact restoration is complete; do not expand to other original files or tune NCM.
+Root has reviewed the current equality proof; this node is complete for the active 570 baseline. Root retains status ownership and must reopen it only if a later candidate changes the blob.

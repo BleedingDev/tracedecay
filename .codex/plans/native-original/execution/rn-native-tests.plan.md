@@ -1,6 +1,6 @@
 ---
 name: rn-native-tests
-overview: "Replace substitute-backed Native tests with original behavior checks. Preserve the complete original b3 Native implementation and its operation boundaries."
+overview: "Replace substitute-backed Native tests with original behavior checks. Preserve the complete original upstream Native implementation from 570 and its operation boundaries."
 todos:
   - id: rn-native-tests-done
     content: "Replace substitute-backed Native tests with original behavior checks and return the required reviewable evidence."
@@ -12,12 +12,12 @@ isProject: false
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
+Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
 
 Model: gpt-5.6-luna. Reasoning: max. Spawn with fork_turns=none and a bounded handoff. You are a leaf; no subagents. You are not alone in the codebase: preserve peers' edits, never revert/reformat/stage them, and send cross-scope needs to root.
 
 Mode: write-capable.
-Prerequisites: rn-native-port, rn-native-bridge. Every named predecessor must be accepted by root before dependent work starts. Original baseline: b3b43410e47115056f2066449aafa1822bbb6049; audited product head: 571daf3a9612e5247443e4da3a107b542686c1ef. The owner may read the accepted wrapper and prepare non-writing notes early; it does not start dependent test edits against an unfinished private bridge API.
+Prerequisites: rn-native-port, rn-native-bridge. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910. The owner may read the accepted wrapper and prepare non-writing notes early; it does not start dependent test edits against an unfinished private bridge API.
 
 Read these reports under ../evidence/: native-facts.md, native-sessions.md, native-adapter.md, saved-data.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
@@ -38,7 +38,7 @@ No push, merge, release, global install, runtime user-data action or unassigned 
 1. Read the accepted route/wrapper contracts and align tests to the original operation boundary. Prepare disjoint fixtures while the bridge owner works; do not guess unfinished private signatures.
 2. Replace staged durability/ranking/lifecycle success expectations with original delegation, truthful unsupported generic behavior and absence of staged side effects.
 3. Keep all still-relevant malformed input, scope, provenance, cancellation, deadline, privacy, replay and lifecycle assertions. Do not weaken unrelated NCM/common-profile tests.
-4. Add relevant in-process checks for original canonical receipts/telemetry boundaries and saved-state continuity, using real original services where available. These checks complement the external b3 differential runner.
+4. Add relevant in-process checks for original canonical receipts/telemetry boundaries and saved-state continuity, using real original services where available. These checks complement the external 570 differential runner.
 5. Send module declarations to composition and exact Cargo filters to the build owner; run only non-build fixture/style checks in this node.
 
 ## Acceptance Checklist

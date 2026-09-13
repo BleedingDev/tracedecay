@@ -1,22 +1,20 @@
 # Original Native source boundary
 
-Reference: `b3b43410e47115056f2066449aafa1822bbb6049`. Audited product head: `571daf3a9612e5247443e4da3a107b542686c1ef`.
+Active reference: `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` (unmodified upstream PR707 tip). Candidate metadata: `1fe250fed7ca615f1dfdcd580befeb276328e910`. Historical reference/audited head: `b3b43410e47115056f2066449aafa1822bbb6049` → `571daf3a9612e5247443e4da3a107b542686c1ef`.
 
 ## Preserve original implementation
 
-The original `tracedecay-session-memory` and `tracedecay-lcm` crates, `tracedecay-store/src/memory`, `tracedecay/src/tracedecay/facts.rs`, original retained LCM services, and original memory-v2 schema/transactions are protected. The reviewed b3-to-head comparisons show no changes in the memory/session application and LCM engines.
+The original `tracedecay-session-memory` and `tracedecay-lcm` crates, `tracedecay-store/src/memory`, `tracedecay/src/tracedecay/facts.rs`, original retained LCM services, and original memory-v2 schema/transactions are protected. The prior b3-to-571 comparisons are historical; the active 570-to-candidate inventory must refresh the current memory/session application and LCM boundaries without rolling back PR707.
 
 The inventory must also include their retained routes, runtime-core database/storage support and shared session ingestion. Do not infer that an unchanged application crate proves every supporting authority is unchanged.
 
-## Required exact restoration
+## Current retrieval-anchor equality gate
 
-`crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs` has a pre-existing change from the original full disposition-history read followed by its last entry to a `SELECT ... ORDER BY sequence DESC LIMIT 1` query. This changes code within the retrieval authority and potentially which earlier invalid history is validated. It is not accepted as a harmless integration exception.
-
-**rn-restore-anchor restores that file's sole changed method to b3 exactly.** This is one specifically authorized original-file restoration in this plan. It restores the original; it does not implement an alternative optimization. Its final file must match b3. Preserve original tests and prove ordinary/missing/invalid-history outcomes through external fixtures where the original public boundary exposes them.
+The active 570 and candidate `crates/tracedecay-runtime-core/src/db/retrieval_anchor_authority.rs` blobs both equal `d976e2a23c19441a60412420a1db5e68f7ccc5ca`; root's `git diff --exit-code` proof returned exit 0. rn-restore-anchor is therefore complete as a read-only current gate. The older b3 method-restoration finding remains historical. Preserve ordinary/missing/invalid-history behavior in later external fixtures; no source edit is authorized by this plan.
 
 ## Preserve pre-existing shared host extensions
 
-The 23 existing differences under `tracedecay-sessions` and `tracedecay-session-runtime` are classified in the final table of [native-sessions.md](evidence/native-sessions.md):
+The 23 existing differences under `tracedecay-sessions` and `tracedecay-session-runtime` are a **historical b3-to-571 classification**, recorded in [native-sessions.md](evidence/native-sessions.md). They are not a current 570 difference count. rn-source-docs reopens the current inventory and retains this table as historical evidence:
 
 | Extension | Preservation requirement |
 | --- | --- |
@@ -35,7 +33,7 @@ Additional reviewed support differences:
 
 ## Complete inventory before interface work
 
-rn-source-docs owns `product/architecture/native-original-source-inventory.md`. Before rn-contract or rn-restore-anchor starts, it must enumerate all b3-to-execution-head changed hunks in the protected/native-adjacent surface, with original path, current path, classification, original behavior, permitted action and associated check. Include:
+rn-source-docs owns `product/architecture/native-original-source-inventory.md`. It must enumerate all 570-to-candidate changed hunks in the protected/native-adjacent surface, with original path, current path, classification, original behavior, permitted action and associated check. The historical 85-path/278-hunk b3-to-571 audit remains untouched. Include:
 
 - complete session-memory and LCM crates, including shared privacy/sanitization dependencies used by original Native operations;
 - original memory/store contracts and facts.rs;
@@ -49,11 +47,11 @@ rn-build validates the final inventory and source diffs. rn-review-fidelity inde
 
 ## Verification split
 
-Original Native cases compare b3 and restored product at the same original operation boundary. Shared host extensions additionally need focused tests for stable/mismatched sealed admission, ordinary and reserved cursor round-trip, exact CAS, locator conflict/rollback/reopen, historical catch-up and refresh begin/status/cancel after restart. Keep original source-sensitive checks and host-extension regressions separately identifiable.
+Original Native cases compare active 570 and the candidate at the same original operation boundary. Shared host extensions additionally need focused tests for stable/mismatched sealed admission, ordinary and reserved cursor round-trip, exact CAS, locator conflict/rollback/reopen, historical catch-up and refresh begin/status/cancel after restart. Keep original source-sensitive checks and host-extension regressions separately identifiable.
 
 No writer edits the existing shared ingestion/storage extensions in this plan. Native composition uses their existing mounted authorities; it does not add a new locator, parser, resolver, ingest transaction or summary engine.
 
 
-## Accepted privacy restoration scope
+## Historical privacy record and active seam gate
 
-Root accepted rn-privacy-audit: rn-privacy-restore also restores `crates/tracedecay-privacy/src/detector_kernel.rs` completely and exactly to b3. Product-only typed Claude history source-field admission is defined in execution-results/privacy-isolation-design.md; generic admission, original Native and LCM privacy stay unchanged. This is the second exact original-file restoration, not authorization for new original implementation. observation_journey.rs privacy edits complete before rn-session-delivery edits that file.
+The earlier b3-to-571 acceptance of `crates/tracedecay-privacy/src/detector_kernel.rs` and typed Claude history admission remains historical. Under active 570, detector equality is recorded in `execution-results/privacy-audit-57006f60.md`; the typed history seam still needs review before rn-session-delivery. Generic admission, original Native and LCM privacy stay unchanged.

@@ -1,24 +1,36 @@
 ---
 name: rn-privacy-audit
-overview: "Resolve newly discovered original privacy algorithm drift at a product boundary."
+overview: "Revalidate privacy detector equality and the typed history admission boundary against the unmodified PR707 baseline."
 todos:
   - id: rn-privacy-audit-done
-    content: "Map original Native and product callers and return an exact bounded restoration/isolation design."
-    status: completed
+    content: "Map current privacy callers and record detector equality against 570; return a bounded gate for the privacy restore lane."
+    status: pending
 isProject: false
 ---
 
-# Audit original privacy algorithm drift
+# Revalidate privacy against upstream 570
 
-Root found a previously omitted b3-to-audited-head change in crates/tracedecay-privacy/src/detector_kernel.rs: looks_high_entropy_token now peels one structural SHA-256 suffix before applying the original entropy predicate. This is a shared original algorithm change, not automatically a host-only extension.
+## Execution Notes
 
-Workdir: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2 on every shell call. Original b3b43410e47115056f2066449aafa1822bbb6049; audited HEAD571daf3a9612e5247443e4da3a107b542686c1ef. Read AGENTS.md, ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md, ../SOURCE-BOUNDARY.md. Luna Max, fork none, read-only code reviewer, no child agents/Cargo. You are not alone; preserve peers.
+Read AGENTS.md, ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md and ../SOURCE-BOUNDARY.md. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Active original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; execution candidate: 1fe250fed7ca615f1dfdcd580befeb276328e910. The earlier b3-to-571 detector finding is historical. rn-source-docs and rn-integration-readiness must be reviewed before this gate releases rn-build. This is a read-only review; no child agents, Cargo or source edits.
 
-Own ONLY ../execution-results/privacy-isolation-design.md. No source/test/doc edits elsewhere.
+## Ownership and Constraints
 
-1. Trace this public predicate and its sanitization callers to original Native fact add/query/privacy/LCM/session operations and product structural identifier processing. Give exact symbols and paths; source/codegraph evidence, no live databases.
-2. Identify precisely which original Native inputs change behavior versus b3 and which product host regression required the suffix handling. Reuse existing tests and typed boundaries; distinguish content from structural identifiers.
-3. Propose the smallest concrete external product-boundary isolation that permits restoring the complete detector file to b3 while preserving existing host privacy/provenance behavior. No copied Native algorithm, new protected original helpers or global weakening. If no safe external seam exists, name exact signature/caller blocker. Do not silently accept changed Native semantics.
-4. Return exact file/method ownership and test filters for execution owners. Identify shared unchanged callers that constrain the change and whether generated contracts or manifest changes are necessary. Runtime proof deferred to designated build owner.
+Own only .codex/plans/native-original/execution-results/privacy-audit-57006f60.md. Read current privacy and host callers; do not modify crates/tracedecay-privacy/src/detector_kernel.rs, the history admission seam or any generated contract. Preserve the historical privacy-isolation-design.md report.
 
-Stop after a reviewable evidence-backed design; root decides and assigns implementation. No scope beyond this discovered difference.
+## Steps
+
+1. Record the detector blob at 570 and the candidate, expecting 9ce4488a34c5bd121d43c35c33f1daf925ab38ba, plus the exact git diff --exit-code.
+2. Recheck the current typed Claude history source-field admission callers and their privacy/provenance invariants. Keep generic admission, original Native and LCM privacy separate.
+3. Compare current caller paths and symbols to the historical report; identify stale line/path/assertion references and assign each to the next gate. Do not rewrite the old report.
+4. If detector equality fails or a caller relies on an unproved changed algorithm, return the exact mismatch and block rn-privacy-restore; do not invent parity.
+
+## Acceptance Checklist
+
+- Current blob, caller paths, and command results are recorded in the new 570 report.
+- Historical b3-to-571 evidence is explicitly separated from the active gate.
+- A bounded privacy restore decision is returned without a detector source edit.
+
+## Operator Guidance
+
+Root launches after rn-source-docs and rn-integration-readiness are accepted. Root reviews the gate before releasing the privacy-dependent host lane. Return exact unresolved caller and assertion owners; do not claim product build success.

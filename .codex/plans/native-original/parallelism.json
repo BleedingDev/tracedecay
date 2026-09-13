@@ -1,24 +1,34 @@
 {
+  "graph_id": "native-original-execution-pr707-20260913",
+  "plan_set_hash": "20bb2dd27a",
+  "selection_hash": "08ad7a0ca9",
+  "plan_count": 33,
+  "edge_count": 71,
   "topological_waves": [
     [
+      "rn-integration-readiness",
       "rn-ncm-tests",
       "rn-reference",
+      "rn-restore-anchor",
       "rn-source-docs"
     ],
     [
       "rn-build-reference",
       "rn-contract",
-      "rn-restore-anchor"
+      "rn-map-checker",
+      "rn-privacy-audit"
     ],
     [
       "rn-cases-facts",
-      "rn-cases-sessions",
       "rn-cases-state",
       "rn-fabric",
+      "rn-history-owner-followup",
       "rn-host-fixtures",
-      "rn-native-port"
+      "rn-native-port",
+      "rn-privacy-restore"
     ],
     [
+      "rn-cases-sessions",
       "rn-host-context",
       "rn-native-bridge",
       "rn-registry",
@@ -49,6 +59,6 @@
       "rn-close"
     ]
   ],
-  "maximum_independent_nodes": 12,
+  "maximum_independent_nodes": 18,
   "longest_dependency_chain_nodes": 10
 }

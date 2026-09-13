@@ -1,12 +1,12 @@
 # Reviewed decisions for restoring original Native
 
-## Reference and protected implementation
+## Active PR707 reference and protected implementation
 
-Use `b3b43410e47115056f2066449aafa1822bbb6049`, the second parent of audited product head `571daf3a9612e5247443e4da3a107b542686c1ef`. This preserves upstream work already merged. No rollback, new upstream sync or acceptance gate is needed. Reconcile stale August metadata truthfully.
+Use unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` as the active original reference. Candidate metadata is audited merge `1fe250fed7ca615f1dfdcd580befeb276328e910` on the continuously evolving `feat/pluggable-memory-providers-v2` worktree. Preserve PR707 Native/session/LCM/runtime/storage improvements; do not roll them back. The b3 revision `b3b43410e47115056f2066449aafa1822bbb6049` and product head `571daf3a9612e5247443e4da3a107b542686c1ef` remain historical audit evidence, including their original checkout.
 
 Protect the whole original memory implementation: `tracedecay-session-memory` (facts, memory, tracking, sessions and transcript services), `tracedecay-lcm`, original session/runtime/ingestion and retained LCM services, fact/store contracts, database authority, and `tracedecay/src/tracedecay/facts.rs`. No original algorithms, tests, helpers, schemas, transactions, ranking, summaries or lifecycle changes. Product wiring changes only inside each node's exact scope. The existing `pub(super)` visibility difference in `tracedecay-store-runtime/src/retained_memory.rs` is recorded; it does not authorize further changes there.
 
-The detailed source inventory and exceptions are defined by [SOURCE-BOUNDARY.md](SOURCE-BOUNDARY.md). Existing shared host extensions are not falsely claimed byte-identical to b3. One permitted original-file write is rn-restore-anchor restoring the pre-existing retrieval-authority optimization exactly to b3; no new original implementation is authorized.
+The detailed source inventory and exceptions are defined by [SOURCE-BOUNDARY.md](SOURCE-BOUNDARY.md). Existing shared host extensions are not falsely claimed byte-identical to 570. The active retrieval-anchor gate is a completed read-only equality proof: both 570 and candidate blobs are `d976e2a23c19441a60412420a1db5e68f7ccc5ca`; no source write is authorized. No new original implementation is authorized.
 
 ## Full Native and the common interface
 
@@ -55,6 +55,6 @@ This root-reviewed decision supersedes provisional audit suggestions: no origina
 
 Execution authorized by the user on 2026-09-11: execute the validated plans now. Root marks nodes complete only after review. Root orchestrates and reviews. Every execution, test and review agent uses `gpt-5.6-luna`, `reasoning_effort=max`, a fresh bounded handoff and no child agents. Root reviews diffs before releasing dependent writers and before any future push.
 
-## Accepted privacy restoration scope
+## Historical privacy restoration record and active gate
 
-Root accepted rn-privacy-audit: rn-privacy-restore also restores `crates/tracedecay-privacy/src/detector_kernel.rs` completely and exactly to b3. Product-only typed Claude history source-field admission is defined in execution-results/privacy-isolation-design.md; generic admission, original Native and LCM privacy stay unchanged. This is the second exact original-file restoration, not authorization for new original implementation. observation_journey.rs privacy edits complete before rn-session-delivery edits that file.
+The earlier b3-to-571 acceptance of `crates/tracedecay-privacy/src/detector_kernel.rs` and the typed Claude history source-field design remain historical. Under active 570, the detector blobs already match (`9ce4488a34c5bd121d43c35c33f1daf925ab38ba`); rn-privacy-audit and rn-privacy-restore therefore perform read-only current seam review before rn-session-delivery. Generic admission, original Native and LCM privacy stay unchanged. `observation_journey.rs` remains ordered behind the active privacy gate.

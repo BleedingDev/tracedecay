@@ -1,6 +1,6 @@
 flowchart TD
   subgraph plan_rn_build_reference["rn-build-reference"]
-    plan_rn_build_reference_todo_1["rn-build-reference-done (in_progress)\nBuild untouched original Native while product work runs and publish the verified reference artifacts."]
+    plan_rn_build_reference_todo_1["rn-build-reference-done (pending)\nBuild untouched original Native while product work runs and publish the verified reference artifacts."]
   end
   subgraph plan_rn_build["rn-build"]
     plan_rn_build_todo_1["rn-build-done (pending)\nIntegrate shared manifests and verify both actual runtimes and return the required reviewable evidence."]
@@ -21,10 +21,13 @@ flowchart TD
     plan_rn_composition_todo_1["rn-composition-done (pending)\nConnect the reviewed Native services and remove staged mount assumptions and return the required reviewable evidence."]
   end
   subgraph plan_rn_contract["rn-contract"]
-    plan_rn_contract_todo_1["rn-contract-done (in_progress)\nMake the product interface fit complete original Native and return the required reviewable evidence."]
+    plan_rn_contract_todo_1["rn-contract-done (pending)\nMake the product interface fit complete original Native and return the required reviewable evidence."]
   end
   subgraph plan_rn_fabric["rn-fabric"]
     plan_rn_fabric_todo_1["rn-fabric-done (pending)\nPreserve routing guarantees for the restored Native boundary and return the required reviewable evidence."]
+  end
+  subgraph plan_rn_history_owner_followup["rn-history-owner-followup"]
+    plan_rn_history_owner_followup_todo_1["rn-history-owner-followup-done (pending)\nTrace the concrete historical-ingest authority and return consumed/not-consumed scope evidence with a bounded owner and assertion."]
   end
   subgraph plan_rn_host_context["rn-host-context"]
     plan_rn_host_context_todo_1["rn-host-context-done (pending)\nDeliver original Native context once through its original host path and return the required reviewable evidence."]
@@ -32,8 +35,11 @@ flowchart TD
   subgraph plan_rn_host_fixtures["rn-host-fixtures"]
     plan_rn_host_fixtures_todo_1["rn-host-fixtures-done (pending)\nPrepare real Claude and Codex Native comparison journeys and return the required reviewable evidence."]
   end
+  subgraph plan_rn_integration_readiness["rn-integration-readiness"]
+    plan_rn_integration_readiness_todo_1["rn-integration-readiness-done (pending)\nRecord current integration checks, resolve the designated build blockers, and return an explicit readiness decision."]
+  end
   subgraph plan_rn_map_checker["rn-map-checker"]
-    plan_rn_map_checker_todo_1["rn-map-checker-done (completed)\nCorrect stale source expectations without weakening map validation and run its checks."]
+    plan_rn_map_checker_todo_1["rn-map-checker-done (pending)\nCorrect stale source expectations without weakening map validation and run its checks."]
   end
   subgraph plan_rn_native_bridge["rn-native-bridge"]
     plan_rn_native_bridge_todo_1["rn-native-bridge-done (pending)\nReplace the staged Native backend with original service delegation and return the required reviewable evidence."]
@@ -45,22 +51,22 @@ flowchart TD
     plan_rn_native_tests_todo_1["rn-native-tests-done (pending)\nReplace substitute-backed Native tests with original behavior checks and return the required reviewable evidence."]
   end
   subgraph plan_rn_ncm_tests["rn-ncm-tests"]
-    plan_rn_ncm_tests_todo_1["rn-ncm-tests-done (completed)\nPreserve NCM behavior while Native is restored and return the required reviewable evidence."]
+    plan_rn_ncm_tests_todo_1["rn-ncm-tests-done (pending)\nPreserve NCM behavior while Native is restored and return the required reviewable evidence."]
   end
   subgraph plan_rn_privacy_audit["rn-privacy-audit"]
-    plan_rn_privacy_audit_todo_1["rn-privacy-audit-done (completed)\nMap original Native and product callers and return an exact bounded restoration/isolation design."]
+    plan_rn_privacy_audit_todo_1["rn-privacy-audit-done (pending)\nMap current privacy callers and record detector equality against 570; return a bounded gate for the privacy restore lane."]
   end
   subgraph plan_rn_privacy_restore["rn-privacy-restore"]
-    plan_rn_privacy_restore_todo_1["rn-privacy-restore-done (in_progress)\nRestore detector exactly to b3 and implement bounded typed host admission with regression coverage."]
+    plan_rn_privacy_restore_todo_1["rn-privacy-restore-done (pending)\nRecord detector equality and typed history admission revalidation for 570; return a bounded fix handoff only if needed."]
   end
   subgraph plan_rn_reference["rn-reference"]
-    plan_rn_reference_todo_1["rn-reference-done (in_progress)\nBuild the independent original Native comparison runner and return the required reviewable evidence."]
+    plan_rn_reference_todo_1["rn-reference-done (pending)\nBuild the independent original Native comparison runner and return the required reviewable evidence."]
   end
   subgraph plan_rn_registry["rn-registry"]
     plan_rn_registry_todo_1["rn-registry-done (pending)\nRegister Native and NCM with truthful independent capabilities and return the required reviewable evidence."]
   end
   subgraph plan_rn_restore_anchor["rn-restore-anchor"]
-    plan_rn_restore_anchor_todo_1["rn-restore-anchor-done (completed)\nRestore the original full-history latest-disposition implementation and return exact source-equality evidence."]
+    plan_rn_restore_anchor_todo_1["rn-restore-anchor-done (completed)\nRecord current 570-to-candidate diff and blob proof for retrieval-anchor authority; current equality proof is complete."]
   end
   subgraph plan_rn_review_fidelity["rn-review-fidelity"]
     plan_rn_review_fidelity_todo_1["rn-review-fidelity-done (pending)\nIndependently review full original Native fidelity and return the required reviewable evidence."]
@@ -72,7 +78,7 @@ flowchart TD
     plan_rn_session_delivery_todo_1["rn-session-delivery-done (pending)\nRetire Native staged acknowledgements in the host observation journey and return the required reviewable evidence."]
   end
   subgraph plan_rn_source_docs["rn-source-docs"]
-    plan_rn_source_docs_todo_1["rn-source-docs-done (completed)\nCorrect Native identity and architecture documentation and return the required reviewable evidence."]
+    plan_rn_source_docs_todo_1["rn-source-docs-done (pending)\nCorrect Native identity and architecture documentation and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_claude["rn-verify-claude"]
     plan_rn_verify_claude_todo_1["rn-verify-claude-done (pending)\nVerify original Native through real Claude delivery and return the required reviewable evidence."]
@@ -81,13 +87,13 @@ flowchart TD
     plan_rn_verify_codex_todo_1["rn-verify-codex-done (pending)\nVerify original Native through real Codex delivery and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_facts["rn-verify-facts"]
-    plan_rn_verify_facts_todo_1["rn-verify-facts-done (pending)\nVerify complete fact behavior against untouched b3 and return the required reviewable evidence."]
+    plan_rn_verify_facts_todo_1["rn-verify-facts-done (pending)\nVerify complete fact behavior against untouched upstream 570 and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_ncm["rn-verify-ncm"]
     plan_rn_verify_ncm_todo_1["rn-verify-ncm-done (pending)\nVerify NCM still works with shared canonical services and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_sessions["rn-verify-sessions"]
-    plan_rn_verify_sessions_todo_1["rn-verify-sessions-done (pending)\nVerify original sessions and LCM against untouched b3 and return the required reviewable evidence."]
+    plan_rn_verify_sessions_todo_1["rn-verify-sessions-done (pending)\nVerify original sessions and LCM against untouched upstream 570 and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_state["rn-verify-state"]
     plan_rn_verify_state_todo_1["rn-verify-state-done (pending)\nVerify cutover leaves original and legacy saved state intact and return the required reviewable evidence."]
@@ -107,11 +113,20 @@ flowchart TD
   plan_rn_contract_todo_1 --> plan_rn_cases_sessions_todo_1
   plan_rn_contract_todo_1 --> plan_rn_cases_state_todo_1
   plan_rn_contract_todo_1 --> plan_rn_fabric_todo_1
+  plan_rn_contract_todo_1 --> plan_rn_history_owner_followup_todo_1
   plan_rn_contract_todo_1 --> plan_rn_host_fixtures_todo_1
   plan_rn_contract_todo_1 --> plan_rn_native_port_todo_1
   plan_rn_fabric_todo_1 --> plan_rn_build_todo_1
+  plan_rn_history_owner_followup_todo_1 --> plan_rn_build_todo_1
+  plan_rn_history_owner_followup_todo_1 --> plan_rn_cases_sessions_todo_1
+  plan_rn_history_owner_followup_todo_1 --> plan_rn_session_delivery_todo_1
   plan_rn_host_context_todo_1 --> plan_rn_composition_todo_1
   plan_rn_host_fixtures_todo_1 --> plan_rn_build_todo_1
+  plan_rn_integration_readiness_todo_1 --> plan_rn_build_todo_1
+  plan_rn_integration_readiness_todo_1 --> plan_rn_contract_todo_1
+  plan_rn_integration_readiness_todo_1 --> plan_rn_fabric_todo_1
+  plan_rn_integration_readiness_todo_1 --> plan_rn_history_owner_followup_todo_1
+  plan_rn_integration_readiness_todo_1 --> plan_rn_native_port_todo_1
   plan_rn_map_checker_todo_1 --> plan_rn_build_todo_1
   plan_rn_native_bridge_todo_1 --> plan_rn_composition_todo_1
   plan_rn_native_bridge_todo_1 --> plan_rn_native_tests_todo_1
@@ -138,7 +153,9 @@ flowchart TD
   plan_rn_session_delivery_todo_1 --> plan_rn_composition_todo_1
   plan_rn_source_docs_todo_1 --> plan_rn_build_reference_todo_1
   plan_rn_source_docs_todo_1 --> plan_rn_contract_todo_1
-  plan_rn_source_docs_todo_1 --> plan_rn_restore_anchor_todo_1
+  plan_rn_source_docs_todo_1 --> plan_rn_history_owner_followup_todo_1
+  plan_rn_source_docs_todo_1 --> plan_rn_map_checker_todo_1
+  plan_rn_source_docs_todo_1 --> plan_rn_privacy_audit_todo_1
   plan_rn_source_docs_todo_1 --> plan_rn_review_fidelity_todo_1
   plan_rn_verify_claude_todo_1 --> plan_rn_review_fidelity_todo_1
   plan_rn_verify_claude_todo_1 --> plan_rn_review_integration_todo_1

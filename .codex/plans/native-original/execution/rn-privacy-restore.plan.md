@@ -1,25 +1,36 @@
 ---
 name: rn-privacy-restore
-overview: "Restore original privacy and isolate trusted Claude history identifiers at the product boundary."
+overview: "Revalidate the privacy restoration gate at the PR707 baseline and route any real mismatch to its exact product owner."
 todos:
   - id: rn-privacy-restore-done
-    content: "Restore detector exactly to b3 and implement bounded typed host admission with regression coverage."
-    status: in_progress
+    content: "Record detector equality and typed history admission revalidation for 570; return a bounded fix handoff only if needed."
+    status: pending
 isProject: false
 ---
 
-# Restore original privacy with a product history boundary
+# Revalidate privacy restoration at upstream 570
 
-Workdir: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2 on every command. HEAD571daf3a9612e5247443e4da3a107b542686c1ef; original b3b43410e47115056f2066449aafa1822bbb6049. Read AGENTS.md, ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md, ../SOURCE-BOUNDARY.md and the complete accepted ../execution-results/privacy-isolation-design.md. Prerequisite rn-privacy-audit accepted by root. Worker gpt-5.6-luna, reasoning max, fork none; no children/Cargo/commits/push. You are not alone; preserve peers. Root owns graph/status.
+## Execution Notes
 
-Exclusive writes:
-- crates/tracedecay-privacy/src/detector_kernel.rs: restore complete file exactly to b3, no new original code/tests.
-- crates/tracedecay-memory-hygiene/src/lib.rs and at most one private adjacent module: typed trusted source-field admission and focused product unit tests only; credentials.rs/recall_text.rs read-only.
-- crates/tracedecay/src/daemon/retained_owner/observation_journey.rs: validated history admission call site and focused seam tests only. rn-session-delivery is serialized after this node.
-- ../execution-results/privacy-restoration.md: exact imports/call signatures, source proof and test filters.
+Workdir: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Active original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; execution candidate: 1fe250fed7ca615f1dfdcd580befeb276328e910. The b3-to-571 privacy result is historical. Read AGENTS.md, ../WORKER-RULES.md, ../REVIEWED-DECISIONS.md, ../SOURCE-BOUNDARY.md and the new 570 privacy audit. This is a read-only gate: no source edit, Cargo, commits, push or child agents. Root owns graph/status.
 
-Implement all six invariants in the accepted audit. Shield only validated exact Claude source IDs at the named metadata source_key paths, never content/extensions/other scalar occurrences. Use a typed host entry point; strict generic and recall admission remain b3. Multiple grant sources require each source's provider/identity validation, not a blanket pointer exemption. Placeholder mapping must be collision-free, survive canonical sanitization, and fail closed on mismatch. Restore metadata before disposition comparison and final sanitized digest; original digest binds untouched input. Preserve limits, findings, error classification, provenance, and receipt verification. Do not copy privacy algorithms, broaden suffix allowance, add a manifest/generated contract, or alter NCM.
+## Ownership and Constraints
 
-Restore source equality and implement product fix in this same lane; no intermediate successful restoration claim while host admission is broken. Unit checks must cover strict withholding, accepted byte-identical full-envelope receipt, malformed/provider/case/extra-tail rejection, duplicate grant fields, content containing matching ID, and existing credential-plus-suffix safeguards. Add meaningful private projection tests if needed; no Cargo until build owner. Run rustfmt scoped to owned product files and git diff --check. Do not format restored original file beyond exact b3.
+Own only .codex/plans/native-original/execution-results/privacy-restoration-57006f60.md. Read the detector and product history admission callers without changing them. Do not relabel privacy-isolation-design.md as current, restore the detector again, or edit observation_journey.rs.
 
-Return exact paths/diff, actual lightweight checks, untouched original/NCM evidence, public seam contract, focused runtime filters and any exact blocker. Stop after bounded authoring. Root reviews before releasing session-delivery and build.
+## Steps
+
+1. Consume the accepted 570 privacy audit and independently verify the detector's 570/candidate blob equality.
+2. Check the typed Claude source-field admission against current caller signatures, exact provider/identity validation, strict withholding, malformed/extra-tail rejection and sanitized provenance behavior.
+3. If all active claims remain supported, record a no-source-change result and leave the gate pending root review. If a mismatch exists, record the smallest product owner and exact path/signature; do not implement it here.
+4. Keep generic admission, original Native and LCM privacy behavior, and NCM behavior distinct from the product-only history seam. Product build and session delivery remain blocked until this gate is accepted.
+
+## Acceptance Checklist
+
+- The active result references 570 and current candidate paths, with actual checks and no fabricated pass.
+- Detector equality is current evidence; the historical b3 restoration is not reused as a current completion.
+- Any required fix is bounded to a named product owner, with no original detector or Cargo edits in this lane.
+
+## Operator Guidance
+
+Root launches this gate after rn-privacy-audit and rn-integration-readiness. Root reviews status and releases rn-session-delivery only after acceptance. Return exact paths, checks, unresolved questions and next owner. Do not claim product build or Native parity.

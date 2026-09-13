@@ -1,10 +1,10 @@
 ---
 name: rn-ncm-tests
-overview: "Preserve NCM behavior while Native is restored. Preserve the complete original b3 Native implementation and its operation boundaries."
+overview: "Preserve NCM behavior while Native is restored. Preserve the complete original upstream Native implementation from 570 and its operation boundaries."
 todos:
   - id: rn-ncm-tests-done
     content: "Preserve NCM behavior while Native is restored and return the required reviewable evidence."
-    status: completed
+    status: pending
 isProject: false
 ---
 
@@ -12,12 +12,12 @@ isProject: false
 
 ## Execution Notes
 
-Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
+Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The reviewed decisions override provisional recommendations in audit reports. Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2. Use this exact workdir on every shell call; confirm the actual execution HEAD and peer changes before editing.
 
 Model: gpt-5.6-luna. Reasoning: max. Spawn with fork_turns=none and a bounded handoff. You are a leaf; no subagents. You are not alone in the codebase: preserve peers' edits, never revert/reformat/stage them, and send cross-scope needs to root.
 
 Mode: write-capable.
-Prerequisites: None; this node can start in the first launch wave.. Every named predecessor must be accepted by root before dependent work starts. Original baseline: b3b43410e47115056f2066449aafa1822bbb6049; audited product head: 571daf3a9612e5247443e4da3a107b542686c1ef.
+Prerequisites: None; this node can start in the first launch wave.. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
 
 Read these reports under ../evidence/: ncm-boundary.md, host-delivery.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
@@ -53,4 +53,3 @@ Root launches this node from the saved execution graph only when its predecessor
 Return: node ID; exact changed paths and reasons; diff; verification commands and actual results; build tickets if applicable; protected-behavior evidence; unresolved dependencies/failures with exact next owner. Do not claim an unrun check passed.
 
 Stop condition: Return focused tests or an evidence-backed no-change result and run list. Do not tune NCM or expand provider features.
-
