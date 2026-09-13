@@ -1114,13 +1114,13 @@ async fn hook_request_acknowledges_only_after_processing_and_publishes_route() {
     let reconcile_sink: CodeIndexReconcileSink = {
         let entered = Arc::clone(&entered);
         let release = Arc::clone(&release);
-        Arc::new(move |_request| {
+        Arc::new(move |_request, _demand| {
             let entered = Arc::clone(&entered);
             let release = Arc::clone(&release);
             Box::pin(async move {
                 entered.notify_one();
                 release.notified().await;
-                true
+                super::CodeIndexAdmission::Accepted
             })
         })
     };

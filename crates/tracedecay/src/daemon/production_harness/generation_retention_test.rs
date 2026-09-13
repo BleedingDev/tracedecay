@@ -820,35 +820,6 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         .latest_generation_id(&canonical_root)
         .await
         .expect("initial sealed code generation");
-    let accepted_query = crate::daemon::query_authority_provider::tests::accepted_profile(
-        "generation-retention",
-        &tracedecay_domain::RetrieverKind::QUERY_FALLBACK_LANES,
-    );
-    let runtime = crate::config::retrieval::RetrievalRuntimeCompatibilityV1 {
-        retrieval_ceiling: accepted_query.profile().retrieval_budget,
-        semantic: None,
-        semantic_ceiling: None,
-        rerank: None,
-        rerank_ceiling: None,
-    };
-    let current = graph
-        .configuration_runtime()
-        .client()
-        .current()
-        .await
-        .expect("current production configuration");
-    graph
-        .configuration_runtime()
-        .bootstrap_query_retrieval_profile(
-            tracedecay_configuration::ConfigurationCurrentStateV1 {
-                revision_id: current.revision_id().clone(),
-                snapshot: current.snapshot().clone(),
-            },
-            accepted_query,
-            &runtime,
-        )
-        .await
-        .expect("durable query-only retention authority");
 
     assert!(
         project_semantic_retained_vector_generations(&canonical_root)
@@ -920,6 +891,7 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
 
     let observations = resources.store_administration.store_telemetry_sampling();
     let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+    let maintenance_lease = project_store_maintenance_lease(graph.as_ref());
     assert!(matches!(
         tracedecay_maintenance::store_maintenance::resolve_vector_retention_inventory(
             &project_store_maintenance_lease(graph.as_ref()),
@@ -1005,18 +977,18 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         } else {
             observations.record_semantic_vector_retention_failure(&canonical_root);
         }
-        let inventory = crate::daemon::store_maintenance::resolve_vector_retention_inventory(
-            graph.as_ref(),
+        let inventory = tracedecay_maintenance::store_maintenance::resolve_vector_retention_inventory(
+            &maintenance_lease,
             schedulers,
             &observations,
         )
         .await;
         assert!(
             match inventory {
-                crate::daemon::store_maintenance::VectorRetentionInventoryV1::SemanticUnseated => {
+                tracedecay_maintenance::store_maintenance::VectorRetentionInventoryV1::SemanticUnseated => {
                     unseated
                 }
-                crate::daemon::store_maintenance::VectorRetentionInventoryV1::Offline {
+                tracedecay_maintenance::store_maintenance::VectorRetentionInventoryV1::Offline {
                     ..
                 } => {
                     !unseated
@@ -1026,13 +998,13 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
             "the requested unavailable census state must actually be reached"
         );
         let expected = if unseated {
-            crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1::SemanticUnseated
+            tracedecay_maintenance::store_maintenance::CodeGenerationRetentionOutcomeV1::SemanticUnseated
         } else {
-            crate::daemon::store_maintenance::CodeGenerationRetentionOutcomeV1::Failed
+            tracedecay_maintenance::store_maintenance::CodeGenerationRetentionOutcomeV1::Failed
         };
         assert_eq!(
-            crate::daemon::store_maintenance::run_code_generation_retention(
-                graph.as_ref(),
+            tracedecay_maintenance::store_maintenance::run_code_generation_retention(
+                &maintenance_lease,
                 schedulers,
                 &observations,
                 &cancellation,
@@ -1049,8 +1021,8 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         let mut census_restored = false;
         for _ in 0..4 {
             census_restored =
-                crate::daemon::store_maintenance::run_semantic_vector_generation_retention(
-                    graph.as_ref(),
+                tracedecay_maintenance::store_maintenance::run_semantic_vector_generation_retention(
+                    &maintenance_lease,
                     schedulers,
                     &observations,
                     &cancellation,
@@ -1070,13 +1042,13 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
             "authoritative census recovers without releasing the lease"
         );
         assert!(matches!(
-            crate::daemon::store_maintenance::resolve_vector_retention_inventory(
-                graph.as_ref(),
+            tracedecay_maintenance::store_maintenance::resolve_vector_retention_inventory(
+                &maintenance_lease,
                 schedulers,
                 &observations,
             )
             .await,
-            crate::daemon::store_maintenance::VectorRetentionInventoryV1::Online { .. }
+            tracedecay_maintenance::store_maintenance::VectorRetentionInventoryV1::Online { .. }
         ));
     }
     assert!(matches!(

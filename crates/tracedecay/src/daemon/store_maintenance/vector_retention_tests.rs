@@ -558,6 +558,8 @@ fn release_queue_files(store_root: &Path) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn held_replay_pool_defers_then_backs_off_then_recovers() {
     let fixture = open_unseated_graph_fixture().await;
+    let repository_id = tracedecay_domain::RepositoryId::new("repository.retention-fixture")
+        .expect("repository id");
     let project_root = fixture.graph.project_root().to_path_buf();
     // Pin the quiet default-off read the vector-retention phase publishes on
     // every real tick. Without it the inventory would be the fail-closed
@@ -619,6 +621,7 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
         graph_replay::reconcile_graph_replay_releases(
             &project_store_maintenance_lease(&fixture.graph),
             &fixture.store_root,
+            &repository_id,
             &fixture.observations,
             &fixture.cancellation,
         )
@@ -641,6 +644,7 @@ async fn held_replay_pool_defers_then_backs_off_then_recovers() {
         graph_replay::reconcile_graph_replay_releases(
             &project_store_maintenance_lease(&fixture.graph),
             &fixture.store_root,
+            &repository_id,
             &fixture.observations,
             &fixture.cancellation,
         )
