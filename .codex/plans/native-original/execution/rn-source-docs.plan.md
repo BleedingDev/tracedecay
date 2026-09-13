@@ -4,7 +4,7 @@ overview: "Correct Native identity and architecture documentation. Preserve the 
 todos:
   - id: rn-source-docs-done
     content: "Correct Native identity and architecture documentation and return the required reviewable evidence."
-    status: complete
+    status: completed
 isProject: false
 ---
 

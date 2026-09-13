@@ -4,7 +4,7 @@ overview: "Build the independent original Native comparison runner. Preserve the
 todos:
   - id: rn-reference-done
     content: "Build the independent original Native comparison runner and return the required reviewable evidence."
-    status: completed
+    status: pending
 isProject: false
 ---
 

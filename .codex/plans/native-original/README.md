@@ -20,7 +20,7 @@ This plan keeps the original Native memory implementation and adapts our product
 
 ## Parallel execution
 
-The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-ncm-reproduce, rn-reference, rn-semantic-diagnose and rn-source-docs. The 201-row acceptance matrix and integration-readiness gate are complete. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
+The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-contract, rn-ncm-reproduce, rn-privacy-audit, rn-reference and rn-semantic-diagnose. The 201-row acceptance matrix, source inventory, map checker and integration-readiness gate are complete. The reference runner is reopened for live-review fixes. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
 
 Use available Codex-native execution agents for scoped implementation; root assigns ownership and reviews changes before pushing. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
 

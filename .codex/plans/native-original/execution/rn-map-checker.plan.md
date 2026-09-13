@@ -4,7 +4,7 @@ overview: "Repair stale source-path expectations in the existing Native surface-
 todos:
   - id: rn-map-checker-done
     content: "Correct stale source expectations without weakening map validation and run its checks."
-    status: pending
+    status: completed
 isProject: false
 ---
 

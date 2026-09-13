@@ -7,10 +7,10 @@ todos:
     status: pending
   - id: trace-semantic-activation
     content: "Trace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition."
-    status: complete
+    status: completed
   - id: freeze-semantic-fix-case
     content: "Publish the responsible setup or code seam, negative controls and failing acceptance case before repair."
-    status: complete
+    status: completed
 isProject: false
 ---
 

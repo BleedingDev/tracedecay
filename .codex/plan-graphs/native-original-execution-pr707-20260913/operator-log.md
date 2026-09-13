@@ -73,10 +73,10 @@ Launched from accepted checkpoint `f6d9bdf7073de9a25994b71e638fc1ff6013e4b0`. Al
 
 | Lane | Agent | Owner / write scope | Status |
 | --- | --- | --- | --- |
-| rn-ncm-reproduce | `/root/rn_ncm_reproduce_owner` | Three new reproduction tests plus `execution-results/ncm-recall-reproduction.md` | running |
-| rn-semantic-diagnose | `/root/rn_semantic_diagnose_owner` | `execution-results/semantic-diagnosis.md` and isolated diagnose artifacts | running |
-| rn-source-docs | `/root/rn_source_docs_owner` | Nine exact architecture/upstream documentation files from the node plan | running |
-| rn-reference | `/root/rn_reference_owner` | Five exact Native runner/contract files plus detached 570 reference verification | running |
+| rn-ncm-reproduce | `/root/rn_ncm_reproduce_owner`, `/root/ncm_real_worker_trace_owner` | Two reproduction tests, `execution-results/ncm-recall-reproduction.md`, isolated real-worker traces | partial; core red test verified, pinned real-worker trace running |
+| rn-semantic-diagnose | `/root/rn_semantic_diagnose_owner` | `execution-results/semantic-diagnosis.md` and isolated diagnose artifacts | partial; setup/bug diagnosis frozen, actual Jina fixture run pending |
+| rn-source-docs | `/root/rn_source_docs_owner` | Nine exact architecture/upstream documentation files from the node plan | complete; accepted and pushed at `97fb17619` |
+| rn-reference | `/root/rn_reference_owner` | Five exact Native runner/contract files plus detached 570 reference verification | reopened; live review fixes in progress |
 | NCM failure artifacts | `/root/ncm_exact_failure_artifact_analyst` | read-only | running |
 | NCM instance proof | `/root/ncm_once_lock_reproduction_designer` | read-only | running |
 | NCM byte budget | `/root/ncm_byte_budget_reproduction_designer` | read-only | running |
@@ -89,3 +89,11 @@ Launched from accepted checkpoint `f6d9bdf7073de9a25994b71e638fc1ff6013e4b0`. Al
 | Reference runner review | `/root/reference_runner_contract_reviewer` | read-only | running |
 | Source documentation review | `/root/source_docs_route_checker` | read-only | running |
 | Wave 2 scope checker | `/root/wave2_scope_conflict_checker` | read-only | running |
+
+## Wave 3 early lanes
+
+| Lane | Agent | Owner / write scope | Status |
+| --- | --- | --- | --- |
+| rn-contract | `/root/rn_contract_owner` | Provider API, memory-provider-v1 contract, route/contract result files | running |
+| rn-map-checker | `/root/rn_map_checker_owner` | Two exact checker/test files plus plan status | complete |
+| rn-privacy-audit | `/root/rn_privacy_audit_owner` | `execution-results/privacy-audit-57006f60.md` plus plan status | running |

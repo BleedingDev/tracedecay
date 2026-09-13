@@ -46,7 +46,7 @@ flowchart TD
     plan_rn_integration_readiness_todo_1["rn-integration-readiness-done (completed)\nRecord current integration checks, resolve the designated build blockers, and return an explicit readiness decision."]
   end
   subgraph plan_rn_map_checker["rn-map-checker"]
-    plan_rn_map_checker_todo_1["rn-map-checker-done (pending)\nCorrect stale source expectations without weakening map validation and run its checks."]
+    plan_rn_map_checker_todo_1["rn-map-checker-done (completed)\nCorrect stale source expectations without weakening map validation and run its checks."]
   end
   subgraph plan_rn_native_bridge["rn-native-bridge"]
     plan_rn_native_bridge_todo_1["rn-native-bridge-done (pending)\nReplace the staged Native backend with original service delegation and return the required reviewable evidence."]
@@ -65,10 +65,10 @@ flowchart TD
     plan_rn_ncm_recall_fix_todo_2 --> plan_rn_ncm_recall_fix_todo_3
   end
   subgraph plan_rn_ncm_reproduce["rn-ncm-reproduce"]
-    plan_rn_ncm_reproduce_todo_1["recover-original-misses (pending)\nRecover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope."]
+    plan_rn_ncm_reproduce_todo_1["recover-original-misses (completed)\nRecover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope."]
     plan_rn_ncm_reproduce_todo_2["trace-first-loss (pending)\nReproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data."]
     plan_rn_ncm_reproduce_todo_1 --> plan_rn_ncm_reproduce_todo_2
-    plan_rn_ncm_reproduce_todo_3["add-failing-regression (pending)\nReduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline."]
+    plan_rn_ncm_reproduce_todo_3["add-failing-regression (completed)\nReduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline."]
     plan_rn_ncm_reproduce_todo_2 --> plan_rn_ncm_reproduce_todo_3
   end
   subgraph plan_rn_ncm_tests["rn-ncm-tests"]
@@ -104,9 +104,9 @@ flowchart TD
   end
   subgraph plan_rn_semantic_diagnose["rn-semantic-diagnose"]
     plan_rn_semantic_diagnose_todo_1["reproduce-semantic-states (pending)\nReproduce fresh-profile, provisioned-profile and restart behavior using the real CLI and strict semantic requests."]
-    plan_rn_semantic_diagnose_todo_2["trace-semantic-activation (pending)\nTrace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition."]
+    plan_rn_semantic_diagnose_todo_2["trace-semantic-activation (completed)\nTrace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition."]
     plan_rn_semantic_diagnose_todo_1 --> plan_rn_semantic_diagnose_todo_2
-    plan_rn_semantic_diagnose_todo_3["freeze-semantic-fix-case (pending)\nPublish the responsible setup or code seam, negative controls and failing acceptance case before repair."]
+    plan_rn_semantic_diagnose_todo_3["freeze-semantic-fix-case (completed)\nPublish the responsible setup or code seam, negative controls and failing acceptance case before repair."]
     plan_rn_semantic_diagnose_todo_2 --> plan_rn_semantic_diagnose_todo_3
   end
   subgraph plan_rn_semantic_fix["rn-semantic-fix"]
@@ -120,7 +120,7 @@ flowchart TD
     plan_rn_session_delivery_todo_1["rn-session-delivery-done (pending)\nRetire Native staged acknowledgements in the host observation journey and return the required reviewable evidence."]
   end
   subgraph plan_rn_source_docs["rn-source-docs"]
-    plan_rn_source_docs_todo_1["rn-source-docs-done (pending)\nCorrect Native identity and architecture documentation and return the required reviewable evidence."]
+    plan_rn_source_docs_todo_1["rn-source-docs-done (completed)\nCorrect Native identity and architecture documentation and return the required reviewable evidence."]
   end
   subgraph plan_rn_verify_claude["rn-verify-claude"]
     plan_rn_verify_claude_todo_1["rn-verify-claude-done (pending)\nVerify original Native through real Claude delivery and return the required reviewable evidence."]

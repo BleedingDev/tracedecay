@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-13T15:02:23.188001+00:00",
+  "generated_at": "2026-09-13T16:01:21.000686+00:00",
   "graph_id": "native-original-execution-pr707-20260913",
   "plan_set_hash": "5befc5f407",
   "selection_hash": "bbc92e4d52",
@@ -669,7 +669,7 @@
         {
           "id": "rn-map-checker-done",
           "content": "Correct stale source expectations without weakening map validation and run its checks.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 1
         }
       ],
@@ -766,7 +766,7 @@
         {
           "id": "recover-original-misses",
           "content": "Recover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 1
         },
         {
@@ -778,7 +778,7 @@
         {
           "id": "add-failing-regression",
           "content": "Reduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 3
         }
       ],
@@ -966,13 +966,13 @@
         {
           "id": "trace-semantic-activation",
           "content": "Trace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 2
         },
         {
           "id": "freeze-semantic-fix-case",
           "content": "Publish the responsible setup or code seam, negative controls and failing acceptance case before repair.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 3
         }
       ],
@@ -1035,7 +1035,7 @@
         {
           "id": "rn-source-docs-done",
           "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 1
         }
       ],
@@ -1177,6 +1177,25 @@
   ],
   "frontier": [
     {
+      "plan_slug": "rn-contract",
+      "plan_name": "rn-contract",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-contract.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-contract-done",
+          "content": "Make the product interface fit complete original Native and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
       "plan_slug": "rn-ncm-reproduce",
       "plan_name": "rn-ncm-reproduce",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-reproduce.plan.md",
@@ -1185,28 +1204,34 @@
       "blocked_by": [],
       "active": [
         {
-          "id": "recover-original-misses",
-          "content": "Recover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [
-        {
           "id": "trace-first-loss",
           "content": "Reproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data.",
           "status": "pending",
           "ordinal": 2
-        },
-        {
-          "id": "add-failing-regression",
-          "content": "Reduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline.",
-          "status": "pending",
-          "ordinal": 3
         }
       ],
-      "completed": 0,
+      "upcoming": [],
+      "completed": 2,
       "total": 3
+    },
+    {
+      "plan_slug": "rn-privacy-audit",
+      "plan_name": "rn-privacy-audit",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-privacy-audit.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-privacy-audit-done",
+          "content": "Map current privacy callers and record detector equality against 570; return a bounded gate for the privacy restore lane.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
     },
     {
       "plan_slug": "rn-reference",
@@ -1242,41 +1267,9 @@
           "ordinal": 1
         }
       ],
-      "upcoming": [
-        {
-          "id": "trace-semantic-activation",
-          "content": "Trace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition.",
-          "status": "pending",
-          "ordinal": 2
-        },
-        {
-          "id": "freeze-semantic-fix-case",
-          "content": "Publish the responsible setup or code seam, negative controls and failing acceptance case before repair.",
-          "status": "pending",
-          "ordinal": 3
-        }
-      ],
-      "completed": 0,
-      "total": 3
-    },
-    {
-      "plan_slug": "rn-source-docs",
-      "plan_name": "rn-source-docs",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
-      "plan_status": "pending",
-      "state": "ready",
-      "blocked_by": [],
-      "active": [
-        {
-          "id": "rn-source-docs-done",
-          "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
       "upcoming": [],
-      "completed": 0,
-      "total": 1
+      "completed": 2,
+      "total": 3
     },
     {
       "plan_slug": "rn-build",
@@ -1291,7 +1284,6 @@
         "rn-ncm-tests",
         "rn-reference",
         "rn-build-reference",
-        "rn-map-checker",
         "rn-privacy-audit",
         "rn-privacy-restore",
         "rn-history-owner-followup",
@@ -1316,7 +1308,6 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-source-docs",
         "rn-reference"
       ],
       "active": [
@@ -1447,27 +1438,6 @@
       "total": 1
     },
     {
-      "plan_slug": "rn-contract",
-      "plan_name": "rn-contract",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-contract.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-source-docs"
-      ],
-      "active": [
-        {
-          "id": "rn-contract-done",
-          "content": "Make the product interface fit complete original Native and return the required reviewable evidence.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
       "plan_slug": "rn-fabric",
       "plan_name": "rn-fabric",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-fabric.plan.md",
@@ -1495,7 +1465,6 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-source-docs",
         "rn-contract"
       ],
       "active": [
@@ -1545,27 +1514,6 @@
         {
           "id": "rn-host-fixtures-done",
           "content": "Prepare real Claude and Codex Native comparison journeys and return the required reviewable evidence.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
-      "plan_slug": "rn-map-checker",
-      "plan_name": "rn-map-checker",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-map-checker.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-source-docs"
-      ],
-      "active": [
-        {
-          "id": "rn-map-checker-done",
-          "content": "Correct stale source expectations without weakening map validation and run its checks.",
           "status": "pending",
           "ordinal": 1
         }
@@ -1694,27 +1642,6 @@
       "total": 1
     },
     {
-      "plan_slug": "rn-privacy-audit",
-      "plan_name": "rn-privacy-audit",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-privacy-audit.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-source-docs"
-      ],
-      "active": [
-        {
-          "id": "rn-privacy-audit-done",
-          "content": "Map current privacy callers and record detector equality against 570; return a bounded gate for the privacy restore lane.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
       "plan_slug": "rn-privacy-restore",
       "plan_name": "rn-privacy-restore",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-privacy-restore.plan.md",
@@ -1805,7 +1732,6 @@
         "rn-verify-claude",
         "rn-verify-codex",
         "rn-verify-ncm",
-        "rn-source-docs",
         "rn-verify-semantic"
       ],
       "active": [
@@ -2093,9 +2019,33 @@
       "total": 1
     },
     {
+      "plan_slug": "rn-map-checker",
+      "plan_name": "rn-map-checker",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-map-checker.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
       "plan_slug": "rn-restore-anchor",
       "plan_name": "rn-restore-anchor",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-restore-anchor.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-source-docs",
+      "plan_name": "rn-source-docs",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
       "plan_status": "completed",
       "state": "done",
       "blocked_by": [],
