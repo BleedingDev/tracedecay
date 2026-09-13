@@ -4,9 +4,10 @@
 The runner is deliberately a thin process and evidence boundary.  It does not
 implement a memory store, score results, or manufacture a baseline response.
 Each side receives the same logical request in a separate process group and a
-separate state/artifact root.  The original side is always the immutable b3
+separate state/artifact root.  The original side is always the immutable 570
 checkout supplied by the build owner; a dirty or differently pinned checkout
-is refused before a case starts.
+is refused before a case starts.  Historical b3/571 audit revisions remain
+metadata only and are never used as an execution oracle.
 
 The case contract is in ``case-contract.json``.  The usual entry point is the
 shipped ``tracedecay tool`` CLI, which dispatches through the production daemon
@@ -37,13 +38,111 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 CONTRACT_FORMAT = "tracedecay.native-original.case-contract.v1"
-REFERENCE_REVISION = "b3b43410e47115056f2066449aafa1822bbb6049"
-PRODUCT_REVISION = "571daf3a9612e5247443e4da3a107b542686c1ef"
+REFERENCE_REVISION = "57006f60cb45bcee8487e73a40d4fad1a12ee2b6"
+# The product checkout is a moving integration lane.  The actual candidate
+# revision is captured from --product-source-revision (or the source root)
+# for every run instead of being frozen to a historical audit commit.
+PRODUCT_REVISION = "current"
+HISTORICAL_REFERENCE_REVISION = "b3b43410e47115056f2066449aafa1822bbb6049"
+HISTORICAL_PRODUCT_REVISION = "571daf3a9612e5247443e4da3a107b542686c1ef"
+REFERENCE_CHECKOUT_NAME = "native-original-reference-57006f60"
 DEFAULT_CONTRACT = Path(__file__).with_name("case-contract.json")
-OUTCOME_STATUSES = ("pass", "fail", "unknown", "unsupported", "invalid", "censored")
+OUTCOME_STATUSES = (
+    "pass",
+    "fail",
+    "unknown",
+    "unsupported",
+    "invalid",
+    "censored",
+    "cancelled",
+    "partial",
+    "effect_unknown",
+    "blocked",
+)
 ROUTE_AVAILABILITY = ("supported", "external_harness", "unsupported", "unknown")
 SIDE_NAMES = ("original", "product")
 COMPOSITIONS = {"original": "direct_original", "product": "product_native"}
+READINESS_MODES = ("comparison", "readiness")
+READINESS_MATRIX_ID = "native-ncm-semantic-readiness.v1"
+REQUIRED_NATIVE_ROUTES = frozenset(
+    {
+        "fact_store_add",
+        "fact_store_search",
+        "fact_store_probe",
+        "fact_store_related",
+        "fact_store_reason",
+        "fact_store_contradict",
+        "fact_store_get",
+        "fact_store_update",
+        "fact_store_remove",
+        "fact_store_supersede",
+        "fact_store_list",
+        "fact_feedback",
+        "memory_status",
+    }
+)
+REQUIRED_SESSION_LCM_ROUTES = frozenset(
+    {
+        "session_lookup",
+        "message_search",
+        "sessions_for",
+        "session_refresh_begin",
+        "session_refresh_status",
+        "session_refresh_cancel",
+        "lcm_load_session",
+        "lcm_grep",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_status",
+        "lcm_doctor",
+    }
+)
+REQUIRED_HOST_EXTENSION_ROUTES = frozenset(
+    {"host_sealed_source_admission", "host_cursor_and_locator_regression"}
+)
+READINESS_REQUIRED_ROUTES = (
+    REQUIRED_NATIVE_ROUTES | REQUIRED_SESSION_LCM_ROUTES | REQUIRED_HOST_EXTENSION_ROUTES
+)
+LEDGER_REQUIRED_FIELDS = (
+    "actual",
+    "attempt_id",
+    "attempt_index",
+    "candidate_binary_sha256",
+    "candidate_process_identity",
+    "candidate_store_identity",
+    "command",
+    "composition_reached",
+    "effect_digest",
+    "evidence_paths",
+    "expected",
+    "failure_class",
+    "feature_set",
+    "first_causal_stage",
+    "fixture_seed",
+    "model_sha256",
+    "oracle_kind",
+    "outcome",
+    "profile_paths",
+    "protocol_version",
+    "provider_id",
+    "provider_implementation_sha256",
+    "receipt_digest",
+    "reference_binary_sha256",
+    "reference_process_identity",
+    "reference_store_identity",
+    "reopen_or_no_effect",
+    "request_digest",
+    "result_digest",
+    "row_id",
+    "scope_digest",
+    "source_sha",
+    "started_at",
+    "state_digest",
+    "state_generation",
+    "state_schema_version",
+    "tokenizer_sha256",
+)
 _ISOLATION_ENV_KEYS = frozenset(
     {
         "HOME",
@@ -56,6 +155,7 @@ _ISOLATION_ENV_KEYS = frozenset(
         "TRACEDECAY_DATA_DIR",
         "TRACEDECAY_GLOBAL_DB",
         "TRACEDECAY_COMPARISON_SIDE_ROOT",
+        "TRACEDECAY_COMPARISON_PROCESS_ROOT",
         "TRACEDECAY_DAEMON_SOCKET",
     }
 )
@@ -75,7 +175,7 @@ class ContractError(RunnerError):
 
 
 class ReferenceError(RunnerError):
-    """The protected b3 source checkout is absent, dirty, or mis-pinned."""
+    """The protected 570 source checkout is absent, dirty, or mis-pinned."""
 
 
 class BinaryError(RunnerError):
@@ -113,6 +213,24 @@ def _write_json(path: Path, value: Any) -> dict[str, Any]:
     return _write_bytes(path, _json_bytes(value) + b"\n")
 
 
+def _append_jsonl(path: Path, value: Any) -> dict[str, Any]:
+    """Append one fsynced immutable ledger row and return its file receipt."""
+
+    encoded = _json_bytes(value) + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("ab") as stream:
+        offset = stream.tell()
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {
+        "path": str(path),
+        "offset": offset,
+        "bytes": len(encoded),
+        "sha256": bytes_digest(encoded),
+    }
+
+
 def _require(condition: bool, message: str, error_type: type[Exception] = ContractError) -> None:
     if not condition:
         raise error_type(message)
@@ -134,9 +252,21 @@ def _git(path: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 def verify_reference_checkout(
     checkout: str | os.PathLike[str],
-    expected_revision: str = REFERENCE_REVISION,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Verify the existing reference checkout without creating or changing it."""
+    """Verify the existing checkout against the immutable 570 reference.
+
+    ``expected_revision`` is retained as a compatibility guard for callers that
+    used the old parameter, but it cannot change the pinned reference.  Any
+    supplied value must equal :data:`REFERENCE_REVISION`.
+    """
+
+    expected = REFERENCE_REVISION.lower()
+    if expected_revision is not None and str(expected_revision).strip().lower() != expected:
+        raise ReferenceError(
+            "reference revision override is not permitted; "
+            f"the runner is fixed to {REFERENCE_REVISION}"
+        )
 
     root = Path(checkout).expanduser()
     if not root.is_absolute():
@@ -146,9 +276,9 @@ def verify_reference_checkout(
     if revision.returncode != 0:
         raise ReferenceError(f"reference checkout has no readable HEAD: {root}: {revision.stderr.strip()}")
     actual_revision = revision.stdout.strip().lower()
-    if actual_revision != expected_revision.lower():
+    if actual_revision != expected:
         raise ReferenceError(
-            f"reference checkout revision mismatch: expected {expected_revision}, got {actual_revision}"
+            f"reference checkout revision mismatch: expected {REFERENCE_REVISION}, got {actual_revision}"
         )
     status = _git(root, "status", "--porcelain=v1", "--untracked-files=all")
     if status.returncode != 0:
@@ -164,6 +294,54 @@ def verify_reference_checkout(
         "status": "",
         "git_root": toplevel.stdout.strip() if toplevel.returncode == 0 else None,
     }
+
+
+def verify_source_root(
+    source_root: str | os.PathLike[str],
+    *,
+    side: str,
+    reference_root: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve a source root and prove it is distinct from the reference.
+
+    The reference source is verified by ``verify_reference_checkout``.  The
+    candidate source is intentionally only inspected here: a moving checkout
+    may have a later revision, but it must still be recorded as its own source
+    root rather than inferred from a binary path or a historical pin.
+    """
+
+    root = Path(source_root).expanduser()
+    if not root.is_absolute():
+        root = root.resolve()
+    _require(root.is_dir(), f"{side} source root is absent: {root}", RunnerError)
+    resolved = root.resolve()
+    if reference_root is not None:
+        _require(
+            resolved != reference_root.resolve(),
+            "original and product source roots are the same; refusing a shared source comparison",
+            RunnerError,
+        )
+    revision = _git(resolved, "rev-parse", "--verify", "HEAD")
+    observed_revision = revision.stdout.strip().lower() if revision.returncode == 0 else None
+    return {
+        "side": side,
+        "path": str(resolved),
+        "revision": observed_revision,
+        "git_readable": revision.returncode == 0,
+        "status": "clean-check-not-required",
+    }
+
+
+def resolve_product_revision(source_root: Path, supplied: str | None) -> str:
+    """Return the attested candidate revision, or an explicit unknown state."""
+
+    if supplied is not None:
+        value = str(supplied).strip().lower()
+        return value or "unknown"
+    revision = _git(source_root, "rev-parse", "--verify", "HEAD")
+    if revision.returncode == 0 and revision.stdout.strip():
+        return revision.stdout.strip().lower()
+    return "unknown"
 
 
 def verify_binary(binary: str | os.PathLike[str], side: str) -> dict[str, Any]:
@@ -198,6 +376,11 @@ def verify_distinct_binaries(
         "original and product binaries have the same SHA-256; refusing a shared-backend comparison",
         BinaryError,
     )
+    _require(
+        Path(original["path"]).resolve().parent != Path(product["path"]).resolve().parent,
+        "original and product binaries share a binary root; refusing a non-isolated comparison",
+        BinaryError,
+    )
     return original, product
 
 
@@ -230,20 +413,68 @@ def _route_map(contract: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {route["id"]: route for route in contract["routes"]}
 
 
+def _route_effect_policy(route: Mapping[str, Any] | None) -> str | None:
+    if route is None:
+        return None
+    policy = route.get("effect_policy")
+    if isinstance(policy, str):
+        return policy
+    # Keep hand-authored older contracts useful while requiring the accepted
+    # contract to publish the explicit policy on every route.  This inference
+    # is also useful for callers that exercise compare helpers directly.
+    operation_kind = route.get("operation_kind")
+    if operation_kind in ("mutation", "host_extension"):
+        return "required"
+    if operation_kind == "explicit_search":
+        return "retrieval"
+    if operation_kind in ("read", "semantic_read", "temporal_read"):
+        return "none"
+    return "unknown"
+
+
+def _validate_pointer_list(value: Any, label: str) -> None:
+    _require(isinstance(value, (list, tuple)), f"{label} must be a list")
+    for pointer in value:
+        _require(isinstance(pointer, str), f"{label} entries must be strings")
+        _pointer_parts(pointer)
+
+
 def _validate_comparison(value: Any, label: str) -> None:
     if value is None:
         return
     _require(isinstance(value, Mapping), f"{label} comparison must be an object")
-    for field in ("semantic_json_pointers", "ignore_json_pointers", "required_json_pointers"):
-        pointers = value.get(field, ())
-        _require(isinstance(pointers, (list, tuple)), f"{label} {field} must be a list")
-        for pointer in pointers:
-            _require(isinstance(pointer, str), f"{label} {field} entries must be strings")
-            _pointer_parts(pointer)
+    for field in (
+        "semantic_json_pointers",
+        "ignore_json_pointers",
+        "required_json_pointers",
+        "effect_json_pointers",
+        "receipt_json_pointers",
+        "state_json_pointers",
+        "no_effect_json_pointers",
+        "reopen_or_no_effect_json_pointers",
+    ):
+        _validate_pointer_list(value.get(field, ()), f"{label} {field}")
+    effect_mode = value.get("effect_mode")
+    if effect_mode is not None:
+        _require(
+            effect_mode in ("required", "none", "retrieval", "unknown"),
+            f"{label} effect_mode is invalid",
+        )
     expected_terminal = value.get("expected_terminal")
     if expected_terminal is not None:
         _require(
-            expected_terminal in ("completed", "error", "unsupported", "unknown", "censored"),
+            expected_terminal in (
+                "completed",
+                "error",
+                "unsupported",
+                "unknown",
+                "invalid",
+                "censored",
+                "cancelled",
+                "partial",
+                "effect_unknown",
+                "blocked",
+            ),
             f"{label} expected_terminal is invalid",
         )
     if "required_json_pointers" in value and not value.get("required_json_pointers"):
@@ -265,6 +496,32 @@ def _validate_comparison(value: Any, label: str) -> None:
             _pointer_parts(pointer)
 
 
+def _validate_effect_declaration(
+    value: Any,
+    route: Mapping[str, Any],
+    label: str,
+) -> None:
+    """Require every paired operation to declare its effect/no-effect proof."""
+
+    if value is None:
+        return
+    policy = _route_effect_policy(route)
+    if policy not in ("required", "none", "retrieval"):
+        return
+    mode = value.get("effect_mode")
+    _require(mode == policy, f"{label} effect_mode must be {policy!r} for route {route['id']}")
+    if policy == "required":
+        for field in ("effect_json_pointers", "receipt_json_pointers", "state_json_pointers"):
+            _require(bool(value.get(field)), f"{label} must declare {field} for a mutating route")
+    elif policy == "none":
+        _require(bool(value.get("no_effect_json_pointers")), f"{label} must declare no_effect_json_pointers for a read route")
+    else:
+        _require(
+            bool(value.get("effect_json_pointers")) or bool(value.get("no_effect_json_pointers")),
+            f"{label} must declare effect or no-effect observables for a retrieval route",
+        )
+
+
 def _validate_output_bindings(value: Any, label: str) -> None:
     if value is None:
         return
@@ -278,10 +535,21 @@ def _validate_output_bindings(value: Any, label: str) -> None:
 def validate_contract(contract: Mapping[str, Any]) -> None:
     _require(contract.get("format") == CONTRACT_FORMAT, "case contract format is not the accepted Native original contract")
     _require(contract.get("contract_id") == CONTRACT_FORMAT, "case contract id is not the accepted Native original contract")
+    _require(contract.get("status") == "accepted", "case contract is not marked accepted")
     baseline = contract.get("baseline")
     _require(isinstance(baseline, dict), "case contract is missing baseline")
-    _require(baseline.get("reference_revision") == REFERENCE_REVISION, "case contract has an incorrect b3 reference revision")
-    _require(baseline.get("product_revision") == PRODUCT_REVISION, "case contract has an incorrect product revision")
+    _require(
+        baseline.get("reference_revision") == REFERENCE_REVISION,
+        "case contract has an incorrect 570 reference revision",
+    )
+    _require(
+        baseline.get("product_revision") == PRODUCT_REVISION,
+        "case contract must use the moving current candidate revision",
+    )
+    _require(
+        baseline.get("reference_checkout") in (REFERENCE_CHECKOUT_NAME, f".worktrees/{REFERENCE_CHECKOUT_NAME}"),
+        "case contract must name the detached 570 reference checkout",
+    )
     runner = contract.get("runner")
     _require(isinstance(runner, dict), "case contract is missing runner description")
     _require(runner.get("entrypoints", {}).get("cli_tool", {}).get("transport") == "process", "cli_tool entrypoint must be a process")
@@ -289,6 +557,24 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
     outcome = runner.get("outcomes")
     _require(isinstance(outcome, dict), "case contract is missing outcome semantics")
     _require(tuple(outcome.get("statuses", ())) == OUTCOME_STATUSES, "case contract outcome statuses changed")
+    ledger = runner.get("ledger")
+    _require(isinstance(ledger, dict), "case contract is missing attempt ledger semantics")
+    _require(ledger.get("storage") == "append-only JSONL", "attempt ledger must be append-only JSONL")
+    _require(
+        tuple(ledger.get("outcome_enum", ())) == OUTCOME_STATUSES,
+        "case contract ledger outcome enum changed",
+    )
+    _require(
+        tuple(ledger.get("required_fields", ())) == LEDGER_REQUIRED_FIELDS,
+        "case contract ledger required fields changed",
+    )
+    readiness = runner.get("readiness")
+    _require(isinstance(readiness, dict), "case contract is missing readiness selection semantics")
+    _require(readiness.get("matrix_id") == READINESS_MATRIX_ID, "case contract readiness matrix is not accepted")
+    _require(
+        readiness.get("filtered_suite_policy") == "reject_as_readiness_evidence",
+        "readiness mode must reject filtered suites as evidence",
+    )
     capture = runner.get("capture")
     _require(isinstance(capture, dict), "case contract is missing capture semantics")
     for field in ("request", "stdout", "stderr", "process", "side_state", "comparison"):
@@ -305,6 +591,11 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
             route.get("classification") in ("original_native", "session_lcm", "host_extension", "unsupported"),
             f"invalid route classification: {route_id}",
         )
+        _require(isinstance(route.get("operation_kind"), str) and route["operation_kind"], f"route lacks operation kind: {route_id}")
+        _require(
+            route.get("effect_policy") in ("required", "none", "retrieval", "unknown"),
+            f"route has invalid effect policy: {route_id}",
+        )
         _require(isinstance(route.get("direct_boundary"), str) and route["direct_boundary"], f"route lacks direct boundary: {route_id}")
         availability = route.get("availability")
         if isinstance(availability, str):
@@ -318,6 +609,12 @@ def validate_contract(contract: Mapping[str, Any]) -> None:
         for name, entrypoint in entrypoints.items():
             _require(name in ("cli_tool", "mcp_stdio", "command"), f"unknown route entrypoint {name}: {route_id}")
             _require(isinstance(entrypoint, dict), f"route entrypoint must be an object: {route_id}/{name}")
+    required_routes = REQUIRED_NATIVE_ROUTES | REQUIRED_SESSION_LCM_ROUTES | REQUIRED_HOST_EXTENSION_ROUTES
+    missing_routes = sorted(required_routes - seen)
+    _require(
+        not missing_routes,
+        "case contract is missing required Native/session/LCM/host routes: " + ", ".join(missing_routes),
+    )
 
 
 def validate_case(case: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
@@ -342,13 +639,14 @@ def validate_case(case: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
         if supported in ("supported", "external_harness"):
             _require(isinstance(action.get("request", {}), dict), f"supported action request must be an object: {case_id}/{action_id}")
         entrypoint = action.get("entrypoint")
-        if entrypoint is None:
+        if entrypoint is None and supported not in ("unsupported", "unknown"):
             entrypoint = "command" if supported == "external_harness" else "cli_tool"
-        _require(entrypoint in ("cli_tool", "mcp_stdio", "command"), f"unknown action entrypoint: {case_id}/{action_id}")
-        _require(
-            entrypoint in route.get("entrypoints", {}) or supported == "external_harness",
-            f"route {route_id} does not publish the {entrypoint} entrypoint: {case_id}/{action_id}",
-        )
+        if entrypoint is not None:
+            _require(entrypoint in ("cli_tool", "mcp_stdio", "command"), f"unknown action entrypoint: {case_id}/{action_id}")
+            _require(
+                entrypoint in route.get("entrypoints", {}) or supported == "external_harness",
+                f"route {route_id} does not publish the {entrypoint} entrypoint: {case_id}/{action_id}",
+            )
         if entrypoint == "mcp_stdio":
             endpoint = route.get("entrypoints", {}).get("mcp_stdio", {})
             _require(
@@ -361,6 +659,8 @@ def validate_case(case: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
             _require(isinstance(argv, list) and argv, f"command action requires argv: {case_id}/{action_id}")
         _validate_output_bindings(action.get("output_bindings"), f"{case_id}/{action_id}")
         _validate_comparison(action.get("comparison"), f"{case_id}/{action_id}")
+        if action.get("comparison") is not None:
+            _validate_effect_declaration(action.get("comparison"), route, f"{case_id}/{action_id}")
         for phase in ("before", "after", "reopened"):
             specs = action.get("checkpoints", {}).get(phase, []) if isinstance(action.get("checkpoints", {}), dict) else []
             if isinstance(specs, dict):
@@ -383,6 +683,8 @@ def validate_case(case: Mapping[str, Any], contract: Mapping[str, Any]) -> None:
                     spec.get("output_bindings"), f"{case_id}/{action_id}/{phase}"
                 )
                 _validate_comparison(spec.get("comparison"), f"{case_id}/{action_id}/{phase}")
+                if spec.get("comparison") is not None:
+                    _validate_effect_declaration(spec.get("comparison"), routes[checkpoint_route], f"{case_id}/{action_id}/{phase}")
 
     side_setup = case.get("side_setup", {})
     _require(isinstance(side_setup, Mapping), f"case side_setup must be an object: {case_id}")
@@ -454,13 +756,16 @@ def _validate_aux_action(spec: Any, contract: Mapping[str, Any], label: str) -> 
     availability = route.get("availability")
     original_availability = availability if isinstance(availability, str) else availability.get("original")
     entrypoint = spec.get("entrypoint")
-    if entrypoint is None:
+    if entrypoint is None and original_availability not in ("unsupported", "unknown"):
         entrypoint = "command" if original_availability == "external_harness" else "cli_tool"
-    _require(entrypoint in ("cli_tool", "mcp_stdio", "command"), f"{label} has invalid entrypoint")
-    _require(entrypoint in route.get("entrypoints", {}) or original_availability == "external_harness", f"{label} entrypoint is not published")
+    if entrypoint is not None:
+        _require(entrypoint in ("cli_tool", "mcp_stdio", "command"), f"{label} has invalid entrypoint")
+        _require(entrypoint in route.get("entrypoints", {}) or original_availability == "external_harness", f"{label} entrypoint is not published")
     _require(isinstance(spec.get("request", {}), dict), f"{label} request must be an object")
     _validate_output_bindings(spec.get("output_bindings"), label)
     _validate_comparison(spec.get("comparison"), label)
+    if spec.get("comparison") is not None:
+        _validate_effect_declaration(spec.get("comparison"), route, label)
 
 
 def _owned_relative_path(value: Any, *, side_dir: Path, field: str, default: str) -> Path:
@@ -507,6 +812,46 @@ def select_relevant_cases(
     if not selected:
         target = ", ".join(sorted(required)) if required else "the requested comparison"
         raise RunnerError(f"zero relevant cases for {target}; refusing a vacuous comparison")
+    return selected
+
+
+def validate_readiness_selection(
+    cases: Sequence[Mapping[str, Any]],
+    required_operations: Iterable[str] = (),
+    *,
+    readiness_mode: str = "comparison",
+) -> list[dict[str, Any]]:
+    """Select cases while preventing a filtered suite from claiming readiness.
+
+    The readiness matrix is a complete route obligation.  A focused
+    comparison is useful for development, but it cannot be reported as
+    readiness evidence when ``--operation`` filters away the accepted route
+    set.  Readiness mode therefore rejects every filtered invocation and also
+    checks that the supplied cases cover each accepted route.
+    """
+
+    _require(readiness_mode in READINESS_MODES, f"invalid readiness mode: {readiness_mode!r}")
+    required = set(required_operations)
+    if readiness_mode == "readiness" and required:
+        raise RunnerError(
+            "readiness evidence cannot use a filtered operation suite; "
+            "run the complete accepted route set without --operation"
+        )
+    selected = select_relevant_cases(cases, required)
+    if readiness_mode != "readiness":
+        return selected
+    covered = {
+        action.get("route", action.get("operation"))
+        for case in selected
+        for action in case.get("actions", ())
+        if isinstance(action, Mapping)
+    }
+    missing = sorted(READINESS_REQUIRED_ROUTES - covered)
+    if missing:
+        raise RunnerError(
+            "readiness evidence is incomplete; missing accepted routes: "
+            + ", ".join(missing)
+        )
     return selected
 
 
@@ -761,6 +1106,7 @@ class _OwnedDaemon:
         binary: Path,
         side_dir: Path,
         profile_root: Path,
+        process_root: Path,
         socket_path: Path,
         authority_path: Path,
         artifact_dir: Path,
@@ -774,6 +1120,7 @@ class _OwnedDaemon:
         self.binary = binary
         self.side_dir = side_dir
         self.profile_root = profile_root
+        self.process_root = process_root
         self.socket_path = socket_path
         self.authority_path = authority_path
         self.artifact_dir = artifact_dir
@@ -798,10 +1145,13 @@ class _OwnedDaemon:
         timeouts: ProcessTimeouts,
     ) -> "_OwnedDaemon":
         profile_root = profile_root.resolve()
+        process_root = (side_dir / "process").resolve()
         socket_path = _daemon_socket_path(side_dir)
         authority_path = _daemon_authority_path(profile_root)
         profile_root.mkdir(parents=True, exist_ok=True)
+        process_root.mkdir(parents=True, exist_ok=True)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_socket_parent(socket_path.parent)
         if _endpoint_connectable({"kind": "unix", "address": str(socket_path)}) if os.name != "nt" else False:
             raise RunnerError(f"{side} daemon endpoint is already connectable: {socket_path}")
         if os.name != "nt" and socket_path.exists():
@@ -820,6 +1170,7 @@ class _OwnedDaemon:
             {},
             {
                 "profile_root": str(profile_root),
+                "process_root": str(process_root),
                 "daemon_socket": str(socket_path),
             },
         )
@@ -857,6 +1208,7 @@ class _OwnedDaemon:
             binary=binary,
             side_dir=side_dir,
             profile_root=profile_root,
+            process_root=process_root,
             socket_path=socket_path,
             authority_path=authority_path,
             artifact_dir=artifact_dir,
@@ -924,6 +1276,7 @@ class _OwnedDaemon:
             "version": record.get("version"),
             "endpoint": copy.deepcopy(record.get("endpoint")),
             "profile_root": str(self.profile_root),
+            "process_root": str(self.process_root),
             "authority_path": str(self.authority_path),
         }
 
@@ -1009,19 +1362,30 @@ class _OwnedDaemon:
                 pass
             self.process.wait()
         returncode = self.process.returncode
+        cleanup_errors: list[str] = []
         members = _group_members(self.process.pid) if os.name != "nt" else []
+        group_observation = members is not None
+        if members is None:
+            members = []
         if members:
             _signal_group(self.process, signal.SIGKILL, self.process.pid)
             deadline = time.monotonic() + timeouts.kill_seconds
-            while _group_members(self.process.pid) and time.monotonic() < deadline:
+            while (_group_members(self.process.pid) or []) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            members = _group_members(self.process.pid)
+            observed_members = _group_members(self.process.pid)
+            if observed_members is None:
+                group_observation = False
+                members = []
+            else:
+                members = observed_members
         self._close_logs()
         if os.name != "nt":
             try:
                 self.socket_path.unlink()
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError as error:
+                cleanup_errors.append(f"cannot remove daemon socket {self.socket_path}: {error}")
         end_monotonic = time.monotonic_ns()
         process_record = {
             "argv": [
@@ -1044,15 +1408,24 @@ class _OwnedDaemon:
             "status": "completed" if returncode == 0 else "error",
             "reason": None if returncode == 0 else f"daemon exited with return code {returncode}",
             "remaining_owned_children": len(members),
+            "process_group_observed": group_observation,
         }
         process_ref = _write_json(self.artifact_dir / "process.json", process_record)
-        status = "completed" if returncode == 0 and not members else "unknown"
+        status = (
+            "completed"
+            if returncode == 0 and not members and group_observation and not cleanup_errors
+            else "unknown"
+        )
         self.cleanup = {
             "status": status,
             "reason": (
                 None
                 if status == "completed"
-                else "owned foreground daemon or child process did not settle"
+                else (
+                    "; ".join(cleanup_errors)
+                    if cleanup_errors
+                    else "owned foreground daemon or child process did not settle"
+                )
             ),
             "requested_reason": reason,
             "signal": sent,
@@ -1063,12 +1436,14 @@ class _OwnedDaemon:
             "stdout": _file_ref(self.artifact_dir / "stdout.bin"),
             "stderr": _file_ref(self.artifact_dir / "stderr.bin"),
             "remaining_owned_children": len(members),
+            "process_group_observed": group_observation,
+            "cleanup_errors": cleanup_errors,
         }
         _write_json(self.artifact_dir / "cleanup.json", self.cleanup)
         return self.cleanup
 
 
-def _group_members(process_group_id: int) -> list[int]:
+def _group_members(process_group_id: int) -> list[int] | None:
     """Return observed members of an owned process group when ps is available."""
 
     if os.name == "nt":
@@ -1080,7 +1455,7 @@ def _group_members(process_group_id: int) -> list[int]:
         text=True,
     )
     if result.returncode != 0:
-        return []
+        return None
     members = []
     for line in result.stdout.splitlines():
         fields = line.split()
@@ -1171,22 +1546,38 @@ def run_process(
     ended_monotonic = time.monotonic_ns()
     if process is not None and process_group_id is not None:
         members = _group_members(process_group_id)
+        group_observation = members is not None
+        if members is None:
+            members = []
         if members:
             _signal_group(process, signal.SIGTERM, process_group_id)
             deadline = time.monotonic() + timeout.terminate_seconds
-            while _group_members(process_group_id) and time.monotonic() < deadline:
+            while (_group_members(process_group_id) or []) and time.monotonic() < deadline:
                 time.sleep(0.01)
-            members = _group_members(process_group_id)
+            observed_members = _group_members(process_group_id)
+            if observed_members is None:
+                group_observation = False
+                members = []
+            else:
+                members = observed_members
             if members:
                 _signal_group(process, signal.SIGKILL, process_group_id)
                 deadline = time.monotonic() + timeout.kill_seconds
-                while _group_members(process_group_id) and time.monotonic() < deadline:
+                while (_group_members(process_group_id) or []) and time.monotonic() < deadline:
                     time.sleep(0.01)
-                members = _group_members(process_group_id)
+                observed_members = _group_members(process_group_id)
+                if observed_members is None:
+                    group_observation = False
+                    members = []
+                else:
+                    members = observed_members
         else:
             members = []
     else:
-        members = []
+        # Windows has no portable process-group enumeration in this runner;
+        # the owned Popen child has still been waited on, which is the
+        # strongest available cleanup observation there.
+        group_observation = os.name == "nt"
     stdout_ref = _write_bytes(artifact_dir / "stdout.bin", stdout)
     stderr_ref = _write_bytes(artifact_dir / "stderr.bin", stderr)
     if spawn_error:
@@ -1201,6 +1592,18 @@ def run_process(
     else:
         status = "error"
         reason = f"process exited with return code {returncode}"
+    cleanup_status = (
+        "unverified"
+        if detached_process_possible or not group_observation
+        else ("completed" if not members else "failed")
+    )
+    if cleanup_status != "completed" and status in ("completed", "error"):
+        status = "unknown"
+        reason = (
+            "process completed but runner-owned cleanup was not verified"
+            if cleanup_status == "unverified"
+            else "process result is unknown because owned process-group cleanup failed"
+        )
     process_record = {
         "argv": list(argv),
         "cwd": str(cwd),
@@ -1214,7 +1617,9 @@ def run_process(
         "status": status,
         "reason": reason,
         "detached_process_possible": detached_process_possible,
+        "process_root": environment.get("TRACEDECAY_COMPARISON_PROCESS_ROOT"),
         "remaining_owned_children": len(members),
+        "process_group_observed": group_observation,
     }
     process_ref = _write_json(artifact_dir / "process.json", process_record)
     return {
@@ -1226,7 +1631,7 @@ def run_process(
         "process": process_record,
         "process_artifact": process_ref,
         "cleanup": {
-            "status": "unverified" if detached_process_possible else ("completed" if not members else "unmeasured"),
+            "status": cleanup_status,
             "reason": (
                 "CLI may have contacted a daemon outside this process group"
                 if detached_process_possible
@@ -1279,6 +1684,8 @@ def _mcp_response(value: bytes, request_id: str) -> tuple[Any | None, str | None
 def _response_status(process_result: Mapping[str, Any], response: Any | None, parse_error: str | None) -> str:
     if process_result["status"] == "censored":
         return "censored"
+    if process_result["status"] == "unknown":
+        return "unknown"
     if response is None:
         return "unknown"
     return "completed" if process_result["status"] == "completed" else "error"
@@ -1298,6 +1705,7 @@ def _route_context(
     side_dir: Path,
     artifact_dir: Path,
     request_file: Path,
+    source_root: Path | None = None,
     bindings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     project_root = _owned_relative_path(
@@ -1311,6 +1719,10 @@ def _route_context(
     )
     for path in (project_root, profile_root, state_root):
         path.mkdir(parents=True, exist_ok=True)
+    process_root = (side_dir / "process").resolve()
+    process_root.mkdir(parents=True, exist_ok=True)
+    resolved_source_root = source_root.resolve() if source_root is not None else None
+    binary_root = binary.resolve().parent
     daemon_socket = _daemon_socket_path(side_dir)
     return {
         "binary": str(binary),
@@ -1320,6 +1732,10 @@ def _route_context(
         "project_root": str(project_root),
         "profile_root": str(profile_root),
         "state_root": str(state_root),
+        "source_root": str(resolved_source_root) if resolved_source_root is not None else None,
+        "binary_root": str(binary_root),
+        "process_root": str(process_root),
+        "store_root": str(profile_root),
         "daemon_socket": str(daemon_socket),
         "artifact_root": str(artifact_dir),
         "request_file": str(request_file),
@@ -1360,6 +1776,9 @@ def _environment(
                 / "global.db"
             ),
             "TRACEDECAY_COMPARISON_SIDE_ROOT": str(side_dir),
+            "TRACEDECAY_COMPARISON_PROCESS_ROOT": str(
+                (context or {}).get("process_root", side_dir / "process")
+            ),
             "TRACEDECAY_DAEMON_SOCKET": str(
                 (context or {}).get("daemon_socket", _daemon_socket_path(side_dir))
             ),
@@ -1450,6 +1869,7 @@ def _execute_side_action(
     timeouts: ProcessTimeouts,
     bindings: Mapping[str, Any] | None = None,
     owned_daemon: _OwnedDaemon | None = None,
+    source_root: Path | None = None,
 ) -> dict[str, Any]:
     route_id = action.get("route", action.get("operation"))
     route = _route_map(contract).get(route_id)
@@ -1459,6 +1879,7 @@ def _execute_side_action(
             "status": "invalid",
             "reason": f"unknown route {route_id!r}",
             "provider_contacted": False,
+            "composition_reached": False,
             "request_sent": False,
             "route": route_id,
             "response": None,
@@ -1475,8 +1896,11 @@ def _execute_side_action(
             "status": status,
             "reason": route.get(f"{side}_reason", route.get("reason", f"{side} route is {availability}")),
             "provider_contacted": False,
+            "composition_reached": False,
             "request_sent": False,
             "route": route_id,
+            "operation_kind": route.get("operation_kind"),
+            "effect_policy": _route_effect_policy(route),
             "request": request,
             "request_sha256": request_ref["sha256"],
             "response": None,
@@ -1494,6 +1918,7 @@ def _execute_side_action(
         side_dir=side_dir,
         artifact_dir=artifact_dir,
         request_file=request_path,
+        source_root=source_root,
         bindings=bindings,
     )
     rendered_request = _render(request, context)
@@ -1543,8 +1968,11 @@ def _execute_side_action(
         "process_status": process["status"],
         "reason": process.get("reason") or parse_error,
         "provider_contacted": None,
+        "composition_reached": None,
         "request_sent": True,
         "route": route_id,
+        "operation_kind": route.get("operation_kind"),
+        "effect_policy": _route_effect_policy(route),
         "entrypoint": entrypoint,
         "logical_request": copy.deepcopy(request),
         "request": rendered_request,
@@ -1555,16 +1983,112 @@ def _execute_side_action(
         "bindings": captured_bindings,
         "binding_errors": binding_errors,
         "composition_proof": action.get("composition_proof"),
+        "roots": {
+            "source_root": context.get("source_root"),
+            "binary_root": context.get("binary_root"),
+            "process_root": context.get("process_root"),
+            "store_root": context.get("store_root"),
+            "artifact_root": str(artifact_dir.resolve()),
+        },
         "daemon_identity": copy.deepcopy(owned_daemon.current_identity())
         if owned_daemon is not None
         else None,
         "process": process,
+        "cleanup": copy.deepcopy(process.get("cleanup")),
     }
     if binding_errors and status in ("completed", "error"):
         result["status"] = "unknown"
         result["reason"] = "declared output binding was absent: " + ", ".join(binding_errors)
     _write_json(artifact_dir / "result.json", result)
     return result
+
+
+def _effect_pointers(comparison: Mapping[str, Any]) -> dict[str, list[str]]:
+    return {
+        field: [str(pointer) for pointer in comparison.get(field, ())]
+        for field in (
+            "effect_json_pointers",
+            "receipt_json_pointers",
+            "state_json_pointers",
+            "no_effect_json_pointers",
+        )
+    }
+
+
+def _compare_operation_effects(
+    original: Mapping[str, Any],
+    product: Mapping[str, Any],
+    *,
+    comparison: Mapping[str, Any] | None,
+    route: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Enforce mutation receipts and explicit no-effect read evidence."""
+
+    policy = _route_effect_policy(route)
+    if policy not in ("required", "none", "retrieval"):
+        return None
+    if not isinstance(comparison, Mapping) or comparison.get("effect_mode") != policy:
+        return {
+            "status": "effect_unknown",
+            "reason": f"operation effect policy {policy!r} was not declared by the case",
+            "effect_policy": policy,
+        }
+    pointers = _effect_pointers(comparison)
+    if policy == "required":
+        fields = ("effect_json_pointers", "receipt_json_pointers", "state_json_pointers")
+    elif policy == "none":
+        fields = ("no_effect_json_pointers",)
+    else:
+        fields = (
+            ("effect_json_pointers",)
+            if pointers["effect_json_pointers"]
+            else ("no_effect_json_pointers",)
+        )
+    declared = [pointer for field in fields for pointer in pointers[field]]
+    if not declared:
+        return {
+            "status": "effect_unknown",
+            "reason": f"{policy} operation has no declared effect/no-effect observables",
+            "effect_policy": policy,
+        }
+    missing_original: list[str] = []
+    missing_product: list[str] = []
+    original_values: dict[str, Any] = {}
+    product_values: dict[str, Any] = {}
+    for pointer in declared:
+        left = json_pointer(original.get("response"), pointer)
+        right = json_pointer(product.get("response"), pointer)
+        if left is _MISSING:
+            missing_original.append(pointer)
+        else:
+            original_values[pointer] = copy.deepcopy(left)
+        if right is _MISSING:
+            missing_product.append(pointer)
+        else:
+            product_values[pointer] = copy.deepcopy(right)
+    if missing_original or missing_product:
+        return {
+            "status": "effect_unknown" if bool(missing_original) == bool(missing_product) else "fail",
+            "reason": "required operation effect/no-effect evidence was absent",
+            "effect_policy": policy,
+            "missing_original": missing_original,
+            "missing_product": missing_product,
+        }
+    if original_values != product_values:
+        return {
+            "status": "fail",
+            "reason": "operation effect/no-effect evidence differs",
+            "effect_policy": policy,
+            "original": original_values,
+            "product": product_values,
+        }
+    return {
+        "status": "pass",
+        "reason": f"{policy} operation effect policy was observed on both sides",
+        "effect_policy": policy,
+        "observed": original_values,
+        "effect_digest": json_digest(original_values),
+    }
 
 
 def compare_results(
@@ -1592,7 +2116,16 @@ def compare_results(
             "original_status": left_status,
             "product_status": right_status,
         }
-    if left_status in ("unsupported", "unknown", "invalid", "censored"):
+    if left_status in (
+        "unsupported",
+        "unknown",
+        "invalid",
+        "censored",
+        "cancelled",
+        "partial",
+        "effect_unknown",
+        "blocked",
+    ):
         return {
             "status": left_status,
             "reason": original.get("reason") or product.get("reason") or f"both sides reported {left_status}",
@@ -1657,7 +2190,18 @@ def _checkpoint_specs(action: Mapping[str, Any], phase: str) -> list[dict[str, A
 
 def _status_priority(statuses: Iterable[str]) -> str:
     observed = set(statuses)
-    order = ("fail", "invalid", "unknown", "censored", "unsupported", "pass")
+    order = (
+        "fail",
+        "invalid",
+        "blocked",
+        "effect_unknown",
+        "partial",
+        "cancelled",
+        "unknown",
+        "censored",
+        "unsupported",
+        "pass",
+    )
     for candidate in order:
         if candidate in observed:
             return candidate
@@ -1684,7 +2228,25 @@ def _pair_comparison(
                 "product_status": product.get("status"),
                 "product_leg": product.get("status"),
             }
-    return compare_results(original, product, comparison)
+    semantic = compare_results(original, product, comparison)
+    if semantic.get("status") != "pass":
+        return semantic
+    effect = _compare_operation_effects(
+        original,
+        product,
+        comparison=comparison,
+        route=route,
+    )
+    if effect is None:
+        return semantic
+    if effect.get("status") != "pass":
+        return {
+            **semantic,
+            "status": effect.get("status", "effect_unknown"),
+            "reason": effect.get("reason"),
+            "effect": effect,
+        }
+    return {**semantic, "effect": effect}
 
 
 def _run_pair_action(
@@ -1700,6 +2262,7 @@ def _run_pair_action(
     bindings: dict[str, dict[str, Any]],
     timeouts: ProcessTimeouts,
     daemons: Mapping[str, _OwnedDaemon] | None = None,
+    source_roots: Mapping[str, Path] | None = None,
 ) -> dict[str, Any]:
     action_id = action.get("id", action.get("action_id", "action"))
     side_results: dict[str, Any] = {}
@@ -1718,6 +2281,7 @@ def _run_pair_action(
             timeouts=timeouts,
             bindings=bindings[side],
             owned_daemon=(daemons or {}).get(side),
+            source_root=(source_roots or {}).get(side),
         )
         bindings[side].update(side_results[side].get("bindings", {}))
     route = _route_map(contract).get(action.get("route", action.get("operation")))
@@ -1744,6 +2308,7 @@ def _proof_result(result: Mapping[str, Any], proof: Mapping[str, Any], side: str
     if result.get("status") != "completed" or response is None:
         return {
             "status": "unknown",
+            "composition_reached": False,
             "reason": f"{side} composition proof did not return a completed response",
             "side_status": result.get("status"),
         }
@@ -1752,6 +2317,7 @@ def _proof_result(result: Mapping[str, Any], proof: Mapping[str, Any], side: str
     if missing:
         return {
             "status": "unknown",
+            "composition_reached": False,
             "reason": f"{side} composition proof omitted required observables",
             "missing": missing,
         }
@@ -1763,11 +2329,13 @@ def _proof_result(result: Mapping[str, Any], proof: Mapping[str, Any], side: str
     if mismatches:
         return {
             "status": "fail",
+            "composition_reached": False,
             "reason": f"{side} composition proof did not match its declared evidence",
             "mismatches": mismatches,
         }
     return {
         "status": "pass",
+        "composition_reached": True,
         "reason": f"{side} composition proof exposed all declared observables",
         "required_json_pointers": list(required),
         "equals": copy.deepcopy(dict(proof.get("equals", {}))),
@@ -1787,6 +2355,7 @@ def _lifecycle_close_observation(
     bindings: dict[str, Any],
     timeouts: ProcessTimeouts,
     owned_daemon: _OwnedDaemon | None,
+    source_root: Path | None = None,
 ) -> dict[str, Any]:
     mode = close_spec.get("mode")
     if mode == "process_exit":
@@ -1821,6 +2390,7 @@ def _lifecycle_close_observation(
         timeouts=timeouts,
         bindings=bindings,
         owned_daemon=owned_daemon,
+        source_root=source_root,
     )
     bindings.update(close_result.get("bindings", {}))
     exited = owned_daemon is not None and owned_daemon.wait_for_exit(timeouts.terminate_seconds)
@@ -1851,6 +2421,7 @@ def _run_case_inner(
     timeouts: ProcessTimeouts = ProcessTimeouts(),
     candidate_product_revision: str | None = None,
     daemons: Mapping[str, _OwnedDaemon] | None = None,
+    source_roots: Mapping[str, Path] | None = None,
 ) -> dict[str, Any]:
     validate_case(case, contract)
     case_id = case.get("id", case.get("case_id"))
@@ -1887,6 +2458,7 @@ def _run_case_inner(
                 timeouts=timeouts,
                 bindings=bindings[side],
                 owned_daemon=(daemons or {}).get(side),
+                source_root=(source_roots or {}).get(side),
             )
             bindings[side].update(result.get("bindings", {}))
             setup_rows[side].append({"id": setup["id"], "result": result})
@@ -1903,9 +2475,17 @@ def _run_case_inner(
             proof = proof_specs.get(side)
             if not isinstance(proof, Mapping):
                 if case.get("classification") == "host_extension" and side == "original":
-                    proof_rows[side] = {"status": "unknown", "reason": "no original counterpart is declared for host extension"}
+                    proof_rows[side] = {
+                        "status": "unknown",
+                        "composition_reached": False,
+                        "reason": "no original counterpart is declared for host extension",
+                    }
                     continue
-                proof_rows[side] = {"status": "invalid", "reason": "side-specific composition proof is missing"}
+                proof_rows[side] = {
+                    "status": "invalid",
+                    "composition_reached": False,
+                    "reason": "side-specific composition proof is missing",
+                }
                 comparison_statuses.append("invalid")
                 continue
             proof_checks = proof.get("checks")
@@ -1926,6 +2506,7 @@ def _run_case_inner(
                     timeouts=timeouts,
                     bindings=bindings[side],
                     owned_daemon=(daemons or {}).get(side),
+                    source_root=(source_roots or {}).get(side),
                 )
                 bindings[side].update(check_result.get("bindings", {}))
                 assessment = _proof_result(check_result, source_check, side)
@@ -1933,6 +2514,8 @@ def _run_case_inner(
             proof_status = _status_priority(row["assessment"]["status"] for row in check_rows)
             proof_rows[side] = {
                 "status": proof_status,
+                "composition_reached": bool(check_rows)
+                and all(row["assessment"].get("composition_reached") is True for row in check_rows),
                 "checks": check_rows,
             }
             comparison_statuses.append(proof_status)
@@ -1961,6 +2544,7 @@ def _run_case_inner(
                     bindings=bindings,
                     timeouts=timeouts,
                     daemons=daemons,
+                    source_roots=source_roots,
                 )
                 checkpoint_rows[phase].append({"id": checkpoint["id"], **checkpoint_result})
                 comparison_statuses.append(checkpoint_result["status"])
@@ -1977,6 +2561,7 @@ def _run_case_inner(
             bindings=bindings,
             timeouts=timeouts,
             daemons=daemons,
+            source_roots=source_roots,
         )
         action_result["checkpoints"] = checkpoint_rows
         checkpoint_rows["after"] = []
@@ -1997,6 +2582,7 @@ def _run_case_inner(
                 bindings=bindings,
                 timeouts=timeouts,
                 daemons=daemons,
+                source_roots=source_roots,
             )
             checkpoint_rows["after"].append({"id": checkpoint["id"], **checkpoint_result})
             comparison_statuses.append(checkpoint_result["status"])
@@ -2033,6 +2619,7 @@ def _run_case_inner(
                 bindings=bindings[side],
                 timeouts=timeouts,
                 owned_daemon=(daemons or {}).get(side),
+                source_root=(source_roots or {}).get(side),
             )
             comparison_statuses.append(close_rows[side]["status"])
         reopen_rows: dict[str, Any] = {}
@@ -2099,6 +2686,7 @@ def _run_case_inner(
                 timeouts=timeouts,
                 bindings=bindings[side],
                 owned_daemon=new_daemon,
+                source_root=(source_roots or {}).get(side),
             )
             bindings[side].update(reopen_result.get("bindings", {}))
             old_identity = old_daemon.identity or {}
@@ -2129,10 +2717,47 @@ def _run_case_inner(
                 "reopened_daemon": copy.deepcopy(new_identity),
             }
             comparison_statuses.append(reopen_rows[side]["status"])
+        reopen_comparison: dict[str, Any]
+        original_reopen = reopen_rows.get("original", {}).get("result")
+        product_reopen = reopen_rows.get("product", {}).get("result")
+        original_reopen_action = lifecycle["reopen"].get("original", {}).get("action")
+        product_reopen_action = lifecycle["reopen"].get("product", {}).get("action")
+        reopen_comparison_spec = (
+            original_reopen_action.get("comparison")
+            if isinstance(original_reopen_action, Mapping)
+            else None
+        )
+        if reopen_comparison_spec is None and isinstance(product_reopen_action, Mapping):
+            reopen_comparison_spec = product_reopen_action.get("comparison")
+        reopen_route = (
+            original_reopen_action.get("route", original_reopen_action.get("operation"))
+            if isinstance(original_reopen_action, Mapping)
+            else None
+        )
+        reopen_route_obj = _route_map(contract).get(reopen_route)
+        if not isinstance(original_reopen, Mapping) or not isinstance(product_reopen, Mapping):
+            reopen_comparison = {
+                "status": "unknown",
+                "reason": "reopen outputs were not produced on both sides",
+            }
+        elif reopen_comparison_spec is None:
+            reopen_comparison = {
+                "status": "effect_unknown",
+                "reason": "reopen outputs require an explicit paired comparison declaration",
+            }
+        else:
+            reopen_comparison = _pair_comparison(
+                original_reopen,
+                product_reopen,
+                comparison=reopen_comparison_spec,
+                route=reopen_route_obj,
+                case_classification=case.get("classification", "original_native"),
+            )
         lifecycle_rows = {
             "require_owned_close": bool(lifecycle.get("require_owned_close", True)),
             "close": close_rows,
             "reopen": reopen_rows,
+            "reopen_comparison": reopen_comparison,
         }
         if lifecycle_rows["require_owned_close"] and any(row["status"] != "pass" for row in close_rows.values()):
             lifecycle_rows["status"] = "unknown"
@@ -2140,6 +2765,9 @@ def _run_case_inner(
         elif any(row["status"] != "pass" for row in reopen_rows.values()):
             lifecycle_rows["status"] = "unknown"
             lifecycle_rows["reason"] = "a side did not complete its fresh-process reopen action"
+        elif reopen_comparison["status"] != "pass":
+            lifecycle_rows["status"] = _status_priority(("unknown", reopen_comparison["status"]))
+            lifecycle_rows["reason"] = "paired reopen outputs did not provide a comparative result"
         else:
             lifecycle_rows["status"] = "pass"
         comparison_statuses.append(lifecycle_rows["status"])
@@ -2169,6 +2797,7 @@ def _run_case_inner(
                     bindings=bindings,
                     timeouts=timeouts,
                     daemons=daemons,
+                    source_roots=source_roots,
                 )
             else:
                 reason = (
@@ -2196,14 +2825,28 @@ def _run_case_inner(
             )
             comparison_statuses.append(checkpoint_result["status"])
 
+    composition_reached = {
+        side: proof_rows.get(side, {}).get("composition_reached") is True
+        for side in SIDE_NAMES
+    }
     result = {
         "case_id": case_id,
         "classification": case.get("classification", "original_native"),
-        "status": _status_priority(comparison_statuses),
+        "status": _status_priority(
+            [*comparison_statuses]
+            + (["blocked"] if not all(composition_reached.values()) else [])
+        ),
         "reference_revision": REFERENCE_REVISION,
         "expected_product_revision": PRODUCT_REVISION,
         "product_source_revision": candidate_product_revision or "unknown",
+        "historical_audit": {
+            "reference_revision": HISTORICAL_REFERENCE_REVISION,
+            "product_revision": HISTORICAL_PRODUCT_REVISION,
+            "status": "historical-only; never used as an execution oracle",
+        },
         "composition": COMPOSITIONS,
+        "composition_reached": composition_reached,
+        "composition_blocked": not all(composition_reached.values()),
         "composition_evidence": proof_rows,
         "setup": setup_rows,
         "lifecycle": lifecycle_rows,
@@ -2220,6 +2863,168 @@ def _run_case_inner(
     return result
 
 
+def _side_operation_digest(
+    result: Mapping[str, Any],
+    side: str,
+    fields: Sequence[str],
+) -> str | None:
+    observations: list[dict[str, Any]] = []
+    for action in result.get("actions", ()):
+        if not isinstance(action, Mapping):
+            continue
+        side_result = action.get(side)
+        if not isinstance(side_result, Mapping):
+            continue
+        input_action = action.get("input", {})
+        comparison = input_action.get("comparison", {}) if isinstance(input_action, Mapping) else {}
+        if not isinstance(comparison, Mapping):
+            continue
+        pointers = [
+            pointer
+            for field in fields
+            for pointer in comparison.get(field, ())
+        ]
+        if not pointers:
+            continue
+        response = side_result.get("response")
+        values: dict[str, Any] = {}
+        for pointer in pointers:
+            value = json_pointer(response, pointer)
+            if value is _MISSING:
+                return None
+            values[pointer] = copy.deepcopy(value)
+        observations.append({"action_id": action.get("action_id"), "values": values})
+    return json_digest(observations) if observations else None
+
+
+def _build_attempt_ledger(
+    *,
+    result: Mapping[str, Any],
+    case: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    original_binary: Path,
+    product_binary: Path,
+    source_roots: Mapping[str, Path] | None,
+    attempt_id: str,
+    attempt_index: int,
+) -> dict[str, Any]:
+    """Materialize one complete append-only readiness attempt row.
+
+    Values that a process did not expose remain ``None`` or a typed evidence
+    object.  The row is still complete in shape, so an absent receipt/state
+    cannot be mistaken for a successful mutation.
+    """
+
+    original_binary_ref = verify_binary(original_binary, "original")
+    product_binary_ref = verify_binary(product_binary, "product")
+    roots = result.get("roots", {})
+    roots = roots if isinstance(roots, Mapping) else {}
+    profile_paths = {
+        side: copy.deepcopy(roots.get(side, {}))
+        for side in SIDE_NAMES
+    }
+    process_identity = result.get("daemon_runtime", {})
+    process_identity = process_identity if isinstance(process_identity, Mapping) else {}
+    actions = [
+        action
+        for action in result.get("actions", ())
+        if isinstance(action, Mapping)
+    ]
+    commands: dict[str, list[Any]] = {side: [] for side in SIDE_NAMES}
+    for action in actions:
+        for side in SIDE_NAMES:
+            side_result = action.get(side)
+            process = side_result.get("process", {}) if isinstance(side_result, Mapping) else {}
+            process_record = process.get("process", {}) if isinstance(process, Mapping) else {}
+            argv = process_record.get("argv") if isinstance(process_record, Mapping) else None
+            if isinstance(argv, list):
+                commands[side].append(copy.deepcopy(argv))
+    source_sha = {
+        "reference": REFERENCE_REVISION,
+        "candidate": result.get("product_source_revision") or "unknown",
+    }
+    scope_values = {
+        side: {
+            key: profile_paths[side].get(key)
+            for key in ("project_root", "profile_root", "state_root", "store_root")
+        }
+        for side in SIDE_NAMES
+    }
+    mutation_fields = ("effect_json_pointers", "receipt_json_pointers", "state_json_pointers")
+    no_effect_fields = ("no_effect_json_pointers",)
+    reopen = result.get("lifecycle", {})
+    reopen_value = reopen.get("reopen_comparison") if isinstance(reopen, Mapping) else None
+    actual = {
+        "status": result.get("status", "unknown"),
+        "action_statuses": {
+            str(action.get("action_id")): action.get("status") for action in actions
+        },
+    }
+    expected = copy.deepcopy(case.get("expected", {"outcome": "pass"}))
+    if not isinstance(expected, Mapping):
+        expected = {"value": expected}
+    row: dict[str, Any] = {
+        "actual": actual,
+        "attempt_id": attempt_id,
+        "attempt_index": attempt_index,
+        "candidate_binary_sha256": product_binary_ref["sha256"],
+        "candidate_process_identity": copy.deepcopy(process_identity.get("product")),
+        "candidate_store_identity": copy.deepcopy(profile_paths.get("product")),
+        "command": commands,
+        "composition_reached": copy.deepcopy(result.get("composition_reached", {side: False for side in SIDE_NAMES})),
+        "effect_digest": {
+            side: _side_operation_digest(result, side, mutation_fields)
+            for side in SIDE_NAMES
+        },
+        "evidence_paths": [str(result.get("artifact_directory", ""))],
+        "expected": expected,
+        "failure_class": None if result.get("status") == "pass" else result.get("reason", result.get("status")),
+        "feature_set": {
+            "reference": contract.get("baseline", {}).get("reference_features"),
+            "candidate": contract.get("baseline", {}).get("candidate_features"),
+        },
+        "first_causal_stage": None if result.get("status") == "pass" else "comparison",
+        "fixture_seed": json_digest(case.get("fixtures", {})),
+        "model_sha256": None,
+        "oracle_kind": "independent_570_candidate_production",
+        "outcome": result.get("status", "unknown") if result.get("status") in OUTCOME_STATUSES else "unknown",
+        "profile_paths": profile_paths,
+        "protocol_version": "native-original.v1",
+        "provider_id": "tracedecay.native",
+        "provider_implementation_sha256": None,
+        "receipt_digest": {
+            side: _side_operation_digest(result, side, ("receipt_json_pointers",))
+            for side in SIDE_NAMES
+        },
+        "reference_binary_sha256": original_binary_ref["sha256"],
+        "reference_process_identity": copy.deepcopy(process_identity.get("original")),
+        "reference_store_identity": copy.deepcopy(profile_paths.get("original")),
+        "reopen_or_no_effect": {
+            "reopen_comparison": copy.deepcopy(reopen_value),
+            "no_effect_digest": {
+                side: _side_operation_digest(result, side, no_effect_fields)
+                for side in SIDE_NAMES
+            },
+        },
+        "request_digest": json_digest(case),
+        "result_digest": json_digest(result),
+        "row_id": str(result.get("case_id", case.get("id", case.get("case_id")))),
+        "scope_digest": json_digest(scope_values),
+        "source_sha": source_sha,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "state_digest": {
+            side: _side_operation_digest(result, side, ("state_json_pointers",))
+            for side in SIDE_NAMES
+        },
+        "state_generation": None,
+        "state_schema_version": None,
+        "tokenizer_sha256": None,
+    }
+    missing = sorted(set(LEDGER_REQUIRED_FIELDS) - row.keys())
+    _require(not missing, "attempt ledger row is missing required fields: " + ", ".join(missing), RunnerError)
+    return row
+
+
 def run_case(
     case: Mapping[str, Any],
     *,
@@ -2229,6 +3034,9 @@ def run_case(
     case_artifact_dir: Path,
     timeouts: ProcessTimeouts = ProcessTimeouts(),
     candidate_product_revision: str | None = None,
+    source_roots: Mapping[str, Path] | None = None,
+    attempt_id: str | None = None,
+    attempt_index: int = 0,
 ) -> dict[str, Any]:
     """Run one case with a runner-owned foreground daemon per side."""
 
@@ -2240,6 +3048,7 @@ def run_case(
     product_dir.mkdir()
     daemons: dict[str, _OwnedDaemon] = {}
     daemon_cleanup: dict[str, Any] = {}
+    profile_roots: dict[str, Path] = {}
     result: dict[str, Any] | None = None
     failure: BaseException | None = None
     try:
@@ -2253,6 +3062,7 @@ def run_case(
                 field="profile_root",
                 default="profile",
             )
+            profile_roots[side] = profile_root
             daemons[side] = _OwnedDaemon.start(
                 side=side,
                 binary=binary,
@@ -2270,6 +3080,7 @@ def run_case(
             timeouts=timeouts,
             candidate_product_revision=candidate_product_revision,
             daemons=daemons,
+            source_roots=source_roots,
         )
     except BaseException as error:
         # Preserve the primary failure while still allowing the finally block
@@ -2317,6 +3128,22 @@ def run_case(
                 "daemon_cleanup": copy.deepcopy(daemon_cleanup),
                 "artifact_directory": str(case_artifact_dir),
             }
+            if attempt_id is not None:
+                try:
+                    failed_result["attempt_ledger"] = [
+                        _build_attempt_ledger(
+                            result=failed_result,
+                            case=case,
+                            contract=contract,
+                            original_binary=original_binary,
+                            product_binary=product_binary,
+                            source_roots=source_roots,
+                            attempt_id=attempt_id,
+                            attempt_index=attempt_index,
+                        )
+                    ]
+                except (RunnerError, OSError, TypeError, ValueError):
+                    failed_result["attempt_ledger"] = []
             try:
                 _write_json(case_artifact_dir / "case-result.json", failed_result)
             except (OSError, TypeError, ValueError):
@@ -2335,6 +3162,45 @@ def run_case(
         }
     else:
         result["daemon_cleanup"] = daemon_cleanup
+        result["roots"] = {
+            side: {
+                "source_root": str((source_roots or {}).get(side).resolve())
+                if (source_roots or {}).get(side) is not None
+                else None,
+                "binary_root": str(Path(binary).resolve().parent),
+                "process_root": str((side_dir / "process").resolve()),
+                "store_root": str(profile_roots[side]),
+                "artifact_root": str((case_artifact_dir / side).resolve()),
+            }
+            for side, binary, side_dir in (
+                ("original", original_binary, original_dir),
+                ("product", product_binary, product_dir),
+            )
+        }
+        cleanup_failures = {
+            side: copy.deepcopy(receipt)
+            for side, receipt in daemon_cleanup.items()
+            if receipt.get("status") != "completed"
+        }
+        if cleanup_failures:
+            result["status"] = _status_priority((result.get("status", "unknown"), "unknown"))
+            result["cleanup_failure"] = cleanup_failures
+            result["cleanup_failure_reason"] = (
+                "runner-owned process cleanup did not complete for one or more sides"
+            )
+        if attempt_id is not None:
+            result["attempt_ledger"] = [
+                _build_attempt_ledger(
+                    result=result,
+                    case=case,
+                    contract=contract,
+                    original_binary=original_binary,
+                    product_binary=product_binary,
+                    source_roots=source_roots,
+                    attempt_id=attempt_id,
+                    attempt_index=attempt_index,
+                )
+            ]
         _write_json(case_artifact_dir / "case-result.json", result)
     return result
 
@@ -2351,13 +3217,28 @@ def run_suite(
     timeouts: ProcessTimeouts = ProcessTimeouts(),
     run_id: str | None = None,
     product_source_revision: str | None = None,
+    product_source_root: str | os.PathLike[str] | None = None,
+    readiness_mode: str = "comparison",
 ) -> dict[str, Any]:
     validate_contract(contract)
     required = tuple(required_operations)
-    selected = select_relevant_cases(cases, required)
+    selected = validate_readiness_selection(
+        cases,
+        required,
+        readiness_mode=readiness_mode,
+    )
     for case in selected:
         validate_case(case, contract)
     reference = verify_reference_checkout(reference_checkout)
+    reference_source_root = Path(reference["path"]).resolve()
+    product_source = verify_source_root(
+        product_source_root or Path(__file__).resolve().parents[3],
+        side="product",
+        reference_root=reference_source_root,
+    )
+    product_source_revision = resolve_product_revision(
+        Path(product_source["path"]), product_source_revision
+    )
     original, product = verify_distinct_binaries(original_binary, product_binary)
     root = Path(artifact_root).expanduser()
     if not root.is_absolute():
@@ -2371,11 +3252,30 @@ def run_suite(
         "contract_id": contract["contract_id"],
         "run_id": token,
         "reference": reference,
+        "source_roots": {
+            "original": reference,
+            "product": product_source,
+        },
         "binaries": {"original": original, "product": product},
+        "binary_roots": {
+            "original": str(Path(original["path"]).resolve().parent),
+            "product": str(Path(product["path"]).resolve().parent),
+        },
         "expected_product_revision": PRODUCT_REVISION,
-        "product_source_revision": product_source_revision or "unknown",
+        "product_source_revision": product_source_revision,
+        "historical_audit": {
+            "reference_revision": HISTORICAL_REFERENCE_REVISION,
+            "product_revision": HISTORICAL_PRODUCT_REVISION,
+            "status": "historical-only; never used as an execution oracle",
+        },
         "selected_cases": [case.get("id", case.get("case_id")) for case in selected],
         "required_operations": sorted(set(required)),
+        "readiness": {
+            "mode": readiness_mode,
+            "matrix_id": READINESS_MATRIX_ID,
+            "accepted_route_set": sorted(READINESS_REQUIRED_ROUTES),
+            "filtered_suite_rejected": readiness_mode == "readiness" and bool(required),
+        },
         "timeouts": asdict(timeouts),
         "composition": COMPOSITIONS,
     }
@@ -2384,8 +3284,7 @@ def run_suite(
     for index, case in enumerate(selected):
         case_id = case.get("id", case.get("case_id"))
         case_dir = run_dir / f"{index:03d}-{_slug(str(case_id))}"
-        case_results.append(
-            run_case(
+        case_result = run_case(
                 case,
                 contract=contract,
                 original_binary=Path(original["path"]),
@@ -2393,7 +3292,22 @@ def run_suite(
                 case_artifact_dir=case_dir,
                 timeouts=timeouts,
                 candidate_product_revision=product_source_revision,
+                source_roots={
+                    "original": reference_source_root,
+                    "product": Path(product_source["path"]),
+                },
+                attempt_id=f"{token}/{index}",
+                attempt_index=index,
             )
+        case_results.append(case_result)
+        ledger_rows = case_result.get("attempt_ledger", ())
+        if not isinstance(ledger_rows, list) or not ledger_rows:
+            raise RunnerError(f"case {case_id} did not produce an attempt ledger row")
+        ledger_ref = _append_jsonl(run_dir / "attempts.jsonl", ledger_rows[0])
+        case_result["attempt_ledger_receipt"] = ledger_ref
+        _write_json(
+            case_dir / "attempt.json",
+            {"row": ledger_rows[0], "receipt": ledger_ref},
         )
     report = {
         **manifest,
@@ -2401,6 +3315,12 @@ def run_suite(
         "cases": case_results,
         "case_count": len(case_results),
         "artifact_directory": str(run_dir),
+        "attempt_ledger": [
+            row
+            for result in case_results
+            for row in result.get("attempt_ledger", ())
+        ],
+        "attempt_ledger_path": str(run_dir / "attempts.jsonl"),
     }
     _write_json(run_dir / "report.json", report)
     return report
@@ -2413,9 +3333,9 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     validate.add_argument("--cases", type=Path)
     validate.add_argument("--operation", action="append", default=[])
-    reference = subparsers.add_parser("verify-reference", help="verify an existing pristine b3 checkout")
+    validate.add_argument("--readiness-mode", choices=READINESS_MODES, default="comparison")
+    reference = subparsers.add_parser("verify-reference", help="verify an existing pristine 570 checkout")
     reference.add_argument("--checkout", type=Path, required=True)
-    reference.add_argument("--revision", default=REFERENCE_REVISION)
     run = subparsers.add_parser("run", aliases=["compare"], help="run cases against independent original and product binaries")
     run.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     run.add_argument("--cases", type=Path, required=True)
@@ -2424,13 +3344,24 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--product-binary", type=Path, required=True)
     run.add_argument("--artifact-root", type=Path, required=True)
     run.add_argument("--operation", action="append", default=[])
+    run.add_argument(
+        "--readiness-mode",
+        choices=READINESS_MODES,
+        default="comparison",
+        help="readiness rejects filtered or incomplete route suites; comparison permits focused cases",
+    )
     run.add_argument("--run-id")
     run.add_argument("--timeout-seconds", type=float, default=120.0)
     run.add_argument("--terminate-seconds", type=float, default=2.0)
     run.add_argument("--kill-seconds", type=float, default=2.0)
     run.add_argument(
         "--product-source-revision",
-        help="actual candidate source revision recorded in the run; omitted means unknown",
+        help="attested candidate source revision; omitted means read from --product-source-root",
+    )
+    run.add_argument(
+        "--product-source-root",
+        type=Path,
+        help="candidate checkout source root; defaults to the checkout containing runner.py",
     )
     return parser
 
@@ -2438,12 +3369,16 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "verify-reference":
-        print(json.dumps(verify_reference_checkout(args.checkout, args.revision), sort_keys=True))
+        print(json.dumps(verify_reference_checkout(args.checkout), sort_keys=True))
         return 0
     contract = load_contract(args.contract)
     if args.command == "validate":
         if args.cases:
-            cases = select_relevant_cases(load_cases(args.cases), args.operation)
+            cases = validate_readiness_selection(
+                load_cases(args.cases),
+                args.operation,
+                readiness_mode=args.readiness_mode,
+            )
             for case in cases:
                 validate_case(case, contract)
             print(json.dumps({"status": "pass", "cases": len(cases), "contract": contract["contract_id"]}, sort_keys=True))
@@ -2462,6 +3397,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         timeouts=ProcessTimeouts(args.timeout_seconds, args.terminate_seconds, args.kill_seconds),
         run_id=args.run_id,
         product_source_revision=args.product_source_revision,
+        product_source_root=args.product_source_root,
+        readiness_mode=args.readiness_mode,
     )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["status"] == "pass" else 2

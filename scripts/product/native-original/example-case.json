@@ -128,6 +128,7 @@
         "limit": 10
       },
       "comparison": {
+        "effect_mode": "retrieval",
         "semantic_json_pointers": [
           "/result/owner",
           "/result/hits",
@@ -137,6 +138,9 @@
         ],
         "required_json_pointers": [
           "/result/hits",
+          "/result/retrieval_telemetry"
+        ],
+        "effect_json_pointers": [
           "/result/retrieval_telemetry"
         ]
       },
@@ -169,6 +173,7 @@
         "id": "${bindings.fact_id}"
       },
       "comparison": {
+        "effect_mode": "none",
         "semantic_json_pointers": [
           "/result/fact/content",
           "/result/fact/category",
@@ -177,6 +182,9 @@
         "required_json_pointers": [
           "/result/fact/content",
           "/result/trust_history"
+        ],
+        "no_effect_json_pointers": [
+          "/result/fact"
         ],
         "identity_mappings": [
           {

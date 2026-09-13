@@ -96,6 +96,21 @@ def test_shared_binary_is_refused() -> None:
         )
 
 
+def test_shared_binary_root_is_refused() -> None:
+    with tempfile.TemporaryDirectory(prefix="native-original-binary-root-") as temporary:
+        root = Path(temporary)
+        original = root / "original"
+        product = root / "product"
+        original.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        product.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        original.chmod(0o755)
+        product.chmod(0o755)
+        expect_raises(
+            runner.BinaryError,
+            lambda: runner.verify_distinct_binaries(original, product),
+        )
+
+
 def test_modified_reference_checkout_is_refused() -> None:
     with tempfile.TemporaryDirectory(prefix="native-original-reference-") as temporary:
         checkout = Path(temporary)
@@ -106,10 +121,31 @@ def test_modified_reference_checkout_is_refused() -> None:
         subprocess.run(["git", "-C", str(checkout), "add", "source.txt"], check=True)
         subprocess.run(["git", "-C", str(checkout), "commit", "-q", "-m", "reference"], check=True)
         revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
-        verified = runner.verify_reference_checkout(checkout, revision)
-        assert verified["clean"] is True
-        (checkout / "source.txt").write_text("modified\n", encoding="utf-8")
-        expect_raises(runner.ReferenceError, lambda: runner.verify_reference_checkout(checkout, revision))
+        pinned_revision = runner.REFERENCE_REVISION
+        runner.REFERENCE_REVISION = revision
+        try:
+            verified = runner.verify_reference_checkout(checkout)
+            assert verified["clean"] is True
+            (checkout / "source.txt").write_text("modified\n", encoding="utf-8")
+            expect_raises(runner.ReferenceError, lambda: runner.verify_reference_checkout(checkout))
+        finally:
+            runner.REFERENCE_REVISION = pinned_revision
+
+
+def test_reference_revision_override_is_refused() -> None:
+    with tempfile.TemporaryDirectory(prefix="native-original-reference-override-") as temporary:
+        checkout = Path(temporary)
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "config", "user.email", "runner@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "config", "user.name", "runner"], check=True)
+        (checkout / "source.txt").write_text("alternate\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "source.txt"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "commit", "-q", "-m", "alternate"], check=True)
+        revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+        expect_raises(
+            runner.ReferenceError,
+            lambda: runner.verify_reference_checkout(checkout, expected_revision=revision),
+        )
 
 
 def test_zero_relevant_cases_and_missing_operation_coverage() -> None:
@@ -119,6 +155,58 @@ def test_zero_relevant_cases_and_missing_operation_coverage() -> None:
         runner.RunnerError,
         lambda: runner.select_relevant_cases(cases, ["fact_store_add", "fact_store_search"]),
     )
+
+
+def test_readiness_rejects_filtered_or_incomplete_suites() -> None:
+    expect_raises(
+        runner.RunnerError,
+        lambda: runner.validate_readiness_selection(
+            [{"id": "focused", "actions": [{"route": "fact_store_search"}]}],
+            ["fact_store_search"],
+            readiness_mode="readiness",
+        ),
+    )
+    expect_raises(
+        runner.RunnerError,
+        lambda: runner.validate_readiness_selection(
+            [{"id": "focused", "actions": [{"route": "fact_store_search"}]}],
+            readiness_mode="readiness",
+        ),
+    )
+
+
+def test_operation_effect_policy_is_typed() -> None:
+    route = {"id": "write", "operation_kind": "mutation", "effect_policy": "required"}
+    comparison = {
+        "effect_mode": "required",
+        "effect_json_pointers": ["/effect"],
+        "receipt_json_pointers": ["/receipt"],
+        "state_json_pointers": ["/state"],
+    }
+    original = {
+        "status": "completed",
+        "response": {"effect": "e", "receipt": "r", "state": 1},
+    }
+    product = {
+        "status": "completed",
+        "response": {"effect": "e", "receipt": "r", "state": 1},
+    }
+    result = runner._pair_comparison(
+        original,
+        product,
+        comparison=comparison,
+        route=route,
+        case_classification="original_native",
+    )
+    assert result["status"] == "pass", result
+    missing = runner._pair_comparison(
+        original,
+        product,
+        comparison={"semantic_json_pointers": []},
+        route=route,
+        case_classification="original_native",
+    )
+    assert missing["status"] == "effect_unknown", missing
 
 
 def test_child_process_is_bounded_and_group_is_cleaned() -> None:
@@ -158,6 +246,30 @@ def test_child_process_is_bounded_and_group_is_cleaned() -> None:
                 time.sleep(0.02)
             else:
                 raise AssertionError(f"owned child survived cleanup: {child_pid}")
+
+
+def test_cleanup_failure_cannot_complete_an_action() -> None:
+    with tempfile.TemporaryDirectory(prefix="native-original-cleanup-") as temporary:
+        root = Path(temporary)
+        script = root / "complete.py"
+        script.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        original_group_members = runner._group_members
+        original_signal_group = runner._signal_group
+        runner._group_members = lambda _group_id: [999999]
+        runner._signal_group = lambda *_args: False
+        try:
+            result = runner.run_process(
+                [sys.executable, str(script)],
+                cwd=root,
+                environment=dict(os.environ),
+                artifact_dir=root / "artifacts",
+                timeout=runner.ProcessTimeouts(0.1, 0.01, 0.01),
+            )
+        finally:
+            runner._group_members = original_group_members
+            runner._signal_group = original_signal_group
+        assert result["cleanup"]["status"] == "failed", result
+        assert result["status"] == "unknown", result
 
 
 def test_owned_daemon_publishes_and_cleans_identity() -> None:
@@ -225,9 +337,14 @@ def main() -> int:
         test_status_priority_materializes_iterable,
         test_missing_original_binary,
         test_shared_binary_is_refused,
+        test_shared_binary_root_is_refused,
         test_modified_reference_checkout_is_refused,
+        test_reference_revision_override_is_refused,
         test_zero_relevant_cases_and_missing_operation_coverage,
+        test_readiness_rejects_filtered_or_incomplete_suites,
+        test_operation_effect_policy_is_typed,
         test_child_process_is_bounded_and_group_is_cleaned,
+        test_cleanup_failure_cannot_complete_an_action,
         test_owned_daemon_publishes_and_cleans_identity,
     ]
     for test in tests:

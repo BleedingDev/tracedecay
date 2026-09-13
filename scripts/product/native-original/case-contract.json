@@ -3,27 +3,37 @@
   "$id": "tracedecay.native-original.case-contract.v1",
   "format": "tracedecay.native-original.case-contract.v1",
   "contract_id": "tracedecay.native-original.case-contract.v1",
-  "status": "proposed",
-  "title": "Proposed direct original Native versus product Native comparison cases",
-  "purpose": "Run corresponding original production operations against independent b3 and product state and preserve the observable result, effect, and failure evidence.",
+  "status": "accepted",
+  "title": "Direct original Native versus current product Native comparison cases",
+  "purpose": "Run corresponding original production operations against independent 570 and current candidate state and preserve the observable result, effect, and failure evidence.",
   "baseline": {
-    "reference_revision": "b3b43410e47115056f2066449aafa1822bbb6049",
-    "product_revision": "571daf3a9612e5247443e4da3a107b542686c1ef",
-    "reference_checkout": ".worktrees/native-original-reference-b3",
-    "reference_checkout_policy": "existing_checkout_only; exact_revision_and_clean_git_required; runner_never_creates_or_modifies_it",
-    "source_policy": "the reference source is read-only; the runner does not copy original implementation code or responses"
+    "reference_revision": "57006f60cb45bcee8487e73a40d4fad1a12ee2b6",
+    "product_revision": "current",
+    "reference_checkout": ".worktrees/native-original-reference-57006f60",
+    "reference_checkout_policy": "detached_checkout; create_only_when_absent; exact_revision_and_clean_git_required; runner_never_resets_or_deletes_existing_checkout",
+    "reference_features": "test-transport",
+    "candidate_features": "test-transport",
+    "build_command": "cargo build -p tracedecay-cli --bin tracedecay --features test-transport",
+    "memory_provider_host": false,
+    "source_policy": "the reference source is read-only; the runner does not copy original implementation code, algorithms, or responses",
+    "historical_audit": {
+      "reference_revision": "b3b43410e47115056f2066449aafa1822bbb6049",
+      "product_revision": "571daf3a9612e5247443e4da3a107b542686c1ef",
+      "status": "historical-only; retained for audit context and never used as an execution oracle"
+    }
   },
   "runner": {
     "module": "scripts/product/native-original/runner.py",
     "validation_command": "python3 -S scripts/product/native-original/runner.py validate --contract scripts/product/native-original/case-contract.json --cases <cases.json>",
-      "comparison_command": "python3 -S scripts/product/native-original/runner.py run --contract scripts/product/native-original/case-contract.json --cases <cases.json> --reference-checkout <b3-checkout> --original-binary <b3-binary> --product-binary <product-binary> --product-source-revision <candidate-revision> --artifact-root <artifact-root>",
-      "invocation": {
+    "comparison_command": "python3 -S scripts/product/native-original/runner.py run --contract scripts/product/native-original/case-contract.json --cases <cases.json> --reference-checkout <570-checkout> --original-binary <570-binary> --product-binary <product-binary> --product-source-root <candidate-source> --product-source-revision <candidate-revision> --artifact-root <artifact-root>",
+    "invocation": {
       "same_logical_input": "the request, operation identity, owner and scope fields are equal on both sides; only binary, process, physical state paths and capture paths differ",
       "separate_state": "the runner allocates original/<case> and product/<case> state roots and never copies a database, WAL, journal, receipt, or post-run state between sides",
       "production_boundary": "supported cases invoke an existing tracedecay CLI tool or MCP tools/call route; an external argv is allowed only when the original route is not CLI-exposed and is recorded as such",
-        "reopen": "case authors request explicit after and reopened checkpoints; the runner executes reopened checkpoints only after verified owned close and a fresh daemon authority identity",
-      "reference_guard": "verify-reference runs before any case and refuses an absent, differently pinned, or dirty reference checkout",
-      "candidate_identity": "the product binary SHA-256 is always captured; the actual candidate source revision is supplied by --product-source-revision and remains unknown when the build owner cannot attest it; the audited head is recorded only as expected_product_revision"
+      "reopen": "case authors request explicit after and reopened checkpoints; the runner executes reopened checkpoints only after verified owned close and a fresh daemon authority identity",
+      "reference_guard": "verify-reference runs before any case and refuses an absent, differently pinned, or dirty 570 reference checkout",
+      "candidate_identity": "the product binary SHA-256, source root, and actual candidate source revision are captured; --product-source-revision overrides the source-root Git revision when the build owner provides an attestation; current is a moving contract label, not a historical commit pin",
+      "root_isolation": "source, binary, process, store, project, profile, state, socket, and artifact roots are side-specific and retained in the run and case manifests"
     },
     "entrypoints": {
       "cli_tool": {
@@ -65,7 +75,11 @@
         "unknown",
         "unsupported",
         "invalid",
-        "censored"
+        "censored",
+        "cancelled",
+        "partial",
+        "effect_unknown",
+        "blocked"
       ],
       "pass": "both sides produced parseable semantic results that agree after only the case-declared reviewed JSON pointer projection",
       "fail": "the corresponding side status, semantic result, score/order/provenance, durable effect, receipt, or checkpoint differs",
@@ -73,24 +87,97 @@
       "unsupported": "the route is explicitly unavailable at the selected boundary on both sides; no process or successful empty result is substituted",
       "invalid": "the case or request violates this contract; invalid input is retained outside the parity denominator",
       "censored": "the process or host action reached its declared cutoff before a terminal result; elapsed-at-cutoff and raw streams remain evidence",
+      "cleanup_failure": "owned process or daemon cleanup was not verified; the operation is unknown even when its response was parseable",
       "errors": "a typed production error is compared as a semantic result when both sides expose one; process nonzero alone never becomes success",
       "unknown_is_not_success": true,
       "unsupported_is_not_empty_success": true,
       "canned_original_results_forbidden": true,
-      "provider_contact_unverified": "a child process being spawned does not prove provider contact; only a case-declared composition proof response can establish the selected boundary"
+      "provider_contact_unverified": "a child process being spawned does not prove provider contact; only a case-declared composition proof response can establish the selected boundary",
+      "same_identity_rejected": "same binary digest/root, same source root, or unverified process/store ownership cannot form a comparison pair",
+      "matrix_outcomes": "cancelled, partial, effect_unknown, and blocked remain typed outcomes; they are never collapsed into pass or an empty response"
     },
     "capture": {
       "request": "request.json contains the exact canonical JSON request sent to the selected route and its SHA-256",
       "stdout": "stdout.bin preserves every byte emitted by the child",
       "stderr": "stderr.bin preserves every diagnostic byte emitted by the child",
-      "process": "process.json records argv, cwd, process identity, process group, return code, cutoff, and remaining owned children",
-      "side_state": "side state and case-owned project/profile roots are recorded in the run manifest; state probes are captured as explicit checkpoints",
+      "process": "process.json records argv, cwd, process identity, process group, process root, return code, cutoff, cleanup status, and remaining owned children",
+      "side_state": "side-specific source, binary, process, store, project, profile, state, socket, and artifact roots are recorded in the run and case manifests; state probes are captured as explicit checkpoints",
       "comparison": "comparison is over parsed semantic responses and selected state probes; raw payloads, source refs, receipts, and all stream artifacts remain alongside it",
       "composition": "case-level side-specific proof actions must expose required JSON pointers and optional exact values; a spawned process or hardcoded label is not contact/composition evidence",
       "bindings": "output_bindings are response-pointer captures scoped independently to original and product; missing bindings are unknown and never substituted",
       "lifecycle": "lifecycle.close and lifecycle.reopen evidence records runner-owned daemon identity, endpoint, profile, process exit, and a fresh authority identity; a completed close child response alone is insufficient",
       "artifact_layout": "<artifact-root>/<run-id>/<case-index>-<case-id>/{original,product}/actions/<action-id> and checkpoints/<checkpoint-id>/<original,product>",
       "overwrite_policy": "new run and case directories are created exclusively; an existing artifact directory is refused so a failed run cannot be replaced"
+    },
+    "ledger": {
+      "storage": "append-only JSONL",
+      "path": "<artifact-root>/<run-id>/attempts.jsonl",
+      "outcome_enum": [
+        "pass",
+        "fail",
+        "unknown",
+        "unsupported",
+        "invalid",
+        "censored",
+        "cancelled",
+        "partial",
+        "effect_unknown",
+        "blocked"
+      ],
+      "required_fields": [
+        "actual",
+        "attempt_id",
+        "attempt_index",
+        "candidate_binary_sha256",
+        "candidate_process_identity",
+        "candidate_store_identity",
+        "command",
+        "composition_reached",
+        "effect_digest",
+        "evidence_paths",
+        "expected",
+        "failure_class",
+        "feature_set",
+        "first_causal_stage",
+        "fixture_seed",
+        "model_sha256",
+        "oracle_kind",
+        "outcome",
+        "profile_paths",
+        "protocol_version",
+        "provider_id",
+        "provider_implementation_sha256",
+        "receipt_digest",
+        "reference_binary_sha256",
+        "reference_process_identity",
+        "reference_store_identity",
+        "reopen_or_no_effect",
+        "request_digest",
+        "result_digest",
+        "row_id",
+        "scope_digest",
+        "source_sha",
+        "started_at",
+        "state_digest",
+        "state_generation",
+        "state_schema_version",
+        "tokenizer_sha256"
+      ],
+      "rules": [
+        "skipped, blocked, fallback-only, evidence-missing and unexplained are not pass",
+        "record first causal stage before any downstream symptom",
+        "reference and candidate artifacts are independently hashed",
+        "composition_reached=false is blocked/unknown",
+        "mutations require effect, receipt and state evidence; reads require explicit no-effect evidence",
+        "process and store identities are distinct from binary identities"
+      ]
+    },
+    "readiness": {
+      "matrix_id": "native-ncm-semantic-readiness.v1",
+      "modes": ["comparison", "readiness"],
+      "filtered_suite_policy": "reject_as_readiness_evidence",
+      "readiness_mode": "requires the complete accepted Native, session/LCM, and host-extension route set; --operation is rejected",
+      "comparison_mode": "permits focused cases for development but does not claim readiness"
     }
   },
   "case_schema": {
@@ -114,7 +201,7 @@
       "state_root": "test-owned relative state directory, default state",
       "fixtures": "logical seed values and expected semantic assertions; no post-run state copied from either side",
       "side_setup": {
-        "original": "optional list of setup actions executed only against the immutable b3 binary",
+        "original": "optional list of setup actions executed only against the immutable 570 binary",
         "product": "optional list of setup actions executed only against the selected product binary",
         "purpose": "public route setup/configuration and independent seed creation; setup output and bindings are retained"
       },
@@ -151,7 +238,13 @@
             "composition_proof": "optional inline proof metadata; prefer the case-level side-specific composition_proof hook",
             "comparison": {
               "semantic_json_pointers": "optional reviewed projection paths; missing paths remain explicit missing values",
-              "ignore_json_pointers": "optional reviewed nondeterministic paths only; raw responses still retain them"
+              "ignore_json_pointers": "optional reviewed nondeterministic paths only; raw responses still retain them",
+              "effect_mode": "required, none, or retrieval; must match the route operation kind",
+              "effect_json_pointers": "effect observables required for mutations or retrieval side effects",
+              "receipt_json_pointers": "durable receipt observables required for mutations",
+              "state_json_pointers": "state generation/digest observables required for mutations",
+              "no_effect_json_pointers": "explicit read/no-mutation observables required for read routes",
+              "reopen_or_no_effect_json_pointers": "reopen or no-effect evidence selected by the case"
             },
             "checkpoints": {
               "before": "optional read/state operations executed before this action",
@@ -164,9 +257,9 @@
     }
   },
   "route_semantics": {
-    "original_native": "corresponding b3 Native operation through the direct retained production boundary; compare canonical payload, score/order, effect, receipt, and reopened state",
-    "session_lcm": "corresponding b3 session/LCM operation through canonical host/session/LCM services; compare coverage, omissions, cursors, raw/payload authority, lineage, effects, and reopened state",
-    "host_extension": "current product host/storage safety behavior with no fabricated b3 counterpart; original availability is unknown or unsupported and the result is classified separately",
+    "original_native": "corresponding 570 Native operation through the direct retained production boundary; compare canonical payload, score/order, effect, receipt, and reopened state",
+    "session_lcm": "corresponding 570 session/LCM operation through canonical host/session/LCM services; compare coverage, omissions, cursors, raw/payload authority, lineage, effects, and reopened state",
+    "host_extension": "current product host/storage safety behavior with no fabricated 570 counterpart; original availability is unknown or unsupported and the result is classified separately",
     "state_regression": "saved-data, owner, cursor, locator, or restart evidence; classify an absent original counterpart as unknown rather than claiming parity"
   },
   "routes": [
@@ -174,6 +267,7 @@
       "id": "fact_store_add",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1::project or ::profile -> FactStoreAdd",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_add"}, "mcp_stdio": {"tool": "tracedecay_fact_store_add"}}
@@ -182,6 +276,7 @@
       "id": "fact_store_search",
       "classification": "original_native",
       "operation_kind": "explicit_search",
+      "effect_policy": "retrieval",
       "direct_boundary": "DirectRetainedMemoryPortV1::project or ::profile -> FactStoreSearch",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_search"}, "mcp_stdio": {"tool": "tracedecay_fact_store_search"}}
@@ -190,6 +285,7 @@
       "id": "fact_store_probe",
       "classification": "original_native",
       "operation_kind": "semantic_read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreProbe",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_probe"}, "mcp_stdio": {"tool": "tracedecay_fact_store_probe"}}
@@ -198,6 +294,7 @@
       "id": "fact_store_related",
       "classification": "original_native",
       "operation_kind": "semantic_read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreRelated",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_related"}, "mcp_stdio": {"tool": "tracedecay_fact_store_related"}}
@@ -206,6 +303,7 @@
       "id": "fact_store_reason",
       "classification": "original_native",
       "operation_kind": "semantic_read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreReason",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_reason"}, "mcp_stdio": {"tool": "tracedecay_fact_store_reason"}}
@@ -214,6 +312,7 @@
       "id": "fact_store_contradict",
       "classification": "original_native",
       "operation_kind": "semantic_read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreContradict",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_contradict"}, "mcp_stdio": {"tool": "tracedecay_fact_store_contradict"}}
@@ -222,6 +321,7 @@
       "id": "fact_store_get",
       "classification": "original_native",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreGet plus feedback history",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_get"}, "mcp_stdio": {"tool": "tracedecay_fact_store_get"}}
@@ -230,6 +330,7 @@
       "id": "fact_store_update",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreUpdate",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_update"}, "mcp_stdio": {"tool": "tracedecay_fact_store_update"}}
@@ -238,6 +339,7 @@
       "id": "fact_store_remove",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreRemove",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_remove"}, "mcp_stdio": {"tool": "tracedecay_fact_store_remove"}}
@@ -246,6 +348,7 @@
       "id": "fact_store_supersede",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreSupersede",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_supersede"}, "mcp_stdio": {"tool": "tracedecay_fact_store_supersede"}}
@@ -254,6 +357,7 @@
       "id": "fact_store_list",
       "classification": "original_native",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreList",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_list"}, "mcp_stdio": {"tool": "tracedecay_fact_store_list"}}
@@ -262,6 +366,7 @@
       "id": "fact_feedback",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "MemoryApplication feedback route -> canonical fact feedback",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_feedback"}, "mcp_stdio": {"tool": "tracedecay_fact_feedback"}}
@@ -270,6 +375,7 @@
       "id": "memory_status",
       "classification": "original_native",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> MemoryStatus",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_memory_status"}, "mcp_stdio": {"tool": "tracedecay_memory_status"}}
@@ -278,15 +384,17 @@
       "id": "configuration_get",
       "classification": "host_extension",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "configuration registry resolved setting -> tracedecay_configuration_get",
       "availability": {"original": "unknown", "product": "supported"},
-      "original_reason": "the b3 reference does not provide a Native provider selection status boundary",
+      "original_reason": "the 570 reference does not provide a Native provider selection status boundary",
       "entrypoints": {"cli_tool": {"tool": "tracedecay_configuration_get"}, "mcp_stdio": {"tool": "tracedecay_configuration_get"}}
     },
     {
       "id": "fact_store_curate",
       "classification": "original_native",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "owner-bound curation application -> FactStoreCurate",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_curate"}, "mcp_stdio": {"tool": "tracedecay_fact_store_curate"}}
@@ -295,14 +403,25 @@
       "id": "session_lookup",
       "classification": "session_lcm",
       "operation_kind": "temporal_read",
+      "effect_policy": "none",
       "direct_boundary": "SessionRetrievalService::retrieve through the retained session lookup",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_session_lookup"}, "mcp_stdio": {"tool": "tracedecay_session_lookup"}}
     },
     {
+      "id": "message_search",
+      "classification": "session_lcm",
+      "operation_kind": "read",
+      "effect_policy": "none",
+      "direct_boundary": "public retained message_search lookup through canonical session authority",
+      "availability": {"original": "supported", "product": "supported"},
+      "entrypoints": {"cli_tool": {"tool": "tracedecay_message_search"}, "mcp_stdio": {"tool": "tracedecay_message_search"}}
+    },
+    {
       "id": "sessions_for",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained sessions-for lookup through canonical session authority",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_sessions_for"}, "mcp_stdio": {"tool": "tracedecay_sessions_for"}}
@@ -311,6 +430,7 @@
       "id": "session_refresh_begin",
       "classification": "session_lcm",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "SessionRefreshService::begin_or_join",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_begin"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_begin"}}
@@ -319,6 +439,7 @@
       "id": "session_refresh_status",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "SessionRefreshService::status",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_status"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_status"}}
@@ -327,6 +448,7 @@
       "id": "session_refresh_cancel",
       "classification": "session_lcm",
       "operation_kind": "mutation",
+      "effect_policy": "required",
       "direct_boundary": "SessionRefreshService::cancel",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_cancel"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_cancel"}}
@@ -335,6 +457,7 @@
       "id": "lcm_load_session",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM LoadSession query and canonical hydration",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_load_session"}, "mcp_stdio": {"tool": "tracedecay_lcm_load_session"}}
@@ -343,6 +466,7 @@
       "id": "lcm_grep",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM Grep query",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_grep"}, "mcp_stdio": {"tool": "tracedecay_lcm_grep"}}
@@ -351,6 +475,7 @@
       "id": "lcm_describe",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM Describe query",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_describe"}, "mcp_stdio": {"tool": "tracedecay_lcm_describe"}}
@@ -359,6 +484,7 @@
       "id": "lcm_expand",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM Expand query with payload verification",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_expand"}, "mcp_stdio": {"tool": "tracedecay_lcm_expand"}}
@@ -367,6 +493,7 @@
       "id": "lcm_expand_query",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM ExpandQuery synthesis",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_expand_query"}, "mcp_stdio": {"tool": "tracedecay_lcm_expand_query"}}
@@ -375,6 +502,7 @@
       "id": "lcm_status",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM Status",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_status"}, "mcp_stdio": {"tool": "tracedecay_lcm_status"}}
@@ -383,43 +511,39 @@
       "id": "lcm_doctor",
       "classification": "session_lcm",
       "operation_kind": "read",
+      "effect_policy": "none",
       "direct_boundary": "retained LCM Doctor",
       "availability": {"original": "supported", "product": "supported"},
       "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_doctor"}, "mcp_stdio": {"tool": "tracedecay_lcm_doctor"}}
     },
     {
-      "id": "lcm_compress",
-      "classification": "session_lcm",
-      "operation_kind": "mutation",
-      "direct_boundary": "retained LCM Compact/Compress authority",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_compress"}, "mcp_stdio": {"tool": "tracedecay_lcm_compress"}}
-    },
-    {
       "id": "host_sealed_source_admission",
       "classification": "host_extension",
       "operation_kind": "host_extension",
+      "effect_policy": "required",
       "direct_boundary": "current sealed Codex source admission and canonical transcript transaction",
       "availability": {"original": "unknown", "product": "external_harness"},
-      "original_reason": "b3 has no counterpart for the product's sealed live-origin extension; compare only in a separately classified product regression fixture",
+      "original_reason": "570 has no counterpart for the product's sealed live-origin extension; compare only in a separately classified product regression fixture",
       "entrypoints": {"command": {"argv_template": ["${binary}"]}}
     },
     {
       "id": "host_cursor_and_locator_regression",
       "classification": "host_extension",
       "operation_kind": "host_extension",
+      "effect_policy": "required",
       "direct_boundary": "current transcript cursor CAS and live locator transaction",
       "availability": {"original": "unknown", "product": "external_harness"},
-      "original_reason": "b3 counterpart is not exposed at this host storage extension boundary",
+      "original_reason": "570 counterpart is not exposed at this host storage extension boundary",
       "entrypoints": {"command": {"argv_template": ["${binary}"]}}
     },
     {
       "id": "original_route_unavailable",
       "classification": "unsupported",
       "operation_kind": "coverage_gap",
+      "effect_policy": "unknown",
       "direct_boundary": "the exact original operation boundary must be supplied by a later external harness",
       "availability": {"original": "unknown", "product": "unknown"},
-      "original_reason": "no callable original production route was identified; retain this as unknown coverage",
+      "original_reason": "no callable 570 production route was identified; retain this as unknown coverage",
       "entrypoints": {}
     }
   ],
