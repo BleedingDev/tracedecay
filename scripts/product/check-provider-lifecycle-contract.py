@@ -51,6 +51,37 @@ COMMON_FIELDS = [
     "extensions",
 ]
 
+FEEDBACK_TARGET_KINDS = [
+    "stable_memory_ref",
+    "retained_source_locator",
+    "recall_trace_ref",
+    "context_pack_item_ref",
+]
+
+CORRECTION_TARGET_KINDS = [
+    "stable_memory_ref",
+    "retained_source_locator",
+    "recall_trace_ref",
+    "source_ref",
+]
+
+TARGET_SCHEMA_MAPPING = {
+    "feedback": "provider-lifecycle-contract.schema.json#/$defs/feedbackTarget",
+    "correction": "provider-lifecycle-contract.schema.json#/$defs/correctionTarget",
+    "shared_lifecycle": "provider-lifecycle-contract.schema.json#/$defs/lifecycleTarget",
+}
+
+REFERENCE_VALUE_SCHEMA = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 1024,
+    "pattern": r"^\S(?:[^\u0000-\u001f\u007f]*\S)?$",
+}
+
+CORRECTION_REFERENCE_VALUE_REF = (
+    "#/$defs/lifecycleTargetReference/properties/reference"
+)
+
 CAPABILITIES = {
     "provider.health.v1": ("tracedecay.memory.provider.health.v1", "mandatory"),
     "feedback.record.v1": ("tracedecay.memory.provider.feedback.v1", "optional"),
@@ -121,6 +152,7 @@ REQUIRED_DOC_PHRASES = [
     "Missing optional behavior returns the typed `capability_unsupported` result",
     "targets exactly one of",
     "a stable provider memory reference",
+    "an opaque retained source locator",
     "a recall trace reference",
     "a context-pack item reference",
     "Maintenance tasks are consolidate, decay, prune-expired, validate-state, repair, and compact",
@@ -534,11 +566,7 @@ def validate_feedback(contract: dict[str, Any], errors: list[str]) -> None:
     exact_keys(target, target_keys, "feedback.target", errors)
     if target.get("selection_rule") != "exactly_one":
         errors.append("feedback target must select exactly one kind")
-    if target.get("target_kinds") != [
-        "stable_memory_ref",
-        "recall_trace_ref",
-        "context_pack_item_ref",
-    ]:
+    if target.get("target_kinds") != FEEDBACK_TARGET_KINDS:
         errors.append("feedback target kinds drifted")
     if target.get("stable_memory_ref_required") is not False:
         errors.append("feedback stable memory ref must remain optional")
@@ -697,11 +725,7 @@ def validate_correction_deletion(
         errors.append("correction capability ID drifted")
     if correction.get("target_selection_rule") != "exactly_one":
         errors.append("correction target must select exactly one kind")
-    if correction.get("target_kinds") != [
-        "stable_memory_ref",
-        "recall_trace_ref",
-        "source_ref",
-    ]:
+    if correction.get("target_kinds") != CORRECTION_TARGET_KINDS:
         errors.append("correction target kinds drifted")
     if correction.get("expected_target_revision_required") is not True:
         errors.append("correction expected target revision must be required")
@@ -1040,6 +1064,77 @@ def validate_schema(schema: dict[str, Any], errors: list[str]) -> None:
         errors.append("lifecycle schema must require twenty-five terminal states")
     if properties.get("invariants", {}).get("minItems") != 15:
         errors.append("lifecycle schema must require fifteen invariants")
+    definitions = schema.get("$defs", {})
+
+    if definitions.get("feedbackTarget") != {
+        "$ref": "#/$defs/lifecycleTarget"
+    }:
+        errors.append("feedbackTarget must be an exact lifecycleTarget alias")
+
+    def resolve_local(name: str) -> dict[str, Any]:
+        definition = definitions.get(name, {})
+        if not isinstance(definition, dict):
+            return {}
+        reference = definition.get("$ref")
+        if reference == "#/$defs/lifecycleTargetReference":
+            target = definitions.get("lifecycleTargetReference", {})
+            return target if isinstance(target, dict) else {}
+        return definition
+
+    for name, expected in (
+        ("lifecycleTargetReference", FEEDBACK_TARGET_KINDS),
+        ("feedbackTargetReference", FEEDBACK_TARGET_KINDS),
+        ("correctionTargetReference", CORRECTION_TARGET_KINDS),
+    ):
+        reference = resolve_local(name)
+        reference_properties = reference.get("properties", {})
+        kind_schema = reference_properties.get("kind", {})
+        reference_schema = reference_properties.get("reference", {})
+        if (
+            reference.get("type") != "object"
+            or reference.get("additionalProperties") is not False
+            or reference.get("required") != ["kind", "reference"]
+            or kind_schema.get("type") != "string"
+            or kind_schema.get("enum") != expected
+        ):
+            if name == "lifecycleTargetReference":
+                errors.append("lifecycle target reference kinds drifted")
+            else:
+                errors.append(f"{name} kinds or shape drifted")
+        if kind_schema.get("type") != "string":
+            errors.append(f"{name} kind type must be string")
+        if name == "lifecycleTargetReference" and reference_schema != REFERENCE_VALUE_SCHEMA:
+            errors.append("lifecycle target reference value schema drifted")
+        if (
+            name == "correctionTargetReference"
+            and reference_schema.get("$ref") != CORRECTION_REFERENCE_VALUE_REF
+        ):
+            errors.append("correctionTargetReference reference mapping drifted")
+
+    for name, reference_name in (
+        ("lifecycleTarget", "feedbackTargetReference"),
+        ("feedbackTarget", "feedbackTargetReference"),
+        ("correctionTarget", "correctionTargetReference"),
+    ):
+        target = resolve_local(name)
+        if name == "feedbackTarget":
+            target = resolve_local("lifecycleTarget")
+        if (
+            target.get("type") != "object"
+            or target.get("additionalProperties") is not False
+            or target.get("required")
+            != [
+                "provider_id",
+                "registration_revision",
+                "original_scope",
+                "delivery_scope",
+                "source",
+                "reference",
+            ]
+            or target.get("properties", {}).get("reference", {}).get("$ref")
+            != f"#/$defs/{reference_name}"
+        ):
+            errors.append(f"{name} target schema mapping drifted")
 
 
 def validate_doc(path: Path, errors: list[str]) -> None:
@@ -1107,6 +1202,8 @@ def validate(
     common = contract.get("common_advisory_semantics")
     if not isinstance(common, dict) or schema.get("properties", {}).get("common_advisory_semantics", {}).get("const") != common:
         errors.append("common_advisory_semantics must match its canonical schema semantics")
+    if not isinstance(common, dict) or common.get("target_schema_mapping") != TARGET_SCHEMA_MAPPING:
+        errors.append("common advisory target schema mapping drifted")
     inspection_shapes = {
         "inspectionDeliveryReceiptSelector": (
             "delivery_receipt_selector_fields", ["idempotency_key"]
@@ -1180,6 +1277,7 @@ def main() -> int:
                 "feedback_target_kinds": contract["feedback"]["target"][
                     "target_kinds"
                 ],
+                "correction_target_kinds": contract["correction"]["target_kinds"],
                 "maintenance_task_count": len(contract["maintenance"]["tasks"]),
                 "forget_postcondition_required": contract["deletion_by_source"][
                     "provider_may_report_success_without_verification"

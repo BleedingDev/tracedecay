@@ -210,8 +210,8 @@ pub const CONTRACTS: &[ContractSpec] = &[
     ContractSpec {
         contract_id: "tracedecay.memory.provider.lifecycle.v1",
         bead_id: "tdmem-0205",
-        contract_sha256: "31bc7f1320229de58e92b5040f3fa0e053a13c954b3b8c585ea10b907a2b4e4c",
-        schema_sha256: "34306254f9110365535aecbd7cbbc9fc402899d96d895afb26da62d92f3de219",
+        contract_sha256: "254b8a5394cdca1762e8dd010513a3c8762a10d2a6e77195e0395924b3515c2b",
+        schema_sha256: "19fb0eeb44242fa923f866b092154de5baad3e2308dcd1d0ebe56531cf9f263e",
     },
     ContractSpec {
         contract_id: "tracedecay.memory.provider.terminal.v1",

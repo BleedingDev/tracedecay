@@ -132,6 +132,11 @@
           "source",
           "reference"
         ],
+        "target_schema_mapping": {
+          "feedback": "provider-lifecycle-contract.schema.json#/$defs/feedbackTarget",
+          "correction": "provider-lifecycle-contract.schema.json#/$defs/correctionTarget",
+          "shared_lifecycle": "provider-lifecycle-contract.schema.json#/$defs/lifecycleTarget"
+        },
         "candidate_id_alone_is_target": false,
         "source_revision_required_for_correction": true,
         "replacement_preserves_original_observation_and_receipt": true,
@@ -274,8 +279,10 @@
       ],
       "properties": {
         "kind": {
+          "type": "string",
           "enum": [
             "stable_memory_ref",
+            "retained_source_locator",
             "recall_trace_ref",
             "context_pack_item_ref"
           ]
@@ -285,6 +292,31 @@
           "minLength": 1,
           "maxLength": 1024,
           "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f]*\\S)?$"
+        }
+      }
+    },
+    "feedbackTargetReference": {
+      "$ref": "#/$defs/lifecycleTargetReference"
+    },
+    "correctionTargetReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reference"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "stable_memory_ref",
+            "retained_source_locator",
+            "recall_trace_ref",
+            "source_ref"
+          ]
+        },
+        "reference": {
+          "$ref": "#/$defs/lifecycleTargetReference/properties/reference"
         }
       }
     },
@@ -319,7 +351,45 @@
           "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
         },
         "reference": {
-          "$ref": "#/$defs/lifecycleTargetReference"
+          "$ref": "#/$defs/feedbackTargetReference"
+        }
+      }
+    },
+    "feedbackTarget": {
+      "$ref": "#/$defs/lifecycleTarget"
+    },
+    "correctionTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "registration_revision",
+        "original_scope",
+        "delivery_scope",
+        "source",
+        "reference"
+      ],
+      "properties": {
+        "provider_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$",
+          "maxLength": 128
+        },
+        "registration_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "original_scope": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originScopeEvidence"
+        },
+        "delivery_scope": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/commonExactScope"
+        },
+        "source": {
+          "$ref": "provider-observation-contract.schema.json#/$defs/originalSourceIdentity"
+        },
+        "reference": {
+          "$ref": "#/$defs/correctionTargetReference"
         }
       }
     },

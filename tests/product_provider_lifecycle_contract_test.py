@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,64 @@ SCHEMA = REPO / "product/contracts/memory-provider-v1/provider-lifecycle-contrac
 DOC = REPO / "product/contracts/memory-provider-v1/provider-lifecycle-contract.md"
 ISSUES = REPO / ".beads/issues.jsonl"
 CHECKER = REPO / "scripts/product/check-provider-lifecycle-contract.py"
+
+
+class LocalSchemaValidator:
+    """Minimal local-schema validator for concrete target-reference fixtures."""
+
+    def __init__(self, schema: dict[str, Any]) -> None:
+        self.schema = schema
+
+    def resolve(self, reference: str) -> dict[str, Any]:
+        if not reference.startswith("#/"):
+            raise ValueError(f"unsupported external reference {reference}")
+        node: Any = self.schema
+        for part in reference[2:].split("/"):
+            node = node[part]
+        if not isinstance(node, dict):
+            raise ValueError(f"reference does not resolve to an object: {reference}")
+        return node
+
+    def errors(
+        self, value: Any, schema: dict[str, Any], path: str = "$"
+    ) -> list[str]:
+        if "$ref" in schema:
+            return self.errors(value, self.resolve(schema["$ref"]), path)
+        problems: list[str] = []
+        if "enum" in schema and value not in schema["enum"]:
+            problems.append(f"{path}: value is outside the closed enum")
+        expected_type = schema.get("type")
+        if expected_type is not None:
+            types = expected_type if isinstance(expected_type, list) else [expected_type]
+            if not any(self._is_type(value, type_name) for type_name in types):
+                problems.append(f"{path}: wrong JSON type")
+                return problems
+        if isinstance(value, str):
+            if "minLength" in schema and len(value) < schema["minLength"]:
+                problems.append(f"{path}: shorter than minimum")
+            if "maxLength" in schema and len(value) > schema["maxLength"]:
+                problems.append(f"{path}: longer than maximum")
+            if "pattern" in schema and re.search(schema["pattern"], value) is None:
+                problems.append(f"{path}: does not match pattern")
+        if isinstance(value, dict):
+            for key in schema.get("required", []):
+                if key not in value:
+                    problems.append(f"{path}: missing required field {key}")
+            properties = schema.get("properties", {})
+            for key, nested in value.items():
+                if key in properties:
+                    problems.extend(self.errors(nested, properties[key], f"{path}.{key}"))
+                elif schema.get("additionalProperties") is False:
+                    problems.append(f"{path}: unexpected field {key}")
+        return problems
+
+    @staticmethod
+    def _is_type(value: Any, type_name: str) -> bool:
+        if type_name == "object":
+            return isinstance(value, dict)
+        if type_name == "string":
+            return isinstance(value, str)
+        return False
 
 
 class ProviderLifecycleContractTest(unittest.TestCase):
@@ -102,7 +161,21 @@ class ProviderLifecycleContractTest(unittest.TestCase):
         self.assertEqual(receipt["lifecycle_capability_count"], 11)
         self.assertEqual(
             receipt["feedback_target_kinds"],
-            ["stable_memory_ref", "recall_trace_ref", "context_pack_item_ref"],
+            [
+                "stable_memory_ref",
+                "retained_source_locator",
+                "recall_trace_ref",
+                "context_pack_item_ref",
+            ],
+        )
+        self.assertEqual(
+            receipt["correction_target_kinds"],
+            [
+                "stable_memory_ref",
+                "retained_source_locator",
+                "recall_trace_ref",
+                "source_ref",
+            ],
         )
         self.assertEqual(receipt["maintenance_task_count"], 6)
         self.assertTrue(receipt["forget_postcondition_required"])
@@ -190,6 +263,18 @@ class ProviderLifecycleContractTest(unittest.TestCase):
             "context_pack_item_ref"
         )
         self.assert_rejected(contract, "feedback target kinds drifted")
+
+    def test_feedback_supports_retained_source_locator_target(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["feedback"]["target"]["target_kinds"].remove(
+            "retained_source_locator"
+        )
+        self.assert_rejected(contract, "feedback target kinds drifted")
+
+    def test_correction_supports_retained_source_locator_target(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["correction"]["target_kinds"].remove("retained_source_locator")
+        self.assert_rejected(contract, "correction target kinds drifted")
 
     def test_feedback_requires_settled_outcome(self) -> None:
         contract = copy.deepcopy(self.contract)
@@ -374,6 +459,103 @@ class ProviderLifecycleContractTest(unittest.TestCase):
         self.assert_rejected(
             copy.deepcopy(self.contract),
             "lifecycle schema required fields must match contract",
+            schema,
+        )
+
+    def test_schema_supports_retained_source_locator_reference(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["lifecycleTargetReference"]["properties"]["kind"][
+            "enum"
+        ].remove("retained_source_locator")
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "lifecycle target reference kinds drifted",
+            schema,
+        )
+
+    def test_target_reference_schema_partitions_feedback_and_correction_kinds(self) -> None:
+        validator = LocalSchemaValidator(self.schema)
+        feedback_schema = self.schema["$defs"]["feedbackTargetReference"]
+        correction_schema = self.schema["$defs"]["correctionTargetReference"]
+        lifecycle_schema = self.schema["$defs"]["lifecycleTargetReference"]
+
+        for kind in ("stable_memory_ref", "retained_source_locator", "recall_trace_ref"):
+            target = {"kind": kind, "reference": "opaque-reference"}
+            self.assertEqual(validator.errors(target, feedback_schema), [])
+            self.assertEqual(validator.errors(target, correction_schema), [])
+            self.assertEqual(validator.errors(target, lifecycle_schema), [])
+
+        context_target = {
+            "kind": "context_pack_item_ref",
+            "reference": "opaque-reference",
+        }
+        self.assertEqual(validator.errors(context_target, feedback_schema), [])
+        self.assertNotEqual(validator.errors(context_target, correction_schema), [])
+
+        source_target = {"kind": "source_ref", "reference": "source-key"}
+        self.assertEqual(validator.errors(source_target, correction_schema), [])
+        self.assertNotEqual(validator.errors(source_target, feedback_schema), [])
+        self.assertNotEqual(validator.errors(source_target, lifecycle_schema), [])
+
+    def test_checker_requires_correction_only_source_ref_schema(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["correctionTargetReference"]["properties"]["kind"][
+            "enum"
+        ].remove("source_ref")
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "correctionTargetReference kinds or shape drifted",
+            schema,
+        )
+
+    def test_checker_requires_feedback_target_lifecycle_alias(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["feedbackTarget"] = {"$ref": "#/$defs/correctionTarget"}
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "feedbackTarget must be an exact lifecycleTarget alias",
+            schema,
+        )
+
+    def test_checker_requires_feedback_target_definition(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        del schema["$defs"]["feedbackTarget"]
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "feedbackTarget must be an exact lifecycleTarget alias",
+            schema,
+        )
+
+    def test_checker_rejects_malformed_reference_kind_type(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["lifecycleTargetReference"]["properties"]["kind"][
+            "type"
+        ] = "integer"
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "lifecycleTargetReference kind type must be string",
+            schema,
+        )
+
+    def test_checker_rejects_malformed_correction_reference_link(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["correctionTargetReference"]["properties"]["reference"][
+            "$ref"
+        ] = "#/$defs/correctionTargetReference/properties/reference"
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "correctionTargetReference reference mapping drifted",
+            schema,
+        )
+
+    def test_checker_rejects_source_ref_in_shared_feedback_schema(self) -> None:
+        schema = copy.deepcopy(self.schema)
+        schema["$defs"]["lifecycleTargetReference"]["properties"]["kind"][
+            "enum"
+        ].append("source_ref")
+        self.assert_rejected(
+            copy.deepcopy(self.contract),
+            "lifecycle target reference kinds drifted",
             schema,
         )
 

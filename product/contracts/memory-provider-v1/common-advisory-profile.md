@@ -30,7 +30,9 @@ uses checked multiplication by 1,000 and never silently rounds wire evidence.
 | Observation or recall request `history_grant` | `provider-observation-contract.schema.json#/$defs/historyGrant` |
 | Common replay request `history_grant` | The same `historyGrant`; required for replay |
 | Recall candidate `provenance.original_sources` | One to 64 `sourceAttribution` values |
-| Feedback/correction `target` | `provider-lifecycle-contract.schema.json#/$defs/lifecycleTarget` |
+| Feedback `target` | `provider-lifecycle-contract.schema.json#/$defs/feedbackTarget` |
+| Correction `target` | `provider-lifecycle-contract.schema.json#/$defs/correctionTarget` |
+| Shared lifecycle target | `provider-lifecycle-contract.schema.json#/$defs/lifecycleTarget` |
 | Snapshot restore `disposition_checkpoint` | `provider-observation-contract.schema.json#/$defs/restoreDispositionCheckpoint` |
 
 `sourceAttribution` has `source`, `origin_scope`, `source_sequence`, `occurred_at`,
@@ -70,13 +72,18 @@ validates the source/daemon identity bridge, original observation evidence and
 current dispositions through its existing marker, observation, disposition and
 deletion journal ports. Missing `history_grant` grants no cross-session reuse.
 
-`lifecycleTarget` pins `provider_id`, `registration_revision`, `original_scope`,
-`delivery_scope`, original `source`, and `reference`. The reference is
-`{ "kind": "stable_memory_ref" | "recall_trace_ref" | "context_pack_item_ref",
-"reference": … }`. A request candidate ID alone cannot authorize a mutation.
-Correction compares the exact nonempty expected revision string; unknown revision
-cannot satisfy a correction comparison. Switching active providers cannot redirect
-feedback or correction to a different producing provider.
+`feedbackTarget` and `correctionTarget` pin `provider_id`,
+`registration_revision`, `original_scope`, `delivery_scope`, original `source`,
+and `reference`. Feedback references use
+`{ "kind": "stable_memory_ref" | "retained_source_locator" | "recall_trace_ref" | "context_pack_item_ref",
+"reference": … }`; correction references use
+`{ "kind": "stable_memory_ref" | "retained_source_locator" | "recall_trace_ref" | "source_ref",
+"reference": … }`. The correction-only `source_ref` kind is never valid in a
+feedback target or the shared `lifecycleTarget` used by other contexts. A request
+candidate ID alone cannot authorize a mutation. Correction compares the exact
+nonempty expected revision string; unknown revision cannot satisfy a correction
+comparison. Switching active providers cannot redirect feedback or correction to a
+different producing provider.
 
 For `supersede` and `replace_content`, `correction.replacement` is the full admitted
 canonical observation envelope, including `source_identity.original_source`. Its

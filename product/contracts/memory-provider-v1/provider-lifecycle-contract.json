@@ -166,6 +166,7 @@
       "selection_rule": "exactly_one",
       "target_kinds": [
         "stable_memory_ref",
+        "retained_source_locator",
         "recall_trace_ref",
         "context_pack_item_ref"
       ],
@@ -298,6 +299,7 @@
     "target_selection_rule": "exactly_one",
     "target_kinds": [
       "stable_memory_ref",
+      "retained_source_locator",
       "recall_trace_ref",
       "source_ref"
     ],
@@ -509,7 +511,7 @@
     "Unsupported optional lifecycle operations return the typed capability_unsupported result and never silently fall back.",
     "All provider-local mutations carry exact coding scope, stable operation identity, deterministic idempotency, expected state generation, deadline, and live cancellation.",
     "Health is mandatory, read-only, bounded, and never infers readiness from process, socket, path, or non-empty state existence.",
-    "Feedback targets exactly one stable memory reference, recall trace, or context-pack item and requires a canonically settled outcome receipt.",
+    "Feedback targets exactly one stable memory reference, retained source locator, recall trace, or context-pack item and requires a canonically settled outcome receipt.",
     "Feedback may change provider-local learning state but never TraceDecay Native trust or another canonical authority.",
     "Maintenance is finite, bounded, single-writer per provider scope, cancellation-aware, and reports partial progress and a resume cursor.",
     "Inspection is bounded, redacted, provider-local, and cannot expose raw credentials, hidden canonical authority, or unadmitted secret material.",
@@ -546,6 +548,11 @@
       "source",
       "reference"
     ],
+    "target_schema_mapping": {
+      "feedback": "provider-lifecycle-contract.schema.json#/$defs/feedbackTarget",
+      "correction": "provider-lifecycle-contract.schema.json#/$defs/correctionTarget",
+      "shared_lifecycle": "provider-lifecycle-contract.schema.json#/$defs/lifecycleTarget"
+    },
     "candidate_id_alone_is_target": false,
     "source_revision_required_for_correction": true,
     "replacement_preserves_original_observation_and_receipt": true,

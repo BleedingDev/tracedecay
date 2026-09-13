@@ -27,6 +27,7 @@ A running process, open socket, existing path, or non-empty state never proves r
 Feedback targets exactly one of:
 
 - a stable provider memory reference;
+- an opaque retained source locator;
 - a recall trace reference;
 - a context-pack item reference.
 
@@ -52,7 +53,7 @@ The common `trace` selector is `{ "stable_memory_ref": "<retained target>" }`. I
 
 ## Correction
 
-Correction targets exactly one stable memory reference, recall trace, or source reference. It may supersede, restrict scope, change validity, replace provider-local content, or mark provider-local material incorrect.
+Correction targets exactly one stable memory reference, retained source locator, recall trace, or source reference. It may supersede, restrict scope, change validity, replace provider-local content, or mark provider-local material incorrect.
 
 The expected target revision is mandatory. Revision mismatch is `revision_conflict`. Correction is idempotent, provider-local, receipt-backed, and cannot edit source code or accepted Native facts.
 
