@@ -178,6 +178,23 @@ const LIVE_REPLAY_PARK: Duration = Duration::from_millis(250);
 /// scope and cached by the registry, so this bounds a rare call, not a batch.
 const READINESS_DEADLINE_MICROS: i64 = 5_000_000;
 
+/// Pause between transient failures while proving the provider instance.
+///
+/// The proof runs on the journey's one delivery worker. Keeping the retry
+/// delay explicit means an immediately failing proof cannot turn that worker
+/// into a tight loop, while a provider that becomes available later can still
+/// recover without remounting the journey.
+const INSTANCE_PROOF_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Maximum number of proof calls one mounted journey may make. A transient
+/// provider failure is recoverable, but it cannot make the delivery worker
+/// hammer an unavailable provider for the whole lifetime of the daemon.
+const INSTANCE_PROOF_MAX_ATTEMPTS: u32 = 3;
+
+/// Maximum wall-clock lifetime of one proof-retry sequence. This remains a
+/// second finite bound if a future backoff or wake policy changes.
+const INSTANCE_PROOF_MAX_LIFETIME: Duration = Duration::from_secs(30);
+
 /// Delivery deadline stamped on the journal envelope. Longer than one attempt's
 /// deadline because it bounds the whole at-least-once lifetime of the row.
 const ADMISSION_DEADLINE_MICROS: i64 = 86_400_000_000;
@@ -3247,7 +3264,7 @@ pub(crate) struct ProjectObservationJourneyV1 {
     /// acceptance tests can read the resulting durable row without polling.
     delivery_changed: Arc<CensusTransitionV1>,
     provider_id: String,
-    provider_instance_id: Arc<OnceLock<Option<String>>>,
+    provider_instance_id: Arc<ProviderInstanceStateV1>,
     instance_proof: Option<Arc<dyn ObservationInstanceProofV1>>,
     registration_revision: u64,
     lease_owner: String,
@@ -3262,6 +3279,282 @@ pub(crate) struct ProjectObservationJourneyV1 {
     /// rather than at the backoff rate.
     live_stall: Mutex<Option<LiveReplayStallV1>>,
     journal_path: PathBuf,
+}
+
+/// Readiness state for a lazily proved provider instance.
+///
+/// A `OnceLock<Option<String>>` cannot represent a transient refusal: its
+/// first `None` is permanent for the lifetime of the journey. This state keeps
+/// the proof's retry decision behind one mutex, while the delivery worker
+/// remains the only caller that can transition `Pending` to `InFlight`.
+#[derive(Debug)]
+struct ProviderInstanceStateV1 {
+    state: Mutex<ProviderInstanceAvailabilityV1>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+enum ProviderInstanceAvailabilityV1 {
+    /// A provider instance has been proved and can receive leased rows.
+    Ready(String),
+    /// The previous proof was transiently unavailable; retry no earlier than
+    /// this instant. `attempts` includes all proof calls in this sequence.
+    /// The lifetime starts at the first actual claim, so a dormant mount does
+    /// not spend its retry budget before activation.
+    Pending {
+        retry_at: Instant,
+        attempts: u32,
+        first_attempt_at: Option<Instant>,
+    },
+    /// The one delivery worker currently owns the proof call.
+    InFlight {
+        attempts: u32,
+        first_attempt_at: Instant,
+    },
+    /// No instance is available and no proof can retry (for example, after
+    /// journey shutdown or when the mount supplied neither identity nor proof).
+    Unavailable,
+}
+
+/// Only failures whose retry is safe and useful belong in this allowlist.
+/// Cancellation belongs to the lifecycle, and all state, capability, scope,
+/// request, authorization, effect, and contract failures are terminal for a
+/// mounted journey.
+fn instance_proof_terminal_is_retryable(terminal: TerminalCode) -> bool {
+    matches!(
+        terminal,
+        TerminalCode::CapacityExceeded
+            | TerminalCode::DeadlineExceeded
+            | TerminalCode::ProviderUnavailable
+    )
+}
+
+impl ProviderInstanceStateV1 {
+    /// Creates the state carried by one mounted journey. A supplied proof is
+    /// authoritative even if a stale identity was also present in the mount;
+    /// a supplied proof always starts in the retryable pending state.
+    fn from_mount(instance: Option<String>, proof_present: bool) -> Self {
+        let now = Instant::now();
+        let state = if proof_present {
+            ProviderInstanceAvailabilityV1::Pending {
+                retry_at: now,
+                attempts: 0,
+                first_attempt_at: None,
+            }
+        } else if let Some(instance) = instance {
+            ProviderInstanceAvailabilityV1::Ready(instance)
+        } else {
+            ProviderInstanceAvailabilityV1::Unavailable
+        };
+        Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// The proved instance, if one is currently available. The clone keeps
+    /// the mutex held only for the state snapshot, never across delivery.
+    fn get(&self) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*state {
+            ProviderInstanceAvailabilityV1::Ready(instance) => Some(instance.clone()),
+            ProviderInstanceAvailabilityV1::Pending { .. }
+            | ProviderInstanceAvailabilityV1::InFlight { .. }
+            | ProviderInstanceAvailabilityV1::Unavailable => None,
+        }
+    }
+
+    /// Whether dispatch may use the current state.
+    fn is_ready(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(&*state, ProviderInstanceAvailabilityV1::Ready(_))
+    }
+
+    /// Whether a transient proof failure is waiting for its next deadline.
+    fn is_pending(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(&*state, ProviderInstanceAvailabilityV1::Pending { .. })
+    }
+
+    /// Claims a due proof attempt for the delivery worker.
+    fn take_proof_attempt(&self, now: Instant) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &*state {
+            ProviderInstanceAvailabilityV1::Pending {
+                retry_at,
+                attempts,
+                first_attempt_at,
+            } if *retry_at <= now => {
+                let lifetime_expired = first_attempt_at.is_some_and(|first_attempt_at| {
+                    now.saturating_duration_since(first_attempt_at) >= INSTANCE_PROOF_MAX_LIFETIME
+                });
+                if *attempts >= INSTANCE_PROOF_MAX_ATTEMPTS || lifetime_expired {
+                    *state = ProviderInstanceAvailabilityV1::Unavailable;
+                    self.changed.notify_all();
+                    false
+                } else {
+                    *state = ProviderInstanceAvailabilityV1::InFlight {
+                        attempts: attempts.saturating_add(1),
+                        first_attempt_at: first_attempt_at.unwrap_or(now),
+                    };
+                    true
+                }
+            }
+            ProviderInstanceAvailabilityV1::Ready(_)
+            | ProviderInstanceAvailabilityV1::Pending { .. }
+            | ProviderInstanceAvailabilityV1::InFlight { .. }
+            | ProviderInstanceAvailabilityV1::Unavailable => false,
+        }
+    }
+
+    /// Records a proof result and returns whether another bounded attempt was
+    /// scheduled. The cancellation check is repeated while the state mutex is
+    /// held immediately before installing the result, so shutdown cannot leave
+    /// a late `Ready` state behind a cancelled worker.
+    fn finish_proof(
+        &self,
+        result: Result<Option<String>, TerminalCode>,
+        stopping: &HostCancellationToken,
+        now: Instant,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (attempts, first_attempt_at) = match &*state {
+            ProviderInstanceAvailabilityV1::InFlight {
+                attempts,
+                first_attempt_at,
+            } => (*attempts, *first_attempt_at),
+            // A lifecycle transition (shutdown or a prior terminal result)
+            // won the state lock first. Never overwrite it with a late proof.
+            ProviderInstanceAvailabilityV1::Ready(_)
+            | ProviderInstanceAvailabilityV1::Pending { .. }
+            | ProviderInstanceAvailabilityV1::Unavailable => return false,
+        };
+
+        if stopping.is_cancelled() {
+            *state = ProviderInstanceAvailabilityV1::Unavailable;
+            self.changed.notify_all();
+            return false;
+        }
+
+        let retryable = match result {
+            Ok(Some(instance)) => {
+                // Check immediately before the transition too. The state
+                // mutex serializes this with `cancel`, so a caller that has
+                // already published shutdown cannot be made ready again.
+                if stopping.is_cancelled() {
+                    *state = ProviderInstanceAvailabilityV1::Unavailable;
+                } else {
+                    *state = ProviderInstanceAvailabilityV1::Ready(instance);
+                    // Cancellation can become visible between the check and
+                    // the assignment. Recheck before releasing the mutex so
+                    // the lifecycle transition cannot expose a late ready
+                    // identity to the replay worker.
+                    if stopping.is_cancelled() {
+                        *state = ProviderInstanceAvailabilityV1::Unavailable;
+                    }
+                }
+                self.changed.notify_all();
+                return false;
+            }
+            Ok(None) => true,
+            Err(terminal) if instance_proof_terminal_is_retryable(terminal) => true,
+            Err(_) => false,
+        };
+
+        if stopping.is_cancelled() {
+            *state = ProviderInstanceAvailabilityV1::Unavailable;
+            self.changed.notify_all();
+            return false;
+        }
+
+        if !retryable {
+            *state = ProviderInstanceAvailabilityV1::Unavailable;
+            self.changed.notify_all();
+            return false;
+        }
+
+        if attempts >= INSTANCE_PROOF_MAX_ATTEMPTS
+            || now.saturating_duration_since(first_attempt_at) >= INSTANCE_PROOF_MAX_LIFETIME
+        {
+            *state = ProviderInstanceAvailabilityV1::Unavailable;
+            self.changed.notify_all();
+            return false;
+        }
+
+        *state = ProviderInstanceAvailabilityV1::Pending {
+            retry_at: now.checked_add(INSTANCE_PROOF_RETRY_BACKOFF).unwrap_or(now),
+            attempts,
+            first_attempt_at: Some(first_attempt_at),
+        };
+        self.changed.notify_all();
+        true
+    }
+
+    /// Cancels proof ownership and wakes a worker waiting for a retry.
+    fn cancel(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *state = ProviderInstanceAvailabilityV1::Unavailable;
+        self.changed.notify_all();
+    }
+
+    /// Waits for the proof's own retry deadline or lifecycle cancellation.
+    /// Delivery wakeups are intentionally not involved: a noisy journal must
+    /// not postpone a due proof or turn the retry into a busy loop.
+    fn wait_until_retry_or_stop(&self, stopping: &HostCancellationToken) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if stopping.is_cancelled() {
+                return false;
+            }
+            let retry_at = match &*state {
+                ProviderInstanceAvailabilityV1::Pending { retry_at, .. } => *retry_at,
+                ProviderInstanceAvailabilityV1::Ready(_)
+                | ProviderInstanceAvailabilityV1::InFlight { .. }
+                | ProviderInstanceAvailabilityV1::Unavailable => return false,
+            };
+            let remaining = retry_at.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            let (guard, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = guard;
+        }
+    }
+
+    /// Makes the retry state visible to same-file lifecycle assertions without
+    /// exposing the internal mutex or allowing a second proof owner.
+    #[cfg(test)]
+    fn is_unavailable(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(&*state, ProviderInstanceAvailabilityV1::Unavailable)
+    }
 }
 
 impl ProjectObservationJourneyV1 {
@@ -4152,14 +4445,11 @@ impl ProjectObservationJourneyV1 {
                 if journey.stopping.is_cancelled() {
                     break;
                 }
-                if !journey
-                    .provider_instance_id
-                    .get()
-                    .is_some_and(Option::is_some)
-                {
-                    // A pending one-shot bootstrap has not proved an instance.
-                    // An unavailable bootstrap remains unavailable until the
-                    // daemon is recreated; do not advance its canonical cursor.
+                if !journey.provider_instance_id.is_ready() {
+                    // A pending proof has not proved an instance.
+                    // A transiently unavailable bootstrap is retried by the
+                    // delivery worker; until it succeeds, do not advance its
+                    // canonical cursor.
                     journey.report_backlog().await;
                     continue;
                 }
@@ -4245,6 +4535,7 @@ impl ProjectObservationJourneyV1 {
     ) -> Vec<ObservationShutdownFailureV1> {
         let mut failures = Vec::new();
         self.stopping.cancel();
+        self.provider_instance_id.cancel();
         self.wake.request_shutdown();
         match self.stalled_on() {
             // Not a shutdown failure: a standing replay condition the next
@@ -4444,6 +4735,7 @@ impl ProjectObservationJourneyV1 {
         self.start_delivery_worker()?;
         if let Err(error) = self.start_live_replay(observation_store) {
             self.stopping.cancel();
+            self.provider_instance_id.cancel();
             self.wake.request_shutdown();
             return Err(error);
         }
@@ -4472,23 +4764,6 @@ impl ProjectObservationJourneyV1 {
         thread::Builder::new()
             .name("td-memory-observation".to_owned())
             .spawn(move || {
-                if let Some(proof) = instance_proof {
-                    let cancelled = stopping.clone();
-                    let result = proof.prove(
-                        Instant::now() + Duration::from_micros(READINESS_DEADLINE_MICROS as u64),
-                        Arc::new(move || cancelled.is_cancelled()),
-                    );
-                    let instance = match result {
-                        Ok(instance) if !stopping.is_cancelled() => instance,
-                        Ok(_) => None,
-                        Err(terminal) => {
-                            tracing::warn!(?terminal, provider = %provider_id,
-                                "observer instance proof unavailable until daemon recreation");
-                            None
-                        }
-                    };
-                    let _ = provider_instance_id.set(instance);
-                }
                 let runtime =
                     DeliveryRuntimeV1::new(journal.as_ref(), delivery.as_ref(), wake.as_ref());
                 // Due at once: a journal a restart found full of aged rows is
@@ -4501,12 +4776,87 @@ impl ProjectObservationJourneyV1 {
                 // Open validated one page; whatever is left is walked here.
                 let mut withheld_audit_complete = false;
                 while !stopping.is_cancelled() {
+                    // The proof is owned by this worker, just like delivery.
+                    // A retry waits on the proof deadline itself. It must not
+                    // be hidden behind a noisy delivery wake or an arbitrary
+                    // delivery park interval.
+                    if let Some(proof) = instance_proof.as_ref() {
+                        if !provider_instance_id.take_proof_attempt(Instant::now()) {
+                            if provider_instance_id.is_pending() {
+                                if !provider_instance_id.wait_until_retry_or_stop(&stopping) {
+                                    if stopping.is_cancelled() {
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                        } else {
+                            let cancelled = stopping.clone();
+                            let result = proof.prove(
+                                Instant::now()
+                                    + Duration::from_micros(READINESS_DEADLINE_MICROS as u64),
+                                Arc::new(move || cancelled.is_cancelled()),
+                            );
+                            let terminal = result.as_ref().err().copied();
+                            let retryable = match &result {
+                                Ok(None) => true,
+                                Ok(Some(_)) => false,
+                                Err(terminal) => {
+                                    instance_proof_terminal_is_retryable(*terminal)
+                                }
+                            };
+                            let retry_scheduled = provider_instance_id.finish_proof(
+                                result,
+                                &stopping,
+                                Instant::now(),
+                            );
+                            if !stopping.is_cancelled() {
+                                if let Some(terminal) = terminal {
+                                    if retryable && retry_scheduled {
+                                        tracing::warn!(
+                                            ?terminal,
+                                            provider = %provider_id,
+                                            "observer instance proof unavailable; retrying"
+                                        );
+                                    } else if retryable {
+                                        tracing::warn!(
+                                            ?terminal,
+                                            provider = %provider_id,
+                                            "observer instance proof retry budget exhausted"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            ?terminal,
+                                            provider = %provider_id,
+                                            "observer instance proof is permanently unavailable; retry disabled"
+                                        );
+                                    }
+                                } else if retryable && retry_scheduled {
+                                    tracing::warn!(
+                                        provider = %provider_id,
+                                        "observer instance proof returned no instance; retrying"
+                                    );
+                                } else if retryable {
+                                    tracing::warn!(
+                                        provider = %provider_id,
+                                        "observer instance proof returned no instance; retry budget exhausted"
+                                    );
+                                }
+                            }
+                            if stopping.is_cancelled() {
+                                break;
+                            }
+                            if retry_scheduled {
+                                continue;
+                            }
+                        }
+                    }
                     if runtime.wait_for_work(delivery_park) == WakeOutcomeV1::ShutdownRequested {
                         break;
                     }
-                    // Only a real one-shot instance proof or the existing
-                    // Native instance can authorize per-attempt lease identity.
-                    if let Some(provider_instance_id) = provider_instance_id.get().and_then(Option::as_ref) {
+                    // Only a proved instance or the existing Native instance
+                    // can authorize per-attempt lease identity.
+                    if let Some(provider_instance_id) = provider_instance_id.get() {
                         let now = tracedecay_contracts::now_micros().0;
                         let request = DispatchRequestV1 {
                             lease: LeaseRequestV1 {
@@ -4724,6 +5074,7 @@ impl ProjectObservationJourneyV1 {
 impl Drop for ProjectObservationJourneyV1 {
     fn drop(&mut self) {
         self.stopping.cancel();
+        self.provider_instance_id.cancel();
         self.wake.request_shutdown();
         let live_replay_task = match self.live_replay_task.get_mut() {
             Ok(task) => task.take(),
@@ -4899,10 +5250,10 @@ fn construct_project_observation_journey(
         BackpressureGateV1::new(inputs.policy.backpressure)
             .map_err(ObservationJourneyError::Journal)?,
     );
-    let provider_instance_id = Arc::new(OnceLock::new());
-    if inputs.provider.instance_proof.is_none() {
-        let _ = provider_instance_id.set(inputs.provider.provider_instance_id.clone());
-    }
+    let provider_instance_id = Arc::new(ProviderInstanceStateV1::from_mount(
+        inputs.provider.provider_instance_id.clone(),
+        inputs.provider.instance_proof.is_some(),
+    ));
     let journey = Arc::new(ProjectObservationJourneyV1 {
         journal,
         wake: Arc::new(DeliveryWakeV1::new()),
@@ -10500,6 +10851,181 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailOnceInstanceProof {
+        attempts: Arc<AtomicUsize>,
+        instance: String,
+    }
+
+    impl ObservationInstanceProofV1 for FailOnceInstanceProof {
+        fn prove(
+            &self,
+            deadline: Instant,
+            cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        ) -> Result<Option<String>, TerminalCode> {
+            if cancelled() {
+                return Err(TerminalCode::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(TerminalCode::DeadlineExceeded);
+            }
+            if self.attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err(TerminalCode::ProviderUnavailable);
+            }
+            Ok(Some(self.instance.clone()))
+        }
+    }
+
+    #[test]
+    fn optional_instance_proof_dormant_activation_starts_lifetime_on_claim() {
+        let state = ProviderInstanceStateV1::from_mount(None, true);
+        let stopping = HostCancellationToken::new();
+        // Advance the injected claim instant beyond the full retry lifetime.
+        // A dormant mount must still get its first proof attempt when it is
+        // activated later; the lifetime starts at this claim, not construction.
+        let delayed_activation = Instant::now()
+            .checked_add(INSTANCE_PROOF_MAX_LIFETIME + Duration::from_secs(1))
+            .unwrap();
+
+        assert!(state.take_proof_attempt(delayed_activation));
+        assert!(!state.finish_proof(
+            Ok(Some("activated-instance".to_owned())),
+            &stopping,
+            delayed_activation,
+        ));
+        assert_eq!(
+            state.get().as_deref(),
+            Some("activated-instance"),
+            "a delayed dormant activation must not expire before its first proof"
+        );
+    }
+
+    #[test]
+    fn optional_instance_proof_permanent_failure_is_not_retried() {
+        for terminal in [
+            TerminalCode::StateIncompatible,
+            TerminalCode::ResetRequired,
+            TerminalCode::CapabilityUnsupported,
+            TerminalCode::InvalidRequest,
+        ] {
+            let state = ProviderInstanceStateV1::from_mount(None, true);
+            let stopping = HostCancellationToken::new();
+            let now = Instant::now();
+            assert!(state.take_proof_attempt(now));
+            assert!(!state.finish_proof(Err(terminal), &stopping, now));
+            assert!(state.is_unavailable());
+            assert!(!state.take_proof_attempt(now.checked_add(Duration::from_secs(2)).unwrap()));
+        }
+    }
+
+    #[test]
+    fn optional_instance_proof_transient_failure_stops_at_attempt_bound() {
+        let state = ProviderInstanceStateV1::from_mount(None, true);
+        let stopping = HostCancellationToken::new();
+        let mut now = Instant::now();
+
+        for attempt in 1..=INSTANCE_PROOF_MAX_ATTEMPTS {
+            assert!(state.take_proof_attempt(now), "proof attempt {attempt}");
+            let retry_scheduled =
+                state.finish_proof(Err(TerminalCode::ProviderUnavailable), &stopping, now);
+            if attempt < INSTANCE_PROOF_MAX_ATTEMPTS {
+                assert!(retry_scheduled, "attempt {attempt} should retry");
+                now = now.checked_add(INSTANCE_PROOF_RETRY_BACKOFF).unwrap();
+            } else {
+                assert!(!retry_scheduled, "attempt budget must terminate retries");
+            }
+        }
+
+        assert!(state.is_unavailable());
+        assert!(!state.take_proof_attempt(now.checked_add(INSTANCE_PROOF_RETRY_BACKOFF).unwrap()));
+    }
+
+    #[test]
+    fn optional_instance_proof_cancellation_cannot_install_ready() {
+        let state = ProviderInstanceStateV1::from_mount(None, true);
+        let stopping = HostCancellationToken::new();
+        let now = Instant::now();
+        assert!(state.take_proof_attempt(now));
+        stopping.cancel();
+
+        assert!(!state.finish_proof(Ok(Some("late-instance".to_owned())), &stopping, now,));
+        assert!(state.is_unavailable());
+        assert!(state.get().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_instance_proof_retries_after_transient_failure_without_remount() {
+        let temp = TempDir::new().unwrap();
+        let project = "project.observation-startup-classification";
+        let project_id = ProjectId::new(project).unwrap();
+        let session = SessionId::new("session.optional-bootstrap-retry").unwrap();
+        let record = settled_record(
+            1,
+            canonical_observation(&project_id, &session, "pending observer message"),
+        );
+        let store = || RefusingReplayPort {
+            refusals: Mutex::new(vec![]),
+            then: vec![record.clone()],
+        };
+
+        // Seed one pending row, then close that first journey. The observer
+        // below must settle this same row after its proof fails once.
+        let mut seed_inputs = classification_mount_inputs(&temp, project);
+        let expected_instance = seed_inputs.provider.provider_instance_id.take().unwrap();
+        // Keep the seed dormant so no delivery worker can race this assertion
+        // and settle the row before the proof-retry journey owns it.
+        let seed = mount_observer_dormant(seed_inputs, &HostCancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            run_startup_replay(seed.as_ref(), &store(), &HostCancellationToken::new())
+                .await
+                .unwrap()
+                .admitted,
+            1
+        );
+        let pending_path = seed.journal_path().to_owned();
+        assert!(!journal_snapshot(&pending_path).contains("acknowledged"));
+        seed.shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        drop(seed);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut inputs = classification_mount_inputs(&temp, project);
+        inputs.provider.provider_instance_id = None;
+        inputs.provider.instance_proof = Some(Arc::new(FailOnceInstanceProof {
+            attempts: Arc::clone(&attempts),
+            instance: expected_instance.clone(),
+        }));
+        let observer = mount_observer_dormant(inputs, &HostCancellationToken::new())
+            .await
+            .unwrap();
+        observer.start_observer_with_live_replay(store()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if observer.provider_instance_id.get().as_deref()
+                    == Some(expected_instance.as_str())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the same journey must retry and record the instance");
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+        assert_eq!(
+            wait_for_settlement_within(&pending_path, Duration::from_secs(5)).await,
+            ("acknowledged".to_owned(), 1)
+        );
+        assert_eq!(observer.journal_path(), pending_path.as_path());
+
+        observer
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn optional_instance_bootstrap_does_not_block_native_and_drains_restart_pending_rows() {
         let temp = TempDir::new().unwrap();
@@ -10517,7 +11043,11 @@ mod tests {
         // Persist admission and its watermark without a proved delivery instance.
         let mut seed_inputs = classification_mount_inputs(&temp, project);
         let expected_instance = seed_inputs.provider.provider_instance_id.take().unwrap();
-        let seed = mount_project_observation_journey(seed_inputs).unwrap();
+        // Keep the seed dormant so this test controls exactly when delivery
+        // begins and the pending row cannot be settled by a racing worker.
+        let seed = mount_observer_dormant(seed_inputs, &HostCancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(
             run_startup_replay(seed.as_ref(), &store(), &HostCancellationToken::new())
                 .await
@@ -10627,7 +11157,7 @@ mod tests {
             "shutdown must join the cancelled proof: {failures:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(observer.provider_instance_id.get(), Some(&None));
+        assert!(observer.provider_instance_id.is_unavailable());
     }
 
     #[tokio::test]

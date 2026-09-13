@@ -16,13 +16,17 @@ pub enum ObservationStateNamespacePolicyV1 {
     AdapterAttestedExactScope,
 }
 
-/// One bounded proof of a provider's global implementation instance.
+/// A bounded proof of a provider's global implementation instance.
 /// This is not exact-scope readiness; delivery must still obtain that proof
 /// for each admitted row through the provider supervisor.
 pub trait ObservationInstanceProofV1: std::fmt::Debug + Send + Sync {
     /// Runs on the existing delivery worker, honoring the absolute deadline
-    /// and a nonblocking cancellation probe. A refusal is not retried by the
-    /// journey; daemon recreation reconstructs the unavailable mount.
+    /// and a nonblocking cancellation probe. A missing instance, or an
+    /// explicit transient `provider_unavailable`, `capacity_exceeded`, or
+    /// `deadline_exceeded` result, is retried by the journey with a bounded
+    /// backoff, attempt count, and lifetime. Other terminal codes make the
+    /// mount unavailable until recreation; daemon recreation still
+    /// reconstructs a mount that is shut down or otherwise unavailable.
     fn prove(
         &self,
         deadline: Instant,
@@ -39,7 +43,10 @@ pub struct ObservationProviderMountV1 {
     pub registration_revision: u64,
     /// Real provider instance used by durable delivery leases; absent while unavailable.
     pub provider_instance_id: Option<String>,
-    /// Optional one-shot proof for a lazily constructed observer.
+    /// Optional bounded proof for a lazily constructed observer. The journey
+    /// retries only explicit transient proof failures within its finite
+    /// attempt and lifetime budget; permanent terminal failures make the
+    /// mount unavailable until recreation.
     /// Native supplies its existing static proved instance instead.
     pub instance_proof: Option<Arc<dyn ObservationInstanceProofV1>>,
     /// Host handshake ceilings for this provider.
