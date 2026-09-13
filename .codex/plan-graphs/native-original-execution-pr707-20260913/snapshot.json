@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-13T14:38:11.296240+00:00",
+  "generated_at": "2026-09-13T15:02:23.308088+00:00",
   "graph_id": "native-original-execution-pr707-20260913",
   "plan_set_hash": "5befc5f407",
   "selection_hash": "bbc92e4d52",
@@ -419,19 +419,19 @@
         {
           "id": "inventory-required-operations",
           "content": "Map every supported Native operation, NCM mode and semantic serving state to a production route and executable case.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 1
         },
         {
           "id": "freeze-acceptance-oracles",
           "content": "Freeze expected outcomes, negative controls, artifact identities and run counts before implementation.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 2
         },
         {
           "id": "publish-missing-coverage",
           "content": "Publish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 3
         }
       ],
@@ -1177,36 +1177,106 @@
   ],
   "frontier": [
     {
-      "plan_slug": "rn-acceptance-matrix",
-      "plan_name": "rn-acceptance-matrix",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-acceptance-matrix.plan.md",
+      "plan_slug": "rn-ncm-reproduce",
+      "plan_name": "rn-ncm-reproduce",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-reproduce.plan.md",
       "plan_status": "pending",
       "state": "ready",
       "blocked_by": [],
       "active": [
         {
-          "id": "inventory-required-operations",
-          "content": "Map every supported Native operation, NCM mode and semantic serving state to a production route and executable case.",
+          "id": "recover-original-misses",
+          "content": "Recover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope.",
           "status": "pending",
           "ordinal": 1
         }
       ],
       "upcoming": [
         {
-          "id": "freeze-acceptance-oracles",
-          "content": "Freeze expected outcomes, negative controls, artifact identities and run counts before implementation.",
+          "id": "trace-first-loss",
+          "content": "Reproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data.",
           "status": "pending",
           "ordinal": 2
         },
         {
-          "id": "publish-missing-coverage",
-          "content": "Publish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted.",
+          "id": "add-failing-regression",
+          "content": "Reduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline.",
           "status": "pending",
           "ordinal": 3
         }
       ],
       "completed": 0,
       "total": 3
+    },
+    {
+      "plan_slug": "rn-reference",
+      "plan_name": "rn-reference",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-reference.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-reference-done",
+          "content": "Build the independent original Native comparison runner and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-semantic-diagnose",
+      "plan_name": "rn-semantic-diagnose",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-semantic-diagnose.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "reproduce-semantic-states",
+          "content": "Reproduce fresh-profile, provisioned-profile and restart behavior using the real CLI and strict semantic requests.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "trace-semantic-activation",
+          "content": "Trace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "freeze-semantic-fix-case",
+          "content": "Publish the responsible setup or code seam, negative controls and failing acceptance case before repair.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "rn-source-docs",
+      "plan_name": "rn-source-docs",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "rn-source-docs-done",
+          "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
     },
     {
       "plan_slug": "rn-build",
@@ -1603,47 +1673,12 @@
       "total": 3
     },
     {
-      "plan_slug": "rn-ncm-reproduce",
-      "plan_name": "rn-ncm-reproduce",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-reproduce.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-acceptance-matrix"
-      ],
-      "active": [
-        {
-          "id": "recover-original-misses",
-          "content": "Recover the original 2-of-4 versus 4-of-4 workload and verify which items were required under its limits and scope.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [
-        {
-          "id": "trace-first-loss",
-          "content": "Reproduce cold, warm, restart and load cases with pinned real worker/model; identify the first stage losing required data.",
-          "status": "pending",
-          "ordinal": 2
-        },
-        {
-          "id": "add-failing-regression",
-          "content": "Reduce a failing case into a deterministic regression or controlled fault/scheduling test with a demonstrated failing baseline.",
-          "status": "pending",
-          "ordinal": 3
-        }
-      ],
-      "completed": 0,
-      "total": 3
-    },
-    {
       "plan_slug": "rn-ncm-tests",
       "plan_name": "rn-ncm-tests",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-ncm-tests.plan.md",
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-acceptance-matrix",
         "rn-ncm-recall-fix"
       ],
       "active": [
@@ -1692,27 +1727,6 @@
         {
           "id": "rn-privacy-restore-done",
           "content": "Record detector equality and typed history admission revalidation for 570; return a bounded fix handoff only if needed.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
-      "plan_slug": "rn-reference",
-      "plan_name": "rn-reference",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-reference.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-acceptance-matrix"
-      ],
-      "active": [
-        {
-          "id": "rn-reference-done",
-          "content": "Build the independent original Native comparison runner and return the required reviewable evidence.",
           "status": "pending",
           "ordinal": 1
         }
@@ -1834,40 +1848,6 @@
       "total": 1
     },
     {
-      "plan_slug": "rn-semantic-diagnose",
-      "plan_name": "rn-semantic-diagnose",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-semantic-diagnose.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-acceptance-matrix"
-      ],
-      "active": [
-        {
-          "id": "reproduce-semantic-states",
-          "content": "Reproduce fresh-profile, provisioned-profile and restart behavior using the real CLI and strict semantic requests.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [
-        {
-          "id": "trace-semantic-activation",
-          "content": "Trace artifact acquisition, generation projection, calibration persistence and scoped query-authority activation to the first missing transition.",
-          "status": "pending",
-          "ordinal": 2
-        },
-        {
-          "id": "freeze-semantic-fix-case",
-          "content": "Publish the responsible setup or code seam, negative controls and failing acceptance case before repair.",
-          "status": "pending",
-          "ordinal": 3
-        }
-      ],
-      "completed": 0,
-      "total": 3
-    },
-    {
       "plan_slug": "rn-semantic-fix",
       "plan_name": "rn-semantic-fix",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-semantic-fix.plan.md",
@@ -1916,27 +1896,6 @@
         {
           "id": "rn-session-delivery-done",
           "content": "Retire Native staged acknowledgements in the host observation journey and return the required reviewable evidence.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
-      "plan_slug": "rn-source-docs",
-      "plan_name": "rn-source-docs",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-source-docs.plan.md",
-      "plan_status": "pending",
-      "state": "blocked",
-      "blocked_by": [
-        "rn-acceptance-matrix"
-      ],
-      "active": [
-        {
-          "id": "rn-source-docs-done",
-          "content": "Correct Native identity and architecture documentation and return the required reviewable evidence.",
           "status": "pending",
           "ordinal": 1
         }
@@ -2108,6 +2067,18 @@
       "upcoming": [],
       "completed": 0,
       "total": 1
+    },
+    {
+      "plan_slug": "rn-acceptance-matrix",
+      "plan_name": "rn-acceptance-matrix",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-acceptance-matrix.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 3,
+      "total": 3
     },
     {
       "plan_slug": "rn-integration-readiness",

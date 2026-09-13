@@ -4,13 +4,13 @@ overview: "Define complete Native, NCM and semantic acceptance coverage"
 todos:
   - id: inventory-required-operations
     content: "Map every supported Native operation, NCM mode and semantic serving state to a production route and executable case."
-    status: pending
+    status: completed
   - id: freeze-acceptance-oracles
     content: "Freeze expected outcomes, negative controls, artifact identities and run counts before implementation."
-    status: pending
+    status: completed
   - id: publish-missing-coverage
     content: "Publish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted."
-    status: pending
+    status: completed
 isProject: false
 ---
 

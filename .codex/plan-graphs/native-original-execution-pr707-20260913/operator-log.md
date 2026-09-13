@@ -26,22 +26,22 @@
 
 | Lane | Agent | Owner / write scope | Dependency | Status | Next action |
 | --- | --- | --- | --- | --- | --- |
-| rn-acceptance-matrix | `/root/acceptance_matrix_owner` | `execution-results/readiness-matrix.{md,json}` only | ready | running | Publish frozen matrix |
+| rn-acceptance-matrix | `/root/acceptance_matrix_owner` | `execution-results/readiness-matrix.{md,json}` only | ready | complete | Root accepted 201-row frozen matrix; wave 2 unblocked |
 | rn-integration-readiness | `/root/integration_readiness_owner` | `execution-results/pr707-integration-readiness.md` only | ready | complete | Root accepted report; keep rn-build blocked |
 | Native facts | `/root/native_facts_scout` | read-only | supports matrix | running | Map routes/oracles |
 | Native trust/feedback | `/root/native_trust_scout` | read-only | supports matrix | running | Map routes/oracles |
 | Native retrieval telemetry | `/root/native_retrieval_scout` | read-only | supports matrix | running | Map effect distinctions |
 | Native sessions | `/root/native_sessions_scout` | read-only | supports matrix | running | Map routes/oracles |
-| Native LCM | `/root/native_lcm_scout` | read-only | supports matrix | running | Map routes/oracles |
-| Native persistence | `/root/native_persistence_scout` | read-only | supports matrix | running | Map restart/state cases |
-| Native lifecycle/background | `/root/native_lifecycle_scout` | read-only | supports matrix | running | Map responsibilities |
+| Native LCM | `/root/native_lcm_scout` | read-only | supports matrix | complete | Fed canonical LCM parity and Hermes integration gap |
+| Native persistence | `/root/native_persistence_scout` | read-only | supports matrix | complete | Fed restart/state and staged-store preservation cases |
+| Native lifecycle/background | `/root/native_lifecycle_scout` | read-only | supports matrix | complete | Fed lifecycle owners and Native actor shutdown risk |
 | Native Codex delivery | `/root/native_codex_host_scout` | read-only | supports matrix | complete | Feed findings to matrix owner |
 | Native Claude contract | `/root/native_claude_contract_scout` | read-only | supports matrix | running | Map shipped hook contract |
 | Native privacy | `/root/native_privacy_scout` | read-only | supports matrix | running | Map isolation cases |
 | Native reference runner | `/root/native_reference_scout` | read-only | supports rn-reference | running | Map immutable runner inputs |
 | Native 570 diff | `/root/native_570_diff_scout` | read-only | supports rn-source-docs | complete | Feed staged-substitute map to wave 2 |
 | NCM admission/journal | `/root/ncm_admission_journal_scout` | read-only | supports reproduce | running | Trace first pipeline segment |
-| NCM worker pipeline | `/root/ncm_worker_pipeline_scout` | read-only | supports reproduce | running | Trace worker segment |
+| NCM worker pipeline | `/root/ncm_worker_pipeline_scout` | read-only | supports reproduce | complete | Fed host-admission evidence and worker-race instrumentation map |
 | NCM selection/exclusions | `/root/ncm_selection_scout` | read-only | supports reproduce | running | Trace ranking/filter segment |
 | NCM replay/recovery | `/root/ncm_recovery_scout` | read-only | supports reproduce | running | Trace persistence segment |
 | NCM scopes | `/root/ncm_scopes_scout` | read-only | supports matrix | running | Map seven bindings |
@@ -64,5 +64,5 @@
 | Repeat campaign | `/root/repeat_campaign_scout` | read-only | supports release | complete | Feed sealed-ledger contract to matrix |
 | Historical NCM workload | `/root/ncm_history_scout` | read-only | supports reproduce | running | Recover exact 2/4 workload |
 | Semantic smoke receipts | `/root/semantic_smoke_receipt_scout` | read-only | supports diagnose | running | Correlate observed timeline |
-| Native operation-map checker | `/root/native_operation_map_checker` | read-only | supports matrix | running | Challenge completeness |
-| Pilot setup | `/root/pilot_setup_scout` | read-only | supports release | running | Map isolated trial/rollback |
+| Native operation-map checker | `/root/native_operation_map_checker` | read-only | supports matrix | complete | Corrected 570 public/internal routes and missing operations |
+| Pilot setup | `/root/pilot_setup_scout` | read-only | supports release | complete | Mapped isolated profile, readiness, and rollback contract |

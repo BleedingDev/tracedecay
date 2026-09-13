@@ -20,11 +20,11 @@ This plan keeps the original Native memory implementation and adapts our product
 
 ## Parallel execution
 
-The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-acceptance-matrix. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
+The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-ncm-reproduce, rn-reference, rn-semantic-diagnose and rn-source-docs. The 201-row acceptance matrix and integration-readiness gate are complete. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
 
 Use available Codex-native execution agents for scoped implementation; root assigns ownership and reviews changes before pushing. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
 
-1. Process integration readiness, the independent comparison runner, source inventory/documentation and NCM regression preparation from the current frontier. Readiness and source inventory release their gated successors; the anchor equality gate is already complete.
+1. Reproduce the NCM miss, build the independent 570 comparison runner, correct the source inventory/documentation and diagnose semantic provisioning from the current frontier. The acceptance, integration-readiness and anchor gates are complete.
 2. Start the original reference build as soon as the runner is ready. When the runner and contracts are ready, launch three fixture lanes and host fixtures; contracts also release the Native wrapper and fabric work.
 3. Release registry, the concrete Native bridge, session delivery and host context as their interfaces become ready.
 4. Integrate the Native tests and composition, then run the shared product build/checks with one Cargo owner.

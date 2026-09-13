@@ -1,9 +1,9 @@
 flowchart TD
   subgraph plan_rn_acceptance_matrix["rn-acceptance-matrix"]
-    plan_rn_acceptance_matrix_todo_1["inventory-required-operations (pending)\nMap every supported Native operation, NCM mode and semantic serving state to a production route and executable case."]
-    plan_rn_acceptance_matrix_todo_2["freeze-acceptance-oracles (pending)\nFreeze expected outcomes, negative controls, artifact identities and run counts before implementation."]
+    plan_rn_acceptance_matrix_todo_1["inventory-required-operations (completed)\nMap every supported Native operation, NCM mode and semantic serving state to a production route and executable case."]
+    plan_rn_acceptance_matrix_todo_2["freeze-acceptance-oracles (completed)\nFreeze expected outcomes, negative controls, artifact identities and run counts before implementation."]
     plan_rn_acceptance_matrix_todo_1 --> plan_rn_acceptance_matrix_todo_2
-    plan_rn_acceptance_matrix_todo_3["publish-missing-coverage (pending)\nPublish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted."]
+    plan_rn_acceptance_matrix_todo_3["publish-missing-coverage (completed)\nPublish missing routes, unimplemented coverage and exact downstream owners; no unsupported required row is accepted."]
     plan_rn_acceptance_matrix_todo_2 --> plan_rn_acceptance_matrix_todo_3
   end
   subgraph plan_rn_build_reference["rn-build-reference"]
