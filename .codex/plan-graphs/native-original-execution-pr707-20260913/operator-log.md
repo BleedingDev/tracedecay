@@ -26,39 +26,39 @@
 
 | Lane | Agent | Owner / write scope | Dependency | Status | Next action |
 | --- | --- | --- | --- | --- | --- |
-| rn-acceptance-matrix | pending | `execution-results/readiness-matrix.{md,json}` only | ready | launching | Publish frozen matrix |
-| rn-integration-readiness | pending | `execution-results/pr707-integration-readiness.md` only | ready | launching | Record current gate |
-| Native facts | pending | read-only | supports matrix | launching | Map routes/oracles |
-| Native trust/feedback | pending | read-only | supports matrix | launching | Map routes/oracles |
-| Native retrieval telemetry | pending | read-only | supports matrix | launching | Map effect distinctions |
-| Native sessions | pending | read-only | supports matrix | launching | Map routes/oracles |
-| Native LCM | pending | read-only | supports matrix | launching | Map routes/oracles |
-| Native persistence | pending | read-only | supports matrix | launching | Map restart/state cases |
-| Native lifecycle/background | pending | read-only | supports matrix | launching | Map responsibilities |
-| Native Codex delivery | pending | read-only | supports matrix | launching | Map host contract |
-| Native Claude contract | pending | read-only | supports matrix | launching | Map shipped hook contract |
-| Native privacy | pending | read-only | supports matrix | launching | Map isolation cases |
-| Native reference runner | pending | read-only | supports rn-reference | launching | Map immutable runner inputs |
-| Native 570 diff | pending | read-only | supports rn-source-docs | launching | Map remaining source delta |
-| NCM admission/journal | pending | read-only | supports reproduce | launching | Trace first pipeline segment |
-| NCM worker pipeline | pending | read-only | supports reproduce | launching | Trace worker segment |
-| NCM selection/exclusions | pending | read-only | supports reproduce | launching | Trace ranking/filter segment |
-| NCM replay/recovery | pending | read-only | supports reproduce | launching | Trace persistence segment |
-| NCM scopes | pending | read-only | supports matrix | launching | Map seven bindings |
-| NCM cancellation/deletion | pending | read-only | supports matrix | launching | Map lifecycle cases |
-| NCM tests | pending | read-only | supports matrix | launching | Inventory real coverage |
-| NCM frozen proposal | pending | read-only | supports reproduce | launching | Audit hypothesis only |
-| NCM budgets | pending | read-only | supports verification | launching | Freeze performance gates |
-| Semantic query authority | pending | read-only | supports diagnose | launching | Trace authority decision |
-| Semantic acquisition | pending | read-only | supports diagnose | launching | Trace artifact acquisition |
-| Semantic projection | pending | read-only | supports diagnose | launching | Trace generation projection |
-| Semantic calibration | pending | read-only | supports diagnose | launching | Trace calibration transition |
-| Semantic artifact store | pending | read-only | supports diagnose | launching | Trace storage/recovery |
-| Semantic retrieval | pending | read-only | supports matrix | launching | Map serving evidence |
-| Semantic tests | pending | read-only | supports matrix | launching | Inventory coverage gaps |
-| Semantic setup/config | pending | read-only | supports diagnose | launching | Map provisioning contract |
-| Build/check map | pending | read-only | supports readiness | launching | Freeze commands/features |
-| Conflict map checker | pending | read-only | supports wave 2 | launching | Challenge ownership split |
-| Acceptance checker | pending | read-only | supports matrix | launching | Challenge completeness |
-| Test isolation | pending | read-only | supports verification | launching | Map safe profiles/sockets |
-| Repeat campaign | pending | read-only | supports release | launching | Specify retained evidence |
+| rn-acceptance-matrix | `/root/acceptance_matrix_owner` | `execution-results/readiness-matrix.{md,json}` only | ready | running | Publish frozen matrix |
+| rn-integration-readiness | `/root/integration_readiness_owner` | `execution-results/pr707-integration-readiness.md` only | ready | running | Record current gate |
+| Native facts | `/root/native_facts_scout` | read-only | supports matrix | running | Map routes/oracles |
+| Native trust/feedback | `/root/native_trust_scout` | read-only | supports matrix | running | Map routes/oracles |
+| Native retrieval telemetry | `/root/native_retrieval_scout` | read-only | supports matrix | running | Map effect distinctions |
+| Native sessions | `/root/native_sessions_scout` | read-only | supports matrix | running | Map routes/oracles |
+| Native LCM | `/root/native_lcm_scout` | read-only | supports matrix | running | Map routes/oracles |
+| Native persistence | `/root/native_persistence_scout` | read-only | supports matrix | running | Map restart/state cases |
+| Native lifecycle/background | `/root/native_lifecycle_scout` | read-only | supports matrix | running | Map responsibilities |
+| Native Codex delivery | `/root/native_codex_host_scout` | read-only | supports matrix | running | Map host contract |
+| Native Claude contract | `/root/native_claude_contract_scout` | read-only | supports matrix | running | Map shipped hook contract |
+| Native privacy | `/root/native_privacy_scout` | read-only | supports matrix | running | Map isolation cases |
+| Native reference runner | `/root/native_reference_scout` | read-only | supports rn-reference | running | Map immutable runner inputs |
+| Native 570 diff | `/root/native_570_diff_scout` | read-only | supports rn-source-docs | running | Map remaining source delta |
+| NCM admission/journal | `/root/ncm_admission_journal_scout` | read-only | supports reproduce | running | Trace first pipeline segment |
+| NCM worker pipeline | `/root/ncm_worker_pipeline_scout` | read-only | supports reproduce | running | Trace worker segment |
+| NCM selection/exclusions | `/root/ncm_selection_scout` | read-only | supports reproduce | running | Trace ranking/filter segment |
+| NCM replay/recovery | `/root/ncm_recovery_scout` | read-only | supports reproduce | running | Trace persistence segment |
+| NCM scopes | `/root/ncm_scopes_scout` | read-only | supports matrix | running | Map seven bindings |
+| NCM cancellation/deletion | `/root/ncm_lifecycle_scout` | read-only | supports matrix | running | Map lifecycle cases |
+| NCM tests | `/root/ncm_tests_scout` | read-only | supports matrix | running | Inventory real coverage |
+| NCM frozen proposal | `/root/ncm_proposal_scout` | read-only | supports reproduce | running | Audit hypothesis only |
+| NCM budgets | `/root/ncm_budgets_scout` | read-only | supports verification | running | Freeze performance gates |
+| Semantic query authority | `/root/semantic_authority_scout` | read-only | supports diagnose | running | Trace authority decision |
+| Semantic acquisition | `/root/semantic_acquisition_scout` | read-only | supports diagnose | running | Trace artifact acquisition |
+| Semantic projection | `/root/semantic_projection_scout` | read-only | supports diagnose | running | Trace generation projection |
+| Semantic calibration | `/root/semantic_calibration_scout` | read-only | supports diagnose | running | Trace calibration transition |
+| Semantic artifact store | `/root/semantic_artifact_scout` | read-only | supports diagnose | running | Trace storage/recovery |
+| Semantic retrieval | `/root/semantic_retrieval_scout` | read-only | supports matrix | running | Map serving evidence |
+| Semantic tests | `/root/semantic_tests_scout` | read-only | supports matrix | running | Inventory coverage gaps |
+| Semantic setup/config | `/root/semantic_setup_scout` | read-only | supports diagnose | running | Map provisioning contract |
+| Build/check map | `/root/build_check_scout` | read-only | supports readiness | running | Freeze commands/features |
+| Conflict map checker | `/root/conflict_map_checker` | read-only | supports wave 2 | running | Challenge ownership split |
+| Acceptance checker | `/root/acceptance_checker` | read-only | supports matrix | running | Challenge completeness |
+| Test isolation | `/root/test_isolation_scout` | read-only | supports verification | running | Map safe profiles/sockets |
+| Repeat campaign | `/root/repeat_campaign_scout` | read-only | supports release | running | Specify retained evidence |
