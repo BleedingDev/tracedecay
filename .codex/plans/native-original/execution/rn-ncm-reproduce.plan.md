@@ -39,3 +39,7 @@ Depends on rn-acceptance-matrix. Gate rn-ncm-recall-fix. The build owner runs re
 ## Current dependency contract
 
 Prerequisites: rn-acceptance-matrix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+
+## Trace-first-loss status (2026-09-13)
+
+The pinned real-worker Codex active-history evidence is recorded in `execution-results/ncm-recall-reproduction.md`: `cc-1440` reproduced cold 2/4, `cc-1442` passed the warm/full journey including its daemon/worker restart and destination recall, and `cc-1445` passed the closest existing concurrent shared-worker namespace case. The separate explicit observer restart discovery (`cc-1446`) was blocked before test execution by the current shared-tree compile blocker. The first directly observed failing assertion is the final two-item candidate set; admission and trace counters also report two. Missing ACK/watermark, worker `common_recall`, and adapter reconstruction receipts leave the actual first-loss stage unresolved; the budget scout rules out the synthetic byte-budget seam. `trace-first-loss` remains pending because the missing stage instrumentation must localize the loss before `rn-ncm-recall-fix` can be released.
