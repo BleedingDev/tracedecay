@@ -1,9 +1,13 @@
 //! Real NCM adapter construction at the daemon composition boundary.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-transport")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use tracedecay_domain::UserProfileId;
+#[cfg(feature = "test-transport")]
+use tracedecay_runtime_core::logging::log_daemon_event;
 
 use tracedecay_memory_provider_ncm::{
     NcmCognitiveSurface, NcmProviderAdapter, RustNcmConfig, RustNcmSurface, RustNcmWorkerOwner,
@@ -39,6 +43,117 @@ pub(in crate::daemon) enum NcmObserverConstructionError {
     /// The real surface declared an invalid adapter identity.
     #[error("NCM observer adapter is invalid: {0}")]
     Adapter(#[from] tracedecay_memory_provider_ncm::NcmAdapterError),
+    /// The opt-in diagnostic journey asked for keyed stage evidence, but the
+    /// daemon could not obtain a fresh secret from the operating system.
+    #[cfg(feature = "test-transport")]
+    #[error("NCM recall diagnostic entropy is unavailable: {0}")]
+    DiagnosticEntropyUnavailable(String),
+}
+
+/// Installs the opt-in recall-stage sink immediately after the adapter is
+/// constructed. The feature gate keeps this code out of ordinary production
+/// builds; the environment gate keeps it dormant even in a test-enabled
+/// binary. The key is generated in this daemon generation, retained only by
+/// the adapter, and never logged or written to the provider state root.
+fn attach_recall_diagnostic_sink(
+    provider: NcmProviderAdapter,
+) -> Result<NcmProviderAdapter, NcmObserverConstructionError> {
+    #[cfg(feature = "test-transport")]
+    {
+        if std::env::var("TRACEDECAY_TEST_NCM_RECALL_DIAGNOSTICS")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Ok(provider);
+        }
+
+        static DIAGNOSTIC_KEY: OnceLock<
+            Result<tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey, String>,
+        > = OnceLock::new();
+        let key = DIAGNOSTIC_KEY
+            .get_or_init(|| {
+                let mut bytes = [0_u8; 32];
+                getrandom::getrandom(&mut bytes)
+                    .map(|()| tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey::new(bytes))
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(NcmObserverConstructionError::DiagnosticEntropyUnavailable)?;
+        return Ok(provider.with_recall_diagnostic_sink(
+            Arc::new(NcmRecallDiagnosticLogSink::default()),
+            Some(key),
+        ));
+    }
+
+    #[cfg(not(feature = "test-transport"))]
+    {
+        Ok(provider)
+    }
+}
+
+/// Stderr sink used only by the exact opt-in host journey. Every field is a
+/// keyed digest or a bounded scalar; no provider/candidate/source identity,
+/// query, content, or source sequence reaches the operator log.
+#[cfg(feature = "test-transport")]
+#[derive(Default)]
+struct NcmRecallDiagnosticLogSink {
+    write_lock: Mutex<()>,
+}
+
+#[cfg(feature = "test-transport")]
+impl tracedecay_memory_provider_ncm::NcmRecallDiagnosticSink for NcmRecallDiagnosticLogSink {
+    fn record(&self, event: tracedecay_memory_provider_ncm::NcmRecallDiagnosticEvent) {
+        let Ok(_guard) = self.write_lock.lock() else {
+            return;
+        };
+
+        let stage = match event.stage {
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::Worker => "worker",
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::Reconstructed => {
+                "reconstructed"
+            }
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::PartialReply => {
+                "partial_reply"
+            }
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::PostDispatchCancellation => {
+                "post_dispatch_cancellation"
+            }
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::PostDispatchDeadline => {
+                "post_dispatch_deadline"
+            }
+            tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::ReconstructionFailure => {
+                "reconstruction_failure"
+            }
+        };
+
+        let mut fields = vec![
+            ("stage", stage.to_owned()),
+            ("state_generation", event.state_generation.to_string()),
+            ("candidate_count", event.candidate_count.to_string()),
+            ("excluded_count", event.excluded_count.to_string()),
+            ("truncated_count", event.truncated_count.to_string()),
+            ("unknown_count", event.unknown_count.to_string()),
+            ("empty_content_count", event.empty_content_count.to_string()),
+            ("score_tie_count", event.score_tie_count.to_string()),
+            (
+                "score_margin_below_epsilon_count",
+                event.score_margin_below_epsilon_count.to_string(),
+            ),
+            (
+                "remaining_candidate_slots",
+                event.remaining_candidate_slots.to_string(),
+            ),
+            (
+                "remaining_content_bytes",
+                event.remaining_content_bytes.to_string(),
+            ),
+        ];
+        if let Some(request_digest) = event.request_id_sha256 {
+            fields.push(("request_digest", request_digest));
+        }
+        log_daemon_event("ncm_recall_diagnostic", &fields);
+    }
 }
 
 /// One strong daemon-generation owner. The empty slot starts no worker thread,
@@ -207,6 +322,7 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
     );
     let provider = NcmProviderAdapter::new(surface)?;
+    let provider = attach_recall_diagnostic_sink(provider)?;
     let provider = Arc::new(match authority {
         Some(authority) => provider.with_admission_authority(authority),
         None => provider,

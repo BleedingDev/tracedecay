@@ -156,6 +156,7 @@ const JOURNAL_INSPECTION_PAGE_LIMIT: u32 = 100;
 
 const USER_DATA_DIR_ENV: &str = "TRACEDECAY_DATA_DIR";
 const GLOBAL_DB_ENV: &str = "TRACEDECAY_GLOBAL_DB";
+const NCM_RECALL_DIAGNOSTIC_EVENT: &str = "[tracedecay] event=ncm_recall_diagnostic ";
 
 // ---------------------------------------------------------------------------
 // Isolated daemon fixture
@@ -260,7 +261,7 @@ impl ClaudeHostJourney {
         assert!(self.daemon.is_none(), "a daemon is already running");
         let log = fs::File::create(self.home.path().join("daemon.stderr.log"))
             .expect("isolated daemon log");
-        let mut daemon = self
+        let mut command = self
             .cli(&["daemon", "run"])
             .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
             .env(
@@ -268,11 +269,93 @@ impl ClaudeHostJourney {
                 "warn,tracedecay::mcp::tools::handlers::hook_runtime::admission=debug",
             )
             .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("daemon should start");
+            .stderr(Stdio::from(log));
+        if self.active_provider.is_ncm() || self.ncm_observer {
+            command.env("TRACEDECAY_TEST_NCM_RECALL_DIAGNOSTICS", "1");
+        }
+        let mut daemon = command.spawn().expect("daemon should start");
         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
         self.daemon = Some(daemon);
+    }
+
+    /// Reads only the daemon's bounded, opt-in NCM stage markers. The marker
+    /// contains keyed request identity plus scalar counters; it never contains
+    /// raw request ids, query text, candidate/source ids, content, or source
+    /// sequence values.
+    fn ncm_recall_diagnostic_events(&self) -> Vec<NcmRecallDiagnosticRecord> {
+        let Ok(mut log) = fs::File::open(self.home.path().join("daemon.stderr.log")) else {
+            return Vec::new();
+        };
+        let Ok(metadata) = log.metadata() else {
+            return Vec::new();
+        };
+        let offset = metadata.len().saturating_sub(256 * 1024);
+        if std::io::Seek::seek(&mut log, std::io::SeekFrom::Start(offset)).is_err() {
+            return Vec::new();
+        }
+        let mut tail = Vec::new();
+        if log.take(256 * 1024).read_to_end(&mut tail).is_err() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&tail)
+            .lines()
+            .filter_map(parse_ncm_recall_diagnostic)
+            .collect()
+    }
+
+    /// Proves the live adapter emitted a correlated worker stage before the
+    /// adapter reconstruction stage for every observed recall request. Equal
+    /// state generations and non-increasing candidate counts make the marker
+    /// useful for diagnosing a lost result without exposing its contents.
+    fn assert_ncm_recall_diagnostics(&self) {
+        if !self.active_provider.is_ncm() {
+            return;
+        }
+        let events = self.ncm_recall_diagnostic_events();
+        assert!(
+            !events.is_empty(),
+            "the opt-in NCM diagnostic sink must emit at least one stage marker"
+        );
+        let mut by_request = BTreeMap::<String, Vec<NcmRecallDiagnosticRecord>>::new();
+        for event in events {
+            by_request
+                .entry(event.request_digest.clone())
+                .or_default()
+                .push(event);
+        }
+        assert!(
+            !by_request.is_empty(),
+            "NCM stage markers need keyed request identities"
+        );
+        for (request_digest, stages) in by_request {
+            let worker = stages
+                .first()
+                .expect("a request must have a first NCM stage");
+            assert_eq!(
+                worker.stage, "worker",
+                "NCM worker stage must precede adapter stages for request {request_digest}: {stages:?}"
+            );
+            let reconstructed = stages
+                .iter()
+                .find(|event| matches!(event.stage.as_str(), "reconstructed" | "partial_reply"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "NCM request {request_digest} has no reconstructed or partial stage: {stages:?}"
+                    )
+                });
+            assert_eq!(
+                worker.state_generation, reconstructed.state_generation,
+                "NCM stage pair must observe one provider generation for request {request_digest}"
+            );
+            assert!(
+                reconstructed.candidate_count <= worker.candidate_count,
+                "adapter reconstruction cannot create candidates for request {request_digest}: {stages:?}"
+            );
+            assert!(
+                stages.iter().skip(1).all(|event| event.stage != "worker"),
+                "worker must be the only first stage for request {request_digest}: {stages:?}"
+            );
+        }
     }
 
     /// Invoked only while formatting a failed populated-recall assertion.
@@ -1785,6 +1868,77 @@ fn recall_diagnostic_summary(line: &str) -> Option<Value> {
     Some(Value::Object(summary))
 }
 
+#[derive(Debug)]
+struct NcmRecallDiagnosticRecord {
+    request_digest: String,
+    stage: String,
+    state_generation: u64,
+    candidate_count: u64,
+}
+
+/// Parses the fixed scalar subset emitted by the test-only NCM sink. Values
+/// are deliberately logfmt-safe, so a malformed or duplicate field cannot be
+/// mistaken for a valid stage marker.
+fn parse_ncm_recall_diagnostic(line: &str) -> Option<NcmRecallDiagnosticRecord> {
+    if line.len() > 4096 {
+        return None;
+    }
+    let encoded = line.strip_prefix(NCM_RECALL_DIAGNOSTIC_EVENT)?;
+    let mut fields = BTreeMap::new();
+    for token in encoded.split_whitespace() {
+        let (key, value) = token.split_once('=')?;
+        if fields.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    const ALLOWED_FIELDS: &[&str] = &[
+        "stage",
+        "request_digest",
+        "state_generation",
+        "candidate_count",
+        "excluded_count",
+        "truncated_count",
+        "unknown_count",
+        "empty_content_count",
+        "score_tie_count",
+        "score_margin_below_epsilon_count",
+        "remaining_candidate_slots",
+        "remaining_content_bytes",
+    ];
+    if fields.keys().any(|key| !ALLOWED_FIELDS.contains(key)) {
+        return None;
+    }
+    let request_digest = fields.get("request_digest").copied()?;
+    if request_digest.len() != 64
+        || !request_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    let stage = fields.get("stage").copied()?;
+    if !matches!(
+        stage,
+        "worker"
+            | "reconstructed"
+            | "partial_reply"
+            | "post_dispatch_cancellation"
+            | "post_dispatch_deadline"
+            | "reconstruction_failure"
+    ) {
+        return None;
+    }
+    for field in ALLOWED_FIELDS.iter().skip(2) {
+        fields.get(field)?.parse::<u64>().ok()?;
+    }
+    Some(NcmRecallDiagnosticRecord {
+        request_digest: request_digest.to_owned(),
+        stage: stage.to_owned(),
+        state_generation: fields.get("state_generation")?.parse().ok()?,
+        candidate_count: fields.get("candidate_count")?.parse().ok()?,
+    })
+}
+
 /// The pinned history policy allows useful Partial/Stale evidence. Keep the
 /// actual returned label; an accepted degraded answer is not a complete answer.
 fn assert_history_degradation(lane: &Value) {
@@ -2610,6 +2764,7 @@ fn assert_recalled_session_messages(
             "_meta": { "session_id": recalled_session_id },
         }),
     );
+    journey.assert_ncm_recall_diagnostics();
     let lane = advisory_lane(&answer)
         .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
     assert_eq!(
@@ -2773,4 +2928,22 @@ fn recall_failure_diagnostics_keep_only_bounded_counter_metadata() {
     assert!(!summary.to_string().contains("private"));
     assert!(recall_diagnostic_summary("unrelated private daemon line").is_none());
     assert!(recall_diagnostic_summary(&format!("{marker}{}", "x".repeat(4097))).is_none());
+}
+
+#[test]
+fn ncm_recall_diagnostic_parser_rejects_unbounded_fields() {
+    let line = format!(
+        "{NCM_RECALL_DIAGNOSTIC_EVENT}stage=worker request_digest={} \
+         state_generation=3 candidate_count=4 excluded_count=0 truncated_count=0 \
+         unknown_count=0 empty_content_count=0 score_tie_count=0 \
+         score_margin_below_epsilon_count=0 remaining_candidate_slots=0 \
+         remaining_content_bytes=0",
+        "a".repeat(64)
+    );
+    assert!(parse_ncm_recall_diagnostic(&line).is_some());
+    assert!(parse_ncm_recall_diagnostic(&format!("{line} query=private")).is_none());
+    assert!(
+        parse_ncm_recall_diagnostic(&line.replace("stage=worker", "stage=worker worker_id=raw"))
+            .is_none()
+    );
 }
