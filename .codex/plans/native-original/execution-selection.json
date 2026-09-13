@@ -1,6 +1,47 @@
 {
   "plans_root": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution",
   "glob": "*.plan.md",
+  "exclude": [
+    "rn-ncm-recall-fix.plan.md",
+    "rn-semantic-fix.plan.md"
+  ],
+  "superseded": {
+    "rn-ncm-recall-fix": [
+      "rn-ncm-byte-budget-fix",
+      "rn-ncm-stage-trace",
+      "rn-ncm-real-fix",
+      "rn-ncm-proof-retry"
+    ],
+    "rn-semantic-fix": [
+      "rn-semantic-runtime-dynamic",
+      "rn-semantic-acquisition-fix",
+      "rn-semantic-serving-fix"
+    ]
+  },
+  "superseded_todos": {
+    "rn-ncm-reproduce": [
+      "trace-first-loss"
+    ],
+    "rn-semantic-diagnose": [
+      "reproduce-semantic-states"
+    ]
+  },
+  "replacement_artifacts": [
+    {
+      "source_plan": "rn-ncm-reproduce",
+      "source_todo": "trace-first-loss",
+      "replacement_plan": "rn-ncm-stage-trace",
+      "blocking": false,
+      "reason": "The partial reproduction artifact remains historical input; the dedicated stage-trace node owns the missing causal receipts."
+    },
+    {
+      "source_plan": "rn-semantic-diagnose",
+      "source_todo": "reproduce-semantic-states",
+      "replacement_plan": "rn-semantic-runtime-dynamic",
+      "blocking": false,
+      "reason": "The static diagnosis remains historical input; the dedicated dynamic node owns real acquisition-to-serving transition evidence."
+    }
+  ],
   "depends": [
     "rn-reference:rn-cases-facts",
     "rn-reference:rn-cases-sessions",
@@ -79,11 +120,36 @@
     "rn-acceptance-matrix:rn-ncm-reproduce",
     "rn-acceptance-matrix:rn-ncm-tests",
     "rn-acceptance-matrix:rn-semantic-diagnose",
-    "rn-ncm-reproduce:rn-ncm-recall-fix",
-    "rn-ncm-recall-fix:rn-ncm-tests",
-    "rn-semantic-diagnose:rn-semantic-fix",
-    "rn-semantic-fix:rn-build",
-    "rn-semantic-fix:rn-verify-semantic",
+    "rn-acceptance-matrix:rn-ncm-byte-budget-fix",
+    "rn-acceptance-matrix:rn-ncm-stage-trace",
+    "rn-acceptance-matrix:rn-ncm-proof-retry",
+    "rn-session-delivery:rn-ncm-proof-retry",
+    "rn-ncm-stage-trace:rn-ncm-real-fix",
+    "rn-ncm-byte-budget-fix:rn-ncm-tests",
+    "rn-ncm-real-fix:rn-ncm-tests",
+    "rn-ncm-proof-retry:rn-ncm-tests",
+    "rn-provider-semantics:rn-ncm-tests",
+    "rn-ncm-byte-budget-fix:rn-build",
+    "rn-ncm-real-fix:rn-build",
+    "rn-ncm-proof-retry:rn-build",
+    "rn-ncm-byte-budget-fix:rn-verify-ncm",
+    "rn-ncm-real-fix:rn-verify-ncm",
+    "rn-ncm-proof-retry:rn-verify-ncm",
+    "rn-provider-semantics:rn-verify-ncm",
+    "rn-contract:rn-provider-semantics",
+    "rn-acceptance-matrix:rn-provider-semantics",
+    "rn-provider-semantics:rn-build",
+    "rn-acceptance-matrix:rn-semantic-runtime-dynamic",
+    "rn-semantic-runtime-dynamic:rn-semantic-acquisition-fix",
+    "rn-semantic-runtime-dynamic:rn-semantic-serving-fix",
+    "rn-semantic-runtime-dynamic:rn-verify-semantic",
+    "rn-semantic-acquisition-fix:rn-build",
+    "rn-semantic-serving-fix:rn-build",
+    "rn-semantic-acquisition-fix:rn-verify-semantic",
+    "rn-semantic-serving-fix:rn-verify-semantic",
+    "rn-host-context:rn-privacy-trace-id",
+    "rn-registry:rn-privacy-trace-id",
+    "rn-privacy-trace-id:rn-privacy-restore",
     "rn-build:rn-verify-semantic",
     "rn-verify-semantic:rn-review-fidelity",
     "rn-verify-semantic:rn-review-integration",

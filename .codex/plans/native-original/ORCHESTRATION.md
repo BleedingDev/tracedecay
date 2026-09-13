@@ -7,22 +7,22 @@ Goal: restore complete original Native code and behavior while preserving NCM an
 - Active original reference: `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` (unmodified upstream PR707 tip); candidate metadata: `1fe250fed7ca615f1dfdcd580befeb276328e910`.
 - Execution branch/worktree: `feat/pluggable-memory-providers-v2`, `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`.
 - Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/native-original-reference-57006f60`; the b3 checkout and audit remain historical.
-- Exact selection: `--plans-root /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution --glob '*.plan.md'`.
-- Dependency overlay: all 89 exact edges in [execution-selection.json](execution-selection.json); do not omit or paraphrase them.
+- Exact selection: `--plans-root /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution --glob '*.plan.md'`, excluding historical `rn-ncm-recall-fix.plan.md` and `rn-semantic-fix.plan.md`.
+- Dependency overlay: all 114 exact edges in [execution-selection.json](execution-selection.json); do not omit or paraphrase them.
 - Graph ID: `native-original-execution-pr707-20260913`.
-- Plan-set hash: `5befc5f407`; selection hash: `bbc92e4d52`.
+- Plan-set hash: `38902296e5`; selection hash: `789c92dd6f`.
 - Snapshot: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json`.
 - State directory: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913`.
 - Complete resolved bundle: [execution-handoff.json](execution-handoff.json).
 - Active state ledger: the current graph snapshot and generated handoff under `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/`; the old 20260911 operator log is historical.
 
-Only `execution/*.plan.md` is selected. README, research, plan-review and other historical project plans are deliberately excluded. Do not add umbrella documents as runnable orphan plans. Revalidate and refresh the full bundle after any edge/selection change.
+Only the 47 selected plans under `execution/*.plan.md` are active. The historical broad NCM/semantic plans are retained but excluded; their exact replacement lanes and the two nonblocking partial-artifact replacements are recorded in `execution-selection.json`. README, research, plan-review and other historical project plans are deliberately excluded. Do not add umbrella documents as runnable orphan plans. Revalidate and refresh the full bundle after any edge/selection change.
 
 ## Limits and scheduling
 
-Resolved limits: max_threads=50, max_depth=3. Reserve root; use at most 49 subagents, and only ready nodes with actual independent ownership. This graph has 40 nodes and 89 edges; the saved summary/frontier are authoritative for current state. No nested delegation or development branch/worktree fan-out is planned. All execution/test/review agents use `gpt-5.6-luna` with `reasoning_effort=max`.
+Resolved limits: max_threads=50, max_depth=3. Reserve root; use at most 49 subagents, and only ready nodes with actual independent ownership. This graph has 47 nodes and 114 edges; the saved summary/frontier are authoritative for current state. No nested delegation or development branch/worktree fan-out is planned. All execution/test/review agents use `gpt-5.6-luna` with `reasoning_effort=max`.
 
-The current frontier has five pending nodes: rn-contract, rn-ncm-reproduce, rn-privacy-audit, rn-reference and rn-semantic-diagnose. The 201-row acceptance matrix, source inventory, map checker, integration-readiness gate and anchor node are complete. The reference runner is reopened for live-review fixes before its build edge releases. Root keeps one continuous focus on this branch/worktree and assigns disjoint write scopes directly in the shared checkout; no independent development branch or worktree launch is implied.
+The current frontier has eight ready nodes: rn-contract, rn-ncm-byte-budget-fix, rn-ncm-reproduce, rn-ncm-stage-trace, rn-privacy-audit, rn-reference, rn-semantic-diagnose and rn-semantic-runtime-dynamic. The 201-row acceptance matrix, source inventory, map checker, integration-readiness gate and anchor node are complete. The reference runner is reopened for live-review fixes before its build edge releases. Root keeps one continuous focus on this branch/worktree and assigns disjoint write scopes directly in the shared checkout; no independent development branch or worktree launch is implied.
 
 After the Native wrapper is accepted, the graph exposes registry, Native bridge, session-delivery and host-context work. Root sequences those owners within the same branch/worktree; Native test edits depend on the completed bridge. Composition waits for accepted bridge, registry, host, observation and test outputs. The critical implementation chain is source inventory → contract → wrapper → bridge → Native tests → composition → product build → verification → independent review → root close.
 
@@ -66,7 +66,7 @@ Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/plug
 Execution HEAD: <actual reviewed current HEAD>
 Original reference: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6
 Graph: native-original-execution-pr707-20260913
-Selection hash: bbc92e4d52
+Selection hash: 789c92dd6f
 Plan: <absolute execution/<node>.plan.md>
 Read first: WORKER-RULES.md and REVIEWED-DECISIONS.md
 Accepted predecessor outputs: <paths, exact type/API decisions and root acceptance>
@@ -98,7 +98,7 @@ All original public operations/background responsibilities need concrete routes 
 
 ## Current reassessment gates
 
-The active graph has 40 nodes and 89 edges. rn-privacy-audit records current detector equality against 570 but keeps the typed Claude history seam pending. rn-history-owner-followup validates whether `ResolvedScope` reaches historical ingestion and assigns a bounded owner/assertion if it does not. Both are read-only gates; no parity is fabricated.
+The active graph has 47 nodes and 114 edges. rn-privacy-audit records current detector equality against 570 but keeps the typed Claude history seam pending. rn-history-owner-followup validates whether `ResolvedScope` reaches historical ingestion and assigns a bounded owner/assertion if it does not. Both are read-only gates; no parity is fabricated.
 
 The independent rn-map-checker owner repairs confirmed stale source/catalog expectations in the existing Python checker and tests. It feeds rn-build; it never establishes runtime parity. Exact files are isolated from source-docs ownership.
 
@@ -110,4 +110,4 @@ The reference-build plan targets the clean detached 570 checkout. Runner and com
 
 ## Current readiness orchestration
 
-READINESS-PLAN.md governs the NCM causal repair and semantic readiness work. The live wave uses Codex-native Luna Max agents on the existing branch, with one writer per owned surface and a single Cargo owner; historical model requirements cannot force another agent CLI. The final release-readiness gate follows both independent reviews and precedes close. All forty plan files and the exact 89 dependencies must be carried together.
+READINESS-PLAN.md governs the NCM causal repair and semantic readiness work. The live wave uses Codex-native Luna Max agents on the existing branch, with one writer per owned surface and a single Cargo owner; historical model requirements cannot force another agent CLI. The final release-readiness gate follows both independent reviews and precedes close. All 47 selected plan files and the exact 114 dependencies must be carried together. The graph helper validates and carries the machine-readable replacement metadata so partial reproduction/diagnosis artifacts do not masquerade as unowned sinks.

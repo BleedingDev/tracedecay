@@ -1,5 +1,52 @@
 {
   "errors": [],
   "warnings": [],
-  "plan_count": 40
+  "plan_count": 47,
+  "graph_id": "native-original-execution-pr707-20260913",
+  "plan_set_hash": "38902296e5",
+  "selection_hash": "789c92dd6f",
+  "edge_count": 114,
+  "selection_metadata": {
+    "exclude": [
+      "rn-ncm-recall-fix.plan.md",
+      "rn-semantic-fix.plan.md"
+    ],
+    "superseded": {
+      "rn-ncm-recall-fix": [
+        "rn-ncm-byte-budget-fix",
+        "rn-ncm-stage-trace",
+        "rn-ncm-real-fix",
+        "rn-ncm-proof-retry"
+      ],
+      "rn-semantic-fix": [
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-serving-fix"
+      ]
+    },
+    "superseded_todos": {
+      "rn-ncm-reproduce": [
+        "trace-first-loss"
+      ],
+      "rn-semantic-diagnose": [
+        "reproduce-semantic-states"
+      ]
+    },
+    "replacement_artifacts": [
+      {
+        "source_plan": "rn-ncm-reproduce",
+        "source_todo": "trace-first-loss",
+        "replacement_plan": "rn-ncm-stage-trace",
+        "blocking": false,
+        "reason": "The partial reproduction artifact remains historical input; the dedicated stage-trace node owns the missing causal receipts."
+      },
+      {
+        "source_plan": "rn-semantic-diagnose",
+        "source_todo": "reproduce-semantic-states",
+        "replacement_plan": "rn-semantic-runtime-dynamic",
+        "blocking": false,
+        "reason": "The static diagnosis remains historical input; the dedicated dynamic node owns real acquisition-to-serving transition evidence."
+      }
+    ]
+  }
 }

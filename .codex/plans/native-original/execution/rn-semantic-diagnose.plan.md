@@ -24,7 +24,7 @@ Use the unmodified `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` Native reference. 
 
 Observed smoke evidence: exact search became fresh and returned branch_smoke; semantic search stayed calibration_unavailable; logs also contained semantic_projection_schedule outcome=artifact_unavailable. This does not prove a corrupt calibration formula. semantic_query_runtime.rs emits CalibrationUnavailable when semantic_query_authority_for_scope is absent. StrictSemantic requests enqueue demand acquisition before canonical generation lookup; the earlier hybrid smoke did not prove that path.
 
-Read crates/tracedecay-code-index-runtime/src/code_index_scheduler/{semantic_query_runtime,queries}.rs; crates/tracedecay-application/src/semantic_runtime/{production,acceptance_calibration}.rs; crates/tracedecay-semantic/src/model_lifecycle/{owner,acquisition,reconciliation,persistence}.rs and artifact_store.rs; query/src/retrieval/semantic/service.rs. Use supported status/doctor/model lifecycle commands, current CLI schemas and synthetic logs. Establish configured provider/model, artifact receipt/hash, generation compatibility, measured calibration availability, activation route, authenticated checkout and query generation. Compare unmodified 570 when behavior may be upstream by design.
+Read crates/tracedecay-code-index-runtime/src/code_index_scheduler/{semantic_query_runtime,queries}.rs; crates/tracedecay-application/src/semantic_runtime/{production,acceptance_calibration}.rs; crates/tracedecay-semantic/src/model_lifecycle/{owner,acquisition,reconciliation,persistence}.rs and crates/tracedecay-semantic/src/artifact_store.rs; crates/tracedecay-query/src/retrieval/semantic/service.rs. Use supported status/doctor/model lifecycle commands, current CLI schemas and synthetic logs. Establish configured provider/model, artifact receipt/hash, generation compatibility, measured calibration availability, activation route, authenticated checkout and query generation. Compare unmodified 570 when behavior may be upstream by design.
 
 Test an empty profile, correctly provisioned compatible artifacts, deliberately missing/corrupt/mismatched artifacts, index generation changes, restart and same-checkout HEAD movement. Distinguish intended lazy acquisition or missing setup from a failure to recover after successful installation. Report network/offline/cancellation behavior separately.
 
@@ -34,7 +34,7 @@ Read-only implementation. Own execution-results/semantic-diagnosis.md and synthe
 
 ## Operator Guidance
 
-Depends on rn-acceptance-matrix; gates rn-semantic-fix. Return a concrete transition failure and bounded fix scope, or a proven setup correction with runnable provisioning steps. A generic availability string is not a root-cause diagnosis. Supported acquisitions run only in isolated test profiles through the build owner/runtime verifier.
+Depends on rn-acceptance-matrix; gates rn-semantic-runtime-dynamic. Return a concrete transition failure and bounded fix scope, or a proven setup correction with runnable provisioning steps. A generic availability string is not a root-cause diagnosis. Supported acquisitions run only in isolated test profiles through the build owner/runtime verifier.
 
 ## Current dependency contract
 

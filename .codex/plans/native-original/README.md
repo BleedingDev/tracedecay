@@ -4,7 +4,7 @@ Current implementation scope: [Complete Native/NCM and semantic readiness](READI
 
 This plan keeps the original Native memory implementation and adapts our product around it. Native includes facts, retrieval tracking, trust and lifecycle behavior, sessions, temporal retrieval and LCM. NCM remains a separate selectable provider.
 
-**Status: active execution.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 40 nodes and 89 edges; the retrieval-anchor and integration-readiness gates are complete.
+**Status: active execution.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 47 selected nodes and 114 edges; the retrieval-anchor and integration-readiness gates are complete. Historical broad NCM/semantic repair plans remain retained but excluded from active selection.
 
 ## The implementation decision
 
@@ -20,7 +20,7 @@ This plan keeps the original Native memory implementation and adapts our product
 
 ## Parallel execution
 
-The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-contract, rn-ncm-reproduce, rn-privacy-audit, rn-reference and rn-semantic-diagnose. The 201-row acceptance matrix, source inventory, map checker and integration-readiness gate are complete. The reference runner is reopened for live-review fixes. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
+The [execution graph](execution-graph.mmd) contains **47 nodes and 114 dependency edges**. The current frontier is rn-contract, rn-ncm-byte-budget-fix, rn-ncm-reproduce, rn-ncm-stage-trace, rn-privacy-audit, rn-reference, rn-semantic-diagnose and rn-semantic-runtime-dynamic. The 201-row acceptance matrix, source inventory, map checker and integration-readiness gate are complete. The reference runner is reopened for live-review fixes. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
 
 Use available Codex-native execution agents for scoped implementation; root assigns ownership and reviews changes before pushing. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
 
@@ -68,15 +68,21 @@ The reference build overlaps implementation. Manifests and the shared Cargo sche
 
 | [rn-acceptance-matrix](execution/rn-acceptance-matrix.plan.md) | Freeze complete operation coverage and acceptance oracles |
 | [rn-ncm-reproduce](execution/rn-ncm-reproduce.plan.md) | Identify the first loss behind intermittent recall |
-| [rn-ncm-recall-fix](execution/rn-ncm-recall-fix.plan.md) | Repair the demonstrated recall failure |
+| [rn-ncm-byte-budget-fix](execution/rn-ncm-byte-budget-fix.plan.md) | Repair deterministic NCM byte-budget backfill |
+| [rn-ncm-stage-trace](execution/rn-ncm-stage-trace.plan.md) | Localize the first real-worker NCM loss |
+| [rn-ncm-real-fix](execution/rn-ncm-real-fix.plan.md) | Repair the demonstrated real-worker NCM seam |
+| [rn-ncm-proof-retry](execution/rn-ncm-proof-retry.plan.md) | Repair transient NCM instance-proof recovery |
+| [rn-provider-semantics](execution/rn-provider-semantics.plan.md) | Repair NCM provider semantic binding |
 | [rn-semantic-diagnose](execution/rn-semantic-diagnose.plan.md) | Trace artifact, projection and calibration readiness |
-| [rn-semantic-fix](execution/rn-semantic-fix.plan.md) | Repair the demonstrated semantic lifecycle or setup gap |
+| [rn-semantic-runtime-dynamic](execution/rn-semantic-runtime-dynamic.plan.md) | Execute dynamic semantic lifecycle evidence |
+| [rn-semantic-acquisition-fix](execution/rn-semantic-acquisition-fix.plan.md) | Repair semantic acquisition and activation |
+| [rn-semantic-serving-fix](execution/rn-semantic-serving-fix.plan.md) | Repair semantic query serving |
 | [rn-verify-semantic](execution/rn-verify-semantic.plan.md) | Prove strict semantic retrieval and recovery |
 | [rn-release-readiness](execution/rn-release-readiness.plan.md) | Require three consecutive integrated passes and pilot instructions |
 
 ## Start or resume
 
-Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the scoped handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 89 edges and exact active paths.
+Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the scoped handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 114 edges, exact active paths and machine-readable supersession/replacement metadata.
 
 From the execution worktree:
 

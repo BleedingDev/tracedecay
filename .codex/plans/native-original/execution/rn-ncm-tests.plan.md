@@ -38,7 +38,7 @@ No push, merge, release, global install, runtime user-data action or unassigned 
 2. Preserve all seven exact-scope fields including resolved_scope_digest, namespace derivation, model identity, learned state format and worker behavior. Source/module internals are read-only.
 3. Cover Native selected plus NCM observer, and NCM selected with shared canonical host state, using existing real registration/worker fixtures where required.
 4. Correct a stale Replay documentation claim only from the verified current runtime dispatch; do not change the algorithm to match documentation.
-5. Consume the accepted failing/passing reproduction and repair from rn-ncm-recall-fix; verify its behavior across the broader integration suite. Retain any unresolved or newly observed incomplete recall explicitly. Submit exact filters and runtime prerequisites to build/verification owners; no Cargo/model run here.
+5. Consume the accepted failing/passing evidence and repairs from rn-ncm-byte-budget-fix, rn-ncm-real-fix, rn-ncm-proof-retry and rn-provider-semantics; verify their behavior across the broader integration suite. Retain any unresolved or newly observed incomplete recall explicitly. Submit exact filters and runtime prerequisites to build/verification owners; no Cargo/model run here.
 
 ## Acceptance Checklist
 
@@ -56,7 +56,7 @@ Stop condition: Return focused tests or an evidence-backed no-change result and 
 
 ## Current dependency contract
 
-Prerequisites: rn-acceptance-matrix, rn-ncm-recall-fix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+Prerequisites: rn-acceptance-matrix, rn-ncm-byte-budget-fix, rn-ncm-real-fix, rn-ncm-proof-retry, rn-provider-semantics. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
 
 ## Added regression coverage
 

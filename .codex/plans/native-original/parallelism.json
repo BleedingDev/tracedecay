@@ -1,9 +1,9 @@
 {
   "graph_id": "native-original-execution-pr707-20260913",
-  "plan_set_hash": "5befc5f407",
-  "selection_hash": "bbc92e4d52",
-  "plan_count": 40,
-  "edge_count": 89,
+  "plan_set_hash": "38902296e5",
+  "selection_hash": "789c92dd6f",
+  "plan_count": 47,
+  "edge_count": 114,
   "topological_waves": [
     [
       "rn-acceptance-matrix",
@@ -11,18 +11,22 @@
       "rn-restore-anchor"
     ],
     [
+      "rn-ncm-byte-budget-fix",
       "rn-ncm-reproduce",
+      "rn-ncm-stage-trace",
       "rn-reference",
       "rn-semantic-diagnose",
+      "rn-semantic-runtime-dynamic",
       "rn-source-docs"
     ],
     [
       "rn-build-reference",
       "rn-contract",
       "rn-map-checker",
-      "rn-ncm-recall-fix",
+      "rn-ncm-real-fix",
       "rn-privacy-audit",
-      "rn-semantic-fix"
+      "rn-semantic-acquisition-fix",
+      "rn-semantic-serving-fix"
     ],
     [
       "rn-cases-facts",
@@ -31,21 +35,30 @@
       "rn-history-owner-followup",
       "rn-host-fixtures",
       "rn-native-port",
-      "rn-ncm-tests",
-      "rn-privacy-restore"
+      "rn-provider-semantics"
     ],
     [
       "rn-cases-sessions",
       "rn-host-context",
       "rn-native-bridge",
-      "rn-registry",
+      "rn-registry"
+    ],
+    [
+      "rn-native-tests",
+      "rn-privacy-trace-id"
+    ],
+    [
+      "rn-privacy-restore"
+    ],
+    [
       "rn-session-delivery"
     ],
     [
-      "rn-native-tests"
+      "rn-composition",
+      "rn-ncm-proof-retry"
     ],
     [
-      "rn-composition"
+      "rn-ncm-tests"
     ],
     [
       "rn-build"
@@ -70,6 +83,49 @@
       "rn-close"
     ]
   ],
-  "longest_dependency_chain_nodes": 12,
-  "scheduling_note": "Eligibility only; keep one branch and one focus, assign only useful disjoint scopes."
+  "longest_dependency_chain_nodes": 15,
+  "scheduling_note": "Eligibility only; keep one branch and one focus, assign only useful disjoint scopes.",
+  "selection_metadata": {
+    "exclude": [
+      "rn-ncm-recall-fix.plan.md",
+      "rn-semantic-fix.plan.md"
+    ],
+    "superseded": {
+      "rn-ncm-recall-fix": [
+        "rn-ncm-byte-budget-fix",
+        "rn-ncm-stage-trace",
+        "rn-ncm-real-fix",
+        "rn-ncm-proof-retry"
+      ],
+      "rn-semantic-fix": [
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-serving-fix"
+      ]
+    },
+    "superseded_todos": {
+      "rn-ncm-reproduce": [
+        "trace-first-loss"
+      ],
+      "rn-semantic-diagnose": [
+        "reproduce-semantic-states"
+      ]
+    },
+    "replacement_artifacts": [
+      {
+        "source_plan": "rn-ncm-reproduce",
+        "source_todo": "trace-first-loss",
+        "replacement_plan": "rn-ncm-stage-trace",
+        "blocking": false,
+        "reason": "The partial reproduction artifact remains historical input; the dedicated stage-trace node owns the missing causal receipts."
+      },
+      {
+        "source_plan": "rn-semantic-diagnose",
+        "source_todo": "reproduce-semantic-states",
+        "replacement_plan": "rn-semantic-runtime-dynamic",
+        "blocking": false,
+        "reason": "The static diagnosis remains historical input; the dedicated dynamic node owns real acquisition-to-serving transition evidence."
+      }
+    ]
+  }
 }

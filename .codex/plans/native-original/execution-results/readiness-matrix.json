@@ -10290,7 +10290,7 @@
         "missing": "Original NCM recall workload remains 2/4; root cause and repaired 4/4 result are unresolved.",
         "route_state": "real_worker_route_present_unexecuted"
       },
-      "downstream_owner": "rn-ncm-recall-fix",
+      "downstream_owner": "rn-ncm-real-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-ncm-reproduce",
@@ -12475,7 +12475,7 @@
         "missing": "Active NCM recall inherits unresolved 2/4 quality and has no sealed real-worker host result.",
         "route_state": "real_worker_route_present_unexecuted"
       },
-      "downstream_owner": "rn-ncm-recall-fix",
+      "downstream_owner": "rn-verify-ncm",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-ncm-reproduce",
@@ -12574,7 +12574,7 @@
         "missing": "Active NCM recall inherits unresolved 2/4 quality and has no sealed real-worker host result.",
         "route_state": "real_worker_route_present_unexecuted"
       },
-      "downstream_owner": "rn-ncm-recall-fix",
+      "downstream_owner": "rn-verify-ncm",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-ncm-reproduce",
@@ -12772,7 +12772,7 @@
         "missing": "The required 100-cell campaign has executed count zero; original 2/4 issue remains a release blocker.",
         "route_state": "real_worker_route_present_unexecuted"
       },
-      "downstream_owner": "rn-ncm-recall-fix",
+      "downstream_owner": "rn-verify-ncm",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-ncm-reproduce",
@@ -12872,11 +12872,11 @@
         "missing": "Corpus fixture and expectations are not sealed into the execution ledger.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-runtime-dynamic",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -12973,11 +12973,12 @@
         "missing": "Current live semantic smoke reports artifact/calibration unavailable; model identity is not sealed.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13074,11 +13075,12 @@
         "missing": "Unit route exists but no production source/generation evidence is recorded.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13175,11 +13177,12 @@
         "missing": "Current calibration is unavailable/shifted in smoke evidence; no valid production digest is recorded.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13276,11 +13279,12 @@
         "missing": "Activation unit coverage exists but production activation/rollback identity is not recorded.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-fix",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13381,7 +13385,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13482,7 +13488,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13579,11 +13587,11 @@
         "missing": "State matrix is unit-covered but production state transitions are unexecuted.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-runtime-dynamic",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13684,7 +13692,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13785,7 +13795,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13886,7 +13898,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -13987,7 +14001,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -14084,11 +14100,12 @@
         "missing": "ANN production artifact and adaptive-recall evidence are not recorded.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-fix",
+      "downstream_owner": "rn-semantic-serving-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -14189,7 +14206,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -14286,11 +14305,11 @@
         "missing": "No production restart run with model/tokenizer/calibration/artifact hashes is recorded.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-runtime-dynamic",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -14352,7 +14371,7 @@
       "track": "semantic",
       "surface": "lifecycle",
       "operation": "missing/corrupt/mismatch artifact recovery",
-      "reference_route": "57006f60cb45bcee8487e73a40d4fad1a12ee2b checkout :: crates/tracedecay-artifact_store.rs :: artifact admission/recovery",
+      "reference_route": "57006f60cb45bcee8487e73a40d4fad1a12ee2b checkout :: crates/tracedecay-semantic/src/artifact_store.rs :: artifact admission/recovery",
       "candidate_route": "artifact store + model lifecycle",
       "effect": "missing/corrupt/mismatched artifact produces typed unavailable and recovery requires fresh compatible activation",
       "oracle": {
@@ -14387,15 +14406,15 @@
         "missing": "Current artifact unavailable state has no completed recovery evidence.",
         "route_state": "real_runtime_route_present_unexecuted_or_blocked"
       },
-      "downstream_owner": "rn-semantic-diagnose",
+      "downstream_owner": "rn-semantic-runtime-dynamic",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-runtime-dynamic",
         "rn-verify-semantic"
       ],
       "source_evidence": [
-        "crates/tracedecay-artifact_store.rs",
+        "crates/tracedecay-semantic/src/artifact_store.rs",
         "crates/tracedecay-code-index-runtime/src/code_index_scheduler/semantic_query_runtime.rs",
         "crates/tracedecay-query/src/retrieval/semantic/service.rs"
       ],
@@ -14492,7 +14511,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -14593,7 +14614,9 @@
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-semantic-diagnose",
-        "rn-semantic-fix",
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic",
+        "rn-semantic-serving-fix",
         "rn-verify-semantic"
       ],
       "source_evidence": [
@@ -17512,10 +17535,11 @@
         "route_state": "real_runtime_route_present_unexecuted_or_blocked",
         "missing": "No production retry/rollback sequence with sealed activation receipts is recorded."
       },
-      "downstream_owner": "rn-semantic-fix",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
-        "rn-semantic-fix"
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic"
       ],
       "source_evidence": [
         "crates/tracedecay-application/src/semantic_runtime/owner.rs",
@@ -20065,10 +20089,11 @@
         "route_state": "real_runtime_route_present_unexecuted_or_blocked",
         "missing": "Scheduler route exists but no production ready-event/generation result is recorded."
       },
-      "downstream_owner": "rn-semantic-fix",
+      "downstream_owner": "rn-semantic-acquisition-fix",
       "dependencies": [
         "rn-acceptance-matrix",
-        "rn-semantic-fix"
+        "rn-semantic-acquisition-fix",
+        "rn-semantic-runtime-dynamic"
       ],
       "source_evidence": [
         "crates/tracedecay-application/src/semantic_runtime/fair_scheduler.rs",
@@ -20254,11 +20279,11 @@
         "route_state": "deterministic_bug_candidate_unexecuted",
         "missing": "Current reconstruction can break on the first candidate that exceeds the remaining byte budget and fail to consider lower-ranked candidates that fit; causality for the historical 2/4 workload is unproven."
       },
-      "downstream_owner": "rn-ncm-reproduce",
+      "downstream_owner": "rn-ncm-byte-budget-fix",
       "dependencies": [
         "rn-acceptance-matrix",
         "rn-ncm-reproduce",
-        "rn-ncm-recall-fix"
+        "rn-ncm-byte-budget-fix"
       ],
       "source_evidence": [
         "crates/tracedecay-memory-ncm-core/src/recall/mod.rs",
@@ -20800,8 +20825,24 @@
       "responsibility": "Recover causal NCM 2/4 workload with correlation IDs across admission/journal/ACK/watermark/model/selection/filter/budget."
     },
     {
-      "id": "rn-ncm-recall-fix",
-      "responsibility": "Repair and re-run NCM recall quality; preserve original 2/4 unresolved until 100-cell proof."
+      "id": "rn-ncm-byte-budget-fix",
+      "responsibility": "Repair the bounded NCM UTF-8 byte-budget scan and preserve the lower-ranked fitting-candidate regression."
+    },
+    {
+      "id": "rn-ncm-stage-trace",
+      "responsibility": "Localize the intermittent real-worker NCM loss with correlation IDs and stage receipts before repair."
+    },
+    {
+      "id": "rn-ncm-real-fix",
+      "responsibility": "Repair only the demonstrated NCM runtime/worker/observer loss and prove failing-before/passing-after recovery."
+    },
+    {
+      "id": "rn-ncm-proof-retry",
+      "responsibility": "Repair transient NCM instance-proof negative caching after the serialized observation-journey handoff."
+    },
+    {
+      "id": "rn-provider-semantics",
+      "responsibility": "Repair the NCM provider common/source-binding semantic boundary and release its focused tests/build gate."
     },
     {
       "id": "rn-ncm-tests",
@@ -20816,8 +20857,16 @@
       "responsibility": "Acquire real semantic artifact/model/calibration and diagnose strict unavailable/negative/recovery routes."
     },
     {
-      "id": "rn-semantic-fix",
-      "responsibility": "Repair semantic activation/projection/ANN/rerank only after causal diagnosis."
+      "id": "rn-semantic-runtime-dynamic",
+      "responsibility": "Execute the real semantic lifecycle and localize the first unavailable-to-ready transition."
+    },
+    {
+      "id": "rn-semantic-acquisition-fix",
+      "responsibility": "Repair the diagnosed semantic model acquisition, projection, calibration or activation transition."
+    },
+    {
+      "id": "rn-semantic-serving-fix",
+      "responsibility": "Repair the diagnosed semantic code-index/query authority and strict-serving transition."
     },
     {
       "id": "rn-verify-semantic",

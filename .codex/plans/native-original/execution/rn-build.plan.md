@@ -17,7 +17,7 @@ Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The revie
 Execution host: Codex. Use an available Codex-native execution/review agent when assigned; adapt unavailable model preferences within Codex. You are a leaf; no child agents or cross-host agent CLI launches. Preserve peers' edits and send cross-scope needs to the lead.
 
 Mode: write-capable and build owner.
-Prerequisites: rn-privacy-audit, rn-map-checker, rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor, rn-integration-readiness, rn-history-owner-followup. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910. Reuse the same designated build execution agent and verified reference artifacts from rn-build-reference; rebuild the reference only if its recorded inputs changed.
+Prerequisites: rn-privacy-audit, rn-map-checker, rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-ncm-byte-budget-fix, rn-ncm-real-fix, rn-ncm-proof-retry, rn-provider-semantics, rn-semantic-acquisition-fix, rn-semantic-serving-fix, rn-reference, rn-build-reference, rn-restore-anchor, rn-integration-readiness, rn-history-owner-followup. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910. Reuse the same designated build execution agent and verified reference artifacts from rn-build-reference; rebuild the reference only if its recorded inputs changed.
 
 Read these reports under ../evidence/: verification.md, source-baseline.md, ncm-boundary.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
@@ -62,7 +62,7 @@ Stop condition: Return tested artifacts and actual results. Failed builds remain
 
 ## Current dependency contract
 
-Prerequisites: rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-reference, rn-build-reference, rn-restore-anchor, rn-map-checker, rn-privacy-audit, rn-privacy-restore, rn-history-owner-followup, rn-integration-readiness, rn-semantic-fix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+Prerequisites: rn-composition, rn-fabric, rn-host-fixtures, rn-ncm-tests, rn-ncm-byte-budget-fix, rn-ncm-real-fix, rn-ncm-proof-retry, rn-provider-semantics, rn-reference, rn-build-reference, rn-restore-anchor, rn-map-checker, rn-privacy-audit, rn-privacy-restore, rn-history-owner-followup, rn-integration-readiness, rn-semantic-acquisition-fix, rn-semantic-serving-fix. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
 
 ## Actual artifact gates
 

@@ -32,8 +32,8 @@ Verification-only: own execution-results/semantic-verification.md and isolated t
 
 ## Operator Guidance
 
-Depends on rn-semantic-fix and rn-build. Gate both independent reviews and rn-release-readiness. If a query returns correct text but semantic is unavailable, this node fails; code search as a whole returning a fallback is not semantic verification.
+Depends on rn-semantic-runtime-dynamic, rn-semantic-acquisition-fix, rn-semantic-serving-fix and rn-build. Gate both independent reviews and rn-release-readiness. If a query returns correct text but semantic is unavailable, this node fails; code search as a whole returning a fallback is not semantic verification.
 
 ## Current dependency contract
 
-Prerequisites: rn-semantic-fix, rn-build. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
+Prerequisites: rn-semantic-runtime-dynamic, rn-semantic-acquisition-fix, rn-semantic-serving-fix, rn-build. The exact edges in ../execution-selection.json are authoritative; this section supersedes older prerequisite prose. Read ../READINESS-PLAN.md for the latest NCM repair and semantic scope.
