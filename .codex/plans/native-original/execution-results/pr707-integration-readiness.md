@@ -1,10 +1,10 @@
 # rn-integration-readiness — current PR707 gate
 
-Date: 2026-09-13  
-Worktree: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`  
-Branch: `feat/pluggable-memory-providers-v2`  
-Current HEAD: `d17f115f4bf455bf205eb39ee1de0b17fb9eaf6b` (`docs(graph): record live Luna Max wave`)  
-Active original baseline: `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`  
+Date: 2026-09-13
+Worktree: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`
+Branch: `feat/pluggable-memory-providers-v2`
+Current HEAD: `d17f115f4bf455bf205eb39ee1de0b17fb9eaf6b` (`docs(graph): record live Luna Max wave`)
+Active original baseline: `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`
 Audited candidate metadata: `1fe250fed7ca615f1dfdcd580befeb276328e910`
 
 ## Decision
