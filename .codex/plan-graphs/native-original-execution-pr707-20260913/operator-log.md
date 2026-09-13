@@ -4,9 +4,9 @@
 
 - Goal: complete Native parity, repair intermittent NCM recall, repair semantic search, and prove release readiness on `feat/pluggable-memory-providers-v2`.
 - Selection: `--plans-root /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution --glob '*.plan.md'`.
-- Explicit dependency edges: the 88 `--depends` entries in `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution-selection.json`; no extra edge overlay.
+- Explicit dependency edges: the 89 `--depends` entries in `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution-selection.json`; no extra edge overlay.
 - Graph ID: `native-original-execution-pr707-20260913`.
-- Selection hash: `1752917f10`.
+- Selection hash: `bbc92e4d52`.
 - Snapshot: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json`.
 - State directory: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913`.
 - Limits: `max_threads=50`, `max_depth=3`; wave 1 reserves 13 thread slots for root, follow-up verification, and replacements.
@@ -27,7 +27,7 @@
 | Lane | Agent | Owner / write scope | Dependency | Status | Next action |
 | --- | --- | --- | --- | --- | --- |
 | rn-acceptance-matrix | `/root/acceptance_matrix_owner` | `execution-results/readiness-matrix.{md,json}` only | ready | running | Publish frozen matrix |
-| rn-integration-readiness | `/root/integration_readiness_owner` | `execution-results/pr707-integration-readiness.md` only | ready | running | Record current gate |
+| rn-integration-readiness | `/root/integration_readiness_owner` | `execution-results/pr707-integration-readiness.md` only | ready | complete | Root accepted report; keep rn-build blocked |
 | Native facts | `/root/native_facts_scout` | read-only | supports matrix | running | Map routes/oracles |
 | Native trust/feedback | `/root/native_trust_scout` | read-only | supports matrix | running | Map routes/oracles |
 | Native retrieval telemetry | `/root/native_retrieval_scout` | read-only | supports matrix | running | Map effect distinctions |
@@ -35,11 +35,11 @@
 | Native LCM | `/root/native_lcm_scout` | read-only | supports matrix | running | Map routes/oracles |
 | Native persistence | `/root/native_persistence_scout` | read-only | supports matrix | running | Map restart/state cases |
 | Native lifecycle/background | `/root/native_lifecycle_scout` | read-only | supports matrix | running | Map responsibilities |
-| Native Codex delivery | `/root/native_codex_host_scout` | read-only | supports matrix | running | Map host contract |
+| Native Codex delivery | `/root/native_codex_host_scout` | read-only | supports matrix | complete | Feed findings to matrix owner |
 | Native Claude contract | `/root/native_claude_contract_scout` | read-only | supports matrix | running | Map shipped hook contract |
 | Native privacy | `/root/native_privacy_scout` | read-only | supports matrix | running | Map isolation cases |
 | Native reference runner | `/root/native_reference_scout` | read-only | supports rn-reference | running | Map immutable runner inputs |
-| Native 570 diff | `/root/native_570_diff_scout` | read-only | supports rn-source-docs | running | Map remaining source delta |
+| Native 570 diff | `/root/native_570_diff_scout` | read-only | supports rn-source-docs | complete | Feed staged-substitute map to wave 2 |
 | NCM admission/journal | `/root/ncm_admission_journal_scout` | read-only | supports reproduce | running | Trace first pipeline segment |
 | NCM worker pipeline | `/root/ncm_worker_pipeline_scout` | read-only | supports reproduce | running | Trace worker segment |
 | NCM selection/exclusions | `/root/ncm_selection_scout` | read-only | supports reproduce | running | Trace ranking/filter segment |
@@ -61,4 +61,8 @@
 | Conflict map checker | `/root/conflict_map_checker` | read-only | supports wave 2 | running | Challenge ownership split |
 | Acceptance checker | `/root/acceptance_checker` | read-only | supports matrix | running | Challenge completeness |
 | Test isolation | `/root/test_isolation_scout` | read-only | supports verification | running | Map safe profiles/sockets |
-| Repeat campaign | `/root/repeat_campaign_scout` | read-only | supports release | running | Specify retained evidence |
+| Repeat campaign | `/root/repeat_campaign_scout` | read-only | supports release | complete | Feed sealed-ledger contract to matrix |
+| Historical NCM workload | `/root/ncm_history_scout` | read-only | supports reproduce | running | Recover exact 2/4 workload |
+| Semantic smoke receipts | `/root/semantic_smoke_receipt_scout` | read-only | supports diagnose | running | Correlate observed timeline |
+| Native operation-map checker | `/root/native_operation_map_checker` | read-only | supports matrix | running | Challenge completeness |
+| Pilot setup | `/root/pilot_setup_scout` | read-only | supports release | running | Map isolated trial/rollback |

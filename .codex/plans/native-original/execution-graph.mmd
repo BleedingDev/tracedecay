@@ -43,7 +43,7 @@ flowchart TD
     plan_rn_host_fixtures_todo_1["rn-host-fixtures-done (pending)\nPrepare real Claude and Codex Native comparison journeys and return the required reviewable evidence."]
   end
   subgraph plan_rn_integration_readiness["rn-integration-readiness"]
-    plan_rn_integration_readiness_todo_1["rn-integration-readiness-done (pending)\nRecord current integration checks, resolve the designated build blockers, and return an explicit readiness decision."]
+    plan_rn_integration_readiness_todo_1["rn-integration-readiness-done (completed)\nRecord current integration checks, resolve the designated build blockers, and return an explicit readiness decision."]
   end
   subgraph plan_rn_map_checker["rn-map-checker"]
     plan_rn_map_checker_todo_1["rn-map-checker-done (pending)\nCorrect stale source expectations without weakening map validation and run its checks."]
@@ -199,6 +199,7 @@ flowchart TD
   plan_rn_privacy_restore_todo_1 --> plan_rn_build_todo_1
   plan_rn_privacy_restore_todo_1 --> plan_rn_session_delivery_todo_1
   plan_rn_reference_todo_1 --> plan_rn_build_todo_1
+  plan_rn_reference_todo_1 --> plan_rn_build_reference_todo_1
   plan_rn_reference_todo_1 --> plan_rn_cases_facts_todo_1
   plan_rn_reference_todo_1 --> plan_rn_cases_sessions_todo_1
   plan_rn_reference_todo_1 --> plan_rn_cases_state_todo_1

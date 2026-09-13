@@ -1,9 +1,9 @@
 {
   "graph_id": "native-original-execution-pr707-20260913",
   "plan_set_hash": "5befc5f407",
-  "selection_hash": "1752917f10",
+  "selection_hash": "bbc92e4d52",
   "plan_count": 40,
-  "edge_count": 88,
+  "edge_count": 89,
   "topological_waves": [
     [
       "rn-acceptance-matrix",

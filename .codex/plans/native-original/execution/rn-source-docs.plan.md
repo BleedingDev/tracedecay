@@ -17,7 +17,7 @@ Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The revie
 Execution host: Codex. Use an available Codex-native execution/review agent when assigned; adapt unavailable model preferences within Codex. You are a leaf; no child agents or cross-host agent CLI launches. Preserve peers' edits and send cross-scope needs to the lead.
 
 Mode: write-capable.
-Prerequisites: None. Root accepts the complete inventory/documentation independently; the escalated privacy audit and required correction block rn-build, not this documentation output. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
+Prerequisites: rn-acceptance-matrix. Root accepts the complete inventory/documentation independently; the escalated privacy audit and required correction block rn-build, not this documentation output. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
 
 Read these reports under ../evidence/: source-baseline.md, native-facts.md, native-sessions.md, saved-data.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
@@ -25,9 +25,13 @@ Read these reports under ../evidence/: source-baseline.md, native-facts.md, nati
 
 Write only:
 
-- product/upstream/** (metadata/documentation only)
+- product/upstream/README.md
+- product/upstream/convergence-map.json
+- product/upstream/pr707-floor.json
+- product/upstream/tracedecay-v2-pr707.json
 - product/architecture/native-memory-surface-map.md
 - product/architecture/native-memory-surface-map.json
+- product/architecture/native-original-source-inventory.md
 - product/architecture/adr/ADR-0010-native-provider-parity-projection.md
 - product/architecture/adr/ADR-0008-upstream-convergence.md (stale-reference clarification only)
 
@@ -35,7 +39,7 @@ Everything else is out of scope. Original Native/session/LCM implementations, or
 
 No push, merge, release, global install, runtime user-data action or unassigned cleanup. Only the designated build owner in rn-build-reference and rn-build submits Cargo work. A no-change conclusion is valid when evidence proves the required behavior already holds; it must not hide missing coverage.
 
-Also own `product/architecture/native-original-source-inventory.md`. Read ../SOURCE-BOUNDARY.md and enumerate every existing 570-to-execution-head hunk across its complete protected/native-adjacent surface. Classify original implementation, exact restoration or pre-existing shared host extension with associated checks. This inventory is a required accepted output before rn-contract and rn-restore-anchor start. No blanket allowlist and no rollback of prior host/privacy/cursor safety fixes.
+Read ../SOURCE-BOUNDARY.md and enumerate every existing 570-to-execution-head hunk across its complete protected/native-adjacent surface in the owned source inventory. Classify original implementation, exact restoration or pre-existing shared host extension with associated checks. This inventory is a required accepted output before rn-contract and rn-restore-anchor start. No blanket allowlist and no rollback of prior host/privacy/cursor safety fixes.
 
 ## Steps
 

@@ -4,7 +4,7 @@ Current implementation scope: [Complete Native/NCM and semantic readiness](READI
 
 This plan keeps the original Native memory implementation and adapts our product around it. Native includes facts, retrieval tracking, trust and lifecycle behavior, sessions, temporal retrieval and LCM. NCM remains a separate selectable provider.
 
-**Status: active bounded reassessment.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 40 nodes and 88 edges; all are pending except the current retrieval-anchor equality gate.
+**Status: active execution.** The active original is unmodified upstream PR707 tip `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`; candidate metadata is `1fe250fed7ca615f1dfdcd580befeb276328e910` on branch `feat/pluggable-memory-providers-v2` at `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. The older b3/571 audit remains historical. The current graph has 40 nodes and 89 edges; the retrieval-anchor and integration-readiness gates are complete.
 
 ## The implementation decision
 
@@ -20,7 +20,7 @@ This plan keeps the original Native memory implementation and adapts our product
 
 ## Parallel execution
 
-The [execution graph](execution-graph.mmd) contains **40 nodes and 88 dependency edges**. The current frontier is rn-acceptance-matrix and rn-integration-readiness. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent branch or worktree launch is implied.
+The [execution graph](execution-graph.mmd) contains **40 nodes and 89 dependency edges**. The current frontier is rn-acceptance-matrix. Root keeps one continuous focus on the active branch/worktree and sequences ready owners from the saved graph; no independent development branch or worktree launch is implied.
 
 Use available Codex-native execution agents for scoped implementation; root assigns ownership and reviews changes before pushing. Each plan supplies exact ownership, prerequisites, ordered steps, one acceptance checklist, prohibited shortcuts and a stop condition.
 
@@ -76,7 +76,7 @@ The reference build overlaps implementation. Manifests and the shared Cargo sche
 
 ## Start or resume
 
-Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the scoped handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 88 edges and exact active paths.
+Use [ORCHESTRATION.md](ORCHESTRATION.md) for exact graph targeting, sequencing rules, conflict ownership and the scoped handoff template. The saved [handoff bundle](execution-handoff.json) and [selection](execution-selection.json) contain all 89 edges and exact active paths.
 
 From the execution worktree:
 

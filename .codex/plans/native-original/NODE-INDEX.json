@@ -354,11 +354,12 @@
     "id": "rn-build-reference",
     "title": "Build untouched upstream 570 Native while product work runs",
     "dependencies": [
-      "rn-source-docs"
+      "rn-source-docs",
+      "rn-reference"
     ],
     "mode": "build owner; original source read-only",
     "ownership": [
-      "A clean detached 570 worktree under the repository .worktrees/ and its repo-local build/test artifacts",
+      "Repo-local build/test artifacts from the clean detached 570 worktree prepared by rn-reference",
       "target/task-scratch/native-original/reference-build/ (logs and binary inventory only)"
     ]
   },

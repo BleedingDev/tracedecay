@@ -17,6 +17,7 @@ Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md. Worktree for orchestration
 Model gpt-5.6-luna, reasoning max, fork_turns=none, no child agents. You are not alone; preserve peer files. Prerequisite: rn-source-docs accepted by root and the root-reviewed reference-build requirements below. Runner completion is not required to compile the independently known original binary. Mode: build owner; original source read-only. Read ../evidence/source-baseline.md and ../evidence/verification.md plus ../execution-results/reference-build-requirements.md.
 
 Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/native-original-reference-57006f60`. Create it only if absent; if it exists, verify its HEAD and clean source rather than resetting or deleting it. Reference process/data roots remain test-owned and separate from operator data.
+The accepted rn-reference node is the sole creator/verifier of this detached checkout. This node consumes that exact clean checkout and must not create, reset, remove or repoint it.
 
 ## Ownership and Constraints
 

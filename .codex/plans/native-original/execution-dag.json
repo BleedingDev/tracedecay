@@ -1,10 +1,10 @@
 {
-  "generated_at": "2026-09-13T11:08:06.034191+00:00",
+  "generated_at": "2026-09-13T14:38:11.027135+00:00",
   "graph_id": "native-original-execution-pr707-20260913",
   "plan_set_hash": "5befc5f407",
-  "selection_hash": "1752917f10",
+  "selection_hash": "bbc92e4d52",
   "plan_count": 40,
-  "edge_count": 88,
+  "edge_count": 89,
   "plans_root": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution",
   "selected_globs": [
     "*.plan.md"
@@ -238,6 +238,10 @@
     },
     {
       "source": "rn-source-docs",
+      "target": "rn-build-reference"
+    },
+    {
+      "source": "rn-reference",
       "target": "rn-build-reference"
     },
     {
@@ -648,7 +652,7 @@
         {
           "id": "rn-integration-readiness-done",
           "content": "Record current integration checks, resolve the designated build blockers, and return an explicit readiness decision.",
-          "status": "pending",
+          "status": "completed",
           "ordinal": 1
         }
       ],
@@ -1205,25 +1209,6 @@
       "total": 3
     },
     {
-      "plan_slug": "rn-integration-readiness",
-      "plan_name": "rn-integration-readiness",
-      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-integration-readiness.plan.md",
-      "plan_status": "pending",
-      "state": "ready",
-      "blocked_by": [],
-      "active": [
-        {
-          "id": "rn-integration-readiness-done",
-          "content": "Record current integration checks, resolve the designated build blockers, and return an explicit readiness decision.",
-          "status": "pending",
-          "ordinal": 1
-        }
-      ],
-      "upcoming": [],
-      "completed": 0,
-      "total": 1
-    },
-    {
       "plan_slug": "rn-build",
       "plan_name": "rn-build",
       "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-build.plan.md",
@@ -1240,7 +1225,6 @@
         "rn-privacy-audit",
         "rn-privacy-restore",
         "rn-history-owner-followup",
-        "rn-integration-readiness",
         "rn-semantic-fix"
       ],
       "active": [
@@ -1262,7 +1246,8 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-source-docs"
+        "rn-source-docs",
+        "rn-reference"
       ],
       "active": [
         {
@@ -1398,8 +1383,7 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-source-docs",
-        "rn-integration-readiness"
+        "rn-source-docs"
       ],
       "active": [
         {
@@ -1420,8 +1404,7 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-contract",
-        "rn-integration-readiness"
+        "rn-contract"
       ],
       "active": [
         {
@@ -1443,8 +1426,7 @@
       "state": "blocked",
       "blocked_by": [
         "rn-source-docs",
-        "rn-contract",
-        "rn-integration-readiness"
+        "rn-contract"
       ],
       "active": [
         {
@@ -1550,8 +1532,7 @@
       "plan_status": "pending",
       "state": "blocked",
       "blocked_by": [
-        "rn-contract",
-        "rn-integration-readiness"
+        "rn-contract"
       ],
       "active": [
         {
@@ -2126,6 +2107,18 @@
       ],
       "upcoming": [],
       "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "rn-integration-readiness",
+      "plan_name": "rn-integration-readiness",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution/rn-integration-readiness.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
       "total": 1
     },
     {

@@ -8,9 +8,9 @@ Goal: restore complete original Native code and behavior while preserving NCM an
 - Execution branch/worktree: `feat/pluggable-memory-providers-v2`, `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`.
 - Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/native-original-reference-57006f60`; the b3 checkout and audit remain historical.
 - Exact selection: `--plans-root /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/execution --glob '*.plan.md'`.
-- Dependency overlay: all 88 exact edges in [execution-selection.json](execution-selection.json); do not omit or paraphrase them.
+- Dependency overlay: all 89 exact edges in [execution-selection.json](execution-selection.json); do not omit or paraphrase them.
 - Graph ID: `native-original-execution-pr707-20260913`.
-- Plan-set hash: `5befc5f407`; selection hash: `1752917f10`.
+- Plan-set hash: `5befc5f407`; selection hash: `bbc92e4d52`.
 - Snapshot: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913/snapshot.json`.
 - State directory: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-execution-pr707-20260913`.
 - Complete resolved bundle: [execution-handoff.json](execution-handoff.json).
@@ -20,7 +20,7 @@ Only `execution/*.plan.md` is selected. README, research, plan-review and other 
 
 ## Limits and scheduling
 
-Resolved limits: max_threads=50, max_depth=3. Reserve root; use at most 49 subagents, and only ready nodes with actual independent ownership. This graph has 40 nodes and 88 edges; the saved summary/frontier are authoritative for current state. No nested delegation or branch/worktree fan-out is planned. All execution/test/review agents use `gpt-5.6-luna` with `reasoning_effort=max`.
+Resolved limits: max_threads=50, max_depth=3. Reserve root; use at most 49 subagents, and only ready nodes with actual independent ownership. This graph has 40 nodes and 89 edges; the saved summary/frontier are authoritative for current state. No nested delegation or development branch/worktree fan-out is planned. All execution/test/review agents use `gpt-5.6-luna` with `reasoning_effort=max`.
 
 The current frontier has two pending nodes: rn-acceptance-matrix and rn-integration-readiness. Root keeps one continuous focus on this branch/worktree and may sequence these disjoint read/write scopes as evidence arrives; no independent branch or worktree launch is implied. Source inventory and readiness acceptance release the contract, map, privacy and history gates. The anchor node is already complete from the current 570 blob proof. After contract acceptance, release the Native wrapper and fabric; history-owner validation gates session cases and delivery.
 
@@ -66,7 +66,7 @@ Worktree: /Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/plug
 Execution HEAD: <actual reviewed current HEAD>
 Original reference: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6
 Graph: native-original-execution-pr707-20260913
-Selection hash: 1752917f10
+Selection hash: bbc92e4d52
 Plan: <absolute execution/<node>.plan.md>
 Read first: WORKER-RULES.md and REVIEWED-DECISIONS.md
 Accepted predecessor outputs: <paths, exact type/API decisions and root acceptance>
@@ -98,7 +98,7 @@ All original public operations/background responsibilities need concrete routes 
 
 ## Current reassessment gates
 
-The active graph has 40 nodes and 88 edges. rn-privacy-audit records current detector equality against 570 but keeps the typed Claude history seam pending. rn-history-owner-followup validates whether `ResolvedScope` reaches historical ingestion and assigns a bounded owner/assertion if it does not. Both are read-only gates; no parity is fabricated.
+The active graph has 40 nodes and 89 edges. rn-privacy-audit records current detector equality against 570 but keeps the typed Claude history seam pending. rn-history-owner-followup validates whether `ResolvedScope` reaches historical ingestion and assigns a bounded owner/assertion if it does not. Both are read-only gates; no parity is fabricated.
 
 The independent rn-map-checker owner repairs confirmed stale source/catalog expectations in the existing Python checker and tests. It feeds rn-build; it never establishes runtime parity. Exact files are isolated from source-docs ownership.
 
@@ -110,4 +110,4 @@ The reference-build plan targets the clean detached 570 checkout. Runner and com
 
 ## Current readiness orchestration
 
-READINESS-PLAN.md governs the added NCM causal repair and semantic readiness work. The current request launches no agents. Subsequent execution stays in Codex on the existing branch, with available native agents and a single Cargo owner; historical model requirements cannot force another agent CLI. The new final release-readiness gate follows both independent reviews and precedes close. All forty plan files and the exact 88 dependencies must be carried together.
+READINESS-PLAN.md governs the NCM causal repair and semantic readiness work. The live wave uses Codex-native Luna Max agents on the existing branch, with one writer per owned surface and a single Cargo owner; historical model requirements cannot force another agent CLI. The final release-readiness gate follows both independent reviews and precedes close. All forty plan files and the exact 89 dependencies must be carried together.

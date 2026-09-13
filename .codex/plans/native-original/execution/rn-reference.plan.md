@@ -17,7 +17,7 @@ Read ../WORKER-RULES.md and ../REVIEWED-DECISIONS.md before this node. The revie
 Execution host: Codex. Use an available Codex-native execution/review agent when assigned; adapt unavailable model preferences within Codex. You are a leaf; no child agents or cross-host agent CLI launches. Preserve peers' edits and send cross-scope needs to the lead.
 
 Mode: write-capable.
-Prerequisites: None; this node can start in the first launch wave.. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
+Prerequisites: rn-acceptance-matrix. Every named predecessor must be accepted by root before dependent work starts. Original baseline: 57006f60cb45bcee8487e73a40d4fad1a12ee2b6; audited product head: 1fe250fed7ca615f1dfdcd580befeb276328e910.
 
 Read these reports under ../evidence/: verification.md, source-baseline.md, native-facts.md, native-sessions.md. Also read the exact predecessor outputs supplied by root; do not infer an unfinished API.
 
@@ -27,7 +27,11 @@ Reference checkout: `/Users/satan/workspace/bleedingdev/projects/tracedecay/.wor
 
 Write only:
 
-- scripts/product/native-original/** except cases/**
+- scripts/product/native-original/README.md
+- scripts/product/native-original/runner.py
+- scripts/product/native-original/test_runner.py
+- scripts/product/native-original/case-contract.json
+- scripts/product/native-original/example-case.json
 
 Everything else is out of scope. Original Native/session/LCM implementations, original storage and contracts, NCM internals, live databases/settings, unrelated docs, manifests and generated files are protected unless explicitly named above. An allowed directory does not permit editing an original file protected by the reviewed decision. Shared generated outputs outside this ownership require an explicit root assignment before generation writes them.
 
@@ -37,7 +41,7 @@ Required owned output: `scripts/product/native-original/case-contract.json`, the
 
 ## Steps
 
-1. Create a small runner that invokes separately built b3 and product binaries through corresponding existing production CLI/MCP entry points. Pin full revisions and refuse a modified reference tree. Reference checkout lives under the repository's .worktrees/; no build or product source edits in this node.
+1. Create a small runner that invokes separately built upstream-570 and product binaries through corresponding existing production CLI/MCP entry points. Pin full revisions and refuse a modified reference tree. This node alone creates or verifies the detached reference checkout under the repository's .worktrees/; no build or product source edits belong here.
 2. Publish the case-input format immediately for facts/session/state fixture authors. Prefer existing retained operation schemas and existing comparison capture helpers; do not invent a parallel provider or copy original algorithms into the harness.
 3. Give every run isolated stores, process ownership, logical fixtures and captures. Seed both sides independently through original public commands or ingestion. Map only justified nondeterministic identity/time fields; retain original score/order/receipt and raw response evidence.
 4. Capture relevant public outputs and operation-specific semantic state before/after reopen. For original operations absent from CLI use an existing original runtime entry point from an external harness without editing b3; inability to reach one is a visible coverage gap.

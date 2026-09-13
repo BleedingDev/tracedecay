@@ -18,7 +18,7 @@ isProject: false
 
 ## Execution Notes
 
-Work only on `feat/pluggable-memory-providers-v2` in `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. Read ../READINESS-PLAN.md and ../WORKER-RULES.md. The current request is planning only: launch no implementation now. Later execution of this node begins only after lead assignment and graph validation. During later execution, stay in Codex and use available native agents only. The lead assigns exact files, reviews diffs, and commits/pushes accepted checkpoints. No development branch or worktree fan-out.
+Work only on `feat/pluggable-memory-providers-v2` in `/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2`. Read ../READINESS-PLAN.md and ../WORKER-RULES.md. Execute only after lead assignment and graph validation. Stay in Codex and use available native agents only. The lead assigns exact files, reviews diffs, and commits/pushes accepted checkpoints. No development branch or worktree fan-out.
 
 Use the unmodified `57006f60cb45bcee8487e73a40d4fad1a12ee2b6` Native reference. Keep stable V1 and operator data separate. Cargo runs belong to the single designated build owner via cargo-hauler; attach to matching tickets. Test profiles live below the active target directory. Capture failures as well as passes. No missing prerequisite, zero-test filter, skipped real-model test, fallback answer, or mock-only result counts as success.
 
@@ -30,7 +30,7 @@ Test an empty profile, correctly provisioned compatible artifacts, deliberately 
 
 ## Constraints
 
-Read-only implementation. Own execution-results/semantic-diagnosis.md and synthetic fixtures/results below target/test-profile/readiness/semantic. No fake calibration, bypassed compatibility guards, setting changes in operator profiles or global installation. Keep code-search semantics separate from Native fact/session memory algorithms.
+Read-only implementation. Own execution-results/semantic-diagnosis.md and synthetic fixtures/results below target/test-profile/readiness/semantic/diagnose. No fake calibration, bypassed compatibility guards, setting changes in operator profiles or global installation. Keep code-search semantics separate from Native fact/session memory algorithms.
 
 ## Operator Guidance
 

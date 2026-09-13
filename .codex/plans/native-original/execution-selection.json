@@ -49,6 +49,7 @@
     "rn-review-fidelity:rn-close",
     "rn-review-integration:rn-close",
     "rn-source-docs:rn-build-reference",
+    "rn-reference:rn-build-reference",
     "rn-native-bridge:rn-native-tests",
     "rn-build-reference:rn-build",
     "rn-source-docs:rn-contract",
