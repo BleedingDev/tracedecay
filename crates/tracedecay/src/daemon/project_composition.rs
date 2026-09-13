@@ -169,7 +169,7 @@ impl ProjectMemoryProviderActivationSelector {
 /// The one reading of the host and routing gates. Pure so the selection table
 /// is unit-testable without a resolved snapshot.
 fn resolve_memory_provider_activation(
-    config: &tracedecay_configuration::config::TraceDecayConfig,
+    config: &tracedecay_configuration::config::RuntimeTraceDecayConfig,
 ) -> Result<ProjectMemoryProviderActivation> {
     let selection = ProjectMemoryProviderActivation::resolve(
         config.memory_provider_native_enabled,
@@ -193,7 +193,7 @@ fn resolve_memory_provider_activation(
 /// crate cannot smuggle a new wire value into the host routing policy.
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_degradation_rule(
-    config: &tracedecay_configuration::config::TraceDecayConfig,
+    config: &tracedecay_configuration::config::RuntimeTraceDecayConfig,
 ) -> Result<tracedecay_memory_provider_registry::DegradationRule> {
     use tracedecay_memory_provider_registry::{
         DegradationCause, DegradationRule, PinnedDegradationPolicy,
@@ -234,7 +234,7 @@ fn project_recall_degradation_rule(
 #[cfg(feature = "memory-provider-host")]
 fn project_recall_routing_policy(
     selected: Option<(&tracedecay_memory_provider_registry::OwnedProviderId, u64)>,
-    config: &tracedecay_configuration::config::TraceDecayConfig,
+    config: &tracedecay_configuration::config::RuntimeTraceDecayConfig,
 ) -> Result<Option<tracedecay_memory_provider_registry::ActiveRoutingPolicy>> {
     use tracedecay_memory_provider_registry::{ActiveRoutingPolicy, FallbackRule};
     let Some((provider_id, registration_revision)) = selected else {
@@ -3098,7 +3098,7 @@ mod memory_provider_routing_tests {
     //! gates; these tests pin it without a resolved snapshot.
     #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-    use tracedecay_configuration::config::TraceDecayConfig;
+    use tracedecay_configuration::config::RuntimeTraceDecayConfig as TraceDecayConfig;
     #[cfg(feature = "memory-provider-host")]
     use tracedecay_domain::configuration::{
         MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
