@@ -1,10 +1,10 @@
 //! Real-worker diagnostic for namespace-seed-dependent Codex history recall.
 //!
 //! The fixture sends the same four message observations and the same query to
-//! six independent 64-hex namespaces. Inspection proves whether all four
-//! observations reached durable NCM state; recall then proves whether a
-//! candidate loss happened after admission. Handshake and inspection digests
-//! retain only bounded identities and hashes, never message content.
+//! six independent 64-hex namespaces by default. Inspection proves whether
+//! all four observations reached durable NCM state; recall then proves whether
+//! a candidate loss happened after admission. Handshake and inspection
+//! digests retain only bounded identities and hashes, never message content.
 
 #![cfg(all(feature = "real-encoder", unix))]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -24,6 +24,16 @@ use tracedecay_memory_ncm_runtime::wire::{Operation, Reply, Request};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tracedecay-ncm-worker");
 const MODEL_ROOT_ENV: &str = "TRACEDECAY_NCM_REAL_MODEL_ROOT";
+// Set FIXED_SEED_ENV to select one exact prefix deterministically. Pair it
+// with FIXED_SEED_REPEATS_ENV to run that prefix repeatedly; set
+// SEED_COUNT_ENV to sweep a deterministic prefix of the varied seed list.
+const FIXED_SEED_ENV: &str = "TRACEDECAY_NCM_REAL_FIXED_SEED";
+const SEED_COUNT_ENV: &str = "TRACEDECAY_NCM_REAL_SEED_COUNT";
+const FIXED_SEED_REPEATS_ENV: &str = "TRACEDECAY_NCM_REAL_FIXED_SEED_REPEATS";
+const SEED_PREFIX_HEX_LEN: usize = 16;
+const MAX_VARIED_SEED_COUNT: usize = 32;
+const MAX_FIXED_SEED_REPEATS: usize = 128;
+const EXTRA_SEED_BASE: u64 = 0x8000_0000_0000_0000;
 const CALL_DEADLINE: Duration = Duration::from_secs(30);
 const QUERY_TEXT: &str =
     "what did the quicksilver retry budget change record, down to the obsidian-ledger-tail note?";
@@ -39,6 +49,8 @@ const NAMESPACE_SEEDS: [&str; 6] = [
     "490f00f66e94ca18", // 5264427547836598808
     "7061cce2694b084b", // 8097978877790062667
 ];
+
+const DEFAULT_SEED_COUNT: usize = NAMESPACE_SEEDS.len();
 
 const CODEX_HISTORY: [(u64, &str, &str); 4] = [
     (
@@ -72,9 +84,16 @@ struct CandidateEvidence {
     payload_sha256: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeedRun {
+    seed_prefix: String,
+    namespace_variant: usize,
+}
+
 #[derive(Debug)]
 struct NamespaceResult {
     seed_prefix: String,
+    namespace_variant: usize,
     algorithm: Value,
     encoder: Value,
     projection_sha256: String,
@@ -91,9 +110,140 @@ struct NamespaceResult {
     recall_truncated: bool,
 }
 
-fn namespace(seed_prefix: &str) -> String {
-    assert_eq!(seed_prefix.len(), 16);
-    format!("{seed_prefix}{}", "0".repeat(48))
+fn namespace(seed_prefix: &str, namespace_variant: usize) -> String {
+    assert_eq!(seed_prefix.len(), SEED_PREFIX_HEX_LEN);
+    assert!(namespace_variant < MAX_FIXED_SEED_REPEATS);
+    format!("{seed_prefix}{namespace_variant:048x}")
+}
+
+fn parse_fixed_seed(value: &str) -> Result<String, String> {
+    if value.len() != SEED_PREFIX_HEX_LEN {
+        return Err(format!(
+            "must contain exactly {SEED_PREFIX_HEX_LEN} ASCII hex digits"
+        ));
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "must contain only ASCII hex digits in its {SEED_PREFIX_HEX_LEN}-digit prefix"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn parse_seed_count(value: &str) -> Result<usize, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("must be an unsigned decimal seed count".to_owned());
+    }
+    let count = value
+        .parse::<usize>()
+        .map_err(|_| "does not fit in the platform seed-count integer".to_owned())?;
+    if !(1..=MAX_VARIED_SEED_COUNT).contains(&count) {
+        return Err(format!(
+            "must be between 1 and {MAX_VARIED_SEED_COUNT} (inclusive)"
+        ));
+    }
+    Ok(count)
+}
+
+fn parse_fixed_seed_repeats(value: &str) -> Result<usize, String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("must be an unsigned decimal fixed-seed repeat count".to_owned());
+    }
+    let repeats = value
+        .parse::<usize>()
+        .map_err(|_| "does not fit in the platform fixed-seed repeat count".to_owned())?;
+    if !(1..=MAX_FIXED_SEED_REPEATS).contains(&repeats) {
+        return Err(format!(
+            "must be between 1 and {MAX_FIXED_SEED_REPEATS} (inclusive)"
+        ));
+    }
+    Ok(repeats)
+}
+
+fn varied_seed_runs(count: usize) -> Result<Vec<SeedRun>, String> {
+    if !(1..=MAX_VARIED_SEED_COUNT).contains(&count) {
+        return Err(format!(
+            "varied seed count must be between 1 and {MAX_VARIED_SEED_COUNT} (inclusive)"
+        ));
+    }
+
+    let built_in = NAMESPACE_SEEDS.iter().take(count).map(|seed| SeedRun {
+        seed_prefix: (*seed).to_owned(),
+        namespace_variant: 0,
+    });
+    let extra = (NAMESPACE_SEEDS.len().min(count)..count).map(|index| SeedRun {
+        seed_prefix: format!(
+            "{:016x}",
+            EXTRA_SEED_BASE + (index - NAMESPACE_SEEDS.len()) as u64
+        ),
+        namespace_variant: 0,
+    });
+    Ok(built_in.chain(extra).collect())
+}
+
+fn select_seed_runs(
+    fixed_seed: Option<&str>,
+    seed_count: Option<&str>,
+    fixed_seed_repeats: Option<&str>,
+) -> Result<Vec<SeedRun>, String> {
+    if fixed_seed_repeats.is_some() && fixed_seed.is_none() {
+        return Err(format!(
+            "{FIXED_SEED_REPEATS_ENV} requires {FIXED_SEED_ENV}"
+        ));
+    }
+    if seed_count.is_some() && fixed_seed.is_some() {
+        return Err(format!(
+            "{FIXED_SEED_ENV} and {SEED_COUNT_ENV} cannot be set together"
+        ));
+    }
+    if seed_count.is_some() && fixed_seed_repeats.is_some() {
+        return Err(format!(
+            "{SEED_COUNT_ENV} and {FIXED_SEED_REPEATS_ENV} cannot be set together"
+        ));
+    }
+
+    if let Some(fixed_seed) = fixed_seed {
+        let seed_prefix = parse_fixed_seed(fixed_seed)?;
+        let repeats = fixed_seed_repeats
+            .map(parse_fixed_seed_repeats)
+            .transpose()?
+            .unwrap_or(1);
+        return Ok((0..repeats)
+            .map(|namespace_variant| SeedRun {
+                seed_prefix: seed_prefix.clone(),
+                namespace_variant,
+            })
+            .collect());
+    }
+
+    let count = seed_count
+        .map(parse_seed_count)
+        .transpose()?
+        .unwrap_or(DEFAULT_SEED_COUNT);
+    varied_seed_runs(count)
+}
+
+fn optional_env(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
+}
+
+fn configured_seed_runs() -> Vec<SeedRun> {
+    let fixed_seed = optional_env(FIXED_SEED_ENV)
+        .unwrap_or_else(|error| panic!("invalid {FIXED_SEED_ENV}: {error}"));
+    let seed_count = optional_env(SEED_COUNT_ENV)
+        .unwrap_or_else(|error| panic!("invalid {SEED_COUNT_ENV}: {error}"));
+    let fixed_seed_repeats = optional_env(FIXED_SEED_REPEATS_ENV)
+        .unwrap_or_else(|error| panic!("invalid {FIXED_SEED_REPEATS_ENV}: {error}"));
+    select_seed_runs(
+        fixed_seed.as_deref(),
+        seed_count.as_deref(),
+        fixed_seed_repeats.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("invalid namespace seed controls: {error}"))
 }
 
 fn real_worker_state_root() -> TempDir {
@@ -286,8 +436,9 @@ fn bounded_counter(value: &Value, field: &str) -> u64 {
 
 fn summary(result: &NamespaceResult) -> String {
     format!(
-        "seed={} observed_records={:?} inspected_records={} inspected_sources={} candidates={} candidate_ids={:?} candidate_evidence={:?} truncated={} projection={} state={} stm={} ltm={} outcome={}",
+        "seed={} variant={} observed_records={:?} inspected_records={} inspected_sources={} candidates={} candidate_ids={:?} candidate_evidence={:?} truncated={} projection={} state={} stm={} ltm={} outcome={}",
         result.seed_prefix,
+        result.namespace_variant,
         result.observed_record_ids,
         result.inspected_records,
         result.inspected_sources,
@@ -303,13 +454,128 @@ fn summary(result: &NamespaceResult) -> String {
     )
 }
 
-/// The same four Codex history observations must survive admission in every
-/// seed namespace. If recall returns 2/4 while inspection says 4/4, the
-/// failure is downstream of durable admission and can be compared against the
-/// seed-specific projection/state digests below.
-#[test]
-#[ignore = "requires TRACEDECAY_NCM_REAL_MODEL_ROOT with the pinned offline NCM model"]
-fn real_worker_codex_history_recall_is_seed_stable() {
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn built_in_runs(count: usize) -> Vec<SeedRun> {
+        NAMESPACE_SEEDS[..count]
+            .iter()
+            .map(|seed| SeedRun {
+                seed_prefix: (*seed).to_owned(),
+                namespace_variant: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_controls_preserve_the_six_seed_default() {
+        assert_eq!(
+            select_seed_runs(None, None, None).expect("default seed selection"),
+            built_in_runs(DEFAULT_SEED_COUNT)
+        );
+    }
+
+    #[test]
+    fn fixed_seed_selects_one_canonical_prefix_for_repeatable_runs() {
+        assert_eq!(
+            select_seed_runs(Some("ABCDEF0123456789"), None, None).expect("fixed seed selection"),
+            vec![SeedRun {
+                seed_prefix: "abcdef0123456789".to_owned(),
+                namespace_variant: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn seed_count_selects_bounded_deterministic_prefixes() {
+        assert_eq!(
+            select_seed_runs(None, Some("3"), None).expect("varied seed selection"),
+            built_in_runs(3)
+        );
+        let runs =
+            select_seed_runs(None, Some("30"), None).expect("expanded varied seed selection");
+        assert_eq!(runs.len(), 30);
+        assert_eq!(runs[6].seed_prefix, "8000000000000000");
+        assert_eq!(runs[29].seed_prefix, "8000000000000017");
+        assert!(runs.iter().all(|run| {
+            run.seed_prefix.len() == SEED_PREFIX_HEX_LEN
+                && run.seed_prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && run.namespace_variant == 0
+        }));
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.seed_prefix.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            runs.len()
+        );
+        let maximum_runs =
+            select_seed_runs(None, Some("32"), None).expect("maximum varied seed selection");
+        assert_eq!(maximum_runs.len(), MAX_VARIED_SEED_COUNT);
+        assert_eq!(maximum_runs[31].seed_prefix, "8000000000000019");
+    }
+
+    #[test]
+    fn fixed_seed_repeats_are_bounded_and_namespace_isolated() {
+        let runs = select_seed_runs(Some("0123456789abcdef"), None, Some("100"))
+            .expect("fixed seed repeat selection");
+        assert_eq!(runs.len(), 100);
+        assert!(runs.iter().enumerate().all(|(index, run)| {
+            run.seed_prefix == "0123456789abcdef" && run.namespace_variant == index
+        }));
+        assert_eq!(
+            runs.iter()
+                .map(|run| namespace(&run.seed_prefix, run.namespace_variant))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            runs.len()
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_controls_fail_closed() {
+        for fixed_seed in [
+            "",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789abcdeg",
+        ] {
+            assert!(
+                select_seed_runs(Some(fixed_seed), None, None).is_err(),
+                "fixed seed should be rejected: {fixed_seed:?}"
+            );
+        }
+        for seed_count in [
+            "",
+            "0",
+            "-1",
+            " 3",
+            "3 ",
+            "three",
+            "999999999999999999999999",
+            "33",
+        ] {
+            assert!(
+                select_seed_runs(None, Some(seed_count), None).is_err(),
+                "seed count should be rejected: {seed_count:?}"
+            );
+        }
+        for fixed_seed_repeats in ["", "0", "129", "-1", "100 ", "many"] {
+            assert!(
+                select_seed_runs(Some("0123456789abcdef"), None, Some(fixed_seed_repeats),)
+                    .is_err(),
+                "fixed seed repeat count should be rejected: {fixed_seed_repeats:?}"
+            );
+        }
+        assert!(select_seed_runs(None, None, Some("1")).is_err());
+        assert!(select_seed_runs(Some("0123456789abcdef"), Some("1"), None).is_err());
+        assert!(select_seed_runs(None, Some("1"), Some("1")).is_err());
+        assert!(select_seed_runs(Some("0123456789abcdef"), Some("1"), Some("1"),).is_err());
+    }
+}
+
+fn spawn_real_worker() -> (TempDir, WorkerClient) {
     let state_root = real_worker_state_root();
     let root_path = state_root.path().to_path_buf();
     let client = WorkerClient::spawn(
@@ -335,117 +601,166 @@ fn real_worker_codex_history_recall_is_seed_stable() {
         true
     );
 
-    let mut results = Vec::with_capacity(NAMESPACE_SEEDS.len());
-    for (namespace_index, seed_prefix) in NAMESPACE_SEEDS.into_iter().enumerate() {
-        let namespace = namespace(seed_prefix);
-        assert_eq!(namespace.len(), 64);
-        assert!(namespace.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    (state_root, client)
+}
 
-        let handshake = client
+fn run_namespace(
+    client: &WorkerClient,
+    namespace_index: usize,
+    seed_run: &SeedRun,
+) -> NamespaceResult {
+    let namespace = namespace(&seed_run.seed_prefix, seed_run.namespace_variant);
+    assert_eq!(namespace.len(), 64);
+    assert!(namespace.bytes().all(|byte| byte.is_ascii_hexdigit()));
+
+    let handshake = client
+        .call(
+            Request::new(
+                10 + namespace_index as u64,
+                0,
+                Operation::Handshake,
+                &namespace,
+                json!({}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("namespace handshake reply");
+    assert_success(&handshake, "handshake");
+    let handshake_payload = handshake.payload.as_ref().expect("handshake payload");
+    assert_eq!(handshake_payload["ready"], true);
+    let projection_sha256 = bounded_digest(handshake_payload, "projection_sha256");
+    let algorithm = handshake_payload["algorithm"].clone();
+    let encoder = handshake_payload["encoder"].clone();
+
+    let mut observed_record_ids = Vec::with_capacity(CODEX_HISTORY.len());
+    for (offset, (sequence, key_text, value_text)) in CODEX_HISTORY.into_iter().enumerate() {
+        let observed = client
             .call(
                 Request::new(
-                    10 + namespace_index as u64,
+                    100 + namespace_index as u64 * 10 + offset as u64,
                     0,
-                    Operation::Handshake,
+                    Operation::Observe,
                     &namespace,
-                    json!({}),
+                    observe_payload(sequence, key_text, value_text),
                 ),
                 CALL_DEADLINE,
             )
-            .expect("namespace handshake reply");
-        assert_success(&handshake, "handshake");
-        let handshake_payload = handshake.payload.as_ref().expect("handshake payload");
-        assert_eq!(handshake_payload["ready"], true);
-        let projection_sha256 = bounded_digest(handshake_payload, "projection_sha256");
-        let algorithm = handshake_payload["algorithm"].clone();
-        let encoder = handshake_payload["encoder"].clone();
-
-        let mut observed_record_ids = Vec::with_capacity(CODEX_HISTORY.len());
-        for (offset, (sequence, key_text, value_text)) in CODEX_HISTORY.into_iter().enumerate() {
-            let observed = client
-                .call(
-                    Request::new(
-                        100 + namespace_index as u64 * 10 + offset as u64,
-                        0,
-                        Operation::Observe,
-                        &namespace,
-                        observe_payload(sequence, key_text, value_text),
-                    ),
-                    CALL_DEADLINE,
-                )
-                .expect("Codex history observation reply");
-            assert_success(&observed, "observe");
-            let record_id = observed.payload.as_ref().expect("observe payload")["record_id"]
-                .as_u64()
-                .expect("observe record id");
-            observed_record_ids.push(record_id);
-        }
-
-        let inspection = client
-            .call(
-                Request::new(
-                    200 + namespace_index as u64,
-                    0,
-                    Operation::Inspection,
-                    &namespace,
-                    json!({}),
-                ),
-                CALL_DEADLINE,
-            )
-            .expect("namespace inspection reply");
-        assert_success(&inspection, "inspection");
-        let inspection_payload = inspection.payload.as_ref().expect("inspection payload");
-        let inspected_records = inspection_payload["records"]
+            .expect("Codex history observation reply");
+        assert_success(&observed, "observe");
+        let record_id = observed.payload.as_ref().expect("observe payload")["record_id"]
             .as_u64()
-            .expect("inspection record count");
-        let inspected_sources = inspection_payload["sources"]
-            .as_u64()
-            .expect("inspection source count");
-        let state_digest = bounded_digest(inspection_payload, "state_digest");
-        let stm_terrain_digest = bounded_counter(inspection_payload, "stm_terrain_digest");
-        let ltm_terrain_digest = bounded_counter(inspection_payload, "ltm_terrain_digest");
-
-        let recall = client
-            .call(
-                Request::new(
-                    300 + namespace_index as u64,
-                    0,
-                    Operation::Recall,
-                    &namespace,
-                    json!({"query_text": QUERY_TEXT, "top_k": 16}),
-                ),
-                CALL_DEADLINE,
-            )
-            .expect("namespace recall reply");
-        let (candidate_evidence, recall_truncated) = recall_evidence(&recall);
-        let candidate_ids = candidate_evidence
-            .iter()
-            .map(|candidate| candidate.record_id)
-            .collect::<Vec<_>>();
-        let recall_outcome = match recall.outcome {
-            Outcome::Success => "success",
-            Outcome::Empty => "empty",
-            _ => "other",
-        };
-        let candidate_count = candidate_ids.len();
-        results.push(NamespaceResult {
-            seed_prefix: seed_prefix.to_owned(),
-            algorithm,
-            encoder,
-            projection_sha256,
-            observed_record_ids,
-            inspected_records,
-            inspected_sources,
-            state_digest,
-            stm_terrain_digest,
-            ltm_terrain_digest,
-            recall_outcome,
-            candidate_ids,
-            candidate_evidence,
-            candidate_count,
-            recall_truncated,
-        });
+            .expect("observe record id");
+        observed_record_ids.push(record_id);
     }
+
+    let inspection = client
+        .call(
+            Request::new(
+                200 + namespace_index as u64,
+                0,
+                Operation::Inspection,
+                &namespace,
+                json!({}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("namespace inspection reply");
+    assert_success(&inspection, "inspection");
+    let inspection_payload = inspection.payload.as_ref().expect("inspection payload");
+    let inspected_records = inspection_payload["records"]
+        .as_u64()
+        .expect("inspection record count");
+    let inspected_sources = inspection_payload["sources"]
+        .as_u64()
+        .expect("inspection source count");
+    let state_digest = bounded_digest(inspection_payload, "state_digest");
+    let stm_terrain_digest = bounded_counter(inspection_payload, "stm_terrain_digest");
+    let ltm_terrain_digest = bounded_counter(inspection_payload, "ltm_terrain_digest");
+
+    let recall = client
+        .call(
+            Request::new(
+                300 + namespace_index as u64,
+                0,
+                Operation::Recall,
+                &namespace,
+                json!({"query_text": QUERY_TEXT, "top_k": 16}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("namespace recall reply");
+    let (candidate_evidence, recall_truncated) = recall_evidence(&recall);
+    let candidate_ids = candidate_evidence
+        .iter()
+        .map(|candidate| candidate.record_id)
+        .collect::<Vec<_>>();
+    let recall_outcome = match recall.outcome {
+        Outcome::Success => "success",
+        Outcome::Empty => "empty",
+        _ => "other",
+    };
+    let candidate_count = candidate_ids.len();
+    NamespaceResult {
+        seed_prefix: seed_run.seed_prefix.clone(),
+        namespace_variant: seed_run.namespace_variant,
+        algorithm,
+        encoder,
+        projection_sha256,
+        observed_record_ids,
+        inspected_records,
+        inspected_sources,
+        state_digest,
+        stm_terrain_digest,
+        ltm_terrain_digest,
+        recall_outcome,
+        candidate_ids,
+        candidate_evidence,
+        candidate_count,
+        recall_truncated,
+    }
+}
+
+fn run_seed_runs(seed_runs: &[SeedRun]) -> Vec<NamespaceResult> {
+    let isolate_each_run =
+        seed_runs.len() > 1 && seed_runs.iter().any(|run| run.namespace_variant != 0);
+    if isolate_each_run {
+        // The worker catalog allows 32 namespaces, so batch fixed repeats
+        // across temporary roots while keeping the test in one invocation.
+        let mut results = Vec::with_capacity(seed_runs.len());
+        for (batch_index, batch) in seed_runs.chunks(MAX_VARIED_SEED_COUNT).enumerate() {
+            let (_state_root, client) = spawn_real_worker();
+            let batch_start = batch_index * MAX_VARIED_SEED_COUNT;
+            results.extend(
+                batch.iter().enumerate().map(|(offset, seed_run)| {
+                    run_namespace(&client, batch_start + offset, seed_run)
+                }),
+            );
+        }
+        return results;
+    }
+
+    let (_state_root, client) = spawn_real_worker();
+    seed_runs
+        .iter()
+        .enumerate()
+        .map(|(namespace_index, seed_run)| run_namespace(&client, namespace_index, seed_run))
+        .collect()
+}
+
+/// The same four Codex history observations must survive admission in every
+/// selected seed namespace. If recall returns 2/4 while inspection says 4/4,
+/// the failure is downstream of durable admission and can be compared against
+/// the seed-specific projection/state digests below. Set
+/// `TRACEDECAY_NCM_REAL_FIXED_SEED` with
+/// `TRACEDECAY_NCM_REAL_FIXED_SEED_REPEATS` to repeat one fixed 16-hex seed
+/// in one invocation, or set `TRACEDECAY_NCM_REAL_SEED_COUNT` to select the
+/// first one through thirty-two deterministic varied seeds. With neither set,
+/// all six built-in seeds run.
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_REAL_MODEL_ROOT with the pinned offline NCM model"]
+fn real_worker_codex_history_recall_is_seed_stable() {
+    let seed_runs = configured_seed_runs();
+    let results = run_seed_runs(&seed_runs);
 
     let first = &results[0];
     assert!(
@@ -465,10 +780,14 @@ fn real_worker_codex_history_recall_is_seed_stable() {
         .iter()
         .map(|result| result.projection_sha256.clone())
         .collect::<BTreeSet<_>>();
+    let distinct_seed_prefixes = seed_runs
+        .iter()
+        .map(|run| run.seed_prefix.clone())
+        .collect::<BTreeSet<_>>();
     assert_eq!(
         projection_digests.len(),
-        NAMESPACE_SEEDS.len(),
-        "distinct namespace seeds must produce distinct projection identities: {:?}",
+        distinct_seed_prefixes.len(),
+        "selected namespace seeds must produce distinct projection identities: {:?}",
         results.iter().map(summary).collect::<Vec<_>>()
     );
 
@@ -476,11 +795,13 @@ fn real_worker_codex_history_recall_is_seed_stable() {
         .iter()
         .map(|result| result.state_digest.clone())
         .collect::<BTreeSet<_>>();
-    assert!(
-        state_digests.len() > 1,
-        "seed-specific projections must produce more than one persisted state digest: {:?}",
-        results.iter().map(summary).collect::<Vec<_>>()
-    );
+    if distinct_seed_prefixes.len() > 1 {
+        assert!(
+            state_digests.len() > 1,
+            "seed-specific projections must produce more than one persisted state digest: {:?}",
+            results.iter().map(summary).collect::<Vec<_>>()
+        );
+    }
 
     let summaries = results.iter().map(summary).collect::<Vec<_>>();
     assert!(
