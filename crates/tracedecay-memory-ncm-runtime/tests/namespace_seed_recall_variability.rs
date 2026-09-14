@@ -34,6 +34,7 @@ const SEED_PREFIX_HEX_LEN: usize = 16;
 const MAX_VARIED_SEED_COUNT: usize = 32;
 const MAX_FIXED_SEED_REPEATS: usize = 128;
 const EXTRA_SEED_BASE: u64 = 0x8000_0000_0000_0000;
+const MIN_RECALL_ACTIVATION: f64 = 0.03;
 const CALL_DEADLINE: Duration = Duration::from_secs(30);
 const QUERY_TEXT: &str =
     "what did the quicksilver retry budget change record, down to the obsidian-ledger-tail note?";
@@ -79,6 +80,7 @@ const CODEX_HISTORY: [(u64, &str, &str); 4] = [
 struct CandidateEvidence {
     record_id: u64,
     source: String,
+    activation: f64,
     key_sha256: String,
     value_sha256: String,
     payload_sha256: String,
@@ -404,6 +406,9 @@ fn recall_evidence(reply: &Reply) -> (Vec<CandidateEvidence>, bool) {
             CandidateEvidence {
                 record_id,
                 source: source.clone(),
+                activation: candidate["activation"]
+                    .as_f64()
+                    .expect("recall candidate activation"),
                 key_sha256: content_sha256(key_text),
                 value_sha256: content_sha256(value_text),
                 payload_sha256: candidate_payload_sha256(&source, key_text, value_text),
@@ -436,7 +441,7 @@ fn bounded_counter(value: &Value, field: &str) -> u64 {
 
 fn summary(result: &NamespaceResult) -> String {
     format!(
-        "seed={} variant={} observed_records={:?} inspected_records={} inspected_sources={} candidates={} candidate_ids={:?} candidate_evidence={:?} truncated={} projection={} state={} stm={} ltm={} outcome={}",
+        "seed={} variant={} observed_records={:?} inspected_records={} inspected_sources={} candidates={} candidate_ids={:?} candidate_activations={:?} candidate_evidence={:?} truncated={} projection={} state={} stm={} ltm={} outcome={}",
         result.seed_prefix,
         result.namespace_variant,
         result.observed_record_ids,
@@ -444,6 +449,11 @@ fn summary(result: &NamespaceResult) -> String {
         result.inspected_sources,
         result.candidate_count,
         result.candidate_ids,
+        result
+            .candidate_evidence
+            .iter()
+            .map(|candidate| candidate.activation)
+            .collect::<Vec<_>>(),
         result.candidate_evidence,
         result.recall_truncated,
         result.projection_sha256,
@@ -825,6 +835,13 @@ fn real_worker_codex_history_recall_is_seed_stable() {
     assert!(
         results.iter().all(|result| result.candidate_count == 4),
         "all four admitted Codex history observations must recall for every seed; a 2/4 result is downstream candidate loss, not admission loss: {summaries:?}"
+    );
+    assert!(
+        results
+            .iter()
+            .flat_map(|result| &result.candidate_evidence)
+            .all(|candidate| { candidate.activation + f64::EPSILON >= MIN_RECALL_ACTIVATION }),
+        "every recalled candidate must meet the calibrated activation floor: {summaries:?}"
     );
     let expected_sources = CODEX_HISTORY
         .iter()

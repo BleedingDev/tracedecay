@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 const MAX_RECALL_TOP_K: usize = 16;
+const DEFAULT_MIN_ACTIVATION: f32 = 0.03;
 
 /// Layer membership of a deduplicated record candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +79,7 @@ pub struct RecallPolicy {
 impl Default for RecallPolicy {
     fn default() -> Self {
         Self {
-            min_activation: 0.05,
+            min_activation: DEFAULT_MIN_ACTIVATION,
             min_margin: 0.0,
             max_candidates: MAX_RECALL_TOP_K,
         }

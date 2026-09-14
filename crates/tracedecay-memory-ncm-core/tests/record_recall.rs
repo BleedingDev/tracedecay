@@ -2,6 +2,7 @@
 //! Acceptance coverage for stable records, correction lineage, and read-only recall.
 
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
+use tracedecay_memory_ncm_core::centers::read::CompoundWeights;
 use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
 use tracedecay_memory_ncm_core::recall::{
     RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy, recall,
@@ -92,6 +93,50 @@ fn candidates(output: RecallOutput) -> (Vec<RecallCandidate>, bool, bool) {
         } => (candidates, truncated, margin_satisfied),
         RecallOutput::Empty => panic!("expected recall candidates"),
     }
+}
+
+fn recall_with_target_activation(target_activation: f32) -> RecallOutput {
+    let config = config();
+    let mut records = RecordTable::new(&config);
+    let id = records
+        .insert(record_input("source", "known", "fact", 0))
+        .expect("record");
+    let mut stm = MemoryCenters::new(config.stm.clone(), 29).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 30).expect("LTM");
+    let mut support = Support::new(&config);
+    let params = WriteParams::for_layer(&config, tracedecay_memory_ncm_core::types::Layer::Stm);
+    let stm_key = unit(STM_DIM, 0, 1.0);
+    let ltm_key = unit(LTM_DIM, 0, 1.0);
+    let context = unit(CONTEXT_DIM, 0, 1.0);
+    write_record(&mut stm, &stm_key, &ltm_key, id, &params, &mut support);
+
+    let raw_rbf_weight = stm
+        .read_compound(
+            &stm_key,
+            Some(&context),
+            None,
+            CompoundWeights::default(),
+            1,
+        )
+        .expect("read fixture center")
+        .selection
+        .centers[0]
+        .raw_rbf_weight;
+    stm.intensity[0] = target_activation / raw_rbf_weight;
+
+    recall(
+        &stm_key,
+        &ltm_key,
+        &context,
+        &stm,
+        &ltm,
+        0.0,
+        &records,
+        &support,
+        &RecallPolicy::default(),
+        4,
+    )
+    .expect("recall")
 }
 
 #[test]
@@ -258,6 +303,64 @@ fn unrelated_singleton_is_empty_not_softmax_confident_or_unavailable() {
     let unavailable: Result<RecallOutput, CoreError> =
         Err(CoreError::InvalidState("namespace unavailable".to_owned()));
     assert_ne!(available, unavailable);
+}
+
+#[test]
+fn calibrated_activation_floor_has_explicit_boundary() {
+    let below = recall_with_target_activation(0.029999);
+    assert_eq!(below, RecallOutput::Empty);
+
+    let at_floor = recall_with_target_activation(0.03);
+    let (found, truncated, _) = candidates(at_floor);
+    assert_eq!(found.len(), 1);
+    assert!(!truncated);
+    assert!((found[0].activation - 0.03).abs() < 1e-6);
+}
+
+#[test]
+fn unrelated_multi_record_query_stays_empty_after_floor_calibration() {
+    let config = config();
+    let mut records = RecordTable::new(&config);
+    let first = records
+        .insert(record_input("source-a", "known-a", "fact-a", 0))
+        .expect("first record");
+    let second = records
+        .insert(record_input("source-b", "known-b", "fact-b", 1))
+        .expect("second record");
+    let mut stm = MemoryCenters::new(config.stm.clone(), 41).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 42).expect("LTM");
+    let mut support = Support::new(&config);
+    let params = WriteParams::for_layer(&config, tracedecay_memory_ncm_core::types::Layer::Stm);
+    write_record(
+        &mut stm,
+        &unit(STM_DIM, 0, 1.0),
+        &unit(LTM_DIM, 0, 1.0),
+        first,
+        &params,
+        &mut support,
+    );
+    write_record(
+        &mut stm,
+        &unit(STM_DIM, 1, 1.0),
+        &unit(LTM_DIM, 1, 1.0),
+        second,
+        &params,
+        &mut support,
+    );
+
+    let available = recall(
+        &unit(STM_DIM, 0, -1.0),
+        &unit(LTM_DIM, 0, -1.0),
+        &unit(CONTEXT_DIM, 0, -1.0),
+        &stm,
+        &ltm,
+        0.0,
+        &records,
+        &support,
+        &RecallPolicy::default(),
+        4,
+    );
+    assert_eq!(available, Ok(RecallOutput::Empty));
 }
 
 #[test]
