@@ -11,6 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -60,6 +61,32 @@ struct DurableLifecycleV1 {
     auto_download: bool,
     state: Option<SemanticModelLifecycleStateV1>,
     previous_ready: Option<SemanticModelLifecycleStateV1>,
+    /// A runtime failure intentionally omits its install path from the public
+    /// state. Preserve the last installed shared artifact privately so restart
+    /// can reconstruct its lease and rollback ownership even if the lease
+    /// file was lost before the lifecycle file was reopened.
+    #[serde(default)]
+    failed_current: Option<SemanticModelLifecycleStateV1>,
+    /// Owner-private installs remain explicitly owned after their worker is
+    /// reaped, including when a later runtime failure projects `Failed`, whose
+    /// public contract intentionally carries no install path.
+    #[serde(default)]
+    private_install: Option<DurablePrivateInstallV1>,
+    /// Owner-private installs whose retirement failed remain durable cleanup
+    /// debt even after a replacement becomes current. A single current slot
+    /// cannot represent more than one unresolved old path, so keep the debt
+    /// as a collection and carry it through every later lifecycle mutation.
+    #[serde(default)]
+    private_install_debts: Vec<DurablePrivateInstallV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurablePrivateInstallV1 {
+    model_id: String,
+    revision: String,
+    artifact_digest: String,
+    install_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
