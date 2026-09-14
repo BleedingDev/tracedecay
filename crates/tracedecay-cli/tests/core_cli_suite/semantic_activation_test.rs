@@ -315,7 +315,8 @@ fn shipped_cli_activates_a_published_profile_for_strict_semantic_search() {
     let project = canonical_existing_path(project.path());
     initialize_project(&project);
     let artifact_digest = install_profile_semantic_fixture(&home, &fixture_root);
-    let _daemon = common::spawn_tracedecay_daemon_from(&home, &binary);
+    let mut daemon = common::spawn_tracedecay_daemon_from(&home, &binary);
+    let initial_daemon_pid = daemon.id();
     let initialization = run_cli(&binary, &home, &project, &["init"]);
     assert!(
         initialization.status.success(),
@@ -420,6 +421,11 @@ fn shipped_cli_activates_a_published_profile_for_strict_semantic_search() {
             .is_some_and(|generation| generation.starts_with("sha256:")),
         "ready runtime must receipt its active vector generation: {ready_runtime}"
     );
+    let activated_generation =
+        ready_runtime["semantic_runtime"]["state"]["receipt"]["activated_generation"]
+            .as_str()
+            .expect("ready runtime must expose its activated generation")
+            .to_owned();
 
     let strict = tool(
         &binary,
@@ -449,5 +455,73 @@ fn shipped_cli_activates_a_published_profile_for_strict_semantic_search() {
         probe["candidate"]["contributions"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item["retriever"] == "semantic"))
+    );
+
+    // A real process boundary must restore the committed activation receipt;
+    // dropping an in-process owner would leave a restart regression hidden.
+    daemon
+        .kill_and_wait()
+        .expect("stop and reap the activated shipped daemon");
+    common::stop_managed_daemon(&home);
+    let restarted_daemon = common::spawn_tracedecay_daemon_from(&home, &binary);
+    assert_ne!(
+        restarted_daemon.id(),
+        initial_daemon_pid,
+        "semantic restart must run under a fresh daemon PID"
+    );
+
+    let restarted_runtime = common::poll_until(
+        Instant::now() + Duration::from_secs(60),
+        Duration::from_millis(100),
+        || {
+            let runtime = tool(&binary, &home, &project, "runtime", r#"{"format":"json"}"#);
+            if !runtime.status.success() {
+                return None;
+            }
+            let payload = tool_payload(&runtime);
+            (payload["semantic_runtime"]["state"]["state"] == "ready").then_some(payload)
+        },
+        || "restarted semantic runtime did not publish typed ready state".to_owned(),
+    );
+    assert_eq!(
+        restarted_runtime["semantic_runtime"]["state"]["receipt"]["activated_generation"],
+        activated_generation,
+        "fresh daemon must reuse the activated vector generation without rebuilding"
+    );
+
+    let restarted_strict = tool(
+        &binary,
+        &home,
+        &project,
+        "search",
+        &json!({
+            "query": PROBE_SYMBOL,
+            "limit": 10,
+            "format": "json",
+            "semantic_mode": "strict_semantic",
+        })
+        .to_string(),
+    );
+    assert!(
+        restarted_strict.status.success(),
+        "strict semantic search failed after daemon restart\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&restarted_strict.stdout),
+        String::from_utf8_lossy(&restarted_strict.stderr)
+    );
+    let restarted_strict = tool_payload(&restarted_strict);
+    assert_eq!(restarted_strict["semantic"]["status"], "complete");
+    let restarted_probe = restarted_strict["results"]
+        .as_array()
+        .and_then(|results| {
+            results
+                .iter()
+                .find(|result| result["display"]["name"] == PROBE_SYMBOL)
+        })
+        .expect("strict search after daemon restart must return the probe");
+    assert!(
+        restarted_probe["candidate"]["contributions"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["retriever"] == "semantic")),
+        "strict search after daemon restart must preserve semantic contribution: {restarted_probe}"
     );
 }
