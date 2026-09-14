@@ -130,6 +130,11 @@ impl tracedecay_memory_provider_ncm::NcmRecallDiagnosticSink for NcmRecallDiagno
         let mut fields = vec![
             ("stage", stage.to_owned()),
             ("state_generation", event.state_generation.to_string()),
+            (
+                "history_source_count",
+                event.history_source_count.to_string(),
+            ),
+            ("scanned_items", event.scanned_items.to_string()),
             ("candidate_count", event.candidate_count.to_string()),
             ("excluded_count", event.excluded_count.to_string()),
             ("truncated_count", event.truncated_count.to_string()),

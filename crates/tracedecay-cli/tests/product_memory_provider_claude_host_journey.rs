@@ -261,8 +261,8 @@ impl ClaudeHostJourney {
         assert!(self.daemon.is_none(), "a daemon is already running");
         let log = fs::File::create(self.home.path().join("daemon.stderr.log"))
             .expect("isolated daemon log");
-        let mut command = self
-            .cli(&["daemon", "run"])
+        let mut command = self.cli(&["daemon", "run"]);
+        command
             .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
             .env(
                 "RUST_LOG",
@@ -307,15 +307,22 @@ impl ClaudeHostJourney {
     /// adapter reconstruction stage for every observed recall request. Equal
     /// state generations and non-increasing candidate counts make the marker
     /// useful for diagnosing a lost result without exposing its contents.
-    fn assert_ncm_recall_diagnostics(&self) {
+    fn assert_ncm_recall_diagnostics(&self, expected_history_sources: usize) {
         if !self.active_provider.is_ncm() {
             return;
         }
+        let expected_history_sources =
+            u64::try_from(expected_history_sources).expect("history source count fits u64");
         let events = self.ncm_recall_diagnostic_events();
         assert!(
             !events.is_empty(),
             "the opt-in NCM diagnostic sink must emit at least one stage marker"
         );
+        let current_request_digest = events
+            .last()
+            .expect("NCM diagnostics include the current recall")
+            .request_digest
+            .clone();
         let mut by_request = BTreeMap::<String, Vec<NcmRecallDiagnosticRecord>>::new();
         for event in events {
             by_request
@@ -327,6 +334,7 @@ impl ClaudeHostJourney {
             !by_request.is_empty(),
             "NCM stage markers need keyed request identities"
         );
+        let mut joined_current_recall = false;
         for (request_digest, stages) in by_request {
             let worker = stages
                 .first()
@@ -355,7 +363,43 @@ impl ClaudeHostJourney {
                 stages.iter().skip(1).all(|event| event.stage != "worker"),
                 "worker must be the only first stage for request {request_digest}: {stages:?}"
             );
+            if request_digest != current_request_digest {
+                continue;
+            }
+            joined_current_recall = true;
+            assert_eq!(
+                worker.history_source_count, expected_history_sources,
+                "NCM worker stage must report the fresh history admission for request {request_digest}: {stages:?}"
+            );
+            assert_eq!(
+                reconstructed.history_source_count, expected_history_sources,
+                "NCM reconstruction stage must report the fresh history admission for request {request_digest}: {stages:?}"
+            );
+            assert!(
+                worker.scanned_items >= expected_history_sources,
+                "NCM worker must scan at least the admitted history sources for request {request_digest}: {stages:?}"
+            );
+            assert!(
+                reconstructed.scanned_items >= expected_history_sources,
+                "NCM reconstruction must preserve worker scanned item count for request {request_digest}: {stages:?}"
+            );
+            assert_eq!(
+                worker.scanned_items, reconstructed.scanned_items,
+                "NCM reconstruction must propagate the worker scanned item count for request {request_digest}: {stages:?}"
+            );
+            assert_eq!(
+                worker.candidate_count, expected_history_sources,
+                "NCM worker matched candidate count must cover the admitted history for request {request_digest}: {stages:?}"
+            );
+            assert_eq!(
+                reconstructed.candidate_count, expected_history_sources,
+                "NCM reconstruction candidate count must cover the admitted history for request {request_digest}: {stages:?}"
+            );
         }
+        assert!(
+            joined_current_recall,
+            "the latest NCM diagnostic request must join to the verified history delivery count"
+        );
     }
 
     /// Invoked only while formatting a failed populated-recall assertion.
@@ -1332,9 +1376,9 @@ impl ClaudeHostJourney {
                     log.take(16 * 1024)
                         .read_to_end(&mut tail)
                         .expect("read diagnostic tail");
-                    tracedecay_privacy::sanitize_provider_metadata_text(
-                        &String::from_utf8_lossy(&tail),
-                    )
+                    tracedecay_privacy::sanitize_provider_metadata_text(&String::from_utf8_lossy(
+                        &tail,
+                    ))
                     .unwrap_or_else(|| "[daemon diagnostics withheld by privacy policy]".to_owned())
                 }
             );
@@ -1873,6 +1917,8 @@ struct NcmRecallDiagnosticRecord {
     request_digest: String,
     stage: String,
     state_generation: u64,
+    history_source_count: u64,
+    scanned_items: u64,
     candidate_count: u64,
 }
 
@@ -1895,6 +1941,8 @@ fn parse_ncm_recall_diagnostic(line: &str) -> Option<NcmRecallDiagnosticRecord> 
         "stage",
         "request_digest",
         "state_generation",
+        "history_source_count",
+        "scanned_items",
         "candidate_count",
         "excluded_count",
         "truncated_count",
@@ -1935,6 +1983,8 @@ fn parse_ncm_recall_diagnostic(line: &str) -> Option<NcmRecallDiagnosticRecord> 
         request_digest: request_digest.to_owned(),
         stage: stage.to_owned(),
         state_generation: fields.get("state_generation")?.parse().ok()?,
+        history_source_count: fields.get("history_source_count")?.parse().ok()?,
+        scanned_items: fields.get("scanned_items")?.parse().ok()?,
         candidate_count: fields.get("candidate_count")?.parse().ok()?,
     })
 }
@@ -2764,11 +2814,11 @@ fn assert_recalled_session_messages(
             "_meta": { "session_id": recalled_session_id },
         }),
     );
-    journey.assert_ncm_recall_diagnostics();
     let lane = advisory_lane(&answer)
         .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
     assert_eq!(
-        lane["state"], "answered",
+        lane["state"],
+        "answered",
         "the advisory lane must answer rather than report a refusal (origin_session={}): {lane}; bounded Native diagnostics: {}",
         recalled_session_id == journey.session_id(),
         journey.native_recall_failure_diagnostics()
@@ -2801,6 +2851,7 @@ fn assert_recalled_session_messages(
         &previous_history,
         recalled_session_id == journey.session_id(),
     );
+    journey.assert_ncm_recall_diagnostics(retained_sources.len());
     let mut recalled_originals = BTreeSet::new();
     let mut recall_item_refs = BTreeSet::new();
     for candidate in &candidates {
@@ -2934,16 +2985,31 @@ fn recall_failure_diagnostics_keep_only_bounded_counter_metadata() {
 fn ncm_recall_diagnostic_parser_rejects_unbounded_fields() {
     let line = format!(
         "{NCM_RECALL_DIAGNOSTIC_EVENT}stage=worker request_digest={} \
-         state_generation=3 candidate_count=4 excluded_count=0 truncated_count=0 \
+         state_generation=3 history_source_count=4 scanned_items=4 candidate_count=4 \
+         excluded_count=0 truncated_count=0 \
          unknown_count=0 empty_content_count=0 score_tie_count=0 \
          score_margin_below_epsilon_count=0 remaining_candidate_slots=0 \
          remaining_content_bytes=0",
         "a".repeat(64)
     );
-    assert!(parse_ncm_recall_diagnostic(&line).is_some());
+    let parsed = parse_ncm_recall_diagnostic(&line).expect("bounded NCM diagnostic fields");
+    assert_eq!(parsed.history_source_count, 4);
+    assert_eq!(parsed.scanned_items, 4);
+    assert_eq!(parsed.candidate_count, 4);
     assert!(parse_ncm_recall_diagnostic(&format!("{line} query=private")).is_none());
     assert!(
         parse_ncm_recall_diagnostic(&line.replace("stage=worker", "stage=worker worker_id=raw"))
             .is_none()
     );
+    for forbidden in [
+        "candidate_id=raw",
+        "source_sequence=7",
+        "content=private",
+        "grant_digest=raw",
+    ] {
+        assert!(
+            parse_ncm_recall_diagnostic(&format!("{line} {forbidden}")).is_none(),
+            "parser must reject raw diagnostic field {forbidden}"
+        );
+    }
 }

@@ -330,6 +330,11 @@ pub struct NcmRecallDiagnosticEvent {
     pub provider_instance_sha256: Option<String>,
     /// Provider state generation observed at capture.
     pub state_generation: u64,
+    /// Number of history sources in the fresh host admission, or zero when no
+    /// admission authority was installed.
+    pub history_source_count: u64,
+    /// Number of items the worker scanned for this recall.
+    pub scanned_items: u64,
     /// Number of candidates reported at this stage.
     pub candidate_count: u64,
     /// One-based ranks for the bounded candidate sample.
@@ -1493,6 +1498,7 @@ impl MemoryProvider for NcmProviderAdapter {
                     &readiness.provider_instance_id,
                     &reply,
                     code,
+                    current_admission.as_ref(),
                     self.recall_diagnostic_sink.as_deref(),
                     self.recall_diagnostic_key
                         .as_ref()

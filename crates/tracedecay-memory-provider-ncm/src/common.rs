@@ -665,6 +665,7 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
                 call,
                 instance,
                 reply.state_generation,
+                admission,
                 diagnostic_key,
             ),
         );
@@ -922,6 +923,10 @@ fn reconstruct_recall_inner(
                 &value,
                 max_candidates,
                 max_total,
+                admission,
+                worker["common_recall"]["scanned_items"]
+                    .as_u64()
+                    .unwrap_or(0),
                 reply.state_generation,
                 if partial {
                     NcmRecallDiagnosticStage::PartialReply
@@ -969,6 +974,8 @@ const RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN: &[u8] =
 const RECALL_DIAGNOSTIC_INSTANCE_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.instance.v1\0";
 
 struct RecallDiagnosticAccumulator {
+    history_source_count: u64,
+    scanned_items: u64,
     candidate_count: u64,
     admitted_candidate_count: u64,
     candidate_ranks: Vec<u64>,
@@ -983,6 +990,8 @@ struct RecallDiagnosticAccumulator {
 impl RecallDiagnosticAccumulator {
     fn new() -> Self {
         Self {
+            history_source_count: 0,
+            scanned_items: 0,
             candidate_count: 0,
             admitted_candidate_count: 0,
             candidate_ranks: Vec::with_capacity(RECALL_DIAGNOSTIC_MAX_ITEMS),
@@ -1085,6 +1094,8 @@ impl RecallDiagnosticAccumulator {
                 instance.as_bytes(),
             ),
             state_generation,
+            history_source_count: self.history_source_count,
+            scanned_items: self.scanned_items,
             candidate_count: self.candidate_count,
             candidate_ranks: self.candidate_ranks,
             candidate_content_bytes: self.candidate_content_bytes,
@@ -1261,6 +1272,12 @@ fn worker_budgeted_content_bytes(
     Some(boundary)
 }
 
+fn diagnostic_history_source_count(admission: Option<&CurrentAdvisoryAdmission>) -> u64 {
+    admission.map_or(0, |admission| {
+        u64::try_from(admission.history_sources.len()).unwrap_or(u64::MAX)
+    })
+}
+
 fn diagnostic_for_worker(
     call: &ProviderCall,
     instance: &str,
@@ -1274,6 +1291,10 @@ fn diagnostic_for_worker(
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let mut summary = RecallDiagnosticAccumulator::new();
+    summary.history_source_count = diagnostic_history_source_count(admission);
+    summary.scanned_items = worker["common_recall"]["scanned_items"]
+        .as_u64()
+        .unwrap_or(0);
     let mut budgeted_total = 0_u64;
     let mut budgeted_candidates = 0_usize;
     let mut budget_available = max_candidates > 0 && max_total > 0;
@@ -1351,6 +1372,8 @@ fn diagnostic_for_reconstructed(
     value: &Value,
     max_candidates: usize,
     max_total: u64,
+    admission: Option<&CurrentAdvisoryAdmission>,
+    scanned_items: u64,
     state_generation: u64,
     stage: NcmRecallDiagnosticStage,
     excluded_count: u64,
@@ -1359,6 +1382,8 @@ fn diagnostic_for_reconstructed(
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let mut summary = RecallDiagnosticAccumulator::new();
+    summary.history_source_count = diagnostic_history_source_count(admission);
+    summary.scanned_items = scanned_items;
     if let Some(candidates) = value["candidates"].as_array() {
         for (index, candidate) in candidates.iter().enumerate() {
             summary.push(
@@ -1390,6 +1415,7 @@ fn diagnostic_for_reconstruction_failure(
     call: &ProviderCall,
     instance: &str,
     state_generation: u64,
+    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
@@ -1400,7 +1426,9 @@ fn diagnostic_for_reconstruction_failure(
     let max_total = request["budgets"]["maximum_total_content_bytes"]
         .as_u64()
         .unwrap_or(0);
-    RecallDiagnosticAccumulator::new().finish(
+    let mut summary = RecallDiagnosticAccumulator::new();
+    summary.history_source_count = diagnostic_history_source_count(admission);
+    summary.finish(
         call,
         instance,
         &request,
@@ -1422,6 +1450,7 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
     instance: &str,
     reply: &ProviderReply,
     code: TerminalCode,
+    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
     diagnostic_key: Option<&[u8; 32]>,
 ) {
@@ -1440,6 +1469,7 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
             instance,
             reply.state_generation,
             stage,
+            admission,
             diagnostic_key,
         ),
     );
@@ -1450,6 +1480,7 @@ fn diagnostic_for_control_terminal(
     instance: &str,
     state_generation: u64,
     stage: NcmRecallDiagnosticStage,
+    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
@@ -1460,7 +1491,9 @@ fn diagnostic_for_control_terminal(
     let max_total = request["budgets"]["maximum_total_content_bytes"]
         .as_u64()
         .unwrap_or(0);
-    RecallDiagnosticAccumulator::new().finish(
+    let mut summary = RecallDiagnosticAccumulator::new();
+    summary.history_source_count = diagnostic_history_source_count(admission);
+    summary.finish(
         call,
         instance,
         &request,
@@ -1696,6 +1729,8 @@ mod recall_diagnostic_tests {
             &reconstructed,
             4,
             8192,
+            None,
+            0,
             7,
             NcmRecallDiagnosticStage::Reconstructed,
             0,
