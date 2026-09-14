@@ -102,25 +102,52 @@ fn target(call: &ProviderCall, target: &Value, namespace: &NcmNamespace) -> Opti
         return None;
     }
     fields(&target["reference"], &["kind", "reference"])?;
-    // Trace/context references are host-resolved to retained stable attribution
-    // before provider dispatch; a transient candidate id is never accepted.
-    if target["reference"]["kind"] != "stable_memory_ref" {
-        return None;
-    }
-    let stable = string(&target["reference"]["reference"])?;
-    if !stable.starts_with("ncm-memory:") || stable.len() != "ncm-memory:".len() + 64 {
-        return None;
-    }
     let original = json!({"source": target["source"], "origin_scope": target["original_scope"],
         "source_sequence": 0, "occurred_at": null, "ingested_at": "1970-01-01T00:00:00Z",
         "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null}});
     let source = attribution(&original)?;
     let identity = json!({"source": target["source"], "origin_scope": target["original_scope"]});
     let binding = source_binding(namespace, &source)?;
-    Some(
-        json!({"stable_memory_ref": stable, "source": binding.source_id, "legacy_source": binding.legacy_source_id,
-        "source_identity_sha256": opaque_surface_id(namespace, b"source-target", &serde_json::to_string(&identity).ok()?)}),
-    )
+    let source_identity_sha256 = opaque_surface_id(
+        namespace,
+        b"source-target",
+        &serde_json::to_string(&identity).ok()?,
+    );
+    match target["reference"]["kind"].as_str()? {
+        // Trace/context references are host-resolved to retained stable
+        // attribution before provider dispatch; a transient candidate id is
+        // never accepted.
+        "stable_memory_ref" => {
+            let stable = string(&target["reference"]["reference"])?;
+            if !stable.starts_with("ncm-memory:") || stable.len() != "ncm-memory:".len() + 64 {
+                return None;
+            }
+            Some(
+                json!({"stable_memory_ref": stable, "source": binding.source_id,
+                "legacy_source": binding.legacy_source_id, "source_identity_sha256": source_identity_sha256}),
+            )
+        }
+        "retained_source_locator" => {
+            // The host locator is intentionally opaque and is only a retained
+            // handle. NCM resolves the provider-local row from the canonical
+            // source-derived observation identity and source binding below.
+            let retained_source_locator = string(&target["reference"]["reference"])?;
+            let observation_identity = opaque_surface_id(
+                namespace,
+                b"observation-identity",
+                &serde_json::to_string(&json!([
+                    source.source.canonical_provider_id.as_str(),
+                    source.source.canonical_session_id,
+                    source.source.observation_id,
+                ]))
+                .ok()?,
+            );
+            Some(json!({"retained_source_locator": retained_source_locator,
+                "observation_identity": observation_identity, "source": binding.source_id,
+                "legacy_source": binding.legacy_source_id, "source_identity_sha256": source_identity_sha256}))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn project(
@@ -156,18 +183,19 @@ pub(crate) fn project(
             }
         }
         ProviderOperation::Inspection => {
-            fields(
-                value,
-                &[
-                    "common_request",
-                    "view",
-                    "selector",
-                    "maximum_items",
-                    "maximum_bytes",
-                    "redaction_policy_revision",
-                    "cursor",
-                ],
-            )?;
+            let mut names = vec![
+                "common_request",
+                "view",
+                "selector",
+                "maximum_items",
+                "maximum_bytes",
+                "redaction_policy_revision",
+                "cursor",
+            ];
+            if value.get("target").is_some() {
+                names.push("target");
+            }
+            fields(value, &names)?;
             let view = string(&value["view"])?;
             if ![
                 "state_summary",
@@ -192,6 +220,29 @@ pub(crate) fn project(
             control["maximum_items"] = json!(items);
             control["maximum_bytes"] = json!(bytes);
             let selector = value["selector"].as_object()?;
+            let retained_target = match value.get("target") {
+                Some(raw_target)
+                    if matches!(view, "source_influence" | "trace" | "delivery_receipt") =>
+                {
+                    let projected = target(call, raw_target, namespace)?;
+                    // Inspection's retained path must be explicitly addressed by
+                    // the opaque locator. A stable target stays on the legacy
+                    // selector-only path so its wire behavior is unchanged.
+                    projected.get("retained_source_locator")?;
+                    if view == "source_influence"
+                        && raw_target["source"]["source_key"] != selector.get("source_key")?.clone()
+                    {
+                        return None;
+                    }
+                    Some(projected)
+                }
+                Some(_) => return None,
+                None => None,
+            };
+            let retained_locator = retained_target
+                .as_ref()
+                .and_then(|target| target.get("retained_source_locator"))
+                .and_then(Value::as_str);
             match view {
                 "delivery_receipt" | "maintenance_receipt" => {
                     let optional = if view == "delivery_receipt" {
@@ -203,12 +254,18 @@ pub(crate) fn project(
                         fields(&value["selector"], &["idempotency_key", optional])?;
                         let selected = string(selected)?;
                         if optional == "stable_memory_ref" {
-                            if !crate::NcmProviderAdapter::valid_sha256(
+                            if let Some(locator) = retained_locator {
+                                if selected != locator {
+                                    return None;
+                                }
+                            } else if !crate::NcmProviderAdapter::valid_sha256(
                                 selected.strip_prefix("ncm-memory:")?,
                             ) {
                                 return None;
                             }
-                            control["stable_memory_ref"] = json!(selected);
+                            if retained_locator.is_none() {
+                                control["stable_memory_ref"] = json!(selected);
+                            }
                         }
                     } else {
                         fields(&value["selector"], &["idempotency_key"])?;
@@ -222,7 +279,11 @@ pub(crate) fn project(
                 "trace" => {
                     fields(&value["selector"], &["stable_memory_ref"])?;
                     let stable = string(&value["selector"]["stable_memory_ref"])?;
-                    if let Some(id) = legacy_record_id(stable) {
+                    if let Some(locator) = retained_locator {
+                        if stable != locator {
+                            return None;
+                        }
+                    } else if let Some(id) = legacy_record_id(stable) {
                         control["legacy_record_id"] = json!(id);
                     } else if !stable
                         .strip_prefix("ncm-memory:")
@@ -230,17 +291,27 @@ pub(crate) fn project(
                     {
                         return None;
                     }
-                    control["stable_memory_ref"] = json!(stable);
+                    if retained_locator.is_none() {
+                        control["stable_memory_ref"] = json!(stable);
+                    }
                 }
                 "source_influence" => {
                     if let Some(stable) = selector.get("stable_memory_ref") {
                         fields(&value["selector"], &["source_key", "stable_memory_ref"])?;
                         let stable = string(stable)?;
-                        let digest = stable.strip_prefix("ncm-memory:")?;
-                        if !crate::NcmProviderAdapter::valid_sha256(digest) {
-                            return None;
+                        if let Some(locator) = retained_locator {
+                            if stable != locator {
+                                return None;
+                            }
+                        } else {
+                            let digest = stable.strip_prefix("ncm-memory:")?;
+                            if !crate::NcmProviderAdapter::valid_sha256(digest) {
+                                return None;
+                            }
                         }
-                        control["stable_memory_ref"] = json!(stable);
+                        if retained_locator.is_none() {
+                            control["stable_memory_ref"] = json!(stable);
+                        }
                     } else {
                         fields(&value["selector"], &["source_key"])?;
                     }
@@ -251,14 +322,21 @@ pub(crate) fn project(
                     }
                 }
             }
-            control["source"] = match selector.get("source_key") {
-                Some(source) => json!(opaque_surface_id(
-                    namespace,
-                    b"forget-source-key",
-                    string(source)?
-                )),
-                None => Value::Null,
+            control["source"] = if let Some(target) = &retained_target {
+                target["source"].clone()
+            } else {
+                match selector.get("source_key") {
+                    Some(source) => json!(opaque_surface_id(
+                        namespace,
+                        b"forget-source-key",
+                        string(source)?
+                    )),
+                    None => Value::Null,
+                }
             };
+            if let Some(target) = retained_target {
+                control["target"] = target;
+            }
             let binding = cursor_binding(call, value)?;
             control["after"] = json!(match nullable_string(&value["cursor"])? {
                 None => 0,
@@ -842,6 +920,13 @@ pub(crate) fn reconstruct(
     } else if call.operation == ProviderOperation::Inspection {
         let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let retained_locator = match request.get("target") {
+            Some(raw_target) => {
+                let projected = target(call, raw_target, &namespace)?;
+                Some(string(&projected["retained_source_locator"])?.to_owned())
+            }
+            None => None,
+        };
         let mut items = Vec::new();
         let mut partial = payload["partial"].as_bool()?;
         let mut bytes_used = 0_u64;
@@ -908,12 +993,16 @@ pub(crate) fn reconstruct(
                     return None;
                 }
                 if let Some(expected) = request["selector"].get("stable_memory_ref") {
-                    if expected.as_str()? != stable {
+                    if let Some(locator) = retained_locator.as_deref() {
+                        if expected.as_str()? != locator {
+                            return None;
+                        }
+                    } else if expected.as_str()? != stable {
                         return None;
                     }
                 }
             }
-            let item = if request["view"] == "delivery_receipt" {
+            let mut item = if request["view"] == "delivery_receipt" {
                 let delivery = decode_receipt_capsule(&row["delivery_capsule"])?;
                 fields(&delivery, &["operation_id", "idempotency_key"])?;
                 let operation_id = string(&delivery["operation_id"])?;
@@ -922,7 +1011,10 @@ pub(crate) fn reconstruct(
                 if idempotency_key != request["selector"]["idempotency_key"].as_str()?
                     || request["selector"]
                         .get("stable_memory_ref")
-                        .is_some_and(|selected| selected.as_str() != Some(stable.as_str()))
+                        .is_some_and(|selected| {
+                            selected.as_str()
+                                != Some(retained_locator.as_deref().unwrap_or(stable.as_str()))
+                        })
                     || !crate::NcmProviderAdapter::valid_sha256(receipt)
                     || !seen_stable.insert(stable.clone())
                 {
@@ -942,7 +1034,11 @@ pub(crate) fn reconstruct(
                 delivery_identity = Some(identity);
                 json!({"operation_id": operation_id, "idempotency_key": idempotency_key, "provider_receipt_digest": receipt, "stable_memory_ref": stable})
             } else if request["view"] == "trace" {
-                if request["selector"]["stable_memory_ref"] != stable {
+                if let Some(locator) = retained_locator.as_deref() {
+                    if request["selector"]["stable_memory_ref"] != locator {
+                        return None;
+                    }
+                } else if request["selector"]["stable_memory_ref"] != stable {
                     return None;
                 }
                 let content = row["content"].as_str()?;
@@ -987,6 +1083,18 @@ pub(crate) fn reconstruct(
                 "last_feedback_receipt": row["provenance"]["control"]["feedback"]["receipt"],
                 "provider_local_effect_summary": effect_summary})
             };
+            if let Some(locator) = retained_locator.as_deref() {
+                match request["view"].as_str()? {
+                    "source_influence" => {
+                        item["target"]["reference"] =
+                            json!({"kind": "retained_source_locator", "reference": locator});
+                    }
+                    "trace" | "delivery_receipt" => {
+                        item["stable_memory_ref"] = json!(locator);
+                    }
+                    _ => return None,
+                }
+            }
             let item_bytes = serde_json::to_vec(&item).ok()?.len() as u64;
             if bytes_used.saturating_add(item_bytes) > request["maximum_bytes"].as_u64()? {
                 partial = true;
