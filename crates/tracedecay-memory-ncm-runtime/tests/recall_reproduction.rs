@@ -24,6 +24,7 @@ const DEADLINE: Deadline = Deadline {
     remaining_ms: u64::MAX,
 };
 const NAMESPACE: &str = "4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b";
+const COUNT_LIMIT: usize = 16;
 const FITTING_VALUES: [&str; 3] = ["fits-sequence-3", "fits-sequence-4", "fits-sequence-5"];
 
 fn fitting_recall_bytes() -> usize {
@@ -92,11 +93,13 @@ fn candidate_values(payload: &Value) -> Vec<&str> {
 }
 
 /// Hypothesis under test:
-/// the pure reconstruction loop breaks at an oversized higher-ranked candidate
-/// instead of continuing to a smaller fitting candidate. The independent
-/// hypothesis retained in the report is the transient instance-proof
-/// OnceLock<Option<String>> cache, which can suppress delivery until daemon
-/// recreation.
+/// the bounded reconstruction loop inspects only the first `COUNT_LIMIT`
+/// ranked rows before applying the byte budget. If all of those rows are too
+/// large, a later fitting candidate is skipped and recall returns an empty
+/// partial result even though the candidate count and byte budgets allow it.
+/// The independent hypothesis retained in the report is the transient
+/// instance-proof `OnceLock<Option<String>>` cache, which can suppress delivery
+/// until daemon recreation.
 #[test]
 fn oversized_ranked_candidate_must_not_hide_a_later_fitting_candidate() {
     let tempdir = TempDir::new().expect("temporary NCM state root");
@@ -107,12 +110,12 @@ fn oversized_ranked_candidate_must_not_hide_a_later_fitting_candidate() {
     );
 
     let oversized = "oversized-ranked-candidate-".repeat(512);
-    for (sequence, value) in [
-        (2, oversized.as_str()),
-        (3, FITTING_VALUES[0]),
-        (4, FITTING_VALUES[1]),
-        (5, FITTING_VALUES[2]),
-    ] {
+    for sequence in 2..=(COUNT_LIMIT as u64 + 1) {
+        let observed = engine.observe(NAMESPACE, request(sequence, oversized.as_str()));
+        assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    }
+    for (offset, value) in FITTING_VALUES.iter().enumerate() {
+        let sequence = COUNT_LIMIT as u64 + 2 + u64::try_from(offset).expect("small offset");
         let observed = engine.observe(NAMESPACE, request(sequence, value));
         assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
     }
@@ -129,5 +132,12 @@ fn oversized_ranked_candidate_must_not_hide_a_later_fitting_candidate() {
 
     let values = candidate_values(&recalled.payload);
     assert_eq!(values, FITTING_VALUES.to_vec());
+    assert!(values.len() <= COUNT_LIMIT);
+    let recalled_bytes = values
+        .iter()
+        .map(|value| "shared-recall-key".len() + value.len())
+        .sum::<usize>();
+    assert_eq!(recalled_bytes, fitting_recall_bytes());
+    assert!(recalled_bytes <= config().max_recall_bytes);
     assert_eq!(recalled.payload["Candidates"]["truncated"], true);
 }

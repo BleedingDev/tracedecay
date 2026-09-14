@@ -94,7 +94,7 @@ pub enum RecallOutput {
     Candidates {
         /// Hydrated candidates in deterministic rank order.
         candidates: Vec<RecallCandidate>,
-        /// Whether candidate count or text budget removed a ranked suffix.
+        /// Whether candidate count or text budget excluded one or more ranked candidates.
         truncated: bool,
         /// Whether the top activation exceeds the runner-up by `min_margin`.
         margin_satisfied: bool,
@@ -222,7 +222,10 @@ pub fn recall(
     let mut truncated = count_limit < ranked.len();
     let mut selected = Vec::with_capacity(count_limit);
     let mut text_bytes = 0_usize;
-    for candidate in ranked.into_iter().take(count_limit) {
+    for candidate in ranked.into_iter() {
+        if selected.len() >= count_limit {
+            break;
+        }
         let record = records
             .get(candidate.record_id)
             .ok_or(CoreError::UnknownRecord(candidate.record_id))?;
