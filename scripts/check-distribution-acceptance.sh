@@ -844,6 +844,21 @@ TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE="$fastembed_fixture" \
   -E 'test(~semantic_activation_journey_test::public_semantic_activation_rollback_and_exact_retry_preserve_graph_authority)' \
   --no-tests=fail
 
+echo "distribution acceptance: exercising packaged semantic restart recovery"
+TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE="$fastembed_fixture" \
+  TRACEDECAY_DISTRIBUTION_FASTEMBED_PROFILE_PARENT="$work/semantic-restart-profile" \
+  CARGO_NET_OFFLINE=true \
+  HF_HUB_OFFLINE=1 \
+  cargo nextest run \
+  --manifest-path "$root_package/Cargo.toml" \
+  --release \
+  --no-default-features \
+  --features production \
+  --lib \
+  --config "$patch_config" \
+  -E 'test(=daemon::production_harness::semantic_restart_journey_test::strict_semantic_answers_again_after_daemon_restart_without_rebuild)' \
+  --no-tests=fail
+
 echo "distribution acceptance: exercising shipped CLI semantic activation"
 TRACEDECAY_TEST_BIN="$packaged_cli_bin" \
   TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE="$fastembed_fixture" \
