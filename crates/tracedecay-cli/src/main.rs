@@ -1233,10 +1233,19 @@ async fn dispatch_project_command(
             project_path,
             json,
             short,
+            details,
             runtime,
         } => {
-            status_cmd::handle_status_command(path, project_id, project_path, json, short, runtime)
-                .await?;
+            status_cmd::handle_status_command(
+                path,
+                project_id,
+                project_path,
+                json,
+                short,
+                details,
+                runtime,
+            )
+            .await?;
         }
         Commands::Projects { action } => {
             project_cmd::handle_projects_action(action, assume_yes, dry_run).await?;

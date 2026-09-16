@@ -64,9 +64,10 @@ Related: tracedecay init (first index), tracedecay status (freshness check).";
 
 pub(crate) const STATUS_LONG_ABOUT: &str = "\
 Reports node/edge/file counts, database size, index freshness, active branch, \
-and tokens saved for the resolved project. Reach for it first when deciding \
-whether the index is stale or when an agent needs project statistics; \
-`--json` emits the same data machine-readably.";
+and tokens saved for the resolved project. `--details` adds the node-kind \
+distribution from the verified graph generation. Reach for it first when \
+deciding whether the index is stale or when an agent needs project \
+statistics; `--json` emits the same data machine-readably.";
 
 pub(crate) const STATUS_AFTER_HELP: &str = "\
 Examples:

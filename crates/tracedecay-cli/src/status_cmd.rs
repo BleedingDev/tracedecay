@@ -12,6 +12,7 @@ use tracedecay_contracts::retained_surfaces::{FactCommitOwnerV1, MemoryStatusV1}
 use tracedecay_contracts::storage::{
     SchemaConvergenceFindingV1, SchemaConvergenceProgressV1, SchemaConvergenceStateV1,
 };
+use tracedecay_runtime_core::text::format_number;
 
 use crate::commands::reject_truncation_envelope;
 use crate::{commands, current_unix_timestamp, global, resolve_cli_project_root};
@@ -185,6 +186,103 @@ fn compact_status_tool_args() -> Value {
     })
 }
 
+fn status_details_tool_args() -> Value {
+    serde_json::json!({
+        "format": "json",
+        "summary": true,
+    })
+}
+
+/// Decodes the current verified distribution route before it is rendered or
+/// attached to the status JSON. The status command must fail closed if the
+/// route changes shape instead of displaying a partial or fabricated report.
+fn node_kind_distribution_entries(
+    value: &Value,
+) -> tracedecay_domain::errors::Result<Vec<(String, u64)>> {
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "tracedecay_distribution omitted its mode".to_owned(),
+        })?;
+    if mode != "summary" {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "tracedecay_distribution returned mode {mode:?}; status details require summary"
+            ),
+        });
+    }
+    let distribution = value
+        .get("distribution")
+        .and_then(Value::as_array)
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "tracedecay_distribution omitted its distribution".to_owned(),
+        })?;
+    if let Some(total_kinds) = value.get("total_kinds").and_then(Value::as_u64)
+        && total_kinds != u64::try_from(distribution.len()).unwrap_or(u64::MAX)
+    {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "tracedecay_distribution reported {total_kinds} kinds but returned {}",
+                distribution.len()
+            ),
+        });
+    }
+    distribution
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let kind = entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "tracedecay_distribution entry {index} omitted its kind"
+                    ),
+                })?;
+            let count = entry
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "tracedecay_distribution entry {index} omitted its count"
+                    ),
+                })?;
+            Ok((kind.to_owned(), count))
+        })
+        .collect()
+}
+
+fn format_node_kind_distribution(value: &Value) -> tracedecay_domain::errors::Result<String> {
+    let entries = node_kind_distribution_entries(value)?;
+    let mut report = String::from("Node-kind distribution\n");
+    if entries.is_empty() {
+        report.push_str("  (none)\n");
+        return Ok(report);
+    }
+    for (kind, count) in entries {
+        report.push_str("  ");
+        report.push_str(&kind);
+        report.push_str(": ");
+        report.push_str(&format_number(count));
+        report.push('\n');
+    }
+    Ok(report)
+}
+
+fn attach_node_kind_distribution(
+    status: &mut Value,
+    distribution: Value,
+) -> tracedecay_domain::errors::Result<()> {
+    if !status.is_object() {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: "tracedecay_status returned a non-object payload".to_owned(),
+        });
+    }
+    status["node_kind_distribution"] = distribution;
+    Ok(())
+}
+
 fn schema_convergence_line(finding: &SchemaConvergenceFindingV1) -> String {
     let progress = match &finding.progress {
         Some(SchemaConvergenceProgressV1::Rows { done, remaining }) => {
@@ -302,6 +400,7 @@ pub(crate) async fn handle_status_command(
     project_path: Option<String>,
     json: bool,
     short: bool,
+    details: bool,
     runtime: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     let budget = status_command_deadline()?;
@@ -326,6 +425,7 @@ pub(crate) async fn handle_status_command(
             project_path,
             json,
             short,
+            details,
             runtime,
         ),
     )
@@ -349,6 +449,7 @@ async fn handle_status_command_within(
     project_path: Option<String>,
     json: bool,
     short: bool,
+    details: bool,
     runtime: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     let project_path = resolve_cli_project_root(path, project_id, project_path).await?;
@@ -373,7 +474,7 @@ async fn handle_status_command_within(
         }
         return Ok(());
     }
-    let daemon_status = daemon_tool_json_within(
+    let mut daemon_status = daemon_tool_json_within(
         deadline,
         server_deadline,
         &project_path,
@@ -382,7 +483,24 @@ async fn handle_status_command_within(
     )
     .await?;
     reject_truncation_envelope(&daemon_status, "tracedecay_status")?;
+    let node_kind_distribution = if details {
+        let distribution = daemon_tool_json_within(
+            deadline,
+            server_deadline,
+            &project_path,
+            "tracedecay_distribution",
+            status_details_tool_args(),
+        )
+        .await?;
+        node_kind_distribution_entries(&distribution)?;
+        Some(distribution)
+    } else {
+        None
+    };
     if json {
+        if let Some(distribution) = node_kind_distribution {
+            attach_node_kind_distribution(&mut daemon_status, distribution)?;
+        }
         println!("{}", serde_json::to_string_pretty(&daemon_status)?);
         return Ok(());
     }
@@ -525,6 +643,10 @@ async fn handle_status_command_within(
         }
     });
 
+    if let Some(distribution) = node_kind_distribution.as_ref() {
+        print!("\n{}", format_node_kind_distribution(distribution)?);
+    }
+
     // A parked deterministic contract violation must be visible on the plain
     // status journey, not only inside the JSON payload: name the exact reason
     // and the operator remediation beside the "parked" staleness row.
@@ -577,8 +699,9 @@ mod tests {
     use super::{
         COUNTRY_FLAGS_MAX_AGE_SECS, OnlineRefresh, OnlineRefreshPlan, WORLDWIDE_TOTAL_MAX_AGE_SECS,
         await_daemon_tool_result, await_online_refresh, project_open_line,
-        reject_truncation_envelope, schema_convergence_line, status_command_deadline_from,
-        status_server_request_budget,
+        attach_node_kind_distribution, format_node_kind_distribution,
+        node_kind_distribution_entries, reject_truncation_envelope, schema_convergence_line,
+        status_command_deadline_from, status_server_request_budget,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -739,6 +862,49 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn status_details_use_the_verified_distribution_shape() {
+        let distribution = json!({
+            "mode": "summary",
+            "total_kinds": 2,
+            "distribution": [
+                {"kind": "function", "count": 7},
+                {"kind": "struct", "count": 3}
+            ]
+        });
+        assert_eq!(
+            node_kind_distribution_entries(&distribution).expect("valid distribution"),
+            vec![("function".to_owned(), 7), ("struct".to_owned(), 3)]
+        );
+        assert_eq!(
+            format_node_kind_distribution(&distribution).expect("rendered distribution"),
+            "Node-kind distribution\n  function: 7\n  struct: 3\n"
+        );
+
+        let mut status = json!({"graph_statistics": {"state": "unavailable"}});
+        attach_node_kind_distribution(&mut status, distribution.clone())
+            .expect("status is an object");
+        assert_eq!(status["node_kind_distribution"], distribution);
+    }
+
+    #[test]
+    fn status_details_reject_malformed_or_non_summary_payloads() {
+        for payload in [
+            json!({"mode": "per_file", "distribution": []}),
+            json!({"mode": "summary"}),
+            json!({
+                "mode": "summary",
+                "total_kinds": 1,
+                "distribution": [{"kind": "function"}]
+            }),
+        ] {
+            assert!(
+                node_kind_distribution_entries(&payload).is_err(),
+                "malformed status details must fail closed: {payload}"
+            );
+        }
     }
 
     #[test]
