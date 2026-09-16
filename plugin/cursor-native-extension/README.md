@@ -7,11 +7,15 @@ Untrusted or non-single-root workspaces resolve through a typed unavailable
 state; multi-root workspaces do not start the bridge.
 
 TraceDecay packages the built, unpacked extension into Cursor's host-component
-lifecycle under `.cursor/extensions/tracedecay.cursor-native-0.0.0/`. The
-receipt-backed Doctor check verifies the deployed `package.json` and
-`dist/extension.js`. The deployed bundle receives the installed TraceDecay
-binary path from that lifecycle; `tracedecay.binaryPath` and `TRACEDECAY_BIN`
-remain explicit overrides.
+lifecycle under `.cursor/extensions/tracedecay.cursor-native-<PRODUCT_VERSION>/`.
+During lifecycle staging, the Rust host stamps the directory suffix and the
+deployed `package.json` version from the compiled
+`tracedecay-agent-hosts::PRODUCT_VERSION` value. The source `package.json`
+keeps its `0.0.0` placeholder and is never deployed raw. The receipt-backed
+Doctor check verifies the deployed `package.json` and `dist/extension.js`. The
+deployed bundle receives the installed TraceDecay binary path from that
+lifecycle; `tracedecay.binaryPath` and `TRACEDECAY_BIN` remain explicit
+overrides.
 
 `embedded/extension.js` is the sole checked-in compiled asset. The Rust host
 bundle embeds it at compile time and the published crate must build with stock

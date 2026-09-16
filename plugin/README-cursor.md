@@ -63,7 +63,10 @@ mode, publishes only TraceDecay findings back to avoid duplicating Cursor's own
 diagnostics. Multi-root workspaces are not supported.
 
 The component is deployed at
-`~/.cursor/extensions/tracedecay.cursor-native-0.0.0/`; its receipt and
+`~/.cursor/extensions/tracedecay.cursor-native-<PRODUCT_VERSION>/`; the host
+stamps both the directory suffix and `package.json` from the compiled
+`tracedecay-agent-hosts::PRODUCT_VERSION` value during lifecycle staging. The
+source bundle's `0.0.0` placeholder is never deployed raw. Its receipt and
 installed manifest/bundle are checked by `tracedecay doctor`.
 TraceDecay does not install or claim ownership of `rust-analyzer`,
 `typescript-language-server`, Pyright, or another language analyzer.

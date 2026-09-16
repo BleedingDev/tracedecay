@@ -1678,9 +1678,24 @@ impl crate::agents::host_bundle::HostComponentSetRegistrationV1
 
     fn commit(
         &mut self,
-        _component_set: &crate::agents::host_bundle::HostComponentSetV1,
+        component_set: &crate::agents::host_bundle::HostComponentSetV1,
         request: &crate::agents::host_bundle::HostComponentSetExecutionRequestV1,
     ) -> Result<(), crate::agents::host_bundle::HostBundleError> {
+        // Cursor's unpacked native extension uses a release-versioned
+        // directory. Older V1 installs used a literal `0.0.0` directory that
+        // is outside the current receipt, so sweep it only after the new
+        // component-set receipt is durable. The Cursor helper verifies the
+        // old directory's own package manifest before removing it and leaves
+        // foreign/malformed paths for Doctor remediation.
+        if self.integration.id() == "cursor"
+            && component_set.components.iter().any(|component| {
+                component.manifest.component
+                    == crate::agents::host_bundle::HostBundleComponentV1::Agent
+            })
+        {
+            crate::agents::cursor::sweep_stale_cursor_native_extension_dirs(&self.context.home)
+                .map_err(|error| Self::registration_error(component_set.host, error))?;
+        }
         self.retire_backup(request.operation_id)
     }
 

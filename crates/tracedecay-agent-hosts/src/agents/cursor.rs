@@ -239,10 +239,7 @@ fn cursor_native_extension_registration(home: &Path) -> HostBundleRegistrationSt
     let Ok(manifest) = serde_json::from_slice::<Value>(&manifest_bytes) else {
         return HostBundleRegistrationStateV1::Corrupt;
     };
-    let expected_manifest = manifest.get("name").and_then(Value::as_str) == Some("cursor-native")
-        && manifest.get("publisher").and_then(Value::as_str) == Some("tracedecay")
-        && manifest.get("main").and_then(Value::as_str) == Some("./dist/extension.js");
-    if !expected_manifest {
+    if !cursor_native_extension_manifest_is_tracedecay(&manifest) {
         return HostBundleRegistrationStateV1::Corrupt;
     }
     if install_dir.join("dist/extension.js").is_file() {
@@ -260,6 +257,32 @@ fn cursor_native_extension_registration(home: &Path) -> HostBundleRegistrationSt
 /// and it no longer loads current diagnostics.
 fn doctor_check_native_extension(dc: &mut DoctorCounters, home: &Path) {
     let install_dir = cursor_native_extension_install_dir(home);
+    let stale = stale_native_extension_paths(home).unwrap_or_default();
+    let (owned_stale, preserved_stale): (Vec<_>, Vec<_>) = stale
+        .iter()
+        .partition(|path| cursor_native_extension_path_is_tracedecay(path));
+    if !owned_stale.is_empty() {
+        dc.warn(&format!(
+            "Cursor native diagnostics has stale TraceDecay extension director{} ({}) — run `tracedecay install --agent cursor` to remove old releases",
+            if owned_stale.len() == 1 { "y" } else { "ies" },
+            owned_stale
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !preserved_stale.is_empty() {
+        dc.warn(&format!(
+            "Cursor extension director{} use the TraceDecay native prefix but have no verified TraceDecay manifest; preserving them for manual inspection ({})",
+            if preserved_stale.len() == 1 { "y" } else { "ies" },
+            preserved_stale
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     match cursor_native_extension_registration(home) {
         HostBundleRegistrationStateV1::Current => dc.pass(&format!(
             "Cursor native diagnostics extension {} deployed at {}",
@@ -267,8 +290,7 @@ fn doctor_check_native_extension(dc: &mut DoctorCounters, home: &Path) {
             install_dir.display()
         )),
         HostBundleRegistrationStateV1::Missing => {
-            let stale = stale_native_extension_dirs(home);
-            if stale.is_empty() {
+            if owned_stale.is_empty() && preserved_stale.is_empty() {
                 dc.info(&format!(
                     "Cursor native diagnostics extension {} not deployed ({}) — run \
                      `tracedecay install --agent cursor`",
@@ -277,10 +299,14 @@ fn doctor_check_native_extension(dc: &mut DoctorCounters, home: &Path) {
                 ));
             } else {
                 dc.warn(&format!(
-                    "Cursor native diagnostics extension is stale ({}) while {} is current — \
-                     run `tracedecay install --agent cursor` to redeploy",
-                    stale.join(", "),
-                    crate::PRODUCT_VERSION
+                    "Cursor native diagnostics extension {} is not deployed while older Cursor extension director{} remain — \
+                     run `tracedecay install --agent cursor` to deploy the current release",
+                    crate::PRODUCT_VERSION,
+                    if owned_stale.len() + preserved_stale.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
                 ));
             }
         }
@@ -297,21 +323,95 @@ fn doctor_check_native_extension(dc: &mut DoctorCounters, home: &Path) {
     }
 }
 
-/// Names of `~/.cursor/extensions/tracedecay.cursor-native-*` directories left
-/// by other product versions (e.g. the unstamped `0.0.0` deploys).
-fn stale_native_extension_dirs(home: &Path) -> Vec<String> {
+fn stale_native_extension_paths(home: &Path) -> Result<Vec<PathBuf>> {
     let current = format!("tracedecay.cursor-native-{}", crate::PRODUCT_VERSION);
-    let Ok(entries) = std::fs::read_dir(home.join(".cursor/extensions")) else {
-        return Vec::new();
+    let extensions_dir = home.join(".cursor/extensions");
+    let entries = match std::fs::read_dir(&extensions_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "failed to inspect Cursor native extension directory {}: {error}",
+                    extensions_dir.display()
+                ),
+            });
+        }
     };
-    let mut stale: Vec<String> = entries
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-        .filter(|name| name.starts_with("tracedecay.cursor-native-") && *name != current)
-        .collect();
+    let mut stale = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inspect Cursor native extension directory {}: {error}",
+                extensions_dir.display()
+            ),
+        })?;
+        let file_type = entry.file_type().map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inspect Cursor native extension {}: {error}",
+                entry.path().display()
+            ),
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if file_type.is_dir() && name.starts_with("tracedecay.cursor-native-") && name != current {
+            stale.push(entry.path());
+        }
+    }
     stale.sort();
-    stale
+    Ok(stale)
+}
+
+fn cursor_native_extension_manifest_is_tracedecay(manifest: &Value) -> bool {
+    manifest.get("name").and_then(Value::as_str) == Some("cursor-native")
+        && manifest.get("publisher").and_then(Value::as_str) == Some("tracedecay")
+        && manifest.get("main").and_then(Value::as_str) == Some("./dist/extension.js")
+}
+
+fn cursor_native_extension_path_is_tracedecay(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_dir() {
+        return false;
+    }
+    cursor_native_extension_manifest_is_tracedecay(&load_json_file(&path.join("package.json")))
+}
+
+/// Remove old TraceDecay native-extension directories after the current
+/// component-set receipt has committed. A directory-name prefix is only a
+/// candidate: the unpacked extension's own package manifest is the ownership
+/// proof. Entries with the prefix but a foreign/malformed manifest remain in
+/// place and are surfaced by Doctor so this sweep cannot remove another
+/// extension's files.
+pub(crate) fn sweep_stale_cursor_native_extension_dirs(home: &Path) -> Result<()> {
+    let stale = stale_native_extension_paths(home)?;
+    let mut preserved = Vec::new();
+    for path in stale {
+        if !cursor_native_extension_path_is_tracedecay(&path) {
+            preserved.push(path.display().to_string());
+            continue;
+        }
+        std::fs::remove_dir_all(&path).map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to remove stale TraceDecay Cursor native extension {}: {error}",
+                path.display()
+            ),
+        })?;
+        eprintln!(
+            "\x1b[32m✔\x1b[0m Removed stale TraceDecay Cursor native extension {}",
+            path.display()
+        );
+    }
+    if !preserved.is_empty() {
+        eprintln!(
+            "\x1b[33mwarning:\x1b[0m preserved Cursor extension path(s) with the TraceDecay native prefix but no verified TraceDecay manifest: {}",
+            preserved.join(", ")
+        );
+    }
+    Ok(())
 }
 
 const RETIRED_CURSOR_MEMORY_RULE_MARKER: &str =
@@ -1458,6 +1558,46 @@ mod tests {
             "/opt/tracedecay-v1"
         );
 
+        // The replacement transaction must retire an old V1 native-extension
+        // directory once the current V2 artifact is committed, while leaving
+        // a same-prefix foreign extension untouched.
+        let extensions = home.path().join(".cursor/extensions");
+        let stale_extension = extensions.join("tracedecay.cursor-native-0.0.0");
+        let foreign_extension = extensions.join("tracedecay.cursor-native-foreign");
+        for directory in [&stale_extension, &foreign_extension] {
+            std::fs::create_dir_all(directory.join("dist")).unwrap();
+        }
+        std::fs::write(
+            stale_extension.join("package.json"),
+            br#"{
+                "name": "cursor-native",
+                "publisher": "tracedecay",
+                "version": "0.0.0",
+                "main": "./dist/extension.js"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            stale_extension.join("dist/extension.js"),
+            "module.exports = {};",
+        )
+        .unwrap();
+        std::fs::write(
+            foreign_extension.join("package.json"),
+            br#"{
+                "name": "cursor-native",
+                "publisher": "foreign",
+                "version": "foreign",
+                "main": "./dist/extension.js"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            foreign_extension.join("dist/extension.js"),
+            "module.exports = {};",
+        )
+        .unwrap();
+
         let current_bin =
             super::super::which_tracedecay().unwrap_or_else(|| "tracedecay".to_string());
         let current = cursor_component_set(&current_bin);
@@ -1474,6 +1614,18 @@ mod tests {
             .execute(&current.component_set, &update, &current, &mut registration)
             .expect("a newer packaged Cursor set must update through the transaction");
         assert_eq!(update_receipt.operation_id, update.operation_id);
+        assert!(
+            !stale_extension.exists(),
+            "the committed V2 replacement must remove the verified V1 extension"
+        );
+        assert!(
+            foreign_extension.exists(),
+            "the replacement must preserve a foreign same-prefix extension"
+        );
+        assert!(
+            cursor_native_extension_install_dir(home.path()).is_dir(),
+            "the current release extension must remain installed"
+        );
 
         let updated_mcp: Value =
             serde_json::from_slice(&std::fs::read(&mcp_path).unwrap()).unwrap();
@@ -1906,6 +2058,51 @@ mod tests {
         assert_eq!(
             cursor_native_extension_registration(tmp.path()),
             HostBundleRegistrationStateV1::Current
+        );
+    }
+
+    #[test]
+    fn stale_native_extension_cleanup_requires_manifest_provenance() {
+        let home = TempDir::new().unwrap();
+        let extensions = home.path().join(".cursor/extensions");
+        let stale = extensions.join("tracedecay.cursor-native-0.0.0");
+        let foreign = extensions.join("tracedecay.cursor-native-operator");
+        for directory in [&stale, &foreign] {
+            std::fs::create_dir_all(directory.join("dist")).unwrap();
+        }
+        std::fs::write(
+            stale.join("package.json"),
+            br#"{
+                "name": "cursor-native",
+                "publisher": "tracedecay",
+                "version": "0.0.0",
+                "main": "./dist/extension.js"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(stale.join("dist/extension.js"), "module.exports = {};").unwrap();
+        std::fs::write(
+            foreign.join("package.json"),
+            br#"{
+                "name": "cursor-native",
+                "publisher": "operator",
+                "version": "operator",
+                "main": "./dist/extension.js"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(foreign.join("dist/extension.js"), "module.exports = {};").unwrap();
+
+        sweep_stale_cursor_native_extension_dirs(home.path())
+            .expect("owned stale extensions should be removed");
+
+        assert!(
+            !stale.exists(),
+            "the verified old TraceDecay extension is stale"
+        );
+        assert!(
+            foreign.exists(),
+            "a same-prefix extension without TraceDecay publisher provenance must survive"
         );
     }
 
