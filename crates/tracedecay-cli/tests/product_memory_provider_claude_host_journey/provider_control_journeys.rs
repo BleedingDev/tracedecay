@@ -140,7 +140,12 @@ fn source_and_state(
         .to_owned();
     let source = evidence["sources"]
         .as_array()
-        .and_then(|sources| sources.first())
+        .and_then(|sources| {
+            sources
+                .iter()
+                .find(|source| source["source"]["source_revision"].is_string())
+                .or_else(|| sources.first())
+        })
         .expect("canonical source evidence");
     let observation_id = source["source"]["observation_id"]
         .as_str()
