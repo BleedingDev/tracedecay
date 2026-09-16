@@ -26,7 +26,7 @@ use tracedecay_sessions::runtime::source::{
 use tracedecay_store::StoreShardScopeV1;
 
 use super::admission::{live_hook_origin_baseline, retain_live_hook_origin};
-use crate::tracedecay::TraceDecay;
+use tracedecay_project::project::TraceDecay;
 
 const MAX_LIVE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_REFLOG_TAIL_BYTES: u64 = 64 * 1024;
@@ -1061,14 +1061,14 @@ mod tests {
         use super::super::super::SessionAuthorities;
         use super::super::admission::hook_v2_admit;
         use super::super::ingest::ingest_transcript;
-        use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
-        use crate::tracedecay::TraceDecayOpenOptions;
         use std::io::Write;
         use std::sync::Arc;
         use tracedecay_domain::ProjectId;
         use tracedecay_hooks::admission_ledger::{
             read_hook_live_origin_boundaries, read_hook_live_origin_proofs,
         };
+        use tracedecay_project::project::TraceDecayOpenOptions;
+        use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
         use tracedecay_sessions::admission::HostAdmissionScope;
 
         let project = repository();
@@ -1105,7 +1105,7 @@ mod tests {
             .with_profile_identity(Some(profile))
             .with_background_cpu(Some(runtime.background_cpu()));
         tracedecay_agent_hosts::hooks::publish_hook_bindings(
-            &crate::runtime_ports::hook_runtime(),
+            &tracedecay_project::runtime_ports::hook_runtime(),
             cg.hook_store_layout(),
         )
         .unwrap();
