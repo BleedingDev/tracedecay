@@ -782,17 +782,16 @@ fn validity_for(
         return None;
     }
 
-    let mut state = match explicit_state.as_deref() {
+    let explicit_state = match explicit_state.as_deref() {
         Some("expired") => NativeSessionRecallValidityState::Expired,
         Some("future") => NativeSessionRecallValidityState::Future,
         Some("superseded") => NativeSessionRecallValidityState::Superseded,
         Some("revoked") => NativeSessionRecallValidityState::Revoked,
         Some("unknown") => NativeSessionRecallValidityState::Unknown,
-        _ if revoked_at.is_some() => NativeSessionRecallValidityState::Revoked,
-        _ if superseded_at.is_some() => NativeSessionRecallValidityState::Superseded,
         _ if valid_from.is_none() => NativeSessionRecallValidityState::Unknown,
         _ => NativeSessionRecallValidityState::Current,
     };
+    let mut state = explicit_state;
 
     let temporal_cutoff = match options.temporal {
         NativeSessionRecallTemporal::AsOf { cutoff_micros } => Some(cutoff_micros),
@@ -815,6 +814,12 @@ fn validity_for(
         }
         if revoked_at.is_some_and(|value| value <= cutoff) {
             state = NativeSessionRecallValidityState::Revoked;
+        }
+    } else if matches!(options.temporal, NativeSessionRecallTemporal::Current) {
+        if revoked_at.is_some() {
+            state = NativeSessionRecallValidityState::Revoked;
+        } else if superseded_at.is_some() {
+            state = NativeSessionRecallValidityState::Superseded;
         }
     }
 
