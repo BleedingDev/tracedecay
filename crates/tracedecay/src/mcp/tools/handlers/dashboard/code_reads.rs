@@ -27,7 +27,6 @@ use tracedecay_query::code_search::{
     CodeIndexSimilarCompletedV1, CodeIndexSimilarExecutor, CodeIndexSimilarOutcomeV1,
     CodeIndexSimilarRequestV1, CodeIndexSimilarTargetV1,
 };
-use tracedecay_query::retrieval::lexical::CloneArtifactCursorV1;
 
 #[derive(Clone)]
 pub(super) struct DashboardCodeReadAdapter {
@@ -62,12 +61,6 @@ impl DashboardCodeReadPortV1 for DashboardCodeReadAdapter {
         request: DashboardSharedFamilyRequestV1,
     ) -> DashboardSharedFamilyReadFuture<'_> {
         Box::pin(async move {
-            let cursor = request
-                .cursor
-                .as_deref()
-                .map(CloneArtifactCursorV1::decode)
-                .transpose()
-                .map_err(|_| DashboardCodeReadErrorV1::InvalidRequest)?;
             let match_class = match request.match_class {
                 SimilarMatchClassV1::ConservativeExact => {
                     tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative
@@ -79,10 +72,12 @@ impl DashboardCodeReadPortV1 for DashboardCodeReadAdapter {
             let outcome = (self.similar_executor)(CodeIndexSimilarRequestV1 {
                 project_root: self.project_root.clone(),
                 target: CodeIndexSimilarTargetV1::SymbolOccurrence(request.symbol_occurrence_id),
+                source_extent:
+                    tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
                 match_classes: vec![match_class],
                 result_limit: request.limit,
                 work_limit: request.limit.saturating_add(1),
-                cursor,
+                cursor: request.cursor,
                 authority: Some(self.search_authority.clone()),
                 deadline: Some(request.control.deadline),
                 cancellation: Some(request.control.cancellation),
@@ -249,12 +244,7 @@ fn shared_family_result(
                 .collect::<Vec<_>>();
             let family_complete = group.complete && members.len() == unfiltered_member_count;
             complete &= family_complete;
-            let next_cursor = group
-                .next_cursor
-                .as_ref()
-                .map(CloneArtifactCursorV1::encode)
-                .transpose()
-                .map_err(|_| DashboardCodeReadErrorV1::Internal)?;
+            let next_cursor = group.next_cursor;
             Ok(SimilarFamilyV1 {
                 match_class,
                 normalization_revision: group.key.normalization_revision,
@@ -286,6 +276,7 @@ fn shared_family_result(
         source,
         families,
         coverage,
+        near: None,
     })
 }
 
