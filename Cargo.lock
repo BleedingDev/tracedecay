@@ -6354,6 +6354,7 @@ dependencies = [
  "tracedecay-host-admission",
  "tracedecay-lsp",
  "tracedecay-maintenance",
+ "tracedecay-memory-conformance",
  "tracedecay-memory-hygiene",
  "tracedecay-memory-observation",
  "tracedecay-memory-provider-ncm",
