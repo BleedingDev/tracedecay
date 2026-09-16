@@ -168,6 +168,19 @@ fn capture_live_origin_with_test_authorities(
         return None;
     }
     let canonical_source_path = fs::canonicalize(&source_path).ok()?;
+    if !canonical_source_path.is_absolute()
+        || canonical_source_path.as_os_str().len() > 4096
+        || canonical_source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("jsonl")
+    {
+        return None;
+    }
+    let identity = identify_claude_source(&canonical_source_path)?;
+    if identity.session_id != source.session_id().as_str() {
+        return None;
+    }
     let marker =
         tracedecay_runtime_core::storage::read_repository_identity_marker(&project_root).ok()??;
     let context = RepositoryProvenanceAdmissionContext::from_authoritative_project_marker(
@@ -254,6 +267,9 @@ fn capture_branch_evidence(
     if Instant::now() >= deadline {
         return None;
     }
+    if !reflog_updates_enabled(Path::new(git_common_dir), deadline) {
+        return None;
+    }
     let expected_ref = match repository.evidence().attached_ref() {
         EvidenceAvailabilityV1::Known(reference) => reference.clone(),
         _ => return None,
@@ -309,6 +325,39 @@ fn capture_branch_evidence(
         head_file_identity,
         head_change_token,
     })
+}
+
+fn reflog_updates_enabled(git_common_dir: &Path, deadline: Instant) -> bool {
+    let config_path = git_common_dir.join("config");
+    let Some((_, bytes)) = read_bounded_file(&config_path, 64 * 1024, deadline) else {
+        return false;
+    };
+    let Ok(config) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line
+                .trim_matches(|character| character == '[' || character == ']')
+                .trim()
+                .eq_ignore_ascii_case("core");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("logallrefupdates")
+            && value.trim().eq_ignore_ascii_case("false")
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn read_bounded_file(
