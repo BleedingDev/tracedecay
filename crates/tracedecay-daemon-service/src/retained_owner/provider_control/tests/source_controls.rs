@@ -912,7 +912,10 @@ impl OfflineSourceFixture {
                     RecallAdmissionLedgerV1::open_for_control_test(&data_root).unwrap(),
                 )),
                 locator_key: RecallLocatorKeyV1::for_test(),
-                live_journals: Vec::new(),
+                // A rebuilt control authority receives the already-mounted
+                // daemon journal. It must never rediscover or reopen the
+                // journal by looking at the provider-data path.
+                live_journals: vec![(self.provider_id.clone(), self.journal.clone())],
                 runtime: tokio::runtime::Handle::current(),
             },
             &operation_control(),

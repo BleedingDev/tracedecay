@@ -16,7 +16,7 @@ use tracedecay_memory_observation::{
     RecoveryTimeBudgetV1, SqliteObservationJournal,
 };
 use tracedecay_memory_provider_registry::{
-    HistoryGrant, NATIVE_PROVIDER_ID, OperationControl, OwnedProviderId, TerminalCode,
+    HistoryGrant, OperationControl, OwnedProviderId, TerminalCode,
 };
 use tracedecay_runtime_core::db::Database;
 
@@ -26,7 +26,6 @@ use super::super::cognitive_recall::{
         RecallLocatorKeyV1, RetainedRecallControlScopeV1, RetainedRecallControlSourceV1,
     },
 };
-use super::super::observation_journey::ObservationJourneyPolicyV1;
 use super::super::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
     ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read, original_source_fence_digest,
@@ -45,6 +44,9 @@ pub(crate) struct ProviderControlAuthorityInputsV1 {
     pub(crate) store_data_root: PathBuf,
     pub(crate) live_ledger: Option<Arc<RecallAdmissionLedgerV1>>,
     pub(crate) locator_key: RecallLocatorKeyV1,
+    /// Journal handles projected from the daemon-owned observation journeys.
+    /// The control authority may read these handles, but it never discovers or
+    /// reopens a provider journal from `store_data_root`.
     pub(crate) live_journals: Vec<(OwnedProviderId, Arc<SqliteObservationJournal>)>,
     pub(crate) runtime: tokio::runtime::Handle,
 }
@@ -436,7 +438,12 @@ impl ProviderControlAuthorityV1 {
     }
 
     /// Call once from existing composition blocking work, under project-open control.
-    /// Existing normal open/migration is reused, even when the provider is disabled.
+    ///
+    /// Observation journeys are mounted by the daemon composition before this
+    /// authority is built. Their journal handles are injected through
+    /// `live_journals`; this control path must never reopen a journal from a
+    /// request-derived or guessed filesystem path. A provider whose journey was
+    /// not mounted remains unavailable to source controls.
     pub(crate) fn from_mounted_data(
         inputs: ProviderControlAuthorityInputsV1,
         control: &OperationControl,
@@ -479,36 +486,17 @@ impl ProviderControlAuthorityV1 {
         };
         let mut journals = BTreeMap::new();
         for (provider, journal) in inputs.live_journals {
-            if journal_file_name(&provider).is_none()
-                || journals.insert(provider, journal).is_some()
-            {
+            if journals.insert(provider, journal).is_some() {
                 return Err(ProviderHistoryErrorV1::ClaimMismatch(
                     "live retained journal identity",
                 ));
             }
         }
-        // Fixed host-owned names match Native and NCM observation composition.
-        // The NCM spelling is retained here even in a build without its adapter.
-        for provider in [NATIVE_PROVIDER_ID, "ncm"] {
-            check(control)?;
-            let provider = OwnedProviderId::new(provider)
-                .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("host provider identity"))?;
-            if journals.contains_key(&provider) {
-                continue;
-            }
-            let name = journal_file_name(&provider).ok_or(
-                ProviderHistoryErrorV1::ClaimMismatch("host journal mapping"),
-            )?;
-            let path = inputs.store_data_root.join(name);
-            if existing_regular_file(&path)? {
-                let journal = SqliteObservationJournal::open_existing(
-                    path,
-                    ObservationJourneyPolicyV1::project_default().retention,
-                )
-                .map_err(|_| ProviderHistoryErrorV1::Unavailable("existing provider journal"))?;
-                journals.insert(provider, Arc::new(journal));
-            }
-        }
+        // The mounted journey handles above are the complete journal
+        // inventory. Do not infer additional providers from filenames: doing
+        // so would create a second connection outside the journey's lifecycle
+        // and could let a stale file outlive the daemon-owned source/grant
+        // authority. Missing mounts fail closed in `authorize_source`.
         check(control)?;
         original_authority.bridge.revalidate()?;
         check(control)?;
@@ -771,14 +759,6 @@ fn check(control: &OperationControl) -> Result<()> {
         .map_err(ProviderHistoryErrorV1::Control)
 }
 
-fn journal_file_name(provider: &OwnedProviderId) -> Option<&'static str> {
-    match provider.as_str() {
-        NATIVE_PROVIDER_ID => Some("memory-observation-journal-v1.sqlite3"),
-        "ncm" => Some("memory-observation-ncm-journal-v1.sqlite3"),
-        _ => None,
-    }
-}
-
 fn existing_regular_file(path: &Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
@@ -818,19 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn host_journal_names_are_fixed_and_missing_files_are_not_created() {
-        assert_eq!(
-            journal_file_name(&OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap()),
-            Some("memory-observation-journal-v1.sqlite3")
-        );
-        assert_eq!(
-            journal_file_name(&OwnedProviderId::new("ncm").unwrap()),
-            Some("memory-observation-ncm-journal-v1.sqlite3")
-        );
-        assert_eq!(
-            journal_file_name(&OwnedProviderId::new("other.provider").unwrap()),
-            None
-        );
+    fn missing_injected_journals_are_not_materialized_by_path() {
         let temporary = tempfile::tempdir().unwrap();
         let missing = temporary.path().join(LEDGER_FILE_NAME);
         assert!(!existing_regular_file(&missing).unwrap());
