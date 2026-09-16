@@ -422,8 +422,11 @@ fn provider_mutation_key(
     if !tracedecay_contracts::retained_surface_operation_is_effect(operation) {
         return Ok(None);
     }
-    // The mutable public body is deliberately excluded. Reusing a caller's
-    // identity with changed parameters must reach the producer's conflict check.
+    // The mutable public body is deliberately excluded. In particular,
+    // `resume_cursor` stays in the operation body, while the request ID keeps
+    // the mutation key stable: an exact retry replays, a changed cursor under
+    // that identity reaches the producer's conflict check, and a fresh
+    // request identity creates the key for a continuation page.
     let bytes = canonical_json_bytes(&(
         "tracedecay.provider-control.idempotency.v1",
         context.actor(),
@@ -859,7 +862,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use tracedecay_contracts::retained_surfaces::{
-        ProviderControlHealthCheckV1, ProviderHealthRequestV1,
+        ProviderControlHealthCheckV1, ProviderControlMaintenanceTaskV1, ProviderHealthRequestV1,
+        ProviderMaintenanceRequestV1,
     };
     use tracedecay_contracts::{
         CancellationContext, CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot,
@@ -924,6 +928,23 @@ mod tests {
         })
     }
 
+    fn maintenance_request(resume_cursor: Option<&str>) -> ProviderControlRequestV1 {
+        ProviderControlRequestV1::Maintenance(ProviderMaintenanceRequestV1 {
+            state: ProviderControlStateSelectorV1::CanonicalSession {
+                provider_id: "native".into(),
+                registration_revision: 1,
+                canonical_provider_id: "claude".into(),
+                session_id: "session.original".into(),
+            },
+            task: ProviderControlMaintenanceTaskV1::Compact,
+            maximum_items: 10,
+            maximum_bytes: 65_536,
+            maximum_duration_millis: 1_000,
+            dry_run: false,
+            resume_cursor: resume_cursor.map(str::to_owned),
+        })
+    }
+
     #[test]
     fn mutation_identity_binds_actor_full_scope_operation_and_caller_identity() {
         let (original, _) = context("actor.one", "request.one", "worktree.one");
@@ -965,6 +986,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn maintenance_cursor_continuation_keeps_replay_and_conflict_identity_explicit() {
+        let first = maintenance_request(None);
+        let replay = first.clone();
+        let continued = maintenance_request(Some("ncm-maintenance:1:compact:17"));
+        let (first_context, _) = context("actor.one", "request.maintenance.1", "worktree.one");
+        let (fresh_context, _) = context("actor.one", "request.maintenance.2", "worktree.one");
+
+        let first_key = provider_mutation_key(&first_context, first.operation())
+            .unwrap()
+            .expect("maintenance mutation key");
+        let replay_key = provider_mutation_key(&first_context, replay.operation())
+            .unwrap()
+            .expect("replay mutation key");
+        let changed_cursor_key = provider_mutation_key(&first_context, continued.operation())
+            .unwrap()
+            .expect("changed cursor mutation key");
+        let fresh_key = provider_mutation_key(&fresh_context, continued.operation())
+            .unwrap()
+            .expect("continuation mutation key");
+
+        // The request identity is the idempotency boundary. An exact retry
+        // replays, while a changed cursor under that same identity keeps the
+        // key and therefore reaches the provider's deterministic conflict
+        // check. A caller-issued continuation gets a fresh key.
+        assert_eq!(first_key, replay_key);
+        assert_eq!(first_key, changed_cursor_key);
+        assert_ne!(first_key, fresh_key);
+
+        let ProviderControlRequestV1::Maintenance(first) = &first else {
+            unreachable!()
+        };
+        let ProviderControlRequestV1::Maintenance(replay) = &replay else {
+            unreachable!()
+        };
+        let ProviderControlRequestV1::Maintenance(continued) = &continued else {
+            unreachable!()
+        };
+        let first_body = state_controls::maintenance_operation_body(first);
+        let replay_body = state_controls::maintenance_operation_body(replay);
+        let continued_body = state_controls::maintenance_operation_body(continued);
+        assert_eq!(first_body, replay_body);
+        assert_eq!(first_body["resume_cursor"], serde_json::Value::Null);
+        assert_eq!(
+            continued_body["resume_cursor"],
+            serde_json::json!("ncm-maintenance:1:compact:17")
+        );
+        assert_ne!(first_body, continued_body);
+        assert_eq!(&first.task, &continued.task);
+        assert_eq!(&first.state, &continued.state);
+        assert_eq!(first.maximum_items, continued.maximum_items);
+        assert_eq!(first.maximum_bytes, continued.maximum_bytes);
+        assert_eq!(
+            first.maximum_duration_millis,
+            continued.maximum_duration_millis
+        );
+        assert_eq!(first.dry_run, continued.dry_run);
     }
 
     #[tokio::test]

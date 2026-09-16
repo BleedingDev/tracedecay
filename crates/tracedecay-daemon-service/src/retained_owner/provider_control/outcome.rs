@@ -1313,6 +1313,89 @@ mod tests {
     }
 
     #[test]
+    fn partial_maintenance_page_is_surface_with_cursor_until_continuation_finishes() {
+        let mut result = unchanged_result();
+        result.terminal = ProviderControlTerminalV1::Partial;
+        result.effect = ProviderControlEffectV1 {
+            state: ProviderControlEffectStateV1::Partial,
+            committed_boundary: Some("item.16".to_owned()),
+            state_generation_before: Some(5),
+            state_generation_after: Some(6),
+            committed_item_refs: vec!["item.16".to_owned()],
+            uncommitted_item_refs: vec!["item.17".to_owned()],
+            provider_receipt_digest: Some("c".repeat(64)),
+            reconciliation_action: Some("resume_from_item.16".to_owned()),
+            verification_digest: Some("e".repeat(64)),
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
+        };
+        let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut result.result else {
+            unreachable!()
+        };
+        data.scanned_items = 16;
+        data.changed_items = 1;
+        data.state_changed = Some(true);
+        data.partial = true;
+        data.resume_cursor = Some("ncm-maintenance:6:compact:17".to_owned());
+        data.receipt.state_generation_after = 6;
+
+        let output = assembled(result);
+        assert_eq!(output.receipt.outcome, EffectTermination::Partial);
+        assert_eq!(output.reconciliation, ReconciliationState::Pending);
+        let Some(RetainedSurfaceResultV1::ProviderControl(result)) = output.payload else {
+            panic!("partial maintenance payload")
+        };
+        let ProviderControlOperationResultV1::Maintenance(Some(data)) = result.result else {
+            panic!("partial maintenance result")
+        };
+        assert_eq!(
+            data.resume_cursor.as_deref(),
+            Some("ncm-maintenance:6:compact:17")
+        );
+        assert!(data.partial);
+
+        // The next caller-issued request carries that cursor with a fresh
+        // identity. Once the provider exhausts the page, the host retains the
+        // final typed result and settles the effect normally.
+        let mut final_result = unchanged_result();
+        final_result.effect = ProviderControlEffectV1 {
+            state: ProviderControlEffectStateV1::Committed,
+            committed_boundary: None,
+            state_generation_before: Some(5),
+            state_generation_after: Some(6),
+            committed_item_refs: vec!["item.17".to_owned()],
+            uncommitted_item_refs: Vec::new(),
+            provider_receipt_digest: Some("c".repeat(64)),
+            reconciliation_action: None,
+            verification_digest: Some("e".repeat(64)),
+            duplicate_of_idempotency_key: None,
+            duplicate_of_operation_id: None,
+        };
+        let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut final_result.result
+        else {
+            unreachable!()
+        };
+        data.scanned_items = 1;
+        data.changed_items = 1;
+        data.state_changed = Some(true);
+        data.partial = false;
+        data.resume_cursor = None;
+        data.receipt.state_generation_after = 6;
+
+        let output = assembled(final_result);
+        assert_eq!(output.receipt.outcome, EffectTermination::Completed);
+        assert_eq!(output.reconciliation, ReconciliationState::Reconciled);
+        let Some(RetainedSurfaceResultV1::ProviderControl(result)) = output.payload else {
+            panic!("final maintenance payload")
+        };
+        let ProviderControlOperationResultV1::Maintenance(Some(data)) = result.result else {
+            panic!("final maintenance result")
+        };
+        assert!(!data.partial);
+        assert!(data.resume_cursor.is_none());
+    }
+
+    #[test]
     fn multi_item_inspection_outcome_preserves_actual_page_and_cursor() {
         let maintenance = request();
         let mut request = ProviderControlRequestV1::Inspection(ProviderInspectionRequestV1 {

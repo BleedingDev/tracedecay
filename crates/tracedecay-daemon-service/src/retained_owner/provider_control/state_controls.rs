@@ -42,19 +42,28 @@ pub(super) async fn maintenance(
         .dispatch(
             invocation,
             &state,
-            json!({
-                "task": request.task,
-                "maximum_items": request.maximum_items,
-                "maximum_bytes": request.maximum_bytes,
-                "maximum_duration_millis": request.maximum_duration_millis,
-                "dry_run": request.dry_run,
-                "resume_cursor": request.resume_cursor,
-            }),
+            maintenance_operation_body(request),
             &invocation.identity,
             None,
         )
         .await?;
     port.project(invocation, dispatched, HostControlEvidence::Maintenance)
+}
+
+/// Builds the provider-local maintenance body without changing its caller
+/// identity. The cursor is part of the operation semantics, so it must remain
+/// in the body while the mutation key stays bound to the caller request ID.
+/// Providers can therefore replay the exact page, reject a changed cursor
+/// under the same key, and accept a continuation issued with a fresh identity.
+pub(super) fn maintenance_operation_body(request: &ProviderMaintenanceRequestV1) -> Value {
+    json!({
+        "task": request.task,
+        "maximum_items": request.maximum_items,
+        "maximum_bytes": request.maximum_bytes,
+        "maximum_duration_millis": request.maximum_duration_millis,
+        "dry_run": request.dry_run,
+        "resume_cursor": request.resume_cursor,
+    })
 }
 
 fn inspection_body(
