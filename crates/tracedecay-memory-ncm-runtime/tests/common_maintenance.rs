@@ -435,6 +435,57 @@ fn maintenance_cursor_rejects_unissued_current_generation() {
 }
 
 #[test]
+fn maintenance_cursor_grants_keep_same_position_for_distinct_operations() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    seed(&live, "beta");
+    let generation = seed(&live, "gamma").state_generation;
+    let key_a = "same-position-maintenance-a";
+    let key_b = "same-position-maintenance-b";
+    let operation_a = "01993262-4d00-0000-8000-000000000011";
+    let operation_b = "01993262-4d00-0000-8000-000000000012";
+
+    let mut page_a = request(key_a, "repair", generation);
+    page_a["maximum_items"] = json!(1);
+    seal(&mut page_a, key_a, operation_a);
+    let first_a = invoke(&live, page_a.clone());
+    assert_eq!(first_a.payload["partial"], true);
+
+    let mut page_b = request(key_b, "repair", generation);
+    page_b["maximum_items"] = json!(1);
+    seal(&mut page_b, key_b, operation_b);
+    let first_b = invoke(&live, page_b.clone());
+    assert_eq!(first_b.payload["partial"], true);
+    assert_eq!(
+        first_a.payload["resume_cursor"],
+        first_b.payload["resume_cursor"]
+    );
+
+    page_a["resume_cursor"] = first_a.payload["resume_cursor"].clone();
+    seal(&mut page_a, key_a, operation_a);
+    let second_a = invoke(&live, page_a.clone());
+    assert_eq!(second_a.outcome, Outcome::Success, "{second_a:?}");
+    assert_eq!(second_a.payload["partial"], true);
+
+    page_b["resume_cursor"] = first_b.payload["resume_cursor"].clone();
+    seal(&mut page_b, key_b, operation_b);
+    let second_b = invoke(&live, page_b);
+    assert_eq!(second_b.outcome, Outcome::Success, "{second_b:?}");
+    assert_eq!(second_b.payload["partial"], true);
+    assert_eq!(
+        second_a.payload["resume_cursor"],
+        second_b.payload["resume_cursor"]
+    );
+
+    page_a["resume_cursor"] = second_a.payload["resume_cursor"].clone();
+    seal(&mut page_a, key_a, operation_a);
+    let committed = invoke(&live, page_a);
+    assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+    assert_eq!(committed.state_generation, generation + 1);
+}
+
+#[test]
 fn maintenance_cursor_survives_restart_before_resume_and_commits_once() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

@@ -767,9 +767,12 @@ impl NamespaceStore {
             operation_id: operation_id.to_owned(),
             request_semantic_sha256: request_semantic_sha256.to_owned(),
         };
-        if let Some(existing) = grants.iter_mut().find(|existing| existing.cursor == cursor) {
-            *existing = grant;
-        } else {
+        if !grants.iter().any(|existing| {
+            existing.cursor == grant.cursor
+                && existing.idempotency_key == grant.idempotency_key
+                && existing.operation_id == grant.operation_id
+                && existing.request_semantic_sha256 == grant.request_semantic_sha256
+        }) {
             grants.push(grant);
         }
         if grants.len() > MAX_MAINTENANCE_CURSOR_GRANTS {
