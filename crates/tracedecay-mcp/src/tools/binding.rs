@@ -336,6 +336,15 @@ const MCP_TOOL_BINDING_SPECS: &[McpToolBinding] = &[
     McpToolBinding { name: "tracedecay_run_affected_tests", group: Some(McpToolDispatchGroup::SessionWorkflow), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_dashboard", group: Some(McpToolDispatchGroup::SessionWorkflow), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_fact_feedback", group: None, project: RegisteredProjectAccess::SelectorOnly },
+    McpToolBinding { name: "tracedecay_provider_feedback", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_correction", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_delete_by_source", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_health", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_inspection", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_maintenance", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_snapshot_export", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_snapshot_restore", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_provider_replay", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_lcm_describe", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_lcm_doctor", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_lcm_expand", group: None, project: RegisteredProjectAccess::ActiveProjectOnly },
@@ -451,6 +460,10 @@ pub fn dispatch_group_for_tool(tool_name: &str) -> Option<McpToolDispatchGroup> 
     ApplicationSurfaceOperation::from_tool_name(tool_name)
         .map(|_| McpToolDispatchGroup::ApplicationSurface)
         .or_else(|| binding(tool_name).and_then(|binding| binding.group))
+        .or_else(|| {
+            RetainedSurfaceOperation::from_tool_name(tool_name)
+                .map(|_| McpToolDispatchGroup::RetainedApplication)
+        })
         .or_else(|| work_operation_for_tool(tool_name).map(|_| McpToolDispatchGroup::Work))
         .or_else(|| workflow_operation_for_tool(tool_name).map(|_| McpToolDispatchGroup::Workflow))
 }
@@ -753,6 +766,12 @@ fn verified_effect_journey(tool_name: &str) -> bool {
             | "tracedecay_fact_store_remove"
             | "tracedecay_fact_store_supersede"
             | "tracedecay_fact_feedback"
+            | "tracedecay_provider_feedback"
+            | "tracedecay_provider_correction"
+            | "tracedecay_provider_delete_by_source"
+            | "tracedecay_provider_maintenance"
+            | "tracedecay_provider_snapshot_restore"
+            | "tracedecay_provider_replay"
             | "tracedecay_session_refresh_begin"
             | "tracedecay_session_refresh_cancel"
             | "tracedecay_run_affected_tests"
@@ -1101,6 +1120,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_controls_have_retained_bindings_and_dispatch_contracts() {
+        let catalog = mcp_dispatch_catalog().expect("MCP dispatch catalog");
+        let executable_registry =
+            tracedecay_contracts::retained_surface_executable_binding_registry()
+                .expect("retained executable registry");
+        for operation in [
+            RetainedSurfaceOperation::ProviderFeedback,
+            RetainedSurfaceOperation::ProviderCorrection,
+            RetainedSurfaceOperation::ProviderDeleteBySource,
+            RetainedSurfaceOperation::ProviderHealth,
+            RetainedSurfaceOperation::ProviderInspection,
+            RetainedSurfaceOperation::ProviderMaintenance,
+            RetainedSurfaceOperation::ProviderSnapshotExport,
+            RetainedSurfaceOperation::ProviderSnapshotRestore,
+            RetainedSurfaceOperation::ProviderReplay,
+        ] {
+            let name = format!("tracedecay_{}", operation.as_str());
+            let binding = MCP_TOOL_BINDINGS
+                .iter()
+                .find(|binding| binding.name == name)
+                .unwrap_or_else(|| panic!("{name} must have a static MCP binding row"));
+            assert_eq!(binding.group, None, "{name} must be retained-owned");
+            assert_eq!(
+                binding.project,
+                RegisteredProjectAccess::ActiveProjectOnly,
+                "{name} must not route through a registered project selector"
+            );
+            assert_eq!(
+                dispatch_group_for_tool(&name),
+                Some(McpToolDispatchGroup::RetainedApplication),
+                "{name} must resolve to retained application dispatch"
+            );
+
+            let contract = catalog
+                .contract(&name)
+                .unwrap_or_else(|| panic!("{name} must have an MCP dispatch contract"));
+            let capability = application_capability_for_tool(&name)
+                .expect("application catalog")
+                .unwrap_or_else(|| panic!("{name} must have a retained capability"));
+            let operation_id = tracedecay_tool_catalog::OperationId::new(format!(
+                "operation.application.{}",
+                operation.as_str()
+            ))
+            .expect("provider operation ID");
+            let executable = executable_registry
+                .get(&operation_id)
+                .and_then(|availability| availability.binding())
+                .unwrap_or_else(|| panic!("{name} must have an executable retained binding"));
+            let resolved =
+                tracedecay_daemon_service::application_surface::resolve_catalog_tool_binding(
+                    BindingSurface::Mcp,
+                    &name,
+                )
+                .expect("retained MCP catalog binding")
+                .unwrap_or_else(|| panic!("{name} must resolve through the retained MCP catalog"));
+
+            assert!(
+                contract.availability().is_available(),
+                "{name} must be admitted once its retained effect route is wired"
+            );
+            assert_eq!(contract.effect(), capability.effect(), "{name} effect");
+            assert_eq!(
+                contract.effect(),
+                executable.effect(),
+                "{name} executable result route must use the same effect"
+            );
+            assert_eq!(
+                contract.deadline().maximum_millis(),
+                capability.deadline().maximum_millis(),
+                "{name} deadline"
+            );
+            assert_eq!(
+                contract.cancellation(),
+                capability.cancellation(),
+                "{name} cancellation"
+            );
+            assert_eq!(
+                contract.pagination(),
+                capability.pagination(),
+                "{name} pagination"
+            );
+            assert_eq!(
+                executable.result_schema().rust_type_path(),
+                "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+                "{name} result routing"
+            );
+            assert_eq!(
+                resolved.result_schema,
+                executable.result_schema().schema_ref().clone(),
+                "{name} dispatch must route the canonical provider result schema"
+            );
+        }
+    }
+
     /// A row without a group must be claimed by one of the surface predicates,
     /// otherwise the tool would reach dispatch with no owner at all.
     #[test]
@@ -1217,6 +1331,17 @@ mod tests {
         ("tracedecay_fact_store_list", BranchSensitivity::Independent),
         ("tracedecay_fact_store_supersede", BranchSensitivity::Independent),
         ("tracedecay_fact_feedback", BranchSensitivity::Independent),
+        // Provider controls resolve retained namespace and source authority;
+        // they do not read the checkout or code graph.
+        ("tracedecay_provider_feedback", BranchSensitivity::Independent),
+        ("tracedecay_provider_correction", BranchSensitivity::Independent),
+        ("tracedecay_provider_delete_by_source", BranchSensitivity::Independent),
+        ("tracedecay_provider_health", BranchSensitivity::Independent),
+        ("tracedecay_provider_inspection", BranchSensitivity::Independent),
+        ("tracedecay_provider_maintenance", BranchSensitivity::Independent),
+        ("tracedecay_provider_snapshot_export", BranchSensitivity::Independent),
+        ("tracedecay_provider_snapshot_restore", BranchSensitivity::Independent),
+        ("tracedecay_provider_replay", BranchSensitivity::Independent),
         ("tracedecay_memory_status", BranchSensitivity::Independent),
         ("tracedecay_session_refresh_status", BranchSensitivity::Independent),
         ("tracedecay_session_refresh_cancel", BranchSensitivity::Independent),

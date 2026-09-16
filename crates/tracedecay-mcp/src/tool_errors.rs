@@ -266,6 +266,25 @@ pub fn tool_error_response(id: Value, tool_name: &str, error: &TraceDecayError) 
             })),
         );
     }
+    if let TraceDecayError::Config { message } = error
+        && (message.starts_with("invalid retained application request for ")
+            || message.starts_with("retained application request does not match ")
+            || message.starts_with("retained MCP request does not match "))
+    {
+        return JsonRpcResponse::error_with_data(
+            id,
+            ErrorCode::InvalidParams,
+            message.clone(),
+            Some(json!({
+                "tool": tool_name,
+                "kind": "invalid_request",
+                "code": "invalid_retained_request",
+                "reason_code": "invalid_retained_request",
+                "retryable": false,
+                "detail": message,
+            })),
+        );
+    }
     if let TraceDecayError::Config { message } = error {
         // Handler-authored argument and lookup failures follow two message
         // conventions; surface them as typed invalid-params data instead of
@@ -366,5 +385,26 @@ mod tests {
             wire["error"]["data"]["code"],
             "application_surface_invalid_request"
         );
+    }
+
+    #[test]
+    fn retained_decode_errors_are_typed_invalid_params() {
+        let response = tool_error_response(
+            json!(8),
+            "tracedecay_provider_health",
+            &TraceDecayError::Config {
+                message: "invalid retained application request for tracedecay_provider_health: missing state"
+                    .to_owned(),
+            },
+        );
+        let wire = serde_json::to_value(response).expect("JSON-RPC wire response");
+
+        assert_eq!(wire["error"]["code"], -32602);
+        assert_eq!(wire["error"]["data"]["kind"], "invalid_request");
+        assert_eq!(
+            wire["error"]["data"]["reason_code"],
+            "invalid_retained_request"
+        );
+        assert_eq!(wire["error"]["data"]["retryable"], false);
     }
 }

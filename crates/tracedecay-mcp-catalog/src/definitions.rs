@@ -12,7 +12,11 @@
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
-use tracedecay_tool_catalog::{ApplicationSurfaceOperation, ScopeDimension};
+use tracedecay_contracts::RetainedSurfaceOperation;
+use tracedecay_tool_catalog::{
+    ApplicationSurfaceOperation, BindingSurface, CapabilityManifestV1, CatalogContributionV1,
+    ExecutableBindingRegistryV1, ScopeDimension,
+};
 
 use crate::McpCatalogError;
 use crate::ToolDefinition;
@@ -389,6 +393,13 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
     let request_schema = |operation: &'static str| {
         canonical_application_request_schema(application_registry, operation)
     };
+    let retained_contribution = tracedecay_contracts::retained_surface_catalog_contribution()
+        .map_err(|error| McpCatalogError::Initialization(error.to_string()))?;
+    let retained_registry = tracedecay_contracts::retained_surface_executable_binding_registry()
+        .map_err(|error| McpCatalogError::Initialization(error.to_string()))?;
+    let provider_definition = |operation| {
+        retained_provider_definition(operation, &retained_contribution, &retained_registry)
+    };
     let mut definitions = vec![
         def_search(),
         def_grep(),
@@ -472,6 +483,15 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_fact_feedback(request_schema("fact_feedback")?),
         def_memory_status(request_schema("memory_status")?),
         def_fact_store_curate(request_schema("fact_store_curate")?),
+        provider_definition(RetainedSurfaceOperation::ProviderFeedback)?,
+        provider_definition(RetainedSurfaceOperation::ProviderCorrection)?,
+        provider_definition(RetainedSurfaceOperation::ProviderDeleteBySource)?,
+        provider_definition(RetainedSurfaceOperation::ProviderHealth)?,
+        provider_definition(RetainedSurfaceOperation::ProviderInspection)?,
+        provider_definition(RetainedSurfaceOperation::ProviderMaintenance)?,
+        provider_definition(RetainedSurfaceOperation::ProviderSnapshotExport)?,
+        provider_definition(RetainedSurfaceOperation::ProviderSnapshotRestore)?,
+        provider_definition(RetainedSurfaceOperation::ProviderReplay)?,
         def_automation_run_list(),
         def_automation_run_view(),
         def_automation_run_artifact_view(),
@@ -544,6 +564,55 @@ fn spawn_definition_worker(
                 "failed to start {name} tool catalog worker: {error}"
             ))
         })
+}
+
+fn retained_capability_for_operation(
+    contribution: &CatalogContributionV1,
+    operation: RetainedSurfaceOperation,
+) -> Option<&CapabilityManifestV1> {
+    let capability_id = contribution
+        .bindings()
+        .iter()
+        .find(|binding| {
+            binding.surface() == BindingSurface::Mcp
+                && binding.operation().as_str() == operation.as_str()
+        })
+        .map(|binding| binding.capability_id())?;
+    contribution
+        .capabilities()
+        .iter()
+        .find(|capability| capability.capability_id() == capability_id)
+}
+
+fn retained_provider_definition(
+    operation: RetainedSurfaceOperation,
+    contribution: &CatalogContributionV1,
+    registry: &ExecutableBindingRegistryV1,
+) -> Result<ToolDefinition, McpCatalogError> {
+    let capability =
+        retained_capability_for_operation(contribution, operation).ok_or_else(|| {
+            McpCatalogError::Initialization(format!(
+                "retained provider operation `{}` has no MCP catalog capability",
+                operation.as_str()
+            ))
+        })?;
+    let name = format!("tracedecay_{}", operation.as_str());
+    let input_schema = canonical_application_request_schema(registry, operation.as_str())?;
+    Ok(if capability.effect().is_read_only() {
+        def(
+            &name,
+            capability.routing().name(),
+            capability.routing().description(),
+            input_schema,
+        )
+    } else {
+        def_rw(
+            &name,
+            capability.routing().name(),
+            capability.routing().description(),
+            input_schema,
+        )
+    })
 }
 
 pub fn retain_host_available_tool_definitions(definitions: &mut Vec<ToolDefinition>) {
@@ -709,6 +778,15 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_fact_store_supersede",
     "tracedecay_fact_store_list",
     "tracedecay_fact_feedback",
+    "tracedecay_provider_feedback",
+    "tracedecay_provider_correction",
+    "tracedecay_provider_delete_by_source",
+    "tracedecay_provider_health",
+    "tracedecay_provider_inspection",
+    "tracedecay_provider_maintenance",
+    "tracedecay_provider_snapshot_export",
+    "tracedecay_provider_snapshot_restore",
+    "tracedecay_provider_replay",
     // workflow
     "tracedecay_diagnose",
     "tracedecay_run_affected_tests",

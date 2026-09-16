@@ -16,6 +16,86 @@ fn internal_host_ingest_is_cli_resolvable_but_not_advertised() {
 }
 
 #[test]
+fn provider_control_tools_project_the_canonical_mcp_and_result_schemas() {
+    use tracedecay_tool_catalog::OperationId;
+
+    let definitions = get_tool_definitions().expect("tool definitions");
+    let contribution = tracedecay_contracts::retained_surface_catalog_contribution()
+        .expect("retained catalog contribution");
+    let registry = tracedecay_contracts::retained_surface_executable_binding_registry()
+        .expect("retained executable registry");
+    for operation in [
+        RetainedSurfaceOperation::ProviderFeedback,
+        RetainedSurfaceOperation::ProviderCorrection,
+        RetainedSurfaceOperation::ProviderDeleteBySource,
+        RetainedSurfaceOperation::ProviderHealth,
+        RetainedSurfaceOperation::ProviderInspection,
+        RetainedSurfaceOperation::ProviderMaintenance,
+        RetainedSurfaceOperation::ProviderSnapshotExport,
+        RetainedSurfaceOperation::ProviderSnapshotRestore,
+        RetainedSurfaceOperation::ProviderReplay,
+    ] {
+        let name = format!("tracedecay_{}", operation.as_str());
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap_or_else(|| panic!("{name} must be advertised by tools/list"));
+        let operation_id =
+            OperationId::new(format!("operation.application.{}", operation.as_str()))
+                .expect("provider operation ID");
+        let executable = registry
+            .get(&operation_id)
+            .and_then(|availability| availability.binding())
+            .unwrap_or_else(|| panic!("{name} must have an executable MCP binding"));
+        let capability = retained_capability_for_operation(&contribution, operation)
+            .unwrap_or_else(|| panic!("{name} must have a retained catalog capability"));
+
+        let mut projected_schema = definition.input_schema.clone();
+        assert!(
+            projected_schema["properties"]
+                .as_object_mut()
+                .is_some_and(|properties| { properties.remove("format").is_some() }),
+            "{name} must advertise the transport format selector"
+        );
+        assert_eq!(
+            projected_schema,
+            mcp_input_schema(executable.request_schema().body()),
+            "{name} must advertise the canonical request schema projection"
+        );
+        assert_eq!(
+            definition.description,
+            capability.routing().description(),
+            "{name} must use the retained routing description"
+        );
+        assert_eq!(
+            definition
+                .annotations
+                .as_ref()
+                .and_then(|annotations| { annotations.get("title").and_then(Value::as_str) }),
+            Some(capability.routing().name()),
+            "{name} must use the retained routing title"
+        );
+        assert_eq!(
+            definition.annotations.as_ref().and_then(|annotations| {
+                annotations.get("readOnlyHint").and_then(Value::as_bool)
+            }),
+            Some(executable.effect().is_read_only()),
+            "{name} must preserve the retained effect annotation"
+        );
+        assert_eq!(
+            executable.result_schema().schema_ref(),
+            capability.result_schema(),
+            "{name} must route results through the canonical provider result schema"
+        );
+        assert_eq!(
+            executable.result_schema().rust_type_path(),
+            "tracedecay_contracts::retained_surfaces::ProviderControlResultV1",
+            "{name} must keep the provider result type authority"
+        );
+    }
+}
+
+#[test]
 fn unused_import_scan_is_advertised_while_diagnostic_reads_remain() {
     let definitions = get_maximal_tool_definitions().expect("tool definitions");
     eprintln!("maximal source catalog count: {}", definitions.len());
