@@ -1582,10 +1582,11 @@ async fn fixture_home_hooks_configuration_is_still_refused() {
     let database = runtime
         .registered_database_lease(HostAdmissionScope::Project)
         .expect("registered project database");
-    let (registry, owner) = mount(database, repository_root.clone()).await;
+    let (registry, owner, _analysis) = mount(database, repository_root.clone()).await;
     let preview = preflight(
         owner,
         preflight_request(
+            &repository_root,
             MechanicalIntegrationModeV1::FastForward,
             "request.native.journey.hooks",
         ),
