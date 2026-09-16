@@ -524,23 +524,66 @@ async fn production_project_server_inner(
     ))
     .await?;
     if inserted {
-        let activation = Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await?;
-        let upgrade = match Box::pin(inputs.construct_full_server(&opened, &core)).await {
-            Ok(full) => {
-                match Box::pin(inputs.finish_full_server(
+        if let Some(project_id) = opened.key.owner.project_id.as_deref() {
+            inputs
+                .http_application_registry
+                .block_project_route(project_id)
+                .await;
+        }
+        let activation = match Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await
+        {
+            Ok(activation) => activation,
+            Err(error) => {
+                // Core activation can fail after installing a source-edit
+                // owner or beginning a runtime publication. Feed even a
+                // partially built activation through the same exact-owner
+                // rollback so a pending route never survives the error.
+                let empty_activation = CoreRouteActivation {
+                    publication_attempt: None,
+                    core_source_edit_mutation: None,
+                };
+                let Err(error) = Box::pin(inputs.settle_failed_full_upgrade(
                     &opened,
                     &core,
-                    &activation,
+                    &empty_activation,
                     &resolved,
-                    &full,
+                    None,
+                    error,
                 ))
                 .await
-                {
-                    Ok(()) => Ok(Arc::clone(&full.server)),
-                    // Keep the complete transaction alive until the failure
-                    // funnel has retired every owner it mounted. In
-                    // particular, dropping the provider bundle alone does not
-                    // stop an already-started observation worker.
+                else {
+                    unreachable!("failed project-open settlement cannot succeed");
+                };
+                return Err(error);
+            }
+        };
+        let upgrade = match Box::pin(inputs.construct_full_server(&opened, &core)).await {
+            Ok(full) => {
+                let phase_failure = inputs
+                    .phase_checkpoint(ProjectOpenFailurePhase::ProviderMount)
+                    .and_then(|()| {
+                        inputs.phase_checkpoint(ProjectOpenFailurePhase::McpConstructed)
+                    });
+                match phase_failure {
+                    Ok(()) => {
+                        match Box::pin(inputs.finish_full_server(
+                            &opened,
+                            &core,
+                            &activation,
+                            &resolved,
+                            &full,
+                        ))
+                        .await
+                        {
+                            Ok(()) => Ok(Arc::clone(&full.server)),
+                            // Keep the complete transaction alive until the
+                            // failure funnel has retired every owner it
+                            // mounted. In particular, dropping the provider
+                            // bundle alone does not stop an already-started
+                            // observation worker.
+                            Err(error) => Err((error, Some(full))),
+                        }
+                    }
                     Err(error) => Err((error, Some(full))),
                 }
             }
@@ -809,6 +852,7 @@ impl ProjectOpenInputs<'_> {
             PROJECT_OPEN_REACHED_PHASE.store(phase as u8, Ordering::Release);
             PROJECT_OPEN_PHASE_CHANGED.notify_waiters();
             if PROJECT_OPEN_FAILURE_AFTER_PHASE.load(Ordering::Acquire) == phase as u8 {
+                PROJECT_OPEN_FAILURE_AFTER_PHASE.store(0, Ordering::Release);
                 return Err(TraceDecayError::Config {
                     message: format!("injected project-open failure after {phase:?}"),
                 });
@@ -1451,7 +1495,6 @@ impl ProjectOpenInputs<'_> {
             )
             .await
             .map_err(|error| TraceDecayError::Config { message: error })?;
-        self.phase_checkpoint(ProjectOpenFailurePhase::ProviderMount)?;
         self.invocation
             .service
             .mount_session_holder_databases([
@@ -1671,10 +1714,6 @@ impl ProjectOpenInputs<'_> {
                 message: "full MCP generation census authority was already installed".to_owned(),
             })?;
         self.log_phase("mcp_full_constructed", None, full_construction_started);
-        if let Err(error) = self.phase_checkpoint(ProjectOpenFailurePhase::McpConstructed) {
-            full_candidate.shutdown().await;
-            return Err(error);
-        }
         if *core.current_key.lock().await != *key {
             full_candidate.shutdown().await;
             return Err(TraceDecayError::Config {

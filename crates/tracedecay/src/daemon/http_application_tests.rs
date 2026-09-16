@@ -8,7 +8,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::post;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
 use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, RetainedSurfaceRequestV1};
 use tracedecay_contracts::{
@@ -702,19 +702,67 @@ async fn daemon_http_project_route_removal_clears_cached_reachability() {
         .mount(PROJECT_ID, Router::new())
         .await
         .expect("mount project route");
-    assert!(registry
-        .resolve(PROJECT_ID)
-        .await
-        .expect("resolve mounted project")
-        .is_some());
+    assert!(
+        registry
+            .resolve(PROJECT_ID)
+            .await
+            .expect("resolve mounted project")
+            .is_some()
+    );
 
     assert!(registry.remove_project_route(PROJECT_ID).await);
-    assert!(registry
-        .resolve(PROJECT_ID)
-        .await
-        .expect("resolve removed project")
-        .is_none());
+    assert!(
+        registry
+            .resolve(PROJECT_ID)
+            .await
+            .expect("resolve removed project")
+            .is_none()
+    );
     assert!(!registry.remove_project_route(PROJECT_ID).await);
+}
+
+#[tokio::test]
+async fn daemon_http_route_block_drops_an_in_flight_cold_resolution() {
+    let registry = DaemonHttpApplicationRegistry::default();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let observed_started = Arc::clone(&started);
+    let observed_release = Arc::clone(&release);
+    registry
+        .install_resolver(move |_| {
+            let started = Arc::clone(&observed_started);
+            let release = Arc::clone(&observed_release);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(Some(Router::new()))
+            }
+        })
+        .expect("install cold project resolver");
+    let resolving = {
+        let registry = registry.clone();
+        let started = started.notified();
+        let resolving = tokio::spawn(async move { registry.resolve(PROJECT_ID).await });
+        started.await;
+        resolving
+    };
+    registry.block_project_route(PROJECT_ID).await;
+    release.notify_waiters();
+
+    assert!(
+        resolving
+            .await
+            .expect("cold resolver task")
+            .expect("cold resolver result")
+            .is_none()
+    );
+    assert!(
+        registry
+            .resolve(PROJECT_ID)
+            .await
+            .expect("resolve blocked project")
+            .is_none()
+    );
 }
 
 #[tokio::test]

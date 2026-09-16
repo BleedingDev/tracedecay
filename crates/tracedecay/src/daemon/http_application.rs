@@ -4,7 +4,7 @@
 //! outer service owns only local transport admission and project routing;
 //! every mounted inner router remains the canonical application adapter.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -78,6 +78,7 @@ enum OuterApplicationRequestIdError {
 struct ProjectRouterCache {
     routers: HashMap<String, Router>,
     least_recently_used: VecDeque<String>,
+    blocked: HashSet<String>,
 }
 
 impl ProjectRouterCache {
@@ -106,14 +107,28 @@ impl ProjectRouterCache {
 
     fn remove(&mut self, project_id: &str) -> bool {
         let removed = self.routers.remove(project_id).is_some();
+        self.blocked.remove(project_id);
         self.least_recently_used
             .retain(|candidate| candidate != project_id);
         removed
     }
 
+    fn block(&mut self, project_id: &str) {
+        self.blocked.insert(project_id.to_owned());
+    }
+
+    fn is_blocked(&self, project_id: &str) -> bool {
+        self.blocked.contains(project_id)
+    }
+
+    fn unblock(&mut self, project_id: &str) {
+        self.blocked.remove(project_id);
+    }
+
     fn clear(&mut self) {
         self.routers.clear();
         self.least_recently_used.clear();
+        self.blocked.clear();
     }
 }
 
@@ -162,10 +177,9 @@ impl DaemonHttpApplicationRegistry {
             ProjectId::new(project_id.to_owned()).map_err(|error| TraceDecayError::Config {
                 message: format!("daemon HTTP project identity is invalid: {error}"),
             })?;
-        self.routers
-            .lock()
-            .await
-            .insert(project_id.as_str().to_owned(), router);
+        let mut routers = self.routers.lock().await;
+        routers.unblock(project_id.as_str());
+        routers.insert(project_id.as_str().to_owned(), router);
         Ok(())
     }
 
@@ -188,6 +202,16 @@ impl DaemonHttpApplicationRegistry {
             return false;
         };
         self.routers.lock().await.remove(project_id.as_str())
+    }
+
+    /// Fence cold HTTP resolution while a project-open transaction is warming
+    /// or unwinding. In-flight resolvers re-check this fence before caching a
+    /// router, so a failed attempt cannot repopulate the route after removal.
+    #[hotpath::skip]
+    pub(super) async fn block_project_route(&self, project_id: &str) {
+        if let Ok(project_id) = ProjectId::new(project_id.to_owned()) {
+            self.routers.lock().await.block(project_id.as_str());
+        }
     }
 
     pub(super) fn install_resolver<F, Fut>(&self, resolver: F) -> Result<()>
@@ -284,9 +308,14 @@ impl DaemonHttpApplicationRegistry {
         let Ok(project_id) = ProjectId::new(project_id.to_owned()) else {
             return Ok(None);
         };
-        if let Some(router) = self.routers.lock().await.get(project_id.as_str()) {
+        let mut routers = self.routers.lock().await;
+        if routers.is_blocked(project_id.as_str()) {
+            return Ok(None);
+        }
+        if let Some(router) = routers.get(project_id.as_str()) {
             return Ok(Some(router));
         }
+        drop(routers);
         let resolver = {
             let slot = self
                 .resolver
@@ -315,10 +344,12 @@ impl DaemonHttpApplicationRegistry {
         let Some(router) = resolved else {
             return Ok(None);
         };
-        self.routers
-            .lock()
-            .await
-            .insert(project_id.as_str().to_owned(), router.clone());
+        let mut routers = self.routers.lock().await;
+        if routers.is_blocked(project_id.as_str()) {
+            return Ok(None);
+        }
+        routers.unblock(project_id.as_str());
+        routers.insert(project_id.as_str().to_owned(), router.clone());
         Ok(Some(router))
     }
 
