@@ -1,8 +1,8 @@
 //! Single-owner worker loop joining bounded wire requests to [`NcmEngine`].
 
 use crate::engine::{
-    CorrectionRequest, EngineReply, FeedbackRequest, MaintenanceKind, NcmEngine, ObserveAffect,
-    ObserveRequest, Outcome, RecallRequest,
+    CorrectionRequest, EngineReply, FeedbackRequest, NcmEngine, ObserveAffect, ObserveRequest,
+    Outcome, RecallRequest,
 };
 use crate::ports::Deadline;
 use crate::wire::{self, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION, Reply, Request};
@@ -439,12 +439,6 @@ struct CorrectionPayload {
     superseded: u64,
     superseding: u64,
     evidence: String,
-}
-
-#[derive(Deserialize)]
-struct MaintenancePayload {
-    idempotency_key: String,
-    kind: MaintenanceKind,
 }
 
 #[derive(Deserialize)]
