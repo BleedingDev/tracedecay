@@ -2293,13 +2293,14 @@ async fn retire_failed_project_open_owner(
         );
         return;
     };
-    let Ok(identity) = store_administration.profile_identity().cloned() else {
+    let Ok(identity) = store_administration.profile_identity() else {
         tracing::warn!(
             project = %canonical_project_path.display(),
             "failed project-open owner profile identity was unavailable during rollback"
         );
         return;
     };
+    let identity = identity.clone();
     let mut project_roots = std::collections::BTreeSet::new();
     project_roots.insert(canonical_project_path.to_path_buf());
     project_roots.insert(failed_key.project_root.clone());
