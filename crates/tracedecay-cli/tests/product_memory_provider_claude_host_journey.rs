@@ -52,6 +52,10 @@ use std::time::{Duration, Instant};
 #[path = "product_memory_provider_claude_host_journey/comparison_fixture.rs"]
 mod comparison_fixture;
 
+#[cfg(unix)]
+#[path = "product_memory_provider_claude_host_journey/provider_control_journeys.rs"]
+mod provider_control_journeys;
+
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
@@ -2268,6 +2272,12 @@ fn assert_host_memory_journey_with_provider(
     );
     if active_provider == ActiveProvider::Native && !ncm_observer {
         assert_canonical_fact_feedback_journey(&mut journey, next_session);
+        #[cfg(unix)]
+        provider_control_journeys::assert_provider_control_journeys(
+            &mut journey,
+            next_session,
+            &recalled.1,
+        );
     }
     record_demo_output(&journey, next_session, &original.1, &recalled.1);
 }

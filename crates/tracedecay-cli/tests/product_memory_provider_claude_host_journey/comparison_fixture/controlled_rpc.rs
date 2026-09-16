@@ -7,11 +7,13 @@
 
 use super::{FixtureResult, HostFixture, io_result, write_durable};
 use serde_json::{Value, json};
+use std::path::Path;
 use tracedecay_contracts::retained_surfaces::{
     ProviderControlRequestV1, RetainedSurfaceOperation, RetainedSurfaceRequestV1,
     retained_surface_operation_is_effect,
 };
 use tracedecay_contracts::{CancellationSignal, Deadline, RequestId};
+use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
 use tracedecay_daemon_protocol::{
     DaemonClientIdentity, DaemonConnection, DaemonHandshake, DaemonInvocationClient,
     DaemonInvocationError, DaemonInvocationExecutor, DaemonInvocationRequest,
@@ -26,6 +28,67 @@ pub(super) struct ControlledRpcEvidence {
     pub(super) result: Result<DaemonInvocationResponse, DaemonInvocationError>,
     pub(super) record: Value,
     pub(super) capture_error: Option<String>,
+}
+
+/// Invoke one already-decoded provider-control request against an existing
+/// host-owned daemon.  The comparison fixture and the real host journey share
+/// this transport so both routes exercise the same authenticated typed RPC,
+/// cancellation policy, and retained-application boundary.  This helper does
+/// not select a provider, source, revision, or receipt, and it performs no
+/// retry or readiness work.
+pub(crate) fn invoke_provider_control(
+    authority: &DaemonAuthorityRecord,
+    project: &Path,
+    profile: &Path,
+    request_id: RequestId,
+    request: ProviderControlRequestV1,
+    observed_at: UtcMicros,
+    deadline: Deadline,
+    cancellation: CancellationSignal,
+) -> FixtureResult<Result<DaemonInvocationResponse, DaemonInvocationError>> {
+    let policy = cancellation_policy(request.operation());
+    let invocation = DaemonInvocationRequest::retained_application(
+        request_id.as_str(),
+        RetainedSurfaceRequestV1::ProviderControl(request),
+        observed_at,
+        deadline.clone(),
+        cancellation.context(),
+    );
+    let connection = DaemonConnection::new(
+        authority.endpoint.clone(),
+        Some(authority.auth_token.clone()),
+    )
+    .with_daemon_version(authority.version.clone());
+    let handshake = DaemonHandshake {
+        project_path: Some(project.to_path_buf()),
+        scope_prefix: None,
+        timings: false,
+        allow_init: false,
+        allow_initialize_root_routing: false,
+        client_identity: DaemonClientIdentity::new(
+            authority.profile_root.clone(),
+            profile.join("global.db"),
+        ),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        client_instance_id: format!("host-provider-control-rpc-{}", std::process::id()),
+        tool_list_changed_capable: false,
+        catalog_version: String::new(),
+        moved_store_adoption: MovedStoreAdoption::Never,
+    };
+    let client = DaemonInvocationClient::new(connection, handshake);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("create provider-control RPC runtime: {error}"))?;
+    Ok(
+        runtime.block_on(DaemonInvocationExecutor::invoke_controlled(
+            &client,
+            invocation,
+            deadline,
+            cancellation,
+            policy,
+        )),
+    )
 }
 
 impl HostFixture<'_> {

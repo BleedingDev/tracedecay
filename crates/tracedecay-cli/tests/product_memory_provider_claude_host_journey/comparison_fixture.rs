@@ -5,7 +5,7 @@
 //! output is retained before a decoded observation copy is inspected.
 
 #[path = "comparison_fixture/controlled_rpc.rs"]
-mod controlled_rpc;
+pub(crate) mod controlled_rpc;
 
 use super::*;
 use sha2::{Digest, Sha256};
