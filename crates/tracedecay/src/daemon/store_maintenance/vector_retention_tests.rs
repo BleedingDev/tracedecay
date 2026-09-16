@@ -24,13 +24,13 @@ use tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::
 use tracedecay_contracts::storage::compaction::CompactionThresholdConfig;
 use tracedecay_domain::UtcMicros;
 use tracedecay_domain::sha256_hex_suffix;
+use tracedecay_maintenance::store_maintenance::test_helpers as graph_replay;
 use tracedecay_maintenance::store_maintenance::{
     CodeGenerationRetentionOutcomeV1, VectorRetentionInventoryV1, apply_code_generation_retention,
     classify_vector_readable_sources, resolve_vector_retention_inventory,
     run_code_generation_retention, run_semantic_vector_generation_retention,
     semantic_retrieval_profiles_disabled,
 };
-use tracedecay_maintenance::store_maintenance::test_helpers as graph_replay;
 use tracedecay_maintenance::telemetry::{
     SemanticVectorRetentionCensusOutcome, SemanticVectorRetentionReadV1,
     StoreTelemetrySamplingRegistry,

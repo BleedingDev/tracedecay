@@ -86,8 +86,8 @@ use model_catalog::{CatalogedFastEmbedModelV1, FastEmbedModelCatalogV1};
 pub use model_lifecycle::ModelMemberSourceV1;
 pub use model_lifecycle::{
     ModelLifecycleErrorV1, SemanticModelLifecycleEvaluationPublicationLeaseV1,
-    SemanticModelLifecycleOwnerV1, SemanticModelLifecyclePublicationIdentityV1,
-    open_local_semantic_evaluation_lifecycle,
+    SemanticModelLifecycleMutationTargetV1, SemanticModelLifecycleOwnerV1,
+    SemanticModelLifecyclePublicationIdentityV1, open_local_semantic_evaluation_lifecycle,
 };
 
 pub use runtime_service::{
@@ -218,6 +218,9 @@ impl LoadedSemanticArtifactV1 {
         document_composition: EmbeddingDocumentCompositionV1,
     ) -> Result<Self, SemanticRuntimeScheduleFailureV1> {
         let loadable = LoadableLifecycleArtifactV1::resolve(lifecycle)?;
+        let lifecycle_target = lifecycle
+            .lifecycle_mutation_target()
+            .ok_or(SemanticRuntimeScheduleFailureV1::Artifact)?;
         let authority = AdmittedProjectionArtifactV1::from_lifecycle_install(
             loadable.model,
             &loadable.install_path,
@@ -227,7 +230,8 @@ impl LoadedSemanticArtifactV1 {
             resources,
             document_composition,
         )
-        .map_err(SemanticRuntimeScheduleFailureV1::artifact)?;
+        .map_err(SemanticRuntimeScheduleFailureV1::artifact)?
+        .with_lifecycle_artifact_identity(lifecycle_target.artifact_digest());
         Ok(Self(Arc::new(authority)))
     }
 
@@ -236,7 +240,14 @@ impl LoadedSemanticArtifactV1 {
         projection: &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1,
         resources: SemanticResourceCeilings,
     ) -> Result<Self, SemanticRuntimeScheduleFailureV1> {
+        // Preserve the runtime-capability diagnosis before checking the
+        // owner-issued artifact binding. A binary without the compiled model
+        // runtime must report `Runtime` even when a projection cannot yet be
+        // paired with the selected artifact.
         let loadable = LoadableLifecycleArtifactV1::resolve(lifecycle)?;
+        let lifecycle_target = lifecycle
+            .lifecycle_mutation_target_for_projection(projection)
+            .ok_or(SemanticRuntimeScheduleFailureV1::Artifact)?;
         let key = projection.embedding_key();
         let authority = AdmittedProjectionArtifactV1::from_lifecycle_install(
             loadable.model,
@@ -248,6 +259,11 @@ impl LoadedSemanticArtifactV1 {
             key.document_composition,
         )
         .map_err(SemanticRuntimeScheduleFailureV1::artifact)?;
+        let authority = if projection.lifecycle_artifact_identity().is_some() {
+            authority.with_lifecycle_artifact_identity(lifecycle_target.artifact_digest())
+        } else {
+            authority
+        };
         if authority.projection() != projection {
             return Err(SemanticRuntimeScheduleFailureV1::artifact(
                 "loaded lifecycle artifact does not match the requested projection",
@@ -267,6 +283,9 @@ impl LoadedSemanticArtifactV1 {
     ) -> Result<tracedecay_domain::AdmittedEmbeddingProjectionKeyV1, SemanticRuntimeScheduleFailureV1>
     {
         let loadable = LoadableLifecycleArtifactV1::resolve(lifecycle)?;
+        let lifecycle_target = lifecycle
+            .lifecycle_mutation_target()
+            .ok_or(SemanticRuntimeScheduleFailureV1::Artifact)?;
         AdmittedProjectionArtifactV1::lifecycle_projection(
             loadable.model,
             manifest.chunker_revision.clone(),
@@ -276,6 +295,9 @@ impl LoadedSemanticArtifactV1 {
             document_composition,
         )
         .map_err(SemanticRuntimeScheduleFailureV1::artifact)
+        .map(|projection| {
+            projection.with_lifecycle_artifact_identity(lifecycle_target.artifact_digest())
+        })
     }
 
     pub fn projection(&self) -> &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1 {
@@ -300,6 +322,14 @@ pub struct FastEmbedSemanticGenerationRequestV1 {
     resume_projection: SemanticProjectionResumeV1,
     commit_batch: SemanticProjectionCommitV1,
     stage_projection: SemanticProjectionStageV1,
+    /// Optional lifecycle binding for production callers. When present, the
+    /// final runtime install and `Ready` transition are committed under the
+    /// owner's mutation reservation, so a same-model replacement cannot leave
+    /// a stale candidate serving after its lifecycle target was retired.
+    lifecycle_binding: Option<(
+        Arc<SemanticModelLifecycleOwnerV1>,
+        SemanticModelLifecycleMutationTargetV1,
+    )>,
 }
 
 impl FastEmbedSemanticGenerationRequestV1 {
@@ -363,7 +393,20 @@ impl FastEmbedSemanticGenerationRequestV1 {
             resume_projection: Box::new(move || Box::pin(resume_projection())),
             commit_batch: Box::new(move |prepared| Box::pin(commit_batch(prepared))),
             stage_projection: Box::new(move || Box::pin(stage_projection())),
+            lifecycle_binding: None,
         })
+    }
+
+    /// Bind the final runtime publication to an owner-issued lifecycle target.
+    /// The binding is optional because the lower-level semantic scheduling
+    /// helper is also used by tests and non-daemon callers that have no owner.
+    pub fn with_lifecycle_target(
+        mut self,
+        lifecycle: Arc<SemanticModelLifecycleOwnerV1>,
+        target: SemanticModelLifecycleMutationTargetV1,
+    ) -> Self {
+        self.lifecycle_binding = Some((lifecycle, target));
+        self
     }
 }
 
@@ -441,6 +484,44 @@ pub struct PreparedSemanticRuntimeRestoreV1 {
     runtime: CurrentSemanticQueryRuntimeV1<ProductionEmbeddingRuntime>,
     expected_current: Option<SemanticGenerationPointerV1>,
     expected_status: SemanticRuntimeScheduleStatusV1,
+}
+
+/// Compensation for a runtime restore that installed its process-local
+/// runtime before the lifecycle's durable `Ready` write completed. The
+/// compensation is conditional: if a newer scheduler pointer is current, the
+/// newer publication remains authoritative.
+pub struct SemanticRuntimeRestoreRollbackV1 {
+    handle: DaemonSemanticRuntimeHandleV1,
+    installed: SemanticGenerationPointerV1,
+    previous_current: Option<SemanticGenerationPointerV1>,
+    previous_status: SemanticRuntimeScheduleStatusV1,
+    previous_runtime: Option<CurrentSemanticQueryRuntimeV1<ProductionEmbeddingRuntime>>,
+}
+
+impl SemanticRuntimeRestoreRollbackV1 {
+    pub fn rollback(self) {
+        let Self {
+            handle,
+            installed,
+            previous_current,
+            previous_status,
+            previous_runtime,
+        } = self;
+        let _transition = handle
+            .transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if handle.scheduling.restore_snapshot_if_current(
+            &installed,
+            previous_current,
+            previous_status,
+        ) {
+            *handle
+                .runtime
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = previous_runtime;
+        }
+    }
 }
 
 pub struct PreparedSemanticRuntimeObservationV1 {
@@ -534,6 +615,7 @@ impl DaemonSemanticRuntimeHandleV1 {
         let pool_config = self.pool_config.clone();
         let runtime = Arc::clone(&self.runtime);
         let query_in_flight = Arc::clone(&self.query_in_flight);
+        let lifecycle_binding = request.lifecycle_binding.clone();
         let work = SemanticRuntimeWorkV1::new_with_projection(
             request.target_generation,
             projection_key.clone(),
@@ -585,6 +667,7 @@ impl DaemonSemanticRuntimeHandleV1 {
                         runtime,
                         candidate,
                         query_in_flight,
+                        lifecycle_binding.clone(),
                     ));
                 }
                 // Embed and commit batch by batch. A batch's vectors are
@@ -667,6 +750,7 @@ impl DaemonSemanticRuntimeHandleV1 {
                     runtime,
                     candidate,
                     query_in_flight,
+                    lifecycle_binding,
                 ))
             },
         );
@@ -884,6 +968,17 @@ impl DaemonSemanticRuntimeHandleV1 {
         self.commit_restore_if_current(prepared)
     }
 
+    /// Publish a warmed restore and return a conditional compensation token.
+    /// Production uses this when the lifecycle `Ready` write follows the
+    /// process-local install: a durable write failure can then restore the
+    /// prior runtime and scheduler snapshot without clobbering a newer one.
+    pub fn commit_restore_with_rollback(
+        &self,
+        prepared: PreparedSemanticRuntimeRestoreV1,
+    ) -> Option<SemanticRuntimeRestoreRollbackV1> {
+        self.commit_restore_if_current_with_rollback(prepared)
+    }
+
     pub fn prepare_current_observation(
         &self,
         pointer: &SemanticGenerationPointerV1,
@@ -931,20 +1026,42 @@ impl DaemonSemanticRuntimeHandleV1 {
 
     #[hotpath::measure(label = "semantic.restart.commit")]
     fn commit_restore_if_current(&self, prepared: PreparedSemanticRuntimeRestoreV1) -> bool {
+        self.commit_restore_if_current_with_rollback(prepared)
+            .is_some()
+    }
+
+    fn commit_restore_if_current_with_rollback(
+        &self,
+        prepared: PreparedSemanticRuntimeRestoreV1,
+    ) -> Option<SemanticRuntimeRestoreRollbackV1> {
         let _transition = self
             .transitions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.restore_snapshot_is_current(&prepared.expected_current, &prepared.expected_status)
         {
-            return false;
+            return None;
         }
+        let installed = prepared.pointer.clone();
+        let previous_current = prepared.expected_current.clone();
+        let previous_status = prepared.expected_status.clone();
+        let previous_runtime = self
+            .runtime
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         *self
             .runtime
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prepared.runtime);
-        self.scheduling.restore_current(prepared.pointer);
-        true
+        self.scheduling.restore_current(installed.clone());
+        Some(SemanticRuntimeRestoreRollbackV1 {
+            handle: self.clone(),
+            installed,
+            previous_current,
+            previous_status,
+            previous_runtime,
+        })
     }
 
     pub fn status_projection(&self) -> SemanticRuntimeStatusProjectionV1 {
@@ -1771,9 +1888,9 @@ mod scheduling_tests {
     use super::fastembed_adapter::lifecycle_test_support::digest_mismatched_lifecycle_authority;
     use super::session_pool::SessionAcquireError;
     use super::{
-        SemanticFallbackReasonV1, SemanticGenerationPointerV1, SemanticProjectionResumeOutcomeV1,
-        SemanticRuntimeScheduleFailureV1, SemanticRuntimeScheduleStatusV1,
-        SemanticRuntimeSchedulingHandleV1, SemanticRuntimeWorkV1, warm_failure,
+        SemanticFallbackReasonV1, SemanticGenerationPointerV1, SemanticRuntimeScheduleFailureV1,
+        SemanticRuntimeScheduleStatusV1, SemanticRuntimeSchedulingHandleV1, SemanticRuntimeWorkV1,
+        warm_failure,
     };
 
     fn source_generation(value: char) -> CodeGenerationId {
@@ -2025,7 +2142,7 @@ mod scheduling_tests {
             documents('a'),
             8,
             move || Ok(super::LoadedSemanticArtifactV1(authority)),
-            || async { Ok(SemanticProjectionResumeOutcomeV1::AlreadyPublished) },
+            || async { Ok(super::SemanticProjectionResumeOutcomeV1::AlreadyPublished) },
             |_prepared| async { Ok(()) },
             move || async move {
                 staged_by_request.store(true, Ordering::Release);

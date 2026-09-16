@@ -977,12 +977,13 @@ async fn mounted_daemon_maintenance_retains_activation_lease_and_converges_after
         } else {
             observations.record_semantic_vector_retention_failure(&canonical_root);
         }
-        let inventory = tracedecay_maintenance::store_maintenance::resolve_vector_retention_inventory(
-            &maintenance_lease,
-            schedulers,
-            &observations,
-        )
-        .await;
+        let inventory =
+            tracedecay_maintenance::store_maintenance::resolve_vector_retention_inventory(
+                &maintenance_lease,
+                schedulers,
+                &observations,
+            )
+            .await;
         assert!(
             match inventory {
                 tracedecay_maintenance::store_maintenance::VectorRetentionInventoryV1::SemanticUnseated => {

@@ -20,7 +20,9 @@ type SemanticRuntimeInstallV1 = Box<
         + 'static,
 >;
 type SemanticRuntimePublishedV1 = Box<
-    dyn FnOnce(SemanticGenerationPointerV1) -> SemanticRuntimePublishedFutureV1 + Send + 'static,
+    dyn FnOnce(SemanticGenerationPointerV1, u64) -> SemanticRuntimePublishedFutureV1
+        + Send
+        + 'static,
 >;
 
 pub struct SemanticRuntimeScheduleCancellationV1 {
@@ -136,7 +138,7 @@ impl PreparedSemanticRuntimeCommitV1 {
         }
     }
 
-    async fn commit(
+    pub(crate) async fn commit(
         self,
     ) -> Result<
         (
@@ -165,12 +167,28 @@ impl PreparedSemanticRuntimeCommitV1 {
     }
 
     /// Observe only after the query runtime and scheduler pointer are installed.
-    pub fn on_published<Published, PublishedFuture>(mut self, published: Published) -> Self
+    pub fn on_published<Published, PublishedFuture>(self, published: Published) -> Self
     where
         Published: FnOnce(SemanticGenerationPointerV1) -> PublishedFuture + Send + 'static,
         PublishedFuture: Future<Output = ()> + Send + 'static,
     {
-        self.published = Some(Box::new(move |pointer| Box::pin(published(pointer))));
+        self.on_published_with_token(move |pointer, _publication_token| published(pointer))
+    }
+
+    /// Observe a publication with the scheduler's opaque transition token.
+    /// The token remains bound to this worker even if a later worker reuses
+    /// every field of the generation pointer.
+    pub fn on_published_with_token<Published, PublishedFuture>(
+        mut self,
+        published: Published,
+    ) -> Self
+    where
+        Published: FnOnce(SemanticGenerationPointerV1, u64) -> PublishedFuture + Send + 'static,
+        PublishedFuture: Future<Output = ()> + Send + 'static,
+    {
+        self.published = Some(Box::new(move |pointer, publication_token| {
+            Box::pin(published(pointer, publication_token))
+        }));
         self
     }
 }
@@ -236,6 +254,14 @@ struct SemanticRuntimeSchedulingStateV1 {
     sequence: u64,
     status: SemanticRuntimeScheduleStatusV1,
     current: Option<SemanticGenerationPointerV1>,
+    /// Unique token for the publication currently represented by `current`.
+    /// The pointer alone is insufficient because a replacement may publish
+    /// the same vector generation and projection again.
+    current_publication_token: Option<u64>,
+    /// A restore rollback may only compensate the `restore_current` transition
+    /// that created it. Any accepted schedule invalidates this token, even if
+    /// the newer work has not published a pointer yet.
+    restore_rollback_token: Option<u64>,
     cancellation: Option<Arc<SemanticRuntimeScheduleCancellationV1>>,
     committing: bool,
     accepting_work: bool,
@@ -247,6 +273,8 @@ impl Default for SemanticRuntimeSchedulingStateV1 {
             sequence: 0,
             status: SemanticRuntimeScheduleStatusV1::Unavailable,
             current: None,
+            current_publication_token: None,
+            restore_rollback_token: None,
             cancellation: None,
             committing: false,
             accepting_work: true,
@@ -320,6 +348,7 @@ impl SemanticRuntimeSchedulingHandleV1 {
             }
             state.sequence = state.sequence.wrapping_add(1);
             let sequence = state.sequence;
+            state.restore_rollback_token = None;
             let cancellation =
                 Arc::new(SemanticRuntimeScheduleCancellationV1::new(work.total_units));
             hotpath::gauge!("semantic_generation_total_units").set(work.total_units);
@@ -409,6 +438,7 @@ impl SemanticRuntimeSchedulingHandleV1 {
                                     return;
                                 }
                                 state.current = Some(pointer.clone());
+                                state.current_publication_token = Some(sequence);
                                 state.status = SemanticRuntimeScheduleStatusV1::Current {
                                     generation: pointer.generation.clone(),
                                 };
@@ -431,7 +461,7 @@ impl SemanticRuntimeSchedulingHandleV1 {
                     };
                     if let Some((published, pointer)) = published {
                         hotpath::future!(
-                            published(pointer),
+                            published(pointer, sequence),
                             label = "semantic.runtime.generation.observe_published"
                         )
                         .await;
@@ -551,9 +581,107 @@ impl SemanticRuntimeSchedulingHandleV1 {
         state.sequence = state.sequence.wrapping_add(1);
         state.committing = false;
         state.current = Some(pointer.clone());
+        state.current_publication_token = Some(state.sequence);
+        state.restore_rollback_token = Some(state.sequence);
         state.status = SemanticRuntimeScheduleStatusV1::Current {
             generation: pointer.generation,
         };
+    }
+
+    /// Restore a pointer/status snapshot only while the pointer installed by
+    /// the transaction is still current. A lifecycle persistence failure must
+    /// not undo a newer scheduled generation that won the scheduler race.
+    pub fn restore_snapshot_if_current(
+        &self,
+        installed: &SemanticGenerationPointerV1,
+        current: Option<SemanticGenerationPointerV1>,
+        status: SemanticRuntimeScheduleStatusV1,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.committing
+            || state.current.as_ref() != Some(installed)
+            || state.restore_rollback_token.is_none()
+            || state.status
+                != (SemanticRuntimeScheduleStatusV1::Current {
+                    generation: installed.generation.clone(),
+                })
+        {
+            return false;
+        }
+        if let Some(cancellation) = state.cancellation.take() {
+            cancellation.cancel();
+        }
+        state.sequence = state.sequence.wrapping_add(1);
+        state.current = current;
+        state.current_publication_token = state.current.as_ref().map(|_| state.sequence);
+        state.restore_rollback_token = None;
+        state.status = status;
+        true
+    }
+
+    /// Return the opaque publication token for an exact current pointer.
+    /// Distinct lifecycle artifacts may intentionally reuse the same pointer.
+    pub fn current_publication_token_for(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+    ) -> Option<u64> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.current.as_ref() == Some(expected))
+            .then_some(state.current_publication_token)
+            .flatten()
+    }
+
+    /// Run one cache/runtime publication step while the exact scheduler
+    /// publication is reserved. Holding the state lock across `commit`
+    /// prevents a worker from replacing the pointer between validation and
+    /// the caller's mutation.
+    pub fn with_current_publication<R>(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+        publication_token: u64,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if _state.current.as_ref() != Some(expected)
+            || _state.current_publication_token != Some(publication_token)
+            || _state.status
+                != (SemanticRuntimeScheduleStatusV1::Current {
+                    generation: expected.generation.clone(),
+                })
+        {
+            return None;
+        }
+        Some(commit())
+    }
+
+    /// Clear only the publication represented by `expected` and `token`.
+    /// Pointer equality by itself would let a late callback for artifact A
+    /// erase artifact B when both artifacts share a vector generation.
+    pub fn clear_current_if_with_publication(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+        token: u64,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.committing
+            || state.current.as_ref() != Some(expected)
+            || state.current_publication_token != Some(token)
+            || state.status
+                != (SemanticRuntimeScheduleStatusV1::Current {
+                    generation: expected.generation.clone(),
+                })
+        {
+            return false;
+        }
+        if let Some(cancellation) = state.cancellation.take() {
+            cancellation.cancel();
+        }
+        state.sequence = state.sequence.wrapping_add(1);
+        state.current = None;
+        state.current_publication_token = None;
+        state.restore_rollback_token = None;
+        state.status = SemanticRuntimeScheduleStatusV1::Unavailable;
+        true
     }
 
     pub fn clear_current_if(&self, expected: &SemanticGenerationPointerV1) -> bool {
@@ -566,6 +694,8 @@ impl SemanticRuntimeSchedulingHandleV1 {
         }
         state.sequence = state.sequence.wrapping_add(1);
         state.current = None;
+        state.current_publication_token = None;
+        state.restore_rollback_token = None;
         state.status = SemanticRuntimeScheduleStatusV1::Unavailable;
         true
     }
@@ -633,6 +763,52 @@ impl SemanticRuntimeSchedulingHandleV1 {
     }
 }
 
+impl crate::DaemonSemanticRuntimeHandleV1 {
+    /// Capture the scheduler's opaque publication token for an exact pointer.
+    /// Callers that may outlive the callback must retain this token alongside
+    /// the lifecycle artifact identity before another schedule can publish.
+    pub fn current_publication_token_for(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+    ) -> Option<u64> {
+        self.scheduling.current_publication_token_for(expected)
+    }
+
+    /// Remove one exact publication from both scheduler and query runtime.
+    /// A late callback cannot clear a replacement that reused the same pointer.
+    pub fn unbind_query_runtime_if_current_with_publication(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+        publication_token: u64,
+    ) -> bool {
+        let _transition = self
+            .transitions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self
+            .scheduling
+            .clear_current_if_with_publication(expected, publication_token)
+        {
+            return false;
+        }
+        *self.runtime.write().unwrap_or_else(PoisonError::into_inner) = None;
+        true
+    }
+
+    /// Run one cache/runtime publication step while the exact scheduler
+    /// publication is reserved. A newer schedule cannot replace the pointer
+    /// between the identity check and the caller's mutation.
+    pub fn with_current_publication<R>(
+        &self,
+        expected: &SemanticGenerationPointerV1,
+        publication_token: u64,
+        commit: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.scheduling
+            .with_current_publication(expected, publication_token, commit)
+    }
+}
+
 struct AbortWorkerOnDrop {
     handle: Option<tokio::task::AbortHandle>,
 }
@@ -677,6 +853,22 @@ async fn join_next_worker(workers: &mut Vec<(u64, JoinHandle<()>)>) -> bool {
 #[cfg(test)]
 mod schedule_failure_tests {
     use super::*;
+    use tracedecay_domain::{ManifestDigest, VectorGenerationIdV1};
+
+    fn same_pointer() -> SemanticGenerationPointerV1 {
+        SemanticGenerationPointerV1 {
+            generation: VectorGenerationIdV1::new(
+                ManifestDigest::new(format!("sha256:{}", "a".repeat(64)))
+                    .expect("vector generation digest"),
+            ),
+            source_generation: CodeGenerationId::new("schedule-race-source")
+                .expect("source generation"),
+            projection_key: crate::session_pool::test_support::authority()
+                .projection()
+                .projection_key()
+                .clone(),
+        }
+    }
 
     #[test]
     fn completed_units_ignore_out_of_order_regressions() {
@@ -685,5 +877,40 @@ mod schedule_failure_tests {
         assert_eq!(progress.set_completed_units(5), 5);
         assert_eq!(progress.set_completed_units(3), 5);
         assert_eq!(progress.completed_units(), 5);
+    }
+
+    #[tokio::test]
+    async fn restore_snapshot_cannot_undo_same_pointer_newer_publication() {
+        let handle =
+            crate::DaemonSemanticRuntimeHandleV1::new(1, 8, 1 << 20).expect("semantic handle");
+        let pointer = same_pointer();
+        handle.scheduling.restore_current(pointer.clone());
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let scheduled_pointer = pointer.clone();
+        assert!(handle.schedule(SemanticRuntimeWorkV1::new_with_projection(
+            pointer.source_generation.clone(),
+            pointer.projection_key.clone(),
+            1,
+            move |_cancellation| async move {
+                Ok(PreparedSemanticRuntimeCommitV1::new(
+                    move || async move { Ok(scheduled_pointer) },
+                )
+                .on_published(move |_pointer| async move {
+                    let _ = published_tx.send(());
+                    let _ = release_rx.await;
+                }))
+            },
+        )));
+        published_rx.await.expect("replacement was published");
+
+        assert!(!handle.scheduling.restore_snapshot_if_current(
+            &pointer,
+            None,
+            SemanticRuntimeScheduleStatusV1::Unavailable,
+        ));
+        assert_eq!(handle.current(), Some(pointer));
+
+        release_tx.send(()).expect("release replacement callback");
     }
 }

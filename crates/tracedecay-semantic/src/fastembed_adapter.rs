@@ -781,6 +781,19 @@ impl AdmittedProjectionArtifactV1 {
         &self.runtime_artifact.projection
     }
 
+    /// Attach the owner-issued lifecycle artifact identity after the
+    /// cataloged runtime authority has been admitted. The identity is
+    /// lifecycle fencing metadata and leaves the canonical embedding key and
+    /// projection digest unchanged.
+    pub fn with_lifecycle_artifact_identity(mut self, identity: impl Into<String>) -> Self {
+        self.runtime_artifact.projection = self
+            .runtime_artifact
+            .projection
+            .clone()
+            .with_lifecycle_artifact_identity(identity);
+        self
+    }
+
     /// The backend family this authority was admitted for; the production
     /// dispatcher routes every port operation on it.
     pub fn runtime_family(&self) -> EmbeddingRuntimeFamilyV1 {

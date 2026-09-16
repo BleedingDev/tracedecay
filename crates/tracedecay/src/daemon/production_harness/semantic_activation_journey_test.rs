@@ -177,12 +177,20 @@ fn installed_selection_survives_background_projection_progress() {
         .acquire_blocking_for_tests()
         .expect("verified installation");
     let installed = installed_selection_material(&owner);
-    owner.mark_loading().expect("background load");
+    owner
+        .mark_loading(&owner.lifecycle_mutation_target().unwrap())
+        .expect("background load");
     assert_eq!(installed_selection_material(&owner), installed);
-    owner.mark_indexing(0, 3).expect("background projection");
+    owner
+        .mark_indexing(&owner.lifecycle_mutation_target().unwrap(), 0, 3)
+        .expect("background projection");
     assert_eq!(installed_selection_material(&owner), installed);
-    owner.mark_indexing(3, 3).expect("projection complete");
-    owner.mark_ready().expect("published projection");
+    owner
+        .mark_indexing(&owner.lifecycle_mutation_target().unwrap(), 3, 3)
+        .expect("projection complete");
+    owner
+        .mark_ready(&owner.lifecycle_mutation_target().unwrap())
+        .expect("published projection");
     assert_eq!(installed_selection_material(&owner), installed);
 }
 
@@ -1502,7 +1510,11 @@ async fn public_semantic_activation_rollback_and_exact_retry_preserve_graph_auth
         )
     );
     lifecycle
-        .mark_runtime_failed("injected live install failure", true)
+        .mark_runtime_failed(
+            &lifecycle.lifecycle_mutation_target().unwrap(),
+            "injected live install failure",
+            true,
+        )
         .expect("inject live install failure");
     let injected_failure = semantic_runtime_status(&harness, &project).await;
     assert_eq!(

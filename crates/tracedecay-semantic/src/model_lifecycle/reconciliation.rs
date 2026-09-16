@@ -31,11 +31,30 @@ fn reconcile_embedding_artifact_leases(
             .and_then(install_path_of)
             .and_then(|path| store.installed_digest(path))
     };
-    let desired_active = digest_for(durable.state.as_ref());
-    let desired_rollback = digest_for(durable.previous_ready.as_ref())
-        .filter(|digest| Some(digest) != desired_active.as_ref());
     let current_active =
         store.artifact_digest_for_lease(active_lease, ArtifactLeaseKindV1::Active, now_unix)?;
+    let failed_current_active = durable
+        .failed_current
+        .as_ref()
+        .and_then(install_path_of)
+        .filter(|path| path.exists())
+        .and_then(|path| store.installed_digest(path));
+    // A runtime failure intentionally omits its install path from the public
+    // state. For a shared inventory artifact the active lease is the durable
+    // path authority, so preserve that lease across restart until rollback or
+    // a replacement explicitly changes it. Private installs have an explicit
+    // owner slot and must not accidentally retain a prior shared lease.
+    let preserve_failed_shared_active = matches!(
+        durable.state,
+        Some(SemanticModelLifecycleStateV1::Failed { .. })
+    ) && durable.private_install.is_none();
+    let desired_active = digest_for(durable.state.as_ref()).or_else(|| {
+        preserve_failed_shared_active
+            .then(|| failed_current_active.clone().or(current_active.clone()))
+            .flatten()
+    });
+    let desired_rollback = digest_for(durable.previous_ready.as_ref())
+        .filter(|digest| Some(digest) != desired_active.as_ref());
     match desired_active.as_ref() {
         Some(digest) => {
             store.activate_artifact_with_rollback(digest, active_lease, rollback_lease, now_unix)?

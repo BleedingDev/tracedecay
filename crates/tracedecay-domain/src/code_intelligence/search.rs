@@ -1122,6 +1122,12 @@ pub struct EmbeddingProjectionKeyV1 {
 pub struct AdmittedEmbeddingProjectionKeyV1 {
     embedding_key: EmbeddingProjectionKeyV1,
     projection_key: ProjectionKeyV1,
+    /// Owner-issued identity of the lifecycle artifact that produced this
+    /// projection. It is deliberately outside `EmbeddingProjectionKeyV1` and
+    /// therefore does not change vector semantics or the canonical projection
+    /// digest, but it does survive vector-generation persistence so a
+    /// same-model replacement cannot be paired with an old runtime pointer.
+    lifecycle_artifact_identity: Option<String>,
 }
 
 impl Serialize for AdmittedEmbeddingProjectionKeyV1 {
@@ -1133,11 +1139,14 @@ impl Serialize for AdmittedEmbeddingProjectionKeyV1 {
         struct AdmittedProjectionRef<'a> {
             embedding_key: &'a EmbeddingProjectionKeyV1,
             projection_key: &'a ProjectionKeyV1,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            lifecycle_artifact_identity: &'a Option<String>,
         }
 
         AdmittedProjectionRef {
             embedding_key: &self.embedding_key,
             projection_key: &self.projection_key,
+            lifecycle_artifact_identity: &self.lifecycle_artifact_identity,
         }
         .serialize(serializer)
     }
@@ -1153,6 +1162,8 @@ impl<'de> Deserialize<'de> for AdmittedEmbeddingProjectionKeyV1 {
         struct AdmittedProjectionRepr {
             embedding_key: EmbeddingProjectionKeyV1,
             projection_key: ProjectionKeyV1,
+            #[serde(default)]
+            lifecycle_artifact_identity: Option<String>,
         }
 
         let repr = AdmittedProjectionRepr::deserialize(deserializer)?;
@@ -1165,7 +1176,10 @@ impl<'de> Deserialize<'de> for AdmittedEmbeddingProjectionKeyV1 {
                 "admitted embedding projection key digest mismatch",
             ));
         }
-        Ok(admitted)
+        Ok(AdmittedEmbeddingProjectionKeyV1 {
+            lifecycle_artifact_identity: repr.lifecycle_artifact_identity,
+            ..admitted
+        })
     }
 }
 
@@ -1222,6 +1236,7 @@ impl EmbeddingProjectionKeyV1 {
                 schema_revision: EMBEDDING_PROJECTION_SCHEMA_V1.to_string(),
                 profile_digest: self.canonical_digest()?,
             },
+            lifecycle_artifact_identity: None,
         })
     }
 
@@ -1264,6 +1279,21 @@ impl AdmittedEmbeddingProjectionKeyV1 {
 
     pub fn projection_key(&self) -> &ProjectionKeyV1 {
         &self.projection_key
+    }
+
+    /// Exact lifecycle artifact identity carried alongside the canonical
+    /// embedding projection. This is present on projections minted from a
+    /// lifecycle owner and absent on standalone adapter fixtures.
+    pub fn lifecycle_artifact_identity(&self) -> Option<&str> {
+        self.lifecycle_artifact_identity.as_deref()
+    }
+
+    /// Bind an owner-issued lifecycle artifact identity to this admitted
+    /// projection. The binding is metadata for lifecycle fencing and does not
+    /// alter the canonical embedding projection digest.
+    pub fn with_lifecycle_artifact_identity(mut self, identity: impl Into<String>) -> Self {
+        self.lifecycle_artifact_identity = Some(identity.into());
+        self
     }
 
     pub fn privacy_domain(&self) -> &PrivacyDomainId {

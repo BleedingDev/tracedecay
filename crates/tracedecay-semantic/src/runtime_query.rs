@@ -88,6 +88,15 @@ pub struct CurrentSemanticQueryRuntimeV1<R: EmbeddingRuntime> {
     factory: Arc<PooledSemanticQueryEmbedderFactory<R>>,
 }
 
+impl<R: EmbeddingRuntime> Clone for CurrentSemanticQueryRuntimeV1<R> {
+    fn clone(&self) -> Self {
+        Self {
+            pointer: self.pointer.clone(),
+            factory: Arc::clone(&self.factory),
+        }
+    }
+}
+
 impl<R> CurrentSemanticQueryRuntimeV1<R>
 where
     R: EmbeddingRuntime + Send + Sync + 'static,
