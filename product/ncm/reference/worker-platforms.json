@@ -6,6 +6,15 @@
   "worker_manifest": "product/ncm/reference/worker-manifest.json",
   "release_target_manifest": ".github/release-targets.json",
   "fallback": "native-only",
+  "runtime_policy": {
+    "provider_package": "tracedecay-memory-provider-ncm",
+    "provider_feature": "rust-backend",
+    "runtime_package": "tracedecay-memory-ncm-runtime",
+    "runtime_feature": "real-encoder",
+    "worker_distribution": "separate-sidecar",
+    "worker_manifest": "product/ncm/reference/worker-manifest.json",
+    "model_manifest": "product/ncm/reference/embedding-manifest.json"
+  },
   "packaging": {
     "worker_distribution": "separate-sidecar",
     "standard_cli_archive_includes_worker": false,

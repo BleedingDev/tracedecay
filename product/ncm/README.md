@@ -68,6 +68,17 @@ The policy is checked with:
 python3 scripts/product/ncm/check-worker-platform.py
 ```
 
+The release feature gate runs the same matrix check through
+`scripts/check-distribution-feature-wiring.py`. Its `runtime_policy` entry
+must name the provider's `rust-backend` feature, the runtime `real-encoder`
+feature, the separate worker manifest, and the pinned embedding manifest. The
+gate rejects an NCM host capability when that feature chain is incomplete or
+when any current release target other than `aarch64-macos` claims the worker;
+those targets must remain explicitly Native-only. It also audits both release
+workflows for the arm64-only worker build, manifest companion archive,
+post-extraction manifest comparison, worker byte/SHA-256 checks, and archive
+checksum publication.
+
 Adding another supported target requires the actual worker bytes, their byte count and lowercase
 SHA-256 in `worker-manifest.json`, plus the matching release-target policy entry. No placeholder
 hash or source-only capability is accepted. The standard CLI archives do not acquire an NCM worker
