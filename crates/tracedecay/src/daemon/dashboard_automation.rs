@@ -1004,14 +1004,119 @@ fn automation_problem(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, feature = "test-transport"))]
+    use std::collections::BTreeMap;
+    #[cfg(all(unix, feature = "test-transport"))]
+    use std::ffi::{OsStr, OsString};
+    #[cfg(all(unix, feature = "test-transport"))]
+    use std::path::PathBuf;
+    #[cfg(all(unix, feature = "test-transport"))]
+    use std::sync::Arc;
+
     use super::{
         DashboardAutomationRequestRuntime, dashboard_memory_curator_options,
         dashboard_session_reflector_options, dashboard_skill_writer_options,
     };
+    #[cfg(all(unix, feature = "test-transport"))]
+    use super::{
+        DashboardAutomationRunInvocationV1, DashboardAutomationRunRequestV1,
+        DashboardHttpRequestControlV1, dashboard_automation_run_port,
+    };
+    #[cfg(all(unix, feature = "test-transport"))]
+    use tracedecay_automation_runtime::automation::backend::AgentTaskKind;
     use tracedecay_automation_runtime::automation::config::AutomationConfig;
+    #[cfg(all(unix, feature = "test-transport"))]
+    use tracedecay_automation_runtime::automation::jobs::{AutomationJob, JobDelivery, save_jobs};
     use tracedecay_automation_runtime::automation::run_ledger::AutomationTrigger;
     use tracedecay_automation_runtime::ports::session_evidence::{LcmGrepSort, LcmScope};
+    #[cfg(all(unix, feature = "test-transport"))]
+    use tracedecay_contracts::retained_surfaces::AutomationRunTerminalV1;
     use tracedecay_contracts::retained_surfaces::{LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1};
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    static USER_JOB_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // Rust 2024 makes process-environment mutation explicitly unsafe.
+            // The test-wide lock keeps the fake app-server path stable while
+            // this daemon execution journey is in flight.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = self.previous.take() {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    fn install_user_job_codex(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let script_path = temp.path().join("codex-user-job.py");
+        let request_log = temp.path().join("user-job-request.json");
+        let script = format!(
+            r##"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+if len(sys.argv) != 2 or sys.argv[1] != "app-server":
+    sys.exit(42)
+
+request_log = pathlib.Path({request_log})
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({{"id": message.get("id"), "result": {{}}}}), flush=True)
+    elif method == "thread/start":
+        print(json.dumps({{
+            "id": message.get("id"),
+            "result": {{"thread": {{"id": "thread-dashboard-user-job", "model": "dashboard-user-job-model"}}}}
+        }}), flush=True)
+    elif method == "turn/start":
+        request_log.write_text(json.dumps(message), encoding="utf-8")
+        print(json.dumps({{
+            "method": "item/agentMessage/delta",
+            "params": {{"delta": "dashboard user job output", "model": "dashboard-user-job-model"}}
+        }}), flush=True)
+        print(json.dumps({{"method": "turn/completed"}}), flush=True)
+        break
+"##,
+            request_log = serde_json::to_string(&request_log.display().to_string())
+                .expect("encode user-job request log path"),
+        );
+        std::fs::write(&script_path, script).expect("write user-job fake codex script");
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("user-job fake codex metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions)
+            .expect("make user-job fake codex executable");
+        (script_path, request_log)
+    }
 
     #[test]
     fn dashboard_user_job_caps_backend_calls_for_the_wall_budget() {
@@ -1080,5 +1185,232 @@ mod tests {
             skill.profile_root.as_deref(),
             Some(std::path::Path::new("/profile"))
         );
+    }
+
+    #[cfg(all(unix, feature = "test-transport"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dashboard_user_job_runs_through_daemon_admission_runner_and_settlement() {
+        let _env_lock = USER_JOB_ENV_LOCK.lock().await;
+        let temp = tempfile::TempDir::new().expect("dashboard user-job fixture");
+        let fixture_root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical dashboard user-job fixture root");
+        let profile_root = fixture_root.join("profile");
+        let project_root = fixture_root.join("project");
+        std::fs::create_dir_all(project_root.join("src"))
+            .expect("dashboard user-job source directory");
+        std::fs::write(project_root.join("src/lib.rs"), "pub fn fixture() {}\n")
+            .expect("dashboard user-job source");
+        let (fake_codex, request_log) = install_user_job_codex(&temp);
+        let _codex_bin = EnvVarGuard::set("TRACEDECAY_CODEX_BIN", &fake_codex);
+
+        let graph = Arc::new(
+            crate::project::TraceDecay::init_with_options_for_test(
+                &project_root,
+                crate::project::TraceDecayOpenOptions {
+                    profile_root: Some(profile_root.clone()),
+                    global_db_path: Some(profile_root.join("global.db")),
+                },
+            )
+            .await
+            .expect("initialize dashboard user-job project"),
+        );
+        let project_root = graph
+            .project_root()
+            .canonicalize()
+            .expect("canonical dashboard user-job project");
+        let dashboard_root = graph.store_layout().dashboard_root.clone();
+        let job_id = "dashboard-user-job";
+        let run_id = "dashboard_user_job_dashboard-user-job_1000000";
+        save_jobs(
+            &dashboard_root,
+            &[AutomationJob {
+                id: job_id.to_owned(),
+                name: "Dashboard user job".to_owned(),
+                prompt: "Produce a dashboard user-job fixture.".to_owned(),
+                schedule: None,
+                enabled: true,
+                interval_secs: None,
+                cooldown_secs: None,
+                skill_ids: Vec::new(),
+                pre_run_command: None,
+                delivery: JobDelivery::default(),
+                created_at: 0,
+                updated_at: 0,
+                extra: BTreeMap::new(),
+            }],
+        )
+        .await
+        .expect("persist dashboard user-job fixture");
+
+        let configuration = graph
+            .configuration_runtime()
+            .client()
+            .current()
+            .await
+            .expect("dashboard user-job configuration");
+        let project_id = graph
+            .configuration_runtime()
+            .configuration_target()
+            .project_id
+            .clone();
+        let scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&project_root, &project_id)
+                .expect("dashboard user-job scope");
+        let observed_at = tracedecay_contracts::now_micros();
+        let access = tracedecay_daemon_service::daemon_owned_project_source_access_at(
+            &scope,
+            &project_root,
+            &configuration,
+            observed_at,
+        )
+        .expect("dashboard user-job retained access");
+        let grant =
+            crate::daemon::project_open_owners::project_open_retained_grant(&access, observed_at)
+                .expect("dashboard user-job retained grant");
+        let invocation_service = tracedecay_daemon_service::DaemonInvocationService::default();
+        let project_sessions = graph
+            .store_runtime_registry()
+            .project_sessions(project_id.clone(), [project_root.clone()])
+            .await
+            .expect("dashboard user-job project sessions");
+        let policy_digest = tracedecay_domain::canonical_sha256(&(
+            "tracedecay.dashboard-user-job.observability-policy.v1",
+            &project_id,
+            &access.configuration_digest,
+        ))
+        .expect("dashboard user-job observability policy");
+        invocation_service
+            .mount_observability_producer(
+                project_root.clone(),
+                project_sessions,
+                project_id.clone(),
+                access.configuration_digest.clone(),
+                policy_digest,
+            )
+            .await
+            .expect("mount dashboard user-job observability");
+        let retained_ports = tracedecay_daemon_service::retained_owner::retained_surface_ports(
+            tracedecay_daemon_service::retained_owner::ProductionRetainedAuthoritiesV1 {
+                cg: Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
+                project_root: project_root.clone(),
+                project_id: project_id.clone(),
+                mounted_profile_id: None,
+                mounted_session_store_id: None,
+                mounted_session_root_id: None,
+                registered_session_db: None,
+                project_refresh: None,
+                project_retrieval: None,
+                project_workflow_index: None,
+                project_lcm: None,
+                #[cfg(feature = "memory-provider-host")]
+                provider_control: None,
+                configuration_digest: access.configuration_digest.clone(),
+                invocation_service: Some(invocation_service.clone()),
+            },
+        );
+        tracedecay_daemon_service::DaemonRetainedRuntimeRegistrar::new(&invocation_service)
+            .register(
+                project_root.clone(),
+                scope,
+                access.requester.clone(),
+                grant,
+                retained_ports,
+            )
+            .await
+            .expect("register dashboard user-job retained runtime");
+
+        let retained_graph = Arc::clone(&graph);
+        let project_resolver: super::DashboardAutomationProjectResolver =
+            Arc::new(move |requested_project_root| {
+                let retained_graph = Arc::clone(&retained_graph);
+                Box::pin(async move {
+                    super::validate_dashboard_automation_project(
+                        retained_graph,
+                        &requested_project_root,
+                    )
+                })
+            });
+        let run_port = dashboard_automation_run_port(
+            profile_root.clone(),
+            project_resolver,
+            invocation_service,
+        );
+        let observed_at = tracedecay_contracts::now_micros();
+        let request_id =
+            tracedecay_contracts::RequestId::new("request.dashboard-user-job-execution")
+                .expect("dashboard user-job request id");
+        let cancellation =
+            tracedecay_contracts::CancellationSignal::active("cancel.dashboard-user-job-execution")
+                .expect("dashboard user-job cancellation");
+        let deadline = tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(
+            observed_at.0 + 300_000_000,
+        ))
+        .expect("dashboard user-job deadline");
+        let outcome = run_port(DashboardAutomationRunInvocationV1 {
+            project_root: project_root.clone(),
+            request: DashboardAutomationRunRequestV1::UserJob {
+                job_id: job_id.to_owned(),
+                run_id: run_id.to_owned(),
+            },
+            control: DashboardHttpRequestControlV1::from_parts_for_test(
+                request_id,
+                deadline,
+                cancellation,
+                observed_at,
+            ),
+        })
+        .await
+        .expect("dashboard user-job daemon execution");
+
+        assert_eq!(outcome.run_id.as_str(), run_id);
+        assert_eq!(
+            outcome.task,
+            tracedecay_contracts::retained_surfaces::AutomationTaskV1::UserJob
+        );
+        assert!(matches!(
+            outcome.terminal,
+            AutomationRunTerminalV1::Completed { .. }
+        ));
+        assert!(
+            request_log.is_file(),
+            "runner must reach the fake app-server"
+        );
+        let request_text =
+            std::fs::read_to_string(&request_log).expect("read dashboard user-job backend request");
+        assert!(request_text.contains(job_id));
+        assert!(request_text.contains(project_root.to_string_lossy().as_ref()));
+        let output_path = dashboard_root
+            .join("job-output")
+            .join(job_id)
+            .join(format!("{run_id}.md"));
+        assert_eq!(
+            std::fs::read_to_string(&output_path)
+                .expect("read delivered dashboard user-job output"),
+            "dashboard user job output"
+        );
+        let record =
+            tracedecay_automation_runtime::automation::run_ledger::find_run_record_exact_bounded(
+                &dashboard_root,
+                run_id,
+            )
+            .await
+            .expect("read settled dashboard user-job record")
+            .expect("settled dashboard user-job record");
+        assert_eq!(record.task, AgentTaskKind::UserJob);
+        assert_eq!(
+            record.task_key.as_deref(),
+            Some("user_job:dashboard-user-job")
+        );
+        assert_eq!(record.trigger, AutomationTrigger::Dashboard);
+        assert_eq!(
+            record.status,
+            tracedecay_automation_runtime::automation::run_ledger::AutomationRunStatus::Succeeded
+        );
+        assert_eq!(record.backend_attempt_count, 1);
+        assert!(record.validation_report.as_ref().is_some_and(|report| {
+            report["status"] == "delivered" && report["delivery"]["mode"] == "file"
+        }));
     }
 }

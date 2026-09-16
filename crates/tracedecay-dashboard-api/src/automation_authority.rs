@@ -444,6 +444,10 @@ mod tests {
                 include_recent_sessions: Some(false),
                 recent_sessions_limit: Some(2),
             },
+            DashboardAutomationRunRequestV1::UserJob {
+                job_id: "nightly-summary".to_owned(),
+                run_id: "dashboard_user_job_nightly-summary_1000000".to_owned(),
+            },
         ];
 
         for request in requests.iter().cloned() {
