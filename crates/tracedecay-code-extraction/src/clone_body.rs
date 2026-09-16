@@ -444,10 +444,10 @@ fn callable_body(owner: TreeSitterNode<'_>) -> Option<TreeSitterNode<'_>> {
     })
 }
 
-fn direct_child_by_kind(
-    owner: TreeSitterNode<'_>,
+fn direct_child_by_kind<'tree>(
+    owner: TreeSitterNode<'tree>,
     expected_kind: &str,
-) -> Option<TreeSitterNode<'_>> {
+) -> Option<TreeSitterNode<'tree>> {
     let mut cursor = owner.walk();
     if !cursor.goto_first_child() {
         return None;
