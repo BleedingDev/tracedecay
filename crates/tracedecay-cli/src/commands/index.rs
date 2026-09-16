@@ -171,6 +171,10 @@ async fn handle_init_with_daemon_availability(
     handshake: tracedecay_daemon_protocol::DaemonHandshake,
     daemon_available: bool,
 ) -> tracedecay_domain::errors::Result<()> {
+    // Validate operator input before checking daemon availability so a bad
+    // path is reported deterministically even when the daemon is offline.
+    // The brokered request validates again at the transport boundary.
+    validated_reconcile_request(false, &skip_folders, &include_folders)?;
     if daemon_available {
         return brokered_init(&project_path, &skip_folders, &include_folders, &handshake).await;
     }
