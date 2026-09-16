@@ -172,11 +172,13 @@ pub(crate) type CodeIndexHookSink =
 /// incremental syncs) and the server's own startup catch-up. Only a
 /// reconciliation the operator asked for by name — `tracedecay init` /
 /// `tracedecay sync` through `tracedecay_admin_sync` — is `Explicit` and may
-/// index a route the watcher policy keeps quiet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// index a route the watcher policy keeps quiet. A request with folder flags
+/// uses `ExplicitWithOptions`; its options apply to one pass only.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CodeIndexReconcileDemandV1 {
     Automatic,
     Explicit,
+    ExplicitWithOptions(tracedecay_contracts::CodeIndexReconcileOptionsV1),
 }
 
 /// Non-blocking bridge for hook/admin requests that require one authoritative
