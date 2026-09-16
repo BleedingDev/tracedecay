@@ -396,6 +396,18 @@ impl NcmEngine {
             .saturating_add(1);
         if namespaces.contains_key(namespace) {
             if let Some(handle) = namespaces.get_mut(namespace) {
+                // A different engine may have committed a privacy fence while
+                // this resident handle was still marked as unfenced. Refresh
+                // the durable admission bit before any caller can read or
+                // mutate the published kernel.
+                if handle
+                    .store
+                    .fenced()
+                    .map_err(|error| store_reply(error, handle.commit_seq))?
+                    .is_some()
+                {
+                    handle.fenced = true;
+                }
                 if handle.fenced {
                     if recover_privacy {
                         if let Some(resumed) =

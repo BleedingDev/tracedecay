@@ -718,6 +718,96 @@ fn stale_resident_fence_reconciles_after_another_engine_finishes_rebuild() {
 }
 
 #[test]
+fn resident_unfenced_handle_refuses_a_new_durable_fence_until_recovery() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let first = make_engine(&tempdir);
+    observe(
+        &first,
+        &namespace,
+        "source-a",
+        "retained key",
+        "retained value",
+        "retained",
+    );
+    observe(&first, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+
+    // Keep `first` resident and unfenced while a second engine commits the
+    // durable privacy fence, then stop before its sanitized rebuild publishes.
+    let second = make_engine(&tempdir);
+    second
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("fault arms");
+    let interrupted = second.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "cross-engine-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+
+    // A resident handle must refresh its admission from SQLite before any
+    // read path can expose the pre-erasure published kernel.
+    let recalled = first.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(matches!(recalled.outcome, Outcome::Unavailable(_)));
+    assert_eq!(recalled.payload, Value::Null);
+
+    let inspected = first.inspection(&namespace);
+    assert!(matches!(inspected.outcome, Outcome::Unavailable(_)));
+    assert_eq!(inspected.payload, Value::Null);
+
+    let health = first.common_control(
+        &namespace,
+        json!({"action":"health","expected_generation":interrupted.state_generation}),
+        DEADLINE,
+    );
+    assert!(matches!(health.outcome, Outcome::Unavailable(_)));
+    assert_eq!(health.payload, Value::Null);
+
+    let exported = snapshot::export(&first, &namespace, DEADLINE)
+        .expect_err("snapshot export must refuse the durable fence");
+    assert_eq!(exported.outcome, Outcome::Busy);
+    assert_eq!(exported.payload, Value::Null);
+
+    let ready = second.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
+
+    // The first engine still carries the fence bit, so its next admission
+    // reconciles the committed sanitized checkpoint before serving again.
+    let recovered = first.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(matches!(recovered.outcome, Outcome::Success | Outcome::Empty));
+    assert!(
+        candidate_texts(&recovered.payload)
+            .iter()
+            .all(|text| !text.contains(B_TOKEN))
+    );
+    let recovered_export = snapshot::export(&first, &namespace, DEADLINE)
+        .expect("snapshot export succeeds after recovery");
+    assert!(
+        !std::str::from_utf8(recovered_export.as_slice())
+            .expect("snapshot is UTF-8")
+            .contains(B_TOKEN)
+    );
+    let recovered_inspection = first.inspection(&namespace);
+    assert_eq!(recovered_inspection.outcome, Outcome::Success);
+    assert_eq!(recovered_inspection.state_generation, ready.state_generation);
+}
+
+#[test]
 fn deleting_an_unknown_source_is_successful_and_idempotent() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
