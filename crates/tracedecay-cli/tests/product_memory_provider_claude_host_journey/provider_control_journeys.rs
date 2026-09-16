@@ -769,13 +769,19 @@ fn assert_answered_lane(answer: &Value, provider_id: &str) -> Value {
 
 fn assert_lane_contains_source(answer: &Value, selector: &ProviderControlSourceSelectorV1) {
     let lane = super::advisory_lane(answer).expect("context advisory lane");
+    let trace_ref = lane["recall_trace"]["trace_ref"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .expect("recovered recall must publish a fresh trace selector");
     let found = lane["candidates"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|candidate| {
-            candidate["provenance_evidence"]["recall"]["trace_ref"] == selector.trace_ref
-                && candidate["provenance_evidence"]["recall"]["item_ref"] == selector.item_ref
+            candidate["provenance_evidence"]["recall"]["trace_ref"] == trace_ref
+                && candidate["provenance_evidence"]["recall"]["item_ref"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
                 && candidate["provenance_evidence"]["sources"]
                     .as_array()
                     .is_some_and(|sources| {
@@ -786,7 +792,7 @@ fn assert_lane_contains_source(answer: &Value, selector: &ProviderControlSourceS
         });
     assert!(
         found,
-        "maintenance restart recall lost the selected source: {lane}"
+        "recovered recall lost the selected original source: {lane}"
     );
 }
 
