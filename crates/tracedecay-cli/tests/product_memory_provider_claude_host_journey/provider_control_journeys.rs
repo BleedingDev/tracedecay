@@ -521,7 +521,7 @@ fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &Reca
     let response = invoke(
         journey,
         "host-provider-control.correction.current",
-        current_request,
+        current_request.clone(),
     )
     .expect("current correction RPC transport");
     let current = typed_result(&response);
