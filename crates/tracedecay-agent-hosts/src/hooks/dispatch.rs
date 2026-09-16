@@ -547,14 +547,9 @@ async fn dispatch_with_required_work<T>(
         }
         Err(_) => return (unavailable(), required.await),
     };
-    let Some(prepared) = prepare_bound_hook(
-        runtime,
-        host,
-        event_json,
-        project_root,
-        decoded,
-        started,
-    ) else {
+    let Some(prepared) =
+        prepare_bound_hook(runtime, host, event_json, project_root, decoded, started)
+    else {
         return (unavailable(), required.await);
     };
     let native_session_id = prepared.native_session_id.clone();
@@ -869,7 +864,11 @@ fn refresh_native_session_start_binding(
         return None;
     }
     let subscriber = HookConfigurationSubscriberV1::new(HookConfigurationFileReaderV1::new(
-        tracedecay_hooks::hook_configuration_path(data_root, envelope.producer),
+        tracedecay_hooks::hook_configuration_path(
+            data_root,
+            snapshot.binding.worktree_id,
+            envelope.producer,
+        ),
     ));
     let HookConfigurationReadOutcomeV1::Bound(current) =
         subscriber.load_current(envelope.producer, now_utc())
@@ -1506,8 +1505,11 @@ mod start_locator_tests {
         retry_reason: Option<&str>,
         first_delay_millis: u64,
     ) {
-        let path =
-            tracedecay_hooks::hook_configuration_path(&prepared.layout.data_root, prepared.host);
+        let path = tracedecay_hooks::hook_configuration_path(
+            &prepared.layout.data_root,
+            prepared.snapshot.binding.worktree_id,
+            prepared.host,
+        );
         std::fs::create_dir_all(&prepared.layout.data_root).unwrap();
         tracedecay_hooks::HookConfigurationPublisherV1::new(
             tracedecay_hooks::HookConfigurationFileWriterV1::new(&path),
