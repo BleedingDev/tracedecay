@@ -1184,8 +1184,10 @@ fn digest_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         cache_snapshot, digest_bytes, read_snapshot_file, read_verified_artifact, EncoderFile,
-        CACHE_REPOSITORY_DIR, MAX_LENGTH, MODEL_NAME, MODEL_REVISION,
+        CACHE_REPOSITORY_DIR, MODEL_REVISION,
     };
+    #[cfg(feature = "real-encoder")]
+    use super::{MAX_LENGTH, MODEL_NAME};
     use std::fs;
     use std::os::unix::fs::symlink;
 
