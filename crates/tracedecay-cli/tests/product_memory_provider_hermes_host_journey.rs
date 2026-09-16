@@ -784,6 +784,10 @@ fn capture_admissions(
     let mut admissions = rows
         .iter()
         .map(|row| {
+            assert_eq!(
+                row.source_stream, "session_observation_store",
+                "Hermes journey admits live canonical source rows only"
+            );
             let admitted = journal
                 .read_admitted_observation_by_idempotency(&row.idempotency_key)
                 .expect("read retained Hermes admission")
