@@ -199,12 +199,11 @@ fn status_details_tool_args() -> Value {
 fn node_kind_distribution_entries(
     value: &Value,
 ) -> tracedecay_domain::errors::Result<Vec<(String, u64)>> {
-    let mode = value
-        .get("mode")
-        .and_then(Value::as_str)
-        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+    let mode = value.get("mode").and_then(Value::as_str).ok_or_else(|| {
+        tracedecay_domain::errors::TraceDecayError::Config {
             message: "tracedecay_distribution omitted its mode".to_owned(),
-        })?;
+        }
+    })?;
     if mode != "summary" {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
@@ -232,22 +231,16 @@ fn node_kind_distribution_entries(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let kind = entry
-                .get("kind")
-                .and_then(Value::as_str)
-                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-                    message: format!(
-                        "tracedecay_distribution entry {index} omitted its kind"
-                    ),
-                })?;
-            let count = entry
-                .get("count")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-                    message: format!(
-                        "tracedecay_distribution entry {index} omitted its count"
-                    ),
-                })?;
+            let kind = entry.get("kind").and_then(Value::as_str).ok_or_else(|| {
+                tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!("tracedecay_distribution entry {index} omitted its kind"),
+                }
+            })?;
+            let count = entry.get("count").and_then(Value::as_u64).ok_or_else(|| {
+                tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!("tracedecay_distribution entry {index} omitted its count"),
+                }
+            })?;
             Ok((kind.to_owned(), count))
         })
         .collect()
@@ -698,10 +691,10 @@ async fn handle_status_command_within(
 mod tests {
     use super::{
         COUNTRY_FLAGS_MAX_AGE_SECS, OnlineRefresh, OnlineRefreshPlan, WORLDWIDE_TOTAL_MAX_AGE_SECS,
-        await_daemon_tool_result, await_online_refresh, project_open_line,
-        attach_node_kind_distribution, format_node_kind_distribution,
-        node_kind_distribution_entries, reject_truncation_envelope, schema_convergence_line,
-        status_command_deadline_from, status_server_request_budget,
+        attach_node_kind_distribution, await_daemon_tool_result, await_online_refresh,
+        format_node_kind_distribution, node_kind_distribution_entries, project_open_line,
+        reject_truncation_envelope, schema_convergence_line, status_command_deadline_from,
+        status_server_request_budget,
     };
     use serde_json::json;
     use std::time::Duration;
