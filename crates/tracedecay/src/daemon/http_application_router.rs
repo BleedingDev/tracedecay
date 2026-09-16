@@ -35,6 +35,7 @@ pub(super) fn install_http_application_cold_resolver(
     invocation: DaemonInvocationState,
     project_open_gates: Arc<tokio::sync::Mutex<ProjectOpenGates>>,
 ) -> Result<()> {
+    let project_runtimes = invocation.service.project_runtimes.clone();
     registry.install_remote_deletion_runtime_owners(
         super::remote_deletion::RemoteDeletionRuntimeOwners {
             administration: store_administration.clone(),
@@ -44,6 +45,7 @@ pub(super) fn install_http_application_cold_resolver(
     )?;
     registry.install_resolver(move |project_id| {
         let store_administration = store_administration.clone();
+        let project_runtimes = project_runtimes.clone();
         hotpath::future!(
             async move {
                 let database = store_administration.registered_profile_database().await?;
@@ -87,6 +89,15 @@ pub(super) fn install_http_application_cold_resolver(
                     return Err(TraceDecayError::Config {
                         message: "daemon HTTP registered project root is not canonical".to_owned(),
                     });
+                }
+                // The cold resolver is an alternate reachability path around
+                // the MCP owner registry. Keep it behind the same publication
+                // fence so a warming or failed full upgrade cannot be reached
+                // through HTTP while its owners are still being assembled.
+                if project_runtimes.publication_state(&canonical_root)
+                    != Some(tracedecay_daemon_service::ProjectRuntimePublicationStateV1::Ready)
+                {
+                    return Ok(None);
                 }
                 build_http_application_router(project_id.as_str(), &canonical_root).map(Some)
             },

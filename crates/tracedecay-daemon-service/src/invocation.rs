@@ -597,4 +597,19 @@ impl DaemonInvocationService {
             mounted.insert(database.db_path().to_path_buf(), database);
         }
     }
+
+    /// Remove session-holder leases that belonged to an aborted project-open
+    /// transaction. Project sessions are exact-root owned; profile/session
+    /// leases may be shared by later opens and are removed only when the
+    /// caller explicitly names their paths.
+    #[hotpath::skip]
+    pub async fn unmount_session_holder_databases(
+        &self,
+        database_paths: impl IntoIterator<Item = PathBuf>,
+    ) {
+        let mut mounted = self.session_holder_databases.lock().await;
+        for database_path in database_paths {
+            mounted.remove(&database_path);
+        }
+    }
 }

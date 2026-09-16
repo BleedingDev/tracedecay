@@ -184,6 +184,23 @@ impl<Server> DatabaseOwnerRegistry<Server> {
         removed
     }
 
+    /// Remove one exact generation when it is still the server selected by the
+    /// caller.  Failed project opens must not evict a newer generation that
+    /// won the same owner while the failed candidate was being unwound.
+    #[hotpath::measure(label = "daemon.owner_registry.remove_if")]
+    pub(super) fn remove_if<F>(&mut self, key: &ProjectServerKey, matches: F) -> Option<Server>
+    where
+        F: FnOnce(&Server) -> bool,
+    {
+        let entry = self.servers.get(key)?;
+        if !matches(&entry.server) {
+            return None;
+        }
+        let entry = self.servers.remove(key)?;
+        self.aliases.retain(|_, alias| alias != key);
+        Some(entry.server)
+    }
+
     pub(super) fn bind_route(&mut self, route: ProjectRouteKey, key: ProjectServerKey) {
         debug_assert!(self.servers.contains_key(&key));
         if let Some(entry) = self.servers.get_mut(&key) {

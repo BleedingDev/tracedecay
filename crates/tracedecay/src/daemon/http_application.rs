@@ -104,10 +104,11 @@ impl ProjectRouterCache {
         self.least_recently_used.push_back(project_id.to_owned());
     }
 
-    fn remove(&mut self, project_id: &str) {
-        self.routers.remove(project_id);
+    fn remove(&mut self, project_id: &str) -> bool {
+        let removed = self.routers.remove(project_id).is_some();
         self.least_recently_used
             .retain(|candidate| candidate != project_id);
+        removed
     }
 
     fn clear(&mut self) {
@@ -175,6 +176,18 @@ impl DaemonHttpApplicationRegistry {
     #[hotpath::skip]
     pub(super) async fn drain_project_routes_for_shutdown(&self) {
         self.routers.lock().await.clear();
+    }
+
+    /// Remove the exact project application route after an owner publication
+    /// fails.  The route cache is independent from the MCP owner registry, so
+    /// rollback must clear it explicitly before any retry can cold-resolve the
+    /// failed project again.
+    #[hotpath::skip]
+    pub(super) async fn remove_project_route(&self, project_id: &str) -> bool {
+        let Ok(project_id) = ProjectId::new(project_id.to_owned()) else {
+            return false;
+        };
+        self.routers.lock().await.remove(project_id.as_str())
     }
 
     pub(super) fn install_resolver<F, Fut>(&self, resolver: F) -> Result<()>

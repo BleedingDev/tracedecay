@@ -696,6 +696,28 @@ async fn daemon_http_cold_entry_resolves_project_before_canonical_dispatch() {
 }
 
 #[tokio::test]
+async fn daemon_http_project_route_removal_clears_cached_reachability() {
+    let registry = DaemonHttpApplicationRegistry::default();
+    registry
+        .mount(PROJECT_ID, Router::new())
+        .await
+        .expect("mount project route");
+    assert!(registry
+        .resolve(PROJECT_ID)
+        .await
+        .expect("resolve mounted project")
+        .is_some());
+
+    assert!(registry.remove_project_route(PROJECT_ID).await);
+    assert!(registry
+        .resolve(PROJECT_ID)
+        .await
+        .expect("resolve removed project")
+        .is_none());
+    assert!(!registry.remove_project_route(PROJECT_ID).await);
+}
+
+#[tokio::test]
 async fn daemon_http_cold_resolution_failure_returns_a_safe_typed_problem() {
     let registry = DaemonHttpApplicationRegistry::default();
     registry
