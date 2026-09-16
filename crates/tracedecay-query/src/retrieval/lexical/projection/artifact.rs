@@ -49,7 +49,8 @@ pub use reader::{
     CloneArtifactCursorV2, CloneArtifactPageV1, CloneCursorCodecV1, CloneCursorErrorV1,
     CloneCursorReadErrorV1, CloneExactArtifactMemberV1, CloneExactFamilyArtifactCandidateV1,
     CloneExactFamilyArtifactPageV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
-    CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactReaderV1,
+    CloneFingerprintDiscoveryPositionV2, CodeExactLexicalArtifactReaderV1,
+    CodeLexicalArtifactReaderV1,
     MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
 };
 pub use schema::CodeLexicalArtifactWriterRevisionV1;

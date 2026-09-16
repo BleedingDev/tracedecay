@@ -571,7 +571,9 @@ impl CodeLexicalArtifactReaderV1 {
                 aggregates.push(previous);
             }
         }
-        let scan_advance_key = last_scanned_family_key.or(scan_sentinel_key);
+        let scan_advance_key = last_scanned_family_key
+            .clone()
+            .or_else(|| scan_sentinel_key.clone());
         let scan_mode = scan_after.is_some() || scan_truncated;
         if scan_mode {
             // A legacy ranked cursor has no raw-key boundary. Preserve its

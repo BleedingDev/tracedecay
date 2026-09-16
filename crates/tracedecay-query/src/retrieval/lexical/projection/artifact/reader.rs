@@ -4,6 +4,7 @@ mod family_report;
 pub use clone_cursor::{
     CloneArtifactCursorPositionV2, CloneArtifactCursorV2, CloneCursorCodecV1,
     CloneCursorErrorV1, CloneCursorReadErrorV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
+    CloneFingerprintDiscoveryPositionV2,
 };
 pub use family_report::{CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1};
 
@@ -153,6 +154,11 @@ pub(super) enum CloneArtifactCursorPositionV1 {
         body_digest: ManifestDigest,
         payload_digest: ManifestDigest,
     },
+    FingerprintDiscovery {
+        discovery: CloneFingerprintDiscoveryPositionV2,
+        comparison_body_digest: Option<ManifestDigest>,
+        comparison_payload_digest: Option<ManifestDigest>,
+    },
 }
 
 impl CloneArtifactCursorV1 {
@@ -164,8 +170,25 @@ impl CloneArtifactCursorV1 {
                 body_digest,
                 payload_digest,
             } => Some((body_digest, payload_digest)),
+            CloneArtifactCursorPositionV1::FingerprintDiscovery {
+                comparison_body_digest: Some(body_digest),
+                comparison_payload_digest: Some(payload_digest),
+                ..
+            } => Some((body_digest, payload_digest)),
+            CloneArtifactCursorPositionV1::FingerprintDiscovery { .. } => None,
             CloneArtifactCursorPositionV1::Exact(_) => None,
         }
+    }
+
+    /// Whether this cursor belongs to the near-clone lane, including a
+    /// continuation that stopped during posting discovery before a candidate
+    /// comparison completed.
+    pub fn is_fingerprint_continuation(&self) -> bool {
+        matches!(
+            &self.after,
+            CloneArtifactCursorPositionV1::Fingerprint { .. }
+                | CloneArtifactCursorPositionV1::FingerprintDiscovery { .. }
+        )
     }
 
     pub fn encode(&self) -> Result<String, CodeLexicalArtifactErrorV1> {
@@ -200,6 +223,15 @@ impl CloneArtifactCursorV1 {
                 } => CloneArtifactCursorPositionV1::Fingerprint {
                     body_digest,
                     payload_digest,
+                },
+                CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                    discovery,
+                    comparison_body_digest,
+                    comparison_payload_digest,
+                } => CloneArtifactCursorPositionV1::FingerprintDiscovery {
+                    discovery,
+                    comparison_body_digest,
+                    comparison_payload_digest,
                 },
             },
         }
@@ -246,6 +278,15 @@ impl CloneArtifactCursorV1 {
                 } => CloneArtifactCursorPositionV2::Fingerprint {
                     body_digest: body_digest.clone(),
                     payload_digest: payload_digest.clone(),
+                },
+                CloneArtifactCursorPositionV1::FingerprintDiscovery {
+                    discovery,
+                    comparison_body_digest,
+                    comparison_payload_digest,
+                } => CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                    discovery: discovery.clone(),
+                    comparison_body_digest: comparison_body_digest.clone(),
+                    comparison_payload_digest: comparison_payload_digest.clone(),
                 },
             },
             now,
@@ -1005,6 +1046,7 @@ impl CodeLexicalArtifactReaderV1 {
                 if !matches!(
                     decoded.after,
                     CloneArtifactCursorPositionV2::Fingerprint { .. }
+                        | CloneArtifactCursorPositionV2::FingerprintDiscovery { .. }
                 ) {
                     return Err(CloneCursorReadErrorV1::Cursor(
                         CloneCursorErrorV1::Invalid,
@@ -1275,6 +1317,7 @@ impl CodeLexicalArtifactReaderV1 {
                 if !matches!(
                     decoded.after,
                     CloneArtifactCursorPositionV2::Fingerprint { .. }
+                        | CloneArtifactCursorPositionV2::FingerprintDiscovery { .. }
                 ) {
                     return Err(CloneCursorReadErrorV1::Cursor(
                         CloneCursorErrorV1::Invalid,

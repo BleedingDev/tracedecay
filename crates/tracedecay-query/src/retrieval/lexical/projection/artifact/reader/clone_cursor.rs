@@ -74,6 +74,42 @@ pub enum CloneArtifactCursorPositionV2 {
         body_digest: ManifestDigest,
         payload_digest: ManifestDigest,
     },
+    /// Discovery stopped inside an ordered fingerprint posting stream. The
+    /// optional comparison key is the last candidate whose expensive body
+    /// comparison completed; the discovery frontier is independent because a
+    /// posting budget can stop before the first candidate is compared.
+    FingerprintDiscovery {
+        discovery: CloneFingerprintDiscoveryPositionV2,
+        #[serde(default)]
+        comparison_body_digest: Option<ManifestDigest>,
+        #[serde(default)]
+        comparison_payload_digest: Option<ManifestDigest>,
+    },
+}
+
+/// Ordered position within one fingerprint's posting stream.
+///
+/// `symbol_occurrence_id` and `token_position` are both absent only when the
+/// fingerprint's complete posting stream has been consumed. They are paired
+/// so a cursor can resume after exactly one `(occurrence, token)` row without
+/// replaying or skipping a row at the budget boundary.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneFingerprintDiscoveryPositionV2 {
+    pub fingerprint: u64,
+    #[serde(default)]
+    pub symbol_occurrence_id: Option<SymbolOccurrenceId>,
+    #[serde(default)]
+    pub token_position: Option<u32>,
+}
+
+impl CloneFingerprintDiscoveryPositionV2 {
+    fn validate(&self) -> Result<(), CloneCursorErrorV1> {
+        if self.symbol_occurrence_id.is_some() != self.token_position.is_some() {
+            return Err(CloneCursorErrorV1::Invalid);
+        }
+        Ok(())
+    }
 }
 
 /// Family-report continuation position for the authenticated wire.
@@ -221,6 +257,7 @@ impl<'a> CloneCursorCodecV1<'a> {
         after: CloneArtifactCursorPositionV2,
         now: UtcMicros,
     ) -> Result<String, CloneCursorErrorV1> {
+        validate_artifact_position(&after)?;
         let expires_at = expiry_from(now)?;
         let payload = CloneArtifactCursorPayloadV2 {
             revision: CLONE_CURSOR_REVISION_V2,
@@ -282,6 +319,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             now,
             self.request,
         )?;
+        validate_artifact_position(&payload.after)?;
         Ok(CloneArtifactCursorV2 {
             artifact_digest: payload.artifact_digest,
             generation: payload.generation,
@@ -339,6 +377,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             now,
             self.request,
         )?;
+        validate_artifact_position(&payload.after)?;
         Ok(CloneArtifactCursorV2 {
             artifact_digest: payload.artifact_digest,
             generation: payload.generation,
@@ -501,6 +540,23 @@ impl<'a> CloneCursorCodecV1<'a> {
 fn scope_digest(request: &RetrievalRequest) -> Result<ManifestDigest, CloneCursorErrorV1> {
     canonical_sha256(&(CLONE_CURSOR_SCOPE_DIGEST_DOMAIN_V1, &request.scope))
         .map_err(|_| CloneCursorErrorV1::Invalid)
+}
+
+fn validate_artifact_position(
+    position: &CloneArtifactCursorPositionV2,
+) -> Result<(), CloneCursorErrorV1> {
+    if let CloneArtifactCursorPositionV2::FingerprintDiscovery {
+        discovery,
+        comparison_body_digest,
+        comparison_payload_digest,
+    } = position
+    {
+        discovery.validate()?;
+        if comparison_body_digest.is_some() != comparison_payload_digest.is_some() {
+            return Err(CloneCursorErrorV1::Invalid);
+        }
+    }
+    Ok(())
 }
 
 fn expiry_from(now: UtcMicros) -> Result<UtcMicros, CloneCursorErrorV1> {
