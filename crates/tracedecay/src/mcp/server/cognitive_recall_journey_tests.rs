@@ -12,7 +12,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay_domain::{Confidence, FactCategoryV1, ProjectId};
-use tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
 use tracedecay_session_memory::memory::{
     ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
 };
@@ -200,7 +199,7 @@ async fn an_ordinary_mcp_context_call_returns_the_routed_advisory_lane() {
 
     let answered = journey.call_context("cognitive recall ledger").await;
     assert!(
-        answered.contains(&format!("Provider {NATIVE_PROVIDER_ID}")),
+        answered.contains("### Provider memory (advisory)"),
         "an ordinary MCP context call must carry the routed provider's lane: {answered}"
     );
     assert!(
@@ -221,7 +220,7 @@ async fn an_mcp_context_call_on_an_unmounted_server_renders_no_advisory_lane() {
         "a server with no mounted route must render no advisory lane: {unmounted}"
     );
     assert!(
-        !unmounted.contains(NATIVE_PROVIDER_ID),
-        "a server with no mounted route must name no provider: {unmounted}"
+        !unmounted.contains("### Provider memory (advisory)"),
+        "a server with no mounted route must name no advisory lane: {unmounted}"
     );
 }

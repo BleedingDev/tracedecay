@@ -5,15 +5,20 @@
 //! tables and does not reconstruct a historical context pack or its decisions.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
+use tracedecay_contracts::ResolvedScope;
+use tracedecay_domain::UserProfileId;
 use tracedecay_memory_provider_registry::{
-    ContextSectionKind, RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainTraceV1,
-    TerminalCode,
+    ActiveRoutingPolicy, ContextSectionKind, DegradationCause, DegradationRule,
+    EnabledProviderMode, FabricConfig, FallbackRule, NATIVE_PROVIDER_ID, NativeProviderActivation,
+    OwnedProviderId, PinnedDegradationPolicy, ProjectMemoryProviderComposition,
+    RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainTraceV1, TerminalCode,
 };
 
 /// Existing control/scope types and common-profile policy for test-only callers.
@@ -105,7 +110,10 @@ pub fn production_provider_numeric_declaration_for_test(
     let declared_registration_revision =
         crate::retained_owner::declared_project_provider_registration_revision_for_test(
             descriptor.provider_id.as_str(),
-        ).ok_or(ContextEvidenceReadErrorV1::Invalid("production registration declaration"))?;
+        )
+        .ok_or(ContextEvidenceReadErrorV1::Invalid(
+            "production registration declaration",
+        ))?;
     let limits = descriptor.limits;
     Ok(Some(ProviderNumericDeclarationForTestV1 {
         provider_id: descriptor.provider_id.as_str().to_owned(),
@@ -147,6 +155,87 @@ pub enum ContextEvidenceReadErrorV1 {
 }
 
 type Result<T> = std::result::Result<T, ContextEvidenceReadErrorV1>;
+
+/// Recreates the production Native recall mount for a root MCP journey test.
+///
+/// The daemon-service crate owns the provider adapter, invocation boundary,
+/// admission ledger, and mount inputs. The root crate owns the MCP server and
+/// therefore must not reach into those implementation details just to prove
+/// that an ordinary `tools/call` carries the mounted advisory lane. Keeping
+/// this fixture bridge here exposes one public, test-only service seam while
+/// preserving the dependency direction: daemon-service never imports MCP.
+///
+/// The returned mount uses the same Native adapter and active routing policy
+/// as production. `store_data_root` is the canonical project data root for
+/// the test fixture; provider-local state and the recall ledger are placed
+/// beneath it exactly as they are during project open.
+pub fn native_cognitive_recall_mount_for_test(
+    graph: Arc<tracedecay_project::project::TraceDecay>,
+    profile_id: UserProfileId,
+    scope: ResolvedScope,
+    store_data_root: impl Into<PathBuf>,
+) -> std::result::Result<Arc<super::super::ProjectCognitiveRecallMountV1>, String> {
+    let store_data_root = store_data_root.into();
+    let project_root = graph.project_root().to_path_buf();
+    let provider_state_root =
+        store_data_root.join(super::super::observation_journey::PROVIDER_STATE_DIR_NAME);
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let native_port = Arc::new(
+        super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
+            graph_cell,
+            project_root.clone(),
+            profile_id.clone(),
+            &provider_state_root,
+        )
+        .map_err(|error| format!("construct Native test port: {error}"))?,
+    );
+    let composition = Arc::new(
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: FabricConfig {
+                max_registered_providers: 1,
+                max_in_flight: 1,
+            },
+            port: Arc::clone(&native_port)
+                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
+            registration_revision: 1,
+            mode: EnabledProviderMode::Active,
+        })
+        .map_err(|error| format!("compose Native test provider: {error}"))?,
+    );
+    let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)
+        .map_err(|error| format!("construct Native routing identity: {error}"))?;
+    let degradation = PinnedDegradationPolicy::new(
+        "policy.cognitive-recall.test.degradation",
+        1,
+        DegradationCause::ALL.iter().copied(),
+    )
+    .map_err(|error| format!("construct Native degradation policy: {error}"))?;
+    let routing = ActiveRoutingPolicy::new_with_degradation(
+        provider_id,
+        1,
+        FallbackRule::Forbidden,
+        DegradationRule::ExplicitPinned(degradation),
+    )
+    .map_err(|error| format!("construct Native routing policy: {error}"))?;
+    let invocation_boundary = super::host_provider_invocation_boundary(1);
+    let mount = super::mount_project_cognitive_recall(super::CognitiveRecallMountInputsV1 {
+        composition,
+        profile_id,
+        scope: scope.clone(),
+        authoritative_project_id: scope.project_id.clone(),
+        store_data_root,
+        canonical_project_path: project_root,
+        graph,
+        routing,
+        host_limits: super::super::native_provider::native_provider_limits(),
+        invocation_boundary,
+        locator_key: super::control_attribution::RecallLocatorKeyV1::for_test(),
+    })
+    .map_err(|error| format!("mount Native cognitive recall test route: {error}"))?;
+    Ok(Arc::new(super::super::ProjectCognitiveRecallMountV1 {
+        inner: mount,
+    }))
+}
 
 impl From<RecallControlAttributionErrorV1> for ContextEvidenceReadErrorV1 {
     fn from(error: RecallControlAttributionErrorV1) -> Self {
@@ -652,11 +741,7 @@ mod tests {
             candidates: Vec::new(),
             explain: None,
         };
-        let delivered = lane.appended_to(super::super::ToolResult::new(
-            json!({"content": [{"type": "text", "text": host}]}),
-            Vec::new(),
-        ));
-        let text = delivered.value["content"][0]["text"].as_str().unwrap();
+        let text = lane.appended_text(host);
         let result = json!({"content": [{"type": "text", "text": "warning"}, {"type": "text", "text": text}]});
         let projection = project_delivered_context_for_test(&result, 1).unwrap();
         let mut rebuilt = String::new();

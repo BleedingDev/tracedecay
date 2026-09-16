@@ -41,7 +41,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use tracedecay_contracts::{ResolvedScope, try_now_micros};
 use tracedecay_domain::{ProjectId, UserProfileId};
-use tracedecay_mcp::tools::ToolResult;
 use tracedecay_memory_provider_registry::{
     ADVISORY_CONTEXT_PACK_JSON_KEY, ActiveRoutingPolicy, AdvisoryLaneV1, CognitiveRecallPortError,
     CognitiveRecallPortInputsV1, ContextPackError, ContextPackPolicyError, ContextPackPolicyV1,
@@ -96,6 +95,43 @@ const PROJECT_RECALL_POLICY_REVISION: u64 = 1;
 // the transport remains responsible for rendering them.
 const CONTEXT_MEMORY_MATCHES_HEADING: &str = "### Memory Matches";
 const CONTEXT_INDEX_COVERAGE_HINT_HEADING: &str = "### Index Coverage Hint";
+
+/// Minimal in-crate result used by the owner unit tests. The production owner
+/// returns transport-neutral rendered text; the root adapter applies that text
+/// to its own result while preserving transport sidecars.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct TestToolResult {
+    value: Value,
+    touched_files: Vec<String>,
+    context_memory_contribution:
+        Option<tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
+}
+
+#[cfg(test)]
+impl TestToolResult {
+    fn new(value: Value, touched_files: Vec<String>) -> Self {
+        Self {
+            value,
+            touched_files,
+            context_memory_contribution: None,
+        }
+    }
+
+    fn with_context_memory_contribution(
+        mut self,
+        contribution: tracedecay_contracts::retrieval::ContextMemoryContributionV1,
+    ) -> Self {
+        self.context_memory_contribution = Some(contribution);
+        self
+    }
+
+    fn context_memory_contribution(
+        &self,
+    ) -> Option<&tracedecay_contracts::retrieval::ContextMemoryContributionV1> {
+        self.context_memory_contribution.as_ref()
+    }
+}
 
 /// Product-owned per-request recall budgets. These are the budgets the
 /// coding-memory evaluation scenarios declare for a project recall and stay
@@ -2729,7 +2765,7 @@ pub(crate) struct AdvisoryRecallInputsV1<'inputs> {
 }
 
 /// Consumes only the already-admitted policy. The contribution's complete
-/// owner/fact/assertion/event identity remains on the original ToolResult;
+/// owner/fact/assertion/event identity remains on the original host result;
 /// provider stable references cannot stand in for host-confirmed revisions.
 fn apply_context_memory_policy(
     mut request: tracedecay_contracts::memory::CognitiveRecallRequest,
@@ -4612,7 +4648,7 @@ impl AdvisoryMemoryContextV1 {
         }
     }
 
-    /// Compiles this advisory lane into one already-rendered tool result.
+    /// Compiles this advisory lane into one already-rendered host answer.
     ///
     /// The lane is compiled after the handler produced its answer, so the
     /// handler itself never depends on the provider host and a coalesced read
@@ -4625,7 +4661,7 @@ impl AdvisoryMemoryContextV1 {
     /// to stop talking. A pack that could not be compiled delivers the host
     /// answer unchanged with a typed withheld notice.
     #[must_use]
-    pub fn appended_to(&self, mut result: ToolResult) -> ToolResult {
+    pub fn appended_text(&self, text: &str) -> String {
         if matches!(
             self,
             Self::Unavailable {
@@ -4634,23 +4670,15 @@ impl AdvisoryMemoryContextV1 {
                 ..
             }
         ) {
-            return result;
+            return text.to_owned();
         }
-        let Some(text) = result
-            .value
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-        else {
-            return result;
-        };
-        let (render_form, host_items) = host_evidence(&text);
+        let (render_form, host_items) = host_evidence(text);
         let Some(control_refs) = self.provisional_control_refs() else {
             tracing::warn!(
                 event = "memory_recall_control_references_unavailable",
                 "controlled advisory contribution withheld before packing"
             );
-            return result;
+            return text.to_owned();
         };
         let recall_trace = self.provisional_recall_trace();
         let delivery = match self.context_pack_with_control_metadata(
@@ -4661,7 +4689,7 @@ impl AdvisoryMemoryContextV1 {
             recall_trace.as_ref(),
         ) {
             AdvisoryContextPackV1::Compiled(pack) => {
-                let delivery = merge_compiled_advisory(render_form, &text, &pack.rendered);
+                let delivery = merge_compiled_advisory(render_form, text, &pack.rendered);
                 match &delivery {
                     AdvisoryDeliveryV1::Delivered(_) => {
                         // The merge is valid, but the result is still private.
@@ -4676,7 +4704,7 @@ impl AdvisoryMemoryContextV1 {
                                 event = "memory_recall_control_retention_failed",
                                 "controlled advisory contribution withheld; host answer preserved"
                             );
-                            return result;
+                            return text.to_owned();
                         }
                     }
                     AdvisoryDeliveryV1::Withheld { reason, .. } => {
@@ -4686,16 +4714,35 @@ impl AdvisoryMemoryContextV1 {
                 delivery
             }
             AdvisoryContextPackV1::Refused(failure) => {
-                let delivery = withheld_rendering(render_form, &text, self.provider_id(), &failure);
+                let delivery = withheld_rendering(render_form, text, self.provider_id(), &failure);
                 let AdvisoryDeliveryV1::Withheld { reason, .. } = &delivery else {
-                    return result;
+                    return text.to_owned();
                 };
                 let _ = self.retain_explain_trace(None, Some(reason));
                 delivery
             }
         };
-        if let Some(slot) = result.value.pointer_mut("/content/0/text") {
-            *slot = Value::String(delivery.into_rendered());
+        delivery.into_rendered()
+    }
+}
+
+#[cfg(test)]
+trait TestAdvisoryAppend {
+    fn appended_to(&self, result: TestToolResult) -> TestToolResult;
+}
+
+#[cfg(test)]
+impl TestAdvisoryAppend for AdvisoryMemoryContextV1 {
+    fn appended_to(&self, mut result: TestToolResult) -> TestToolResult {
+        if let Some(text) = result
+            .value
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            if let Some(slot) = result.value.pointer_mut("/content/0/text") {
+                *slot = Value::String(self.appended_text(&text));
+            }
         }
         result
     }
@@ -4839,14 +4886,14 @@ mod advisory_rendering_tests {
     /// receives.
     const CANONICAL: O200kBaseContextTokenizer = O200kBaseContextTokenizer;
 
-    fn tool_result(text: &str) -> ToolResult {
-        ToolResult::new(
+    fn tool_result(text: &str) -> TestToolResult {
+        TestToolResult::new(
             json!({ "content": [{ "type": "text", "text": text }] }),
             Vec::new(),
         )
     }
 
-    fn rendered_text(result: &ToolResult) -> String {
+    fn rendered_text(result: &TestToolResult) -> String {
         result.value["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -5729,18 +5776,18 @@ mod tests {
     use super::*;
     use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
-    /// One already-rendered host answer, in the exact `ToolResult` shape the
+    /// One already-rendered host answer, in the exact result shape the
     /// tool layer produces, so the advisory lane is appended to a real result
     /// rather than to a string.
-    pub(super) fn tool_result_for_test(text: &str) -> ToolResult {
-        ToolResult::new(
+    pub(super) fn tool_result_for_test(text: &str) -> TestToolResult {
+        TestToolResult::new(
             serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
             Vec::new(),
         )
     }
 
     /// The exact agent-visible text of one tool result.
-    pub(super) fn rendered_text_for_test(result: &ToolResult) -> String {
+    pub(super) fn rendered_text_for_test(result: &TestToolResult) -> String {
         result.value["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -6720,7 +6767,7 @@ mod tests {
     /// The whole production journey, end to end, with a hostile memory in the
     /// store: mount, recall through the real Native provider and the real host
     /// admission, assemble the advisory lane, compile the real context pack,
-    /// and inspect the exact `ToolResult` text an agent would receive.
+    /// and inspect the exact rendered text an agent would receive.
     ///
     /// Real defect this catches: the untrusted-memory gate being removed from,
     /// or bypassed on, the mounted lane. Nothing here constructs a hardener:
@@ -7628,7 +7675,7 @@ mod tests {
         );
         let (lane, _scope, _source) =
             history_recall_tests::control_output_fixture(ledger.clone(), "request.tampered");
-        let delivered = lane.appended_to(ToolResult::new(
+        let delivered = lane.appended_to(TestToolResult::new(
             json!({"content": [{"type": "text", "text": "{\"answer\":true}"}]}),
             Vec::new(),
         ));
@@ -7777,7 +7824,7 @@ mod tests {
             "### Related Symbols\n- mount_project_cognitive_recall\n",
             "### Index Coverage Hint\nthe index was last built 12m ago\n",
         );
-        let rendered = advisory.appended_to(ToolResult::new(
+        let rendered = advisory.appended_to(TestToolResult::new(
             serde_json::json!({ "content": [{ "type": "text", "text": host_answer }] }),
             Vec::new(),
         ));
@@ -7911,7 +7958,7 @@ mod tests {
         );
 
         let host_answer = "## Code Context\nthe canonical answer body\n";
-        let rendered = advisory.appended_to(ToolResult::new(
+        let rendered = advisory.appended_to(TestToolResult::new(
             serde_json::json!({ "content": [{ "type": "text", "text": host_answer }] }),
             Vec::new(),
         ));
@@ -8467,7 +8514,6 @@ mod tests {
             "a completed recall leaves no worker behind"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -9380,7 +9426,7 @@ mod history_recall_tests {
                     .is_err(),
                 "preparing locators must not retain them"
             );
-            let result = lane.appended_to(ToolResult::new(
+            let result = lane.appended_to(TestToolResult::new(
                 json!({"content": [{"type": "text", "text": text}]}),
                 Vec::new(),
             ));
@@ -9523,7 +9569,7 @@ mod history_recall_tests {
                     .unwrap()
                     .is_none()
             );
-            let result = lane.appended_to(ToolResult::new(
+            let result = lane.appended_to(TestToolResult::new(
                 json!({"content": [{"type": "text", "text": text}]}),
                 Vec::new(),
             ));
@@ -9583,7 +9629,7 @@ mod history_recall_tests {
             std::sync::atomic::AtomicUsize::new(0),
         ));
         let (lane, _) = empty_control_output_fixture(sink.clone(), "recall.context.empty.refused");
-        let host = ToolResult::new(
+        let host = TestToolResult::new(
             json!({"content": [{"type": "text", "text": "{\"answer\":\"host evidence\"}"}, {"type": "text", "text": "warning retained"}]}),
             vec!["host.rs".to_owned()],
         );
@@ -9606,7 +9652,7 @@ mod history_recall_tests {
         let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).unwrap());
         let request_id = "recall.context.readonly.empty";
         let (lane, scope) = empty_control_output_fixture(ledger.clone(), request_id);
-        let delivered = lane.appended_to(ToolResult::new(
+        let delivered = lane.appended_to(TestToolResult::new(
             json!({"content": [{"type": "text", "text": "{\"answer\":\"actual host\"}"}]}),
             Vec::new(),
         ));
@@ -9694,7 +9740,7 @@ mod history_recall_tests {
             );
             let request_id = format!("recall.context.readonly.{mutation}");
             let (lane, scope, _) = control_output_fixture(ledger.clone(), &request_id);
-            let delivered = lane.appended_to(ToolResult::new(
+            let delivered = lane.appended_to(TestToolResult::new(
                 json!({"content": [{"type": "text", "text": "{\"answer\":\"actual host\"}"}]}),
                 Vec::new(),
             ));
@@ -9842,7 +9888,7 @@ mod history_recall_tests {
             try_now_micros().unwrap(),
         )
         .unwrap();
-        let host = ToolResult::new(json!({"content": [{"type": "text", "text": "{\"answer\":\"unchanged host evidence\"}"}]}), vec!["host.rs".to_owned()]).with_context_memory_contribution(sidecar);
+        let host = TestToolResult::new(json!({"content": [{"type": "text", "text": "{\"answer\":\"unchanged host evidence\"}"}]}), vec!["host.rs".to_owned()]).with_context_memory_contribution(sidecar);
         let delivered = lane.appended_to(host.clone());
         assert_eq!(delivered.value, host.value);
         assert_eq!(delivered.touched_files, host.touched_files);
@@ -9941,7 +9987,7 @@ mod history_recall_tests {
                 "{\"answer\":\"original host evidence\"}",
                 "## Code Context\noriginal host evidence\n",
             ] {
-                let original = ToolResult::new(
+                let original = TestToolResult::new(
                     json!({"content": [{"type": "text", "text": text}]}),
                     vec!["host.rs".to_owned()],
                 )
