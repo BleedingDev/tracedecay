@@ -414,6 +414,7 @@ impl HermesJourney {
             result["host_boundary"], "register_ctx_fixture",
             "the fixture must state that it exercised register(ctx) without stock Hermes"
         );
+        assert_eq!(result["context_engine_callback"], "complete");
         assert_eq!(result["replay"]["mode"], "exact");
         assert_eq!(result["replay"]["fresh_provider"], true);
         result
