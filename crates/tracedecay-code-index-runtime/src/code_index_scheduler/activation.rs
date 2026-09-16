@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracedecay_contracts::ResolvedScope;
+use tracedecay_contracts::{CodeIndexReconcileOptionsV1, ResolvedScope};
 
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
@@ -51,12 +51,16 @@ enum ActivationDemandV1 {
 pub struct CodeIndexActivationHookBatchV1 {
     pub paths: Vec<String>,
     pub overflow: bool,
+    /// One request-scoped reconcile policy, delivered after the route mounts.
+    /// It is consumed by the mounted scheduler and never persisted.
+    pub reconcile_options: Option<CodeIndexReconcileOptionsV1>,
 }
 
 #[derive(Default)]
 struct PendingHookPathsV1 {
     paths: BTreeSet<String>,
     overflow: bool,
+    reconcile_options: Option<CodeIndexReconcileOptionsV1>,
 }
 
 impl PendingHookPathsV1 {
@@ -77,6 +81,7 @@ impl PendingHookPathsV1 {
         CodeIndexActivationHookBatchV1 {
             paths: std::mem::take(&mut self.paths).into_iter().collect(),
             overflow: std::mem::take(&mut self.overflow),
+            reconcile_options: self.reconcile_options.take(),
         }
     }
 }
@@ -324,7 +329,11 @@ impl CodeIndexActivationV1 {
                         .set(f64::from(ACTIVATION_MOUNTED));
                     pending.take()
                 };
-                if route_is_live() && (!batch.paths.is_empty() || batch.overflow) {
+                if route_is_live()
+                    && (!batch.paths.is_empty()
+                        || batch.overflow
+                        || batch.reconcile_options.is_some())
+                {
                     let _ = hint_sink(batch).await;
                 }
                 tracing::info!(
@@ -359,6 +368,7 @@ impl CodeIndexActivationV1 {
                 Some(CodeIndexActivationHookBatchV1 {
                     paths: rel_paths,
                     overflow: false,
+                    reconcile_options: None,
                 })
             } else {
                 pending.extend(rel_paths);
@@ -381,7 +391,7 @@ impl CodeIndexActivationV1 {
         future = true
     )]
     pub async fn notify_hook_overflow(&self, project_root: &Path) -> bool {
-        self.request_reconciliation(project_root, ActivationDemandV1::Automatic)
+        self.request_reconciliation(project_root, ActivationDemandV1::Automatic, None)
             .await
     }
 
@@ -397,7 +407,23 @@ impl CodeIndexActivationV1 {
         future = true
     )]
     pub async fn notify_explicit_reconciliation(&self, project_root: &Path) -> bool {
-        self.request_reconciliation(project_root, ActivationDemandV1::Explicit)
+        self.request_reconciliation(project_root, ActivationDemandV1::Explicit, None)
+            .await
+    }
+
+    /// Explicit operator demand carrying one validated, request-scoped folder
+    /// selection. The selection survives a cold mount and is consumed by one
+    /// scheduler pass; it never changes the durable project configuration.
+    #[hotpath::measure(
+        label = "daemon.code_index.activation.notify_explicit_reconciliation_with_options",
+        future = true
+    )]
+    pub async fn notify_explicit_reconciliation_with_options(
+        &self,
+        project_root: &Path,
+        options: CodeIndexReconcileOptionsV1,
+    ) -> bool {
+        self.request_reconciliation(project_root, ActivationDemandV1::Explicit, Some(options))
             .await
     }
 
@@ -405,6 +431,7 @@ impl CodeIndexActivationV1 {
         &self,
         project_root: &Path,
         demand: ActivationDemandV1,
+        options: Option<CodeIndexReconcileOptionsV1>,
     ) -> bool {
         if !self.route_is_live() || !self.accepts_root(project_root) {
             return false;
@@ -418,9 +445,13 @@ impl CodeIndexActivationV1 {
                 Some(CodeIndexActivationHookBatchV1 {
                     paths: Vec::new(),
                     overflow: true,
+                    reconcile_options: options,
                 })
             } else {
                 pending.overflow = true;
+                if options.is_some() {
+                    pending.reconcile_options = options;
+                }
                 None
             }
         };
@@ -596,6 +627,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_folder_options_survive_cold_mount_and_are_delivered_once() {
+        let repository = repository();
+        let mount_attempts = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let activation = activation(
+            repository.path(),
+            Arc::clone(&mount_attempts),
+            Some(Arc::clone(&gate)),
+            Arc::clone(&batches),
+        );
+        let options =
+            CodeIndexReconcileOptionsV1::new(["vendor".to_owned()], ["dist/generated".to_owned()])
+                .expect("valid folder options");
+
+        assert!(
+            activation
+                .notify_explicit_reconciliation_with_options(repository.path(), options.clone())
+                .await
+        );
+        wait_until(|| mount_attempts.load(Ordering::SeqCst) == 1).await;
+        gate.notify_waiters();
+        wait_until(|| !batches.lock().expect("batches").is_empty()).await;
+        let batch = batches.lock().expect("batches").remove(0);
+        assert_eq!(batch.reconcile_options, Some(options));
+        assert!(batch.overflow);
     }
 
     #[tokio::test]

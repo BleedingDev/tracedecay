@@ -11,7 +11,19 @@ pub(crate) async fn handle_admin_sync(
     args: Value,
     reconcile_sink: Option<&crate::mcp::server::CodeIndexReconcileSink>,
 ) -> Result<ToolResult> {
-    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let request =
+        tracedecay_contracts::CodeIndexReconcileRequestV1::from_json(args).map_err(|error| {
+            TraceDecayError::Config {
+                message: error.to_string(),
+            }
+        })?;
+    let force = request.force;
+    let options_digest = request
+        .options
+        .digest()
+        .map_err(|error| TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
     let reconcile_sink = reconcile_sink.ok_or_else(|| {
         TraceDecayError::project_route(
             "code_index_scheduler_unavailable",
@@ -21,11 +33,13 @@ pub(crate) async fn handle_admin_sync(
     })?;
     // The operator named this route (`tracedecay init` / `tracedecay sync`):
     // the one demand that may index a route the watcher policy keeps quiet.
+    let demand = if request.options.is_default() {
+        crate::mcp::server::CodeIndexReconcileDemandV1::Explicit
+    } else {
+        crate::mcp::server::CodeIndexReconcileDemandV1::ExplicitWithOptions(request.options.clone())
+    };
     if hotpath::future!(
-        reconcile_sink(
-            cg.project_root().to_path_buf(),
-            crate::mcp::server::CodeIndexReconcileDemandV1::Explicit,
-        ),
+        reconcile_sink(cg.project_root().to_path_buf(), demand),
         label = "mcp.info.admin_sync.reconcile"
     )
     .await
@@ -42,6 +56,9 @@ pub(crate) async fn handle_admin_sync(
         "reconcile_scope": "authoritative_project",
         "status": "queued",
         "project_root": cg.project_root(),
+        "skip_folders": request.options.skip_folders,
+        "include_folders": request.options.include_folders,
+        "options_digest": options_digest,
     });
     let text = serde_json::to_string(&output)?;
     Ok(ToolResult::new(

@@ -23,6 +23,7 @@ mod capability_manifest;
 pub mod catalog_composition;
 pub mod clock;
 pub mod code_index_freshness;
+pub mod code_index_reconcile;
 pub mod configuration;
 pub mod context;
 pub mod context_scout;
@@ -124,6 +125,9 @@ pub use authorization::{
     SourceAuthorizationSnapshot,
 };
 pub use clock::{ClockError, now_micros, try_now_micros};
+pub use code_index_reconcile::{
+    CodeIndexReconcileOptionsErrorV1, CodeIndexReconcileOptionsV1, CodeIndexReconcileRequestV1,
+};
 pub use configuration::{
     ActivationDriftV1, ComponentConfigurationState, ConfigurationAuditPage,
     ConfigurationAuditRequestV1, ConfigurationBatchRequestV1, ConfigurationDirectMutationRequestV1,

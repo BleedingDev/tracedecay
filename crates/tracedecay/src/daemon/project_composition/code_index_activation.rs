@@ -294,6 +294,7 @@ pub(super) fn code_index_activation_hint_sink(
         let schedulers = schedulers.clone();
         let project_root = project_root.clone();
         Box::pin(async move {
+            let has_options = batch.reconcile_options.is_some();
             let paths_accepted = if batch.paths.is_empty() {
                 true
             } else {
@@ -301,7 +302,14 @@ pub(super) fn code_index_activation_hint_sink(
                     .notify_hook_paths(&project_root, &batch.paths)
                     .await
             };
-            let overflow_accepted = if batch.overflow {
+            let options_accepted = if let Some(options) = batch.reconcile_options {
+                schedulers
+                    .notify_explicit_reconciliation(&project_root, options)
+                    .await
+            } else {
+                true
+            };
+            let overflow_accepted = if batch.overflow && !has_options {
                 schedulers.notify_hook_overflow(&project_root).await
             } else {
                 true
@@ -358,22 +366,47 @@ pub(super) fn code_index_reconcile_sink(
             let schedulers = schedulers.clone();
             let activation = Arc::clone(&activation);
             Box::pin(async move {
-                if demand == crate::mcp::server::CodeIndexReconcileDemandV1::Automatic
-                    && activation.automatic_admission() == code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled
+                if matches!(
+                    &demand,
+                    crate::mcp::server::CodeIndexReconcileDemandV1::Automatic
+                ) && activation.automatic_admission()
+                    == code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled
                 {
                     return crate::mcp::server::CodeIndexAdmission::LinkedWorktreeDisabled;
                 }
-                if schedulers.notify_hook_overflow(&root).await {
-                    return crate::mcp::server::CodeIndexAdmission::Accepted;
-                }
                 match demand {
-                    crate::mcp::server::CodeIndexReconcileDemandV1::Automatic => {
-                        activation.notify_hook_overflow(&root).await.into()
+                    crate::mcp::server::CodeIndexReconcileDemandV1::ExplicitWithOptions(
+                        options,
+                    ) => {
+                        if schedulers
+                            .notify_explicit_reconciliation(&root, options.clone())
+                            .await
+                        {
+                            crate::mcp::server::CodeIndexAdmission::Accepted
+                        } else {
+                            activation
+                                .notify_explicit_reconciliation_with_options(&root, options)
+                                .await
+                                .into()
+                        }
                     }
-                    crate::mcp::server::CodeIndexReconcileDemandV1::Explicit => activation
-                        .notify_explicit_reconciliation(&root)
-                        .await
-                        .into(),
+                    crate::mcp::server::CodeIndexReconcileDemandV1::Automatic => {
+                        if schedulers.notify_hook_overflow(&root).await {
+                            crate::mcp::server::CodeIndexAdmission::Accepted
+                        } else {
+                            activation.notify_hook_overflow(&root).await.into()
+                        }
+                    }
+                    crate::mcp::server::CodeIndexReconcileDemandV1::Explicit => {
+                        if schedulers.notify_hook_overflow(&root).await {
+                            crate::mcp::server::CodeIndexAdmission::Accepted
+                        } else {
+                            activation
+                                .notify_explicit_reconciliation(&root)
+                                .await
+                                .into()
+                        }
+                    }
                 }
             })
         },

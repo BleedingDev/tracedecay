@@ -187,11 +187,7 @@ async fn brokered_init(
     include_folders: &[String],
     handshake: &tracedecay_daemon_protocol::DaemonHandshake,
 ) -> tracedecay_domain::errors::Result<()> {
-    if !skip_folders.is_empty() || !include_folders.is_empty() {
-        return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: "brokered init does not yet support --skip-folders/--include-folders; configure tracedecay.toml first".to_string(),
-        });
-    }
+    let request = validated_reconcile_request(false, skip_folders, include_folders)?;
     // Init deliberately triggers a cold project open behind this single
     // status call. The default warming-retry grace is far tighter than a cold
     // open can take on a debug build or slow shared runner, which surfaced as
@@ -214,7 +210,7 @@ async fn brokered_init(
     let reconcile = tracedecay::daemon::call_default_tool_awaiting_project_open(
         handshake,
         "tracedecay_admin_sync",
-        serde_json::json!({}),
+        serde_json::to_value(request)?,
         init_deadline,
     )
     .await;
@@ -233,6 +229,21 @@ async fn brokered_init(
         project_path.display()
     );
     Ok(())
+}
+
+fn validated_reconcile_request(
+    force: bool,
+    skip_folders: &[String],
+    include_folders: &[String],
+) -> tracedecay_domain::errors::Result<tracedecay_contracts::CodeIndexReconcileRequestV1> {
+    tracedecay_contracts::CodeIndexReconcileRequestV1::new(
+        force,
+        skip_folders.iter().cloned(),
+        include_folders.iter().cloned(),
+    )
+    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+        message: error.to_string(),
+    })
 }
 
 async fn code_index_reconciliation_is_optional(
@@ -397,9 +408,14 @@ mod init_bootstrap_tests {
         };
 
         let handshake = test_handshake(&project, &profile);
-        brokered_init(&project, &[], &[], &handshake)
-            .await
-            .expect("brokered init against the fixture daemon");
+        brokered_init(
+            &project,
+            &["vendor".to_owned(), "dist".to_owned()],
+            &["dist/generated".to_owned()],
+            &handshake,
+        )
+        .await
+        .expect("brokered init against the fixture daemon");
         tokio::time::timeout(std::time::Duration::from_secs(5), responder)
             .await
             .expect("fixture daemon must observe both requests")
@@ -417,10 +433,20 @@ mod init_bootstrap_tests {
             serde_json::json!(true),
             "the bootstrap status call stays admission-only"
         );
+        assert_eq!(
+            recorded[1].1["skip_folders"],
+            serde_json::json!(["dist", "vendor"]),
+            "init sends canonical per-invocation skip folders through V2"
+        );
+        assert_eq!(
+            recorded[1].1["include_folders"],
+            serde_json::json!(["dist/generated"]),
+            "init sends canonical per-invocation include folders through V2"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn brokered_init_retains_folder_option_error_before_sending_request() {
+    async fn brokered_init_rejects_invalid_folder_options_before_sending_request() {
         let temp = tempfile::TempDir::new().unwrap();
         let project = temp.path().join("project");
         let profile = temp.path().join("profile");
@@ -429,7 +455,7 @@ mod init_bootstrap_tests {
 
         let error = handle_init_with_daemon_availability(
             project,
-            vec!["generated".to_string()],
+            vec!["../generated".to_string()],
             Vec::new(),
             handshake,
             true,
@@ -440,7 +466,7 @@ mod init_bootstrap_tests {
         assert!(
             error
                 .to_string()
-                .contains("brokered init does not yet support --skip-folders/--include-folders"),
+                .contains("skip_folders folder `../generated` is invalid"),
             "unexpected brokered-init error: {error}"
         );
         assert!(
@@ -490,11 +516,7 @@ pub(crate) async fn handle_sync(
     doctor: bool,
     verbose: bool,
 ) -> tracedecay_domain::errors::Result<()> {
-    if !skip_folders.is_empty() || !include_folders.is_empty() {
-        return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: "brokered sync does not yet support --skip-folders/--include-folders; update tracedecay.toml first".to_string(),
-        });
-    }
+    let request = validated_reconcile_request(force, &skip_folders, &include_folders)?;
     let resolved = super::scope::resolve_project_scope(
         tracedecay_configuration::resolve_path_with_discovery(path),
     )
@@ -508,7 +530,7 @@ pub(crate) async fn handle_sync(
     let result = tracedecay::daemon::call_default_tool(
         &handshake,
         "tracedecay_admin_sync",
-        serde_json::json!({"force": force}),
+        serde_json::to_value(request)?,
     )
     .await?;
     if verbose {

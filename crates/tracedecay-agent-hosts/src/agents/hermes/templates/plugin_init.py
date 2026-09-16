@@ -2568,6 +2568,22 @@ class TraceDecayContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = str(result.get("reason") or "no usable replay")
             return original
+        try:
+            source_estimate = int(current_tokens) if current_tokens is not None else None
+            replay_estimate = int(result.get("replay_token_estimate"))
+        except (TypeError, ValueError):
+            source_estimate = None
+            replay_estimate = None
+        if (
+            source_estimate is not None
+            and source_estimate > 0
+            and replay_estimate is not None
+            and replay_estimate >= source_estimate
+        ):
+            reason = "compression replay did not shrink the reported context"
+            self._last_compress_aborted = True
+            self._last_summary_error = reason
+            return original
         if replay == original:
             return original
         self.compression_count += 1
