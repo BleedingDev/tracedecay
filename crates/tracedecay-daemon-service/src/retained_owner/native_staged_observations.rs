@@ -10135,6 +10135,7 @@ fn preflight_replay(
         let source_key = required_text(&attribution["source"], "source_key")?;
         let source_sequence = item
             .get("source_sequence")
+            .or_else(|| envelope.get("source_sequence"))
             .and_then(Value::as_u64)
             .ok_or(StagedStoreError::InvalidAdvisory("replay source sequence"))?;
         if attribution["source_sequence"].as_u64() != Some(source_sequence)
@@ -10158,11 +10159,17 @@ fn preflight_replay(
         // duplicate operation receipt can be reused, bind the item's exact
         // canonical key and all host settlement facts to the sibling journal.
         // This also rejects source-only replay envelopes that lack the key.
-        let idempotency_key = required_text(item, "idempotency_key")?;
+        let idempotency_key = item
+            .get("idempotency_key")
+            .or_else(|| envelope.get("idempotency_key"))
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .ok_or(StagedStoreError::InvalidAdvisory("replay canonical key"))?;
         ObservationIdempotencyKeyV1::parse(idempotency_key)
             .map_err(|_| StagedStoreError::LifecycleConflict("replay canonical key"))?;
         let request_identity = item
             .get("request_identity")
+            .or_else(|| envelope.get("request_identity"))
             .and_then(Value::as_str)
             .unwrap_or(call.request_id.as_str());
         let observation_kind = required_text(envelope, "observation_kind")?;
@@ -10302,7 +10309,13 @@ fn replay_advisory(
             // Replay metadata is carried beside the retained observation by
             // ProviderHistory. The inner observation is intentionally kept
             // byte-for-byte canonical and does not mint a second key.
-            idempotency_key: required_text(item, "idempotency_key")?.to_owned(),
+            idempotency_key: item
+                .get("idempotency_key")
+                .or_else(|| envelope.get("idempotency_key"))
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .ok_or(StagedStoreError::InvalidAdvisory("replay canonical key"))?
+                .to_owned(),
             source_authority: admitted_source_authority(envelope),
             source_event_id: required_text(original, "observation_id")?.to_owned(),
             source_revision: original["source_revision"].as_str().map(str::to_owned),
@@ -10312,6 +10325,7 @@ fn replay_advisory(
             operation_id: call.operation_id.clone(),
             request_identity: item
                 .get("request_identity")
+                .or_else(|| envelope.get("request_identity"))
                 .and_then(Value::as_str)
                 .unwrap_or(call.request_id.as_str())
                 .to_owned(),
