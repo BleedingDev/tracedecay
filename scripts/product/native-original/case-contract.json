@@ -1,6 +1,61 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "tracedecay.native-original.case-contract.v1",
+  "$id": "https://schemas.tracedecay.invalid/native-original-contract-v1",
+  "type": "object",
+  "required": [
+    "$schema",
+    "$id",
+    "format",
+    "contract_id",
+    "status",
+    "baseline",
+    "runner",
+    "case_schema",
+    "route_semantics",
+    "routes",
+    "required_evidence",
+    "example"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "$id": {
+      "const": "https://schemas.tracedecay.invalid/native-original-contract-v1"
+    },
+    "format": {
+      "const": "tracedecay.native-original.case-contract.v1"
+    },
+    "contract_id": {
+      "const": "tracedecay.native-original.case-contract.v1"
+    },
+    "status": {
+      "const": "accepted"
+    },
+    "baseline": {
+      "type": "object"
+    },
+    "runner": {
+      "type": "object"
+    },
+    "case_schema": {
+      "$ref": "#/$defs/caseSchemaDocument"
+    },
+    "route_semantics": {
+      "type": "object"
+    },
+    "routes": {
+      "type": "array",
+      "minItems": 1
+    },
+    "required_evidence": {
+      "type": "object"
+    },
+    "example": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true,
   "format": "tracedecay.native-original.case-contract.v1",
   "contract_id": "tracedecay.native-original.case-contract.v1",
   "status": "accepted",
@@ -12,8 +67,11 @@
     "reference_checkout": ".worktrees/native-original-reference-57006f60",
     "reference_checkout_policy": "detached_checkout; create_only_when_absent; exact_revision_and_clean_git_required; runner_never_resets_or_deletes_existing_checkout",
     "reference_features": "test-transport",
-    "candidate_features": "test-transport",
-    "build_command": "cargo build -p tracedecay-cli --bin tracedecay --features test-transport",
+    "candidate_features": "production,memory-provider-host,semantic-fastembed",
+    "candidate_feature_policy": "Cargo default production plus explicit memory-provider-host and semantic-fastembed; attestation records this effective ordered set",
+    "reference_build_command": "cargo build -p tracedecay-cli --bin tracedecay --features test-transport",
+    "candidate_build_command": "cargo build -p tracedecay-cli --bin tracedecay --features memory-provider-host,semantic-fastembed",
+    "build_command": "reference: cargo build -p tracedecay-cli --bin tracedecay --features test-transport; candidate: cargo build -p tracedecay-cli --bin tracedecay --features memory-provider-host,semantic-fastembed",
     "memory_provider_host": false,
     "source_policy": "the reference source is read-only; the runner does not copy original implementation code, algorithms, or responses",
     "historical_audit": {
@@ -25,15 +83,17 @@
   "runner": {
     "module": "scripts/product/native-original/runner.py",
     "validation_command": "python3 -S scripts/product/native-original/runner.py validate --contract scripts/product/native-original/case-contract.json --cases <cases.json>",
-    "comparison_command": "python3 -S scripts/product/native-original/runner.py run --contract scripts/product/native-original/case-contract.json --cases <cases.json> --reference-checkout <570-checkout> --original-binary <570-binary> --product-binary <product-binary> --product-source-root <candidate-source> --product-source-revision <candidate-revision> --artifact-root <artifact-root>",
+    "comparison_command": "python3 -S scripts/product/native-original/runner.py run --contract scripts/product/native-original/case-contract.json --cases <cases.json> --reference-checkout <570-checkout> --original-binary <570-binary> --product-binary <product-binary> --product-source-root <candidate-source> --product-source-revision <candidate-revision> --artifact-root <artifact-root> --original-build-attestation <570-attestation.json> --product-build-attestation <candidate-attestation.json> --ncm-worker-attestation <trusted-ncm-worker.json>",
     "invocation": {
       "same_logical_input": "the request, operation identity, owner and scope fields are equal on both sides; only binary, process, physical state paths and capture paths differ",
       "separate_state": "the runner allocates original/<case> and product/<case> state roots and never copies a database, WAL, journal, receipt, or post-run state between sides",
       "production_boundary": "supported cases invoke an existing tracedecay CLI tool or MCP tools/call route; an external argv is allowed only when the original route is not CLI-exposed and is recorded as such",
       "reopen": "case authors request explicit after and reopened checkpoints; the runner executes reopened checkpoints only after verified owned close and a fresh daemon authority identity",
       "reference_guard": "verify-reference runs before any case and refuses an absent, differently pinned, or dirty 570 reference checkout",
-      "candidate_identity": "the product binary SHA-256, source root, and actual candidate source revision are captured; --product-source-revision overrides the source-root Git revision when the build owner provides an attestation; current is a moving contract label, not a historical commit pin",
-      "root_isolation": "source, binary, process, store, project, profile, state, socket, and artifact roots are side-specific and retained in the run and case manifests"
+      "candidate_identity": "the product binary SHA-256, full candidate source revision, source root, and build attestation are captured; missing or unknown candidate provenance blocks execution",
+      "root_isolation": "source, binary, process, store, project, profile, state, socket, and artifact roots are side-specific and retained in the run and case manifests",
+      "authority": "owned MCP actions require an authenticated initialize nativeOriginalActionPrepare acknowledgement followed by tools/call nativeOriginalActionNonce and a runner-verified nativeOriginalActionReceipt; response self-assertions are insufficient",
+      "ncm_oracle": "independent_real_worker_conformance; the pinned 570 side has no encoder worker and records an explicit unavailable worker boundary, while the candidate worker is independently attested"
     },
     "entrypoints": {
       "cli_tool": {
@@ -94,7 +154,35 @@
       "canned_original_results_forbidden": true,
       "provider_contact_unverified": "a child process being spawned does not prove provider contact; only a case-declared composition proof response can establish the selected boundary",
       "same_identity_rejected": "same binary digest/root, same source root, or unverified process/store ownership cannot form a comparison pair",
-      "matrix_outcomes": "cancelled, partial, effect_unknown, and blocked remain typed outcomes; they are never collapsed into pass or an empty response"
+      "matrix_outcomes": "cancelled, partial, effect_unknown, and blocked remain typed outcomes; they are never collapsed into pass or an empty response",
+      "retained_statuses": [
+        "aborted",
+        "budget_exhausted",
+        "busy",
+        "cancelled",
+        "complete",
+        "complete_zero",
+        "cursor_manifest_limit_exceeded",
+        "deadline_exceeded",
+        "deleted",
+        "denied",
+        "error",
+        "failed",
+        "joined",
+        "locked",
+        "not_found",
+        "ok",
+        "partial",
+        "recorded",
+        "redacted",
+        "running",
+        "stale",
+        "started",
+        "unavailable",
+        "unsupported_filter",
+        "wrong_scope"
+      ],
+      "terminal_mapping": "all RetainedOutcomeStatusV1 values map to typed runner outcomes; only recognized completed values can pass and arbitrary nonzero payloads remain unknown"
     },
     "capture": {
       "request": "request.json contains the exact canonical JSON request sent to the selected route and its SHA-256",
@@ -128,6 +216,7 @@
         "actual",
         "attempt_id",
         "attempt_index",
+        "authority_correlated",
         "candidate_binary_sha256",
         "candidate_process_identity",
         "candidate_store_identity",
@@ -169,92 +258,906 @@
         "reference and candidate artifacts are independently hashed",
         "composition_reached=false is blocked/unknown",
         "mutations require effect, receipt and state evidence; reads require explicit no-effect evidence",
-        "process and store identities are distinct from binary identities"
+        "process and store identities are distinct from binary identities",
+        "exact request_digest hashes the canonical request bytes retained in request.json",
+        "every readiness row carries an exact matrix binding including operation oracle track profile and evidence shape",
+        "Native NCM and semantic tracks require their declared identity fields; missing fields block pass",
+        "authority-correlated route and store identity is required; response self-assertion is not authority",
+        "mutating attempts require observed checkpoint or fresh reopen evidence; read-only attempts require explicit no-effect evidence",
+        "MCP action.tool must equal the published daemon-mapped tool for its route; fact_store variants use tracedecay_fact_store_<action> and cannot be relabelled through the generic dispatcher",
+        "receipt-backed requests cannot carry caller-selected session_id, thread_id, conversation, provider-session, agent-session, or task-session selectors; scope is daemon-selected before prepare",
+        "digest-bearing action and terminal-result JSON rejects floating-point values until an exact cross-language number canonicalizer is adopted",
+        "ledger population rejects unexpected and over-counted rows",
+        "run-manifest and case-result are atomically finalized after all observed attempt fields are known",
+        "final case-result result_digest hashes canonical newline-terminated content with its own digest and nested ledger-row result_digest fields set to null; the digest is verified when the artifact is read",
+        "nested attempt-row result_digest remains null so the append receipt and final case-result digest cannot form a self-referential cycle"
       ]
     },
     "readiness": {
       "matrix_id": "native-ncm-semantic-readiness.v1",
-      "modes": ["comparison", "readiness"],
+      "matrix_path": ".codex/plans/native-original/execution-results/readiness-matrix.json",
+      "matrix_sha256": "0115793c5909113571f9b5a9f0f73008aa8ba3d5745a904bb34d3a8d689db227",
+      "matrix_row_count": 201,
+      "matrix_planned_attempts": 1381,
+      "matrix_row_ids_sha256": "1ad228fabfa48dd86371aa9fcf4fb98defba4d62bc1d1cafcb5be7c729c4edee",
+      "matrix_oracle_runs_sha256": "eecce27fa55b3a421d3bee89b5503d7e35b75262cccc2134e632bbe2f3a24978",
+      "matrix_row_bindings_sha256": "a8f46e8c87b0e83ab09798962b101a1fef7428c1202001c166b87ac29b19f445",
+      "modes": [
+        "comparison",
+        "readiness"
+      ],
       "filtered_suite_policy": "reject_as_readiness_evidence",
-      "readiness_mode": "requires the complete accepted Native, session/LCM, and host-extension route set; --operation is rejected",
-      "comparison_mode": "permits focused cases for development but does not claim readiness"
+      "readiness_mode": "requires every row in the frozen matrix with its declared oracle and planned run count; --operation is rejected",
+      "matrix_compatibility_command": "native-original-runner --case <row-id> --ledger <append-only-jsonl>",
+      "comparison_mode": "permits focused cases for development but does not claim readiness",
+      "attempt_population_policy": "readiness requires all frozen rows, exact binding, and exactly each row.runs.planned observed ledger attempts; missing, unexpected, or over-counted rows are blocked",
+      "case_binding": "matrix_binding must exactly repeat matrix_row_id, track, profile, operation, oracle_kind, oracle_case, identity, identity_evidence, effect_receipt_state, required_identity_fields, required_evidence_fields, identity_requirements, and track_identity_requirements; every readiness action must repeat matrix_row_id, matrix_operation, matrix_oracle_case, and matrix_route, with public route translation checked against the frozen row"
+    },
+    "normative_command": "native-original-runner",
+    "build_attestation": {
+      "format": "tracedecay.native-original.build-attestation.v1",
+      "required_for": "both original and candidate binaries",
+      "fields": [
+        "side",
+        "features",
+        "source_root",
+        "source_revision",
+        "binary_path",
+        "binary_sha256"
+      ],
+      "policy": "the attestation must bind the selected executable hash to the full source revision and source root before a run starts"
+    },
+    "ncm_worker_attestation": {
+      "format": "tracedecay.native-original.ncm-worker-attestation.v1",
+      "required_for": "normal NCM worker execution; independent 570 oracle records the reference worker as unavailable",
+      "fields": [
+        "format",
+        "kind",
+        "worker_id",
+        "binary_path",
+        "binary_sha256",
+        "source_root",
+        "source_revision",
+        "protocol_version",
+        "implementation_sha256",
+        "model_artifact_sha256",
+        "tokenizer_sha256",
+        "vector_fixture_digest",
+        "pin_sha256"
+      ],
+      "identity_pin_fields": [
+        "worker_id",
+        "binary_sha256",
+        "source_revision",
+        "protocol_version",
+        "implementation_sha256",
+        "model_artifact_sha256",
+        "tokenizer_sha256",
+        "vector_fixture_digest"
+      ],
+      "policy": "runner input is read through a stable non-symlink file; pins are checked against an independently observed native worker, authenticated daemon action receipt, live daemon runtime, and functionality probe"
     }
   },
   "case_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://schemas.tracedecay.invalid/native-original-case-v1",
+    "$defs": {
+      "requiredAttemptEvidence": {
+        "type": "object",
+        "required": [
+          "state",
+          "value"
+        ],
+        "properties": {
+          "state": {
+            "const": "required_per_attempt"
+          },
+          "value": {
+            "type": "null"
+          }
+        },
+        "additionalProperties": false
+      },
+      "identityEvidence": {
+        "type": "object",
+        "required": [
+          "candidate_binary_sha256",
+          "process_identity",
+          "reference_binary_sha256",
+          "route_identity",
+          "store_identity"
+        ],
+        "properties": {
+          "candidate_binary_sha256": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "process_identity": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "reference_binary_sha256": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "route_identity": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "store_identity": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          }
+        },
+        "additionalProperties": false
+      },
+      "effectReceiptState": {
+        "type": "object",
+        "required": [
+          "effect_digest",
+          "expected_effect",
+          "receipt_digest",
+          "receipt_policy",
+          "reopen_or_no_effect",
+          "state_digest"
+        ],
+        "properties": {
+          "effect_digest": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "expected_effect": {
+            "type": "string",
+            "minLength": 1
+          },
+          "receipt_digest": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "receipt_policy": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reopen_or_no_effect": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          },
+          "state_digest": {
+            "$ref": "#/$defs/requiredAttemptEvidence"
+          }
+        },
+        "additionalProperties": false
+      },
+      "identityRequirements": {
+        "type": "object",
+        "required": [
+          "reference",
+          "candidate",
+          "native",
+          "ncm",
+          "semantic"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/$defs/referenceIdentityRequirements"
+          },
+          "candidate": {
+            "$ref": "#/$defs/candidateIdentityRequirements"
+          },
+          "native": {
+            "$ref": "#/$defs/nativeIdentityRequirements"
+          },
+          "ncm": {
+            "$ref": "#/$defs/ncmIdentityRequirements"
+          },
+          "semantic": {
+            "$ref": "#/$defs/semanticIdentityRequirements"
+          }
+        },
+        "additionalProperties": false
+      },
+      "identityRequirement": {
+        "description": "A frozen identity requirement is a non-empty literal, non-empty literal list, or an explicit typed requirement descriptor.",
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "state",
+              "value"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "state": {
+                "type": "string",
+                "minLength": 1
+              },
+              "value": {
+                "type": "null"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "referenceIdentityRequirements": {
+        "type": "object",
+        "required": [
+          "binary",
+          "features",
+          "profile",
+          "rule",
+          "source_revision"
+        ],
+        "properties": {
+          "binary": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "features": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "profile": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "rule": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "source_revision": {
+            "$ref": "#/$defs/identityRequirement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "candidateIdentityRequirements": {
+        "type": "object",
+        "required": [
+          "binary",
+          "features",
+          "profile",
+          "rule",
+          "source_revision"
+        ],
+        "properties": {
+          "binary": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "features": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "profile": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "rule": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "source_revision": {
+            "$ref": "#/$defs/identityRequirement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "nativeIdentityRequirements": {
+        "type": "object",
+        "required": [
+          "contribution_digest",
+          "exact_scope",
+          "marker",
+          "provider_id",
+          "provider_instance",
+          "registration_revision",
+          "request_digest"
+        ],
+        "properties": {
+          "contribution_digest": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "exact_scope": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "marker": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "provider_id": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "provider_instance": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "registration_revision": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "request_digest": {
+            "$ref": "#/$defs/identityRequirement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ncmIdentityRequirements": {
+        "type": "object",
+        "required": [
+          "exact_scope",
+          "implementation_sha256",
+          "model_artifact_sha256",
+          "protocol_version",
+          "provider_id",
+          "state_generation",
+          "state_schema_version",
+          "tokenizer_sha256",
+          "vector_fixture_digest"
+        ],
+        "properties": {
+          "exact_scope": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "implementation_sha256": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "model_artifact_sha256": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "protocol_version": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "provider_id": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "state_generation": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "state_schema_version": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "tokenizer_sha256": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "vector_fixture_digest": {
+            "$ref": "#/$defs/identityRequirement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "semanticIdentityRequirements": {
+        "type": "object",
+        "required": [
+          "calibration_digest",
+          "calibration_profile_id",
+          "capability_manifest_digest",
+          "model_artifact_sha256",
+          "projection_key",
+          "rerank_policy_pins",
+          "search_index_key",
+          "source_generation",
+          "tokenizer_sha256",
+          "vector_generation"
+        ],
+        "properties": {
+          "calibration_digest": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "calibration_profile_id": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "capability_manifest_digest": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "model_artifact_sha256": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "projection_key": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "rerank_policy_pins": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "search_index_key": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "source_generation": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "tokenizer_sha256": {
+            "$ref": "#/$defs/identityRequirement"
+          },
+          "vector_generation": {
+            "$ref": "#/$defs/identityRequirement"
+          }
+        },
+        "additionalProperties": false
+      },
+      "trackIdentityRequirements": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/nativeIdentityRequirements"
+          },
+          {
+            "$ref": "#/$defs/ncmIdentityRequirements"
+          },
+          {
+            "$ref": "#/$defs/semanticIdentityRequirements"
+          },
+          {
+            "type": "object",
+            "maxProperties": 0,
+            "additionalProperties": false
+          }
+        ]
+      },
+      "setupAction": {
+        "type": "object",
+        "required": [
+          "id",
+          "request"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "route"
+            ],
+            "properties": {
+              "route": {}
+            }
+          },
+          {
+            "required": [
+              "operation"
+            ],
+            "properties": {
+              "operation": {}
+            }
+          }
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "route": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operation": {
+            "type": "string",
+            "minLength": 1
+          },
+          "entrypoint": {
+            "type": "string",
+            "enum": [
+              "cli_tool",
+              "mcp_stdio",
+              "command"
+            ]
+          },
+          "request": {
+            "type": "object"
+          },
+          "tool": {
+            "type": "string",
+            "minLength": 1
+          },
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "includes_binary": {
+            "type": "boolean"
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1
+          },
+          "output_bindings": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "comparison": {
+            "type": "object"
+          },
+          "checkpoints": {
+            "type": "object"
+          },
+          "composition_proof": {
+            "type": "object"
+          },
+          "phase": {
+            "type": "string",
+            "minLength": 1
+          },
+          "protocol_version": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "title": "Native original comparison case",
+    "description": "Schema for one runner case. Runtime validation additionally enforces route, effect, lifecycle, and frozen-matrix rules.",
     "type": "object",
     "required": [
-      "id",
       "classification",
       "actions"
     ],
+    "anyOf": [
+      {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      {
+        "required": [
+          "case_id"
+        ],
+        "properties": {
+          "case_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    ],
     "properties": {
-      "id": "stable case identity; case_id is accepted as an input alias",
-      "classification": [
-        "original_native",
-        "session_lcm",
-        "host_extension",
-        "state_regression"
-      ],
-      "description": "human-readable purpose and protected behavior under test",
-      "project_root": "test-owned relative project directory, default project",
-      "profile_root": "test-owned relative profile directory, default profile",
-      "state_root": "test-owned relative state directory, default state",
-      "fixtures": "logical seed values and expected semantic assertions; no post-run state copied from either side",
+      "id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable case identity."
+      },
+      "case_id": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Compatibility alias for id."
+      },
+      "classification": {
+        "type": "string",
+        "enum": [
+          "original_native",
+          "session_lcm",
+          "host_extension",
+          "state_regression"
+        ]
+      },
+      "description": {
+        "type": "string"
+      },
+      "project_root": {
+        "type": "string",
+        "minLength": 1
+      },
+      "profile_root": {
+        "type": "string",
+        "minLength": 1
+      },
+      "state_root": {
+        "type": "string",
+        "minLength": 1
+      },
+      "fixtures": {
+        "type": "object"
+      },
       "side_setup": {
-        "original": "optional list of setup actions executed only against the immutable 570 binary",
-        "product": "optional list of setup actions executed only against the selected product binary",
-        "purpose": "public route setup/configuration and independent seed creation; setup output and bindings are retained"
+        "type": "object",
+        "required": [
+          "original",
+          "product"
+        ],
+        "properties": {
+          "original": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/setupAction"
+            }
+          },
+          "product": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/setupAction"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "composition_proof": {
-        "original": "required side-specific proof action for a parity case; it must expose a declared response observable proving the direct original route",
-        "product": "required side-specific proof action for a parity case; it must expose a declared response observable proving product Native composition",
-        "checks": "optional ordered list of proof actions when selection and runtime status require separate production responses; every check has its own required_json_pointers and equals",
-        "required_json_pointers": "proof response paths that must be present; absence is unknown and never a successful proof",
-        "equals": "non-empty map of JSON pointers to exact proof values; no global response normalization is allowed"
+        "type": "object",
+        "additionalProperties": true
       },
       "lifecycle": {
-        "close": "explicit per-side close action or process_exit observation; daemon cleanup is unverified unless this hook proves ownership",
-        "reopen": "explicit per-side fresh-process action after close; the word reopened on a checkpoint is not evidence by itself",
-        "require_owned_close": "when true, a reopened comparison is unknown unless every side reports owned close completion"
+        "type": "object",
+        "additionalProperties": true
       },
       "actions": {
         "type": "array",
+        "minItems": 1,
         "items": {
+          "type": "object",
           "required": [
             "id",
             "route",
             "request"
           ],
-          "fields": {
-            "id": "stable logical action identity; action_id is accepted as an input alias",
-            "route": "one id from routes",
-            "entrypoint": "cli_tool, mcp_stdio, or command; defaults to cli_tool",
-            "request": "the exact request object; rendered independently for each side",
-            "tool": "MCP tool name for mcp_stdio",
-            "argv": "command argv when route availability is external_harness or entrypoint is command",
-            "includes_binary": "command argv already contains ${binary}; defaults false",
-            "environment": "test-owned environment overrides; HOME/XDG/daemon socket are isolated by the runner",
-            "output_bindings": "map symbolic names to response JSON pointers; bindings are scoped per side and may feed later requests as ${bindings.name}",
-            "composition_proof": "optional inline proof metadata; prefer the case-level side-specific composition_proof hook",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "action_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "route": {
+              "type": "string",
+              "minLength": 1
+            },
+            "operation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_row_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_operation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_oracle_case": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_route": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_candidate_route": {
+              "type": "string",
+              "minLength": 1
+            },
+            "matrix_reference_route": {
+              "type": "string",
+              "minLength": 1
+            },
+            "entrypoint": {
+              "type": "string",
+              "enum": [
+                "cli_tool",
+                "mcp_stdio",
+                "command"
+              ]
+            },
+            "request": {
+              "type": "object"
+            },
+            "tool": {
+              "type": "string",
+              "minLength": 1
+            },
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "includes_binary": {
+              "type": "boolean"
+            },
+            "environment": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "output_bindings": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "composition_proof": {
+              "type": "object"
+            },
             "comparison": {
-              "semantic_json_pointers": "optional reviewed projection paths; missing paths remain explicit missing values",
-              "ignore_json_pointers": "optional reviewed nondeterministic paths only; raw responses still retain them",
-              "effect_mode": "required, none, or retrieval; must match the route operation kind",
-              "effect_json_pointers": "effect observables required for mutations or retrieval side effects",
-              "receipt_json_pointers": "durable receipt observables required for mutations",
-              "state_json_pointers": "state generation/digest observables required for mutations",
-              "no_effect_json_pointers": "explicit read/no-mutation observables required for read routes",
-              "reopen_or_no_effect_json_pointers": "reopen or no-effect evidence selected by the case"
+              "type": "object",
+              "properties": {
+                "semantic_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "ignore_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "required_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "effect_mode": {
+                  "type": "string",
+                  "enum": [
+                    "required",
+                    "none",
+                    "retrieval",
+                    "unknown"
+                  ]
+                },
+                "effect_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "receipt_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "state_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "no_effect_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "reopen_or_no_effect_json_pointers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "additionalProperties": true
             },
             "checkpoints": {
-              "before": "optional read/state operations executed before this action",
-              "after": "optional read/state operations executed after this action",
-              "reopened": "optional read/state operations executed after the fixture has independently closed and reopened its store"
+              "type": "object",
+              "properties": {
+                "before": {
+                  "anyOf": [
+                    {
+                      "type": "array"
+                    },
+                    {
+                      "type": "object"
+                    }
+                  ]
+                },
+                "after": {
+                  "anyOf": [
+                    {
+                      "type": "array"
+                    },
+                    {
+                      "type": "object"
+                    }
+                  ]
+                },
+                "reopened": {
+                  "anyOf": [
+                    {
+                      "type": "array"
+                    },
+                    {
+                      "type": "object"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
             }
-          }
+          },
+          "additionalProperties": true
         }
+      },
+      "matrix_binding": {
+        "type": "object",
+        "required": [
+          "matrix_row_id",
+          "track",
+          "profile",
+          "operation",
+          "oracle_kind",
+          "oracle_case",
+          "identity",
+          "identity_evidence",
+          "effect_receipt_state",
+          "required_identity_fields",
+          "required_evidence_fields",
+          "identity_requirements",
+          "track_identity_requirements"
+        ],
+        "properties": {
+          "matrix_row_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "track": {
+            "type": "string",
+            "enum": [
+              "native",
+              "ncm",
+              "semantic",
+              "release"
+            ]
+          },
+          "profile": {
+            "type": "string",
+            "minLength": 1
+          },
+          "operation": {
+            "type": "string",
+            "minLength": 1
+          },
+          "oracle_kind": {
+            "type": "string",
+            "minLength": 1
+          },
+          "oracle_case": {
+            "type": "string",
+            "minLength": 1
+          },
+          "identity": {
+            "type": "string",
+            "minLength": 1
+          },
+          "identity_evidence": {
+            "$ref": "#/$defs/identityEvidence"
+          },
+          "effect_receipt_state": {
+            "$ref": "#/$defs/effectReceiptState"
+          },
+          "required_identity_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "required_evidence_fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "identity_requirements": {
+            "$ref": "#/$defs/identityRequirements"
+          },
+          "track_identity_requirements": {
+            "$ref": "#/$defs/trackIdentityRequirements"
+          }
+        },
+        "additionalProperties": false
       }
-    }
+    },
+    "additionalProperties": true
   },
   "route_semantics": {
     "original_native": "corresponding 570 Native operation through the direct retained production boundary; compare canonical payload, score/order, effect, receipt, and reopened state",
@@ -269,8 +1172,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1::project or ::profile -> FactStoreAdd",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_add"}, "mcp_stdio": {"tool": "tracedecay_fact_store_add"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_add"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_add"
+        }
+      }
     },
     {
       "id": "fact_store_search",
@@ -278,8 +1191,18 @@
       "operation_kind": "explicit_search",
       "effect_policy": "retrieval",
       "direct_boundary": "DirectRetainedMemoryPortV1::project or ::profile -> FactStoreSearch",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_search"}, "mcp_stdio": {"tool": "tracedecay_fact_store_search"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_search"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_search"
+        }
+      }
     },
     {
       "id": "fact_store_probe",
@@ -287,8 +1210,18 @@
       "operation_kind": "semantic_read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreProbe",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_probe"}, "mcp_stdio": {"tool": "tracedecay_fact_store_probe"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_probe"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_probe"
+        }
+      }
     },
     {
       "id": "fact_store_related",
@@ -296,8 +1229,18 @@
       "operation_kind": "semantic_read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreRelated",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_related"}, "mcp_stdio": {"tool": "tracedecay_fact_store_related"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_related"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_related"
+        }
+      }
     },
     {
       "id": "fact_store_reason",
@@ -305,8 +1248,18 @@
       "operation_kind": "semantic_read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreReason",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_reason"}, "mcp_stdio": {"tool": "tracedecay_fact_store_reason"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_reason"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_reason"
+        }
+      }
     },
     {
       "id": "fact_store_contradict",
@@ -314,8 +1267,18 @@
       "operation_kind": "semantic_read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreContradict",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_contradict"}, "mcp_stdio": {"tool": "tracedecay_fact_store_contradict"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_contradict"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_contradict"
+        }
+      }
     },
     {
       "id": "fact_store_get",
@@ -323,8 +1286,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreGet plus feedback history",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_get"}, "mcp_stdio": {"tool": "tracedecay_fact_store_get"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_get"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_get"
+        }
+      }
     },
     {
       "id": "fact_store_update",
@@ -332,8 +1305,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreUpdate",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_update"}, "mcp_stdio": {"tool": "tracedecay_fact_store_update"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_update"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_update"
+        }
+      }
     },
     {
       "id": "fact_store_remove",
@@ -341,8 +1324,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreRemove",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_remove"}, "mcp_stdio": {"tool": "tracedecay_fact_store_remove"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_remove"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_remove"
+        }
+      }
     },
     {
       "id": "fact_store_supersede",
@@ -350,8 +1343,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreSupersede",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_supersede"}, "mcp_stdio": {"tool": "tracedecay_fact_store_supersede"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_supersede"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_supersede"
+        }
+      }
     },
     {
       "id": "fact_store_list",
@@ -359,8 +1362,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> FactStoreList",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_list"}, "mcp_stdio": {"tool": "tracedecay_fact_store_list"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_list"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_list"
+        }
+      }
     },
     {
       "id": "fact_feedback",
@@ -368,8 +1381,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "MemoryApplication feedback route -> canonical fact feedback",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_feedback"}, "mcp_stdio": {"tool": "tracedecay_fact_feedback"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_feedback"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_feedback"
+        }
+      }
     },
     {
       "id": "memory_status",
@@ -377,8 +1400,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "DirectRetainedMemoryPortV1 -> MemoryStatus",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_memory_status"}, "mcp_stdio": {"tool": "tracedecay_memory_status"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_memory_status"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_memory_status"
+        }
+      }
     },
     {
       "id": "configuration_get",
@@ -386,9 +1419,19 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "configuration registry resolved setting -> tracedecay_configuration_get",
-      "availability": {"original": "unknown", "product": "supported"},
+      "availability": {
+        "original": "unknown",
+        "product": "supported"
+      },
       "original_reason": "the 570 reference does not provide a Native provider selection status boundary",
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_configuration_get"}, "mcp_stdio": {"tool": "tracedecay_configuration_get"}}
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_configuration_get"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_configuration_get"
+        }
+      }
     },
     {
       "id": "fact_store_curate",
@@ -396,8 +1439,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "owner-bound curation application -> FactStoreCurate",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_fact_store_curate"}, "mcp_stdio": {"tool": "tracedecay_fact_store_curate"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_fact_store_curate"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_fact_store_curate"
+        }
+      }
     },
     {
       "id": "session_lookup",
@@ -405,8 +1458,18 @@
       "operation_kind": "temporal_read",
       "effect_policy": "none",
       "direct_boundary": "SessionRetrievalService::retrieve through the retained session lookup",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_session_lookup"}, "mcp_stdio": {"tool": "tracedecay_session_lookup"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_session_lookup"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_session_lookup"
+        }
+      }
     },
     {
       "id": "message_search",
@@ -414,8 +1477,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "public retained message_search lookup through canonical session authority",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_message_search"}, "mcp_stdio": {"tool": "tracedecay_message_search"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_message_search"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_message_search"
+        }
+      }
     },
     {
       "id": "sessions_for",
@@ -423,8 +1496,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained sessions-for lookup through canonical session authority",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_sessions_for"}, "mcp_stdio": {"tool": "tracedecay_sessions_for"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_sessions_for"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_sessions_for"
+        }
+      }
     },
     {
       "id": "session_refresh_begin",
@@ -432,8 +1515,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "SessionRefreshService::begin_or_join",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_begin"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_begin"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_session_refresh_begin"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_session_refresh_begin"
+        }
+      }
     },
     {
       "id": "session_refresh_status",
@@ -441,8 +1534,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "SessionRefreshService::status",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_status"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_status"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_session_refresh_status"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_session_refresh_status"
+        }
+      }
     },
     {
       "id": "session_refresh_cancel",
@@ -450,8 +1553,18 @@
       "operation_kind": "mutation",
       "effect_policy": "required",
       "direct_boundary": "SessionRefreshService::cancel",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_session_refresh_cancel"}, "mcp_stdio": {"tool": "tracedecay_session_refresh_cancel"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_session_refresh_cancel"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_session_refresh_cancel"
+        }
+      }
     },
     {
       "id": "lcm_load_session",
@@ -459,8 +1572,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM LoadSession query and canonical hydration",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_load_session"}, "mcp_stdio": {"tool": "tracedecay_lcm_load_session"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_load_session"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_load_session"
+        }
+      }
     },
     {
       "id": "lcm_grep",
@@ -468,8 +1591,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM Grep query",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_grep"}, "mcp_stdio": {"tool": "tracedecay_lcm_grep"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_grep"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_grep"
+        }
+      }
     },
     {
       "id": "lcm_describe",
@@ -477,8 +1610,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM Describe query",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_describe"}, "mcp_stdio": {"tool": "tracedecay_lcm_describe"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_describe"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_describe"
+        }
+      }
     },
     {
       "id": "lcm_expand",
@@ -486,8 +1629,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM Expand query with payload verification",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_expand"}, "mcp_stdio": {"tool": "tracedecay_lcm_expand"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_expand"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_expand"
+        }
+      }
     },
     {
       "id": "lcm_expand_query",
@@ -495,8 +1648,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM ExpandQuery synthesis",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_expand_query"}, "mcp_stdio": {"tool": "tracedecay_lcm_expand_query"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_expand_query"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_expand_query"
+        }
+      }
     },
     {
       "id": "lcm_status",
@@ -504,8 +1667,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM Status",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_status"}, "mcp_stdio": {"tool": "tracedecay_lcm_status"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_status"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_status"
+        }
+      }
     },
     {
       "id": "lcm_doctor",
@@ -513,8 +1686,18 @@
       "operation_kind": "read",
       "effect_policy": "none",
       "direct_boundary": "retained LCM Doctor",
-      "availability": {"original": "supported", "product": "supported"},
-      "entrypoints": {"cli_tool": {"tool": "tracedecay_lcm_doctor"}, "mcp_stdio": {"tool": "tracedecay_lcm_doctor"}}
+      "availability": {
+        "original": "supported",
+        "product": "supported"
+      },
+      "entrypoints": {
+        "cli_tool": {
+          "tool": "tracedecay_lcm_doctor"
+        },
+        "mcp_stdio": {
+          "tool": "tracedecay_lcm_doctor"
+        }
+      }
     },
     {
       "id": "host_sealed_source_admission",
@@ -522,9 +1705,18 @@
       "operation_kind": "host_extension",
       "effect_policy": "required",
       "direct_boundary": "current sealed Codex source admission and canonical transcript transaction",
-      "availability": {"original": "unknown", "product": "external_harness"},
+      "availability": {
+        "original": "unknown",
+        "product": "external_harness"
+      },
       "original_reason": "570 has no counterpart for the product's sealed live-origin extension; compare only in a separately classified product regression fixture",
-      "entrypoints": {"command": {"argv_template": ["${binary}"]}}
+      "entrypoints": {
+        "command": {
+          "argv_template": [
+            "${binary}"
+          ]
+        }
+      }
     },
     {
       "id": "host_cursor_and_locator_regression",
@@ -532,9 +1724,18 @@
       "operation_kind": "host_extension",
       "effect_policy": "required",
       "direct_boundary": "current transcript cursor CAS and live locator transaction",
-      "availability": {"original": "unknown", "product": "external_harness"},
+      "availability": {
+        "original": "unknown",
+        "product": "external_harness"
+      },
       "original_reason": "570 counterpart is not exposed at this host storage extension boundary",
-      "entrypoints": {"command": {"argv_template": ["${binary}"]}}
+      "entrypoints": {
+        "command": {
+          "argv_template": [
+            "${binary}"
+          ]
+        }
+      }
     },
     {
       "id": "original_route_unavailable",
@@ -542,7 +1743,10 @@
       "operation_kind": "coverage_gap",
       "effect_policy": "unknown",
       "direct_boundary": "the exact original operation boundary must be supplied by a later external harness",
-      "availability": {"original": "unknown", "product": "unknown"},
+      "availability": {
+        "original": "unknown",
+        "product": "unknown"
+      },
       "original_reason": "no callable 570 production route was identified; retain this as unknown coverage",
       "entrypoints": {}
     }
@@ -577,5 +1781,606 @@
     "file": "example-case.json",
     "command": "python3 -S scripts/product/native-original/runner.py validate --cases scripts/product/native-original/example-case.json",
     "description": "One project-owned explicit Search followed by a status checkpoint. It is a contract example, not a measured result."
+  },
+  "$defs": {
+    "caseSchemaDocument": {
+      "type": "object",
+      "required": [
+        "$schema",
+        "$id",
+        "$defs",
+        "title",
+        "description",
+        "type",
+        "required",
+        "properties",
+        "additionalProperties"
+      ],
+      "properties": {
+        "$schema": {
+          "const": "https://json-schema.org/draft/2020-12/schema"
+        },
+        "$id": {
+          "type": "string",
+          "pattern": "^https://schemas\\.tracedecay\\.invalid/[^#]+$"
+        },
+        "$defs": {
+          "type": "object",
+          "required": [
+            "requiredAttemptEvidence",
+            "identityEvidence",
+            "effectReceiptState"
+          ],
+          "properties": {
+            "requiredAttemptEvidence": {
+              "type": "object",
+              "required": [
+                "type",
+                "required",
+                "properties",
+                "additionalProperties"
+              ],
+              "properties": {
+                "type": {
+                  "const": "object"
+                },
+                "required": {
+                  "type": "array",
+                  "minItems": 2,
+                  "contains": {
+                    "const": "state"
+                  },
+                  "allOf": [
+                    {
+                      "contains": {
+                        "const": "value"
+                      }
+                    }
+                  ]
+                },
+                "properties": {
+                  "type": "object",
+                  "required": [
+                    "state",
+                    "value"
+                  ]
+                },
+                "additionalProperties": {
+                  "const": false
+                }
+              },
+              "additionalProperties": true
+            },
+            "identityEvidence": {
+              "type": "object",
+              "required": [
+                "type",
+                "required",
+                "properties",
+                "additionalProperties"
+              ],
+              "properties": {
+                "type": {
+                  "const": "object"
+                },
+                "required": {
+                  "type": "array",
+                  "minItems": 5,
+                  "contains": {
+                    "const": "candidate_binary_sha256"
+                  },
+                  "allOf": [
+                    {
+                      "contains": {
+                        "const": "process_identity"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "reference_binary_sha256"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "route_identity"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "store_identity"
+                      }
+                    }
+                  ]
+                },
+                "properties": {
+                  "type": "object",
+                  "required": [
+                    "candidate_binary_sha256",
+                    "process_identity",
+                    "reference_binary_sha256",
+                    "route_identity",
+                    "store_identity"
+                  ],
+                  "properties": {
+                    "candidate_binary_sha256": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "process_identity": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "reference_binary_sha256": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "route_identity": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "store_identity": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "additionalProperties": {
+                  "const": false
+                }
+              },
+              "additionalProperties": true
+            },
+            "effectReceiptState": {
+              "type": "object",
+              "required": [
+                "type",
+                "required",
+                "properties",
+                "additionalProperties"
+              ],
+              "properties": {
+                "type": {
+                  "const": "object"
+                },
+                "required": {
+                  "type": "array",
+                  "minItems": 6,
+                  "allOf": [
+                    {
+                      "contains": {
+                        "const": "effect_digest"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "expected_effect"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "receipt_digest"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "receipt_policy"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "reopen_or_no_effect"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "state_digest"
+                      }
+                    }
+                  ]
+                },
+                "properties": {
+                  "type": "object",
+                  "required": [
+                    "effect_digest",
+                    "expected_effect",
+                    "receipt_digest",
+                    "receipt_policy",
+                    "reopen_or_no_effect",
+                    "state_digest"
+                  ],
+                  "properties": {
+                    "effect_digest": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "expected_effect": {
+                      "type": "object",
+                      "required": [
+                        "type",
+                        "minLength"
+                      ],
+                      "properties": {
+                        "type": {
+                          "const": "string"
+                        },
+                        "minLength": {
+                          "const": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "receipt_digest": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "receipt_policy": {
+                      "type": "object",
+                      "required": [
+                        "type",
+                        "minLength"
+                      ],
+                      "properties": {
+                        "type": {
+                          "const": "string"
+                        },
+                        "minLength": {
+                          "const": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "reopen_or_no_effect": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "state_digest": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/requiredAttemptEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "additionalProperties": {
+                  "const": false
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "const": "object"
+        },
+        "required": {
+          "type": "array",
+          "minItems": 2,
+          "allOf": [
+            {
+              "contains": {
+                "const": "classification"
+              }
+            },
+            {
+              "contains": {
+                "const": "actions"
+              }
+            }
+          ]
+        },
+        "properties": {
+          "type": "object",
+          "required": [
+            "classification",
+            "actions",
+            "matrix_binding"
+          ],
+          "properties": {
+            "classification": {
+              "type": "object",
+              "required": [
+                "type",
+                "enum"
+              ],
+              "properties": {
+                "type": {
+                  "const": "string"
+                },
+                "enum": {
+                  "type": "array",
+                  "minItems": 1
+                }
+              },
+              "additionalProperties": true
+            },
+            "actions": {
+              "type": "object",
+              "required": [
+                "type",
+                "minItems",
+                "items"
+              ],
+              "properties": {
+                "type": {
+                  "const": "array"
+                },
+                "minItems": {
+                  "const": 1
+                },
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "type",
+                    "required",
+                    "properties"
+                  ],
+                  "properties": {
+                    "type": {
+                      "const": "object"
+                    },
+                    "required": {
+                      "type": "array",
+                      "minItems": 3,
+                      "allOf": [
+                        {
+                          "contains": {
+                            "const": "id"
+                          }
+                        },
+                        {
+                          "contains": {
+                            "const": "route"
+                          }
+                        },
+                        {
+                          "contains": {
+                            "const": "request"
+                          }
+                        }
+                      ]
+                    },
+                    "properties": {
+                      "type": "object"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            },
+            "matrix_binding": {
+              "type": "object",
+              "required": [
+                "type",
+                "required",
+                "properties",
+                "additionalProperties"
+              ],
+              "properties": {
+                "type": {
+                  "const": "object"
+                },
+                "required": {
+                  "type": "array",
+                  "minItems": 13,
+                  "allOf": [
+                    {
+                      "contains": {
+                        "const": "matrix_row_id"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "track"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "profile"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "operation"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "oracle_kind"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "oracle_case"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "identity"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "identity_evidence"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "effect_receipt_state"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "required_identity_fields"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "required_evidence_fields"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "identity_requirements"
+                      }
+                    },
+                    {
+                      "contains": {
+                        "const": "track_identity_requirements"
+                      }
+                    }
+                  ]
+                },
+                "properties": {
+                  "type": "object",
+                  "required": [
+                    "identity_evidence",
+                    "effect_receipt_state"
+                  ],
+                  "properties": {
+                    "identity_evidence": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/identityEvidence"
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "effect_receipt_state": {
+                      "type": "object",
+                      "required": [
+                        "$ref"
+                      ],
+                      "properties": {
+                        "$ref": {
+                          "const": "#/$defs/effectReceiptState"
+                        }
+                      },
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "additionalProperties": {
+                  "const": false
+                },
+                "identity_evidence": {
+                  "type": "object",
+                  "required": [
+                    "$ref"
+                  ],
+                  "properties": {
+                    "$ref": {
+                      "const": "#/$defs/identityEvidence"
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "effect_receipt_state": {
+                  "type": "object",
+                  "required": [
+                    "$ref"
+                  ],
+                  "properties": {
+                    "$ref": {
+                      "const": "#/$defs/effectReceiptState"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "additionalProperties": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
   }
 }
