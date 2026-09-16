@@ -17,7 +17,7 @@ use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::embedding::{MiniLmEncoder, PinnedEncoder, install};
 use tracedecay_memory_ncm_runtime::engine::{
     CorrectionRequest, FaultPoint, FeedbackRequest, MaintenanceKind, MaintenanceRequest, NcmEngine,
-    ObserveRequest, Outcome, RecallRequest, RejectReason,
+    ObserveAffect, ObserveRequest, Outcome, RecallRequest, RejectReason,
 };
 use tracedecay_memory_ncm_runtime::ports::{
     Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder,
@@ -68,6 +68,20 @@ fn observe_request(key: &str, value: &str, idempotency_key: &str) -> ObserveRequ
     request.payload_sha256 = request
         .canonical_payload_sha256()
         .expect("canonical payload serializes");
+    request
+}
+
+fn observe_request_with_affect(
+    key: &str,
+    value: &str,
+    idempotency_key: &str,
+    affect: ObserveAffect,
+) -> ObserveRequest {
+    let mut request = observe_request(key, value, idempotency_key);
+    request.affect = Some(affect);
+    request.payload_sha256 = request
+        .canonical_payload_sha256()
+        .expect("canonical affect payload serializes");
     request
 }
 
@@ -199,6 +213,105 @@ fn same_key_with_different_payload_is_rejected() {
         Outcome::Rejected(RejectReason::IdempotencyConflict)
     );
     assert_eq!(inspect(&engine, &ns), before);
+}
+
+#[test]
+fn unknown_affect_preset_is_rejected_before_persistence_and_reopen() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let root = state_root(&tempdir);
+    let ns = namespace(93);
+    let request = observe_request_with_affect(
+        "unknown preset",
+        "must not persist",
+        "unknown-preset",
+        ObserveAffect::Preset("mystery".to_owned()),
+    );
+    let engine = make_engine(&tempdir);
+
+    for (label, reply) in [
+        ("first", engine.observe(&ns, request.clone())),
+        ("duplicate", engine.observe(&ns, request.clone())),
+    ] {
+        assert_eq!(
+            reply.outcome,
+            Outcome::Rejected(RejectReason::InvalidRequest(
+                "unknown affect preset".to_owned()
+            )),
+            "{label} unknown preset admission"
+        );
+        assert_eq!(reply.state_generation, 0);
+    }
+    assert!(!root.path().join("namespaces").join(&ns).exists());
+    drop(engine);
+
+    let reopened = make_engine(&tempdir);
+    assert_eq!(reopened.handshake(&ns).outcome, Outcome::Success);
+    assert_eq!(reopened.handshake(&ns).payload["empty"], true);
+}
+
+#[test]
+fn known_affect_preset_replays_after_reopen() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let ns = namespace(94);
+    let request = observe_request_with_affect(
+        "known preset",
+        "must recover",
+        "known-preset",
+        ObserveAffect::Preset("positive".to_owned()),
+    );
+    let engine = make_engine(&tempdir);
+    let first = engine.observe(&ns, request.clone());
+    assert_eq!(first.outcome, Outcome::Success);
+    assert_eq!(first.state_generation, 1);
+    let duplicate = engine.observe(&ns, request.clone());
+    assert_eq!(duplicate.outcome, Outcome::Success);
+    assert_eq!(duplicate.payload["replayed"], true);
+    let before = inspect(&engine, &ns);
+    drop(engine);
+
+    let reopened = make_engine(&tempdir);
+    let replay = reopened.observe(&ns, request);
+    assert_eq!(replay.outcome, Outcome::Success);
+    assert_eq!(replay.state_generation, 1);
+    assert_eq!(replay.payload["replayed"], true);
+    assert_semantic_state_eq(&inspect(&reopened, &ns), &before);
+}
+
+#[test]
+fn affect_preset_names_remain_exact_case_sensitive() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let ns = namespace(95);
+    let engine = make_engine(&tempdir);
+    let known = engine.observe(
+        &ns,
+        observe_request_with_affect(
+            "lowercase preset",
+            "accepted",
+            "lowercase-preset",
+            ObserveAffect::Preset("positive".to_owned()),
+        ),
+    );
+    assert_eq!(known.outcome, Outcome::Success);
+
+    for name in ["Positive", " positive", "positive "] {
+        let reply = engine.observe(
+            &ns,
+            observe_request_with_affect(
+                "case-sensitive preset",
+                "rejected",
+                &format!("unknown-preset-{name}"),
+                ObserveAffect::Preset(name.to_owned()),
+            ),
+        );
+        assert_eq!(
+            reply.outcome,
+            Outcome::Rejected(RejectReason::InvalidRequest(
+                "unknown affect preset".to_owned()
+            )),
+            "preset {name:?} should be rejected"
+        );
+    }
+    assert_eq!(scalar(&inspect(&engine, &ns), "records"), 1);
 }
 
 #[test]

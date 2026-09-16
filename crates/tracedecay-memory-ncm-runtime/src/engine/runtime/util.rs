@@ -261,6 +261,9 @@ pub(super) fn resolve_affect(input: Option<&ObserveAffect>) -> Result<AffectVect
     match input {
         None => Ok(affect::neutral()),
         Some(ObserveAffect::Values(values)) => affect::validated(*values),
+        Some(ObserveAffect::Preset(name)) if !affect::is_known_preset(name) => {
+            Err(CoreError::Unsupported("unknown affect preset"))
+        }
         Some(ObserveAffect::Preset(name)) => affect::from_name(name),
     }
 }
@@ -411,6 +414,9 @@ pub(super) fn core_reply(error: CoreError, commit_seq: u64) -> EngineReply {
         }
         CoreError::UnknownRecord(record_id) => {
             EngineReply::rejected(RejectReason::UnknownRecord(record_id), commit_seq)
+        }
+        CoreError::Unsupported(what) if what == "unknown affect preset" => {
+            EngineReply::rejected(RejectReason::InvalidRequest(what.to_owned()), commit_seq)
         }
         CoreError::Unsupported(_) => {
             EngineReply::new(Outcome::Unsupported, commit_seq, Value::Null)

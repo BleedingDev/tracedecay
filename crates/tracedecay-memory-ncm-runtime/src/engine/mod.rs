@@ -134,13 +134,13 @@ impl EngineReply {
     }
 }
 
-/// Observe affect input: explicit channels or a Biomem-compatible preset name.
+/// Observe affect input: explicit channels or a known Biomem-compatible preset name.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObserveAffect {
     /// Explicit dopamine, serotonin, cortisol, and oxytocin channels.
     Values([f32; 4]),
-    /// Exact reference preset name; unknown names resolve to neutral.
+    /// Exact reference preset name; unknown names are rejected before admission.
     Preset(String),
 }
 

@@ -92,6 +92,28 @@ pub fn from_name(name: &str) -> Result<AffectVector, CoreError> {
     AffectVector::validated(values)
 }
 
+/// Returns whether `name` is one of the reference preset spellings.
+///
+/// This check is separate from [`from_name`] because the low-level signal
+/// helper intentionally preserves the reference's unknown-name-to-neutral
+/// behavior. Runtime admission must distinguish an explicit known preset from
+/// an unknown name before hashing and persisting the observation.
+#[must_use]
+pub fn is_known_preset(name: &str) -> bool {
+    matches!(
+        name,
+        "positive"
+            | "curious"
+            | "negative"
+            | "stressed"
+            | "social"
+            | "dopamin"
+            | "serotonin"
+            | "kortizol"
+            | "oxytocin"
+    )
+}
+
 /// Creates an affect vector from the reference's exact dictionary spellings.
 ///
 /// The accepted keys are `dopamin`, `serotonin`, `kortizol`, and `oxytocin`.
