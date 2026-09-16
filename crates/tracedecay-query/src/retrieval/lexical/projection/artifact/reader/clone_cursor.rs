@@ -96,6 +96,10 @@ pub enum CloneArtifactCursorPositionV2 {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloneFingerprintDiscoveryPositionV2 {
+    /// The immutable posting count is part of the ordered fingerprint key.
+    /// Keeping it in the cursor prevents a future artifact revision from
+    /// interpreting the same fingerprint as a different discovery boundary.
+    pub posting_count: u64,
     pub fingerprint: u64,
     #[serde(default)]
     pub symbol_occurrence_id: Option<SymbolOccurrenceId>,
@@ -851,6 +855,52 @@ mod tests {
                 .after,
             CloneArtifactCursorPositionV2::Exact {
                 symbol_occurrence_id: id("occurrence.clone-cursor"),
+            }
+        );
+    }
+
+    #[test]
+    fn fingerprint_discovery_cursor_round_trips_without_a_comparison_key() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let discovery = CloneFingerprintDiscoveryPositionV2 {
+            posting_count: 31,
+            fingerprint: 7,
+            symbol_occurrence_id: Some(id("occurrence.discovery")),
+            token_position: Some(4),
+        };
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                    discovery: discovery.clone(),
+                    comparison_body_digest: None,
+                    comparison_payload_digest: None,
+                },
+                UtcMicros(100),
+            )
+            .expect("signed discovery cursor");
+        let decoded = codec
+            .decode_artifact(
+                &encoded,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            )
+            .expect("verified discovery cursor");
+        assert_eq!(
+            decoded.after,
+            CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                discovery,
+                comparison_body_digest: None,
+                comparison_payload_digest: None,
             }
         );
     }

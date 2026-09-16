@@ -1374,6 +1374,11 @@ impl CodeLexicalArtifactReaderV1 {
                             "clone cursor position does not match an exact read".to_owned(),
                         ))
                     }
+                    CloneArtifactCursorPositionV1::FingerprintDiscovery { .. } => {
+                        Err(CodeLexicalArtifactErrorV1::Contract(
+                            "clone cursor position does not match an exact read".to_owned(),
+                        ))
+                    }
                 }
             }
             Some(_) => Err(CodeLexicalArtifactErrorV1::Contract(
