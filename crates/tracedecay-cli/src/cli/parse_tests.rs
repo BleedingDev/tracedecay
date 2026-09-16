@@ -618,6 +618,16 @@ fn status_and_branch_add_commands_dispatch_to_expected_variants() {
 }
 
 #[test]
+fn status_details_accepts_the_short_alias() {
+    let status =
+        Cli::try_parse_from(["tracedecay", "status", "-d"]).expect("status -d should parse");
+    assert!(matches!(
+        status.command,
+        Some(Commands::Status { details: true, .. })
+    ));
+}
+
+#[test]
 fn init_accepts_short_and_long_path_flag_like_dashboard_does() {
     // `-p, --path` is documented (see TOP_LEVEL_AFTER_HELP) and already works
     // on `dashboard`, `gitignore`, and `bench`; `init` previously only took

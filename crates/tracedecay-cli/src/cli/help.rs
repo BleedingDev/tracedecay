@@ -74,7 +74,7 @@ Examples:
   tracedecay status                              Human-readable project stats
   tracedecay status --json                       Machine-readable output
   tracedecay status --short                      Header only (version, tokens, sync)
-  tracedecay status --details                    Node-kind breakdown
+  tracedecay status --details                    Node-kind distribution
   tracedecay status --runtime                    PID/RSS/CPU/DB-size snapshot
   tracedecay status --project-id proj_123 --json Inspect another registered project
 

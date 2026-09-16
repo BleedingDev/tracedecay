@@ -259,7 +259,7 @@ pub enum Commands {
         #[arg(short, long)]
         short: bool,
         /// Show the node-kind distribution from the verified graph generation
-        #[arg(long)]
+        #[arg(short, long)]
         details: bool,
         /// Capture a runtime telemetry snapshot (PID, RSS, CPU%, DB / WAL
         /// sizes) — useful when reporting unexpected resource use (#80).
