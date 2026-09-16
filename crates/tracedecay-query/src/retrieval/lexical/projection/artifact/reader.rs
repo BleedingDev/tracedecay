@@ -1,6 +1,10 @@
 pub(super) mod clone_cursor;
 mod family_report;
 
+pub use clone_cursor::{
+    CloneArtifactCursorPositionV2, CloneArtifactCursorV2, CloneCursorCodecV1,
+    CloneCursorErrorV1, CloneCursorReadErrorV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
+};
 pub use family_report::{CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1};
 
 #[cfg(test)]
@@ -28,8 +32,8 @@ use tracedecay_domain::{
     CodeGenerationId, CodeSearchChunkGrainV1, CodeSearchChunkId, CompactCandidate,
     ComponentRevision, EvidenceRole, ExactAdmissionProof, ExactFieldV1, ExactTechnicalTermKindV1,
     FixedPointScore, LogicalEvidenceId, ManifestDigest, RetrieverBatch, RetrieverCoverage,
-    RetrieverKind, RetrieverOutcome, ScoreDomainId, SourceOccurrenceId, SourceSpan,
-    SymbolOccurrenceId, canonical_sha256,
+    RetrieverKind, RetrieverOutcome, RetrievalRequest, ScoreDomainId, SourceOccurrenceId,
+    SourceSpan, SymbolOccurrenceId, UtcMicros, canonical_sha256,
 };
 use tracedecay_private_fs::open_private_file;
 
@@ -38,7 +42,8 @@ use super::clone_census::{CodeLexicalCloneIndexCensusV1, read_clone_index_census
 use super::fingerprints::{
     CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1, CloneFingerprintArtifactReadV1,
     CloneFingerprintReadRequestV1, CloneSelectedBlockArtifactCandidateV1,
-    CloneSelectedBlockArtifactReadV1, read_clone_fingerprint_page,
+    CloneSelectedBlockArtifactReadV1, AuthenticatedCloneFingerprintArtifactReadV1,
+    AuthenticatedCloneSelectedBlockArtifactReadV1, read_clone_fingerprint_page,
 };
 use super::format::{
     ArtifactRowV1, CodeLexicalArtifactOccurrenceV1, CodeLexicalImportMembershipWitnessV1,
@@ -175,12 +180,105 @@ impl CloneArtifactCursorV1 {
         serde_json::from_slice(&bytes)
             .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
     }
+
+    /// Reconstruct the reader's internal cursor after the authenticated wire
+    /// envelope has been verified. The operation descriptor remains the
+    /// reader's request digest so the existing deterministic seek checks stay
+    /// in force.
+    pub fn from_authenticated(cursor: CloneArtifactCursorV2) -> Self {
+        Self {
+            artifact_digest: cursor.artifact_digest,
+            generation: cursor.generation,
+            request_digest: cursor.query_descriptor,
+            after: match cursor.after {
+                CloneArtifactCursorPositionV2::Exact {
+                    symbol_occurrence_id,
+                } => CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id),
+                CloneArtifactCursorPositionV2::Fingerprint {
+                    body_digest,
+                    payload_digest,
+                } => CloneArtifactCursorPositionV1::Fingerprint {
+                    body_digest,
+                    payload_digest,
+                },
+            },
+        }
+    }
+
+    /// Return the canonical operation descriptor carried by this internal
+    /// cursor. It is used only when minting the authenticated replacement
+    /// after the legacy reader has produced a next row.
+    pub fn query_descriptor(&self) -> &ManifestDigest {
+        &self.request_digest
+    }
+
+    pub fn artifact_digest(&self) -> &ManifestDigest {
+        &self.artifact_digest
+    }
+
+    pub fn generation(&self) -> &CodeGenerationId {
+        &self.generation
+    }
+
+    /// Convert this verified internal cursor into the authenticated clone
+    /// wire. The codec supplies the request/principal/scope binding; this
+    /// cursor supplies the reader operation and seek position.
+    pub fn encode_authenticated(
+        &self,
+        codec: &CloneCursorCodecV1<'_>,
+        snapshot_digest: ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorErrorV1> {
+        codec.issue_artifact(
+            self.artifact_digest.clone(),
+            self.generation.clone(),
+            snapshot_digest,
+            self.request_digest.clone(),
+            match &self.after {
+                CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id) => {
+                    CloneArtifactCursorPositionV2::Exact {
+                        symbol_occurrence_id: symbol_occurrence_id.clone(),
+                    }
+                }
+                CloneArtifactCursorPositionV1::Fingerprint {
+                    body_digest,
+                    payload_digest,
+                } => CloneArtifactCursorPositionV2::Fingerprint {
+                    body_digest: body_digest.clone(),
+                    payload_digest: payload_digest.clone(),
+                },
+            },
+            now,
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CloneArtifactPageV1<T> {
     pub members: Vec<T>,
     pub next_cursor: Option<CloneArtifactCursorV1>,
+}
+
+/// Artifact page projection exposed to serving callers. The page members stay
+/// typed while the continuation is already in its authenticated wire form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedCloneArtifactPageV1<T> {
+    pub members: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+fn map_authenticated_artifact_error(
+    error: CodeLexicalArtifactErrorV1,
+) -> CloneCursorReadErrorV1 {
+    match error {
+        CodeLexicalArtifactErrorV1::Contract(message)
+            if matches!(
+                message.as_str(),
+                "clone exact cursor does not match its artifact, key, or authority"
+                    | "clone fingerprint cursor does not match its artifact, generation, or request"
+            ) => CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale),
+        error => CloneCursorReadErrorV1::Artifact(error),
+    }
 }
 
 fn clone_authority_digest(
@@ -800,6 +898,56 @@ impl CodeLexicalArtifactReaderV1 {
         })
     }
 
+    /// Serve one exact clone page using the daemon-mounted retrieval
+    /// authority. The legacy reader remains the bounded row implementation;
+    /// this seam authenticates the incoming wire before handing it to that
+    /// reader and authenticates the next cursor before returning it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_page_authenticated(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneArtifactPageV1<CloneExactArtifactMemberV1>, CloneCursorReadErrorV1>
+    {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let cursor = cursor
+            .map(|encoded| {
+                let decoded = codec.decode_artifact_unbound(
+                    encoded,
+                    self.receipt.artifact_digest(),
+                    &self.metadata.generation,
+                    snapshot_digest,
+                    now,
+                )?;
+                if !matches!(decoded.after, CloneArtifactCursorPositionV2::Exact { .. }) {
+                    return Err(CloneCursorReadErrorV1::Cursor(
+                        CloneCursorErrorV1::Invalid,
+                    ));
+                }
+                Ok(CloneArtifactCursorV1::from_authenticated(decoded))
+            })
+            .transpose()?;
+        let page = self
+            .clone_exact_page(authority, key, cursor.as_ref(), limit, control)
+            .map_err(map_authenticated_artifact_error)?;
+        let next_cursor = page
+            .next_cursor
+            .as_ref()
+            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .transpose()?;
+        Ok(AuthenticatedCloneArtifactPageV1 {
+            members: page.members,
+            next_cursor,
+        })
+    }
+
     pub fn clone_fingerprint_page(
         &self,
         authority: &CloneBodyOccurrenceV1,
@@ -825,6 +973,67 @@ impl CodeLexicalArtifactReaderV1 {
                 control,
             },
         )
+    }
+
+    /// Serve a whole-body near-clone page through the authenticated cursor
+    /// boundary. The fingerprint reader retains ownership of its descriptor
+    /// calculation and verifies it after the authenticated cursor is mapped
+    /// back to the internal seek type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_fingerprint_page_authenticated(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneFingerprintArtifactReadV1, CloneCursorReadErrorV1> {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let cursor = cursor
+            .map(|encoded| {
+                let decoded = codec.decode_artifact_unbound(
+                    encoded,
+                    self.receipt.artifact_digest(),
+                    &self.metadata.generation,
+                    snapshot_digest,
+                    now,
+                )?;
+                if !matches!(
+                    decoded.after,
+                    CloneArtifactCursorPositionV2::Fingerprint { .. }
+                ) {
+                    return Err(CloneCursorReadErrorV1::Cursor(
+                        CloneCursorErrorV1::Invalid,
+                    ));
+                }
+                Ok(CloneArtifactCursorV1::from_authenticated(decoded))
+            })
+            .transpose()?;
+        let read = self
+            .clone_fingerprint_page(authority, source, cursor.as_ref(), limit, control)
+            .map_err(map_authenticated_artifact_error)?;
+        let next_cursor = read
+            .page
+            .next_cursor
+            .as_ref()
+            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .transpose()?;
+        Ok(AuthenticatedCloneFingerprintArtifactReadV1 {
+            page: AuthenticatedCloneArtifactPageV1 {
+                members: read.page.members,
+                next_cursor,
+            },
+            stream: read.stream,
+            source_eligibility: read.source_eligibility,
+            minimum_directional_coverage_millionths: read.minimum_directional_coverage_millionths,
+            coverage: read.coverage,
+            partial_reasons: read.partial_reasons,
+            accounting: read.accounting,
+        })
     }
 
     pub fn clone_body(
@@ -1030,6 +1239,72 @@ impl CodeLexicalArtifactReaderV1 {
                 next_cursor: read.page.next_cursor,
             },
             stream,
+            coverage: read.coverage,
+            partial_reasons: read.partial_reasons,
+            accounting: read.accounting,
+        })
+    }
+
+    /// Serve a selected-token-range near page through the authenticated cursor
+    /// boundary. Its descriptor includes the selected block and is checked by
+    /// the existing fingerprint reader after authentication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_selected_block_page_authenticated(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        selected_block: &CloneSelectedBlockV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneSelectedBlockArtifactReadV1, CloneCursorReadErrorV1> {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let cursor = cursor
+            .map(|encoded| {
+                let decoded = codec.decode_artifact_unbound(
+                    encoded,
+                    self.receipt.artifact_digest(),
+                    &self.metadata.generation,
+                    snapshot_digest,
+                    now,
+                )?;
+                if !matches!(
+                    decoded.after,
+                    CloneArtifactCursorPositionV2::Fingerprint { .. }
+                ) {
+                    return Err(CloneCursorReadErrorV1::Cursor(
+                        CloneCursorErrorV1::Invalid,
+                    ));
+                }
+                Ok(CloneArtifactCursorV1::from_authenticated(decoded))
+            })
+            .transpose()?;
+        let read = self
+            .clone_selected_block_page(
+                authority,
+                source,
+                selected_block,
+                cursor.as_ref(),
+                limit,
+                control,
+            )
+            .map_err(map_authenticated_artifact_error)?;
+        let next_cursor = read
+            .page
+            .next_cursor
+            .as_ref()
+            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .transpose()?;
+        Ok(AuthenticatedCloneSelectedBlockArtifactReadV1 {
+            page: AuthenticatedCloneArtifactPageV1 {
+                members: read.page.members,
+                next_cursor,
+            },
+            stream: read.stream,
             coverage: read.coverage,
             partial_reasons: read.partial_reasons,
             accounting: read.accounting,

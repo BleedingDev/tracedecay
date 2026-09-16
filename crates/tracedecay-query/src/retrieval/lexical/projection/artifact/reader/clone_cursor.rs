@@ -51,6 +51,18 @@ pub enum CloneCursorErrorV1 {
     Unavailable(String),
 }
 
+/// Failure while serving a clone page through the authenticated cursor
+/// boundary. Keeping cursor failures separate from artifact failures lets the
+/// application preserve invalid/tampered/stale/unavailable cursor semantics
+/// instead of collapsing them into a generic reader error.
+#[derive(Debug, Error)]
+pub enum CloneCursorReadErrorV1 {
+    #[error(transparent)]
+    Cursor(#[from] CloneCursorErrorV1),
+    #[error(transparent)]
+    Artifact(#[from] super::super::CodeLexicalArtifactErrorV1),
+}
+
 /// Exact-posting continuation position for the authenticated wire.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +89,21 @@ pub struct CloneFamilyCursorPositionV2 {
     /// absent when the cursor represents the ranked family boundary.
     #[serde(default)]
     pub scan_after: Option<CloneExactKeyV1>,
+    /// When a bounded posting read stopped in the middle of one family, seek
+    /// past this occurrence within `scan_after` before rebuilding that family.
+    /// Keeping the row boundary prevents an oversized family from being
+    /// skipped when the sentinel falls inside its posting run.
+    #[serde(default)]
+    pub scan_after_occurrence: Option<SymbolOccurrenceId>,
+    /// Prefix aggregate state retained when the posting budget stopped inside
+    /// a family. It lets the next page finish that family without replaying
+    /// the bounded prefix or dropping its members.
+    #[serde(default)]
+    pub minimum_source_bytes: u64,
+    #[serde(default)]
+    pub representative: Option<SymbolOccurrenceId>,
+    #[serde(default)]
+    pub has_pull_request_member: bool,
 }
 
 /// Authenticated artifact-reader cursor body returned after verification.
@@ -250,7 +277,64 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload.snapshot_digest,
             snapshot_digest,
             &payload.query_descriptor,
-            query_descriptor,
+            Some(query_descriptor),
+            payload.expires_at,
+            now,
+            self.request,
+        )?;
+        Ok(CloneArtifactCursorV2 {
+            artifact_digest: payload.artifact_digest,
+            generation: payload.generation,
+            snapshot_digest: payload.snapshot_digest,
+            query_descriptor: payload.query_descriptor,
+            after: payload.after,
+            expires_at: payload.expires_at,
+        })
+    }
+
+    /// Verify and decode an artifact continuation before the reader has
+    /// computed its operation-specific descriptor.
+    ///
+    /// The MAC still covers the complete admitted [`RetrievalRequest`], and
+    /// the artifact, generation, snapshot, principal, authorization, and
+    /// expiry bindings are checked here. The reader subsequently compares
+    /// `query_descriptor` with the canonical descriptor for the exact or
+    /// fingerprint operation. Keeping that final comparison in the reader is
+    /// necessary because the fingerprint descriptor includes the selected
+    /// token block, which is only available at the serving call site.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_artifact_unbound(
+        &self,
+        encoded: &str,
+        artifact_digest: &ManifestDigest,
+        generation: &CodeGenerationId,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<CloneArtifactCursorV2, CloneCursorErrorV1> {
+        let envelope = decode_envelope::<AuthenticatedCloneArtifactCursorV2>(encoded)?;
+        let payload_bytes =
+            serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
+        self.verify(
+            &envelope.payload.authentication_key_id,
+            &payload_bytes,
+            &envelope.authentication,
+        )?;
+        let payload = envelope.payload;
+        validate_common(
+            &payload.operation,
+            CLONE_ARTIFACT_CURSOR_OPERATION_V1,
+            payload.revision,
+            &payload.principal,
+            &payload.scope_digest,
+            &payload.authorization_revision,
+            &payload.artifact_digest,
+            artifact_digest,
+            &payload.generation,
+            generation,
+            &payload.snapshot_digest,
+            snapshot_digest,
+            &payload.query_descriptor,
+            None,
             payload.expires_at,
             now,
             self.request,
@@ -331,7 +415,56 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload.snapshot_digest,
             snapshot_digest,
             &payload.query_descriptor,
-            query_descriptor,
+            Some(query_descriptor),
+            payload.expires_at,
+            now,
+            self.request,
+        )?;
+        Ok(CloneFamilyCursorV2 {
+            artifact_digest: payload.artifact_digest,
+            generation: payload.generation,
+            snapshot_digest: payload.snapshot_digest,
+            query_descriptor: payload.query_descriptor,
+            after: payload.after,
+            expires_at: payload.expires_at,
+        })
+    }
+
+    /// Verify and decode a family continuation before the family reader has
+    /// computed its filter descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_family_unbound(
+        &self,
+        encoded: &str,
+        artifact_digest: &ManifestDigest,
+        generation: &CodeGenerationId,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<CloneFamilyCursorV2, CloneCursorErrorV1> {
+        let envelope = decode_envelope::<AuthenticatedCloneFamilyCursorV2>(encoded)?;
+        let payload_bytes =
+            serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
+        self.verify(
+            &envelope.payload.authentication_key_id,
+            &payload_bytes,
+            &envelope.authentication,
+        )?;
+        let payload = envelope.payload;
+        validate_common(
+            &payload.operation,
+            CLONE_FAMILY_CURSOR_OPERATION_V1,
+            payload.revision,
+            &payload.principal,
+            &payload.scope_digest,
+            &payload.authorization_revision,
+            &payload.artifact_digest,
+            artifact_digest,
+            &payload.generation,
+            generation,
+            &payload.snapshot_digest,
+            snapshot_digest,
+            &payload.query_descriptor,
+            None,
             payload.expires_at,
             now,
             self.request,
@@ -391,7 +524,7 @@ fn validate_common(
     encoded_snapshot_digest: &ManifestDigest,
     expected_snapshot_digest: &ManifestDigest,
     encoded_query_descriptor: &ManifestDigest,
-    expected_query_descriptor: &ManifestDigest,
+    expected_query_descriptor: Option<&ManifestDigest>,
     expires_at: UtcMicros,
     now: UtcMicros,
     request: &RetrievalRequest,
@@ -408,7 +541,8 @@ fn validate_common(
     if encoded_artifact_digest != expected_artifact_digest
         || encoded_generation != expected_generation
         || encoded_snapshot_digest != expected_snapshot_digest
-        || encoded_query_descriptor != expected_query_descriptor
+        || expected_query_descriptor
+            .is_some_and(|expected| encoded_query_descriptor != expected)
     {
         return Err(CloneCursorErrorV1::Stale);
     }
@@ -457,7 +591,8 @@ fn map_authority_error(error: QueryAuthorityErrorV1) -> CloneCursorErrorV1 {
         }
         authority @ (QueryAuthorityErrorV1::QueryAuthentication(
             crate::retrieval::fusion::QueryDigestAuthenticationError::KeyUnavailable,
-        ) | QueryAuthorityErrorV1::AuthorityUnavailable) => {
+        )
+        | QueryAuthorityErrorV1::AuthorityUnavailable) => {
             CloneCursorErrorV1::Unavailable(authority.to_string())
         }
         QueryAuthorityErrorV1::QueryAuthentication(
@@ -683,6 +818,10 @@ mod tests {
                     normalization_revision: 2,
                     digest: digest("family.clone-cursor"),
                     scan_after: None,
+                    scan_after_occurrence: None,
+                    minimum_source_bytes: 0,
+                    representative: None,
+                    has_pull_request_member: false,
                 },
                 UtcMicros(100),
             )

@@ -12,7 +12,10 @@ use tracedecay_code_index::production::CodeIndexExecutionControlV1;
 use tracedecay_domain::{ManifestDigest, RetrieverCoverage, SymbolOccurrenceId, canonical_sha256};
 
 use super::format::VerifiedCodeLexicalArtifactV1;
-use super::reader::{CloneArtifactCursorPositionV1, CloneArtifactCursorV1, CloneArtifactPageV1};
+use super::reader::{
+    AuthenticatedCloneArtifactPageV1, CloneArtifactCursorPositionV1, CloneArtifactCursorV1,
+    CloneArtifactPageV1,
+};
 use super::schema::LexicalArtifactLayoutV1;
 use super::{CodeLexicalArtifactErrorV1, sqlite_error};
 
@@ -96,6 +99,18 @@ pub struct CloneFingerprintArtifactReadV1 {
     pub accounting: CloneFingerprintReadAccountingV1,
 }
 
+/// Whole-body near evidence with an authenticated wire continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedCloneFingerprintArtifactReadV1 {
+    pub page: AuthenticatedCloneArtifactPageV1<CloneNearMatchArtifactV1>,
+    pub stream: Option<CloneFingerprintStreamDescriptorV1>,
+    pub source_eligibility: CloneBodyEligibilityV1,
+    pub minimum_directional_coverage_millionths: u32,
+    pub coverage: RetrieverCoverage,
+    pub partial_reasons: Vec<CloneFingerprintPartialReasonV1>,
+    pub accounting: CloneFingerprintReadAccountingV1,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CloneSelectedBlockContainmentClassV1 {
     Equal,
@@ -114,6 +129,16 @@ pub struct CloneSelectedBlockArtifactCandidateV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CloneSelectedBlockArtifactReadV1 {
     pub page: CloneArtifactPageV1<CloneSelectedBlockArtifactCandidateV1>,
+    pub stream: CloneFingerprintStreamDescriptorV1,
+    pub coverage: RetrieverCoverage,
+    pub partial_reasons: Vec<CloneFingerprintPartialReasonV1>,
+    pub accounting: CloneFingerprintReadAccountingV1,
+}
+
+/// Selected-token near evidence with an authenticated wire continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedCloneSelectedBlockArtifactReadV1 {
+    pub page: AuthenticatedCloneArtifactPageV1<CloneSelectedBlockArtifactCandidateV1>,
     pub stream: CloneFingerprintStreamDescriptorV1,
     pub coverage: RetrieverCoverage,
     pub partial_reasons: Vec<CloneFingerprintPartialReasonV1>,

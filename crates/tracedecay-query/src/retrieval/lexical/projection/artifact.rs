@@ -32,6 +32,7 @@ pub use fingerprints::{
     CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
     CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
     CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
+    AuthenticatedCloneFingerprintArtifactReadV1, AuthenticatedCloneSelectedBlockArtifactReadV1,
     CloneFingerprintArtifactReadV1, CloneFingerprintCancellationPointV1,
     CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
     CloneFingerprintStreamDescriptorV1, CloneNearMatchArtifactV1, CloneNearMatchExtentV1,
@@ -44,9 +45,12 @@ pub use format::{
 };
 pub use prepared::PreparedCodeLexicalArtifactPageV1;
 pub use reader::{
-    CloneArtifactCursorV1, CloneArtifactPageV1, CloneExactArtifactMemberV1,
-    CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1,
-    CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactReaderV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
+    AuthenticatedCloneArtifactPageV1, CloneArtifactCursorPositionV2, CloneArtifactCursorV1,
+    CloneArtifactCursorV2, CloneArtifactPageV1, CloneCursorCodecV1, CloneCursorErrorV1,
+    CloneCursorReadErrorV1, CloneExactArtifactMemberV1, CloneExactFamilyArtifactCandidateV1,
+    CloneExactFamilyArtifactPageV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
+    CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactReaderV1,
+    MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
 };
 pub use schema::CodeLexicalArtifactWriterRevisionV1;
 

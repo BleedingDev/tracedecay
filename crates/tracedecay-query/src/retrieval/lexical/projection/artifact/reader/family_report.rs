@@ -7,10 +7,14 @@ use tracedecay_code_index::clones::{
 };
 use tracedecay_code_index::production::CodeIndexExecutionControlV1;
 use tracedecay_domain::{
-    CodeGenerationId, ManifestDigest, ProjectId, RepositoryId, SymbolOccurrenceId, canonical_sha256,
+    CodeGenerationId, ManifestDigest, ProjectId, RepositoryId, RetrievalRequest,
+    SymbolOccurrenceId, UtcMicros, canonical_sha256,
 };
 
-use super::{CodeLexicalArtifactReaderV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1};
+use super::{
+    CloneCursorCodecV1, CloneCursorErrorV1, CloneCursorReadErrorV1, CodeLexicalArtifactReaderV1,
+    MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
+};
 use crate::retrieval::lexical::projection::artifact::{
     CodeLexicalArtifactErrorV1, checkpoint, sqlite_error,
 };
@@ -36,6 +40,17 @@ struct CloneFamilyCursorPositionV1 {
     /// cursor inspection, but are not used to seek a scan cursor.
     #[serde(default)]
     scan_after: Option<CloneExactKeyV1>,
+    /// If the posting-row budget stopped inside `scan_after`, this is the
+    /// last occurrence consumed from that family. A following page resumes
+    /// after the occurrence and can therefore finish an oversized family.
+    #[serde(default)]
+    scan_after_occurrence: Option<SymbolOccurrenceId>,
+    #[serde(default)]
+    minimum_source_bytes: u64,
+    #[serde(default)]
+    representative: Option<SymbolOccurrenceId>,
+    #[serde(default)]
+    has_pull_request_member: bool,
 }
 
 impl CloneFamilyCursorV1 {
@@ -50,6 +65,57 @@ impl CloneFamilyCursorV1 {
             .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
         serde_json::from_slice(&bytes)
             .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
+    }
+
+    fn from_authenticated(
+        cursor: super::CloneFamilyCursorV2,
+    ) -> Result<Self, CloneCursorErrorV1> {
+        let member_count = usize::try_from(cursor.after.member_count)
+            .map_err(|_| CloneCursorErrorV1::Invalid)?;
+        Ok(Self {
+            artifact_digest: cursor.artifact_digest,
+            generation: cursor.generation,
+            request_digest: cursor.query_descriptor,
+            after: CloneFamilyCursorPositionV1 {
+                reviewable_source_bytes: cursor.after.reviewable_source_bytes,
+                member_count,
+                class: cursor.after.class,
+                normalization_revision: cursor.after.normalization_revision,
+                digest: cursor.after.digest,
+                scan_after: cursor.after.scan_after,
+                scan_after_occurrence: cursor.after.scan_after_occurrence,
+                minimum_source_bytes: cursor.after.minimum_source_bytes,
+                representative: cursor.after.representative,
+                has_pull_request_member: cursor.after.has_pull_request_member,
+            },
+        })
+    }
+
+    fn encode_authenticated(
+        &self,
+        codec: &CloneCursorCodecV1<'_>,
+        snapshot_digest: ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorErrorV1> {
+        codec.issue_family(
+            self.artifact_digest.clone(),
+            self.generation.clone(),
+            snapshot_digest,
+            self.request_digest.clone(),
+            super::CloneFamilyCursorPositionV2 {
+                reviewable_source_bytes: self.after.reviewable_source_bytes,
+                member_count: self.after.member_count as u64,
+                class: self.after.class,
+                normalization_revision: self.after.normalization_revision,
+                digest: self.after.digest.clone(),
+                scan_after: self.after.scan_after.clone(),
+                scan_after_occurrence: self.after.scan_after_occurrence.clone(),
+                minimum_source_bytes: self.after.minimum_source_bytes,
+                representative: self.after.representative.clone(),
+                has_pull_request_member: self.after.has_pull_request_member,
+            },
+            now,
+        )
     }
 }
 
@@ -155,15 +221,52 @@ fn family_is_after_rank(
                                     && family.key.digest > after.digest)))))))
 }
 
-fn family_scan_cursor_position(key: &CloneExactKeyV1) -> CloneFamilyCursorPositionV1 {
+fn family_scan_cursor_position(
+    key: &CloneExactKeyV1,
+    scan_after_occurrence: Option<SymbolOccurrenceId>,
+    partial_family: Option<&CloneFamilyAggregateV1>,
+) -> CloneFamilyCursorPositionV1 {
     CloneFamilyCursorPositionV1 {
-        reviewable_source_bytes: 0,
-        member_count: 0,
+        reviewable_source_bytes: partial_family
+            .map(|family| family.reviewable_source_bytes)
+            .unwrap_or_default(),
+        member_count: partial_family
+            .map(|family| family.member_count)
+            .unwrap_or_default(),
         class: key.class,
         normalization_revision: key.normalization_revision,
         digest: key.digest.clone(),
         scan_after: Some(key.clone()),
+        scan_after_occurrence,
+        minimum_source_bytes: partial_family
+            .map(|family| family.minimum_source_bytes)
+            .unwrap_or_default(),
+        representative: partial_family.map(|family| family.representative.clone()),
+        has_pull_request_member: partial_family
+            .map(|family| family.has_pull_request_member)
+            .unwrap_or_default(),
     }
+}
+
+fn family_from_scan_cursor(
+    position: &CloneFamilyCursorPositionV1,
+) -> Option<CloneFamilyAggregateV1> {
+    let key = position.scan_after.as_ref()?.clone();
+    let representative = position.representative.clone()?;
+    let member_count = position.member_count;
+    let minimum_source_bytes = position.minimum_source_bytes;
+    let total_source_bytes = position
+        .reviewable_source_bytes
+        .saturating_add(minimum_source_bytes);
+    Some(CloneFamilyAggregateV1 {
+        key,
+        representative,
+        member_count,
+        total_source_bytes,
+        minimum_source_bytes,
+        reviewable_source_bytes: position.reviewable_source_bytes,
+        has_pull_request_member: position.has_pull_request_member,
+    })
 }
 
 fn family_rank_cursor_position(family: &CloneFamilyAggregateV1) -> CloneFamilyCursorPositionV1 {
@@ -174,6 +277,10 @@ fn family_rank_cursor_position(family: &CloneFamilyAggregateV1) -> CloneFamilyCu
         normalization_revision: family.key.normalization_revision,
         digest: family.key.digest.clone(),
         scan_after: None,
+        scan_after_occurrence: None,
+        minimum_source_bytes: 0,
+        representative: None,
+        has_pull_request_member: false,
     }
 }
 
@@ -307,6 +414,13 @@ impl CodeLexicalArtifactReaderV1 {
         let scan_after_digest = scan_after
             .map(|position| position.digest.as_str())
             .unwrap_or("");
+        let scan_after_occurrence = after.and_then(|position| {
+            position
+                .scan_after
+                .as_ref()
+                .and(position.scan_after_occurrence.as_ref())
+                .map(SymbolOccurrenceId::as_str)
+        });
         let connection = self.lock_connection()?;
         install_generated_path_function(&connection)?;
         install_pull_request_path_function(&connection, pull_request_paths)?;
@@ -330,7 +444,12 @@ impl CodeLexicalArtifactReaderV1 {
                             AND posting.normalization_revision > :scan_after_revision) \
                         OR (posting.class = :scan_after_class \
                             AND posting.normalization_revision = :scan_after_revision \
-                            AND posting.digest > :scan_after_digest)) \
+                            AND posting.digest > :scan_after_digest) \
+                        OR (posting.class = :scan_after_class \
+                            AND posting.normalization_revision = :scan_after_revision \
+                            AND posting.digest = :scan_after_digest \
+                            AND (NOT :has_scan_after_occurrence \
+                                 OR posting.symbol_occurrence_id > :scan_after_occurrence))) \
                  ORDER BY posting.class, posting.normalization_revision, posting.digest, \
                           posting.symbol_occurrence_id \
                  LIMIT :fetch",
@@ -346,6 +465,8 @@ impl CodeLexicalArtifactReaderV1 {
                 ":scan_after_class": i64::from(scan_after_class),
                 ":scan_after_revision": i64::from(scan_after_revision),
                 ":scan_after_digest": scan_after_digest,
+                ":has_scan_after_occurrence": scan_after_occurrence.is_some(),
+                ":scan_after_occurrence": scan_after_occurrence.unwrap_or(""),
                 ":fetch": i64::try_from(fetch)
                     .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?,
             })
@@ -353,8 +474,9 @@ impl CodeLexicalArtifactReaderV1 {
         let pull_request_set =
             pull_request_paths.map(|paths| paths.iter().cloned().collect::<BTreeSet<_>>());
         let mut aggregates = Vec::new();
-        let mut current: Option<CloneFamilyAggregateV1> = None;
+        let mut current = after.and_then(family_from_scan_cursor);
         let mut last_scanned_family_key = None;
+        let mut last_scanned_occurrence_id = None;
         let mut scan_sentinel_key = None;
         let mut scanned_rows = 0usize;
         let mut scan_truncated = false;
@@ -382,6 +504,7 @@ impl CodeLexicalArtifactReaderV1 {
             let occurrence_id =
                 SymbolOccurrenceId::new(row.get::<_, String>(3).map_err(sqlite_error)?)
                     .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
+            last_scanned_occurrence_id = Some(occurrence_id.clone());
             let posting_payload_digest =
                 ManifestDigest::new(row.get::<_, String>(4).map_err(sqlite_error)?)
                     .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
@@ -440,6 +563,7 @@ impl CodeLexicalArtifactReaderV1 {
                 .as_ref()
                 .zip(scan_sentinel_key.as_ref())
                 .is_some_and(|(family, sentinel)| family.key == *sentinel);
+        let partial_family = incomplete_current.then(|| current.clone()).flatten();
         if !incomplete_current {
             if let Some(previous) = current.take()
                 && previous.is_reportable(pull_request_set.is_some())
@@ -472,7 +596,7 @@ impl CodeLexicalArtifactReaderV1 {
             .take(limit)
             .map(|family| {
                 let after = if scan_mode {
-                    family_scan_cursor_position(&family.key)
+                    family_scan_cursor_position(&family.key, None, None)
                 } else {
                     family_rank_cursor_position(&family)
                 };
@@ -498,7 +622,13 @@ impl CodeLexicalArtifactReaderV1 {
         } else if scan_truncated {
             scan_advance_key
                 .as_ref()
-                .map(family_scan_cursor_position)
+                .map(|key| {
+                    let occurrence = last_scanned_family_key
+                        .as_ref()
+                        .filter(|last_key| *last_key == key)
+                        .and(last_scanned_occurrence_id.clone());
+                    family_scan_cursor_position(key, occurrence, partial_family.as_ref())
+                })
                 .map(|after| CloneFamilyCursorV1 {
                     artifact_digest: self.receipt.artifact_digest().clone(),
                     generation: self.metadata.generation.clone(),
@@ -515,6 +645,91 @@ impl CodeLexicalArtifactReaderV1 {
             next_cursor,
             partial: scan_mode,
         })
+    }
+
+    /// Serve one family page through the daemon-mounted authenticated cursor
+    /// boundary. The legacy family aggregator remains the bounded storage
+    /// implementation; this wrapper authenticates its input and replaces all
+    /// legacy continuations in the returned family projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_family_page_authenticated(
+        &self,
+        project_id: &ProjectId,
+        repository_id: &RepositoryId,
+        match_classes: &[CloneNormalizationClassV1],
+        path: Option<&str>,
+        pull_request_paths: Option<&[String]>,
+        pull_request_scope_digest: Option<&ManifestDigest>,
+        include_generated_paths: bool,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneExactFamilyArtifactPageV1, CloneCursorReadErrorV1> {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let legacy_cursor = cursor
+            .map(|encoded| {
+                CloneFamilyCursorV1::from_authenticated(codec.decode_family_unbound(
+                    encoded,
+                    self.receipt.artifact_digest(),
+                    &self.metadata.generation,
+                    snapshot_digest,
+                    now,
+                )?)
+            })
+            .transpose()?;
+        let legacy_encoded = legacy_cursor
+            .as_ref()
+            .map(CloneFamilyCursorV1::encode)
+            .transpose()
+            .map_err(CloneCursorReadErrorV1::Artifact)?;
+        let mut page = self
+            .clone_exact_family_page(
+                project_id,
+                repository_id,
+                match_classes,
+                path,
+                pull_request_paths,
+                pull_request_scope_digest,
+                include_generated_paths,
+                legacy_encoded.as_deref(),
+                limit,
+                control,
+            )
+            .map_err(map_authenticated_family_artifact_error)?;
+        for family in &mut page.families {
+            let legacy = CloneFamilyCursorV1::decode(&family.continuation)
+                .map_err(CloneCursorReadErrorV1::Artifact)?;
+            family.continuation = legacy
+                .encode_authenticated(&codec, snapshot_digest.clone(), now)
+                .map_err(CloneCursorReadErrorV1::Cursor)?;
+        }
+        page.next_cursor = page
+            .next_cursor
+            .as_deref()
+            .map(CloneFamilyCursorV1::decode)
+            .transpose()
+            .map_err(CloneCursorReadErrorV1::Artifact)?
+            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .transpose()
+            .map_err(CloneCursorReadErrorV1::Cursor)?;
+        Ok(page)
+    }
+}
+
+fn map_authenticated_family_artifact_error(
+    error: CodeLexicalArtifactErrorV1,
+) -> CloneCursorReadErrorV1 {
+    match error {
+        CodeLexicalArtifactErrorV1::Contract(message)
+            if message == "clone family cursor does not match its artifact or request" =>
+        {
+            CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale)
+        }
+        error => CloneCursorReadErrorV1::Artifact(error),
     }
 }
 
@@ -614,7 +829,7 @@ mod tests {
             artifact_digest: digest("artifact"),
             generation: id("generation.clone-family"),
             request_digest: digest("request"),
-            after: family_scan_cursor_position(&family_key),
+        after: family_scan_cursor_position(&family_key, None, None),
         };
 
         let encoded = cursor.encode().expect("encode family cursor");
