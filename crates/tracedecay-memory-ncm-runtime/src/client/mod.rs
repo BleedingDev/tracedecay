@@ -715,19 +715,36 @@ fn idempotency_key(request: &Request) -> Option<&str> {
     if request.op.is_mutating() {
         request
             .payload
-            .get("idempotency_key")
+            .pointer("/common_control/idempotency_key")
             .or_else(|| {
-                matches!(request.op, Operation::SnapshotRestore | Operation::Replay)
-                    .then(|| {
-                        request
-                            .payload
-                            .pointer("/common_portability/idempotency_key")
-                    })
-                    .flatten()
-            })?
-            .as_str()
+                request
+                    .payload
+                    .pointer("/common_portability/idempotency_key")
+            })
+            .or_else(|| request.payload.get("idempotency_key"))
+            .and_then(Value::as_str)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idempotency_key_reads_common_control_before_legacy_fields() {
+        let request = Request::new(
+            1,
+            1_000,
+            Operation::Maintenance,
+            "namespace",
+            serde_json::json!({
+                "idempotency_key": "legacy-key",
+                "common_control": {"idempotency_key": "common-key"}
+            }),
+        );
+        assert_eq!(idempotency_key(&request), Some("common-key"));
     }
 }
 
