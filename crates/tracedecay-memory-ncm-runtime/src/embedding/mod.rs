@@ -486,7 +486,7 @@ impl TextEncoder for MiniLmEncoder {
 /// Named deterministic test doubles for runtime tests that do not need ORT.
 pub mod doubles {
     use super::{
-        validate_input, Deadline, Embedding, EncoderError, EncoderIdentity, Sha256, TextEncoder,
+        Deadline, Embedding, EncoderError, EncoderIdentity, Sha256, TextEncoder, validate_input,
     };
     use sha2::Digest;
     use tracedecay_memory_ncm_core::types::EMBEDDING_DIM;
@@ -1040,8 +1040,8 @@ fn digest_bytes(bytes: &[u8]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        cache_snapshot, digest_bytes, read_snapshot_file, read_verified_artifact, EncoderFile,
-        CACHE_REPOSITORY_DIR, MODEL_REVISION,
+        CACHE_REPOSITORY_DIR, EncoderFile, MODEL_REVISION, cache_snapshot, digest_bytes,
+        read_snapshot_file, read_verified_artifact,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
