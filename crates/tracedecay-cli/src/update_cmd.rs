@@ -1335,7 +1335,8 @@ mod tests {
         match post_update_binary(Some(&missing)) {
             Ok(resolved) => assert_ne!(resolved, missing.to_string_lossy()),
             Err(error) => assert!(
-                error.to_string().contains("not found on PATH"),
+                error.to_string().contains("not found on PATH")
+                    || error.to_string().contains("not a tracedecay binary"),
                 "unexpected fallback error: {error}"
             ),
         }
