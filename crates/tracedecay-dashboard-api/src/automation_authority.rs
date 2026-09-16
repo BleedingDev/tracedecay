@@ -17,7 +17,9 @@ use tracedecay_automation_runtime::automation::managed_skills::{
 };
 use tracedecay_automation_runtime::automation::skill_writer::ManagedSkillDeploymentReceipt;
 use tracedecay_contracts::ApplicationProblemEnvelope;
-use tracedecay_contracts::retained_surfaces::{AutomationRunProblemV1, AutomationRunResultV1};
+use tracedecay_contracts::retained_surfaces::{
+    AutomationRunProblemV1, AutomationRunResultV1, LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1,
+};
 
 use super::DashboardHttpRequestControlV1;
 
@@ -121,7 +123,42 @@ pub(crate) fn exact_automation_authority(
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DashboardAutomationRunRequestV1 {
-    UserJob { job_id: String, run_id: String },
+    /// Run the bounded Memory Curator through the dashboard's admitted daemon
+    /// authority. `None` preserves the runtime's registered default.
+    MemoryCurator {
+        fact_review_limit: Option<usize>,
+        min_confidence: Option<f64>,
+    },
+    /// Run the bounded Session Reflector through the dashboard's admitted
+    /// daemon authority. Optional fields preserve the runtime defaults.
+    SessionReflector {
+        provider: Option<String>,
+        query: Option<String>,
+        evidence_limit: Option<usize>,
+        scope: Option<LcmSearchScopeV1>,
+        session_id: Option<String>,
+        include_summaries: Option<bool>,
+        include_recent_sessions: Option<bool>,
+        recent_sessions_limit: Option<usize>,
+        sort: Option<LcmGrepSortV1>,
+        source: Option<String>,
+        role: Option<LcmRoleV1>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    },
+    /// Run the bounded Skill Writer through the dashboard's admitted daemon
+    /// authority. Optional fields preserve the runtime defaults.
+    SkillWriter {
+        provider: Option<String>,
+        query: Option<String>,
+        evidence_limit: Option<usize>,
+        include_recent_sessions: Option<bool>,
+        recent_sessions_limit: Option<usize>,
+    },
+    UserJob {
+        job_id: String,
+        run_id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +388,80 @@ mod tests {
             result,
             Err(DashboardAutomationAuthorityErrorV1::Unavailable { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn automation_authority_forwards_each_typed_dashboard_run_variant() {
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_run = Arc::clone(&observed);
+        let run: DashboardAutomationRunPortV1 = Arc::new(move |invocation| {
+            observed_run
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(invocation.request);
+            Box::pin(async {
+                Err(DashboardAutomationAuthorityErrorV1::unavailable(
+                    "typed dashboard run test",
+                ))
+            })
+        });
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\profiles\selected")
+        } else {
+            PathBuf::from("/profiles/selected")
+        };
+        let project_root = if cfg!(windows) {
+            PathBuf::from(r"C:\projects\selected")
+        } else {
+            PathBuf::from("/projects/selected")
+        };
+        let authority = DashboardAutomationAuthorityV1::new(root, run, unavailable_skill_port())
+            .expect("absolute selected profile root");
+        let requests = vec![
+            DashboardAutomationRunRequestV1::MemoryCurator {
+                fact_review_limit: Some(12),
+                min_confidence: Some(0.72),
+            },
+            DashboardAutomationRunRequestV1::SessionReflector {
+                provider: Some("cursor".to_owned()),
+                query: Some("workflow correction".to_owned()),
+                evidence_limit: Some(7),
+                scope: Some(LcmSearchScopeV1::All),
+                session_id: Some("session-1".to_owned()),
+                include_summaries: Some(true),
+                include_recent_sessions: Some(true),
+                recent_sessions_limit: Some(3),
+                sort: Some(LcmGrepSortV1::Relevance),
+                source: Some("codex".to_owned()),
+                role: Some(LcmRoleV1::Assistant),
+                start_time: Some(10),
+                end_time: Some(20),
+            },
+            DashboardAutomationRunRequestV1::SkillWriter {
+                provider: Some("all".to_owned()),
+                query: Some("repeated correction".to_owned()),
+                evidence_limit: Some(9),
+                include_recent_sessions: Some(false),
+                recent_sessions_limit: Some(2),
+            },
+        ];
+
+        for request in requests.iter().cloned() {
+            let result = authority
+                .run(&project_root, request, request_control())
+                .await;
+            assert!(matches!(
+                result,
+                Err(DashboardAutomationAuthorityErrorV1::Unavailable { .. })
+            ));
+        }
+
+        assert_eq!(
+            *observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            requests
+        );
     }
 
     #[tokio::test]

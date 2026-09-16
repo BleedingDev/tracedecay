@@ -4,12 +4,138 @@ use axum::response::Json;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::DashboardState;
+use super::automation_authority::{
+    DashboardAutomationRunRequestV1, automation_authority_error_response,
+    exact_automation_authority,
+};
 use super::util::http_detail;
+use super::{DashboardHttpRequestControlV1, DashboardState};
 use tracedecay_automation_runtime::automation::run_ledger::{
     AutomationRunArtifact, AutomationRunArtifactKind, AutomationRunLedgerRecord, find_run_record,
     read_published_artifact_chain, read_run_artifact_payload,
 };
+use tracedecay_contracts::retained_surfaces::{LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1};
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryCuratorRunBody {
+    fact_review_limit: Option<usize>,
+    min_confidence: Option<f64>,
+}
+
+impl From<MemoryCuratorRunBody> for DashboardAutomationRunRequestV1 {
+    fn from(body: MemoryCuratorRunBody) -> Self {
+        Self::MemoryCurator {
+            fact_review_limit: body.fact_review_limit,
+            min_confidence: body.min_confidence,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReflectorRunBody {
+    provider: Option<String>,
+    query: Option<String>,
+    evidence_limit: Option<usize>,
+    scope: Option<LcmSearchScopeV1>,
+    session_id: Option<String>,
+    include_summaries: Option<bool>,
+    include_recent_sessions: Option<bool>,
+    recent_sessions_limit: Option<usize>,
+    sort: Option<LcmGrepSortV1>,
+    source: Option<String>,
+    role: Option<LcmRoleV1>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+}
+
+impl From<SessionReflectorRunBody> for DashboardAutomationRunRequestV1 {
+    fn from(body: SessionReflectorRunBody) -> Self {
+        Self::SessionReflector {
+            provider: body.provider,
+            query: body.query,
+            evidence_limit: body.evidence_limit,
+            scope: body.scope,
+            session_id: body.session_id,
+            include_summaries: body.include_summaries,
+            include_recent_sessions: body.include_recent_sessions,
+            recent_sessions_limit: body.recent_sessions_limit,
+            sort: body.sort,
+            source: body.source,
+            role: body.role,
+            start_time: body.start_time,
+            end_time: body.end_time,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillWriterRunBody {
+    provider: Option<String>,
+    query: Option<String>,
+    evidence_limit: Option<usize>,
+    include_recent_sessions: Option<bool>,
+    recent_sessions_limit: Option<usize>,
+}
+
+impl From<SkillWriterRunBody> for DashboardAutomationRunRequestV1 {
+    fn from(body: SkillWriterRunBody) -> Self {
+        Self::SkillWriter {
+            provider: body.provider,
+            query: body.query,
+            evidence_limit: body.evidence_limit,
+            include_recent_sessions: body.include_recent_sessions,
+            recent_sessions_limit: body.recent_sessions_limit,
+        }
+    }
+}
+
+#[hotpath::measure(label = "dashboard_api.automation.memory_curator", future = true)]
+pub async fn memory_curator(
+    State(state): State<DashboardState>,
+    axum::Extension(control): axum::Extension<DashboardHttpRequestControlV1>,
+    body: Option<axum::extract::Json<MemoryCuratorRunBody>>,
+) -> (StatusCode, Json<Value>) {
+    let body = body.map(|body| body.0).unwrap_or_default();
+    run_dashboard_task_endpoint(state, body.into(), control).await
+}
+
+#[hotpath::measure(label = "dashboard_api.automation.session_reflector", future = true)]
+pub async fn session_reflection(
+    State(state): State<DashboardState>,
+    axum::Extension(control): axum::Extension<DashboardHttpRequestControlV1>,
+    body: Option<axum::extract::Json<SessionReflectorRunBody>>,
+) -> (StatusCode, Json<Value>) {
+    let body = body.map(|body| body.0).unwrap_or_default();
+    run_dashboard_task_endpoint(state, body.into(), control).await
+}
+
+#[hotpath::measure(label = "dashboard_api.automation.skill_writer", future = true)]
+pub async fn skill_writing(
+    State(state): State<DashboardState>,
+    axum::Extension(control): axum::Extension<DashboardHttpRequestControlV1>,
+    body: Option<axum::extract::Json<SkillWriterRunBody>>,
+) -> (StatusCode, Json<Value>) {
+    let body = body.map(|body| body.0).unwrap_or_default();
+    run_dashboard_task_endpoint(state, body.into(), control).await
+}
+
+async fn run_dashboard_task_endpoint(
+    state: DashboardState,
+    request: DashboardAutomationRunRequestV1,
+    control: DashboardHttpRequestControlV1,
+) -> (StatusCode, Json<Value>) {
+    let authority = match exact_automation_authority(&state) {
+        Ok(authority) => authority,
+        Err(error) => return automation_authority_error_response(error),
+    };
+    match authority.run(&state.project_root, request, control).await {
+        Ok(payload) => (StatusCode::OK, Json(json!({ "run": payload }))),
+        Err(error) => automation_authority_error_response(error),
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct RunListParams {
@@ -217,4 +343,93 @@ fn expected_artifact_chain_kinds() -> Vec<&'static str> {
         AutomationRunArtifactKind::OptimizerDiagnosis.as_str(),
         AutomationRunArtifactKind::CodexHandoff.as_str(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_run_bodies_project_current_typed_options() {
+        let memory = serde_json::from_value::<MemoryCuratorRunBody>(json!({
+            "fact_review_limit": 12,
+            "min_confidence": 0.72,
+        }))
+        .expect("memory-curator body");
+        assert_eq!(
+            DashboardAutomationRunRequestV1::from(memory),
+            DashboardAutomationRunRequestV1::MemoryCurator {
+                fact_review_limit: Some(12),
+                min_confidence: Some(0.72),
+            }
+        );
+
+        let reflector = serde_json::from_value::<SessionReflectorRunBody>(json!({
+            "provider": "cursor",
+            "query": "workflow correction",
+            "evidence_limit": 7,
+            "scope": "all",
+            "session_id": "session-1",
+            "include_summaries": true,
+            "include_recent_sessions": true,
+            "recent_sessions_limit": 3,
+            "sort": "hybrid",
+            "source": "codex",
+            "role": "assistant",
+            "start_time": 10,
+            "end_time": 20,
+        }))
+        .expect("session-reflection body");
+        assert_eq!(
+            DashboardAutomationRunRequestV1::from(reflector),
+            DashboardAutomationRunRequestV1::SessionReflector {
+                provider: Some("cursor".to_owned()),
+                query: Some("workflow correction".to_owned()),
+                evidence_limit: Some(7),
+                scope: Some(LcmSearchScopeV1::All),
+                session_id: Some("session-1".to_owned()),
+                include_summaries: Some(true),
+                include_recent_sessions: Some(true),
+                recent_sessions_limit: Some(3),
+                sort: Some(LcmGrepSortV1::Hybrid),
+                source: Some("codex".to_owned()),
+                role: Some(LcmRoleV1::Assistant),
+                start_time: Some(10),
+                end_time: Some(20),
+            }
+        );
+
+        let writer = serde_json::from_value::<SkillWriterRunBody>(json!({
+            "provider": "all",
+            "query": "repeated correction",
+            "evidence_limit": 9,
+            "include_recent_sessions": false,
+            "recent_sessions_limit": 2,
+        }))
+        .expect("skill-writing body");
+        assert_eq!(
+            DashboardAutomationRunRequestV1::from(writer),
+            DashboardAutomationRunRequestV1::SkillWriter {
+                provider: Some("all".to_owned()),
+                query: Some("repeated correction".to_owned()),
+                evidence_limit: Some(9),
+                include_recent_sessions: Some(false),
+                recent_sessions_limit: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn manual_run_bodies_reject_unregistered_storage_selectors() {
+        for body in [
+            json!({"hermes_home": "/tmp/hermes"}),
+            json!({"storage_scope": "hermes_profile"}),
+            json!({"unsupported_field": true}),
+        ] {
+            assert!(
+                serde_json::from_value::<SkillWriterRunBody>(body).is_err(),
+                "unregistered skill-writer body field must be rejected"
+            );
+        }
+    }
 }
