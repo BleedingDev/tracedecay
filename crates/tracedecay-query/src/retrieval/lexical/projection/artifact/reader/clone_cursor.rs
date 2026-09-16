@@ -111,6 +111,14 @@ pub struct CloneFingerprintDiscoveryPositionV2 {
     pub symbol_occurrence_id: Option<SymbolOccurrenceId>,
     #[serde(default)]
     pub token_position: Option<u32>,
+    /// The candidate whose body alignment exhausted the current page's work
+    /// budget. This key is deliberately separate from the completed
+    /// comparison key carried by the surrounding cursor position: the next
+    /// page must retry this candidate before advancing past it.
+    #[serde(default)]
+    pub pending_comparison_body_digest: Option<ManifestDigest>,
+    #[serde(default)]
+    pub pending_comparison_payload_digest: Option<ManifestDigest>,
     /// Marks the boundary between bounded posting discovery and the later
     /// comparison pass. A completed discovery cursor deliberately carries no
     /// row position; the next read replays the immutable posting stream from
@@ -123,6 +131,11 @@ pub struct CloneFingerprintDiscoveryPositionV2 {
 impl CloneFingerprintDiscoveryPositionV2 {
     fn validate(&self) -> Result<(), CloneCursorErrorV1> {
         if self.symbol_occurrence_id.is_some() != self.token_position.is_some() {
+            return Err(CloneCursorErrorV1::Invalid);
+        }
+        if self.pending_comparison_body_digest.is_some()
+            != self.pending_comparison_payload_digest.is_some()
+        {
             return Err(CloneCursorErrorV1::Invalid);
         }
         if self.complete && self.symbol_occurrence_id.is_some() {
@@ -1052,6 +1065,8 @@ mod tests {
             fingerprint: 7,
             symbol_occurrence_id: Some(id("occurrence.discovery")),
             token_position: Some(4),
+            pending_comparison_body_digest: None,
+            pending_comparison_payload_digest: None,
             complete: false,
         };
         let encoded = codec
@@ -1085,6 +1100,69 @@ mod tests {
                 comparison_body_digest: None,
                 comparison_payload_digest: None,
             }
+        );
+    }
+
+    #[test]
+    fn fingerprint_discovery_cursor_round_trips_a_pending_comparison_key() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let discovery = CloneFingerprintDiscoveryPositionV2 {
+            posting_count: 31,
+            fingerprint: 7,
+            symbol_occurrence_id: None,
+            token_position: None,
+            pending_comparison_body_digest: Some(digest("body.pending")),
+            pending_comparison_payload_digest: Some(digest("payload.pending")),
+            complete: true,
+        };
+        let position = CloneArtifactCursorPositionV2::FingerprintDiscovery {
+            discovery: discovery.clone(),
+            comparison_body_digest: Some(digest("body.completed")),
+            comparison_payload_digest: Some(digest("payload.completed")),
+        };
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                position.clone(),
+                UtcMicros(100),
+            )
+            .expect("signed pending discovery cursor");
+        let decoded = codec
+            .decode_artifact(
+                &encoded,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            )
+            .expect("verified pending discovery cursor");
+        assert_eq!(decoded.after, position);
+
+        let malformed = CloneFingerprintDiscoveryPositionV2 {
+            pending_comparison_payload_digest: None,
+            ..discovery
+        };
+        assert_eq!(
+            codec.issue_artifact(
+                artifact,
+                generation,
+                snapshot,
+                descriptor,
+                CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                    discovery: malformed,
+                    comparison_body_digest: None,
+                    comparison_payload_digest: None,
+                },
+                UtcMicros(100),
+            ),
+            Err(CloneCursorErrorV1::Invalid)
         );
     }
 
