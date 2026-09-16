@@ -1730,6 +1730,35 @@ impl ProjectOpenInputs<'_> {
         }
         let full_construction_started = Instant::now();
         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
+        #[cfg(feature = "memory-provider-host")]
+        {
+            let retrieval = match full_candidate
+                .project_session_application_retrieval_service(&code_index.scope)
+            {
+                Ok(retrieval) => retrieval,
+                Err(error) => {
+                    shutdown_failed_provider_full_mount(
+                        &provider_full_mount,
+                        self.canonical_project_path,
+                    )
+                    .await;
+                    full_candidate.shutdown().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = core
+                .memory_provider_host
+                .bind_session_retrieval(retrieval)
+            {
+                shutdown_failed_provider_full_mount(
+                    &provider_full_mount,
+                    self.canonical_project_path,
+                )
+                .await;
+                full_candidate.shutdown().await;
+                return Err(TraceDecayError::Config { message: error });
+            }
+        }
         if full_candidate
             .install_generation_census_reader(Arc::clone(&code_index.generation_census_reader))
             .is_err()

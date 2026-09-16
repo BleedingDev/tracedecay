@@ -220,9 +220,27 @@ fn legacy_common_feedback_without_capsule_replays_without_inventing_public_ident
 #[test]
 fn common_control_recovery_recomputes_semantics_from_receipt_input() {
     #[derive(Serialize)]
+    struct ReplyIntegrityBasis<'a> {
+        outcome: &'a Value,
+        state_generation: &'a Value,
+        payload: &'a Value,
+    }
+
+    #[derive(Serialize)]
+    struct CommonControlIntegrityBasis<'a> {
+        operations: &'a Value,
+        canonical_input: &'a Value,
+    }
+
+    #[derive(Serialize)]
+    struct OperationIntegrityBasis<'a> {
+        common_control: CommonControlIntegrityBasis<'a>,
+    }
+
+    #[derive(Serialize)]
     struct IntegrityBasis<'a> {
-        reply: &'a Value,
-        operation: &'a Value,
+        reply: ReplyIntegrityBasis<'a>,
+        operation: OperationIntegrityBasis<'a>,
         state_digest: &'a str,
     }
 
@@ -253,8 +271,17 @@ fn common_control_recovery_recomputes_semantics_from_receipt_input() {
     receipt["operation"]["common_control"]["canonical_input"] = json!({"tampered": true});
     let state_digest = receipt["state_digest"].as_str().unwrap().to_owned();
     let integrity = IntegrityBasis {
-        reply: &receipt["reply"],
-        operation: &receipt["operation"],
+        reply: ReplyIntegrityBasis {
+            outcome: &receipt["reply"]["outcome"],
+            state_generation: &receipt["reply"]["state_generation"],
+            payload: &receipt["reply"]["payload"],
+        },
+        operation: OperationIntegrityBasis {
+            common_control: CommonControlIntegrityBasis {
+                operations: &receipt["operation"]["common_control"]["operations"],
+                canonical_input: &receipt["operation"]["common_control"]["canonical_input"],
+            },
+        },
         state_digest: &state_digest,
     };
     receipt["integrity_digest"] = json!(digest(&serde_json::to_vec(&integrity).unwrap()));
