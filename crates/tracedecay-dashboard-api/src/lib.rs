@@ -2225,6 +2225,12 @@ mod authority_tests {
                     "/api/application/retained/fact_store_curate",
                     post(deadline_budget),
                 )
+                .route("/api/automation/run/memory-curator", post(deadline_budget))
+                .route(
+                    "/api/automation/run/session-reflection",
+                    post(deadline_budget),
+                )
+                .route("/api/automation/run/skill-writing", post(deadline_budget))
                 .route("/api/automation/runs", get(deadline_budget)),
             std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         );
@@ -2232,6 +2238,21 @@ mod authority_tests {
             (
                 Method::POST,
                 "/api/application/retained/fact_store_curate",
+                DASHBOARD_AUTOMATION_RUN_REQUEST_DEADLINE_MICROS,
+            ),
+            (
+                Method::POST,
+                "/api/automation/run/memory-curator",
+                DASHBOARD_AUTOMATION_RUN_REQUEST_DEADLINE_MICROS,
+            ),
+            (
+                Method::POST,
+                "/api/automation/run/session-reflection",
+                DASHBOARD_AUTOMATION_RUN_REQUEST_DEADLINE_MICROS,
+            ),
+            (
+                Method::POST,
+                "/api/automation/run/skill-writing",
                 DASHBOARD_AUTOMATION_RUN_REQUEST_DEADLINE_MICROS,
             ),
             (
