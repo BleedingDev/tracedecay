@@ -1,6 +1,8 @@
 //! Serving handles for the latest complete generation: query owners, the
 //! durable lexical text artifact, and graph activation state.
 mod family_report;
+#[cfg(test)]
+mod similar_tests;
 
 use std::{
     collections::VecDeque,
@@ -74,14 +76,16 @@ use crate::{
             CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
             CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
             CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeExactLexicalArtifactReaderV1,
-            CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
-            CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
-            CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
-            CodeLexicalArtifactWriterRevisionV1, CodeLexicalCloneIndexCensusV1,
-            CodeLexicalCloneSuccessorV1, CodeLexicalProjectionMetadataV1, LexicalLane,
-            LexicalLaneEvidence, LexicalLaneRequest, LexicalLaneRetriever,
-            code_lexical_artifact_build_memory_budget_for,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintArtifactReadV1,
+            CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
+            CloneFingerprintStreamDescriptorV1, CloneSelectedBlockArtifactReadV1,
+            CloneSelectedBlockV1, CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBuilderV1,
+            CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationPhaseV1,
+            CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactOccurrenceV1,
+            CodeLexicalArtifactReaderV1, CodeLexicalArtifactWriterRevisionV1,
+            CodeLexicalCloneIndexCensusV1, CodeLexicalCloneSuccessorV1,
+            CodeLexicalProjectionMetadataV1, LexicalLane, LexicalLaneEvidence, LexicalLaneRequest,
+            LexicalLaneRetriever, code_lexical_artifact_build_memory_budget_for,
         },
         ports::RetrievalPortError,
     },
@@ -587,6 +591,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
         Option<tracedecay_query::code_search::CodeIndexSimilarCompletedV1>,
         RetrievalPortError,
     > {
+        check_similar_control(control)?;
         let source = match &request.target {
             tracedecay_query::code_search::CodeIndexSimilarTargetV1::SymbolOccurrence(
                 occurrence,
@@ -595,10 +600,23 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 self.hydration.clone_body_by_source_range(path, *span)
             }
         }
-        .map_err(|error| RetrievalPortError::AuthorityUnavailable(error.to_string()))?;
+        .map_err(map_text_artifact_error)?;
         let Some(source) = source else {
             return Ok(None);
         };
+        check_similar_control(control)?;
+        self.validate_similar_source(&source)?;
+
+        // A fingerprint cursor continues the near lane. Replaying it through
+        // the exact reader would fail its request-digest check, so the exact
+        // lane is deliberately omitted on that continuation. An exact cursor
+        // continues exact families while the additive near lane starts a new
+        // page; the two readers have intentionally distinct cursor domains.
+        let near_cursor = request
+            .cursor
+            .as_ref()
+            .filter(|cursor| cursor.fingerprint_continuation_digests().is_some());
+        let continue_near = near_cursor.is_some();
         // Request-wide budgets: share result_limit and work_limit across match
         // classes instead of resetting a per-family page size on each key.
         let mut remaining_results = request.result_limit;
@@ -610,49 +628,165 @@ impl ProductionCodeIndexQueryOwnersV1 {
             .filter(|key| request.match_classes.contains(&key.class))
             .collect::<Vec<_>>();
         let mut exact_groups = Vec::new();
-        for (key_index, key) in exact_keys.iter().cloned().enumerate() {
-            if remaining_results == 0 || remaining_work == 0 {
-                // Keep every key whose stream was never visited in the
-                // response. An omitted key is indistinguishable from a key
-                // with no matches at the MCP boundary; marking it incomplete
-                // makes the shared-budget cutoff visible to the caller. A
-                // per-key continuation is minted only after that key has
-                // actually been read, so an unvisited key is intentionally
-                // restartable from the original request.
-                exact_groups.extend(incomplete_exact_groups(&exact_keys[key_index..]));
-                break;
-            }
-            let page_limit = remaining_results.min(remaining_work);
-            let page = self.verified_exact_clone_page(
-                &source,
-                &key,
-                request.cursor.as_ref(),
-                page_limit,
-                control,
-            )?;
-            remaining_results = remaining_results.saturating_sub(page.members.len());
-            // The reader reports every decoded posting row, including rows
-            // rejected by the source/payload verification and the lookahead
-            // row. Counting only returned members lets a hot or invalid
-            // stream consume the shared budget without being accounted for.
-            remaining_work = remaining_work.saturating_sub(page.work_spent.max(1));
-            if !page.members.is_empty() || !page.complete {
-                exact_groups.push(
-                    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-                        key,
-                        members: page.members,
-                        complete: page.complete,
-                        next_cursor: page.next_cursor,
-                    },
-                );
+        if !continue_near {
+            for (key_index, key) in exact_keys.iter().cloned().enumerate() {
+                if remaining_results == 0 || remaining_work == 0 {
+                    // Keep every key whose stream was never visited in the
+                    // response. An omitted key is indistinguishable from a key
+                    // with no matches at the MCP boundary; marking it incomplete
+                    // makes the shared-budget cutoff visible to the caller. A
+                    // per-key continuation is minted only after that key has
+                    // actually been read, so an unvisited key is intentionally
+                    // restartable from the original request.
+                    exact_groups.extend(incomplete_exact_groups(&exact_keys[key_index..]));
+                    break;
+                }
+                let page_limit = remaining_results.min(remaining_work);
+                let page = self.verified_exact_clone_page(
+                    &source,
+                    &key,
+                    request.cursor.as_ref(),
+                    page_limit,
+                    control,
+                )?;
+                remaining_results = remaining_results.saturating_sub(page.members.len());
+                // The reader reports every decoded posting row, including rows
+                // rejected by the source/payload verification and the lookahead
+                // row. Counting only returned members lets a hot or invalid
+                // stream consume the shared budget without being accounted for.
+                remaining_work = remaining_work.saturating_sub(page.work_spent.max(1));
+                if !page.members.is_empty() || !page.complete {
+                    exact_groups.push(
+                        tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+                            key,
+                            members: page.members,
+                            complete: page.complete,
+                            next_cursor: page.next_cursor,
+                        },
+                    );
+                }
             }
         }
+
+        let near = self.read_similar_near(
+            &source,
+            &request.source_extent,
+            &request.match_classes,
+            remaining_results,
+            remaining_work,
+            near_cursor,
+            control,
+        )?;
         Ok(Some(
             tracedecay_query::code_search::CodeIndexSimilarCompletedV1 {
                 source,
                 exact_groups,
+                near,
             },
         ))
+    }
+
+    fn validate_similar_source(
+        &self,
+        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    ) -> Result<(), RetrievalPortError> {
+        let metadata = self.hydration.metadata();
+        if metadata.repository_id.as_ref() != Some(&source.occurrence.repository_id) {
+            return Err(RetrievalPortError::AuthorityUnavailable(
+                "similar source repository authority is unavailable".to_owned(),
+            ));
+        }
+        if metadata.generation != source.occurrence.source_generation {
+            return Err(RetrievalPortError::AuthorityUnavailable(
+                "similar source generation is stale".to_owned(),
+            ));
+        }
+        if source.occurrence.payload_digest != source.payload.payload_digest
+            || source.payload.validate().is_err()
+        {
+            return Err(RetrievalPortError::Contract(
+                "similar source payload does not match its occurrence".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_similar_near(
+        &self,
+        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+        extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
+        requested_classes: &[tracedecay_code_index::clones::CloneNormalizationClassV1],
+        result_limit: usize,
+        work_limit: usize,
+        cursor: Option<&tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<tracedecay_query::code_search::CodeIndexSimilarNearReadV1, RetrievalPortError> {
+        let source_class = source
+            .payload
+            .fingerprint_stream(source.occurrence.eligibility)
+            .map(|stream| stream.class);
+        if let Some(source_class) = source_class
+            && !requested_classes.contains(&source_class)
+        {
+            return Ok(
+                tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(
+                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable,
+                ),
+            );
+        }
+
+        let page_limit = result_limit
+            .min(work_limit)
+            .min(tracedecay_query::retrieval::lexical::MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1);
+        match extent {
+            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
+                if page_limit == 0 {
+                    return Ok(similar_near_budget_exhausted_whole_body(source));
+                }
+                self.hydration
+                    .clone_fingerprint_page(
+                        &source.occurrence,
+                        &source.payload,
+                        cursor,
+                        page_limit,
+                        control,
+                    )
+                    .map(tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody)
+                    .map_err(map_text_artifact_error)
+            }
+            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
+                start,
+                end,
+            } => {
+                if source.occurrence.eligibility
+                    != tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
+                {
+                    return Ok(similar_near_budget_exhausted_selected_range(source));
+                }
+                let selected = tracedecay_code_index::clones::CloneSelectedBlockV1::from_payload(
+                    &source.payload,
+                    source.occurrence.eligibility,
+                    *start..*end,
+                )
+                .map_err(RetrievalPortError::Contract)?;
+                if page_limit == 0 {
+                    return Ok(similar_near_budget_exhausted_selected_block(&selected));
+                }
+                self.hydration
+                    .clone_selected_block_page(
+                        &source.occurrence,
+                        &source.payload,
+                        &selected,
+                        cursor,
+                        page_limit,
+                        control,
+                    )
+                    .map(
+                        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange,
+                    )
+                    .map_err(map_text_artifact_error)
+            }
+        }
     }
 
     /// Continue paging past filter rejects until `limit` verified members exist.
@@ -747,6 +881,115 @@ fn incomplete_exact_groups(
             members: Vec::new(),
             complete: false,
             next_cursor: None,
+        },
+    )
+}
+
+fn check_similar_control(
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<(), RetrievalPortError> {
+    if control.is_cancelled() {
+        Err(RetrievalPortError::Cancelled)
+    } else if control.is_deadline_exceeded() {
+        Err(RetrievalPortError::BudgetExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+fn similar_stream_descriptor(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+) -> Option<CloneFingerprintStreamDescriptorV1> {
+    source
+        .payload
+        .fingerprint_stream(source.occurrence.eligibility)
+        .map(|stream| CloneFingerprintStreamDescriptorV1 {
+            language: source.payload.language.clone(),
+            class: stream.class,
+            normalization_revision: stream.normalization_revision,
+            rename_tier_unavailable: stream.rename_tier_unavailable,
+        })
+}
+
+fn fallback_similar_stream_descriptor(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+) -> CloneFingerprintStreamDescriptorV1 {
+    CloneFingerprintStreamDescriptorV1 {
+        language: source.payload.language.clone(),
+        class: tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
+        normalization_revision: source.payload.conservative_normalization_revision,
+        rename_tier_unavailable: Some(source.payload.rename_coverage),
+    }
+}
+
+fn similar_near_partial_coverage() -> tracedecay_domain::RetrieverCoverage {
+    tracedecay_domain::RetrieverCoverage {
+        capped: 1,
+        ..tracedecay_domain::RetrieverCoverage::default()
+    }
+}
+
+fn similar_near_budget_reason() -> Vec<CloneFingerprintPartialReasonV1> {
+    vec![CloneFingerprintPartialReasonV1::VerificationWorkBudget]
+}
+
+fn similar_near_budget_exhausted_whole_body(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
+    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(
+        CloneFingerprintArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+                members: Vec::new(),
+                next_cursor: None,
+            },
+            stream: similar_stream_descriptor(source),
+            source_eligibility: source.occurrence.eligibility,
+            minimum_directional_coverage_millionths:
+                CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1,
+            coverage: similar_near_partial_coverage(),
+            partial_reasons: similar_near_budget_reason(),
+            accounting: CloneFingerprintReadAccountingV1::default(),
+        },
+    )
+}
+
+fn similar_near_budget_exhausted_selected_range(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
+    let stream = similar_stream_descriptor(source)
+        .unwrap_or_else(|| fallback_similar_stream_descriptor(source));
+    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
+        CloneSelectedBlockArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+                members: Vec::new(),
+                next_cursor: None,
+            },
+            stream,
+            coverage: similar_near_partial_coverage(),
+            partial_reasons: similar_near_budget_reason(),
+            accounting: CloneFingerprintReadAccountingV1::default(),
+        },
+    )
+}
+
+fn similar_near_budget_exhausted_selected_block(
+    selected: &CloneSelectedBlockV1,
+) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
+    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
+        CloneSelectedBlockArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+                members: Vec::new(),
+                next_cursor: None,
+            },
+            stream: CloneFingerprintStreamDescriptorV1 {
+                language: selected.language().to_owned(),
+                class: selected.class(),
+                normalization_revision: selected.normalization_revision(),
+                rename_tier_unavailable: selected.rename_tier_unavailable(),
+            },
+            coverage: similar_near_partial_coverage(),
+            partial_reasons: similar_near_budget_reason(),
+            accounting: CloneFingerprintReadAccountingV1::default(),
         },
     )
 }
