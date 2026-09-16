@@ -1434,6 +1434,7 @@ fn client_terminal_code(error: &ClientError) -> TerminalCode {
         ClientError::RequestTooLarge => TerminalCode::InvalidRequest,
         ClientError::Disabled
         | ClientError::Spawn(_)
+        | ClientError::Unavailable(_)
         | ClientError::RestartExhausted
         | ClientError::Transport(_)
         | ClientError::MalformedReply(_)
@@ -1451,6 +1452,7 @@ fn client_diagnostic(error: &ClientError) -> &'static str {
         ClientError::EffectUnknown { .. } => "ncm.rust.worker_effect_unknown",
         ClientError::RequestTooLarge => "ncm.rust.request_too_large",
         ClientError::Spawn(_) => "ncm.rust.worker_spawn_failed",
+        ClientError::Unavailable(_) => "ncm.rust.worker_unavailable",
         ClientError::RestartExhausted => "ncm.rust.worker_restart_exhausted",
         ClientError::Transport(_) => "ncm.rust.worker_transport_failed",
         ClientError::MalformedReply(_) => "ncm.rust.worker_reply_malformed",
