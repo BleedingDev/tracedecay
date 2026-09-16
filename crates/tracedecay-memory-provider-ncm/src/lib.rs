@@ -741,7 +741,11 @@ impl NcmProviderAdapter {
             })
     }
 
-    fn valid_maintenance_partial_cursor(payload: &Value, surface_call: &NcmSurfaceCall) -> bool {
+    fn valid_maintenance_partial_cursor(
+        payload: &Value,
+        surface_call: &NcmSurfaceCall,
+        state_generation: u64,
+    ) -> bool {
         let Some(cursor) = payload["resume_cursor"].as_str() else {
             return false;
         };
@@ -774,7 +778,8 @@ impl NcmProviderAdapter {
         let Some(after) = after_text.parse::<u64>().ok() else {
             return false;
         };
-        generation.to_string() == generation_text
+        generation == state_generation
+            && generation.to_string() == generation_text
             && after <= i64::MAX as u64
             && after.to_string() == after_text
             && parts.next().is_none()
@@ -1109,7 +1114,11 @@ impl NcmProviderAdapter {
                     && serde_json::from_slice::<Value>(&payload.bytes).is_ok_and(|mut value| {
                         if call.operation == ProviderOperation::Maintenance
                             && Self::valid_maintenance_partial_payload(reply)
-                            && Self::valid_maintenance_partial_cursor(&value, surface_call)
+                            && Self::valid_maintenance_partial_cursor(
+                                &value,
+                                surface_call,
+                                reply.state_generation,
+                            )
                         {
                             if let Some(object) = value.as_object_mut() {
                                 object.remove("resume_cursor");
