@@ -1,9 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
-use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
+use tracedecay_runtime_core::db::engine::{params, QueryExecutor};
 
 use crate::configuration::FreshConfigurationStoreEvidence;
 use crate::schema_contract::{
+    invariant_trigger_names_for_tables, invariant_trigger_sql_for_tables,
     starts_with_ignore_ascii_case, validate_session_graph_publication_schema_contract,
     validate_session_temporal_schema_contract,
 };
@@ -26,6 +28,75 @@ const TEMPORAL_FTS_SHADOW_TABLES: &[&str] = &[
     "session_summary_nodes_fts_docsize",
     "session_summary_nodes_fts_idx",
 ];
+
+type TemporalTableContractInventory = BTreeMap<String, String>;
+
+/// The structural PRAGMA contract can observe columns, indexes, and foreign
+/// key metadata, but SQLite does not expose CHECK expressions through a
+/// PRAGMA. Keep the canonical CREATE TABLE text in one place (the installer)
+/// and compare its normalized form during current-store admission. This pins
+/// both CHECK expressions and FOREIGN KEY clauses while allowing harmless
+/// formatting and `IF NOT EXISTS` differences in persisted SQLite text.
+static EXPECTED_TEMPORAL_TABLE_CONTRACTS: LazyLock<
+    std::result::Result<TemporalTableContractInventory, String>,
+> = LazyLock::new(build_expected_temporal_table_contracts);
+
+fn build_expected_temporal_table_contracts(
+) -> std::result::Result<TemporalTableContractInventory, String> {
+    let connection = rusqlite::Connection::open_in_memory()
+        .map_err(|error| format!("failed to open canonical session temporal schema: {error}"))?;
+    connection
+        .execute_batch(super::TEMPORAL_SCHEMA_DDL)
+        .map_err(|error| format!("failed to install canonical session temporal schema: {error}"))?;
+
+    let expected_tables = TEMPORAL_TABLE_COLUMNS
+        .iter()
+        .map(|(table, _)| *table)
+        .filter(|table| !table.ends_with("_fts"))
+        .collect::<BTreeSet<_>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .map_err(|error| format!("failed to prepare canonical session temporal schema: {error}"))?;
+    let rows = statement
+        .query_map((), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("failed to query canonical session temporal schema: {error}"))?;
+    let mut inventory = TemporalTableContractInventory::new();
+    for row in rows {
+        let (name, sql) = row.map_err(|error| {
+            format!("failed to read canonical session temporal schema: {error}")
+        })?;
+        if !expected_tables.contains(name.as_str()) {
+            continue;
+        }
+        let Some(sql) = sql else {
+            return Err(format!(
+                "canonical session temporal table '{name}' has no CREATE TABLE definition"
+            ));
+        };
+        if inventory
+            .insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql))
+            .is_some()
+        {
+            return Err(format!(
+                "canonical session temporal schema repeats table '{name}'"
+            ));
+        }
+    }
+    if inventory.len() != expected_tables.len() {
+        return Err(format!(
+            "canonical session temporal schema defines {} tables, expected {}",
+            inventory.len(),
+            expected_tables.len()
+        ));
+    }
+    Ok(inventory)
+}
 
 /// Read-only admission result for the final session-temporal schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +142,167 @@ pub(super) async fn validate_current_session_temporal_schema(
     validate_session_temporal_schema_contract(conn, &tables)
         .await
         .map_err(|error| session_temporal_reset_required(error.to_string()))?;
+    validate_temporal_table_contracts(conn, &tables)
+        .await
+        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
+    validate_temporal_trigger_inventory(conn, &tables)
+        .await
+        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
     validate_temporal_namespace_and_fts(conn).await
+}
+
+async fn validate_temporal_table_contracts(
+    conn: &impl QueryExecutor,
+    tables: &[&str],
+) -> tracedecay_domain::errors::Result<()> {
+    let expected = EXPECTED_TEMPORAL_TABLE_CONTRACTS
+        .as_ref()
+        .map_err(|error| global_db_operation_message(OPERATION, error.clone()))?;
+    let mut rows = conn
+        .query(
+            "SELECT name, sql FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+            (),
+        )
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    let mut actual = TemporalTableContractInventory::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?
+    {
+        let name = row
+            .get::<String>(0)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        if !tables.iter().any(|table| table.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        let sql = row
+            .get::<Option<String>>(1)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?
+            .ok_or_else(|| {
+                global_db_operation_message(
+                    OPERATION,
+                    format!("temporal table '{name}' has no CREATE TABLE definition"),
+                )
+            })?;
+        actual.insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql));
+    }
+
+    for table in tables {
+        let key = table.to_ascii_lowercase();
+        let Some(expected_sql) = expected.get(&key) else {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!("canonical session temporal contract is missing table '{table}'"),
+            ));
+        };
+        let Some(actual_sql) = actual.get(&key) else {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!("temporal table '{table}' is missing"),
+            ));
+        };
+        if actual_sql != expected_sql {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!(
+                    "table '{table}' has an incompatible normalized CHECK/FOREIGN KEY contract"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_temporal_trigger_inventory(
+    conn: &impl QueryExecutor,
+    tables: &[&str],
+) -> tracedecay_domain::errors::Result<()> {
+    let expected_names = invariant_trigger_names_for_tables(tables);
+    let expected_sql = invariant_trigger_sql_for_tables(tables);
+    if expected_names.len() != expected_sql.len() {
+        return Err(global_db_operation_message(
+            OPERATION,
+            "temporal trigger contract has mismatched name and SQL inventories",
+        ));
+    }
+    let mut expected = BTreeMap::new();
+    for (name, sql) in expected_names.into_iter().zip(expected_sql) {
+        if expected
+            .insert(name.to_ascii_lowercase(), normalize_schema_sql(sql))
+            .is_some()
+        {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!("temporal trigger contract repeats '{name}'"),
+            ));
+        }
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT name, tbl_name, sql FROM sqlite_master
+             WHERE type = 'trigger' ORDER BY name",
+            (),
+        )
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    let mut actual = BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?
+    {
+        let name = row
+            .get::<String>(0)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        let table = row
+            .get::<String>(1)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        if !tables
+            .iter()
+            .any(|expected_table| expected_table.eq_ignore_ascii_case(&table))
+        {
+            continue;
+        }
+        let sql = row
+            .get::<Option<String>>(2)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?
+            .ok_or_else(|| {
+                global_db_operation_message(
+                    OPERATION,
+                    format!("temporal trigger '{name}' has no CREATE TRIGGER definition"),
+                )
+            })?;
+        if actual
+            .insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql))
+            .is_some()
+        {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!("temporal trigger inventory repeats '{name}'"),
+            ));
+        }
+    }
+
+    if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
+        return Err(global_db_operation_message(
+            OPERATION,
+            "temporal trigger inventory is not exact",
+        ));
+    }
+    for (name, expected_sql) in expected {
+        if actual.get(&name) != Some(&expected_sql) {
+            return Err(global_db_operation_message(
+                OPERATION,
+                format!("temporal trigger '{name}' has an incompatible normalized contract"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn validate_temporal_namespace_and_fts(

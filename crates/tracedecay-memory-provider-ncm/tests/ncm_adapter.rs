@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -541,6 +541,94 @@ impl NcmCognitiveSurface for MockSurface {
                 }
             }),
         }
+    }
+}
+
+const IDENTITY_REFRESH_DIAGNOSTIC: &str = "ncm.rust.handshake_identity_refresh_required";
+
+struct HandshakeRefreshSurface {
+    inner: Arc<MockSurface>,
+    handshake_calls: AtomicUsize,
+    stale_forever: bool,
+    cancel_after_stale: AtomicBool,
+    malformed_retry_identity: bool,
+    diagnostic: &'static str,
+}
+
+impl HandshakeRefreshSurface {
+    fn new(inner: Arc<MockSurface>, stale_forever: bool) -> Self {
+        Self {
+            inner,
+            handshake_calls: AtomicUsize::new(0),
+            stale_forever,
+            cancel_after_stale: AtomicBool::new(false),
+            malformed_retry_identity: false,
+            diagnostic: IDENTITY_REFRESH_DIAGNOSTIC,
+        }
+    }
+
+    fn cancel_after_stale(self) -> Self {
+        self.cancel_after_stale.store(true, Ordering::Release);
+        self
+    }
+
+    fn malformed_retry_identity(mut self) -> Self {
+        self.malformed_retry_identity = true;
+        self
+    }
+
+    fn with_diagnostic(mut self, diagnostic: &'static str) -> Self {
+        self.diagnostic = diagnostic;
+        self
+    }
+
+    fn stale_response(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+        self.inner.change_state_generation(5);
+        let observed_generation = self.inner.descriptor_snapshot().state_generation;
+        if self.cancel_after_stale.load(Ordering::Acquire) {
+            request.control.cancellation().cancel();
+        }
+        NcmSurfaceHandshakeResponse {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Handshake,
+                OwnedProviderId::new(NCM_PROVIDER_ID).expect("provider id"),
+                TerminalCode::StaleIdentity,
+                CommittedEffectEvidence::none(Some(observed_generation)),
+                FallbackDirective::forbidden(),
+                request.request_id.clone(),
+                request.namespace.as_str(),
+                Some(self.diagnostic.to_owned()),
+            )
+            .expect("stale identity terminal"),
+            descriptor: None,
+            provider_instance_id: None,
+            namespace: None,
+            effective_limits: None,
+            ready_receipt_sha256: None,
+            challenge_response_sha256: None,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl NcmCognitiveSurface for HandshakeRefreshSurface {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+        let call = self.handshake_calls.fetch_add(1, Ordering::AcqRel);
+        if self.stale_forever || call == 0 {
+            return self.stale_response(request);
+        }
+        if self.malformed_retry_identity {
+            self.inner.change_implementation_identity(ONE_SHA);
+        }
+        self.inner.handshake(request)
+    }
+
+    fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
+        self.inner.invoke(call)
     }
 }
 
@@ -1112,6 +1200,94 @@ fn handshake_exposes_only_namespace_to_surface_and_reattaches_scope() {
     );
     request.control.cancellation().cancel();
     assert_eq!(mapped.control.snapshot(), Err(TerminalCode::Cancelled));
+}
+
+#[test]
+fn handshake_refreshes_one_generation_transition_before_public_recall() {
+    let inner = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface = Arc::new(HandshakeRefreshSurface::new(inner.clone(), false));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    assert_eq!(response.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(surface.handshake_calls.load(Ordering::Acquire), 2);
+    assert_eq!(inner.handshake_calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        response
+            .descriptor
+            .as_ref()
+            .expect("ready descriptor")
+            .state_generation,
+        5
+    );
+
+    let mut recall = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
+    recall.ready_receipt_sha256 = response.ready_receipt_sha256.expect("ready receipt");
+    recall.expected_state_generation = 5;
+    let reply = provider.invoke(&recall);
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(inner.invoke_calls.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn handshake_refresh_retry_is_strictly_bounded() {
+    let inner = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface = Arc::new(HandshakeRefreshSurface::new(inner.clone(), true));
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    assert_eq!(
+        response.terminal.terminal_code(),
+        TerminalCode::StaleIdentity
+    );
+    assert_eq!(surface.handshake_calls.load(Ordering::Acquire), 2);
+    assert_eq!(inner.handshake_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn handshake_does_not_retry_unrelated_stale_identity() {
+    let inner = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface = Arc::new(
+        HandshakeRefreshSurface::new(inner.clone(), false)
+            .with_diagnostic("ncm.surface_identity_changed"),
+    );
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    assert_eq!(
+        response.terminal.terminal_code(),
+        TerminalCode::StaleIdentity
+    );
+    assert_eq!(surface.handshake_calls.load(Ordering::Acquire), 1);
+    assert_eq!(inner.handshake_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn handshake_refresh_stops_before_retry_when_cancelled() {
+    let inner = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface = Arc::new(HandshakeRefreshSurface::new(inner.clone(), false).cancel_after_stale());
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    assert_eq!(response.terminal.terminal_code(), TerminalCode::Cancelled);
+    assert_eq!(surface.handshake_calls.load(Ordering::Acquire), 1);
+    assert_eq!(inner.handshake_calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn handshake_refresh_still_rejects_changed_immutable_identity() {
+    let inner = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let surface =
+        Arc::new(HandshakeRefreshSurface::new(inner.clone(), false).malformed_retry_identity());
+    let provider = NcmProviderAdapter::new(surface.clone()).expect("adapter");
+
+    let response = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    assert_eq!(
+        response.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(surface.handshake_calls.load(Ordering::Acquire), 2);
+    assert_eq!(inner.handshake_calls.load(Ordering::Acquire), 1);
 }
 
 #[test]

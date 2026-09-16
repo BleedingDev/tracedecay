@@ -69,6 +69,7 @@ const UNKNOWN_EFFECT_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-unknown-ef
 const RECONCILE_SURFACE_DISPATCH_ACTION: &str = "ncm.adapter.reconcile-surface-dispatch.v1";
 const MAX_WARNINGS: usize = 32;
 const MAX_OBSERVATION_TOTAL_EXTENSION_BYTES: u64 = 524_288;
+const SURFACE_IDENTITY_REFRESH_DIAGNOSTIC: &str = "ncm.rust.handshake_identity_refresh_required";
 
 /// Construction failure before an NCM surface can be registered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -894,6 +895,27 @@ impl NcmProviderAdapter {
         }
     }
 
+    fn surface_identity_refresh_required(
+        response: &NcmSurfaceHandshakeResponse,
+        descriptor: &ProviderDescriptor,
+    ) -> bool {
+        let effect = response.terminal.committed_effect();
+        let observed_generation = effect.state_generation_before();
+        response.terminal.terminal_code() == TerminalCode::StaleIdentity
+            && response.terminal.diagnostic_id() == Some(SURFACE_IDENTITY_REFRESH_DIAGNOSTIC)
+            && effect.state() == CommittedEffectState::None
+            && observed_generation.is_some()
+            && observed_generation == effect.state_generation_after()
+            && observed_generation != Some(descriptor.state_generation)
+            && response.descriptor.is_none()
+            && response.provider_instance_id.is_none()
+            && response.namespace.is_none()
+            && response.effective_limits.is_none()
+            && response.ready_receipt_sha256.is_none()
+            && response.challenge_response_sha256.is_none()
+            && response.warnings.is_empty()
+    }
+
     fn surface_metadata_is_scope_safe(
         call: &ProviderCall,
         surface_call: &NcmSurfaceCall,
@@ -1255,6 +1277,16 @@ impl MemoryProvider for NcmProviderAdapter {
                 TerminalCode::ContractViolation,
                 "ncm.surface_handshake_contract_violation",
             );
+        }
+        if Self::surface_identity_refresh_required(&surface_response, &descriptor) {
+            if let Err(code) = surface_request.control.snapshot() {
+                return Self::handshake_failure(request, code, "ncm.request_control_terminal");
+            }
+            // RustNcmSurface installs the worker generation before reporting
+            // this bounded transition. One re-handshake can therefore bind
+            // the new identity, while the final response still goes through
+            // every normal scope, model, provider, and challenge check below.
+            surface_response = self.surface.handshake(&surface_request);
         }
         let surface_success = surface_response.terminal.terminal_code() == TerminalCode::Success;
         if matches!(

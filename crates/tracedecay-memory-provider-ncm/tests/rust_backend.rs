@@ -1942,19 +1942,20 @@ mod enabled {
                 &format!("assistant: {text}")
             ));
         }
-        let adapter = NcmProviderAdapter::new(surface(&root)).expect("restarted adapter");
+        let reopened_surface = surface(&root);
+        assert_eq!(reopened_surface.descriptor().state_generation, 0);
+        let adapter = NcmProviderAdapter::new(reopened_surface).expect("restarted adapter");
         // Construction preflights an empty namespace. Loading this persisted
-        // namespace refreshes the new surface's generation once before admission.
-        let mut reopened_ready = handshake(&adapter, &exact_scope);
-        if reopened_ready.terminal.terminal_code() == TerminalCode::StaleIdentity {
-            reopened_ready = handshake(&adapter, &exact_scope);
-        }
+        // namespace refreshes the new surface's generation inside the first
+        // public handshake, before readiness is admitted.
+        let reopened_ready = handshake(&adapter, &exact_scope);
         assert_eq!(
             reopened_ready.terminal.terminal_code(),
             TerminalCode::Success,
             "persisted namespace must be ready after at most one identity refresh"
         );
         let (receipt, generation) = ready_parts(&reopened_ready);
+        assert_eq!(generation, 1);
         let recalled = adapter.invoke(&call(
             ProviderOperation::Recall,
             &exact_scope,
