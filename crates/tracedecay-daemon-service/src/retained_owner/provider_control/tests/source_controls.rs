@@ -1,8 +1,9 @@
 //! Offline source deletion through real canonical admission and retained authority.
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::path::Path;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -13,11 +14,14 @@ use tracedecay_contracts::{
     RetainedSurfaceExecutionContextV1,
 };
 use tracedecay_domain::{
-    ActorId, ManifestDigest, ObservationScopeV1, ObservationSourceIdentityV1, ProjectId,
-    ProviderId, SessionId,
+    ActorId, BrainId, CommitId, EvidenceAvailabilityV1, ManifestDigest, ObservationScopeV1,
+    ObservationSourceIdentityV1, ProjectId, ProviderId, RefId, SessionId, UserProfileId,
+    framed_log::checksum,
 };
 use tracedecay_hooks::admission_ledger::{
-    HookAdmissionLedgerLimitsV1, HookAdmissionLedgerV1, HookLiveOriginOutcomeV1,
+    HookAdmissionLedgerLimitsV1, HookAdmissionLedgerV1, HookLiveOriginBoundaryV1,
+    HookLiveOriginBranchEvidenceV1, HookLiveOriginCheckpointV1, HookLiveOriginFrameV1,
+    HookLiveOriginObservationV1, HookLiveOriginOutcomeV1, MAX_LIVE_ORIGIN_FRAMES,
 };
 use tracedecay_hooks::{
     HOOK_EVENT_SCHEMA_VERSION, HookBoundaryV1, HookEventEnvelopeV2, HookEventV2, HookHostV1,
@@ -38,6 +42,9 @@ use tracedecay_sessions::observation::ObservationCancellation;
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_sessions::runtime::claude::{ClaudeSource, identify_claude_source};
 use tracedecay_sessions::runtime::claude_observation::ingest_source_with_observations_with_admission;
+use tracedecay_sessions::runtime::source::{
+    JsonlResumeState, LiveJsonlOriginPrevious, StoredCursor, capture_live_jsonl_origin,
+};
 
 use crate::retained_owner::cognitive_recall::{
     RecallAdmissionLedgerV1,
@@ -56,7 +63,6 @@ use crate::retained_owner::provider_history::{
     ProviderHistoryAuthorityV1, ProviderHistoryReaderV1, history_grant_json,
     source_attribution_json,
 };
-use crate::mcp::tools::handlers::hook_runtime::capture_live_origin_for_control_test;
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 
 const SESSION: &str = "offline-source-control-session";
@@ -133,6 +139,244 @@ fn hook_envelope(event: u8, now: UtcMicros) -> HookEventEnvelopeV2 {
             boundary: HookBoundaryV1::TurnComplete,
         },
     }
+}
+
+const MAX_LIVE_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REFLOG_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Capture a live source boundary using only the public, provider-neutral
+/// session scanner and repository-provenance admission context.
+///
+/// The daemon-service fixture deliberately cannot reach into MCP's private
+/// hook-runtime implementation. Keeping this small authority here exercises
+/// the same neutral primitives that production relies on: the bounded JSONL
+/// scanner, the authoritative project marker, and a stable reflog/HEAD
+/// watermark. It does not parse or retain transcript content.
+#[allow(clippy::too_many_arguments)]
+fn capture_live_origin_with_test_authorities(
+    project_root: PathBuf,
+    project_id: ProjectId,
+    brain_id: BrainId,
+    profile_id: UserProfileId,
+    source_path: PathBuf,
+    source: ObservationSourceIdentityV1,
+    previous: Option<&HookLiveOriginBoundaryV1>,
+    now: UtcMicros,
+    deadline: Instant,
+) -> Option<HookLiveOriginObservationV1> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let canonical_source_path = fs::canonicalize(&source_path).ok()?;
+    let marker =
+        tracedecay_runtime_core::storage::read_repository_identity_marker(&project_root).ok()??;
+    let context = RepositoryProvenanceAdmissionContext::from_authoritative_project_marker(
+        &project_root,
+        &project_id,
+        &marker,
+    )?;
+    let captured = context.capture_snapshot(now);
+    let EvidenceAvailabilityV1::Known(repository) = captured.availability() else {
+        return None;
+    };
+    let branch_evidence = capture_branch_evidence(&marker.git_common_dir, repository, deadline)?;
+    let previous_observation = previous.filter(|previous| {
+        previous.observation.canonical_source_path == canonical_source_path
+            && previous.observation.source == source
+    });
+    let checkpoint = previous_observation.map(|previous| previous.checkpoint);
+    let resume = previous_observation.map(|previous| {
+        let checkpoint = previous.checkpoint;
+        LiveJsonlOriginPrevious {
+            cursor: StoredCursor {
+                position: checkpoint.complete_frontier,
+                file_id: checkpoint.generation,
+                mtime: 0,
+            },
+            resume: JsonlResumeState {
+                generation: checkpoint.generation,
+                file_identity: checkpoint.file_identity,
+                fingerprint: checkpoint.complete_prefix_fingerprint,
+            },
+            physical_eof: previous.observation.physical_eof,
+            native_birth_witness: previous.observation.native_birth_witness,
+        }
+    });
+    let scan = capture_live_jsonl_origin(
+        &source_path,
+        resume,
+        MAX_LIVE_SOURCE_BYTES,
+        MAX_LIVE_ORIGIN_FRAMES,
+        deadline,
+    )
+    .ok()?;
+    if Instant::now() >= deadline
+        || fs::canonicalize(&source_path).ok()? != canonical_source_path
+        || capture_branch_evidence(&marker.git_common_dir, repository, deadline)? != branch_evidence
+    {
+        return None;
+    }
+    Some(HookLiveOriginObservationV1 {
+        scope: tracedecay_hooks::admission_ledger::HookLiveOriginScopeV1 {
+            brain_id,
+            profile_id,
+            repository: repository.clone(),
+        },
+        source,
+        canonical_source_path,
+        branch_evidence,
+        checkpoint: HookLiveOriginCheckpointV1 {
+            generation: scan.generation,
+            file_identity: scan.file_identity,
+            complete_frontier: scan.complete_frontier,
+            complete_prefix_fingerprint: scan.complete_prefix_fingerprint,
+        },
+        physical_eof: scan.physical_eof,
+        native_birth_witness: scan.native_birth_witness,
+        validated_checkpoint: checkpoint.filter(|_| scan.validated_previous),
+        frames: scan
+            .frames
+            .into_iter()
+            .map(|frame| HookLiveOriginFrameV1 {
+                start: frame.offset,
+                end: frame.end_offset,
+                resume_fingerprint: frame.resume_fingerprint,
+            })
+            .collect(),
+    })
+}
+
+fn capture_branch_evidence(
+    git_common_dir: &str,
+    repository: &tracedecay_domain::RepositoryProvenanceV1,
+    deadline: Instant,
+) -> Option<HookLiveOriginBranchEvidenceV1> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let expected_ref = match repository.evidence().attached_ref() {
+        EvidenceAvailabilityV1::Known(reference) => reference.clone(),
+        _ => return None,
+    };
+    let expected_commit = match repository.evidence().head_commit() {
+        EvidenceAvailabilityV1::Known(commit) => commit.clone(),
+        _ => return None,
+    };
+    let reflog = Path::new(git_common_dir).join("logs/HEAD");
+    let canonical_path = fs::canonicalize(&reflog).ok()?;
+    let (metadata, tail) = read_bounded_file(&reflog, MAX_REFLOG_TAIL_BYTES, deadline)?;
+    if metadata.len() == 0 || tail.last() != Some(&b'\n') {
+        return None;
+    }
+    let last = tail
+        .strip_suffix(b"\n")?
+        .rsplit(|byte| *byte == b'\n')
+        .next()?;
+    let mut fields = last.split(|byte| *byte == b' ');
+    let old = fields.next()?;
+    let new = fields.next()?;
+    if ![40, 64].contains(&old.len())
+        || new.len() != old.len()
+        || !old.iter().chain(new).all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    let head_commit = CommitId::new(std::str::from_utf8(new).ok()?).ok()?;
+    if head_commit != expected_commit {
+        return None;
+    }
+    let head_path = Path::new(git_common_dir).join("HEAD");
+    let (head_metadata, head) = read_bounded_file(&head_path, 4096, deadline)?;
+    let attached_ref = RefId::new(
+        std::str::from_utf8(head.strip_prefix(b"ref: ")?)
+            .ok()?
+            .trim_end_matches('\n'),
+    )
+    .ok()?;
+    if attached_ref != expected_ref {
+        return None;
+    }
+    let (file_identity, change_token) = file_evidence(&metadata)?;
+    let (head_file_identity, head_change_token) = file_evidence(&head_metadata)?;
+    Some(HookLiveOriginBranchEvidenceV1 {
+        attached_ref,
+        head_commit,
+        canonical_path,
+        file_identity,
+        frontier: metadata.len(),
+        fingerprint: checksum(&tail),
+        change_token,
+        head_file_identity,
+        head_change_token,
+    })
+}
+
+fn read_bounded_file(
+    path: &Path,
+    maximum: u64,
+    deadline: Instant,
+) -> Option<(fs::Metadata, Vec<u8>)> {
+    if Instant::now() >= deadline || fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let mut file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(path).ok()?;
+    let before = file.metadata().ok()?;
+    if !before.is_file() {
+        return None;
+    }
+    let identity = file_evidence(&before)?;
+    let length = before.len().min(maximum);
+    file.seek(SeekFrom::Start(before.len().checked_sub(length)?))
+        .ok()?;
+    let mut bytes = vec![0; usize::try_from(length).ok()?];
+    file.read_exact(&mut bytes).ok()?;
+    let after = file.metadata().ok()?;
+    let current = fs::metadata(path).ok()?;
+    if Instant::now() >= deadline
+        || before.len() != after.len()
+        || before.len() != current.len()
+        || file_evidence(&after)? != identity
+        || file_evidence(&current)? != identity
+    {
+        return None;
+    }
+    Some((after, bytes))
+}
+
+#[cfg(unix)]
+fn file_evidence(metadata: &fs::Metadata) -> Option<([u64; 2], [i64; 4])> {
+    use std::os::unix::fs::MetadataExt;
+    Some((
+        [metadata.dev(), metadata.ino()],
+        [
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ],
+    ))
+}
+
+#[cfg(windows)]
+fn file_evidence(metadata: &fs::Metadata) -> Option<([u64; 2], [i64; 4])> {
+    use std::os::windows::fs::MetadataExt;
+    Some((
+        [
+            u64::from(metadata.volume_serial_number()?),
+            metadata.file_index(),
+        ],
+        [
+            metadata.last_write_time() as i64,
+            metadata.creation_time() as i64,
+            metadata.last_access_time() as i64,
+            metadata.file_size() as i64,
+        ],
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_evidence(_metadata: &fs::Metadata) -> Option<([u64; 2], [i64; 4])> {
+    None
 }
 
 impl OfflineSourceFixture {
@@ -264,7 +508,7 @@ impl OfflineSourceFixture {
         )
         .unwrap();
         let baseline_now = tracedecay_contracts::now_micros();
-        let baseline = capture_live_origin_for_control_test(
+        let baseline = capture_live_origin_with_test_authorities(
             project_root.clone(),
             project.clone(),
             brain.clone(),
@@ -300,7 +544,7 @@ impl OfflineSourceFixture {
         file.sync_all().unwrap();
         drop(file);
         let appended_now = tracedecay_contracts::now_micros();
-        let appended = capture_live_origin_for_control_test(
+        let appended = capture_live_origin_with_test_authorities(
             project_root.clone(),
             project.clone(),
             brain,
