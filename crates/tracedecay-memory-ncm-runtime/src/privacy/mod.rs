@@ -1191,6 +1191,12 @@ fn validate_completed_deletion_replay(
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|error| corrupt_reply(handle.commit_seq, &format!("decode receipt: {error}")))?;
     validate_recovery_event(&event, event.seq, meta.commit_seq)?;
+    if durable.idempotency_key.as_deref() != Some(key) {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion receipt idempotency key mismatch",
+        ));
+    }
     validate_event_payload_digest(&event, &durable, &capsules)?;
     let DurableOperation::DeleteBySource {
         source,
@@ -1243,6 +1249,12 @@ fn validate_completed_deletion_replay(
         )
     })?;
     validate_recovery_event(&fence_event, fence_event.seq, meta.commit_seq)?;
+    if fence.idempotency_key.is_some() {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "deletion fence receipt unexpectedly has an idempotency key",
+        ));
+    }
     validate_event_payload_digest(&fence_event, &fence, &capsules)?;
     let DurableOperation::DeletionFence {
         source: fence_source,
