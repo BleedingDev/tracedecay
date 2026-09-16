@@ -327,6 +327,10 @@ pub fn verified_embedded_host_bundle(
     )
 }
 
+/// Build one canonical bundle with an explicitly supplied lifecycle binary.
+///
+/// Lifecycle callers pass the executable resolved at command entry so bundle
+/// contents cannot drift to a different installation discovered on `PATH`.
 #[hotpath::measure(label = "host_bundle_registry_verify")]
 pub fn verified_embedded_host_bundle_with_tracedecay_bin(
     host: HostKindV1,
