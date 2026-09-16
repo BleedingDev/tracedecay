@@ -47,6 +47,12 @@ pub enum FallbackRule {
     ExplicitPinned(PinnedFallbackPolicy),
 }
 
+impl Default for FallbackRule {
+    fn default() -> Self {
+        Self::Forbidden
+    }
+}
+
 /// Typed causes that a host may explicitly permit as a recall degradation.
 ///
 /// The routing layer uses this closed vocabulary rather than string flags, so
@@ -652,9 +658,26 @@ pub enum FallbackDecision {
         from: RoutedProviderIdentity,
         /// Terminal code that provider returned.
         from_terminal_code: TerminalCode,
+        /// Exact diagnostic identity attached to that provider failure, when
+        /// one was supplied. The fallback route must not erase this evidence.
+        from_diagnostic_id: Option<String>,
         /// Policy under which the second route was admitted.
         policy: PinnedFallbackPolicy,
     },
+}
+
+impl FallbackDecision {
+    /// Returns the exact diagnostic identity of the provider failure that
+    /// authorized a dispatched fallback, when that failure supplied one.
+    #[must_use]
+    pub fn source_diagnostic_id(&self) -> Option<&str> {
+        match self {
+            Self::Dispatched {
+                from_diagnostic_id, ..
+            } => from_diagnostic_id.as_deref(),
+            Self::NotApplicable | Self::Declined(_) => None,
+        }
+    }
 }
 
 /// One routed reply together with the identity of the provider that produced
@@ -903,6 +926,7 @@ impl MemoryFabric {
 
         let directive = reply.terminal.fallback();
         let terminal_code = reply.terminal.terminal_code();
+        let diagnostic_id = reply.terminal.diagnostic_id().map(str::to_owned);
         let decision = match directive.eligibility() {
             FallbackEligibility::Forbidden => {
                 if matches!(
@@ -973,6 +997,7 @@ impl MemoryFabric {
                             fallback: FallbackDecision::Dispatched {
                                 from: identity,
                                 from_terminal_code: terminal_code,
+                                from_diagnostic_id: diagnostic_id,
                                 policy,
                             },
                         });

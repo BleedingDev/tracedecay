@@ -1,7 +1,7 @@
 //! Behavioral tests for capability-driven memory-fabric orchestration.
 
 use std::error::Error;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -372,6 +372,71 @@ impl MemoryProvider for TestProvider {
             Ordering::Release,
         );
         reply
+    }
+}
+
+/// Deterministic NCM stand-in for the routing kill/recover journey. A worker
+/// loss happens after the readiness handshake, so the provider can report an
+/// exact `ProviderUnavailable` terminal with its configured fallback policy;
+/// recovery only changes the provider's own availability and never mutates
+/// the host's active route.
+struct KillRecoverProvider {
+    inner: TestProvider,
+    killed: AtomicBool,
+    unavailable_reply: ProviderReply,
+}
+
+impl KillRecoverProvider {
+    fn new(policy: PinnedFallbackPolicy) -> Result<Self, ApiError> {
+        let provider = provider_id("ncm")?;
+        let fallback = FallbackDirective::explicit_policy_only(
+            &provider,
+            policy,
+            "operator-approved NCM worker recovery",
+        )?;
+        Ok(Self {
+            inner: TestProvider::new("ncm", &[])?,
+            killed: AtomicBool::new(false),
+            unavailable_reply: unavailable_recall_reply_with_diagnostic(
+                "ncm",
+                fallback,
+                "ncm.worker.killed",
+            )?,
+        })
+    }
+
+    fn kill(&self) {
+        self.killed.store(true, Ordering::Release);
+    }
+
+    fn recover(&self) {
+        self.killed.store(false, Ordering::Release);
+    }
+
+    fn invocation_count(&self) -> usize {
+        self.inner.invocation_count()
+    }
+
+    fn handshake_count(&self) -> usize {
+        self.inner.handshake_count()
+    }
+}
+
+impl MemoryProvider for KillRecoverProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.inner.handshake(request)
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        if self.killed.load(Ordering::Acquire) {
+            self.inner.invocations.fetch_add(1, Ordering::AcqRel);
+            return self.unavailable_reply.clone();
+        }
+        self.inner.invoke(call)
     }
 }
 
@@ -2087,6 +2152,14 @@ fn unavailable_recall_reply(
     provider: &str,
     fallback: FallbackDirective,
 ) -> Result<ProviderReply, ApiError> {
+    unavailable_recall_reply_with_diagnostic(provider, fallback, "diagnostic.provider-unavailable")
+}
+
+fn unavailable_recall_reply_with_diagnostic(
+    provider: &str,
+    fallback: FallbackDirective,
+    diagnostic_id: &str,
+) -> Result<ProviderReply, ApiError> {
     Ok(ProviderReply {
         terminal: terminal(
             ProviderOperation::Recall,
@@ -2096,7 +2169,7 @@ fn unavailable_recall_reply(
             fallback,
             "operation-recall.query.v1",
             &scope()?.exact_scope_sha256(),
-            Some("diagnostic.provider-unavailable"),
+            Some(diagnostic_id),
         )?,
         payload: None,
         warnings: Vec::new(),
@@ -2436,6 +2509,7 @@ fn fallback_dispatches_only_under_the_matching_pinned_rule_with_a_fresh_target_h
                 provider_instance_id: "test.provider.instance-1".to_owned(),
             },
             from_terminal_code: TerminalCode::ProviderUnavailable,
+            from_diagnostic_id: Some("diagnostic.provider-unavailable".to_owned()),
             policy: policy.clone(),
         }
     );
@@ -2464,6 +2538,130 @@ fn fallback_dispatches_only_under_the_matching_pinned_rule_with_a_fresh_target_h
     );
     assert_eq!(target.handshake_count(), 1);
     assert_eq!(target.invocation_count(), 1);
+    Ok(())
+}
+
+/// A configured NCM outage may use the explicitly pinned Native route, while
+/// the default remains fail-closed and a later healthy NCM call resumes the
+/// original route. The source identity and diagnostic are retained in the
+/// dispatch evidence, so the target result cannot be mistaken for NCM output.
+#[test]
+fn ncm_worker_kill_uses_pinned_native_fallback_then_recovers_to_ncm() -> Result<(), Box<dyn Error>>
+{
+    let fabric = MemoryFabric::new(FabricConfig::new(2, 2)?)?;
+    let native = Arc::new(TestProvider::new("tracedecay.native", &[])?);
+    fabric.register(
+        provider_id("tracedecay.native")?,
+        1,
+        ProviderMode::Active,
+        native.clone(),
+    )?;
+
+    let fallback_policy = PinnedFallbackPolicy::new(
+        "policy.ncm-native-worker-recovery",
+        1,
+        provider_id("tracedecay.native")?,
+    )?;
+    let ncm = Arc::new(KillRecoverProvider::new(fallback_policy.clone())?);
+    fabric.register(provider_id("ncm")?, 1, ProviderMode::Active, ncm.clone())?;
+
+    // The healthy baseline proves that the configured active route starts on
+    // NCM and that a successful result does not consult its fallback target.
+    let baseline = fabric.route_active(
+        &routing_policy(
+            "ncm",
+            1,
+            FallbackRule::ExplicitPinned(fallback_policy.clone()),
+        )?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(baseline.identity.provider_id.as_str(), "ncm");
+    assert_eq!(baseline.terminal_code(), TerminalCode::SuccessZeroResults);
+    assert_eq!(baseline.fallback, FallbackDecision::NotApplicable);
+    assert_eq!(ncm.handshake_count(), 1);
+    assert_eq!(ncm.invocation_count(), 1);
+    assert_eq!(native.handshake_count(), 0);
+    assert_eq!(native.invocation_count(), 0);
+    ncm.kill();
+
+    // The NCM terminal may carry an explicit directive, but that directive is
+    // not authority by itself. The product default still returns NCM's exact
+    // unavailable result and never contacts Native.
+    let forbidden = fabric.route_active(
+        &routing_policy("ncm", 1, FallbackRule::default())?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(forbidden.identity.provider_id.as_str(), "ncm");
+    assert_eq!(forbidden.terminal_code(), TerminalCode::ProviderUnavailable);
+    assert_eq!(
+        forbidden.reply.terminal.diagnostic_id(),
+        Some("ncm.worker.killed")
+    );
+    assert_eq!(
+        forbidden.fallback,
+        FallbackDecision::Declined(FallbackDeclinedReason::HostRuleForbidden)
+    );
+    assert_eq!(ncm.handshake_count(), 2);
+    assert_eq!(ncm.invocation_count(), 2);
+    assert_eq!(native.handshake_count(), 0);
+    assert_eq!(native.invocation_count(), 0);
+
+    // The exact policy pin admits one fresh Native handshake and call. The
+    // source diagnostic remains attached to the fallback decision even though
+    // the routed reply is now Native's.
+    let fallback = fabric.route_active(
+        &routing_policy(
+            "ncm",
+            1,
+            FallbackRule::ExplicitPinned(fallback_policy.clone()),
+        )?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(fallback.identity.provider_id.as_str(), "tracedecay.native");
+    assert_eq!(fallback.call.provider_id.as_str(), "tracedecay.native");
+    assert_eq!(fallback.terminal_code(), TerminalCode::SuccessZeroResults);
+    assert_eq!(
+        fallback.fallback,
+        FallbackDecision::Dispatched {
+            from: RoutedProviderIdentity {
+                provider_id: provider_id("ncm")?,
+                registration_revision: 1,
+                provider_instance_id: "test.provider.instance-1".to_owned(),
+            },
+            from_terminal_code: TerminalCode::ProviderUnavailable,
+            from_diagnostic_id: Some("ncm.worker.killed".to_owned()),
+            policy: fallback_policy.clone(),
+        }
+    );
+    assert_eq!(
+        fallback.fallback.source_diagnostic_id(),
+        Some("ncm.worker.killed")
+    );
+    assert_eq!(ncm.handshake_count(), 3);
+    assert_eq!(ncm.invocation_count(), 3);
+    assert_eq!(native.handshake_count(), 1);
+    assert_eq!(native.invocation_count(), 1);
+
+    // Recovery does not leave the host sticky on Native. Once NCM is healthy,
+    // the same pinned active route answers from NCM and Native is untouched.
+    ncm.recover();
+    let recovered = fabric.route_active(
+        &routing_policy("ncm", 1, FallbackRule::ExplicitPinned(fallback_policy))?,
+        "recall.query.v1",
+        &RecallRoutePlan,
+    )?;
+    assert_eq!(recovered.identity.provider_id.as_str(), "ncm");
+    assert_eq!(recovered.call.provider_id.as_str(), "ncm");
+    assert_eq!(recovered.terminal_code(), TerminalCode::SuccessZeroResults);
+    assert_eq!(recovered.reply.terminal.diagnostic_id(), None);
+    assert_eq!(recovered.fallback, FallbackDecision::NotApplicable);
+    assert_eq!(ncm.handshake_count(), 4);
+    assert_eq!(ncm.invocation_count(), 4);
+    assert_eq!(native.handshake_count(), 1);
+    assert_eq!(native.invocation_count(), 1);
     Ok(())
 }
 

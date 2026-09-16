@@ -340,6 +340,15 @@ fn ncm_lifecycle_is_opt_in_and_scope_is_exact() {
     journey.init_project();
 
     let initial = journey.status();
+    assert_eq!(
+        initial["profile_root"].as_str(),
+        Some(journey.profile.to_str().expect("profile path is UTF-8")),
+        "NCM status must stay inside the fixture profile"
+    );
+    assert_eq!(
+        initial["project_root"].as_str(),
+        Some(journey.project.to_str().expect("project path is UTF-8"))
+    );
     assert_eq!(initial["enabled"], false);
     assert_eq!(initial["pending_recovery"], false);
     assert_eq!(initial["worker_present"], false);
