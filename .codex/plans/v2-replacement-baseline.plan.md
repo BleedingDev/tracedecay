@@ -21,7 +21,7 @@ todos:
     content: "Using the recoverable checkpoints, retain and port Native, NCM, provider-contract, persistence, privacy, and justified production-receipt slices, then deliberately delete dense code-search and PR-specific gate-runner machinery that the roadmap rejects; commit and push the resulting clean merge input."
     status: pending
   - id: repin-pr707-head
-    content: "Re-query PR #707 immediately before integration, record its exact head, merge base, draft and CI state, and redo the delta classification if it moved from 4f28d6fa95377a4ee305a7c7049c725c84c461f1."
+    content: "Re-query PR #707 immediately before integration, record its exact head, merge base, draft and CI state, and redo the delta classification if it moved from 06bc83c9f798b3ed46121a54413981c633a75d3a."
     status: pending
   - id: build-ownership-map
     content: "Map each retained provider capability from the old root layout to the latest owners in tracedecay-project, tracedecay-daemon-service, tracedecay-mcp, tracedecay-mcp-catalog, application, SDK, dashboard, and release packaging; identify every deletion-versus-port decision before resolving conflicts."
@@ -42,7 +42,7 @@ isProject: false
 
 ## Execution Notes
 
-The reviewed upstream snapshot is PR #707 head `4f28d6fa95377a4ee305a7c7049c725c84c461f1`; its merge base with the current branch is `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`. The current pushed branch head is `613d9d4ffd961eca0211903a684f1ba5850242ae`. PR #707 is open, draft, mergeable, and currently unstable, so its failing checks remain explicit blockers until fixed or shown unrelated. The early replacement contract prevents a late audit from discovering that an integrated build silently omitted a required V1 workflow or a flagship V2 surface.
+The reviewed upstream snapshot is PR #707 head `06bc83c9f798b3ed46121a54413981c633a75d3a`; its merge base with the current branch is `57006f60cb45bcee8487e73a40d4fad1a12ee2b6`. The current pushed branch head before the merge is `eda4f1ca343f559d13763f4914b930cadafe949b`. PR #707 is open, draft, mergeable, and currently unstable with the newest CI run still queued, so aggregate CI remains an explicit blocker until stable. The early replacement contract prevents a late audit from discovering that an integrated build silently omitted a required V1 workflow or a flagship V2 surface.
 
 The latest upstream tree retires dense neural code retrieval and moves major ownership boundaries. Conflict resolution must not resurrect `tracedecay-semantic`, FastEmbed/ORT code indexing, semantic activation, vector generations, or their public surfaces. NCM remains a separate memory provider and must be ported without becoming a fourth code-intelligence authority.
 
