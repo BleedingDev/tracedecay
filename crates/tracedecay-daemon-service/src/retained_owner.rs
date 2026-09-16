@@ -571,7 +571,8 @@ pub async fn mount_project_memory_provider_host(
         ConfiguredObservationProviderMountV1, EnabledProviderMode, FabricConfig,
         NATIVE_RECALL_SCOPE_BINDINGS, NativeProvider, ObservationMountActivationV1,
         ObservationMountRequirementV1, ProjectMemoryProviderComposition, ProviderExecutionShapeV1,
-        ProviderRegistrationV1, RecallScopeBindingsV1, SelectedProviderActivationV1,
+        ProviderLifecycleOwnershipV1, ProviderRegistrationV1, RecallScopeBindingsV1,
+        SelectedProviderActivationV1,
     };
 
     if inputs.activation.is_disabled() {
