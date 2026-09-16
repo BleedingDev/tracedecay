@@ -699,8 +699,9 @@ where
         // request context before invoking this handler; the typed
         // `CallToolRequestParams` consequently has `meta=None` for ordinary
         // wire traffic. Merge both representations before the shared dispatch
-        // envelope reads action-receipt metadata. A hand-built typed request's
-        // fields are applied after the context map so its explicit values win.
+        // envelope reads caller metadata such as the request deadline. A
+        // hand-built typed request's fields are applied after the context map
+        // so its explicit values win.
         let mut request_meta = std::mem::take(&mut context.meta);
         if let Some(params_meta) = request.meta.take() {
             request_meta.extend(params_meta);

@@ -232,10 +232,6 @@ pub struct McpServer {
     /// by the request that noticed the drift: a reopen is a full DB open plus a
     /// sealed restore, and no caller ever waits on it.
     branch_reopen: Arc<tokio::sync::Mutex<()>>,
-    /// Runner-prepared, one-shot action reservations. Project servers from
-    /// one authenticated daemon profile share this in-memory authority so a
-    /// routed call can finish against the selected retained server.
-    action_receipt_authority: tracedecay_daemon_protocol::action_receipt::ActionReceiptAuthority,
     /// Count of settled branch reopens (success, failure, cancellation, or
     /// shutdown-time rejection) without exposing the retained task handle.
     branch_reopen_completions: Arc<AtomicU64>,
@@ -1020,19 +1016,9 @@ impl McpServer {
             }
             None => None,
         };
-        let action_receipt_authority = profile_root.as_ref().map_or_else(
-            tracedecay_daemon_protocol::action_receipt::ActionReceiptAuthority::new,
-            |profile_root| {
-                tracedecay_daemon_protocol::action_receipt::ActionReceiptAuthority::for_scope(
-                    profile_root.to_string_lossy().into_owned(),
-                )
-            },
-        );
-
         let server = Arc::new_cyclic(|dispatch_server| Self {
             cg: Arc::new(tokio::sync::RwLock::new(cg)),
             branch_reopen: Arc::new(tokio::sync::Mutex::new(())),
-            action_receipt_authority,
             branch_reopen_completions: Arc::new(AtomicU64::new(0)),
             background_tasks: McpBackgroundTaskOwner::default(),
             tool_activity_publish_running: Arc::new(AtomicBool::new(false)),
