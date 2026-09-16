@@ -27,7 +27,7 @@ pub use builder::{
     PreparedCodeLexicalArtifactBatchV1,
 };
 pub use clone_census::CodeLexicalCloneIndexCensusV1;
-pub use clone_successor::CodeLexicalCloneSuccessorV1;
+pub use clone_successor::{CloneSuccessorReuseAccountingV1, CodeLexicalCloneSuccessorV1};
 pub use fingerprints::{
     CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
     CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
