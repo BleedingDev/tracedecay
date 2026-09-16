@@ -947,7 +947,7 @@ fn read_file_nofollow(
 }
 
 fn read_open_file(
-    mut file: cap_std::fs::File,
+    file: cap_std::fs::File,
     path: &Path,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, EncoderError> {
@@ -972,7 +972,8 @@ fn open_file_following(
     name: &OsStr,
     path: &Path,
 ) -> Result<cap_std::fs::File, EncoderError> {
-    let options = OpenOptions::new().read(true);
+    let mut options = OpenOptions::new();
+    options.read(true);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())
