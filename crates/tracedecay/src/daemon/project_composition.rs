@@ -1572,6 +1572,7 @@ impl ProjectOpenInputs<'_> {
                 project_id: code_index.project_id.clone(),
                 profile_root: core.profile_identity.profile_root().to_path_buf(),
                 project_root: self.canonical_project_path.to_path_buf(),
+                scope: code_index.scope.clone(),
                 transcript_source_home: core.transcript_source_home.clone(),
                 project_sessions: session_db.clone(),
                 user_sessions: user_session_db.clone(),
@@ -2396,6 +2397,7 @@ async fn retire_failed_project_open_owner(
     }
 
     let project_sessions_path = failed_key
+        .owner
         .store_root
         .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
     let project_id = failed_key
