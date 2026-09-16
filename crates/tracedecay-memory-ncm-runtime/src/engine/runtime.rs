@@ -396,24 +396,28 @@ impl NcmEngine {
             .saturating_add(1);
         if namespaces.contains_key(namespace) {
             if let Some(handle) = namespaces.get_mut(namespace) {
-                if recover_privacy && handle.fenced {
-                    if let Some(resumed) =
-                        crate::privacy::resume_pending_rebuild(&mut handle.store, &self.config)?
+                if handle.fenced {
+                    if recover_privacy {
+                        if let Some(resumed) =
+                            crate::privacy::resume_pending_rebuild(&mut handle.store, &self.config)?
+                        {
+                            handle.commit_seq = resumed.meta.commit_seq;
+                            handle.epoch = resumed.meta.epoch;
+                            util::publish(handle, resumed.kernel)?;
+                            handle.fenced = false;
+                        }
+                    }
+                    if handle.fenced
+                        && handle
+                            .store
+                            .fenced()
+                            .map_err(|error| store_reply(error, handle.commit_seq))?
+                            .is_none()
                     {
-                        handle.commit_seq = resumed.meta.commit_seq;
-                        handle.epoch = resumed.meta.epoch;
-                        util::publish(handle, resumed.kernel)?;
-                        handle.fenced = false;
-                    } else if handle
-                        .store
-                        .fenced()
-                        .map_err(|error| store_reply(error, handle.commit_seq))?
-                        .is_none()
-                    {
-                        // A rebuild can commit and then lose publication. The
-                        // resident handle still carries its pre-commit fence
-                        // bit, while the durable fence has already cleared.
-                        // Reconcile the committed checkpoint before serving it.
+                        // Another engine may have completed the rebuild and
+                        // cleared the durable fence while this resident handle
+                        // still carries its stale in-memory fence bit. Rebuild
+                        // from the committed checkpoint before serving reads.
                         let meta = handle
                             .store
                             .meta()

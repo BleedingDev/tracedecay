@@ -663,6 +663,61 @@ fn corrupted_pending_rebuild_journal_fails_closed_without_publishing_recallable_
 }
 
 #[test]
+fn stale_resident_fence_reconciles_after_another_engine_finishes_rebuild() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let first = make_engine(&tempdir);
+    observe(
+        &first,
+        &namespace,
+        "source-a",
+        "retained key",
+        "retained value",
+        "retained",
+    );
+    observe(&first, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    first
+        .inject_fault_once(FaultPoint::AfterCommitBeforePublish)
+        .expect("fault arms");
+    let interrupted = first.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "stale-resident-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+
+    let second = make_engine(&tempdir);
+    let ready = second.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
+    drop(second);
+
+    // `first` still has the stale in-memory fence bit. A normal recall must
+    // notice that the durable fence is gone and reconcile before reading.
+    let recalled = first.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(matches!(
+        recalled.outcome,
+        Outcome::Success | Outcome::Empty
+    ));
+    assert!(
+        candidate_texts(&recalled.payload)
+            .iter()
+            .all(|text| !text.contains(B_TOKEN))
+    );
+    assert_eq!(
+        first.inspection(&namespace).state_generation,
+        ready.state_generation
+    );
+}
+
+#[test]
 fn deleting_an_unknown_source_is_successful_and_idempotent() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
