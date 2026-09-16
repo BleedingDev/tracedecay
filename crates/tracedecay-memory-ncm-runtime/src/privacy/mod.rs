@@ -1262,7 +1262,7 @@ fn validate_completed_deletion_replay(
     };
     if fence_event.kind != "deletion_fence"
         || fence_event.idempotency_key.is_some()
-        || fence_event.seq + 1 != event.seq
+        || fence_event.seq.checked_add(1) != Some(event.seq)
         || fence_source != source
         || fence_sources != sources
         || fence_epoch != target_epoch
@@ -1286,13 +1286,14 @@ fn validate_completed_deletion_replay(
         .store
         .revocations()
         .map_err(|error| store_reply(error, handle.commit_seq))?;
-    if fence_sources.iter().any(|source| {
-        !revocations.iter().any(|revocation| {
-            revocation.source_id == *source
-                && revocation.epoch == *target_epoch
-                && revocation.seq == fence_event.seq
+    let actual_revocation_sources = revocations
+        .iter()
+        .filter(|revocation| {
+            revocation.epoch == *target_epoch && revocation.seq == fence_event.seq
         })
-    }) {
+        .map(|revocation| revocation.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_revocation_sources != fence_sources.iter().cloned().collect::<BTreeSet<_>>() {
         return Err(corrupt_reply(
             handle.commit_seq,
             "completed deletion revocation authority does not match its fence",

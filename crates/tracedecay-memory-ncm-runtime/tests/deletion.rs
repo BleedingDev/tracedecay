@@ -742,6 +742,62 @@ fn deleting_an_unknown_source_is_successful_and_idempotent() {
 }
 
 #[test]
+fn multi_source_deletion_uses_one_canonical_source_order_for_fence_and_replay() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-z", "z key", "z value", "z");
+    observe(&engine, &namespace, "source-a", "a key", "a value", "a");
+    let expected_generation = inspect(&engine, &namespace)["commit_seq"]
+        .as_u64()
+        .expect("generation");
+
+    let first = engine.common_control(
+        &namespace,
+        json!({
+            "action": "delete_by_source",
+            "sources": ["source-z", "source-a"],
+            "idempotency_key": "delete-multi",
+            "expected_generation": expected_generation
+        }),
+        DEADLINE,
+    );
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(
+        first.payload["_retained_receipt"]["payload"]["source"],
+        "source-a"
+    );
+    assert_eq!(
+        first.payload["_retained_receipt"]["payload"]["deleted_records"],
+        2
+    );
+    assert_eq!(
+        engine.revoked_sources(&namespace).expect("revocations"),
+        vec![
+            SourceId("source-a".to_owned()),
+            SourceId("source-z".to_owned())
+        ]
+    );
+
+    let replay = engine.common_control(
+        &namespace,
+        json!({
+            "action": "delete_by_source",
+            "sources": ["source-a", "source-z"],
+            "idempotency_key": "delete-multi",
+            "expected_generation": first.state_generation
+        }),
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(
+        replay.payload["_retained_receipt"]["payload"]["source"],
+        "source-a"
+    );
+}
+
+#[test]
 fn revoked_source_rejects_fresh_keys_and_preserves_duplicates_across_restart() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
