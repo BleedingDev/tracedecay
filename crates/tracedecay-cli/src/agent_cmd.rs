@@ -1418,6 +1418,7 @@ pub(crate) async fn handle_reinstall_command(adopt: bool) -> tracedecay_domain::
         }
     })?;
     let tracedecay_bin = lifecycle_tracedecay_bin()?;
+    tracedecay_agent_hosts::agents::reconcile_git_post_commit_hook(&tracedecay_bin);
     let mut user_cfg = load_host_lifecycle_user_config()?;
 
     if user_cfg.installed_agents.is_empty() {
@@ -1480,6 +1481,7 @@ pub(crate) async fn handle_update_plugin_command(
         }
     })?;
     let tracedecay_bin = lifecycle_tracedecay_bin()?;
+    tracedecay_agent_hosts::agents::reconcile_git_post_commit_hook(&tracedecay_bin);
     let user_cfg = load_host_lifecycle_user_config()?;
 
     for id in &user_cfg.installed_agents {

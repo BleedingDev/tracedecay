@@ -70,7 +70,7 @@ pub use roo_code::RooCodeIntegration;
 pub use vibe::VibeIntegration;
 pub use zed::ZedIntegration;
 
-pub use git_post_commit_hook::offer_git_post_commit_hook;
+pub use git_post_commit_hook::{offer_git_post_commit_hook, reconcile_git_post_commit_hook};
 pub use host_config_io::{
     HostFileMetadataIdentityV1, JsonConfigDialect, backup_config_file, capture_host_file_metadata,
     config_backup_path, copilot_cli_dir, home_dir, host_config_write_intent_path, kiro_data_dir,

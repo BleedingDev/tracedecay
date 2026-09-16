@@ -911,6 +911,21 @@ fn production_cli_pins_lifecycle_outputs_to_invoked_v2_with_v1_on_path() {
     let shadowing_v1 = cli.shadowing_v1_bin();
     let invoked_v2_text = invoked_v2.to_str().expect("UTF-8 test binary path");
     let shadowing_v1_text = shadowing_v1.to_str().expect("UTF-8 V1 fixture path");
+    let git_hooks_dir = cli.home.path().join(".config/git/hooks");
+    fs::create_dir_all(&git_hooks_dir).unwrap();
+    let git_hook = git_hooks_dir.join("post-commit");
+    fs::write(
+        &git_hook,
+        format!(
+            "#!/bin/sh\n# foreign before\necho foreign\n# tracedecay: auto-sync\n{shadowing_v1_text} sync >/dev/null 2>&1 &\n# foreign after\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        cli.home.path().join(".gitconfig"),
+        "[core]\n\thooksPath = ~/.config/git/hooks\n",
+    )
+    .unwrap();
 
     // Exercise the default install, update-plugin, repair, read-only
     // preflight, and an explicit component-set lifecycle while PATH offers a
@@ -965,6 +980,11 @@ fn production_cli_pins_lifecycle_outputs_to_invoked_v2_with_v1_on_path() {
     )
     .unwrap();
     assert!(registration.contains(invoked_v2_text));
+    let git_hook_contents = fs::read_to_string(&git_hook).unwrap();
+    assert!(git_hook_contents.contains("# foreign before\necho foreign"));
+    assert!(git_hook_contents.contains("# foreign after"));
+    assert!(git_hook_contents.contains(&format!("{invoked_v2_text} sync >/dev/null 2>&1 &")));
+    assert!(!git_hook_contents.contains(&format!("{shadowing_v1_text} sync >/dev/null 2>&1 &")));
     let config: serde_json::Value = serde_json::from_slice(
         &fs::read(cli.home.path().join(".config/opencode/opencode.json")).unwrap(),
     )

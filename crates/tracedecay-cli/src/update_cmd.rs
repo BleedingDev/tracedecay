@@ -411,7 +411,7 @@ fn run_update_flow(
         |lease_token| {
             let installed_version =
                 run_install_then_refresh(refresh_policy, crate::upgrade::run_upgrade, |binary| {
-                    run_post_update_subcommand(no_reinstall, binary, lease_token)
+                    run_post_update_subcommand(no_reinstall, binary, Some(lease_token))
                 })?;
             // Report the installed version so the window's daemon restore
             // validates the binary it actually starts, not the one that was
@@ -501,17 +501,19 @@ fn post_update_binary_from(installed: Option<&Path>, current: Option<&Path>) -> 
         .or_else(|| current_tracedecay_exe_from(current))
 }
 
-fn run_post_update_subcommand(
+pub(crate) fn run_post_update_subcommand(
     no_reinstall: bool,
     installed: Option<&Path>,
-    lifecycle_lease_token: &str,
+    lifecycle_lease_token: Option<&str>,
 ) -> tracedecay_domain::errors::Result<()> {
     let tracedecay_bin = post_update_binary(installed)?;
     let mut command = std::process::Command::new(&tracedecay_bin);
-    command
-        .arg("post-update")
-        .arg("--lifecycle-lease-token")
-        .arg(lifecycle_lease_token);
+    command.arg("post-update");
+    if let Some(lifecycle_lease_token) = lifecycle_lease_token {
+        command
+            .arg("--lifecycle-lease-token")
+            .arg(lifecycle_lease_token);
+    }
     if no_reinstall {
         command.arg("--no-reinstall");
     }
@@ -659,6 +661,7 @@ async fn run_post_update_mutations(
     tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<()> {
     let home = tracedecay_home_dir()?;
+    tracedecay_agent_hosts::agents::reconcile_git_post_commit_hook(tracedecay_bin);
     refresh_generated_plugins_at(
         tracedecay_agent_hosts::agents::all_integrations(),
         &home,

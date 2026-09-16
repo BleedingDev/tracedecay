@@ -1147,10 +1147,22 @@ fn switch_channel_for(method: &InstallMethod, target_channel: &str) -> Result<St
 
     let download = preflight_asset_check(&latest, target_is_beta)?;
 
-    // Channel switches do not yet run the post-update refresh chain, so the
-    // installed path is unused here.
-    let _ = perform_upgrade(&download)?;
+    let installed = perform_upgrade(&download)?;
     record_previous_version();
+    // A channel switch replaces the executable just like `update` and
+    // `upgrade`. Re-exec the freshly installed binary so it runs the same
+    // generated-plugin, tracked-agent, and daemon-service refresh chain with
+    // its exact current executable path. Without this, switching channels
+    // leaves every existing integration pinned to the old channel binary.
+    if let Err(error) =
+        crate::update_cmd::run_post_update_subcommand(false, installed.as_deref(), None)
+    {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "channel switch installed v{latest}, but post-update lifecycle refresh failed: {error}"
+            ),
+        });
+    }
     eprintln!("\x1b[32m✔\x1b[0m Switched to {target_channel} channel: v{latest}");
     Ok(latest)
 }
