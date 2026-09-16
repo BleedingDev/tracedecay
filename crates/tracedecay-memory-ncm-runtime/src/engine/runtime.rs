@@ -8,7 +8,7 @@ pub(crate) mod recovery;
 mod selection;
 mod util;
 
-pub(crate) use util::canonical_digest;
+pub(crate) use util::{canonical_digest, durable_integrity_digest};
 
 use super::*;
 use crate::ports::EncoderIdentity;

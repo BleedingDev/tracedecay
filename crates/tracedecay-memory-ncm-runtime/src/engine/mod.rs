@@ -13,7 +13,7 @@ pub(crate) use runtime::recovery::{
     replay_event as replay_recovery_event, validate_event_payload_digest,
     validate_pending_deletion_fence, validate_recovery_event,
 };
-pub(crate) use runtime::util::durable_integrity_digest;
+pub(crate) use runtime::durable_integrity_digest;
 
 use crate::ports::{Deadline, StateRoot, TextEncoder};
 use crate::store::{CommitSeq, NamespaceStore};

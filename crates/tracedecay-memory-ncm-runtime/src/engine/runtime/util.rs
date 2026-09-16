@@ -203,7 +203,7 @@ pub(super) fn validate_idempotency_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<String, String> {
+pub(crate) fn canonical_digest<T: Serialize + ?Sized>(value: &T) -> Result<String, String> {
     serde_json::to_vec(value)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|error| format!("serialize canonical payload: {error}"))

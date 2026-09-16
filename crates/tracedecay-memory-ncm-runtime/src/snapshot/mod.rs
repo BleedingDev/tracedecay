@@ -1501,7 +1501,7 @@ fn restore_receipt(reply: &EngineReply, kernel: &NcmKernel) -> Result<String, En
     };
     let state_digest = sha256_hex(&kernel.state_digest());
     let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)
-        .map_err(|reason| corrupt_reply(reply.state_generation, &reason))?;
+        .map_err(|reason: String| corrupt_reply(reply.state_generation, &reason))?;
     serde_json::to_string(&DurableReceipt {
         reply: reply.clone(),
         operation,
