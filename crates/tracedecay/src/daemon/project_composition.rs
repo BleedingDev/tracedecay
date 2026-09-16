@@ -38,15 +38,17 @@ use session_database_admission::{join_independent_session_opens, log_session_dat
 #[repr(u8)]
 pub(super) enum ProjectOpenFailurePhase {
     SessionDatabases = 1,
-    ProviderMount = 2,
-    McpConstructed = 3,
-    GitTransactions = 4,
-    IndependentOwners = 5,
-    DependentOwners = 6,
-    ProviderActivated = 7,
-    RuntimeReady = 8,
-    RegistryPublished = 9,
-    HttpMounted = 10,
+    ObservabilityMounted = 2,
+    ProviderMount = 3,
+    McpConstructed = 4,
+    SessionHoldersMounted = 5,
+    GitTransactions = 6,
+    IndependentOwners = 7,
+    DependentOwners = 8,
+    ProviderActivated = 9,
+    RuntimeReady = 10,
+    RegistryPublished = 11,
+    HttpMounted = 12,
 }
 
 #[cfg(test)]
@@ -1435,11 +1437,12 @@ impl ProjectOpenInputs<'_> {
     /// `finish_full_server`, after every required owner and publication fence
     /// has succeeded.
     ///
-    /// The core is reachable from here on, so every step leaves this function
-    /// with an error instead of returning behind a published route: the
-    /// caller's funnel owns retiring the owner. Retired relational graph repair
-    /// is deliberately absent; the bounded code-index activation owns
-    /// background indexing.
+    /// The core remains the route's published server while this private
+    /// candidate is assembled. Every error therefore returns through the
+    /// caller's transaction funnel; the candidate has no registry or HTTP
+    /// reachability until `finish_full_server` commits it. Retired relational
+    /// graph repair is deliberately absent; the bounded code-index activation
+    /// owns background indexing.
     #[hotpath::measure(label = "daemon.project.compose.construct_full", future = true)]
     #[expect(
         clippy::too_many_lines,
@@ -1492,7 +1495,7 @@ impl ProjectOpenInputs<'_> {
             &delivery_access,
         )
         .await?;
-        self.phase_checkpoint(ProjectOpenFailurePhase::GitTransactions)?;
+        self.phase_checkpoint(ProjectOpenFailurePhase::ObservabilityMounted)?;
         let host_admission_broker = Some(
             self.store_administration
                 .host_admission_broker(&session_db)
@@ -1846,6 +1849,7 @@ impl ProjectOpenInputs<'_> {
                     full.session_db.clone(),
                 ])
                 .await;
+            self.phase_checkpoint(ProjectOpenFailurePhase::SessionHoldersMounted)?;
             Box::pin(self.mount_full_server_owners(
                 opened,
                 core,
@@ -2354,80 +2358,86 @@ async fn retire_failed_project_open_owner(
         }
     }
 
-    let Some(project_id) = failed_key
+    let project_sessions_path = failed_key
+        .store_root
+        .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
+    let project_id = failed_key
         .owner
         .project_id
         .clone()
-        .and_then(|project_id| tracedecay_domain::ProjectId::new(project_id).ok())
-    else {
+        .and_then(|project_id| tracedecay_domain::ProjectId::new(project_id).ok());
+    if project_id.is_none() {
         tracing::warn!(
             project = %canonical_project_path.display(),
             "failed project-open owner omitted its authoritative project identity"
         );
-        return;
-    };
-    let Ok(identity) = store_administration.profile_identity() else {
+    }
+    let identity = store_administration.profile_identity().ok().cloned();
+    if identity.is_none() {
         tracing::warn!(
             project = %canonical_project_path.display(),
             "failed project-open owner profile identity was unavailable during rollback"
         );
-        return;
-    };
-    let identity = identity.clone();
-    let mut project_roots = std::collections::BTreeSet::new();
-    project_roots.insert(canonical_project_path.to_path_buf());
-    project_roots.insert(failed_key.project_root.clone());
-    if let Err(error) = invocation
-        .retire_project_runtime_owners(identity.profile_id(), &project_id, &project_roots)
-        .await
-    {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            %error,
-            "failed project-open invocation owners did not retire cleanly"
-        );
     }
 
-    let project_sessions_path = failed_key
-        .store_root
-        .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
-    if let Err(error) = store_administration
-        .git_index_transaction_services()
-        .retire_project_database(&project_id, &project_sessions_path)
-        .await
-    {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            %error,
-            "failed project-open Git transaction owner did not retire cleanly"
+    // Keep the final holder-lease release below unconditional. A malformed
+    // identity or a profile lookup failure must not turn rollback into an
+    // early return that strands the session stores mounted by this attempt.
+    if let Some(project_id) = project_id.as_ref() {
+        if let Some(identity) = identity.as_ref() {
+            let mut project_roots = std::collections::BTreeSet::new();
+            project_roots.insert(canonical_project_path.to_path_buf());
+            project_roots.insert(failed_key.project_root.clone());
+            if let Err(error) = invocation
+                .retire_project_runtime_owners(identity.profile_id(), project_id, &project_roots)
+                .await
+            {
+                tracing::warn!(
+                    project = %canonical_project_path.display(),
+                    %error,
+                    "failed project-open invocation owners did not retire cleanly"
+                );
+            }
+        }
+        if let Err(error) = store_administration
+            .git_index_transaction_services()
+            .retire_project_database(project_id, &project_sessions_path)
+            .await
+        {
+            tracing::warn!(
+                project = %canonical_project_path.display(),
+                %error,
+                "failed project-open Git transaction owner did not retire cleanly"
+            );
+        }
+        if let Err(error) = store_administration
+            .native_integration_services()
+            .retire_project_database(project_id, &project_sessions_path)
+            .await
+        {
+            tracing::warn!(
+                project = %canonical_project_path.display(),
+                %error,
+                "failed project-open Native integration owner did not retire cleanly"
+            );
+        }
+        if let Some(identity) = identity.as_ref()
+            && let Err(error) = store_administration
+                .session_sync_service()
+                .retire_project(identity.profile_id(), project_id)
+                .await
+        {
+            tracing::warn!(
+                project = %canonical_project_path.display(),
+                %error,
+                "failed project-open session sync owner did not retire cleanly"
+            );
+        }
+        super::branch_admin::retire_registered_context_scout_owner(
+            project_id,
+            &failed_key.owner.graph_db_path,
         );
     }
-    if let Err(error) = store_administration
-        .native_integration_services()
-        .retire_project_database(&project_id, &project_sessions_path)
-        .await
-    {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            %error,
-            "failed project-open Native integration owner did not retire cleanly"
-        );
-    }
-    if let Err(error) = store_administration
-        .session_sync_service()
-        .retire_project(identity.profile_id(), &project_id)
-        .await
-    {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            %error,
-            "failed project-open session sync owner did not retire cleanly"
-        );
-    }
-    super::branch_admin::retire_registered_context_scout_owner(
-        &project_id,
-        &failed_key.owner.graph_db_path,
-    );
     super::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(
         &opened.cg.hook_store_layout().data_root,
     )
@@ -2435,15 +2445,17 @@ async fn retire_failed_project_open_owner(
     let telemetry_sampling = store_administration.store_telemetry_sampling();
     telemetry_sampling.release_retained_handle(&project_sessions_path);
     telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
-    if let Ok(runtime_registry) = store_administration.session_runtime_registry().await {
+    if let Some(project_id) = project_id.as_ref()
+        && let Ok(runtime_registry) = store_administration.session_runtime_registry().await
+    {
         let _ = runtime_registry
-            .retire_project_session_relation_graph(&project_id)
+            .retire_project_session_relation_graph(project_id)
             .await;
         let _ = runtime_registry
-            .retire_project_memory_graph(&project_id)
+            .retire_project_memory_graph(project_id)
             .await;
         runtime_registry
-            .drop_project_runtime_caches(&project_id)
+            .drop_project_runtime_caches(project_id)
             .await;
     }
     invocation
