@@ -949,6 +949,21 @@ fn process_death_is_detected_then_lazily_restarted() {
 fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     let root = TempDir::new().expect("temp root");
     let ns = namespace(28);
+    let client = client(&root);
+    client
+        .call(
+            Request::new(260, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("initial health starts worker");
+    client
+        .call(
+            Request::new(261, 0, Operation::Handshake, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("empty namespace handshake caches readiness");
+    let first_pid = client.pid().expect("initial worker pid exists");
+
     let engine = NcmEngine::new(
         StateRoot::new(root.path()).expect("state root is absolute"),
         Arc::new(HashEncoder::new()),
@@ -983,15 +998,6 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     );
     assert_eq!(fenced.outcome, Outcome::EffectUnknown);
     drop(engine);
-
-    let client = client(&root);
-    client
-        .call(
-            Request::new(260, 0, Operation::Health, "", json!({})),
-            CALL_DEADLINE,
-        )
-        .expect("initial health starts worker");
-    let first_pid = client.pid().expect("initial worker pid exists");
     assert!(
         Command::new("kill")
             .arg("-9")
@@ -1003,7 +1009,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     let recovered = client
         .call(
             Request::new(
-                261,
+                262,
                 0,
                 Operation::Recall,
                 &ns,
@@ -1026,7 +1032,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
 
     let inspection = client
         .call(
-            Request::new(262, 0, Operation::Inspection, &ns, json!({})),
+            Request::new(263, 0, Operation::Inspection, &ns, json!({})),
             CALL_DEADLINE,
         )
         .expect("recovered namespace can be inspected");
