@@ -108,6 +108,8 @@ impl Counters {
 struct MockNativePort {
     descriptor: ProviderDescriptor,
     followup_descriptor: Mutex<Option<ProviderDescriptor>>,
+    handshake_override: Mutex<Option<HandshakeResponse>>,
+    reply_override: Mutex<Option<ProviderReply>>,
     observation_code: TerminalCode,
     counters: Counters,
     last_call: Mutex<Option<ProviderCall>>,
@@ -138,6 +140,8 @@ impl MockNativePort {
             )
             .expect("descriptor"),
             followup_descriptor: Mutex::new(None),
+            handshake_override: Mutex::new(None),
+            reply_override: Mutex::new(None),
             observation_code: TerminalCode::Success,
             counters: Counters::default(),
             last_call: Mutex::new(None),
@@ -180,6 +184,22 @@ impl MockNativePort {
                     call.expected_state_generation,
                 )
             };
+        let payload = if matches!(
+            code,
+            TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial
+        ) {
+            Some(
+                CanonicalPayload::new(
+                    OwnedVersionedId::new(result_contract_id(call.operation))
+                        .expect("result contract"),
+                    call.payload.bytes.clone(),
+                    call.payload.sha256.clone(),
+                )
+                .expect("result payload"),
+            )
+        } else {
+            None
+        };
         ProviderReply {
             terminal: TerminalRecord::new(
                 call.operation,
@@ -192,7 +212,7 @@ impl MockNativePort {
                 (code != TerminalCode::Success).then(|| format!("native.{}", code.as_wire())),
             )
             .expect("terminal"),
-            payload: (code == TerminalCode::Success).then(|| call.payload.clone()),
+            payload,
             warnings: Vec::new(),
             extensions: call.extensions.clone(),
             state_generation,
@@ -202,26 +222,17 @@ impl MockNativePort {
     fn record(&self, call: &ProviderCall) {
         *self.last_call.lock().expect("last call lock") = Some(call.clone());
     }
-}
 
-impl NativeMemoryApplicationPort for MockNativePort {
-    fn descriptor(&self) -> ProviderDescriptor {
-        let call_index = self.counters.descriptor.fetch_add(1, Ordering::Relaxed);
-        if call_index > 0
-            && let Some(descriptor) = self
-                .followup_descriptor
-                .lock()
-                .expect("followup descriptor lock")
-                .as_ref()
-        {
-            return descriptor.clone();
-        }
-        self.descriptor.clone()
+    fn reply(&self, call: &ProviderCall, code: TerminalCode) -> ProviderReply {
+        let override_reply = self
+            .reply_override
+            .lock()
+            .expect("reply override lock")
+            .take();
+        override_reply.unwrap_or_else(|| self.terminal(call, code))
     }
 
-    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
-        self.counters.handshake.fetch_add(1, Ordering::Relaxed);
-        *self.last_handshake.lock().expect("handshake lock") = Some(request.clone());
+    fn default_handshake_response(&self, request: &HandshakeRequest) -> HandshakeResponse {
         HandshakeResponse {
             terminal: TerminalRecord::new(
                 ProviderOperation::Handshake,
@@ -243,11 +254,38 @@ impl NativeMemoryApplicationPort for MockNativePort {
             warnings: Vec::new(),
         }
     }
+}
+
+impl NativeMemoryApplicationPort for MockNativePort {
+    fn descriptor(&self) -> ProviderDescriptor {
+        let call_index = self.counters.descriptor.fetch_add(1, Ordering::Relaxed);
+        if call_index > 0
+            && let Some(descriptor) = self
+                .followup_descriptor
+                .lock()
+                .expect("followup descriptor lock")
+                .as_ref()
+        {
+            return descriptor.clone();
+        }
+        self.descriptor.clone()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.counters.handshake.fetch_add(1, Ordering::Relaxed);
+        *self.last_handshake.lock().expect("handshake lock") = Some(request.clone());
+        let override_response = self
+            .handshake_override
+            .lock()
+            .expect("handshake override lock")
+            .take();
+        override_response.unwrap_or_else(|| self.default_handshake_response(request))
+    }
 
     fn health(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.health.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
@@ -255,37 +293,37 @@ impl NativeMemoryApplicationPort for MockNativePort {
         *self.last_observation.lock().expect("last observation lock") =
             Some(ObservedVariant::capture(&observation));
         self.record(observation.call());
-        self.terminal(observation.call(), self.observation_code)
+        self.reply(observation.call(), self.observation_code)
     }
 
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.recall.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn feedback(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.feedback.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.maintenance.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn inspection(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.inspection.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn correction(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.correction.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
@@ -293,7 +331,7 @@ impl NativeMemoryApplicationPort for MockNativePort {
             .delete_by_source
             .fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
@@ -301,7 +339,7 @@ impl NativeMemoryApplicationPort for MockNativePort {
             .snapshot_export
             .fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
@@ -309,13 +347,13 @@ impl NativeMemoryApplicationPort for MockNativePort {
             .snapshot_restore
             .fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 
     fn replay(&self, call: &ProviderCall) -> ProviderReply {
         self.counters.replay.fetch_add(1, Ordering::Relaxed);
         self.record(call);
-        self.terminal(call, TerminalCode::Success)
+        self.reply(call, TerminalCode::Success)
     }
 }
 
@@ -359,6 +397,23 @@ fn operation_contract_id(operation: ProviderOperation) -> &'static str {
         ProviderOperation::SnapshotExport => "tracedecay.memory.provider.snapshot-export.v1",
         ProviderOperation::SnapshotRestore => "tracedecay.memory.provider.snapshot-restore.v1",
         ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
+    }
+}
+
+fn result_contract_id(operation: ProviderOperation) -> &'static str {
+    match operation {
+        ProviderOperation::Handshake => "tracedecay.memory.provider.handshake.v1",
+        ProviderOperation::Health => "tracedecay.memory.provider.health.v1",
+        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
+        ProviderOperation::Recall => "tracedecay.memory.recall.query.outcome.v1",
+        ProviderOperation::Feedback => "tracedecay.memory.feedback.record.outcome.v1",
+        ProviderOperation::Maintenance => "tracedecay.memory.maintenance.run.outcome.v1",
+        ProviderOperation::Inspection => "tracedecay.memory.inspection.read.outcome.v1",
+        ProviderOperation::Correction => "tracedecay.memory.correction.apply.outcome.v1",
+        ProviderOperation::DeleteBySource => "tracedecay.memory.deletion.by_source.outcome.v1",
+        ProviderOperation::SnapshotExport => "tracedecay.memory.snapshot.export.outcome.v1",
+        ProviderOperation::SnapshotRestore => "tracedecay.memory.snapshot.restore.outcome.v1",
+        ProviderOperation::Replay => "tracedecay.memory.replay.apply.outcome.v1",
     }
 }
 
@@ -563,10 +618,7 @@ fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
             reply.terminal.diagnostic_id(),
             Some("native.descriptor_drift")
         );
-        assert_eq!(
-            port.counters.operation_calls(ProviderOperation::Health),
-            0
-        );
+        assert_eq!(port.counters.operation_calls(ProviderOperation::Health), 0);
     }
 }
 
@@ -837,6 +889,110 @@ fn invalid_handshake_envelopes_fail_before_native_contact() {
 }
 
 #[test]
+fn cancelled_or_expired_handshake_is_refused_before_descriptor_and_port_contact() {
+    let cases = [
+        (TerminalCode::Cancelled, {
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            OperationControl::new(i64::MAX, 500, cancellation)
+        }),
+        (
+            TerminalCode::DeadlineExceeded,
+            OperationControl::new(0, 500, CancellationToken::new()),
+        ),
+    ];
+
+    for (expected_code, control) in cases {
+        let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+        let provider = NativeProvider::new(port.clone()).expect("adapter");
+        let mut request = handshake(NATIVE_PROVIDER_ID);
+        request.control = control;
+        let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+        let response = provider.handshake(&request);
+
+        assert_eq!(response.terminal.terminal_code(), expected_code);
+        assert_eq!(
+            response.terminal.diagnostic_id(),
+            Some("native.handshake_request_control_terminal")
+        );
+        assert!(response.descriptor.is_none());
+        assert_eq!(
+            port.counters.descriptor.load(Ordering::Relaxed),
+            descriptor_calls
+        );
+        assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn cancelled_or_expired_operation_is_refused_before_descriptor_and_port_contact() {
+    let cases = [
+        (TerminalCode::Cancelled, {
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+            OperationControl::new(i64::MAX, 500, cancellation)
+        }),
+        (
+            TerminalCode::DeadlineExceeded,
+            OperationControl::new(0, 500, CancellationToken::new()),
+        ),
+    ];
+
+    for (expected_code, control) in cases {
+        let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+        let provider = NativeProvider::new(port.clone()).expect("adapter");
+        let mut request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+        request.control = control;
+        let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
+
+        let reply = provider.invoke(&request);
+
+        assert_eq!(reply.terminal.terminal_code(), expected_code);
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.request_control_terminal")
+        );
+        assert_eq!(reply.payload, None);
+        assert_eq!(reply.state_generation, request.expected_state_generation);
+        assert_eq!(
+            port.counters.descriptor.load(Ordering::Relaxed),
+            descriptor_calls
+        );
+        assert_eq!(port.counters.health.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
+fn malformed_handshake_reply_is_converted_to_contract_violation() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let request = handshake(NATIVE_PROVIDER_ID);
+    let mut malformed = port.default_handshake_response(&request);
+    let mut foreign_scope = scope();
+    foreign_scope.project_id = "project-b".to_owned();
+    malformed.accepted_scope = Some(foreign_scope);
+    *port
+        .handshake_override
+        .lock()
+        .expect("handshake override lock") = Some(malformed);
+
+    let response = provider.handshake(&request);
+
+    assert_eq!(
+        response.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        response.terminal.diagnostic_id(),
+        Some("native.handshake_response_contract_violation")
+    );
+    assert!(response.descriptor.is_none());
+    assert!(response.provider_instance_id.is_none());
+    assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn mutated_operation_envelopes_fail_before_all_native_contact() {
     let port = Arc::new(MockNativePort::new(
         NATIVE_PROVIDER_ID,
@@ -963,7 +1119,13 @@ fn supported_mandatory_operations_route_without_payload_transformation() {
         assert_eq!(reply.terminal.operation(), operation);
         assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
         assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-        assert_eq!(reply.payload, Some(expected_payload));
+        let result_payload = reply.payload.as_ref().expect("result payload");
+        assert_eq!(result_payload.bytes, expected_payload.bytes);
+        assert_eq!(result_payload.sha256, expected_payload.sha256);
+        assert_eq!(
+            result_payload.contract_id.as_str(),
+            result_contract_id(operation)
+        );
         if operation.mutates_provider_state() {
             assert_eq!(
                 reply.terminal.committed_effect().state(),
@@ -1019,6 +1181,54 @@ fn supported_mandatory_operations_route_without_payload_transformation() {
 }
 
 #[test]
+fn malformed_application_result_contract_is_converted_to_contract_violation() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Recall);
+    let mut malformed = port.terminal(&request, TerminalCode::Success);
+    malformed
+        .payload
+        .as_mut()
+        .expect("result payload")
+        .contract_id = OwnedVersionedId::new("tracedecay.memory.provider.health.v1")
+        .expect("foreign result contract");
+    *port.reply_override.lock().expect("reply override lock") = Some(malformed);
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.application_reply_contract_violation")
+    );
+    assert_eq!(reply.payload, None);
+    assert_eq!(reply.state_generation, request.expected_state_generation);
+    assert_eq!(port.counters.recall.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn malformed_application_reply_digest_is_converted_to_contract_violation() {
+    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let provider = NativeProvider::new(port.clone()).expect("adapter");
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
+    let mut malformed = port.terminal(&request, TerminalCode::Success);
+    malformed.payload.as_mut().expect("result payload").sha256 = ZERO_SHA.to_owned();
+    *port.reply_override.lock().expect("reply override lock") = Some(malformed);
+
+    let reply = provider.invoke(&request);
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(reply.payload, None);
+    assert_eq!(port.counters.health.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn port_declared_optional_operations_remain_hidden_without_lossless_mapping() {
     let optional_operations = optional_provider_operations();
     let capabilities = optional_operations
@@ -1033,7 +1243,10 @@ fn port_declared_optional_operations_remain_hidden_without_lossless_mapping() {
         let reply = provider.invoke(&request);
         assert_eq!(reply.terminal.operation(), request.operation);
         assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
-        assert_eq!(reply.terminal.terminal_code(), TerminalCode::CapabilityUnsupported);
+        assert_eq!(
+            reply.terminal.terminal_code(),
+            TerminalCode::CapabilityUnsupported
+        );
         assert!(!provider.descriptor().supports(capability));
         assert_eq!(
             reply.terminal.committed_effect().state_generation_before(),
@@ -1043,7 +1256,10 @@ fn port_declared_optional_operations_remain_hidden_without_lossless_mapping() {
             reply.terminal.fallback().eligibility(),
             FallbackEligibility::Forbidden
         );
-        assert_eq!(reply.terminal.diagnostic_id(), Some("native.capability_unsupported"));
+        assert_eq!(
+            reply.terminal.diagnostic_id(),
+            Some("native.capability_unsupported")
+        );
     }
 
     for operation in optional_provider_operations().map(|(operation, _)| operation) {

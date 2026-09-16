@@ -101,6 +101,7 @@ pub const NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID: &str =
 const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
+const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
 const FEEDBACK_CONTRACT_ID: &str = "tracedecay.memory.provider.feedback.v1";
 const MAINTENANCE_CONTRACT_ID: &str = "tracedecay.memory.provider.maintenance.v1";
 const INSPECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.inspection.v1";
@@ -398,6 +399,164 @@ impl NativeProvider {
             .all(|capability| descriptor.supports(capability.as_str()))
     }
 
+    fn valid_terminal_identity(
+        &self,
+        operation: ProviderOperation,
+        operation_id: &str,
+        exact_scope_sha256: &str,
+        terminal: &TerminalRecord,
+    ) -> bool {
+        terminal.operation() == operation
+            && terminal.provider_id() == &self.descriptor.provider_id
+            && terminal.operation_id() == operation_id
+            && terminal.exact_scope_sha256() == exact_scope_sha256
+            && terminal.fallback().eligibility()
+                == tracedecay_memory_provider_api::contract::FallbackEligibility::Forbidden
+            && TerminalRecord::new(
+                terminal.operation(),
+                terminal.provider_id().clone(),
+                terminal.terminal_code(),
+                terminal.committed_effect().clone(),
+                terminal.fallback().clone(),
+                terminal.operation_id().to_owned(),
+                terminal.exact_scope_sha256().to_owned(),
+                terminal.diagnostic_id().map(str::to_owned),
+            )
+            .is_ok()
+    }
+
+    fn validate_handshake_response(
+        &self,
+        request: &HandshakeRequest,
+        response: &HandshakeResponse,
+    ) -> Result<Option<ProviderDescriptor>, ()> {
+        let exact_scope_sha256 = request.exact_scope.exact_scope_sha256();
+        if response.warnings.len() > 32
+            || !self.valid_terminal_identity(
+                ProviderOperation::Handshake,
+                &request.request_id,
+                &exact_scope_sha256,
+                &response.terminal,
+            )
+            || response.terminal.committed_effect().state()
+                != tracedecay_memory_provider_api::contract::CommittedEffectState::None
+            || response
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256()
+                .is_some()
+        {
+            return Err(());
+        }
+
+        if response.terminal.terminal_code() != TerminalCode::Success {
+            if matches!(
+                response.terminal.terminal_code(),
+                TerminalCode::SuccessZeroResults | TerminalCode::Partial
+            ) {
+                return Err(());
+            }
+            if response.descriptor.is_some()
+                || response.provider_instance_id.is_some()
+                || response.state_namespace.is_some()
+                || response.accepted_scope.is_some()
+                || response.effective_limits.is_some()
+                || response.ready_receipt_sha256.is_some()
+            {
+                return Err(());
+            }
+            return Ok(None);
+        }
+
+        let descriptor = response.descriptor.as_ref().ok_or(())?;
+        descriptor.validate().map_err(|_| ())?;
+        if descriptor.provider_id.as_str() != NATIVE_PROVIDER_ID {
+            return Err(());
+        }
+        let projected = project_descriptor(descriptor.clone());
+        projected.validate().map_err(|_| ())?;
+        if !same_immutable_descriptor(&self.descriptor, &projected)
+            || projected.state_generation < self.state_generation.load(Ordering::Acquire)
+            || response.accepted_scope.as_ref() != Some(&request.exact_scope)
+            || !response
+                .provider_instance_id
+                .as_deref()
+                .is_some_and(|value| valid_canonical_text(value, None))
+            || !response
+                .state_namespace
+                .as_deref()
+                .is_some_and(|value| valid_canonical_text(value, Some(128)))
+            || response.effective_limits
+                != Some(request.host_limits.minimum(self.descriptor.limits))
+            || response
+                .effective_limits
+                .is_none_or(|limits| limits.validate().is_err())
+            || !response
+                .ready_receipt_sha256
+                .as_deref()
+                .is_some_and(is_lowercase_sha256)
+        {
+            return Err(());
+        }
+
+        let effect = response.terminal.committed_effect();
+        if effect.state_generation_before() != Some(projected.state_generation)
+            || effect.state_generation_after() != Some(projected.state_generation)
+        {
+            return Err(());
+        }
+        Ok(Some(projected))
+    }
+
+    fn validate_application_reply(&self, call: &ProviderCall, reply: &ProviderReply) -> bool {
+        let exact_scope_sha256 = call.exact_scope.exact_scope_sha256();
+        if !self.valid_terminal_identity(
+            call.operation,
+            &call.operation_id,
+            &exact_scope_sha256,
+            &reply.terminal,
+        ) || reply
+            .validate(self.descriptor.limits.response_bytes)
+            .is_err()
+        {
+            return false;
+        }
+
+        let effect = reply.terminal.committed_effect();
+        if effect.state_generation_before() != Some(call.expected_state_generation)
+            || effect.state_generation_after() != Some(reply.state_generation)
+        {
+            return false;
+        }
+
+        match reply.terminal.terminal_code() {
+            TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial => {
+                reply.payload.as_ref().is_some_and(|payload| {
+                    payload.contract_id.as_str() == canonical_result_contract_id(call.operation)
+                        && serde_json::from_slice::<Value>(&payload.bytes)
+                            .is_ok_and(|value| value.is_object())
+                })
+            }
+            _ => reply.payload.is_none(),
+        }
+    }
+
+    fn validated_application_reply(
+        &self,
+        call: &ProviderCall,
+        reply: ProviderReply,
+    ) -> ProviderReply {
+        if self.validate_application_reply(call, &reply) {
+            reply
+        } else {
+            self.reject(
+                call,
+                TerminalCode::ContractViolation,
+                "native.application_reply_contract_violation",
+            )
+        }
+    }
+
     fn reject(
         &self,
         call: &ProviderCall,
@@ -580,6 +739,13 @@ impl MemoryProvider for NativeProvider {
                 "native.required_capability_missing",
             );
         }
+        if let Err(code) = request.control.snapshot() {
+            return self.reject_handshake(
+                request,
+                code,
+                "native.handshake_request_control_terminal",
+            );
+        }
         if self.refresh_descriptor().is_none() {
             return self.reject_handshake(
                 request,
@@ -587,24 +753,28 @@ impl MemoryProvider for NativeProvider {
                 "native.descriptor_drift",
             );
         }
+        if let Err(code) = request.control.snapshot() {
+            return self.reject_handshake(
+                request,
+                code,
+                "native.handshake_request_control_terminal",
+            );
+        }
         let mut response = self.port.handshake(request);
-        if let Some(descriptor) = response.descriptor.take() {
-            if descriptor.validate().is_err() {
+        let projected_descriptor = match self.validate_handshake_response(request, &response) {
+            Ok(projected_descriptor) => projected_descriptor,
+            Err(()) => {
                 return self.reject_handshake(
                     request,
                     TerminalCode::ContractViolation,
-                    "native.handshake_descriptor_invalid",
+                    "native.handshake_response_contract_violation",
                 );
             }
-            let projected = project_descriptor(descriptor);
-            if !same_immutable_descriptor(&self.descriptor, &projected) {
-                return self.reject_handshake(
-                    request,
-                    TerminalCode::ContractViolation,
-                    "native.handshake_descriptor_drift",
-                );
-            }
-            response.descriptor = Some(projected);
+        };
+        if let Some(projected_descriptor) = projected_descriptor {
+            self.state_generation
+                .fetch_max(projected_descriptor.state_generation, Ordering::AcqRel);
+            response.descriptor = Some(projected_descriptor);
         }
         response
     }
@@ -645,6 +815,9 @@ impl MemoryProvider for NativeProvider {
                 "native.required_capability_missing",
             );
         }
+        if let Err(code) = call.control.snapshot() {
+            return self.reject(call, code, "native.request_control_terminal");
+        }
         if let Some(rejection) = self.validate_payload_contract(call) {
             return rejection;
         }
@@ -668,25 +841,50 @@ impl MemoryProvider for NativeProvider {
                 );
             }
         }
+        if let Err(code) = call.control.snapshot() {
+            return self.reject(call, code, "native.request_control_terminal");
+        }
         match call.operation {
-            ProviderOperation::Health => self.port.health(call),
+            ProviderOperation::Health => {
+                self.validated_application_reply(call, self.port.health(call))
+            }
             ProviderOperation::Observe => match observation {
-                Some(observation) => self.port.observe(observation),
+                Some(observation) => {
+                    self.validated_application_reply(call, self.port.observe(observation))
+                }
                 None => self.reject(
                     call,
                     TerminalCode::ContractViolation,
                     "native.observation_dispatch_missing",
                 ),
             },
-            ProviderOperation::Recall => self.port.recall(call),
-            ProviderOperation::Feedback => self.port.feedback(call),
-            ProviderOperation::Maintenance => self.port.maintenance(call),
-            ProviderOperation::Inspection => self.port.inspection(call),
-            ProviderOperation::Correction => self.port.correction(call),
-            ProviderOperation::DeleteBySource => self.port.delete_by_source(call),
-            ProviderOperation::SnapshotExport => self.port.snapshot_export(call),
-            ProviderOperation::SnapshotRestore => self.port.snapshot_restore(call),
-            ProviderOperation::Replay => self.port.replay(call),
+            ProviderOperation::Recall => {
+                self.validated_application_reply(call, self.port.recall(call))
+            }
+            ProviderOperation::Feedback => {
+                self.validated_application_reply(call, self.port.feedback(call))
+            }
+            ProviderOperation::Maintenance => {
+                self.validated_application_reply(call, self.port.maintenance(call))
+            }
+            ProviderOperation::Inspection => {
+                self.validated_application_reply(call, self.port.inspection(call))
+            }
+            ProviderOperation::Correction => {
+                self.validated_application_reply(call, self.port.correction(call))
+            }
+            ProviderOperation::DeleteBySource => {
+                self.validated_application_reply(call, self.port.delete_by_source(call))
+            }
+            ProviderOperation::SnapshotExport => {
+                self.validated_application_reply(call, self.port.snapshot_export(call))
+            }
+            ProviderOperation::SnapshotRestore => {
+                self.validated_application_reply(call, self.port.snapshot_restore(call))
+            }
+            ProviderOperation::Replay => {
+                self.validated_application_reply(call, self.port.replay(call))
+            }
             ProviderOperation::Handshake => self.reject(
                 call,
                 TerminalCode::InvalidRequest,
@@ -715,6 +913,20 @@ fn same_immutable_descriptor(left: &ProviderDescriptor, right: &ProviderDescript
         && left.limits == right.limits
 }
 
+fn valid_canonical_text(value: &str, maximum: Option<usize>) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+        && maximum.is_none_or(|maximum| value.len() <= maximum)
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 const fn canonical_payload_contract_id(operation: ProviderOperation) -> &'static str {
     match operation {
         ProviderOperation::Handshake => HANDSHAKE_CONTRACT_ID,
@@ -729,5 +941,22 @@ const fn canonical_payload_contract_id(operation: ProviderOperation) -> &'static
         ProviderOperation::SnapshotExport => SNAPSHOT_EXPORT_CONTRACT_ID,
         ProviderOperation::SnapshotRestore => SNAPSHOT_RESTORE_CONTRACT_ID,
         ProviderOperation::Replay => REPLAY_CONTRACT_ID,
+    }
+}
+
+const fn canonical_result_contract_id(operation: ProviderOperation) -> &'static str {
+    match operation {
+        ProviderOperation::Handshake => HANDSHAKE_CONTRACT_ID,
+        ProviderOperation::Health => HEALTH_CONTRACT_ID,
+        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
+        ProviderOperation::Recall => RECALL_RESULT_CONTRACT_ID,
+        ProviderOperation::Feedback => "tracedecay.memory.feedback.record.outcome.v1",
+        ProviderOperation::Maintenance => "tracedecay.memory.maintenance.run.outcome.v1",
+        ProviderOperation::Inspection => "tracedecay.memory.inspection.read.outcome.v1",
+        ProviderOperation::Correction => "tracedecay.memory.correction.apply.outcome.v1",
+        ProviderOperation::DeleteBySource => "tracedecay.memory.deletion.by_source.outcome.v1",
+        ProviderOperation::SnapshotExport => "tracedecay.memory.snapshot.export.outcome.v1",
+        ProviderOperation::SnapshotRestore => "tracedecay.memory.snapshot.restore.outcome.v1",
+        ProviderOperation::Replay => "tracedecay.memory.replay.apply.outcome.v1",
     }
 }
