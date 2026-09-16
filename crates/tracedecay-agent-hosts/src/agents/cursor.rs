@@ -257,7 +257,15 @@ fn cursor_native_extension_registration(home: &Path) -> HostBundleRegistrationSt
 /// and it no longer loads current diagnostics.
 fn doctor_check_native_extension(dc: &mut DoctorCounters, home: &Path) {
     let install_dir = cursor_native_extension_install_dir(home);
-    let stale = stale_native_extension_paths(home).unwrap_or_default();
+    let stale = match stale_native_extension_paths(home) {
+        Ok(paths) => paths,
+        Err(error) => {
+            dc.warn(&format!(
+                "Cursor native diagnostics could not inspect stale extension directories: {error}"
+            ));
+            Vec::new()
+        }
+    };
     let (owned_stale, preserved_stale): (Vec<_>, Vec<_>) = stale
         .iter()
         .partition(|path| cursor_native_extension_path_is_tracedecay(path));
