@@ -47,9 +47,10 @@ pub(super) fn assert_provider_control_journeys(
 ) {
     let (source, state) = source_and_state(journey, recalled_stdout, session_id);
 
-    assert_health(journey, &state, "health.before-maintenance");
+    assert_health(journey, &state, "health.before-controls");
     assert_feedback_idempotency(journey, &source.selector);
-    assert_maintenance(journey, &state);
+    let generation_before_maintenance = assert_health(journey, &state, "health.before-maintenance");
+    assert_maintenance(journey, &state, generation_before_maintenance);
 
     // Maintenance is a durable provider operation. A fresh daemon and a real
     // SessionStart must leave the retained source recallable.
@@ -271,7 +272,11 @@ fn assert_health(
     health.state_generation
 }
 
-fn assert_maintenance(journey: &ClaudeHostJourney, state: &ProviderControlStateSelectorV1) {
+fn assert_maintenance(
+    journey: &ClaudeHostJourney,
+    state: &ProviderControlStateSelectorV1,
+    generation_before: u64,
+) {
     // Native's staged provider recalculates feedback bias; NCM's real worker
     // consolidates the admitted STM records. Both are mutations with a
     // provider-reported kernel change, but their task names are intentionally
@@ -332,6 +337,10 @@ fn assert_maintenance(journey: &ClaudeHostJourney, state: &ProviderControlStateS
         maintenance.receipt.state_generation_after > maintenance.receipt.state_generation_before,
         "maintenance must advance durable provider state: {:?}",
         maintenance.receipt
+    );
+    assert_eq!(
+        maintenance.receipt.state_generation_before, generation_before,
+        "maintenance must start from the generation observed by the preceding Health RPC"
     );
     assert_eq!(
         result.effect.state,
