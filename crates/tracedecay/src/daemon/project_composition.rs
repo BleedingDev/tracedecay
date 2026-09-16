@@ -526,15 +526,24 @@ async fn production_project_server_inner(
     ))
     .await?;
     if inserted {
-        if let Some(project_id) = opened.key.owner.project_id.as_deref() {
-            inputs
-                .http_application_registry
-                .block_project_route(project_id)
-                .await;
-        }
+        let http_route_attempt = if inputs.http_application_registry.is_active() {
+            if let Some(project_id) = opened.key.owner.project_id.as_deref() {
+                inputs
+                    .http_application_registry
+                    .block_project_route(project_id)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let activation = match Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await
         {
-            Ok(activation) => activation,
+            Ok(mut activation) => {
+                activation.http_route_attempt = http_route_attempt;
+                activation
+            }
             Err(error) => {
                 // Core activation can fail after installing a source-edit
                 // owner or beginning a runtime publication. Feed even a
@@ -543,6 +552,7 @@ async fn production_project_server_inner(
                 let empty_activation = CoreRouteActivation {
                     publication_attempt: None,
                     core_source_edit_mutation: None,
+                    http_route_attempt,
                 };
                 let Err(error) = Box::pin(inputs.settle_failed_full_upgrade(
                     &opened,
@@ -747,6 +757,7 @@ impl ComposedCoreServer {
         context: crate::mcp::server::McpServerConstructionContext,
         cg: &Arc<crate::project::TraceDecay>,
         invocation: &DaemonInvocationState,
+        expose_cognitive_recall: bool,
     ) -> crate::mcp::server::McpServerConstructionContext {
         let ports = &self.ports;
         let code_index = &ports.code_index;
@@ -795,8 +806,10 @@ impl ComposedCoreServer {
         {
             context =
                 context.with_memory_provider_host_mount(Arc::clone(&self.memory_provider_host));
-            if let Some(recall) = self.memory_provider_host.cognitive_recall_mount() {
-                context = context.with_cognitive_recall_mount(recall);
+            if expose_cognitive_recall {
+                if let Some(recall) = self.memory_provider_host.cognitive_recall_mount() {
+                    context = context.with_cognitive_recall_mount(recall);
+                }
             }
         }
         if let Some(reconciler) = ports.automation_scheduler_reconciler.as_ref() {
@@ -823,6 +836,9 @@ struct CoreRouteActivation {
     /// The core's preview-only source-edit lane; `None` for a read-only database.
     core_source_edit_mutation:
         Option<Arc<tracedecay_daemon_service::project_owner_registration::SourceEditMutationGate>>,
+    /// Identity of the HTTP publication fence installed for this attempt.
+    /// Rollback must use this token so a newer replacement route survives.
+    http_route_attempt: Option<http_application::ProjectHttpRouteAttempt>,
 }
 
 /// Both session databases this route serves, admitted together.
@@ -1234,6 +1250,7 @@ impl ProjectOpenInputs<'_> {
             ),
             cg,
             self.invocation,
+            false,
         );
         project_open_cancellation_checkpoint(self.cancellation)?;
         let mcp_construction_started = Instant::now();
@@ -1377,6 +1394,7 @@ impl ProjectOpenInputs<'_> {
         Ok(CoreRouteActivation {
             publication_attempt,
             core_source_edit_mutation,
+            http_route_attempt: None,
         })
     }
 
@@ -1690,6 +1708,7 @@ impl ProjectOpenInputs<'_> {
                 ),
                 cg,
                 self.invocation,
+                true,
             )
             .with_remote_operational_status(remote_operational_status)
             .with_dashboard_doctor_report_reader(doctor_report_reader)
@@ -1860,7 +1879,10 @@ impl ProjectOpenInputs<'_> {
             .await?;
             #[cfg(feature = "memory-provider-host")]
             full.provider_full_mount
-                .activate_after_publication(full.session_db.observation_store())
+                .activate_after_publication(
+                    full.session_db.observation_store(),
+                    self.cancellation,
+                )
                 .await
                 .map_err(|error| TraceDecayError::Config { message: error })?;
             self.phase_checkpoint(ProjectOpenFailurePhase::ProviderActivated)?;
@@ -1906,6 +1928,7 @@ impl ProjectOpenInputs<'_> {
                 self.http_application_registry,
                 &core.project_id,
                 self.canonical_project_path,
+                activation.http_route_attempt.as_ref(),
             )
             .await?;
             self.log_phase("http_application_mounted", None, self.started);
@@ -1950,9 +1973,11 @@ impl ProjectOpenInputs<'_> {
             // Restore the core before returning to the common failure funnel;
             // this makes the candidate unreachable even when a later mount
             // fails after the registry swap.
-            self.http_application_registry
-                .remove_project_route(&core.project_id)
-                .await;
+            if let Some(attempt) = activation.http_route_attempt.as_ref() {
+                self.http_application_registry
+                    .remove_project_route_if(attempt)
+                    .await;
+            }
             if registry_published {
                 let restored = self
                     .store_administration
@@ -1968,12 +1993,6 @@ impl ProjectOpenInputs<'_> {
                         "full project publication rollback found a different registry owner"
                     );
                 }
-            }
-            if let Some(attempt) = &activation.publication_attempt {
-                self.invocation
-                    .service
-                    .project_runtimes
-                    .mark_publication_failed(attempt);
             }
         }
         result
@@ -1993,26 +2012,32 @@ impl ProjectOpenInputs<'_> {
         published_full_server: Option<PublishedFullServer>,
         error: TraceDecayError,
     ) -> Result<()> {
-        let failed_key = core.current_key.lock().await.clone();
         if let Some(mutation) = &activation.core_source_edit_mutation {
             mutation.mark_failed();
         }
-        if let Some(attempt) = &activation.publication_attempt {
-            self.invocation
-                .service
-                .project_runtimes
-                .mark_publication_failed(attempt);
-        }
+        // The runtime publication identity is the immutable CAS token for
+        // this attempt. A rekeyed/replaced project must retain its newer
+        // publication while this failed attempt is being unwound.
+        let publication_is_current = activation.publication_attempt.as_ref().is_some_and(
+            |attempt| {
+                self.invocation
+                    .service
+                    .project_runtimes
+                    .mark_publication_failed(attempt)
+            },
+        );
         retire_failed_project_open_owner(
             self.store_administration,
             self.invocation,
             self.http_application_registry,
             self.canonical_project_path,
             opened,
-            &failed_key,
+            &opened.key,
             resolved,
             published_full_server,
+            activation.http_route_attempt.as_ref(),
             &core.route_registered,
+            publication_is_current,
         )
         .await;
         Err(error)
@@ -2300,7 +2325,9 @@ async fn retire_failed_project_open_owner(
     failed_key: &ProjectServerKey,
     resolved: &Arc<crate::mcp::McpServer>,
     published_full_server: Option<PublishedFullServer>,
+    http_route_attempt: Option<&http_application::ProjectHttpRouteAttempt>,
     route_registered: &Arc<AtomicBool>,
+    publication_is_current: bool,
 ) {
     let full_server = published_full_server
         .as_ref()
@@ -2321,10 +2348,20 @@ async fn retire_failed_project_open_owner(
         })
         .into_iter()
         .collect::<Vec<_>>();
-    route_registered.store(false, Ordering::Release);
-    if let Some(project_id) = failed_key.owner.project_id.as_deref() {
+    // Registry removal is the attempt's owner-registry CAS. If a newer
+    // generation already replaced this key, leave its route and shared owner
+    // state untouched. The immutable runtime token below gives the same CAS
+    // guarantee for publication state.
+    let owns_registry = !removed.is_empty();
+    let owns_attempt = owns_registry && (publication_is_current || http_route_attempt.is_none());
+    if owns_registry {
+        route_registered.store(false, Ordering::Release);
+    }
+    if let Some(attempt) = http_route_attempt
+        && owns_registry
+    {
         http_application_registry
-            .remove_project_route(project_id)
+            .remove_project_route_if(attempt)
             .await;
     }
     for server in &removed {
@@ -2333,7 +2370,7 @@ async fn retire_failed_project_open_owner(
     let full_is_removed = full_server
         .as_ref()
         .is_some_and(|full| removed.iter().any(|server| Arc::ptr_eq(server, full)));
-    if !removed.is_empty() {
+    if owns_registry {
         store_administration
             .session_temporal_refresh_schedulers()
             .retire_project(&failed_key.owner)
@@ -2383,7 +2420,7 @@ async fn retire_failed_project_open_owner(
     // Keep the final holder-lease release below unconditional. A malformed
     // identity or a profile lookup failure must not turn rollback into an
     // early return that strands the session stores mounted by this attempt.
-    if let Some(project_id) = project_id.as_ref() {
+    if owns_attempt && let Some(project_id) = project_id.as_ref() {
         if let Some(identity) = identity.as_ref() {
             let mut project_roots = std::collections::BTreeSet::new();
             project_roots.insert(canonical_project_path.to_path_buf());
@@ -2447,14 +2484,19 @@ async fn retire_failed_project_open_owner(
             &failed_key.owner.graph_db_path,
         );
     }
-    super::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(
-        &opened.cg.hook_store_layout().data_root,
-    )
-    .await;
+    if owns_attempt {
+        super::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(
+            &opened.cg.hook_store_layout().data_root,
+        )
+        .await;
+    }
     let telemetry_sampling = store_administration.store_telemetry_sampling();
-    telemetry_sampling.release_retained_handle(&project_sessions_path);
-    telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
-    if let Some(project_id) = project_id.as_ref()
+    if owns_attempt {
+        telemetry_sampling.release_retained_handle(&project_sessions_path);
+        telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
+    }
+    if owns_attempt
+        && let Some(project_id) = project_id.as_ref()
         && let Ok(runtime_registry) = store_administration.session_runtime_registry().await
     {
         let _ = runtime_registry

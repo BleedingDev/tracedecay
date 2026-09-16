@@ -594,6 +594,7 @@ impl ProjectMemoryProviderFullMountV1 {
     pub async fn activate_after_publication(
         &self,
         observation_store: tracedecay_global_db::GlobalDbObservationStore,
+        cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
     ) -> std::result::Result<(), String> {
         let deferred = self
             .deferred_observation_journeys
@@ -602,7 +603,22 @@ impl ProjectMemoryProviderFullMountV1 {
             .drain(..)
             .collect::<Vec<_>>();
         for (journey, requirement) in deferred {
-            if let Err(error) = journey.start_observer_with_live_replay(observation_store.clone()) {
+            let activation = if requirement
+                == tracedecay_memory_provider_registry::ObservationMountRequirementV1::Required
+            {
+                observation_journey::activate_required_with_startup_replay(
+                    Arc::clone(&journey),
+                    observation_store.clone(),
+                    cancellation,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                journey
+                    .start_observer_with_live_replay(observation_store.clone())
+                    .map(|_| ())
+            };
+            if let Err(error) = activation {
                 if requirement
                     == tracedecay_memory_provider_registry::ObservationMountRequirementV1::Required
                 {
@@ -870,9 +886,18 @@ pub async fn mount_project_memory_provider_full(
     let mut journeys = Vec::with_capacity(host.observation_provider_mounts.len());
     let mut deferred = Vec::new();
     let mut control_journals = Vec::new();
+    macro_rules! fail_partial_provider_mount {
+        ($error:expr) => {{
+            let error = $error;
+            shutdown_partial_provider_journeys(&journeys).await;
+            return Err(error);
+        }};
+    }
     for (configured, history_mount) in &host.observation_provider_mounts {
         if cancellation.is_cancelled() {
-            return Err("project open was cancelled during provider observation mount".to_owned());
+            fail_partial_provider_mount!(
+                "project open was cancelled during provider observation mount".to_owned()
+            );
         }
         let provider = &configured.mount;
         let required = configured.requirement == ObservationMountRequirementV1::Required;
@@ -889,10 +914,10 @@ pub async fn mount_project_memory_provider_full(
             match observation_journey::mount_observer_dormant(journey_inputs, cancellation).await {
                 Ok(journey) => journey,
                 Err(error @ observation_journey::ObservationJourneyError::Cancelled { .. }) => {
-                    return Err(error.to_string());
+                    fail_partial_provider_mount!(error.to_string());
                 }
                 Err(error) if required => {
-                    return Err(format!(
+                    fail_partial_provider_mount!(format!(
                         "could not mount project observation journey: {error}"
                     ));
                 }
@@ -935,9 +960,13 @@ pub async fn mount_project_memory_provider_full(
                 None
             }
             Err(error) => {
-                return Err(format!("provider history mount refused: {error}"));
+                fail_partial_provider_mount!(format!("provider history mount refused: {error}"));
             }
         };
+        let journey_mount = Arc::new(ProjectObservationJourneyMountV1 {
+            inner: Arc::clone(&journey),
+        });
+        journeys.push(Arc::clone(&journey_mount));
         let authority = Arc::new(provider_history::ProviderHistoryAuthorityV1 {
             mounted_scope: inputs.scope.clone(),
             profile_id: inputs.profile_id.clone(),
@@ -950,42 +979,53 @@ pub async fn mount_project_memory_provider_full(
             policy_revision: 1,
             runtime: tokio::runtime::Handle::current(),
         });
-        authority
-            .validate_mount()
-            .map_err(|error| format!("provider history mount refused: {error}"))?;
-        history_mount
-            .bind(authority.clone())
-            .map_err(|error| format!("provider history binding refused: {error}"))?;
-        journey
-            .bind_history_authority(authority.clone())
-            .map_err(|error| format!("provider journey history binding refused: {error}"))?;
+        if let Err(error) = authority.validate_mount() {
+            fail_partial_provider_mount!(format!("provider history mount refused: {error}"));
+        }
+        if let Err(error) = history_mount.bind(authority.clone()) {
+            fail_partial_provider_mount!(format!("provider history binding refused: {error}"));
+        }
+        if let Err(error) = journey.bind_history_authority(authority.clone()) {
+            fail_partial_provider_mount!(format!(
+                "provider journey history binding refused: {error}"
+            ));
+        }
         if let Some(recall) = host
             .cognitive_recall_mount
             .as_ref()
             .filter(|recall| recall.inner.routing().active_provider() == &provider.provider_id)
         {
-            recall
+            if let Err(error) = recall
                 .inner
                 .bind_selected_history(authority, Arc::clone(&journey))
-                .map_err(|error| format!("provider recall history binding refused: {error}"))?;
+            {
+                fail_partial_provider_mount!(format!(
+                    "provider recall history binding refused: {error}"
+                ));
+            }
         }
         if configured.activation
             == tracedecay_memory_provider_registry::ObservationMountActivationV1::BeforePublication
         {
-            observation_journey::activate_required_with_startup_replay(
+            if let Err(error) = observation_journey::activate_required_with_startup_replay(
                 Arc::clone(&journey),
                 inputs.session_db.observation_store(),
                 cancellation,
             )
             .await
-            .map_err(|error| format!("provider observation startup replay failed: {error}"))?;
+            {
+                fail_partial_provider_mount!(format!(
+                    "provider observation startup replay failed: {error}"
+                ));
+            }
         } else {
             deferred.push((Arc::clone(&journey), configured.requirement));
         }
         control_journals.push((provider.provider_id.clone(), journey.history_journal()));
-        journeys.push(Arc::new(ProjectObservationJourneyMountV1 {
-            inner: journey,
-        }));
+        // Keep the wrapper in `journeys` from the moment the worker-capable
+        // journey is mounted. Any later provider or control failure therefore
+        // shuts down every earlier and current journey before returning.
+        let _ = journey_mount;
     }
 
     let now = tracedecay_contracts::now_micros().0;
@@ -1022,7 +1062,9 @@ pub async fn mount_project_memory_provider_full(
         () = cancellation.cancelled() => {
             control.cancellation().cancel();
             let _ = work.await;
-            return Err("project open was cancelled during provider control mount".to_owned());
+            fail_partial_provider_mount!(
+                "project open was cancelled during provider control mount".to_owned()
+            );
         }
         joined = &mut work => joined,
     };
@@ -1067,6 +1109,21 @@ pub async fn mount_project_memory_provider_full(
         deferred_observation_journeys: std::sync::Mutex::new(deferred),
         provider_control_mount,
     }))
+}
+
+#[cfg(feature = "memory-provider-host")]
+async fn shutdown_partial_provider_journeys(
+    journeys: &[Arc<ProjectObservationJourneyMountV1>],
+) {
+    let deadline = tokio::time::Instant::now() + crate::TASK_ABORT_DEADLINE;
+    for journey in journeys {
+        for failure in journey.shutdown(deadline).await {
+            tracing::warn!(
+                failure = %failure,
+                "partial project provider mount did not stop its observation journey cleanly"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "memory-provider-host")]

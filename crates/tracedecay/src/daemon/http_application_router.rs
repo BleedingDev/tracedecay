@@ -127,10 +127,15 @@ pub(super) async fn mount_http_application_router(
     registry: &http_application::DaemonHttpApplicationRegistry,
     project_id: &str,
     project_path: &Path,
+    attempt: Option<&http_application::ProjectHttpRouteAttempt>,
 ) -> Result<()> {
     if !registry.is_active() {
         return Ok(());
     }
     let router = build_http_application_router(project_id, project_path)?;
-    registry.mount(project_id, router).await
+    if let Some(attempt) = attempt {
+        registry.mount_for_attempt(attempt, router).await
+    } else {
+        registry.mount(project_id, router).await
+    }
 }
