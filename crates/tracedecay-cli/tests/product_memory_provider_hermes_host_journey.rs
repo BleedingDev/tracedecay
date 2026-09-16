@@ -1,15 +1,20 @@
 //! Live Hermes provider journey through the shipped CLI and generated plugin.
 //!
 //! The test installs Hermes into an isolated HOME, starts a real TraceDecay
-//! daemon, registers a real git project, enables Native through the operator
-//! configuration surface, and then runs the installed Python provider. The
-//! provider's project-scoped `ingest_transcript` call and its asynchronous
-//! `turnCompleted`/`turnIngested` callbacks are therefore exercised as Hermes
-//! invokes them. The project observation journal and a later context recall
-//! are the assertions that the full route settled.
+//! daemon, registers a real git project, enables one configured provider
+//! through the operator configuration surface, and then runs the installed
+//! Python provider. The provider's project-scoped `ingest_transcript` call,
+//! its asynchronous `turnCompleted`/`turnIngested` callbacks, and the
+//! installed context-engine callback are therefore exercised as Hermes invokes
+//! them. The project observation journal and a later context recall are the
+//! assertions that the full route settled.
+//!
+//! The repository does not ship a stock Hermes runtime, so the Python fixture
+//! uses the generated plugin's public `register(ctx)` contract with a faithful
+//! minimal `PluginContext` stand-in. The fixture names that boundary in its
+//! sentinel; it does not pretend to be a stock loader.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -23,50 +28,99 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
 };
 use tracedecay_memory_observation::{
-    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1, ObservationJournalReaderV1,
+    AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+    ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
     RetentionPolicyV1, SqliteObservationJournal,
 };
 
 const SESSION_ID: &str = "hermes-cli-project-journey";
 const PROJECT_TERM: &str = "quartz";
+const RECALL_QUERY: &str = "Which crystal themed workspace note did Hermes capture?";
+const FOREIGN_RECALL_QUERY: &str = "Which crystal themed workspace note did Hermes capture?";
 const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
+const NCM_JOURNAL_FILE_NAME: &str = "memory-observation-ncm-journal-v1.sqlite3";
 const OBSERVATION_KIND: &str = "session.message_committed.v1";
-const PROVIDER_ID: &str = "tracedecay.native";
+const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
+const NCM_PROVIDER_ID: &str = "ncm";
 const JOURNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLEMENT_BUDGET: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveProvider {
+    Native,
+    RustNcm,
+}
+
+impl ActiveProvider {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Native => NATIVE_PROVIDER_ID,
+            Self::RustNcm => NCM_PROVIDER_ID,
+        }
+    }
+
+    fn journal_file_name(self) -> &'static str {
+        match self {
+            Self::Native => JOURNAL_FILE_NAME,
+            Self::RustNcm => NCM_JOURNAL_FILE_NAME,
+        }
+    }
+
+    fn is_ncm(self) -> bool {
+        self == Self::RustNcm
+    }
+}
 
 struct HermesJourney {
     home: TempDir,
     profile: PathBuf,
     project: PathBuf,
+    foreign_project: PathBuf,
     bin_dir: PathBuf,
+    active_provider: ActiveProvider,
     daemon: Option<Child>,
     journal: OnceLock<SqliteObservationJournal>,
 }
 
 impl HermesJourney {
-    fn new() -> Self {
+    fn new(active_provider: ActiveProvider) -> Self {
         let home = TempDir::new().expect("isolated Hermes HOME");
         let root = home.path().to_path_buf();
         let profile = root.join(".tracedecay");
         let project = root.join("project");
+        let foreign_project = root.join("foreign-project");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&profile).expect("profile root");
         fs::create_dir_all(root.join(".hermes")).expect("Hermes home");
         fs::create_dir_all(&bin_dir).expect("binary shim directory");
         install_binary_shim(&bin_dir);
-        initialize_project(&project);
+        initialize_project(
+            &project,
+            "hermes-cli-journey-fixture",
+            "pub fn quartz_project_observation() -> u8 { 7 }\n",
+        );
+        initialize_project(
+            &foreign_project,
+            "hermes-cli-foreign-journey-fixture",
+            "pub fn unrelated_foreign_observation() -> u8 { 3 }\n",
+        );
         Self {
             home,
             profile,
             project,
+            foreign_project,
             bin_dir,
+            active_provider,
             daemon: None,
             journal: OnceLock::new(),
         }
     }
 
     fn cli(&self, args: &[&str]) -> Command {
+        self.cli_at(&self.project, args)
+    }
+
+    fn cli_at(&self, project: &Path, args: &[&str]) -> Command {
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
             std::iter::once(self.bin_dir.clone()).chain(std::env::split_paths(&inherited_path)),
@@ -75,7 +129,7 @@ impl HermesJourney {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tracedecay"));
         command
             .args(args)
-            .current_dir(&self.project)
+            .current_dir(project)
             .env("HOME", self.home.path())
             .env("USERPROFILE", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
@@ -93,6 +147,12 @@ impl HermesJourney {
         assert!(self.daemon.is_none(), "daemon already running");
         let log = fs::File::create(self.home.path().join("daemon.stderr.log")).expect("daemon log");
         let mut command = self.cli(&["daemon", "run"]);
+        command
+            .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
+            .env(
+                "RUST_LOG",
+                "warn,tracedecay::mcp::tools::handlers::hook_runtime::admission=debug",
+            );
         command.stdout(Stdio::null()).stderr(Stdio::from(log));
         let mut daemon = command.spawn().expect("daemon starts");
         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
@@ -107,9 +167,16 @@ impl HermesJourney {
     }
 
     fn init_project(&self) {
+        self.init_project_at(&self.project);
+    }
+
+    fn init_project_at(&self, project: &Path) {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
-            let output = self.cli(&["init"]).output().expect("tracedecay init runs");
+            let output = self
+                .cli_at(project, &["init"])
+                .output()
+                .expect("tracedecay init runs");
             if output.status.success() {
                 return;
             }
@@ -126,10 +193,14 @@ impl HermesJourney {
     }
 
     fn project_id(&self) -> String {
+        self.project_id_at(&self.project)
+    }
+
+    fn project_id_at(&self, project: &Path) -> String {
         let bytes = run_ok(
             &mut self
-                .cli(&["projects", "context"])
-                .arg(&self.project)
+                .cli_at(project, &["projects", "context"])
+                .arg(project)
                 .arg("--json"),
             "projects context",
         );
@@ -173,12 +244,15 @@ impl HermesJourney {
         );
     }
 
-    fn configure_native(&self, project_id: &str) {
+    fn configure_provider(&self, project_id: &str) {
         self.configuration_set(
             project_id,
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-            json!({ "kind": "boolean", "value": true }),
-            "configuration.idempotency.hermes-cli-project-journey.native",
+            json!({
+                "kind": "boolean",
+                "value": self.active_provider == ActiveProvider::Native,
+            }),
+            "configuration.idempotency.hermes-cli-project-journey.native-gate",
         );
         self.configuration_set(
             project_id,
@@ -186,7 +260,7 @@ impl HermesJourney {
             json!({
                 "kind": "text",
                 "value": json!({
-                    "active_provider": PROVIDER_ID,
+                    "active_provider": self.active_provider.id(),
                     "degradation": {
                         "policy_id": "policy.hermes-cli-project-journey.v1",
                         "policy_revision": 1,
@@ -196,21 +270,73 @@ impl HermesJourney {
             }),
             "configuration.idempotency.hermes-cli-project-journey.routing",
         );
+        if self.active_provider.is_ncm() {
+            self.configure_real_ncm(project_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn configure_real_ncm(&self, project_id: &str) {
+        let worker = PathBuf::from(
+            std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
+        );
+        let installed = PathBuf::from(
+            std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT")
+                .expect("installed pinned NCM model root is required"),
+        );
+        assert!(
+            worker.is_absolute() && worker.is_file(),
+            "NCM worker must be an absolute binary path"
+        );
+        let models = installed
+            .join("models")
+            .canonicalize()
+            .expect("installed NCM models directory");
+        assert!(models.is_dir(), "NCM model root must contain models");
+        let state_root = self.home.path().join("ncm-observer");
+        fs::create_dir_all(&state_root).expect("isolated NCM state root");
+        std::os::unix::fs::symlink(models, state_root.join("models"))
+            .expect("share only installed NCM model artifacts");
+        self.configuration_set(
+            project_id,
+            "memory.provider_ncm_observer.v1",
+            json!({
+                "kind": "text",
+                "value": json!({
+                    "mode": "enabled",
+                    "worker_binary": worker.canonicalize().expect("canonical NCM worker"),
+                    "state_root": state_root.canonicalize().expect("canonical NCM state root"),
+                }).to_string(),
+            }),
+            "configuration.idempotency.hermes-cli-project-journey.ncm",
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn configure_real_ncm(&self, _project_id: &str) {
+        panic!("the opt-in real NCM Hermes journey requires Unix");
     }
 
     fn tool_result(&self, name: &str, args: &Value) -> Value {
-        let project = self.project.to_string_lossy().to_string();
+        self.tool_result_at(&self.project, name, args)
+    }
+
+    fn tool_result_at(&self, project_root: &Path, name: &str, args: &Value) -> Value {
+        let project = project_root.to_string_lossy().to_string();
         let payload = args.to_string();
         let bytes = run_ok(
-            &mut self.cli(&[
-                "tool",
-                "--project",
-                &project,
-                name,
-                "--args",
-                &payload,
-                "--json",
-            ]),
+            &mut self.cli_at(
+                project_root,
+                &[
+                    "tool",
+                    "--project",
+                    &project,
+                    name,
+                    "--args",
+                    &payload,
+                    "--json",
+                ],
+            ),
             name,
         );
         let result: Value = serde_json::from_slice(&bytes)
@@ -220,7 +346,12 @@ impl HermesJourney {
     }
 
     fn context(&self, task: &str) -> Value {
-        let result = self.tool_result(
+        self.context_at(&self.project, task)
+    }
+
+    fn context_at(&self, project_root: &Path, task: &str) -> Value {
+        let result = self.tool_result_at(
+            project_root,
             "tracedecay_context",
             &json!({ "task": task, "format": "json", "_meta": { "session_id": SESSION_ID } }),
         );
@@ -249,7 +380,7 @@ impl HermesJourney {
         }
     }
 
-    fn run_provider_fixture(&self) {
+    fn run_provider_fixture(&self) -> Value {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py");
         let plugin = self.home.path().join(".hermes/plugins/tracedecay");
@@ -278,17 +409,55 @@ impl HermesJourney {
         assert_eq!(result["sync"], "complete");
         let expected_project = fs::canonicalize(&self.project).expect("canonical project root");
         assert_eq!(result["project_root"].as_str(), expected_project.to_str());
+        assert_eq!(result["installed_provider_id"], "tracedecay");
+        assert_eq!(
+            result["host_boundary"], "register_ctx_fixture",
+            "the fixture must state that it exercised register(ctx) without stock Hermes"
+        );
+        assert_eq!(result["replay"]["mode"], "exact");
+        assert_eq!(result["replay"]["fresh_provider"], true);
+        result
     }
 
     fn journal(&self) -> Option<&SqliteObservationJournal> {
         if let Some(journal) = self.journal.get() {
             return Some(journal);
         }
-        let path = find_file(&self.profile, JOURNAL_FILE_NAME)?;
+        let path = find_file(&self.profile, self.active_provider.journal_file_name())?;
         let journal = SqliteObservationJournal::open_existing(&path, inspection_policy())
-            .expect("Native observation journal opens");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} observation journal opens: {error}",
+                    self.active_provider.id()
+                )
+            });
         let _ = self.journal.set(journal);
         self.journal.get()
+    }
+
+    /// Close the reader inherited from the first daemon and open a fresh
+    /// journal handle after restart. Reusing a pre-restart SQLite connection
+    /// would leave this journey unable to prove durable reopen semantics.
+    fn reopen_journal(&mut self) {
+        self.journal.take();
+        let path = find_file(&self.profile, self.active_provider.journal_file_name())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} observation journal must exist before reopen",
+                    self.active_provider.id()
+                )
+            });
+        let journal = SqliteObservationJournal::open_existing(&path, inspection_policy())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} observation journal reopens: {error}",
+                    self.active_provider.id()
+                )
+            });
+        assert!(
+            self.journal.set(journal).is_ok(),
+            "reopened journal slot is empty"
+        );
     }
 
     fn journal_rows(&self) -> Vec<JournalInspectionRowV1> {
@@ -298,10 +467,12 @@ impl HermesJourney {
         journal
             .inspect(&JournalInspectionFilterV1 {
                 limit: 100,
-                provider_id: Some(PROVIDER_ID.to_owned()),
+                provider_id: Some(self.active_provider.id().to_owned()),
                 ..JournalInspectionFilterV1::default()
             })
-            .expect("Native journal inspection")
+            .unwrap_or_else(|error| {
+                panic!("{} journal inspection: {error}", self.active_provider.id())
+            })
             .rows
     }
 
@@ -330,108 +501,162 @@ impl Drop for HermesJourney {
 
 #[test]
 fn installed_hermes_provider_scopes_native_observations_and_recall_to_the_project() {
-    let mut journey = HermesJourney::new();
+    assert_hermes_provider_journey(ActiveProvider::Native);
+}
+
+/// The real worker/model path is deliberately opt-in: CI and ordinary test
+/// runs stay offline, while a pinned installation can prove the same Hermes
+/// admission and receipt contract against the NCM provider.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with a pinned offline model"]
+fn real_ncm_hermes_provider_reopens_and_recalls_with_native_disabled() {
+    assert_hermes_provider_journey(ActiveProvider::RustNcm);
+}
+
+/// A real NCM process loss must surface as the provider's typed refusal and
+/// retain the exact configured provider identity. The journey is ignored for
+/// the same reason as the healthy NCM variant and kills only the worker child
+/// owned by this isolated daemon.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with a pinned offline model"]
+fn unavailable_ncm_hermes_provider_refuses_then_recovers() {
+    let mut journey = HermesJourney::new(ActiveProvider::RustNcm);
     journey.install_hermes_plugin();
     journey.start_daemon();
     journey.init_project();
     let project_id = journey.project_id();
-    journey.configure_native(&project_id);
+    journey.configure_provider(&project_id);
     journey.stop_daemon();
     journey.start_daemon();
+    journey.init_project_at(&journey.foreign_project);
 
-    // First context call mounts the configured Native provider and its journal
-    // before Hermes writes evidence, keeping project scoping observable.
-    let baseline = journey.context("hermes quartz project provider baseline");
-    let baseline_lane = baseline
-        .get("advisory_provider_memory")
-        .expect("baseline advisory provider lane");
-    assert_eq!(baseline_lane["provider_id"], PROVIDER_ID);
-    assert!(
-        journey.journal().is_some(),
-        "Native journal must be mounted"
-    );
-    assert!(
-        journey.journal_rows().is_empty(),
-        "baseline journal is empty"
-    );
-
-    journey.run_provider_fixture();
+    journey.assert_baseline();
+    let fixture = journey.run_provider_fixture();
+    assert_fixture_replay(&fixture);
     let rows = journey.await_settled_rows();
-    assert_eq!(rows.len(), 2, "one user and one assistant message");
-    let mut source_sequences = rows
-        .iter()
-        .map(|row| row.source_sequence.0)
-        .collect::<Vec<_>>();
-    source_sequences.sort_unstable();
-    source_sequences.dedup();
-    assert_eq!(
-        source_sequences.len(),
-        2,
-        "messages occupy distinct source positions"
+    assert_settled_rows(&rows, journey.active_provider);
+    let original_admissions = capture_admissions(journey.journal().expect("NCM journal"), &rows);
+    assert_provider_receipts(
+        journey.journal().expect("NCM journal"),
+        &rows,
+        journey.active_provider,
     );
-    for row in &rows {
-        assert_eq!(row.provider_id, PROVIDER_ID);
-        assert_eq!(row.observation_kind, OBSERVATION_KIND);
-        assert_eq!(row.state, DeliveryStateV1::Acknowledged);
-        assert_eq!(row.attempt_number, 1);
-        assert!(row.content_present);
-        let receipts = journey
-            .journal()
-            .expect("Native journal")
-            .receipts_for(&row.observation_id)
-            .expect("Native provider receipt");
-        assert_eq!(receipts.len(), 1, "one applied receipt per message");
-    }
 
-    // The generated plugin calls the same turn twice only at the host level;
-    // re-running the provider fixture is a distinct turn. Instead, prove the
-    // first callback/ingest result is idempotent by replaying its exact
-    // projectless/project-scoped event through the hidden shipped hook command
-    // after the real fixture settled. The hook itself remains project-bound by
-    // cwd and must not create any extra observation rows.
-    let receipt = json!({
-        "agent": "hermes",
-        "event": "turnIngested",
-        "cwd": journey.project.to_string_lossy(),
-        "route": { "session_id": SESSION_ID, "cwd": journey.project.to_string_lossy() },
-        "receipt": { "status": "success", "transcript_watermark": "tracedecay_sync_1" },
-    })
-    .to_string();
-    let before = journal_identities(&rows);
-    for _ in 0..2 {
-        let mut command = journey.cli(&["hook-hermes-terminal-receipt"]);
-        command.stdin(Stdio::piped());
-        let mut child = command.spawn().expect("Hermes receipt hook starts");
-        child
-            .stdin
-            .take()
-            .expect("receipt stdin")
-            .write_all(receipt.as_bytes())
-            .expect("receipt event writes");
-        let output = child.wait_with_output().expect("receipt hook exits");
-        assert!(
-            output.status.success(),
-            "project-scoped Hermes receipt hook failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    assert_eq!(journal_identities(&journey.journal_rows()), before);
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.reopen_journal();
+    let reopened = journey.await_settled_rows();
+    assert_eq!(journal_identities(&reopened), journal_identities(&rows));
+    assert_eq!(
+        capture_admissions(journey.journal().expect("reopened NCM journal"), &reopened),
+        original_admissions,
+        "daemon restart must preserve every admitted envelope"
+    );
 
-    // A resolved project callback writes its hook analytics into this
-    // project's store. The bounded poll also waits for the daemon's
-    // best-effort analytics side write, and distinguishes the project route
-    // from the projectless Hermes receipt fallback.
+    terminate_owned_ncm_worker(&journey);
+    let unavailable = journey.context(RECALL_QUERY);
+    let lane = unavailable
+        .get("advisory_provider_memory")
+        .expect("NCM worker loss retains an advisory lane");
+    assert_eq!(lane["state"], "unavailable", "typed NCM refusal: {lane}");
+    assert_eq!(lane["provider_id"], NCM_PROVIDER_ID);
+    assert_eq!(lane["registration_revision"], 1);
+
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.reopen_journal();
+    let recovered = journey.context(RECALL_QUERY);
+    assert_answered_recall(&recovered, journey.active_provider);
+}
+
+fn assert_hermes_provider_journey(active_provider: ActiveProvider) {
+    let mut journey = HermesJourney::new(active_provider);
+    journey.install_hermes_plugin();
+    journey.start_daemon();
+    journey.init_project();
+    let project_id = journey.project_id();
+    journey.configure_provider(&project_id);
+    journey.stop_daemon();
+    journey.start_daemon();
+    // Register a second git project after provider configuration. Its context
+    // is the foreign-scope control: it must not inherit this project's rows.
+    journey.init_project_at(&journey.foreign_project);
+
+    journey.assert_baseline();
+    let fixture = journey.run_provider_fixture();
+    assert_fixture_replay(&fixture);
+    let rows = journey.await_settled_rows();
+    assert_settled_rows(&rows, active_provider);
+    let original_admissions =
+        capture_admissions(journey.journal().expect("provider journal"), &rows);
+    assert_provider_receipts(
+        journey.journal().expect("provider journal"),
+        &rows,
+        active_provider,
+    );
+
+    // The fixture has already replayed the same deterministic admission with
+    // a fresh provider instance. Compare the full row identity and the
+    // immutable admitted envelope, not just a row count.
+    assert_eq!(
+        journal_identities(&journey.journal_rows()),
+        journal_identities(&rows)
+    );
+    assert_eq!(
+        capture_admissions(
+            journey.journal().expect("provider journal"),
+            &journey.journal_rows()
+        ),
+        original_admissions,
+        "exact provider replay must preserve the original admitted envelope"
+    );
+
+    // Reopen the journal only after a real daemon restart. This catches a
+    // stale reader or in-memory provider mount that would make recall appear
+    // durable while the process that admitted it is still alive.
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.reopen_journal();
+    let reopened = journey.await_settled_rows();
+    assert_eq!(journal_identities(&reopened), journal_identities(&rows));
+    assert_eq!(
+        capture_admissions(
+            journey.journal().expect("reopened provider journal"),
+            &reopened
+        ),
+        original_admissions,
+        "reopened journal must decode the same immutable admissions"
+    );
+    assert_provider_receipts(
+        journey.journal().expect("reopened provider journal"),
+        &reopened,
+        active_provider,
+    );
+
+    let foreign = journey.context_at(&journey.foreign_project, FOREIGN_RECALL_QUERY);
+    assert_foreign_scope_control(&foreign, active_provider);
+
+    let answer = journey.context(RECALL_QUERY);
+    assert_answered_recall(&answer, active_provider);
+
+    // Keep the existing hook analytics assertion as a separate route proof:
+    // the provider callbacks carry the resolved project and leave evidence in
+    // this project's analytics store, while the foreign context above cannot
+    // see that route.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let diagnostics = journey.analytics_diagnostics();
         if diagnostics["hook_call_count"].as_i64().unwrap_or_default() > 0
-            && diagnostics["by_event_kind"].as_array().is_some_and(|rows| {
-                rows.iter().any(|row| {
-                    row["event_kind"] == "hook_route"
-                        && row["count"].as_i64().unwrap_or_default() > 0
+            && diagnostics["by_event_kind"]
+                .as_array()
+                .is_some_and(|events| {
+                    events.iter().any(|event| {
+                        event["event_kind"] == "hook_route"
+                            && event["count"].as_i64().unwrap_or_default() > 0
+                    })
                 })
-            })
         {
             break;
         }
@@ -441,12 +666,148 @@ fn installed_hermes_provider_scopes_native_observations_and_recall_to_the_projec
         );
         std::thread::sleep(JOURNAL_POLL_INTERVAL);
     }
+}
 
-    let answer = journey.context("what did the Hermes quartz project observation record?");
+impl HermesJourney {
+    fn assert_baseline(&self) {
+        // The first context call mounts the configured provider before Hermes
+        // writes evidence, so the empty journal is an unambiguous baseline.
+        let baseline = self.context("hermes quartz project provider baseline");
+        let lane = baseline
+            .get("advisory_provider_memory")
+            .expect("baseline advisory provider lane");
+        assert_eq!(lane["provider_id"], self.active_provider.id());
+        assert!(self.journal().is_some(), "provider journal must be mounted");
+        assert!(self.journal_rows().is_empty(), "baseline journal is empty");
+    }
+}
+
+fn assert_fixture_replay(fixture: &Value) {
+    assert_eq!(fixture["replay"]["mode"], "exact");
+    assert_eq!(fixture["replay"]["fresh_provider"], true);
+    let ids = fixture["replay"]["message_ids"]
+        .as_array()
+        .expect("fixture reports exact original message ids");
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(Value::is_string));
+}
+
+fn assert_settled_rows(rows: &[JournalInspectionRowV1], provider: ActiveProvider) {
+    assert_eq!(rows.len(), 2, "one Hermes user and one assistant message");
+    let mut source_sequences = rows
+        .iter()
+        .map(|row| row.source_sequence.0)
+        .collect::<Vec<_>>();
+    source_sequences.sort_unstable();
+    source_sequences.dedup();
+    assert_eq!(
+        source_sequences.len(),
+        2,
+        "messages use distinct source positions"
+    );
+    for row in rows {
+        assert_eq!(row.provider_id, provider.id());
+        assert_eq!(row.observation_kind, OBSERVATION_KIND);
+        assert_eq!(row.state, DeliveryStateV1::Acknowledged);
+        assert_eq!(row.attempt_number, 1);
+        assert!(row.content_present);
+    }
+}
+
+fn capture_admissions(
+    journal: &SqliteObservationJournal,
+    rows: &[JournalInspectionRowV1],
+) -> Vec<AdmittedObservationV1> {
+    let mut admissions = rows
+        .iter()
+        .map(|row| {
+            let admitted = journal
+                .read_admitted_observation_by_idempotency(&row.idempotency_key)
+                .expect("read retained Hermes admission")
+                .expect("Hermes admission content is retained");
+            admitted
+                .validate()
+                .expect("valid retained Hermes admission");
+            assert_eq!(admitted.observation_id, row.observation_id);
+            assert_eq!(admitted.idempotency_key, row.idempotency_key);
+            assert_eq!(admitted.payload.sha256, row.payload_sha256);
+            assert_eq!(admitted.extensions_digest, row.extensions_digest);
+            admitted
+        })
+        .collect::<Vec<_>>();
+    admissions.sort_by(|left, right| {
+        left.idempotency_key
+            .as_str()
+            .cmp(right.idempotency_key.as_str())
+    });
+    admissions
+}
+
+fn assert_provider_receipts(
+    journal: &SqliteObservationJournal,
+    rows: &[JournalInspectionRowV1],
+    provider: ActiveProvider,
+) {
+    for row in rows {
+        let receipts = journal
+            .receipts_for(&row.observation_id)
+            .expect("provider receipt lookup");
+        assert_eq!(receipts.len(), 1, "one receipt for each exact admission");
+        let receipt = &receipts[0];
+        receipt.validate().expect("valid provider receipt");
+        assert_eq!(receipt.provider_id.as_str(), provider.id());
+        assert_eq!(receipt.observation_id, row.observation_id);
+        assert_eq!(receipt.idempotency_key, row.idempotency_key);
+        assert_eq!(receipt.payload_sha256, row.payload_sha256);
+        assert_eq!(receipt.extensions_digest, row.extensions_digest);
+        assert_eq!(receipt.registration_revision, row.registration_revision);
+        assert_eq!(
+            receipt.provider_instance_id.as_ref(),
+            Some(&row.provider_instance_id)
+        );
+        assert_eq!(receipt.attempt_number, 1);
+        assert_eq!(receipt.outcome, ObservationOutcomeV1::Applied);
+        assert_eq!(
+            receipt.committed_effect,
+            ObservationCommittedEffectV1::Applied
+        );
+        assert!(
+            receipt
+                .provider_receipt_digest
+                .as_ref()
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+            "applied {provider:?} receipt must carry a 64-character digest"
+        );
+    }
+}
+
+fn assert_foreign_scope_control(foreign: &Value, provider: ActiveProvider) {
+    if let Some(lane) = foreign.get("advisory_provider_memory") {
+        assert_ne!(
+            lane["state"], "answered",
+            "foreign project must not answer from the Hermes project store: {lane}"
+        );
+        if lane["provider_id"].is_string() {
+            assert_eq!(lane["provider_id"], provider.id());
+        }
+        if let Some(candidates) = lane["candidates"].as_array() {
+            assert!(
+                candidates.iter().all(|candidate| candidate["content"]
+                    .as_str()
+                    .is_none_or(|content| !content.contains(PROJECT_TERM))),
+                "foreign project returned primary-project evidence: {lane}"
+            );
+        }
+    }
+}
+
+fn assert_answered_recall(answer: &Value, provider: ActiveProvider) {
     let lane = answer
         .get("advisory_provider_memory")
         .expect("recall advisory provider lane");
-    assert_eq!(lane["provider_id"], PROVIDER_ID);
+    assert_eq!(lane["provider_id"], provider.id());
     assert_eq!(lane["state"], "answered");
     let candidates = lane["candidates"].as_array().expect("recall candidates");
     assert!(
@@ -459,6 +820,56 @@ fn installed_hermes_provider_scopes_native_observations_and_recall_to_the_projec
             .is_some_and(|content| content.contains(PROJECT_TERM))),
         "recall returns the project-scoped Hermes evidence: {lane}"
     );
+}
+
+#[cfg(unix)]
+fn terminate_owned_ncm_worker(journey: &HermesJourney) {
+    let worker = PathBuf::from(
+        std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
+    )
+    .canonicalize()
+    .expect("canonical NCM worker binary");
+    let daemon_pid = journey.daemon.as_ref().expect("running NCM daemon").id();
+    let listing = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .expect("ps enumerates NCM workers");
+    let worker_pid = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line
+                .splitn(3, char::is_whitespace)
+                .filter(|field| !field.is_empty());
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let ppid = fields.next()?.parse::<u32>().ok()?;
+            let command = fields.next()?.trim();
+            (ppid == daemon_pid && command.starts_with(worker.to_string_lossy().as_ref()))
+                .then_some(pid)
+        })
+        .find(|pid| *pid != std::process::id())
+        .expect("daemon must own the real NCM worker child");
+    let status = Command::new("kill")
+        .args(["-TERM", &worker_pid.to_string()])
+        .status()
+        .expect("kill signals only the discovered NCM worker");
+    assert!(status.success(), "NCM worker termination must be delivered");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let probe = Command::new("kill")
+            .args(["-0", &worker_pid.to_string()])
+            .status()
+            .expect("kill -0 probes worker state");
+        if !probe.success() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("NCM worker {worker_pid} did not exit after SIGTERM");
+}
+
+#[cfg(not(unix))]
+fn terminate_owned_ncm_worker(_journey: &HermesJourney) {
+    panic!("the unavailable-NCM Hermes journey requires Unix");
 }
 
 fn inspection_policy() -> RetentionPolicyV1 {
@@ -477,13 +888,14 @@ fn inspection_policy() -> RetentionPolicyV1 {
     }
 }
 
-fn journal_identities(rows: &[JournalInspectionRowV1]) -> Vec<(String, String, u32)> {
+fn journal_identities(rows: &[JournalInspectionRowV1]) -> Vec<(String, String, String, u32)> {
     let mut result = rows
         .iter()
         .map(|row| {
             (
                 row.idempotency_key.as_str().to_owned(),
                 row.observation_id.as_str().to_owned(),
+                row.payload_sha256.clone(),
                 row.attempt_number,
             )
         })
@@ -525,21 +937,17 @@ fn install_binary_shim(bin_dir: &Path) {
     }
 }
 
-fn initialize_project(project: &Path) {
+fn initialize_project(project: &Path, package_name: &str, source: &str) {
     fs::create_dir_all(project.join("src")).expect("project source");
     git(project, &["init", "--quiet", "-b", "main"]);
     git(project, &["config", "user.email", "journey@example.com"]);
     git(project, &["config", "user.name", "Hermes Journey"]);
     fs::write(
         project.join("Cargo.toml"),
-        "[package]\nname=\"hermes-cli-journey-fixture\"\nversion=\"0.0.0\"\nedition=\"2024\"\n",
+        format!("[package]\nname=\"{package_name}\"\nversion=\"0.0.0\"\nedition=\"2024\"\n"),
     )
     .expect("fixture manifest");
-    fs::write(
-        project.join("src/lib.rs"),
-        "pub fn quartz_project_observation() -> u8 { 7 }\n",
-    )
-    .expect("fixture source");
+    fs::write(project.join("src/lib.rs"), source).expect("fixture source");
     git(project, &["add", "."]);
     git(project, &["commit", "--quiet", "-m", "initial"]);
 }
