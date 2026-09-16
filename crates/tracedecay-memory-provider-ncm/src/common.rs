@@ -52,6 +52,13 @@ const EXCLUSIONS: &[&str] = &[
     "content_sha256",
 ];
 
+/// Maximum serialized size of any retained named capsule.
+///
+/// Projection and reconstruction share this bound. Projection must reject a
+/// capsule before dispatch so a successful mutation cannot become an unknown
+/// effect only when its response is reconstructed.
+pub(crate) const MAX_NAMED_CAPSULE_BYTES: usize = 131_072;
+
 fn fields(value: &Value, names: &[&str]) -> Option<()> {
     let object = value.as_object()?;
     (object.len() == names.len() && names.iter().all(|name| object.contains_key(*name)))
@@ -402,12 +409,18 @@ pub(crate) fn project_attribution(
     let retained = json!({"original_source": original, "canonical_payload": canonical, "source_refs": [source_ref], "delivery_scope": scope_value(&call.exact_scope),
         "projection": {"key_text": key_text, "value_text": value_text, "observation_kind": kind}});
     let bytes = serde_json::to_vec(&retained).ok()?;
+    if bytes.len() > MAX_NAMED_CAPSULE_BYTES {
+        return None;
+    }
     let digest = hex_digest(&Sha256::digest(&bytes));
     let v = &admitted.validity;
     let delivery_bytes = serde_json::to_vec(
         &json!({"operation_id": call.operation_id, "idempotency_key": call.idempotency_key}),
     )
     .ok()?;
+    if delivery_bytes.len() > MAX_NAMED_CAPSULE_BYTES {
+        return None;
+    }
     let delivery_digest = hex_digest(&Sha256::digest(&delivery_bytes));
     Some(Some(json!({
         "source_binding": source_binding(namespace, &admitted)?.provenance(),
@@ -468,31 +481,81 @@ pub(crate) fn evidence_text(kind: &str, canonical: &Value) -> Option<(String, St
         let role = string(&payload["role"])?;
         return Some((content.clone(), format!("{role}: {content}")));
     }
-    let names: &[&str] = match kind {
-        "source.edit_settled.v1" => &["claim", "status", "assertion", "reason"],
-        "test.execution_settled.v1" => &["assertion", "status", "approach", "outcome", "reason"],
-        "feedback.outcome_settled.v1" => {
-            &["approach", "outcome", "signal", "reason", "claim", "status"]
-        }
+    let (key_names, value_names): (&[&str], &[&str]) = match kind {
+        "tool.execution_settled.v1" => (
+            &["command", "tool_name", "tool", "summary"],
+            &["outcome_summary", "result", "output", "outcome", "summary"],
+        ),
+        "source.edit_settled.v1" => (
+            &[
+                "change_summary",
+                "path_summary",
+                "claim",
+                "assertion",
+                "summary",
+            ],
+            &[
+                "result_summary",
+                "diff_summary",
+                "status",
+                "content",
+                "reason",
+                "summary",
+            ],
+        ),
+        "test.execution_settled.v1" => (
+            &["test_name", "command", "assertion", "approach", "summary"],
+            &[
+                "outcome_summary",
+                "result",
+                "outcome",
+                "status",
+                "reason",
+                "summary",
+            ],
+        ),
+        "diagnostic.observed.v1" => (
+            &["code", "diagnostic", "summary"],
+            &["message", "detail", "summary"],
+        ),
+        "git.evidence_observed.v1" => (
+            &["commit", "ref", "summary"],
+            &["message", "evidence", "summary"],
+        ),
+        "native.fact_promoted.v1" => (
+            &["subject", "key", "summary"],
+            &["fact", "value", "content", "summary"],
+        ),
+        "feedback.outcome_settled.v1" | "automation.outcome_settled.v1" => (
+            &["action", "job", "approach", "claim", "summary"],
+            &[
+                "outcome_summary",
+                "result",
+                "outcome",
+                "signal",
+                "status",
+                "reason",
+                "summary",
+            ],
+        ),
         _ => return None,
     };
-    let mut lines = Vec::new();
-    for name in names {
-        if let Some(field) = payload.get(*name) {
-            let text = field.as_str()?;
-            if text.len() > 8192 {
-                return None;
-            }
-            if !text.trim().is_empty() {
-                lines.push(format!("{name}: {text}"));
-            }
-        }
-    }
-    let text = lines.join("\n");
-    if text.is_empty() || text.len() > 32768 {
+    let key = evidence_field(payload, key_names)?;
+    let value = evidence_field(payload, value_names)?;
+    if key.len().saturating_add(value.len()) > 32_768 {
         return None;
     }
-    Some((text.clone(), text))
+    Some((key, value))
+}
+
+fn evidence_field(payload: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        payload
+            .get(*name)
+            .and_then(|field| string(field))
+            .filter(|text| text.len() <= 8_192)
+            .map(str::to_owned)
+    })
 }
 
 fn scope_value(scope: &OwnedExactScope) -> Value {
@@ -515,7 +578,7 @@ fn decode_capsule_bounded(provenance: &Value, maximum_bytes: usize) -> Option<Va
         return None;
     }
     let encoded = capsule["bytes"].as_array()?;
-    if encoded.len() > maximum_bytes {
+    if encoded.len() > maximum_bytes.min(MAX_NAMED_CAPSULE_BYTES) {
         return None;
     }
     let bytes = encoded
@@ -533,12 +596,15 @@ fn decode_named_capsule(provenance: &Value, name: &str) -> Option<Value> {
     if capsule["version"] != 1 {
         return None;
     }
-    let bytes = capsule["bytes"]
-        .as_array()?
+    let encoded = capsule["bytes"].as_array()?;
+    if encoded.len() > MAX_NAMED_CAPSULE_BYTES {
+        return None;
+    }
+    let bytes = encoded
         .iter()
         .map(|item| u8::try_from(item.as_u64()?).ok())
         .collect::<Option<Vec<_>>>()?;
-    if bytes.len() > 131_072 || capsule["sha256"].as_str()? != hex_digest(&Sha256::digest(&bytes)) {
+    if capsule["sha256"].as_str()? != hex_digest(&Sha256::digest(&bytes)) {
         return None;
     }
     serde_json::from_slice(&bytes).ok()
@@ -2205,5 +2271,69 @@ mod recall_diagnostic_tests {
         );
         assert_eq!(event.remaining_candidate_slots, 1);
         assert_eq!(event.remaining_content_bytes, 64);
+    }
+
+    #[test]
+    fn retained_attribution_rejects_an_oversized_named_capsule_before_dispatch() {
+        let call = call();
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let canonical = json!({
+            "command": "build",
+            "outcome_summary": "passed",
+            "ignored_retained_metadata": "x".repeat(MAX_NAMED_CAPSULE_BYTES)
+        });
+        let observation = json!({
+            "observation_kind": "tool.execution_settled.v1",
+            "canonical_payload": canonical,
+            "source_identity": {"original_source": original_source(&call, 1)}
+        });
+        assert!(project_attribution(&call, &observation, &namespace, None).is_none());
+    }
+
+    #[test]
+    fn evidence_text_covers_every_advertised_observation_kind() {
+        let cases = [
+            (
+                "session.message_committed.v1",
+                json!({"role": "assistant", "content": "ready"}),
+            ),
+            (
+                "tool.execution_settled.v1",
+                json!({"command": "cargo test", "outcome_summary": "passed"}),
+            ),
+            (
+                "source.edit_settled.v1",
+                json!({"change_summary": "updated adapter", "result_summary": "applied"}),
+            ),
+            (
+                "test.execution_settled.v1",
+                json!({"test_name": "adapter boundary", "outcome_summary": "passed"}),
+            ),
+            (
+                "diagnostic.observed.v1",
+                json!({"code": "E0001", "message": "fixed"}),
+            ),
+            (
+                "git.evidence_observed.v1",
+                json!({"commit": "abc123", "message": "landed"}),
+            ),
+            (
+                "native.fact_promoted.v1",
+                json!({"subject": "adapter", "fact": "bounded"}),
+            ),
+            (
+                "feedback.outcome_settled.v1",
+                json!({"action": "retain", "outcome_summary": "helpful"}),
+            ),
+            (
+                "automation.outcome_settled.v1",
+                json!({"job": "nightly", "outcome_summary": "complete"}),
+            ),
+        ];
+        for (kind, payload) in cases {
+            let (key, value) = evidence_text(kind, &payload).expect("advertised kind");
+            assert!(!key.is_empty(), "empty key for {kind}");
+            assert!(!value.is_empty(), "empty value for {kind}");
+        }
     }
 }

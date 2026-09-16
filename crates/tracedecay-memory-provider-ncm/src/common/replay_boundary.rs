@@ -73,6 +73,13 @@ fn validate(
     if requested.is_empty()
         || requested.len() > 4096
         || rows.len() != requested.len()
+        || request["first_source_sequence"].as_u64() == Some(0)
+        || request["last_source_sequence"].as_u64() < request["first_source_sequence"].as_u64()
+        || request["last_source_sequence"].as_u64().and_then(|last| {
+            request["first_source_sequence"]
+                .as_u64()
+                .and_then(|first| last.checked_sub(first)?.checked_add(1))
+        }) != Some(requested.len() as u64)
         || !response["warnings"].as_array()?.is_empty()
     {
         return None;
@@ -120,6 +127,8 @@ fn validate(
     }
     let mut counts = [0_u64; 5];
     let mut seen = BTreeSet::new();
+    let mut seen_receipts = BTreeSet::new();
+    let mut seen_delivery_keys = BTreeSet::new();
     for (input, row) in requested.iter().zip(rows) {
         fields(
             row,
@@ -134,10 +143,15 @@ fn validate(
         )?;
         let sequence = row["source_sequence"].as_u64()?;
         let receipt = row["receipt_digest"].as_str()?;
+        let delivery_key = input["delivery_key"].as_str()?;
         if !seen.insert(sequence)
+            || sequence == 0
             || input["source_sequence"] != sequence
             || input["receipt_digest"] != receipt
             || !crate::NcmProviderAdapter::valid_sha256(receipt)
+            || !crate::NcmProviderAdapter::valid_sha256(delivery_key)
+            || !seen_receipts.insert(receipt.to_owned())
+            || !seen_delivery_keys.insert(delivery_key.to_owned())
         {
             return None;
         }
@@ -250,14 +264,17 @@ mod tests {
 
     fn fixture() -> (Value, Value) {
         let receipt = "a".repeat(64);
+        let second_receipt = "b".repeat(64);
+        let first_delivery = "1".repeat(64);
+        let second_delivery = "2".repeat(64);
         (
             json!({"action":"replay", "first_source_sequence":1, "last_source_sequence":2, "expected_previous_acknowledged_sequence":0,
-            "items":[{"source_sequence":1,"receipt_digest":receipt,"delivery_key":"key1"},{"source_sequence":2,"receipt_digest":receipt,"delivery_key":"key2"}]}),
+            "items":[{"source_sequence":1,"receipt_digest":receipt,"delivery_key":first_delivery},{"source_sequence":2,"receipt_digest":second_receipt,"delivery_key":second_delivery}]}),
             json!({"common_portability":"replay", "first_source_sequence":1, "last_source_sequence":2, "acknowledged_sequence":1,
             "state_generation_before":0,"state_generation_after":1,"applied_observations":1,"duplicate_observations":0,"sources_already_applied":0,
             "rejected_observations":0,"effect_unknown_observations":1,"partial":true,"replayed":false,"warnings":[],
             "items":[{"source_sequence":1,"receipt_digest":receipt,"state":"applied","reason":null,"record_id":1,"state_generation":1},
-            {"source_sequence":2,"receipt_digest":receipt,"state":"effect_unknown","reason":"commit_unknown","record_id":null,"state_generation":1}]}),
+            {"source_sequence":2,"receipt_digest":second_receipt,"state":"effect_unknown","reason":"commit_unknown","record_id":null,"state_generation":1}]}),
         )
     }
 
@@ -554,6 +571,63 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn replay_partial_rejects_malformed_sequence_digest_ref_and_acknowledgement() {
+        for malformed in [
+            "missing_sequence",
+            "zero_sequence",
+            "invalid_digest",
+            "duplicate_digest",
+            "duplicate_ref",
+            "ack_too_high",
+            "ack_before_previous",
+        ] {
+            let (mut request, mut response) = fixture();
+            match malformed {
+                "missing_sequence" => {
+                    response["items"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("source_sequence");
+                }
+                "zero_sequence" => {
+                    request["items"][0]["source_sequence"] = json!(0);
+                    response["items"][0]["source_sequence"] = json!(0);
+                }
+                "invalid_digest" => {
+                    request["items"][0]["receipt_digest"] = json!("invalid");
+                    response["items"][0]["receipt_digest"] = json!("invalid");
+                }
+                "duplicate_digest" => {
+                    let first = request["items"][0]["receipt_digest"].clone();
+                    request["items"][1]["receipt_digest"] = first.clone();
+                    response["items"][1]["receipt_digest"] = first;
+                }
+                "duplicate_ref" => {
+                    let first = request["items"][0]["delivery_key"].clone();
+                    request["items"][1]["delivery_key"] = first;
+                }
+                "ack_too_high" => response["acknowledged_sequence"] = json!(3),
+                "ack_before_previous" => {
+                    request["expected_previous_acknowledged_sequence"] = json!(2);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                validate(
+                    &request,
+                    &response,
+                    0,
+                    1,
+                    TerminalCode::EffectUnknown,
+                    crate::CommittedEffectState::Unknown,
+                )
+                .is_none(),
+                "accepted malformed replay metadata: {malformed}"
+            );
+        }
     }
 
     #[test]

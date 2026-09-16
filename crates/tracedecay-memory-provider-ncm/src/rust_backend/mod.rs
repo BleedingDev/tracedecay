@@ -874,6 +874,99 @@ fn client_error_reply(
     )
 }
 
+fn unknown_effect(receipt: &str, action: String) -> CommittedEffectEvidence {
+    CommittedEffectEvidence::unknown(receipt, action).unwrap_or_else(|_| {
+        let digest = Sha256::digest(receipt.as_bytes());
+        CommittedEffectEvidence::unknown_from_reconciliation_digest(digest.into())
+    })
+}
+
+/// Validates the metadata needed to construct a replay partial-effect
+/// partition.  The adapter's full replay validator runs later, but the
+/// partition is effect evidence and must never be built from malformed values.
+fn valid_replay_partial_metadata(call: &NcmSurfaceCall, payload: &Value) -> bool {
+    let request = serde_json::from_slice::<Value>(&call.payload.bytes).ok();
+    let Some(request) = request else {
+        return false;
+    };
+    let Some(request) = request.get("common_portability") else {
+        return false;
+    };
+    let Some(request_items) = request.get("items").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(response_items) = payload.get("items").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(first) = request.get("first_source_sequence").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(last) = request.get("last_source_sequence").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(previous) = request
+        .get("expected_previous_acknowledged_sequence")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let Some(acknowledged) = payload.get("acknowledged_sequence").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(expected_len) = last.checked_sub(first).and_then(|span| span.checked_add(1)) else {
+        return false;
+    };
+    if first == 0
+        || last < first
+        || expected_len != request_items.len() as u64
+        || request_items.is_empty()
+        || response_items.len() != request_items.len()
+        || payload.get("first_source_sequence").and_then(Value::as_u64) != Some(first)
+        || payload.get("last_source_sequence").and_then(Value::as_u64) != Some(last)
+        || acknowledged < previous
+        || acknowledged > previous.max(last)
+    {
+        return false;
+    }
+    let mut sequences = BTreeSet::new();
+    let mut receipts = BTreeSet::new();
+    let mut delivery_keys = BTreeSet::new();
+    for (index, (request_item, response_item)) in
+        request_items.iter().zip(response_items).enumerate()
+    {
+        let Some(sequence) = response_item.get("source_sequence").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(receipt) = response_item.get("receipt_digest").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(delivery_key) = request_item.get("delivery_key").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(request_sequence) = request_item.get("source_sequence").and_then(Value::as_u64)
+        else {
+            return false;
+        };
+        let Some(request_receipt) = request_item.get("receipt_digest").and_then(Value::as_str)
+        else {
+            return false;
+        };
+        if sequence == 0
+            || sequence != first.saturating_add(index as u64)
+            || sequence != request_sequence
+            || receipt != request_receipt
+            || !valid_sha256(receipt)
+            || delivery_key.is_empty()
+            || !sequences.insert(sequence)
+            || !receipts.insert(receipt.to_owned())
+            || !delivery_keys.insert(delivery_key.to_owned())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply) -> ProviderReply {
     let replay_accounting = call.operation == ProviderOperation::Replay
         && reply
@@ -886,12 +979,23 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
             .payload
             .as_ref()
             .is_some_and(|payload| payload["partial"] == true);
+    let replay_partial_metadata_invalid = replay_partial
+        && reply
+            .payload
+            .as_ref()
+            .is_none_or(|payload| !valid_replay_partial_metadata(call, payload));
     let maintenance_partial = call.operation == ProviderOperation::Maintenance
         && reply.outcome == Outcome::Success
         && reply.payload.as_ref().is_some_and(|payload| {
             payload["common_control"] == "maintenance" && payload["partial"] == true
         });
-    let terminal_code = if replay_partial {
+    let terminal_code = if replay_partial_metadata_invalid {
+        // A committed replay page cannot be partitioned safely when its
+        // sequence, receipt, delivery reference, or acknowledgement metadata
+        // is malformed. Report uncertainty with the worker receipt rather than
+        // manufacturing an item reference from zero or an invalid digest.
+        TerminalCode::EffectUnknown
+    } else if replay_partial {
         TerminalCode::PartialEffect
     } else if maintenance_partial {
         // Common maintenance may have scanned only one bounded page.  This is
@@ -910,7 +1014,12 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
         .unwrap_or(false);
     let receipt = worker_receipt(call.operation, &reply);
     let effect = if call.operation.mutates_provider_state() {
-        if reply.outcome == Outcome::Success
+        if replay_partial_metadata_invalid {
+            unknown_effect(
+                &receipt,
+                format!("ncm.worker.reconcile-idempotency.v1:{}", &receipt[..16]),
+            )
+        } else if reply.outcome == Outcome::Success
             && reply
                 .payload
                 .as_ref()
@@ -960,7 +1069,10 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
                 &receipt,
             )
             .unwrap_or_else(|_| {
-                CommittedEffectEvidence::unknown_from_reconciliation_digest([0; 32])
+                unknown_effect(
+                    &receipt,
+                    format!("ncm.worker.reconcile-idempotency.v1:{}", &receipt[..16]),
+                )
             })
         } else if reply.outcome == Outcome::Success && replayed {
             CommittedEffectEvidence::duplicate(
@@ -997,7 +1109,9 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
     } else {
         CommittedEffectEvidence::none(Some(call.expected_state_generation))
     };
-    let payload = if success || (replay_accounting && reply.outcome == Outcome::EffectUnknown) {
+    let payload = if !replay_partial_metadata_invalid
+        && (success || (replay_accounting && reply.outcome == Outcome::EffectUnknown))
+    {
         reply
             .payload
             .as_ref()
@@ -1005,7 +1119,9 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
     } else {
         None
     };
-    let diagnostic = if replay_partial {
+    let diagnostic = if replay_partial_metadata_invalid {
+        Some("ncm.rust.replay_partial_metadata_invalid")
+    } else if replay_partial {
         Some("ncm.rust.replay_partial")
     } else {
         (!success).then(|| worker_diagnostic(&reply))
