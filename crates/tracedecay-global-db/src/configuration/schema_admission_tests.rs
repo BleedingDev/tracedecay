@@ -1,4 +1,4 @@
-use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor};
+use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, TransactionBehavior};
 
 use super::{
     ConfigurationSchemaError, ensure_configuration_schema, fresh_configuration_store_evidence,
@@ -184,8 +184,8 @@ async fn sqlite_objects(
 }
 
 /// Every release from beta.25 through beta.37 published the fixture's exact
-/// shape. It remains a reset-required historical shape, and admission must
-/// leave every object and row untouched.
+/// shape. Read-only admission accepts it, then the writer converges the
+/// retired empty tables while preserving supported configuration rows.
 const RELEASED_BETA37_CONFIGURATION_SQL: &str =
     include_str!("../../tests/fixtures/configuration-released-beta37.sql");
 
@@ -253,7 +253,7 @@ async fn count(connection: &impl QueryExecutor, sql: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn released_configuration_shape_requires_reset_without_mutation() {
+async fn released_configuration_shape_is_admitted_and_converged_with_rows_intact() {
     let (_directory, connection) = released_connection().await;
     assert_eq!(
         count(
@@ -265,10 +265,24 @@ async fn released_configuration_shape_requires_reset_without_mutation() {
         "fixture carries the shipped table"
     );
 
-    let before = sqlite_objects(&connection).await;
-    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
-    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
-    assert_eq!(sqlite_objects(&connection).await, before);
+    super::admit_configuration_schema(&*connection, None)
+        .await
+        .expect("the shipped beta.25-beta.37 shape is admissible read-only");
+    ensure_configuration_schema(&*connection, None)
+        .await
+        .expect("the shipped shape converges instead of demanding a reset");
+
+    assert_eq!(
+        count(
+            &*connection,
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name LIKE 'configuration_credential_references%'
+                OR name LIKE 'configuration_semantic_%'"
+        )
+        .await,
+        0,
+        "retired schema objects are gone"
+    );
 
     let mut rows = connection
         .query(
@@ -285,6 +299,44 @@ async fn released_configuration_shape_requires_reset_without_mutation() {
             .get::<String>(0)
             .unwrap(),
         "{\"kept\":true}"
+    );
+    drop(rows);
+    ensure_configuration_schema(&*connection, None)
+        .await
+        .expect("the converged store is the exact current shape");
+}
+
+#[tokio::test]
+async fn released_configuration_convergence_can_be_rolled_back_atomically() {
+    let (_directory, connection) = released_connection().await;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await
+        .unwrap();
+    ensure_configuration_schema(&transaction, None)
+        .await
+        .expect("the known released shape converges inside the transaction");
+    transaction.rollback().await.unwrap();
+
+    assert_eq!(
+        count(
+            &*connection,
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE name LIKE 'configuration_credential_references%'
+                OR name LIKE 'configuration_semantic_%'"
+        )
+        .await,
+        21,
+        "rolling back retains every retired table and trigger"
+    );
+    assert_eq!(
+        count(
+            &*connection,
+            "SELECT COUNT(*) FROM configuration_entries WHERE revision_id = 'revision.1'"
+        )
+        .await,
+        1,
+        "rolling back retains supported settings"
     );
 }
 
@@ -354,7 +406,9 @@ async fn released_configuration_shape_with_credential_rows_stays_reset_required(
         )
         .await
         .unwrap();
+    let before = sqlite_objects(&connection).await;
     assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
     assert_eq!(
         count(
             &*connection,

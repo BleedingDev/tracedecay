@@ -31,6 +31,19 @@ const PRE_RESIDUE_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
 /// mutating the store.
 const RELEASED_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:99b8f5f5cebc584ab564181d8a67ee665031c20bbdf63b479c212d16a1c63746";
+/// Tables removed from the current canonical configuration shape. The
+/// beta.25-beta.37 binaries never wrote these tables as part of the stable
+/// configuration surface. Their presence is therefore a known released
+/// shape, while rows in the credential-reference table remain unknown data
+/// that must be preserved for an explicit reset decision.
+const CONVERGE_RELEASED_CONFIGURATION_SQL: &str = "
+DROP TABLE configuration_credential_references;
+DROP TABLE configuration_semantic_retrieval_state_v1;
+DROP TABLE configuration_semantic_retrieval_pending_v1;
+DROP TABLE configuration_semantic_retrieval_inventory_v1;
+DROP TABLE configuration_semantic_accepted_profiles_v1;
+DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
+";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {
@@ -471,19 +484,18 @@ async fn validate_configuration_schema(
     Ok(shape)
 }
 
-/// Read-only admission: only the exact final shape is admissible for an
-/// existing store. Recognized historical shapes are reported as typed reset
-/// outcomes so no migration or cleanup can run before the operator explicitly
-/// replaces the store.
+/// Read-only admission: the exact final shape and the known beta.25-beta.37
+/// shape are admissible. The writer converges the released shape on its next
+/// open; unknown schema drift remains reset-required and untouched.
 pub async fn admit_configuration_schema(
     connection: &impl QueryExecutor,
     fresh_store: Option<&FreshConfigurationStoreEvidence>,
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
-        ConfigurationShape::Final => Ok(()),
-        shape @ (ConfigurationShape::PriorFinal
-        | ConfigurationShape::PreResidueFinal
-        | ConfigurationShape::Released) => Err(historical_shape_reset(shape)),
+        ConfigurationShape::Final | ConfigurationShape::Released => Ok(()),
+        shape @ (ConfigurationShape::PriorFinal | ConfigurationShape::PreResidueFinal) => {
+            Err(historical_shape_reset(shape))
+        }
         ConfigurationShape::Absent if fresh_store.is_some() => Ok(()),
         ConfigurationShape::Absent => Err(ConfigurationSchemaError::ResetRequired {
             reason: "configuration schema is missing from a non-fresh registered store",
@@ -497,9 +509,10 @@ pub async fn ensure_configuration_schema(
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
         ConfigurationShape::Final => return Ok(()),
-        shape @ (ConfigurationShape::PriorFinal
-        | ConfigurationShape::PreResidueFinal
-        | ConfigurationShape::Released) => return Err(historical_shape_reset(shape)),
+        ConfigurationShape::Released => return converge_released_configuration(connection).await,
+        shape @ (ConfigurationShape::PriorFinal | ConfigurationShape::PreResidueFinal) => {
+            return Err(historical_shape_reset(shape));
+        }
         ConfigurationShape::Absent => {}
     }
     if fresh_store.is_none() {
@@ -518,6 +531,42 @@ pub async fn ensure_configuration_schema(
     } else {
         Err(ConfigurationSchemaError::ResetRequired {
             reason: "fresh configuration schema publication was incomplete",
+        })
+    }
+}
+
+/// Converges the known beta.25-beta.37 shape to the current canonical shape.
+///
+/// Callers run this from the atomic registered-schema transaction. The
+/// credential-reference table had no shipped writer after its introduction;
+/// a row therefore represents data this binary cannot interpret or safely
+/// migrate. Refuse before the first drop so a refused store remains byte-for-
+/// byte available for an explicit reset decision. Supported revision and
+/// setting rows stay in place while the retired empty tables are removed.
+async fn converge_released_configuration(
+    connection: &impl Executor,
+) -> Result<(), ConfigurationSchemaError> {
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM configuration_credential_references LIMIT 1",
+            (),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Err(ConfigurationSchemaError::ResetRequired {
+            reason: "released configuration store holds credential references no shipped binary wrote",
+        });
+    }
+    drop(rows);
+
+    connection
+        .execute_batch(CONVERGE_RELEASED_CONFIGURATION_SQL)
+        .await?;
+    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
+        Ok(())
+    } else {
+        Err(ConfigurationSchemaError::ResetRequired {
+            reason: "released configuration store did not converge to the final shape",
         })
     }
 }
