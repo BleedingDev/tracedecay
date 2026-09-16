@@ -162,6 +162,38 @@ def test_ncm_worker_sidecar_archive(temp: Path) -> None:
     assert target["sha256"] == hashlib.sha256(WORKER_PAYLOAD).hexdigest()
 
 
+def test_ncm_worker_manifest_symlink_is_rejected(temp: Path) -> None:
+    root = temp / "manifest-symlink"
+    root.mkdir()
+    worker = root / "tracedecay-ncm-worker"
+    manifest = root / "worker-manifest.json"
+    manifest_target = root / "worker-manifest-target.json"
+    output = root / "ncm-worker-symlink.tar.gz"
+    worker.write_bytes(WORKER_PAYLOAD)
+    worker.chmod(0o755)
+    manifest_target.write_bytes(WORKER_MANIFEST)
+    manifest.symlink_to(manifest_target)
+    command = [
+        "python3",
+        str(PACKAGER),
+        "--binary",
+        str(worker),
+        "--output",
+        str(output),
+        "--format",
+        "tar.gz",
+        "--entry-name",
+        "tracedecay-ncm-worker",
+        "--epoch",
+        str(EPOCH),
+        "--companion",
+        f"{manifest}=worker-manifest.json",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert completed.returncode != 0
+    assert "must not be a symlink" in completed.stderr
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as temp_name:
         temp = Path(temp_name)
@@ -171,6 +203,7 @@ def main() -> None:
         test_tar_gz(temp, binary)
         test_zip(temp, binary)
         test_ncm_worker_sidecar_archive(temp)
+        test_ncm_worker_manifest_symlink_is_rejected(temp)
     print("release archive packaging tests passed")
 
 

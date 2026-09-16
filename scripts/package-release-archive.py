@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import gzip
 import io
+import os
 import stat
 import tarfile
 import time
@@ -85,9 +87,28 @@ def write_zip(
 
 def read_entry(path: Path, entry_name: str, mode: int) -> tuple[str, bytes, int]:
     validate_entry_name(entry_name)
-    if not path.is_file():
-        raise FileNotFoundError(f"release input does not exist: {path}")
-    payload = path.read_bytes()
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"release input does not exist: {path}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"release input must not be a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise FileNotFoundError(f"release input is not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"release input must not be a symlink: {path}") from error
+        raise
+    try:
+        payload = b"".join(
+            iter(lambda: os.read(descriptor, 1024 * 1024), b"")
+        )
+    finally:
+        os.close(descriptor)
     if not payload:
         raise ValueError(f"release input is empty: {path}")
     return entry_name, payload, mode

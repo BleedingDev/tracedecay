@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,10 +30,12 @@ CHECKER_MODULE = load_checker()
 
 
 class NcmWorkerArtifactTest(unittest.TestCase):
-    def fixture(self, *, installed: bool = False) -> tuple[Path, Path, bytes, dict]:
+    def fixture(
+        self, *, installed: bool = False, data: bytes | None = None
+    ) -> tuple[Path, Path, bytes, dict]:
         root = Path(tempfile.mkdtemp(prefix="ncm-worker-trust-"))
         target = CHECKER_MODULE.current_worker_target()
-        data = b"fixture-worker\x00fastembed\x00onnxruntime"
+        data = data or b"fixture-worker\x00fastembed\x00onnxruntime"
         manifest = {
             "schema_version": CHECKER_MODULE.WORKER_MANIFEST_SCHEMA_VERSION,
             "worker": CHECKER_MODULE.WORKER_NAME,
@@ -102,6 +106,40 @@ class NcmWorkerArtifactTest(unittest.TestCase):
         binary.symlink_to(target)
         with self.assertRaisesRegex(CHECKER_MODULE.GateFailure, "must not be a symlink"):
             CHECKER_MODULE.verify_worker_artifact(binary, repo=root)
+
+    def test_symlink_sibling_manifest_is_rejected_before_artifact_use(self) -> None:
+        root, binary, data, manifest = self.fixture(installed=True)
+        sibling = binary.parent / "worker-manifest.json"
+        target = sibling.with_name("trusted-manifest.json")
+        target.write_text(json.dumps(manifest), encoding="utf-8")
+        sibling.unlink()
+        sibling.symlink_to(target)
+        with self.assertRaisesRegex(CHECKER_MODULE.GateFailure, "must not be a symlink"):
+            CHECKER_MODULE.verify_worker_artifact(binary, repo=root)
+
+    def test_symlink_trusted_manifest_is_rejected_before_artifact_use(self) -> None:
+        root, binary, _, manifest = self.fixture()
+        trusted = root / "product" / "ncm" / "reference" / "worker-manifest.json"
+        target = trusted.with_name("trusted-manifest-target.json")
+        target.write_text(json.dumps(manifest), encoding="utf-8")
+        trusted.unlink()
+        trusted.symlink_to(target)
+        with self.assertRaisesRegex(CHECKER_MODULE.GateFailure, "must not be a symlink"):
+            CHECKER_MODULE.verify_worker_artifact(binary, repo=root)
+
+    @unittest.skipUnless(os.name == "posix", "the replacement barrier uses a POSIX script")
+    def test_verified_worker_launch_uses_staged_bytes_after_source_replacement(self) -> None:
+        data = b"#!/bin/sh\n# fastembed onnxruntime\nprintf '%s' verified\n"
+        root, binary, _, _ = self.fixture(data=data)
+        artifact = CHECKER_MODULE.verify_worker_artifact(binary, repo=root)
+        staged = artifact.launch_path
+        binary.write_bytes(b"#!/bin/sh\nprintf '%s' replaced\n")
+        binary.chmod(binary.stat().st_mode | 0o111)
+        launched = subprocess.run([str(staged)], capture_output=True, check=False)
+        self.assertEqual(launched.returncode, 0, launched.stderr.decode())
+        self.assertEqual(launched.stdout, b"verified")
+        artifact.close()
+        self.assertFalse(staged.exists())
 
 
 if __name__ == "__main__":

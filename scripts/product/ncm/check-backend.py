@@ -10,16 +10,19 @@ machine-readable receipt even when a prerequisite blocks acceptance.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import stat
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Iterable
 
@@ -36,6 +39,45 @@ WORKER_PROTOCOL_IDENTITY = "tracedecay.ncm.worker.v1"
 
 class GateFailure(RuntimeError):
     """One backend acceptance assertion failed."""
+
+
+class VerifiedWorkerArtifact(dict[str, Any]):
+    """Own a private staged worker and its sibling manifest until launch ends."""
+
+    def __init__(
+        self,
+        receipt: dict[str, Any],
+        *,
+        source_path: Path,
+        launch_path: Path,
+        staging_dir: Path,
+    ) -> None:
+        super().__init__(receipt)
+        self.source_path = source_path
+        self.launch_path = launch_path
+        self.staging_dir = staging_dir
+        self._closed = False
+
+    def close(self) -> None:
+        """Remove the private staging directory after all child launches."""
+        if self._closed:
+            return
+        self._closed = True
+        shutil.rmtree(self.staging_dir, ignore_errors=True)
+
+    def __enter__(self) -> VerifiedWorkerArtifact:
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # The gate closes artifacts explicitly; this is only the failure-path
+        # backstop when an unexpected exception aborts the gate.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def canonical_json(value: Any) -> bytes:
@@ -150,9 +192,266 @@ def worker_manifest_path(path: Path) -> Path:
     so source and installed workers use the same sibling binding.
     """
     sibling = path.parent / "worker-manifest.json"
-    if sibling.is_file():
+    try:
+        metadata = sibling.lstat()
+    except FileNotFoundError as error:
+        raise GateFailure(f"worker manifest must be beside the worker: {sibling}") from error
+    except OSError as error:
+        raise GateFailure(f"inspect worker manifest {sibling}: {error}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise GateFailure(f"worker manifest must not be a symlink: {sibling}")
+    if stat.S_ISREG(metadata.st_mode):
         return sibling
-    raise GateFailure(f"worker manifest must be beside the worker: {sibling}")
+    raise GateFailure(f"worker manifest must be a regular file: {sibling}")
+
+
+def _open_regular_no_follow(path: Path, *, label: str) -> int:
+    """Open one regular file without following symlinks where supported."""
+    try:
+        path_metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise GateFailure(f"{label} is missing: {path}") from error
+    except OSError as error:
+        raise GateFailure(f"inspect {label} {path}: {error}") from error
+    if stat.S_ISLNK(path_metadata.st_mode):
+        raise GateFailure(f"{label} must not be a symlink: {path}")
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise GateFailure(f"{label} must be a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP or path.is_symlink():
+            raise GateFailure(f"{label} must not be a symlink: {path}") from error
+        raise GateFailure(f"read {label} {path}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise GateFailure(f"inspect {label} {path}: {error}") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise GateFailure(f"{label} must be a regular file: {path}")
+    return descriptor
+
+
+def _read_regular_no_follow(path: Path, *, label: str) -> bytes:
+    """Read one exact regular-file handle, rejecting symlink substitution."""
+    descriptor = _open_regular_no_follow(path, label=label)
+    try:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as error:
+        raise GateFailure(f"read {label} {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+
+
+def _read_worker_manifest(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
+    """Read a worker manifest and retain the exact bytes for staging."""
+    data = _read_regular_no_follow(path, label=f"{label} worker manifest")
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateFailure(f"read {label} worker manifest {path}: {error}") from error
+    require(isinstance(value, dict), f"{label} worker manifest is not an object")
+    return value, data
+
+
+def _private_staging_directory() -> Path:
+    """Create and validate one owner-private staging directory."""
+    directory = Path(tempfile.mkdtemp(prefix="tracedecay-ncm-worker-"))
+    try:
+        if os.name != "nt":
+            os.chmod(directory, 0o700)
+            metadata = directory.lstat()
+            require(
+                stat.S_IMODE(metadata.st_mode) == 0o700,
+                f"worker staging directory is not private: {directory}",
+            )
+            if hasattr(os, "geteuid"):
+                require(
+                    metadata.st_uid == os.geteuid(),
+                    f"worker staging directory is not owned by the current user: {directory}",
+                )
+        return directory
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def _write_private_file(directory: Path, name: str, payload: bytes, *, mode: int) -> Path:
+    """Create one private regular file with exact bytes and permissions."""
+    path = directory / name
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise GateFailure(f"worker staging file must not be a symlink: {path}") from error
+        raise GateFailure(f"create worker staging file {path}: {error}") from error
+    try:
+        offset = 0
+        while offset < len(payload):
+            try:
+                written = os.write(descriptor, payload[offset:])
+            except OSError as error:
+                raise GateFailure(f"write worker staging file {path}: {error}") from error
+            require(written > 0, f"write worker staging file made no progress: {path}")
+            offset += written
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, mode)
+        else:
+            os.chmod(path, mode)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode), f"worker staging file is not regular: {path}")
+        if os.name != "nt":
+            require(
+                stat.S_IMODE(metadata.st_mode) == mode,
+                f"worker staging file has unsafe permissions: {path}",
+            )
+    except OSError as error:
+        raise GateFailure(f"seal worker staging file {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _stage_worker_bytes(
+    source: Path,
+    target_pin: dict[str, Any],
+    manifest_bytes: bytes,
+    manifest_path: Path,
+    manifest_digest: str,
+) -> VerifiedWorkerArtifact:
+    """Hash source bytes once while copying them into a private launch root."""
+    source_descriptor = _open_regular_no_follow(source, label="worker artifact")
+    try:
+        staging_dir = _private_staging_directory()
+    except Exception:
+        os.close(source_descriptor)
+        raise
+    staged_path = staging_dir / WORKER_NAME
+    try:
+        try:
+            source_metadata = os.fstat(source_descriptor)
+            if os.name != "nt":
+                require(
+                    source_metadata.st_mode & 0o111,
+                    f"worker artifact is not executable: {source}",
+                )
+            require(
+                source_metadata.st_size == target_pin["bytes"],
+                f"worker artifact size mismatch: expected {target_pin['bytes']} bytes, got {source_metadata.st_size}",
+            )
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                staged_descriptor = os.open(staged_path, flags, 0o600)
+            except OSError as error:
+                if error.errno == errno.ELOOP:
+                    raise GateFailure(
+                        f"worker staging file must not be a symlink: {staged_path}"
+                    ) from error
+                raise GateFailure(f"create worker staging file {staged_path}: {error}") from error
+
+            digest = hashlib.sha256()
+            marker_tail = b""
+            marker_size = max(len(marker) for marker in REAL_ARTIFACT_MARKERS)
+            markers = {marker.decode(): False for marker in REAL_ARTIFACT_MARKERS}
+            bytes_read = 0
+            try:
+                while True:
+                    chunk = os.read(source_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    digest.update(chunk)
+                    marker_window = marker_tail + chunk
+                    for marker in REAL_ARTIFACT_MARKERS:
+                        if marker in marker_window:
+                            markers[marker.decode()] = True
+                    marker_tail = marker_window[-(marker_size - 1) :]
+                    offset = 0
+                    while offset < len(chunk):
+                        written = os.write(staged_descriptor, chunk[offset:])
+                        require(
+                            written > 0,
+                            f"write worker staging file made no progress: {staged_path}",
+                        )
+                        offset += written
+            except OSError as error:
+                raise GateFailure(f"copy worker artifact {source}: {error}") from error
+            finally:
+                try:
+                    if hasattr(os, "fchmod"):
+                        os.fchmod(staged_descriptor, 0o500)
+                    else:
+                        os.chmod(staged_path, 0o500)
+                    os.fsync(staged_descriptor)
+                finally:
+                    os.close(staged_descriptor)
+
+            require(
+                bytes_read == target_pin["bytes"],
+                f"worker artifact size mismatch: expected {target_pin['bytes']} bytes, got {bytes_read}",
+            )
+            source_final = os.fstat(source_descriptor)
+            require(
+                source_final.st_size == target_pin["bytes"],
+                f"worker artifact size changed while reading: expected {target_pin['bytes']} bytes, got {source_final.st_size}",
+            )
+            digest_hex = digest.hexdigest()
+            require(
+                digest_hex == target_pin["sha256"],
+                f"worker artifact digest mismatch: expected {target_pin['sha256']}, got {digest_hex}",
+            )
+            # chmod after the copy makes the staged launch pathname read/execute
+            # only; the directory remains owner-private and create-new prevents
+            # a replacement at that pathname.
+            staged_metadata = staged_path.lstat()
+            require(
+                stat.S_ISREG(staged_metadata.st_mode),
+                f"worker staging file is not regular: {staged_path}",
+            )
+            if os.name != "nt":
+                require(
+                    stat.S_IMODE(staged_metadata.st_mode) == 0o500,
+                    f"worker staging file has unsafe permissions: {staged_path}",
+                )
+            _write_private_file(staging_dir, "worker-manifest.json", manifest_bytes, mode=0o600)
+        finally:
+            os.close(source_descriptor)
+        receipt = {
+            "path": str(source),
+            "staged_path": str(staged_path),
+            "staged_manifest_path": str(staging_dir / "worker-manifest.json"),
+            "bytes": bytes_read,
+            "sha256": digest_hex,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": manifest_digest,
+            "target": target_pin["triple"],
+            "required_markers": markers,
+        }
+        return VerifiedWorkerArtifact(
+            receipt,
+            source_path=source,
+            launch_path=staged_path,
+            staging_dir=staging_dir,
+        )
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
 
 def validate_worker_manifest(manifest: dict[str, Any], *, target: tuple[str, str, str, str]) -> dict[str, Any]:
@@ -220,16 +519,11 @@ def validate_worker_manifest(manifest: dict[str, Any], *, target: tuple[str, str
 
 
 def read_worker_manifest(path: Path, *, label: str) -> dict[str, Any]:
-    """Read one strict worker manifest."""
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise GateFailure(f"read {label} worker manifest {path}: {error}") from error
-    require(isinstance(value, dict), f"{label} worker manifest is not an object")
-    return value
+    """Read one strict worker manifest through a no-follow file handle."""
+    return _read_worker_manifest(path, label=label)[0]
 
 
-def verify_worker_artifact(path: Path, *, repo: Path) -> dict[str, Any]:
+def verify_worker_artifact(path: Path, *, repo: Path) -> VerifiedWorkerArtifact:
     """Prove real native inference is linked into the worker artifact.
 
     The same artifact serves production and ``--test-double`` launches (task
@@ -237,14 +531,29 @@ def verify_worker_artifact(path: Path, *, repo: Path) -> dict[str, Any]:
     literal is necessarily present in the bytes. Which encoder is active is
     proven per launch by the handshake identity check in ``worker_identity``.
     """
-    require(not path.is_symlink(), f"worker artifact must not be a symlink: {path}")
-    require(path.is_file(), f"worker artifact missing: {path}")
     trusted_manifest_path = repo / "product" / "ncm" / "reference" / "worker-manifest.json"
-    require(trusted_manifest_path.is_file(), f"trusted worker manifest missing: {trusted_manifest_path}")
+    try:
+        trusted_manifest_metadata = trusted_manifest_path.lstat()
+    except FileNotFoundError as error:
+        raise GateFailure(f"trusted worker manifest missing: {trusted_manifest_path}") from error
+    except OSError as error:
+        raise GateFailure(f"inspect trusted worker manifest {trusted_manifest_path}: {error}") from error
+    require(
+        not stat.S_ISLNK(trusted_manifest_metadata.st_mode),
+        f"trusted worker manifest must not be a symlink: {trusted_manifest_path}",
+    )
+    require(
+        stat.S_ISREG(trusted_manifest_metadata.st_mode),
+        f"trusted worker manifest must be a regular file: {trusted_manifest_path}",
+    )
     target = current_worker_target()
-    trusted_manifest = read_worker_manifest(trusted_manifest_path, label="trusted")
+    trusted_manifest, _trusted_manifest_bytes = _read_worker_manifest(
+        trusted_manifest_path, label="trusted"
+    )
     selected_manifest_path = worker_manifest_path(path)
-    selected_manifest = read_worker_manifest(selected_manifest_path, label="selected")
+    selected_manifest, selected_manifest_bytes = _read_worker_manifest(
+        selected_manifest_path, label="selected"
+    )
     trusted_digest = sha256_bytes(canonical_json(trusted_manifest))
     selected_digest = sha256_bytes(canonical_json(selected_manifest))
     require(
@@ -253,24 +562,13 @@ def verify_worker_artifact(path: Path, *, repo: Path) -> dict[str, Any]:
     )
     target_pin = validate_worker_manifest(trusted_manifest, target=target)
     validate_worker_manifest(selected_manifest, target=target)
-    metadata = path.stat()
-    require((metadata.st_mode & 0o111) != 0, f"worker artifact is not executable: {path}")
-    require(metadata.st_size == target_pin["bytes"],
-            f"worker artifact size mismatch: expected {target_pin['bytes']} bytes, got {metadata.st_size}")
-    data = path.read_bytes()
-    digest = sha256_bytes(data)
-    require(digest == target_pin["sha256"],
-            f"worker artifact digest mismatch: expected {target_pin['sha256']}, got {digest}")
-    markers = {marker.decode(): marker in data for marker in REAL_ARTIFACT_MARKERS}
-    return {
-        "path": str(path),
-        "bytes": len(data),
-        "sha256": digest,
-        "manifest_path": str(selected_manifest_path),
-        "manifest_sha256": selected_digest,
-        "target": target_pin["triple"],
-        "required_markers": markers,
-    }
+    return _stage_worker_bytes(
+        path,
+        target_pin,
+        selected_manifest_bytes,
+        selected_manifest_path,
+        selected_digest,
+    )
 
 
 def model_snapshot(model_root: Path, manifest: dict[str, Any]) -> tuple[Path, str]:
@@ -498,7 +796,7 @@ fn adapter(worker: PathBuf, root: PathBuf) -> NcmProviderAdapter {
     let surface = RustNcmSurface::new(RustNcmConfig {
         worker_binary: worker,
         state_root: StateRoot::new(root).unwrap(),
-        worker_options: WorkerOptions { test_double: false, reconciliation_deadline: Duration::from_secs(30), ..WorkerOptions::default() },
+        worker_options: WorkerOptions { reconciliation_deadline: Duration::from_secs(30), ..WorkerOptions::default() },
     }).unwrap();
     NcmProviderAdapter::new(Arc::new(surface)).unwrap()
 }
@@ -897,7 +1195,7 @@ def main() -> int:
         "This is standalone backend evidence only; tasks 023-026 still gate host integration, Observer/active behavior, usefulness, packaging, and release.",
     ]
     populations: list[dict[str, Any]] = []
-    artifact: dict[str, Any] | None = None
+    artifact: VerifiedWorkerArtifact | None = None
     model: dict[str, Any] | None = None
     production_identity: dict[str, Any] | None = None
     test_double_identity: dict[str, Any] | None = None
@@ -934,8 +1232,8 @@ def main() -> int:
 
     cheap_groups = [
         ("core_no_default", ["cargo", "test", "--locked", "-p", "tracedecay-memory-ncm-core", "--no-default-features"]),
-        ("runtime_no_default", ["cargo", "test", "--locked", "-p", "tracedecay-memory-ncm-runtime", "--no-default-features"]),
-        ("adapter_rust_backend", ["cargo", "test", "--locked", "-p", "tracedecay-memory-provider-ncm", "--no-default-features", "--features", "rust-backend"]),
+        ("runtime_no_default", ["cargo", "test", "--locked", "-p", "tracedecay-memory-ncm-runtime", "--no-default-features", "--features", "test-transport"]),
+        ("adapter_rust_backend", ["cargo", "test", "--locked", "-p", "tracedecay-memory-provider-ncm", "--no-default-features", "--features", "rust-backend,test-transport"]),
     ]
     for name, command in cheap_groups:
         commands.append([*command, "--", "--list"])
@@ -972,12 +1270,12 @@ def main() -> int:
         empty_path = journey_root.parent / f"ncm-backend-empty-path-{os.getpid()}"
         try:
             production_identity = worker_identity(
-                Path(artifact["path"]), model_root, empty_path, test_double=False
+                artifact.launch_path, model_root, empty_path, test_double=False
             )
             test_double_root = journey_root.parent / f"ncm-backend-double-{os.getpid()}-{time.time_ns()}"
             test_double_root.mkdir(parents=True)
             test_double_identity = worker_identity(
-                Path(artifact["path"]), test_double_root, empty_path, test_double=True
+                artifact.launch_path, test_double_root, empty_path, test_double=True
             )
         except GateFailure as error:
             blockers.append(f"worker launch identity: {error}")
@@ -1000,7 +1298,7 @@ def main() -> int:
                 "adapter_real_encoder_population",
                 [
                     "cargo", "test", "--locked", "-p", "tracedecay-memory-provider-ncm",
-                    "--no-default-features", "--features", "rust-backend", "--test", "rust_backend_conformance",
+                    "--no-default-features", "--features", "rust-backend,test-transport", "--test", "rust_backend_conformance",
                     "enabled::real_encoder_process_population",
                 ],
                 ["--exact", "--ignored"],
@@ -1008,7 +1306,7 @@ def main() -> int:
         ]
         real_environment = environment.copy()
         real_environment["TRACEDECAY_NCM_REAL_MODEL_ROOT"] = str(model_root)
-        real_environment["TRACEDECAY_NCM_WORKER"] = str(worker_path(repo, production_environment))
+        real_environment["TRACEDECAY_NCM_WORKER"] = str(artifact.launch_path)
         for name, command, test_args in real_groups:
             commands.append([*command, "--", "--list"])
             commands.append([*command, "--", *(test_args or [])])
@@ -1028,9 +1326,12 @@ def main() -> int:
 
         try:
             prepare_isolated_root(model_root, journey_root)
-            journey = run_adapter_journey(repo, Path(artifact["path"]), journey_root, environment)
+            journey = run_adapter_journey(repo, artifact.launch_path, journey_root, environment)
         except (GateFailure, subprocess.TimeoutExpired) as error:
             blockers.append(f"real worker+adapter journey: {error}")
+
+    if artifact is not None:
+        artifact.close()
 
     status = "pass" if not blockers else "blocked"
     receipt = {
