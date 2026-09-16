@@ -18,6 +18,7 @@ all other current release targets must remain Native-only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Any
 
 REQUIRED_ROOT_FEATURES = {
     "full",
+    "production",
     "hotpath",
     "hotpath-alloc",
     "hotpath-cpu",
@@ -71,6 +73,7 @@ NCM_RUNTIME_POLICY = {
     "worker_distribution": "separate-sidecar",
     "worker_manifest": "product/ncm/reference/worker-manifest.json",
     "model_manifest": "product/ncm/reference/embedding-manifest.json",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
 }
 NCM_MODEL_CONTRACT = {
     "model": "paraphrase-multilingual-MiniLM-L12-v2",
@@ -80,6 +83,10 @@ NCM_MODEL_CONTRACT = {
     "pooling": "mean",
     "normalize": True,
 }
+NCM_MODEL_REVISION_PROVENANCE = (
+    "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+    "#/identities/model/revision"
+)
 NCM_MODEL_FILES = {
     "onnx/model.onnx",
     "tokenizer.json",
@@ -90,6 +97,7 @@ NCM_MODEL_FILES = {
 NCM_RELEASE_WORKFLOW_SNIPPETS = (
     "Build NCM worker sidecar",
     "cargo build -p tracedecay-memory-ncm-runtime --bin tracedecay-ncm-worker",
+    "--no-default-features --features real-encoder",
     "Package NCM worker sidecar",
     'manifest="product/ncm/reference/worker-manifest.json"',
     'test -x "$worker"',
@@ -97,12 +105,21 @@ NCM_RELEASE_WORKFLOW_SNIPPETS = (
     "--format tar.gz",
     "--entry-name tracedecay-ncm-worker",
     '--companion "$manifest=worker-manifest.json"',
+    'model_manifest="product/ncm/release/model-acquisition-manifest.json"',
+    '--companion "$model_manifest=model-acquisition-manifest.json"',
     "test -x verify-ncm-worker/tracedecay-ncm-worker",
     'cmp "$manifest" verify-ncm-worker/worker-manifest.json',
+    'cmp "$model_manifest" verify-ncm-worker/model-acquisition-manifest.json',
+    "test-verify-installed.py",
     'if len(payload) != target["bytes"]',
     "digest = hashlib.sha256(payload).hexdigest()",
     'if digest != target["sha256"]',
     'shasum -a 256 "$archive" > "$archive.sha256"',
+    "python3 .release-automation/scripts/product/ncm/verify-installed.py",
+    "--binary-archive",
+    '--worker-archive "$archive"',
+    "python3 .release-automation/scripts/product/ncm/check-backend.py",
+    "--install-model",
 )
 
 
@@ -312,12 +329,20 @@ def _require_ncm_runtime_policy(policy: dict[str, Any]) -> dict[str, Any]:
             )
     if policy.get("worker_manifest") != runtime_policy["worker_manifest"]:
         _ncm_failure("runtime_policy.worker_manifest differs from worker_manifest")
+    if policy.get("model_acquisition_manifest") != runtime_policy["model_acquisition_manifest"]:
+        _ncm_failure(
+            "runtime_policy.model_acquisition_manifest differs from the release model descriptor"
+        )
     packaging = policy.get("packaging")
     if not isinstance(packaging, dict):
         _ncm_failure("packaging must describe the worker artifact")
     if packaging.get("worker_distribution") != runtime_policy["worker_distribution"]:
         _ncm_failure(
             "packaging.worker_distribution must match runtime_policy.worker_distribution"
+        )
+    if packaging.get("model_acquisition_manifest_sidecar_required") is not True:
+        _ncm_failure(
+            "packaging must require the target-bound model acquisition manifest sidecar"
         )
     return runtime_policy
 
@@ -459,6 +484,8 @@ def _require_ncm_model_contract(
             _ncm_failure(
                 f"pinned model contract field {key} must be {expected!r}"
             )
+
+
     provenance = model_manifest.get("revision_provenance")
     if not isinstance(provenance, str) or not provenance.startswith("product/ncm/receipts/"):
         _ncm_failure("pinned model contract must include a receipt-backed revision provenance")
@@ -512,6 +539,116 @@ def _require_ncm_model_contract(
             _ncm_failure(
                 f"source-manifest.json model field {key} differs from the pinned model contract"
             )
+
+
+def _require_ncm_model_acquisition_contract(
+    acquisition_manifest: dict[str, Any],
+    embedding_manifest: dict[str, Any],
+    embedding_manifest_path: Path,
+) -> None:
+    """Keep the target-specific release descriptor tied to the model pin."""
+    expected = {
+        "schema_version": 1,
+        "manifest_type": "ncm-model-acquisition",
+        "provider_id": "ncm",
+        "worker": "tracedecay-ncm-worker",
+        "target": NCM_SUPPORTED_TARGET,
+        "release_name": NCM_SUPPORTED_RELEASE,
+        "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
+        "model_root": "models",
+        "cache_repository": "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2",
+        "model": NCM_MODEL_CONTRACT["model"],
+        "repository": NCM_MODEL_CONTRACT["repository"],
+        "revision": NCM_MODEL_CONTRACT["revision"],
+        "revision_provenance": NCM_MODEL_REVISION_PROVENANCE,
+        "max_length": NCM_MODEL_CONTRACT["max_length"],
+        "pooling": NCM_MODEL_CONTRACT["pooling"],
+        "normalize": NCM_MODEL_CONTRACT["normalize"],
+        "transport": "https",
+    }
+    for key, value in expected.items():
+        if acquisition_manifest.get(key) != value:
+            _ncm_failure(f"model acquisition manifest field {key} must be {value!r}")
+    try:
+        raw_embedding = embedding_manifest_path.read_bytes()
+    except OSError as error:
+        _ncm_failure(f"cannot read trusted embedding manifest for acquisition validation: {error}")
+    if acquisition_manifest.get("embedding_manifest_sha256") != hashlib.sha256(raw_embedding).hexdigest():
+        _ncm_failure(
+            "model acquisition manifest embedding_manifest_sha256 differs from the trusted embedding manifest"
+        )
+    files = acquisition_manifest.get("files")
+    if not isinstance(files, list) or len(files) != len(NCM_MODEL_FILES):
+        _ncm_failure("model acquisition manifest must pin exactly the required model files")
+    embedding_files = {
+        entry.get("path"): entry
+        for entry in embedding_manifest.get("files", [])
+        if isinstance(entry, dict)
+    }
+    seen: set[str] = set()
+    base_url = acquisition_manifest.get("base_url")
+    expected_base_url = (
+        "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+        f"{NCM_MODEL_CONTRACT['revision']}/"
+    )
+    if base_url != expected_base_url:
+        _ncm_failure(
+            "model acquisition manifest base_url must use the pinned HTTPS model host and revision"
+        )
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            _ncm_failure(f"model acquisition manifest files[{index}] must be an object")
+        path = entry.get("path")
+        if path not in NCM_MODEL_FILES or path in seen:
+            _ncm_failure(f"model acquisition manifest files[{index}] has an invalid or duplicate path")
+        seen.add(path)
+        byte_count = entry.get("bytes")
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count <= 0:
+            _ncm_failure(f"model acquisition manifest files[{index}].bytes must be positive")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            _ncm_failure(f"model acquisition manifest files[{index}].sha256 must be lowercase hexadecimal")
+        trusted = embedding_files.get(path)
+        if not isinstance(trusted, dict) or trusted.get("bytes") != byte_count or trusted.get("sha256") != digest:
+            _ncm_failure(f"model acquisition manifest file pin differs from embedding manifest for {path}")
+        if entry.get("url") != f"{base_url}{path}":
+            _ncm_failure(f"model acquisition manifest URL is not revision-bound for {path}")
+    if seen != NCM_MODEL_FILES:
+        _ncm_failure("model acquisition manifest file set differs from the embedding manifest")
+    transaction = acquisition_manifest.get("transaction")
+    if (
+        not isinstance(transaction, dict)
+        or transaction.get("version") != 1
+        or transaction.get("publication") != "atomic-directory-swap"
+        or transaction.get("journal") != "ncm-model-acquisition-v1.json"
+        or transaction.get("staging_prefix") != ".ncm-model-staging-"
+        or transaction.get("backup_prefix") != ".ncm-model-backup-"
+    ):
+        _ncm_failure("model acquisition manifest does not require atomic publication")
+    receipt = acquisition_manifest.get("receipt")
+    required_receipt_fields = {
+        "schema_version",
+        "operation_id",
+        "operation",
+        "outcome",
+        "target",
+        "model",
+        "repository",
+        "revision",
+        "manifest_sha256",
+        "files",
+        "created_at_unix",
+    }
+    receipt_fields = receipt.get("required_fields") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema_version") != 1
+        or receipt.get("relative_path") != "receipts/ncm-model-acquisition-v1.json"
+        or not isinstance(receipt_fields, list)
+        or not all(isinstance(field, str) for field in receipt_fields)
+        or not required_receipt_fields.issubset(set(receipt_fields))
+    ):
+        _ncm_failure("model acquisition manifest does not name the pinned receipt")
 
 
 def _require_ncm_runtime_features(
@@ -647,6 +784,7 @@ def validate_ncm_distribution_matrix(
     provider_manifest_path: Path,
     runtime_manifest_path: Path,
     source_manifest_path: Path | None = None,
+    model_acquisition_manifest_path: Path | None = None,
     release_workflow_paths: list[Path] | None = None,
 ) -> None:
     """Validate NCM's explicit sidecar/native-only distribution matrix.
@@ -685,6 +823,14 @@ def validate_ncm_distribution_matrix(
     _require_ncm_target_matrix(policy, release_target_manifest)
     _require_ncm_worker_artifact(policy, worker_manifest)
     _require_ncm_model_contract(model_manifest, source_manifest)
+    if model_acquisition_manifest_path is None:
+        _ncm_failure("supported NCM distribution has no model acquisition manifest")
+    acquisition_manifest = load_json(
+        model_acquisition_manifest_path, "NCM model acquisition manifest"
+    )
+    _require_ncm_model_acquisition_contract(
+        acquisition_manifest, model_manifest, model_manifest_path
+    )
     _require_ncm_runtime_features(
         root_manifest, provider_manifest, runtime_manifest, runtime_policy
     )
@@ -759,6 +905,9 @@ def main() -> int:
     ncm_policy = repo / "product/ncm/reference/worker-platforms.json"
     ncm_worker_manifest = repo / "product/ncm/reference/worker-manifest.json"
     ncm_model_manifest = repo / "product/ncm/reference/embedding-manifest.json"
+    ncm_model_acquisition_manifest = (
+        repo / "product/ncm/release/model-acquisition-manifest.json"
+    )
     ncm_release_targets = repo / ".github/release-targets.json"
     ncm_provider_manifest = repo / "crates/tracedecay-memory-provider-ncm/Cargo.toml"
     ncm_runtime_manifest = repo / "crates/tracedecay-memory-ncm-runtime/Cargo.toml"
@@ -787,6 +936,7 @@ def main() -> int:
     parser.add_argument("--ncm-platform-policy", type=Path)
     parser.add_argument("--ncm-worker-manifest", type=Path)
     parser.add_argument("--ncm-model-manifest", type=Path)
+    parser.add_argument("--ncm-model-acquisition-manifest", type=Path)
     parser.add_argument("--ncm-release-targets", type=Path)
     parser.add_argument("--ncm-provider-manifest", type=Path)
     parser.add_argument("--ncm-runtime-manifest", type=Path)
@@ -833,6 +983,14 @@ def main() -> int:
                 else ncm_source_manifest
                 if ncm_policy_path.resolve() == ncm_policy.resolve()
                 and ncm_source_manifest.exists()
+                else None
+            ),
+            model_acquisition_manifest_path=(
+                arguments.ncm_model_acquisition_manifest
+                if arguments.ncm_model_acquisition_manifest is not None
+                else ncm_model_acquisition_manifest
+                if ncm_policy_path.resolve() == ncm_policy.resolve()
+                and ncm_model_acquisition_manifest.exists()
                 else None
             ),
             release_workflow_paths=(

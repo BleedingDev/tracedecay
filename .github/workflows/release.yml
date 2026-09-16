@@ -197,6 +197,7 @@ jobs:
           python3 .release-automation/scripts/test-package-release-archive.py
           python3 .release-automation/scripts/test-plan-release-recovery.py
           python3 .release-automation/scripts/test-check-release-artifacts.py
+          python3 .release-automation/scripts/product/ncm/test-verify-installed.py
           bash .release-automation/scripts/test-check-distribution-clean-source.sh
           bash .release-automation/scripts/test-check-distribution-snapshot.sh
 
@@ -279,7 +280,7 @@ jobs:
 
       - name: Build NCM worker sidecar
         if: matrix.name == 'aarch64-macos'
-        run: cargo build -p tracedecay-memory-ncm-runtime --bin tracedecay-ncm-worker --release --target ${{ matrix.target }} --locked
+        run: cargo build -p tracedecay-memory-ncm-runtime --bin tracedecay-ncm-worker --release --target ${{ matrix.target }} --no-default-features --features real-encoder --locked
 
       - name: Install modern Bash for distribution acceptance
         if: runner.os == 'macOS'
@@ -393,21 +394,25 @@ jobs:
           set -euo pipefail
           worker="target/${{ matrix.target }}/release/tracedecay-ncm-worker"
           manifest="product/ncm/reference/worker-manifest.json"
+          model_manifest="product/ncm/release/model-acquisition-manifest.json"
           archive="tracedecay-ncm-worker-${{ steps.version.outputs.tag }}-${{ matrix.name }}.tar.gz"
           test -x "$worker"
           test -s "$manifest"
+          test -s "$model_manifest"
           python3 .release-automation/scripts/package-release-archive.py \
             --binary "$worker" \
             --output "$archive" \
             --format tar.gz \
             --entry-name tracedecay-ncm-worker \
             --epoch "${{ needs.validate-release.outputs.source_epoch }}" \
-            --companion "$manifest=worker-manifest.json"
+            --companion "$manifest=worker-manifest.json" \
+            --companion "$model_manifest=model-acquisition-manifest.json"
           rm -rf verify-ncm-worker
           mkdir verify-ncm-worker
           tar xzf "$archive" -C verify-ncm-worker
           test -x verify-ncm-worker/tracedecay-ncm-worker
           cmp "$manifest" verify-ncm-worker/worker-manifest.json
+          cmp "$model_manifest" verify-ncm-worker/model-acquisition-manifest.json
           python3 - "$manifest" "$worker" <<'PY'
           import hashlib
           import json
@@ -434,6 +439,17 @@ jobs:
               )
           PY
           shasum -a 256 "$archive" > "$archive.sha256"
+          python3 .release-automation/scripts/product/ncm/verify-installed.py \
+            --binary-archive "tracedecay-${{ steps.version.outputs.tag }}-${{ matrix.name }}.${{ matrix.archive }}" \
+            --worker-archive "$archive" \
+            --target "${{ matrix.target }}" \
+            --release-name "${{ matrix.name }}"
+          python3 .release-automation/scripts/product/ncm/check-backend.py \
+            --repo .release-automation \
+            --model-root "${RUNNER_TEMP}/ncm-release-model-root" \
+            --state-root "${RUNNER_TEMP}/ncm-release-state" \
+            --install-model \
+            --receipt-dir "${RUNNER_TEMP}/ncm-release-receipts"
 
       - name: Verify binary archive (unix)
         if: matrix.archive == 'tar.gz'
@@ -642,7 +658,8 @@ jobs:
             --binaries binaries \
             --mcpbs mcpbs \
             --sidecars ncm-workers \
-            --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json
+            --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json \
+            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json
           for bundle in mcpbs/*.mcpb; do
             platform="${bundle#mcpbs/tracedecay-"${TAG}"-}"
             platform="${platform%.mcpb}"
@@ -749,7 +766,8 @@ jobs:
             --binaries remote-assets/binaries \
             --mcpbs remote-assets/mcpbs \
             --sidecars remote-assets/ncm-workers \
-            --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json
+            --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json \
+            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json
           .release-automation/scripts/verify-retained-release-assets.sh \
             --tag "$TAG" \
             --repo "${{ github.repository }}" \

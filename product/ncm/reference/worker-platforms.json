@@ -4,6 +4,7 @@
   "worker": "tracedecay-ncm-worker",
   "policy": "pinned-artifact-only",
   "worker_manifest": "product/ncm/reference/worker-manifest.json",
+  "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
   "release_target_manifest": ".github/release-targets.json",
   "fallback": "native-only",
   "runtime_policy": {
@@ -13,12 +14,14 @@
     "runtime_feature": "real-encoder",
     "worker_distribution": "separate-sidecar",
     "worker_manifest": "product/ncm/reference/worker-manifest.json",
-    "model_manifest": "product/ncm/reference/embedding-manifest.json"
+    "model_manifest": "product/ncm/reference/embedding-manifest.json",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json"
   },
   "packaging": {
     "worker_distribution": "separate-sidecar",
     "standard_cli_archive_includes_worker": false,
-    "manifest_sidecar_required": true
+    "manifest_sidecar_required": true,
+    "model_acquisition_manifest_sidecar_required": true
   },
   "supported_targets": [
     {

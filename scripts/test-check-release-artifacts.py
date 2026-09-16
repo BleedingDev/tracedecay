@@ -46,6 +46,7 @@ NCM_TARGETS = {
                 "worker": "tracedecay-ncm-worker",
                 "archive": "tar.gz",
                 "manifest": "worker-manifest.json",
+                "model_manifest": "model-acquisition-manifest.json",
                 "checksum": "sha256",
             },
         },
@@ -63,10 +64,12 @@ NCM_POLICY = {
     "schema_version": 1,
     "provider_id": "ncm",
     "worker": "tracedecay-ncm-worker",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
     "packaging": {
         "worker_distribution": "separate-sidecar",
         "standard_cli_archive_includes_worker": False,
         "manifest_sidecar_required": True,
+        "model_acquisition_manifest_sidecar_required": True,
     },
     "release_targets": [
         {
@@ -114,6 +117,9 @@ def invoke(
         command.extend(["--sidecars", str(root / "sidecars")])
         command.extend(["--worker-platforms", str(root / "worker-platforms.json")])
         command.extend(["--worker-manifest", str(root / "worker-manifest.json")])
+        command.extend(
+            ["--model-acquisition-manifest", str(root / "model-acquisition-manifest.json")]
+        )
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -151,6 +157,108 @@ def write_sidecar(root: Path, profile: str = "stable") -> str:
     }
     manifest_path = root / "worker-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    model_manifest = {
+        "schema_version": 1,
+        "manifest_type": "ncm-model-acquisition",
+        "provider_id": "ncm",
+        "worker": "tracedecay-ncm-worker",
+        "target": "aarch64-apple-darwin",
+        "release_name": "aarch64-macos",
+        "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
+        "embedding_manifest_sha256": "40084ced45c8bc429e525f65ffbfec6dd4e9ded4267f1be8d092c499f2dcb328",
+        "model_root": "models",
+        "cache_repository": "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2",
+        "model": "paraphrase-multilingual-MiniLM-L12-v2",
+        "repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+        "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+        "revision_provenance": (
+            "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+            "#/identities/model/revision"
+        ),
+        "max_length": 128,
+        "pooling": "mean",
+        "normalize": True,
+        "transport": "https",
+        "base_url": (
+            "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+            "2c4055b12046f11709e9df2c122e59ffbdc2f900/"
+        ),
+        "files": [
+            {
+                "path": "onnx/model.onnx",
+                "url": (
+                    "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                    "2c4055b12046f11709e9df2c122e59ffbdc2f900/onnx/model.onnx"
+                ),
+                "bytes": 470268510,
+                "sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113",
+            },
+            {
+                "path": "tokenizer.json",
+                "url": (
+                    "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                    "2c4055b12046f11709e9df2c122e59ffbdc2f900/tokenizer.json"
+                ),
+                "bytes": 17082913,
+                "sha256": "b60b6b43406a48bf3638526314f3d232d97058bc93472ff2de930d43686fa441",
+            },
+            {
+                "path": "config.json",
+                "url": (
+                    "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                    "2c4055b12046f11709e9df2c122e59ffbdc2f900/config.json"
+                ),
+                "bytes": 673,
+                "sha256": "05b570bff786faa5c4604152aa16f19f77ed6dfc31e47dd0f3dd987078693ac7",
+            },
+            {
+                "path": "special_tokens_map.json",
+                "url": (
+                    "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                    "2c4055b12046f11709e9df2c122e59ffbdc2f900/special_tokens_map.json"
+                ),
+                "bytes": 280,
+                "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+            },
+            {
+                "path": "tokenizer_config.json",
+                "url": (
+                    "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                    "2c4055b12046f11709e9df2c122e59ffbdc2f900/tokenizer_config.json"
+                ),
+                "bytes": 496,
+                "sha256": "3f5961b9ac86288cccdb97f32fb848d6187c78e1603958c53f3ea1f296b7d8a2",
+            },
+        ],
+        "transaction": {
+            "version": 1,
+            "publication": "atomic-directory-swap",
+            "journal": "ncm-model-acquisition-v1.json",
+            "staging_prefix": ".ncm-model-staging-",
+            "backup_prefix": ".ncm-model-backup-",
+        },
+        "receipt": {
+            "schema_version": 1,
+            "relative_path": "receipts/ncm-model-acquisition-v1.json",
+            "required_fields": [
+                "schema_version",
+                "operation_id",
+                "operation",
+                "outcome",
+                "target",
+                "model",
+                "repository",
+                "revision",
+                "manifest_sha256",
+                "files",
+                "created_at_unix",
+            ],
+        },
+    }
+    model_manifest_path = root / "model-acquisition-manifest.json"
+    model_manifest_path.write_text(
+        json.dumps(model_manifest, indent=2) + "\n", encoding="utf-8"
+    )
     prefix = "tracedecay-ncm-worker-beta" if profile == "beta" else "tracedecay-ncm-worker"
     archive = f"{prefix}-v1.2.3-aarch64-macos.tar.gz"
     archive_path = sidecars / archive
@@ -168,6 +276,13 @@ def write_sidecar(root: Path, profile: str = "stable") -> str:
         manifest_info.mtime = 0
         manifest_info.size = len(manifest_bytes)
         bundle.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        model_bytes = model_manifest_path.read_bytes()
+        model_info = tarfile.TarInfo("model-acquisition-manifest.json")
+        model_info.mode = 0o644
+        model_info.uid = model_info.gid = 0
+        model_info.mtime = 0
+        model_info.size = len(model_bytes)
+        bundle.addfile(model_info, io.BytesIO(model_bytes))
     digest = hashlib.sha256((sidecars / archive).read_bytes()).hexdigest()
     (sidecars / f"{archive}.sha256").write_text(
         f"{digest}  {archive}\n", encoding="utf-8"

@@ -22,6 +22,7 @@ TARGETS = {
                 "worker": "tracedecay-ncm-worker",
                 "archive": "tar.gz",
                 "manifest": "worker-manifest.json",
+                "model_manifest": "model-acquisition-manifest.json",
                 "checksum": "sha256",
             },
         },
@@ -38,10 +39,12 @@ POLICY = {
     "schema_version": 1,
     "provider_id": "ncm",
     "worker": "tracedecay-ncm-worker",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
     "packaging": {
         "worker_distribution": "separate-sidecar",
         "standard_cli_archive_includes_worker": False,
         "manifest_sidecar_required": True,
+        "model_acquisition_manifest_sidecar_required": True,
     },
     "release_targets": [
         {

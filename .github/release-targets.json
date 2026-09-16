@@ -10,6 +10,7 @@
         "worker": "tracedecay-ncm-worker",
         "archive": "tar.gz",
         "manifest": "worker-manifest.json",
+        "model_manifest": "model-acquisition-manifest.json",
         "checksum": "sha256"
       }
     },

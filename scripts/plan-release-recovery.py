@@ -11,6 +11,7 @@ from typing import Any
 
 WORKER_POLICY_NAME = "tracedecay-ncm-worker"
 WORKER_MANIFEST_NAME = "worker-manifest.json"
+MODEL_ACQUISITION_MANIFEST_NAME = "model-acquisition-manifest.json"
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -58,6 +59,16 @@ def _validate_worker_platforms(
         raise SystemExit("NCM worker policy must keep the worker out of CLI archives")
     if packaging.get("manifest_sidecar_required") is not True:
         raise SystemExit("NCM worker policy requires a sidecar manifest")
+    if policy.get("model_acquisition_manifest") != (
+        "product/ncm/release/model-acquisition-manifest.json"
+    ):
+        raise SystemExit(
+            "NCM worker platform policy must name the pinned model acquisition manifest"
+        )
+    if packaging.get("model_acquisition_manifest_sidecar_required") is not True:
+        raise SystemExit(
+            "NCM worker policy requires a model acquisition manifest sidecar"
+        )
     rows = policy.get("release_targets")
     if not isinstance(rows, list) or not rows:
         raise SystemExit("NCM worker platform policy has no release target rows")
@@ -92,6 +103,12 @@ def _validate_worker_platforms(
             policy_manifest = policy.get("worker_manifest")
             if isinstance(policy_manifest, str) and Path(policy_manifest).name != sidecar.get("manifest"):
                 raise SystemExit(f"NCM sidecar manifest differs from policy for {name}")
+            policy_model_manifest = policy.get("model_acquisition_manifest")
+            if (
+                isinstance(policy_model_manifest, str)
+                and Path(policy_model_manifest).name != sidecar.get("model_manifest")
+            ):
+                raise SystemExit(f"NCM sidecar model manifest differs from policy for {name}")
         elif sidecar is not None:
             raise SystemExit(f"native-only target {name} must not publish an NCM sidecar")
 
@@ -107,7 +124,7 @@ def _validate_sidecar_metadata(target: dict[str, Any]) -> None:
         return
     if not isinstance(sidecar, dict):
         raise SystemExit(f"release target {target['name']} sidecar must be an object")
-    required = ("worker", "archive", "manifest", "checksum")
+    required = ("worker", "archive", "manifest", "model_manifest", "checksum")
     if any(not isinstance(sidecar.get(field), str) or not sidecar[field] for field in required):
         raise SystemExit(f"release target {target['name']} sidecar is missing metadata")
     if sidecar["archive"] != "tar.gz" or sidecar["checksum"] != "sha256":
@@ -116,6 +133,10 @@ def _validate_sidecar_metadata(target: dict[str, Any]) -> None:
         raise SystemExit(f"release target {target['name']} has an unsupported NCM worker")
     if sidecar["manifest"] != WORKER_MANIFEST_NAME:
         raise SystemExit(f"release target {target['name']} has an invalid NCM worker manifest")
+    if sidecar["model_manifest"] != MODEL_ACQUISITION_MANIFEST_NAME:
+        raise SystemExit(
+            f"release target {target['name']} has an invalid NCM model acquisition manifest"
+        )
     if status != "supported":
         raise SystemExit(f"release target {target['name']} sidecar is not supported by its NCM status")
 

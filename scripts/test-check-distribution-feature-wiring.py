@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -22,6 +23,7 @@ tracedecay-code-index = { version = "0.1.0" }
 tracedecay-application = { version = "0.1.0" }
 
 [features]
+production = []
 lite = ["tracedecay-code-index/lite", "tracedecay-code-index-runtime/lite"]
 medium = ["tracedecay-code-index/medium"]
 full = ["tracedecay-code-index/full", "tracedecay-code-index-runtime/full"]
@@ -179,6 +181,7 @@ NCM_POLICY = {
     "worker": "tracedecay-ncm-worker",
     "policy": "pinned-artifact-only",
     "worker_manifest": "product/ncm/reference/worker-manifest.json",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
     "release_target_manifest": ".github/release-targets.json",
     "fallback": "native-only",
     "runtime_policy": {
@@ -189,11 +192,13 @@ NCM_POLICY = {
         "worker_distribution": "separate-sidecar",
         "worker_manifest": "product/ncm/reference/worker-manifest.json",
         "model_manifest": "product/ncm/reference/embedding-manifest.json",
+        "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
     },
     "packaging": {
         "worker_distribution": "separate-sidecar",
         "standard_cli_archive_includes_worker": False,
         "manifest_sidecar_required": True,
+        "model_acquisition_manifest_sidecar_required": True,
     },
     "supported_targets": [
         {
@@ -252,7 +257,10 @@ NCM_MODEL_MANIFEST = {
     "model": "paraphrase-multilingual-MiniLM-L12-v2",
     "repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
     "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
-    "revision_provenance": "product/ncm/receipts/test.json#/identities/model/revision",
+    "revision_provenance": (
+        "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+        "#/identities/model/revision"
+    ),
     "files": [
         {"path": path, "sha256": "b" * 64, "bytes": 1}
         for path in (
@@ -266,6 +274,67 @@ NCM_MODEL_MANIFEST = {
     "max_length": 128,
     "pooling": "mean",
     "normalize": True,
+}
+
+NCM_MODEL_ACQUISITION_MANIFEST = {
+    "schema_version": 1,
+    "manifest_type": "ncm-model-acquisition",
+    "provider_id": "ncm",
+    "worker": "tracedecay-ncm-worker",
+    "target": "aarch64-apple-darwin",
+    "release_name": "aarch64-macos",
+    "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
+    "embedding_manifest_sha256": hashlib.sha256(
+        json.dumps(NCM_MODEL_MANIFEST).encode("utf-8")
+    ).hexdigest(),
+    "model_root": "models",
+    "cache_repository": "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2",
+    "model": "paraphrase-multilingual-MiniLM-L12-v2",
+    "repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+    "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+    "revision_provenance": NCM_MODEL_MANIFEST["revision_provenance"],
+    "max_length": 128,
+    "pooling": "mean",
+    "normalize": True,
+    "transport": "https",
+    "base_url": (
+        "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+        "2c4055b12046f11709e9df2c122e59ffbdc2f900/"
+    ),
+    "files": [
+        {
+            **entry,
+            "url": (
+                "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
+                f"2c4055b12046f11709e9df2c122e59ffbdc2f900/{entry['path']}"
+            ),
+        }
+        for entry in NCM_MODEL_MANIFEST["files"]
+    ],
+    "transaction": {
+        "version": 1,
+        "publication": "atomic-directory-swap",
+        "journal": "ncm-model-acquisition-v1.json",
+        "staging_prefix": ".ncm-model-staging-",
+        "backup_prefix": ".ncm-model-backup-",
+    },
+    "receipt": {
+        "schema_version": 1,
+        "relative_path": "receipts/ncm-model-acquisition-v1.json",
+        "required_fields": [
+            "schema_version",
+            "operation_id",
+            "operation",
+            "outcome",
+            "target",
+            "model",
+            "repository",
+            "revision",
+            "manifest_sha256",
+            "files",
+            "created_at_unix",
+        ],
+    },
 }
 
 NCM_RELEASE_TARGETS = {
@@ -303,6 +372,9 @@ def ncm_fixture() -> dict[str, object]:
         "policy.json": json.loads(json.dumps(NCM_POLICY)),
         "worker.json": json.loads(json.dumps(NCM_WORKER_MANIFEST)),
         "model.json": json.loads(json.dumps(NCM_MODEL_MANIFEST)),
+        "model-acquisition.json": json.loads(
+            json.dumps(NCM_MODEL_ACQUISITION_MANIFEST)
+        ),
         "release-targets.json": json.loads(json.dumps(NCM_RELEASE_TARGETS)),
         "provider.toml": NCM_PROVIDER_MANIFEST,
         "runtime.toml": NCM_RUNTIME_MANIFEST,
@@ -379,6 +451,8 @@ def run_fixture(
                     str(root / "worker.json"),
                     "--ncm-model-manifest",
                     str(root / "model.json"),
+                    "--ncm-model-acquisition-manifest",
+                    str(root / "model-acquisition.json"),
                     "--ncm-release-targets",
                     str(root / "release-targets.json"),
                     "--ncm-provider-manifest",
