@@ -2433,8 +2433,16 @@ fn assert_host_memory_journey_with_provider(
     assert_eq!(original_sources.len(), expected_source_count);
     let recalled = assert_recalled_session_messages(&journey, next_session, &original_sources);
     assert_eq!(
-        recalled.0, original.0,
-        "restart and session change must preserve the same four messages and their canonical source evidence"
+        recalled.0.len(),
+        original.0.len() + 1,
+        "restart recall must preserve the four hook messages and add the revisioned producer source"
+    );
+    assert!(
+        original
+            .0
+            .iter()
+            .all(|identity| recalled.0.contains(identity)),
+        "restart and session change must preserve every original hook message and its canonical source evidence"
     );
     assert_ne!(
         original.2, recalled.2,
