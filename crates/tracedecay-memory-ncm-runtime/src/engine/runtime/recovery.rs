@@ -762,7 +762,7 @@ pub(crate) fn replay_event(
     commit_seq: u64,
 ) -> Result<(), EngineReply> {
     match operation {
-        DurableOperation::CommonControl { operations } => {
+        DurableOperation::CommonControl { operations, .. } => {
             if event.kind != "common_control" {
                 return Err(corrupt_reply(
                     commit_seq,
@@ -929,7 +929,7 @@ fn operation_contains_revoked_observe(
     capsules: &[StoredCapsule],
 ) -> bool {
     match operation {
-        DurableOperation::CommonControl { operations } => operations
+        DurableOperation::CommonControl { operations, .. } => operations
             .iter()
             .any(|operation| operation_contains_revoked_observe(operation, capsules)),
         DurableOperation::Observe { record_id } => capsules.iter().any(|capsule| {
@@ -946,7 +946,7 @@ fn operation_contains_revoked_observe(
 
 fn operation_tick_delta(operation: &DurableOperation) -> u64 {
     match operation {
-        DurableOperation::CommonControl { operations } => {
+        DurableOperation::CommonControl { operations, .. } => {
             operations.iter().fold(0_u64, |total, operation| {
                 total.saturating_add(operation_tick_delta(operation))
             })

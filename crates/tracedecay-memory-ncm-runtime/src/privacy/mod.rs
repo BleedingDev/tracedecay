@@ -258,6 +258,7 @@ fn delete_sources_inner(
             steps_since_consolidation: live.scheduler.steps_since_consolidation,
         },
         &live,
+        None,
     ) {
         Ok(receipt) => receipt,
         Err(reply) => return reply,
@@ -535,6 +536,7 @@ fn finish_store_rebuild(
             deleted_record_ids,
         },
         &report.kernel,
+        Some(&idempotency_key),
     )?;
     let mut mutation = store
         .begin_mutation()
@@ -705,7 +707,7 @@ fn validate_checkpoint_anchor(
 
 fn operation_tick_delta(operation: &DurableOperation) -> u64 {
     match operation {
-        DurableOperation::CommonControl { operations } => {
+        DurableOperation::CommonControl { operations, .. } => {
             operations.iter().fold(0_u64, |total, operation| {
                 total.saturating_add(operation_tick_delta(operation))
             })
@@ -820,7 +822,7 @@ fn sanitized_replay(
             }
         }
         let operations = match durable.operation {
-            DurableOperation::CommonControl { operations } => operations,
+            DurableOperation::CommonControl { operations, .. } => operations,
             operation => vec![operation],
         };
         for operation in operations {
@@ -978,7 +980,7 @@ fn operation_contains_revoked_observe(
     by_record: &BTreeMap<RecordId, &StoredCapsule>,
 ) -> bool {
     match operation {
-        DurableOperation::CommonControl { operations } => operations
+        DurableOperation::CommonControl { operations, .. } => operations
             .iter()
             .any(|operation| operation_contains_revoked_observe(operation, by_record)),
         DurableOperation::Observe { record_id } => by_record
@@ -1288,9 +1290,7 @@ fn validate_completed_deletion_replay(
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let actual_revocation_sources = revocations
         .iter()
-        .filter(|revocation| {
-            revocation.epoch == *target_epoch && revocation.seq == fence_event.seq
-        })
+        .filter(|revocation| revocation.epoch == *target_epoch && revocation.seq == fence_event.seq)
         .map(|revocation| revocation.source_id.clone())
         .collect::<BTreeSet<_>>();
     if actual_revocation_sources != fence_sources.iter().cloned().collect::<BTreeSet<_>>() {
@@ -1363,6 +1363,7 @@ fn durable_receipt(
     reply: &EngineReply,
     operation: DurableOperation,
     kernel: &NcmKernel,
+    idempotency_key: Option<&str>,
 ) -> Result<String, EngineReply> {
     let state_digest = sha256_hex(&kernel.state_digest());
     let integrity_digest = durable_integrity_digest(&reply, &operation, &state_digest)
@@ -1372,6 +1373,7 @@ fn durable_receipt(
         operation,
         state_digest,
         integrity_digest,
+        idempotency_key: idempotency_key.map(str::to_owned),
     })
     .map_err(|error| {
         corrupt_reply(
