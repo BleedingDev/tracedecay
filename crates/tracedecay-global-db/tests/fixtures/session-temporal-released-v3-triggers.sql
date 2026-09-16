@@ -18,10 +18,8 @@
 -- everywhere else.
 --
 -- Loading this file converts a store created at the current contract into the
--- published v3 trigger shape. It is deliberately independent of the production
--- reconstruction in `released_v3_invariant_triggers_intact`: a test that
--- derived the released bodies from the current contract could not detect a
--- reconstruction that drifted from what shipped.
+-- published v3 trigger shape. It remains a byte-exact refusal fixture so the
+-- admission test can prove that no released trigger body is repaired in place.
 
 DROP TRIGGER IF EXISTS session_refresh_progress_insert_guard_v1;
 CREATE TRIGGER session_refresh_progress_insert_guard_v1

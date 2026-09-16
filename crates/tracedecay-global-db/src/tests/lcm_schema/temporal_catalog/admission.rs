@@ -102,14 +102,15 @@ async fn table_trigger_sql(conn: &Connection, table: &str) -> Vec<String> {
 /// them, extracted verbatim from the tagged source. The file header carries the
 /// tag-to-inventory table. Deriving these from the current contract instead
 /// would make the fixture agree with whatever
-/// `released_v3_invariant_triggers_intact` reconstructs, including a
-/// reconstruction that no release ever wrote to disk.
+/// The fixture is loaded verbatim so the refusal test proves that admission
+/// does not repair a trigger body that a released binary persisted.
 const RELEASED_V3_AUTHORITY_TRIGGERS_SQL: &str =
     include_str!("../../../../tests/fixtures/session-temporal-released-v3-triggers.sql");
 
-/// Rebuilds the two tables the v4 migration widened, and the three authority
-/// triggers whose bodies changed after v3, from their exact published
-/// definitions. Recreating the tables costs two statement parses; the
+/// Rebuilds the two tables whose definitions differ from the final contract,
+/// and the three authority triggers whose bodies changed after v3, from their
+/// exact published definitions. Recreating the tables costs two statement
+/// parses; the
 /// equivalent `DROP COLUMN` sequence reparses the whole 700-object schema
 /// several times per column, which under a full parallel test run exceeded the
 /// exact-SQL statement budget.
@@ -159,8 +160,7 @@ const RELEASED_V3_DRIFTED_TRIGGERS: [&str; 3] = [
 
 /// Seeds the retained user sessions and messages a reset would destroy.
 /// `session_messages` carries two of the three drifted authority triggers, so
-/// these rows also prove the migration replaces a trigger without touching the
-/// table under it.
+/// these rows also prove refusal does not touch the table under a trigger.
 async fn seed_retained_sessions_and_messages(db_path: &Path) {
     let raw_db = TestConnection::open(db_path);
     let conn = (*raw_db).clone();
@@ -182,7 +182,7 @@ async fn seed_retained_sessions_and_messages(db_path: &Path) {
              'keep my sessions', 'text', NULL, NULL,
              '/Users/mac/.claude/one.jsonl', 0, NULL),
             ('claude', 'mac-message-two', 'mac-session-one', 'assistant', 1002, 1,
-             'byte-exact after migration', 'text', 'claude-opus', 'Read,Edit',
+             'byte-exact after refusal', 'text', 'claude-opus', 'Read,Edit',
              '/Users/mac/.claude/one.jsonl', 512, '{\"turn\":1}'),
             ('cursor', 'mac-message-three', 'mac-session-two', 'user', 2001, 0,
              'second provider', NULL, NULL, NULL, NULL, NULL, NULL);",
@@ -595,273 +595,167 @@ async fn insert_seeded_active_released_v3_refresh_receipts(
     restore_schema_triggers(db_path, &triggers).await;
 }
 
-async fn projection_receipt_progress_counts(db_path: &Path) -> Vec<(i64, i64, i64, i64)> {
-    let raw_db = TestConnection::open(db_path);
-    let conn = (*raw_db).clone();
-    let mut rows = conn
-        .query(
-            "SELECT batch_ordinal, batch_item_count, committed_item_count,
-                    committed_copy_count
-             FROM session_temporal_projection_receipts
-             WHERE session_id = 'released-v3' AND generation = 2
-             ORDER BY batch_ordinal",
-            (),
-        )
-        .await
-        .unwrap();
-    let mut counts = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        counts.push((
-            row.get(0).unwrap(),
-            row.get(1).unwrap(),
-            row.get(2).unwrap(),
-            row.get(3).unwrap(),
-        ));
-    }
-    counts
-}
-
 #[tokio::test]
-async fn released_v3_temporal_receipts_migrate_to_v4_with_exact_progress_counts() {
+async fn released_v3_temporal_schema_requires_reset_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
     let db = open_global_db(&db_path)
         .await
         .expect("fresh initialization should install the final temporal schema");
     drop(db);
+    seed_retained_sessions_and_messages(&db_path).await;
+    let retained = retained_sessions_and_messages(&db_path).await;
+    assert_eq!(retained.len(), 5, "the fixture must seed sessions to retain");
     convert_final_temporal_schema_to_released_v3(&db_path).await;
-    insert_seeded_active_released_v3_refresh_receipts(&db_path, (8, 2, 2)).await;
 
-    let reopened = open_global_db(&db_path)
-        .await
-        .expect("the exact published v3 temporal shape should migrate atomically");
-    drop(reopened);
+    let before_catalog = temporal_schema_object_catalog(&db_path).await;
+    let before_projection_sql =
+        schema_object_sql(&db_path, "table", "session_temporal_projection_receipts").await;
+    let before_relation_sql =
+        schema_object_sql(&db_path, "table", "session_relation_receipts").await;
 
-    assert_eq!(temporal_schema_version(&db_path).await, 4);
+    let error = match open_global_db(&db_path).await {
+        Ok(_) => panic!("a released-v3 store must require reset"),
+        Err(error) => error,
+    };
+    let (authority, reason) = error
+        .reset_required_context()
+        .expect("released-v3 admission must return typed reset-required");
+    assert_eq!(authority, "session temporal");
+    assert!(reason.contains("version 3"), "unexpected reason: {reason}");
+    assert_eq!(temporal_schema_version(&db_path).await, 3);
     assert_eq!(
-        projection_receipt_progress_counts(&db_path).await,
-        [(0, 4, 9, 1), (1, 3, 12, 2)]
+        temporal_schema_object_catalog(&db_path).await,
+        before_catalog,
+        "reset-required admission must not mutate the temporal object catalog"
     );
-    assert!(
-        normalized_trigger_sql(&db_path, "session_refresh_progress_insert_guard_v1")
-            .await
-            .contains("new.committed_records=receipt.committed_item_count"),
-        "migration must install the v4 refresh accounting guard before commit"
+    assert_eq!(
+        schema_object_sql(&db_path, "table", "session_temporal_projection_receipts").await,
+        before_projection_sql,
+        "reset-required admission must preserve the released projection table bytes"
     );
-    assert!(
-        schema_object_exists(
-            &db_path,
-            "trigger",
-            "session_temporal_projection_receipts_immutable_update_v1"
-        )
-        .await,
-        "migration must restore projection receipt immutability before commit"
+    assert_eq!(
+        schema_object_sql(&db_path, "table", "session_relation_receipts").await,
+        before_relation_sql,
+        "reset-required admission must preserve the released relation table bytes"
+    );
+    assert_eq!(
+        retained_sessions_and_messages(&db_path).await,
+        retained,
+        "reset-required admission must preserve retained session data"
     );
 }
 
-/// A profile written by a released v3 binary carries the authority triggers
-/// that release published, not the bodies the tip contracts. Triggers are
-/// derived objects holding no data, so admission must classify the store as the
-/// shipped v3 shape and the migration must replace them — a reset would destroy
-/// the operator's sessions over a trigger body.
 #[tokio::test]
-async fn published_v3_authority_triggers_migrate_and_retain_every_session() {
+async fn published_v3_authority_triggers_require_reset_without_repair() {
     let tmp = TempDir::new().unwrap();
-    let fresh_path = tmp.path().join(".tracedecay").join("fresh.db");
-    let db = open_global_db(&fresh_path)
+    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
+    let db = open_global_db(&db_path)
         .await
         .expect("fresh initialization should install the final temporal schema");
     drop(db);
-    let fresh_catalog = temporal_schema_object_catalog(&fresh_path).await;
-    let mut current_drifted = Vec::new();
-    for trigger in RELEASED_V3_DRIFTED_TRIGGERS {
-        current_drifted.push(normalized_trigger_sql(&fresh_path, trigger).await);
-    }
-
-    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
-    let db = open_global_db(&db_path).await.unwrap();
-    drop(db);
     seed_retained_sessions_and_messages(&db_path).await;
     let retained = retained_sessions_and_messages(&db_path).await;
-    assert_eq!(
-        retained.len(),
-        5,
-        "the fixture must seed sessions to retain"
-    );
     convert_final_temporal_schema_to_released_v3(&db_path).await;
-    insert_seeded_active_released_v3_refresh_receipts(&db_path, (8, 2, 2)).await;
 
     let mut published_drifted = Vec::new();
     for trigger in RELEASED_V3_DRIFTED_TRIGGERS {
         published_drifted.push(normalized_trigger_sql(&db_path, trigger).await);
     }
-    assert!(
-        published_drifted
-            .iter()
-            .zip(&current_drifted)
-            .all(|(published, current)| published != current),
-        "the fixture must present the published bodies, not the current contract"
+    let before_catalog = temporal_schema_object_catalog(&db_path).await;
+
+    let error = match open_global_db(&db_path).await {
+        Ok(_) => panic!("a store carrying published v3 triggers must require reset"),
+        Err(error) => error,
+    };
+    let (authority, reason) = error
+        .reset_required_context()
+        .expect("released-v3 admission must return typed reset-required");
+    assert_eq!(authority, "session temporal");
+    assert!(reason.contains("version 3"), "unexpected reason: {reason}");
+    assert_eq!(temporal_schema_version(&db_path).await, 3);
+    assert_eq!(
+        temporal_schema_object_catalog(&db_path).await,
+        before_catalog,
+        "reset-required admission must not rewrite published trigger objects"
     );
-
-    let reopened = open_global_db(&db_path)
-        .await
-        .expect("a store carrying the published v3 triggers must migrate, not reset");
-    drop(reopened);
-
-    // Admission's own `authority_invariant_triggers_intact` gate runs inside
-    // the migration transaction, so a successful open already proves all
-    // eighty-one triggers converged; these read back the three that drifted.
-    assert_eq!(temporal_schema_version(&db_path).await, 4);
-    for (trigger, current) in RELEASED_V3_DRIFTED_TRIGGERS.iter().zip(&current_drifted) {
+    for (trigger, published) in RELEASED_V3_DRIFTED_TRIGGERS.iter().zip(&published_drifted) {
         assert_eq!(
-            &normalized_trigger_sql(&db_path, trigger).await,
-            current,
-            "the migration must leave '{trigger}' at the current contract"
+            normalized_trigger_sql(&db_path, trigger).await,
+            *published,
+            "reset-required admission must not repair published trigger '{trigger}'"
         );
     }
     assert_eq!(
-        temporal_schema_object_catalog(&db_path).await,
-        fresh_catalog,
-        "a migrated store must carry exactly the fresh store's temporal objects"
-    );
-    assert_eq!(
         retained_sessions_and_messages(&db_path).await,
         retained,
-        "every retained session and message row must survive byte-exact"
-    );
-    assert_eq!(
-        projection_receipt_progress_counts(&db_path).await,
-        [(0, 4, 9, 1), (1, 3, 12, 2)]
-    );
-
-    let restart_path = tmp.path().join(".tracedecay").join("restart.db");
-    copy_database_for_temporal_restart(&db_path, &restart_path).await;
-    let reopened = open_global_db(&restart_path)
-        .await
-        .expect("a migrated store must reopen as exactly current");
-    drop(reopened);
-    assert_eq!(temporal_schema_version(&restart_path).await, 4);
-    assert_eq!(
-        temporal_schema_object_catalog(&restart_path).await,
-        fresh_catalog,
-        "the second open must be a no-op on the schema"
-    );
-    assert_eq!(
-        retained_sessions_and_messages(&restart_path).await,
-        retained
-    );
-    assert_eq!(
-        projection_receipt_progress_counts(&restart_path).await,
-        [(0, 4, 9, 1), (1, 3, 12, 2)]
+        "reset-required admission must preserve retained session data"
     );
 }
 
 #[tokio::test]
-async fn v4_receipts_without_recovery_columns_migrate_in_place_and_reopen() {
+async fn v4_receipts_without_recovery_columns_require_reset_without_mutation() {
     let tmp = TempDir::new().unwrap();
-    let fresh_path = tmp.path().join(".tracedecay").join("fresh.db");
-    let db = open_global_db(&fresh_path)
+    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
+    let db = open_global_db(&db_path)
         .await
         .expect("fresh initialization should install the final temporal schema");
     drop(db);
-    let fresh_catalog = temporal_schema_object_catalog(&fresh_path).await;
-
-    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
-    let db = open_global_db(&db_path).await.unwrap();
-    drop(db);
     convert_final_temporal_schema_to_v4_without_receipt_recovery(&db_path).await;
-    assert_eq!(
-        persisted_column_names(&db_path, "session_relation_receipts").await,
-        SESSION_RELATION_RECEIPT_COLUMNS_WITHOUT_RECOVERY
+    let before_columns = persisted_column_names(&db_path, "session_relation_receipts").await;
+    let before_sql = schema_object_sql(&db_path, "table", "session_relation_receipts").await;
+    let before_catalog = temporal_schema_object_catalog(&db_path).await;
+    let before_receipts = retained_relation_receipts(&db_path).await;
+    let before_effect_journal_count = row_count(&db_path, "session_relation_effect_journal").await;
+
+    assert_eq!(before_columns, SESSION_RELATION_RECEIPT_COLUMNS_WITHOUT_RECOVERY);
+    assert_eq!(temporal_schema_version(&db_path).await, 4);
+
+    let error = match open_global_db(&db_path).await {
+        Ok(_) => panic!("a v4 store without recovery columns must require reset"),
+        Err(error) => error,
+    };
+    let (authority, reason) = error
+        .reset_required_context()
+        .expect("missing recovery columns must return typed reset-required");
+    assert_eq!(authority, "session temporal");
+    assert!(
+        reason.contains("session_relation_receipts"),
+        "unexpected reason: {reason}"
     );
     assert_eq!(temporal_schema_version(&db_path).await, 4);
-
-    let reopened = open_global_db(&db_path)
-        .await
-        .expect("the exact pre-recovery v4 receipt shape should migrate in place");
-    drop(reopened);
-
-    assert_eq!(temporal_schema_version(&db_path).await, 4);
     assert_eq!(
         persisted_column_names(&db_path, "session_relation_receipts").await,
-        [
-            "session_id",
-            "generation",
-            "scope_kind",
-            "scope_id",
-            "expected_graph_watermark",
-            "state",
-            "graph_watermark",
-            "created_at",
-            "applied_at",
-            "recovery_state",
-            "recovery_failure_code",
-            "recovery_failure_count",
-            "recovery_next_attempt_at",
-        ]
+        before_columns,
+        "reset-required admission must preserve the pre-recovery columns"
+    );
+    assert_eq!(
+        schema_object_sql(&db_path, "table", "session_relation_receipts").await,
+        before_sql,
+        "reset-required admission must preserve the pre-recovery table bytes"
     );
     assert_eq!(
         temporal_schema_object_catalog(&db_path).await,
-        fresh_catalog,
-        "a migrated store must carry exactly the fresh store's temporal objects"
+        before_catalog,
+        "reset-required admission must not mutate the temporal object catalog"
     );
     assert_eq!(
         retained_relation_receipts(&db_path).await,
-        expected_retained_relation_receipts()
+        before_receipts,
+        "reset-required admission must preserve relation receipts"
     );
     assert_eq!(
         row_count(&db_path, "session_relation_effect_journal").await,
-        1
+        before_effect_journal_count
     );
-
-    let raw_db = TestConnection::open(&db_path);
-    let conn = (*raw_db).clone();
-    let mut rows = conn
-        .query(
-            "SELECT generation, recovery_state, recovery_failure_code,
-                    recovery_failure_count, recovery_next_attempt_at
-             FROM session_relation_receipts ORDER BY generation",
-            (),
+    assert!(
+        !schema_object_exists(
+            &db_path,
+            "index",
+            "idx_session_relation_receipts_recovery_due"
         )
-        .await
-        .unwrap();
-    let mut recovery = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        recovery.push((
-            row.get::<i64>(0).unwrap(),
-            row.get::<String>(1).unwrap(),
-            row.get::<Option<String>>(2).unwrap(),
-            row.get::<i64>(3).unwrap(),
-            row.get::<i64>(4).unwrap(),
-        ));
-    }
-    drop(rows);
-    drop(conn);
-    drop(raw_db);
-    assert_eq!(
-        recovery,
-        [
-            (1, "pending".to_string(), None, 0, 0),
-            (2, "pending".to_string(), None, 0, 0),
-        ],
-        "retained receipts must take the contract's recovery defaults"
-    );
-
-    let migrated_catalog = temporal_schema_object_catalog(&db_path).await;
-    let restart_path = tmp.path().join(".tracedecay").join("restart.db");
-    copy_database_for_temporal_restart(&db_path, &restart_path).await;
-    let reopened = open_global_db(&restart_path)
-        .await
-        .expect("a migrated store must reopen as exactly current");
-    drop(reopened);
-    assert_eq!(temporal_schema_version(&restart_path).await, 4);
-    assert_eq!(
-        temporal_schema_object_catalog(&restart_path).await,
-        migrated_catalog
-    );
-    assert_eq!(
-        retained_relation_receipts(&restart_path).await,
-        expected_retained_relation_receipts()
+        .await,
+        "reset-required admission must not add the recovery index"
     );
 }
 
@@ -1088,7 +982,7 @@ async fn unbound_released_v3_receipts_are_refused_without_fabricated_batch_count
 }
 
 #[tokio::test]
-async fn valid_watermarks_unbound_released_v3_receipts_refuse_duplicate_batch_semantics() {
+async fn valid_watermarks_unbound_released_v3_receipts_require_reset() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
     let db = open_global_db(&db_path).await.unwrap();
@@ -1126,7 +1020,7 @@ async fn valid_watermarks_unbound_released_v3_receipts_refuse_duplicate_batch_se
     };
     let (authority, reason) = error.reset_required_context().unwrap();
     assert_eq!(authority, "session temporal");
-    assert!(reason.contains("unbound or ambiguous"));
+    assert!(reason.contains("version 3"), "unexpected reason: {reason}");
     assert_eq!(temporal_schema_version(&db_path).await, 3);
     assert!(
         !persisted_column_names(&db_path, "session_temporal_projection_receipts")
@@ -1137,7 +1031,7 @@ async fn valid_watermarks_unbound_released_v3_receipts_refuse_duplicate_batch_se
 }
 
 #[tokio::test]
-async fn ambiguous_released_v3_refresh_progress_rolls_back_without_batch_counts() {
+async fn ambiguous_released_v3_refresh_progress_requires_reset() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
     let db = open_global_db(&db_path).await.unwrap();
@@ -1167,7 +1061,7 @@ async fn ambiguous_released_v3_refresh_progress_rolls_back_without_batch_counts(
     };
     let (authority, reason) = error.reset_required_context().unwrap();
     assert_eq!(authority, "session temporal");
-    assert!(reason.contains("unbound or ambiguous"));
+    assert!(reason.contains("version 3"), "unexpected reason: {reason}");
     assert_eq!(temporal_schema_version(&db_path).await, 3);
     assert!(
         !persisted_column_names(&db_path, "session_temporal_projection_receipts")
@@ -1178,7 +1072,7 @@ async fn ambiguous_released_v3_refresh_progress_rolls_back_without_batch_counts(
 }
 
 #[tokio::test]
-async fn non_monotonic_released_v3_receipts_roll_back_the_v4_migration() {
+async fn non_monotonic_released_v3_receipts_require_reset() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
     let db = open_global_db(&db_path)
@@ -1189,7 +1083,7 @@ async fn non_monotonic_released_v3_receipts_roll_back_the_v4_migration() {
     insert_seeded_active_released_v3_refresh_receipts(&db_path, (1, 1, 1)).await;
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("non-monotonic released-v3 receipts must not migrate"),
+        Ok(_) => panic!("non-monotonic released-v3 receipts must require reset"),
         Err(error) => error,
     };
     let (authority, reason) = error
@@ -1197,7 +1091,7 @@ async fn non_monotonic_released_v3_receipts_roll_back_the_v4_migration() {
         .expect("invalid released-v3 progress must return typed reset-required");
     assert_eq!(authority, "session temporal");
     assert!(
-        reason.contains("non-monotonic"),
+        reason.contains("version 3"),
         "unexpected reason: {reason}"
     );
     assert_eq!(temporal_schema_version(&db_path).await, 3);
