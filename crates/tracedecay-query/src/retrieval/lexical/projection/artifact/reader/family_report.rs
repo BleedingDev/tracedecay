@@ -37,7 +37,8 @@ struct CloneFamilyCursorPositionV1 {
     /// A bounded family scan resumes after this whole family key. It is
     /// present only when the posting-row bound made the page partial; the
     /// ranking fields above remain populated for diagnostics and stable
-    /// cursor inspection, but are not used to seek a scan cursor.
+    /// cursor inspection; when a pending family is carried, they also hold
+    /// that family's aggregate state while `scan_after` remains the seek key.
     #[serde(default)]
     scan_after: Option<CloneExactKeyV1>,
     /// If the posting-row budget stopped inside `scan_after`, this is the
@@ -67,11 +68,9 @@ impl CloneFamilyCursorV1 {
             .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
     }
 
-    fn from_authenticated(
-        cursor: super::CloneFamilyCursorV2,
-    ) -> Result<Self, CloneCursorErrorV1> {
-        let member_count = usize::try_from(cursor.after.member_count)
-            .map_err(|_| CloneCursorErrorV1::Invalid)?;
+    fn from_authenticated(cursor: super::CloneFamilyCursorV2) -> Result<Self, CloneCursorErrorV1> {
+        let member_count =
+            usize::try_from(cursor.after.member_count).map_err(|_| CloneCursorErrorV1::Invalid)?;
         Ok(Self {
             artifact_digest: cursor.artifact_digest,
             generation: cursor.generation,
@@ -226,6 +225,7 @@ fn family_scan_cursor_position(
     scan_after_occurrence: Option<SymbolOccurrenceId>,
     partial_family: Option<&CloneFamilyAggregateV1>,
 ) -> CloneFamilyCursorPositionV1 {
+    let state_key = partial_family.map_or(key, |family| &family.key);
     CloneFamilyCursorPositionV1 {
         reviewable_source_bytes: partial_family
             .map(|family| family.reviewable_source_bytes)
@@ -233,9 +233,9 @@ fn family_scan_cursor_position(
         member_count: partial_family
             .map(|family| family.member_count)
             .unwrap_or_default(),
-        class: key.class,
-        normalization_revision: key.normalization_revision,
-        digest: key.digest.clone(),
+        class: state_key.class,
+        normalization_revision: state_key.normalization_revision,
+        digest: state_key.digest.clone(),
         scan_after: Some(key.clone()),
         scan_after_occurrence,
         minimum_source_bytes: partial_family
@@ -251,8 +251,13 @@ fn family_scan_cursor_position(
 fn family_from_scan_cursor(
     position: &CloneFamilyCursorPositionV1,
 ) -> Option<CloneFamilyAggregateV1> {
-    let key = position.scan_after.as_ref()?.clone();
+    position.scan_after.as_ref()?;
     let representative = position.representative.clone()?;
+    let key = CloneExactKeyV1 {
+        class: position.class,
+        normalization_revision: position.normalization_revision,
+        digest: position.digest.clone(),
+    };
     let member_count = position.member_count;
     let minimum_source_bytes = position.minimum_source_bytes;
     let total_source_bytes = position
@@ -448,8 +453,8 @@ impl CodeLexicalArtifactReaderV1 {
                         OR (posting.class = :scan_after_class \
                             AND posting.normalization_revision = :scan_after_revision \
                             AND posting.digest = :scan_after_digest \
-                            AND (NOT :has_scan_after_occurrence \
-                                 OR posting.symbol_occurrence_id > :scan_after_occurrence))) \
+                            AND :has_scan_after_occurrence \
+                            AND posting.symbol_occurrence_id > :scan_after_occurrence)) \
                  ORDER BY posting.class, posting.normalization_revision, posting.digest, \
                           posting.symbol_occurrence_id \
                  LIMIT :fetch",
@@ -620,7 +625,23 @@ impl CodeLexicalArtifactReaderV1 {
             .collect::<Result<Vec<_>, CodeLexicalArtifactErrorV1>>()?;
 
         let next_cursor = if has_page_overflow {
-            families.last().map(|family| family.continuation.clone())
+            if scan_truncated
+                && let (Some(family), Some(partial_family)) =
+                    (families.last(), partial_family.as_ref())
+            {
+                let after = family_scan_cursor_position(&family.key, None, Some(partial_family));
+                Some(
+                    CloneFamilyCursorV1 {
+                        artifact_digest: self.receipt.artifact_digest().clone(),
+                        generation: self.metadata.generation.clone(),
+                        request_digest: request_digest.clone(),
+                        after,
+                    }
+                    .encode()?,
+                )
+            } else {
+                families.last().map(|family| family.continuation.clone())
+            }
         } else if scan_truncated {
             scan_advance_key
                 .as_ref()
@@ -831,7 +852,7 @@ mod tests {
             artifact_digest: digest("artifact"),
             generation: id("generation.clone-family"),
             request_digest: digest("request"),
-        after: family_scan_cursor_position(&family_key, None, None),
+            after: family_scan_cursor_position(&family_key, None, None),
         };
 
         let encoded = cursor.encode().expect("encode family cursor");
@@ -839,6 +860,25 @@ mod tests {
 
         assert_eq!(decoded, cursor);
         assert_eq!(decoded.after.scan_after.as_ref(), Some(&family_key));
+    }
+
+    #[test]
+    fn scan_cursor_keeps_scan_boundary_and_pending_family_state_separate() {
+        let boundary_key = key(CloneNormalizationClassV1::Conservative, 1, "boundary");
+        let pending_key = key(CloneNormalizationClassV1::Rename, 2, "pending");
+        let mut pending =
+            CloneFamilyAggregateV1::new(pending_key.clone(), id("symbol.pending.02"), 20, false);
+        pending.push(id("symbol.pending.01"), 35, false);
+
+        let position = family_scan_cursor_position(&boundary_key, None, Some(&pending));
+        assert_eq!(position.scan_after.as_ref(), Some(&boundary_key));
+        assert_eq!(position.class, pending_key.class);
+        assert_eq!(
+            position.normalization_revision,
+            pending_key.normalization_revision
+        );
+        assert_eq!(position.digest, pending_key.digest);
+        assert_eq!(family_from_scan_cursor(&position), Some(pending));
     }
 
     #[test]
