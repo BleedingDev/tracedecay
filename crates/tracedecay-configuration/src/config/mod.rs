@@ -14,7 +14,7 @@ pub mod work_executable_binding;
 pub use tracedecay_domain::configuration::{
     MemoryProviderNcmObserverV1, MemoryProviderRecallDegradationCauseV1,
     MemoryProviderRecallDegradationV1, MemoryProviderRecallFallbackV1,
-    MemoryProviderRecallRoutingV1, SEMANTIC_RUNTIME_SETTING_KEY,
+    MemoryProviderRecallRoutingV1,
 };
 pub use tracedecay_global_db::configuration::{registry, resolver};
 #[cfg(test)]
@@ -37,7 +37,6 @@ use tracedecay_domain::configuration::{
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_global_db::configuration::contracts::ConfigurationCurrentStateV1;
-use tracedecay_semantic_contracts::SemanticConfig;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeTraceDecayConfig {
@@ -52,7 +51,6 @@ pub struct RuntimeTraceDecayConfig {
     pub memory_provider_native_enabled: bool,
     pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
-    pub semantic: SemanticConfig,
     pub sync: RuntimeSyncConfig,
     pub telemetry: RuntimeTelemetryConfig,
 }
@@ -71,7 +69,6 @@ impl Default for RuntimeTraceDecayConfig {
             memory_provider_native_enabled: false,
             memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
-            semantic: SemanticConfig::default(),
             sync: RuntimeSyncConfig::default(),
             telemetry: RuntimeTelemetryConfig::default(),
         }
@@ -263,7 +260,6 @@ fn runtime_config_from_snapshot(
         )?,
         memory_provider_ncm_observer: memory_provider_ncm_observer_from_snapshot(snapshot)?,
         memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
-        semantic: semantic_config_from_snapshot(snapshot)?,
         sync: RuntimeSyncConfig {
             auto_track_pr_branches: required_bool(
                 snapshot,
@@ -278,24 +274,6 @@ fn runtime_config_from_snapshot(
             timings: required_bool(snapshot, TELEMETRY_TIMINGS_SETTING_KEY)?,
         },
     })
-}
-
-fn semantic_config_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<SemanticConfig> {
-    let semantic = match optional_text_setting(snapshot, SEMANTIC_RUNTIME_SETTING_KEY)? {
-        None => SemanticConfig::default(),
-        Some(value) => serde_json::from_str(value).map_err(|error| {
-            config_error(format!(
-                "resolved semantic runtime setting is invalid: {error}"
-            ))
-        })?,
-    };
-    // Structural only: this crate is catalog-free. Membership of
-    // `selected_model` is admitted at the configuration write boundary and
-    // again by the lifecycle owner on selection, so a persisted id the
-    // catalog no longer serves degrades semantics without blocking exact,
-    // lexical, or graph retrieval behind an unpublishable configuration.
-    semantic.validate()?;
-    Ok(semantic)
 }
 
 fn setting_key(key_name: &str) -> Result<SettingKey> {
@@ -750,7 +728,6 @@ mod tests {
         ConfigurationValueV1, INDEX_MAX_FILE_SIZE_SETTING_KEY, SettingKey,
     };
     use tracedecay_domain::errors::TraceDecayError;
-    use tracedecay_semantic_contracts::SemanticConfig;
 
     use super::{PinnedRuntimeConfiguration, RuntimeConfigurationTarget, registry, resolver};
 
@@ -823,23 +800,6 @@ mod tests {
             message.contains("expected unsigned"),
             "type mismatches must be reported as such: {message}"
         );
-    }
-
-    #[test]
-    fn pin_materializes_the_semantic_selection_from_the_snapshot() {
-        let configured = SemanticConfig {
-            auto_download: false,
-            ..SemanticConfig::default()
-        };
-        let snapshot = resolved(BTreeMap::from([(
-            SettingKey::new(super::SEMANTIC_RUNTIME_SETTING_KEY).unwrap(),
-            ConfigurationValueV1::Text(serde_json::to_string(&configured).unwrap()),
-        )]));
-
-        let pinned = PinnedRuntimeConfiguration::new(target(), revision(), snapshot).unwrap();
-
-        assert_eq!(pinned.config().semantic, configured);
-        assert_ne!(pinned.config().semantic, SemanticConfig::default());
     }
 
     #[test]

@@ -13,6 +13,7 @@ use tracedecay_domain::UtcMicros;
 use tracedecay_tool_catalog::{BindingId, SchemaId};
 
 use crate::ToolResult;
+use crate::handlers::support::unknown_tool_error;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_daemon_protocol::{
     DaemonInvocationExecutor, InvocationCancellationPolicy, invocation_now_micros,
@@ -41,9 +42,8 @@ pub async fn handle_multi_root(
     protocol_deadline: Option<Deadline>,
     protocol_cancellation: Option<CancellationSignal>,
 ) -> Result<ToolResult> {
-    let operation = operation_for_tool(tool_name).ok_or_else(|| TraceDecayError::Config {
-        message: format!("unknown tool: {tool_name}"),
-    })?;
+    let operation =
+        multi_root_operation_for_tool(tool_name).ok_or_else(|| unknown_tool_error(tool_name))?;
     let request_id = match protocol_request_id {
         Some(request_id) => request_id,
         None => mint_global_request_id(GlobalRequestSurface::McpFallback).map_err(|_| {
@@ -69,12 +69,12 @@ pub async fn handle_multi_root(
                 message: error.to_string(),
             })?,
     };
-    // The MCP transport injects its protocol request id for cooperative
-    // cancellation; the typed multi-root requests deny unknown fields and
-    // never consume it (the protocol id already arrives as a parameter).
+    // MCP transport controls arrive outside the typed application request.
+    // Strip them before decoding the deny-unknown-fields contract.
     let mut body = body;
     if let Some(map) = body.as_object_mut() {
         map.remove("__mcp_request_id");
+        map.remove("format");
     }
     let invocation = hotpath::measure_block!(
         "mcp.multi_root.decode",
@@ -148,7 +148,14 @@ pub async fn handle_multi_root(
     )
 }
 
-fn operation_for_tool(tool_name: &str) -> Option<MultiRootApplicationOperation> {
+/// The multi-root operation a tool name resolves to, if any.
+///
+/// The three multi-root tools are daemon-owned: they carry no application
+/// surface binding, so the binding table takes their contract from the
+/// multi-root capability catalog through this lookup.
+pub(crate) fn multi_root_operation_for_tool(
+    tool_name: &str,
+) -> Option<MultiRootApplicationOperation> {
     match tool_name {
         "tracedecay_multi_root_scope_set_read" => Some(MultiRootApplicationOperation::ScopeSetRead),
         "tracedecay_multi_root_scope_set_compare_and_swap" => {
@@ -342,10 +349,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_request_id_is_stripped_before_typed_deserialization() {
+    async fn transport_controls_are_stripped_before_typed_deserialization() {
         let body = json!({
             "scope_set_id": "tool-sweep-scope-set.v1",
             "__mcp_request_id": "request.mcp.fixture",
+            "format": "json",
         });
 
         let result = handle_multi_root(
@@ -359,8 +367,8 @@ mod tests {
         .await
         .unwrap();
 
-        // The injected transport id must not fail typed deserialization; the
-        // request reaches the daemon-owner gate and reports its absence.
+        // Transport controls must not fail typed deserialization; the request
+        // reaches the daemon-owner gate and reports its absence.
         assert_eq!(problem_code(&result), "multi_root.daemon_unavailable");
     }
 

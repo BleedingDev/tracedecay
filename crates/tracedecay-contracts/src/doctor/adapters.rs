@@ -17,7 +17,7 @@ use super::sources::{
     CodeIndexMountReadV1, ConfigurationAuthorityReadV1, DoctorStorageFamilyReadV1,
     DoctorStorageIncompleteReasonV1, HostIntegrationReadV1, IngestRefusalCensusReadV1,
     LanguageServerReadV1, ObservabilityReadV1, OperationalAuditReadV1, RuntimeHealthReadV1,
-    RuntimeLivenessV1, SemanticOwnerReadV1,
+    RuntimeLivenessV1,
 };
 use super::types::{DoctorCoverageCompletenessV1, DoctorStorageFindingV1};
 
@@ -267,10 +267,8 @@ pub struct DoctorKernelInputsV1 {
     pub advisory_feedback: AdvisoryFeedbackReadV1,
     /// Live language-server/analyzer read (`LanguageServer` family).
     pub language_server: LanguageServerReadV1,
-    /// Code-index mount read (`SemanticIndex` family).
+    /// Code-index mount read (`CodeIndex` family).
     pub code_index: CodeIndexMountReadV1,
-    /// Independent semantic activation-owner read (`SemanticIndex` family).
-    pub semantic_owner: SemanticOwnerReadV1,
     /// Canonical durable Plan-26 feedback read (`Observability` family).
     pub observability: ObservabilityReadV1,
     /// Durable ingest-coverage refusal census (`Observability` family).

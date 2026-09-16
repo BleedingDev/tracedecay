@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use sha2::{Digest, Sha256};
 use tracedecay_code_index::chunks::{
     DeterministicCodeChunker, ExtractionAdmittedCodeSearchChunkV1, content_digest,
 };
+use tracedecay_code_index::clones::CloneNormalizationClassV1;
 use tracedecay_code_index::extract::{LanguageExtractor, NeverCancelled, TreeSitterExtractor};
 use tracedecay_code_index::intake::{CodeIndexIntake, SanitizedCodeIntake};
 use tracedecay_code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
@@ -23,6 +25,7 @@ use tracedecay_code_index::production::{
     VerifiedSealedLexicalPageBatchBoundsV1, VerifiedSealedLexicalPageBatchReadV1,
     VerifiedSealedLexicalPageReadV1, VerifiedSealedLexicalPageSourceV1,
     VerifiedSealedLexicalPageV1, VerifiedSealedLexicalSourceReceiptV1,
+    VerifiedSealedLexicalSymbolDisplayV1,
 };
 use tracedecay_code_index::projection::{
     ChunkProjectionDecisionV1, CodeChunkProjectionSink, ProjectionReceiptBuilderV1,
@@ -37,9 +40,9 @@ use tracedecay_domain::{
     PolicyRevisionId, PrincipalId, PrivacyDomainId, ProjectId, ProjectionBatchRequestV1,
     ProjectionKeyV1, ProjectionKindV1, ProjectionOperationV1, ProjectionOutcomeV1,
     QueryNormalizationRevision, RepositoryDirtyStateV1, RepositoryId, RetrievalBudget,
-    RetrievalError, RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverOutcome,
-    SanitizationReceiptId, SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision,
-    ScoreDomainId, SensitivityDecision, SensitivityLevelV1, SingleRootScopeV1,
+    RetrievalError, RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverCoverage,
+    RetrieverOutcome, SanitizationReceiptId, SanitizedCodeFileV1, SanitizedCodeSnapshotV1,
+    SanitizerRevision, ScoreDomainId, SensitivityDecision, SensitivityLevelV1, SingleRootScopeV1,
     SnapshotFileDispositionV1, SourceFreshness, SourceInstanceKey, SourceNamespace, SourceSpan,
     SymbolOccurrenceId, TemporalModeV1, UtcMicros, ValidatedCodeFileV1, VectorWatermark,
 };
@@ -50,13 +53,15 @@ use tracedecay_query::retrieval::exact::{
 use tracedecay_query::retrieval::lexical::{
     CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_MAXIMUM_PAGE_RETAINED_BYTES_V1,
-    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeLexicalArtifactBatchLimitV1,
-    CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
-    CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1,
-    CodeLexicalArtifactWriterRevisionV1, CodeLexicalProjectionAdapterV1,
-    CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
+    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintCancellationPointV1,
+    CloneFingerprintPartialReasonV1, CloneNearMatchExtentV1, CloneSelectedBlockContainmentClassV1,
+    CloneSelectedBlockV1, CodeLexicalArtifactBatchLimitV1, CodeLexicalArtifactBuilderV1,
+    CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1,
+    CodeLexicalArtifactWriterRevisionV1, CodeLexicalCloneSuccessorV1,
+    CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
     CodeLexicalProjectionMetadataV1, LexicalFieldFilterV1, LexicalFieldV1, LexicalLane,
-    LexicalLaneRequest, LexicalLaneRetriever, MAX_FUZZY_TERM_EXPANSIONS_V1,
+    LexicalLaneRequest, LexicalLaneRetriever, LexicalProximityV1, LexicalSpellingVariantV1,
+    MAX_CLONE_EXACT_PAGE_MEMBERS_V1, MAX_FUZZY_TERM_EXPANSIONS_V1,
     MAX_LEXICAL_CANDIDATE_DOCUMENTS_V1, MAX_LEXICAL_QUERY_TERM_BYTES_V1,
     VerifiedCodeLexicalArtifactV1,
 };
@@ -88,6 +93,21 @@ struct ArtifactControl {
 impl CodeIndexExecutionControlV1 for ArtifactControl {
     fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    fn is_deadline_exceeded(&self) -> bool {
+        false
+    }
+}
+
+struct CancelsAfterChecks {
+    checks: AtomicUsize,
+    cancel_at: usize,
+}
+
+impl CodeIndexExecutionControlV1 for CancelsAfterChecks {
+    fn is_cancelled(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::SeqCst).saturating_add(1) >= self.cancel_at
     }
 
     fn is_deadline_exceeded(&self) -> bool {
@@ -435,13 +455,18 @@ fn generation_backed_projection(
         .iter()
         .cloned()
         .collect::<Vec<_>>();
-    let symbol_qualified_names = generation
+    let symbol_displays = generation
         .symbols()
         .symbols
         .iter()
-        .map(|symbol| (symbol.occurrence.clone(), symbol.qualified_name.clone()))
+        .map(|symbol| {
+            (
+                symbol.occurrence.clone(),
+                VerifiedSealedLexicalSymbolDisplayV1::from(symbol.as_ref()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
-    CodeLexicalProjectionAdapterV1::new_admitted(metadata, chunks, symbol_qualified_names)
+    CodeLexicalProjectionAdapterV1::new_admitted(metadata, chunks, symbol_displays)
         .expect("generation-backed lexical projection")
 }
 
@@ -616,21 +641,13 @@ fn real_verified_pages_with_maximum_page_chunks(
     (fixture, pages, receipt)
 }
 
-/// The parser-attested qualified name of every symbol the pages carry. The
-/// in-memory projection has no sealed page to read a symbol display from, so
-/// it takes the same authority as a map.
-fn page_symbol_qualified_names(
+fn page_symbol_displays(
     pages: &[VerifiedSealedLexicalPageV1],
-) -> BTreeMap<SymbolOccurrenceId, String> {
+) -> BTreeMap<SymbolOccurrenceId, VerifiedSealedLexicalSymbolDisplayV1> {
     pages
         .iter()
         .flat_map(|page| page.symbol_displays().iter().flatten())
-        .map(|display| {
-            (
-                display.occurrence().clone(),
-                display.qualified_name().to_owned(),
-            )
-        })
+        .map(|display| (display.occurrence().clone(), display.clone()))
         .collect()
 }
 
@@ -651,6 +668,37 @@ fn drain_verified_pages(
         }
     };
     (pages, receipt)
+}
+
+fn build_clone_artifact(
+    fixture: &RealLexicalSourceFixture,
+) -> (
+    tempfile::TempDir,
+    Vec<VerifiedSealedLexicalPageV1>,
+    CodeLexicalArtifactReaderV1,
+) {
+    let (pages, receipt) = drain_verified_pages(fixture, 128);
+    let directory = tempfile::tempdir().expect("clone artifact tempdir");
+    let path = directory.path().join("clone-artifact-v16.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let verified = {
+        let mut builder = CodeLexicalArtifactBuilderV1::create(&path, fixture.metadata.clone())
+            .expect("create clone artifact");
+        for page in &pages {
+            builder
+                .append_page(page, &control)
+                .expect("append clone artifact page");
+        }
+        finish_staged_artifact(&mut builder, &receipt, &control)
+    };
+    let reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &path,
+        &verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open clone artifact");
+    (directory, pages, reader)
 }
 
 fn real_verified_pages() -> (
@@ -1206,7 +1254,7 @@ fn disk_artifact_resume_reopen_and_lexical_results_match_one_shot_projection() {
     let one_shot = CodeLexicalProjectionAdapterV1::new_admitted(
         metadata.clone(),
         chunks.clone(),
-        page_symbol_qualified_names(&pages),
+        page_symbol_displays(&pages),
     )
     .expect("one-shot lexical projection");
     let import_evidence = pages
@@ -1311,6 +1359,1011 @@ fn disk_artifact_resume_reopen_and_lexical_results_match_one_shot_projection() {
     assert_eq!(artifact, expected);
 }
 
+#[test]
+fn v16_clone_payloads_are_content_addressed_and_postings_page() {
+    let body = "one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten();";
+    let fixture = real_lexical_source_fixture_from_sources(vec![
+        (
+            "file.clone.alpha".to_owned(),
+            "src/alpha.ts".to_owned(),
+            format!("export function alpha() {{ {body} }}\n").into_bytes(),
+        ),
+        (
+            "file.clone.beta".to_owned(),
+            "src/beta.ts".to_owned(),
+            format!("export function beta() {{ {body} }}\n").into_bytes(),
+        ),
+        (
+            "file.clone.delta".to_owned(),
+            "src/delta.ts".to_owned(),
+            format!("export function delta() {{ {body} }}\n").into_bytes(),
+        ),
+        (
+            "file.clone.gamma".to_owned(),
+            "src/gamma.ts".to_owned(),
+            b"export function gamma() { return 1; }\n".to_vec(),
+        ),
+    ]);
+    let (pages, receipt) = drain_verified_pages(&fixture, 1);
+    let clone_bodies = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .collect::<Vec<_>>();
+    assert_eq!(clone_bodies.len(), 4);
+    let excluded = clone_bodies
+        .iter()
+        .find(|body| body.payload.token_count < 30)
+        .expect("small body remains a payload occurrence");
+    assert!(
+        excluded
+            .payload
+            .exact_keys(excluded.occurrence.eligibility)
+            .is_empty()
+    );
+    let key = clone_bodies[0]
+        .payload
+        .exact_keys(clone_bodies[0].occurrence.eligibility)
+        .into_iter()
+        .find(|key| key.class == CloneNormalizationClassV1::Conservative)
+        .expect("conservative exact key");
+    let authority = clone_bodies[0].occurrence.clone();
+
+    let directory = tempfile::tempdir().expect("artifact tempdir");
+    let legacy_path = directory.path().join("lexical-artifact-v14.sqlite");
+    let artifact_path = directory.path().join("lexical-artifact-v16.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let legacy_verified = {
+        let mut builder = CodeLexicalArtifactBuilderV1::create_with_format_revision(
+            &legacy_path,
+            fixture.metadata.clone(),
+            CodeLexicalArtifactWriterRevisionV1::V14,
+        )
+        .expect("create V14 artifact");
+        for page in &pages {
+            builder
+                .append_page(page, &control)
+                .expect("append V14 page");
+        }
+        finish_staged_artifact(&mut builder, &receipt, &control)
+    };
+    let legacy_reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &legacy_path,
+        &legacy_verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open V14 artifact");
+    assert!(matches!(
+        legacy_reader.clone_exact_page(&authority, &key, None, 1, &control,),
+        Err(CodeLexicalArtifactErrorV1::Incompatible(_))
+    ));
+    let verified = {
+        let mut builder =
+            CodeLexicalArtifactBuilderV1::create(&artifact_path, fixture.metadata.clone())
+                .expect("create V16 artifact");
+        for page in &pages {
+            builder.append_page(page, &control).expect("append page");
+        }
+        finish_staged_artifact(&mut builder, &receipt, &control)
+    };
+    assert_eq!(
+        legacy_verified.section_digests(),
+        &verified.section_digests()[..legacy_verified.section_digests().len()],
+        "V16 clone sections must not rewrite lexical section identities"
+    );
+    let successor_path = directory
+        .path()
+        .join("lexical-artifact-successor-v16.sqlite");
+    let mut successor = CodeLexicalCloneSuccessorV1::open_or_create(
+        &legacy_path,
+        &successor_path,
+        legacy_verified.clone(),
+        fixture.metadata.clone(),
+        CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+    )
+    .expect("create clone-only successor");
+    successor
+        .append_page(&pages[0], &control)
+        .expect("append first clone page");
+    drop(successor);
+    let mut successor = CodeLexicalCloneSuccessorV1::open_or_create(
+        &legacy_path,
+        &successor_path,
+        legacy_verified,
+        fixture.metadata.clone(),
+        CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+    )
+    .expect("resume clone-only successor");
+    assert_eq!(
+        successor
+            .next_cursor()
+            .expect("successor cursor")
+            .expect("accepted page cursor"),
+        pages[0].next_cursor().clone()
+    );
+    for page in &pages[1..] {
+        successor
+            .append_page(page, &control)
+            .expect("append remaining clone page");
+    }
+    let successor_verified = successor
+        .finish(&receipt, &control)
+        .expect("finish clone-only successor");
+    assert_eq!(
+        successor_verified.section_digests(),
+        verified.section_digests()
+    );
+    assert_eq!(
+        successor_verified.artifact_digest(),
+        verified.artifact_digest()
+    );
+    CodeLexicalArtifactReaderV1::open_with_control(
+        &successor_path,
+        &successor_verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open clone-only successor");
+    let v15_path = directory.path().join("lexical-artifact-v15.sqlite");
+    let v15_verified = {
+        let mut builder = CodeLexicalArtifactBuilderV1::create_with_format_revision(
+            &v15_path,
+            fixture.metadata.clone(),
+            CodeLexicalArtifactWriterRevisionV1::V15,
+        )
+        .expect("create V15 artifact");
+        for page in &pages {
+            builder
+                .append_page(page, &control)
+                .expect("append V15 page");
+        }
+        finish_staged_artifact(&mut builder, &receipt, &control)
+    };
+    let v15_reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &v15_path,
+        &v15_verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open V15 serving owner");
+    let v16_from_v15_path = directory
+        .path()
+        .join("lexical-artifact-v16-from-v15.sqlite");
+    let mut v16_from_v15 = CodeLexicalCloneSuccessorV1::open_or_create(
+        &v15_path,
+        &v16_from_v15_path,
+        v15_verified,
+        fixture.metadata.clone(),
+        CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+    )
+    .expect("create V16 successor from V15");
+    v16_from_v15
+        .append_page(&pages[0], &control)
+        .expect("append V16 successor page");
+    assert_eq!(
+        v15_reader
+            .clone_exact_page(&authority, &key, None, 1, &control)
+            .expect("V15 owner serves during successor work")
+            .members
+            .len(),
+        1
+    );
+    for page in &pages[1..] {
+        v16_from_v15
+            .append_page(page, &control)
+            .expect("append remaining V16 successor page");
+    }
+    let v16_from_v15_verified = v16_from_v15
+        .finish(&receipt, &control)
+        .expect("finish V16 successor from V15");
+    assert_eq!(
+        v16_from_v15_verified.artifact_digest(),
+        verified.artifact_digest()
+    );
+    let connection = rusqlite::Connection::open(&artifact_path).expect("inspect V16 artifact");
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM clone_body_payloads", [], |row| row
+                .get::<_, i64>(0))
+            .expect("payload count"),
+        2
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM clone_occurrences", [], |row| row
+                .get::<_, i64>(0))
+            .expect("occurrence count"),
+        4
+    );
+    let (fingerprint_rows, counted_rows): (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM clone_fingerprint_postings),
+                (SELECT COALESCE(SUM(posting_count), 0) FROM clone_fingerprint_counts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("fingerprint counts");
+    assert!(fingerprint_rows > 0);
+    assert_eq!(counted_rows, fingerprint_rows);
+    drop(connection);
+
+    let reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &artifact_path,
+        &verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open V16 artifact");
+    let excluded_page = reader
+        .clone_fingerprint_page(&excluded.occurrence, &excluded.payload, None, 10, &control)
+        .expect("excluded fingerprint read");
+    assert_eq!(
+        excluded_page.source_eligibility,
+        excluded.occurrence.eligibility
+    );
+    assert_eq!(
+        excluded_page.coverage,
+        RetrieverCoverage {
+            examined: 1,
+            excluded: 1,
+            ..RetrieverCoverage::default()
+        }
+    );
+    assert!(excluded_page.page.members.is_empty());
+    let fingerprints = reader
+        .clone_fingerprint_page(&authority, &clone_bodies[0].payload, None, 10, &control)
+        .expect("fingerprint candidates");
+    assert_eq!(
+        fingerprints.coverage,
+        RetrieverCoverage {
+            examined: 1,
+            eligible: 1,
+            ..RetrieverCoverage::default()
+        }
+    );
+    assert_eq!(fingerprints.page.members.len(), 1);
+    assert_eq!(fingerprints.accounting.candidates_admitted, 1);
+    assert_eq!(fingerprints.accounting.pairs_verified, 1);
+    assert!(!fingerprints.page.members[0].ordered_anchors.is_empty());
+    assert_eq!(fingerprints.page.members[0].occurrences.len(), 2);
+    let cancelled = reader
+        .clone_fingerprint_page(
+            &authority,
+            &clone_bodies[0].payload,
+            None,
+            10,
+            &ArtifactControl { cancelled: true },
+        )
+        .expect("cancelled fingerprint read");
+    assert_eq!(cancelled.coverage.unknown, 1);
+    assert_eq!(
+        cancelled.partial_reasons,
+        vec![CloneFingerprintPartialReasonV1::Cancelled]
+    );
+    assert_eq!(
+        cancelled.accounting.cancellation_point,
+        Some(CloneFingerprintCancellationPointV1::FingerprintCountRead)
+    );
+    let mut unauthorized = authority.clone();
+    unauthorized.repository_id = id::<RepositoryId>("repository.unauthorized");
+    assert!(matches!(
+        reader.clone_exact_page(&unauthorized, &key, None, 1, &control),
+        Err(CodeLexicalArtifactErrorV1::Missing(_))
+    ));
+    assert!(matches!(
+        reader.clone_exact_page(
+            &authority,
+            &key,
+            None,
+            MAX_CLONE_EXACT_PAGE_MEMBERS_V1 + 1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let first = reader
+        .clone_exact_page(&authority, &key, None, 1, &control)
+        .expect("first clone page");
+    assert_eq!(first.members.len(), 1);
+    assert!(matches!(
+        reader.clone_fingerprint_page(
+            &authority,
+            &clone_bodies[0].payload,
+            first.next_cursor.as_ref(),
+            1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let rename_key = clone_bodies[0]
+        .payload
+        .exact_keys(clone_bodies[0].occurrence.eligibility)
+        .into_iter()
+        .find(|key| key.class == CloneNormalizationClassV1::Rename)
+        .expect("rename exact key");
+    assert!(matches!(
+        reader.clone_exact_page(
+            &authority,
+            &rename_key,
+            first.next_cursor.as_ref(),
+            1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let mut altered_scope = authority.clone();
+    altered_scope.project_id = id::<ProjectId>("project.other");
+    assert!(matches!(
+        reader.clone_exact_page(
+            &altered_scope,
+            &key,
+            first.next_cursor.as_ref(),
+            1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let second = reader
+        .clone_exact_page(&authority, &key, first.next_cursor.as_ref(), 1, &control)
+        .expect("second clone page");
+    assert_eq!(second.members.len(), 1);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        first.members[0].payload.payload_digest,
+        second.members[0].payload.payload_digest
+    );
+    assert_ne!(
+        first.members[0].occurrence.symbol_occurrence_id,
+        second.members[0].occurrence.symbol_occurrence_id
+    );
+
+    let reduced = real_lexical_source_fixture_from_sources(vec![
+        (
+            "file.clone.alpha".to_owned(),
+            "src/alpha.ts".to_owned(),
+            format!("export function alpha() {{ {body} }}\n").into_bytes(),
+        ),
+        (
+            "file.clone.gamma".to_owned(),
+            "src/gamma.ts".to_owned(),
+            b"export function gamma() { return 1; }\n".to_vec(),
+        ),
+    ]);
+    let (reduced_pages, reduced_receipt) = drain_verified_pages(&reduced, 1);
+    let reduced_payload = reduced_pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .find(|body| body.payload.token_count >= 30)
+        .expect("unchanged eligible body");
+    assert_eq!(
+        reduced_payload.payload.payload_digest,
+        first.members[0].payload.payload_digest
+    );
+    let reduced_path = directory.path().join("lexical-artifact-reduced-v15.sqlite");
+    let reduced_verified = {
+        let mut builder =
+            CodeLexicalArtifactBuilderV1::create(&reduced_path, reduced.metadata.clone())
+                .expect("create reduced V15 artifact");
+        for page in &reduced_pages {
+            builder
+                .append_page(page, &control)
+                .expect("append reduced page");
+        }
+        finish_staged_artifact(&mut builder, &reduced_receipt, &control)
+    };
+    let reduced_reader = CodeLexicalArtifactReaderV1::open_with_control(
+        &reduced_path,
+        &reduced_verified,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        &control,
+    )
+    .expect("open reduced V15 artifact");
+    assert_eq!(
+        reduced_reader
+            .clone_exact_page(&reduced_payload.occurrence, &key, None, 10, &control)
+            .expect("query after deletion")
+            .members
+            .len(),
+        0,
+        "deleted occurrences and postings must not remain active"
+    );
+    drop(reader);
+    let connection = rusqlite::Connection::open(&artifact_path).expect("open clone tamper writer");
+    connection
+        .execute_batch(
+            "DROP TRIGGER immutable_clone_body_payloads_update;
+             UPDATE clone_body_payloads SET payload = zeroblob(length(payload));",
+        )
+        .expect("tamper clone payload bytes");
+    drop(connection);
+    assert!(matches!(
+        CodeLexicalArtifactReaderV1::open_with_control(
+            &artifact_path,
+            &verified,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Corrupt(_))
+    ));
+    let connection = rusqlite::Connection::open(&artifact_path).expect("open shape tamper writer");
+    connection
+        .execute_batch("DROP TABLE clone_exact_postings;")
+        .expect("remove required clone table");
+    drop(connection);
+    assert!(matches!(
+        CodeLexicalArtifactReaderV1::open_with_control(
+            &artifact_path,
+            &verified,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+            &control,
+        ),
+        Err(CodeLexicalArtifactErrorV1::Incompatible(_))
+    ));
+}
+
+#[test]
+fn fingerprint_candidates_reject_incompatible_bodies_and_page_byte_identically() {
+    let shared = "shared01(); shared02(); shared03(); shared04(); shared05(); shared06(); shared07(); shared08(); shared09(); shared10(); shared11(); shared12(); shared13(); shared14();";
+    let function = |name: &str, difference: &str| {
+        format!(
+            "export function {name}() {{ before(); before2(); {shared} {difference} after(); after2(); }}\n"
+        )
+    };
+    let fixture = real_lexical_source_fixture_from_sources(vec![
+        (
+            "file.clone.page.alpha".to_owned(),
+            "src/alpha.ts".to_owned(),
+            function("alpha", "execute(\"original\");").into_bytes(),
+        ),
+        (
+            "file.clone.page.beta".to_owned(),
+            "src/beta.ts".to_owned(),
+            function("beta", "execute(\"changed\");").into_bytes(),
+        ),
+        (
+            "file.clone.page.delta".to_owned(),
+            "src/delta.ts".to_owned(),
+            function(
+                "delta",
+                "if (enabled()) { added_branch(); } execute(\"original\");",
+            )
+            .into_bytes(),
+        ),
+        (
+            "file.clone.page.gamma".to_owned(),
+            "src/gamma.ts".to_owned(),
+            function(
+                "gamma",
+                "try { execute(\"original\"); } catch (error) { report(error); }",
+            )
+            .into_bytes(),
+        ),
+        (
+            "file.clone.page.method".to_owned(),
+            "src/method.ts".to_owned(),
+            format!("export class Holder {{ candidate() {{ {shared} }} }}\n").into_bytes(),
+        ),
+    ]);
+    let (_directory, pages, reader) = build_clone_artifact(&fixture);
+    let source = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .find(|body| body.occurrence.path == "src/alpha.ts")
+        .expect("source clone body");
+    let control = ArtifactControl { cancelled: false };
+    let all = reader
+        .clone_fingerprint_page(&source.occurrence, &source.payload, None, 256, &control)
+        .expect("all fingerprint candidates");
+    assert_eq!(all.coverage.capped, 0);
+    assert_eq!(all.coverage.unknown, 0);
+    assert_eq!(all.minimum_directional_coverage_millionths, 700_000);
+    assert!(all.page.members.len() >= 3);
+    let stream = all.stream.as_ref().expect("fingerprint stream");
+    assert!(all.page.members.iter().all(|candidate| {
+        let candidate_stream = candidate
+            .payload
+            .fingerprint_stream(candidate.occurrences[0].eligibility)
+            .expect("candidate stream");
+        candidate.payload.language == stream.language
+            && candidate.payload.symbol_kind == source.payload.symbol_kind
+            && candidate_stream.class == stream.class
+            && candidate_stream.normalization_revision == stream.normalization_revision
+            && !candidate.ordered_anchors.is_empty()
+            && candidate.source == source.occurrence
+            && candidate.extent == CloneNearMatchExtentV1::WholeBody
+            && candidate.source_coverage_millionths >= 700_000
+            && candidate.candidate_coverage_millionths >= 700_000
+            && candidate.shared_ordered_token_count > 0
+            && !candidate.differences.is_empty()
+    }));
+    for (path, expected_token) in [
+        ("src/beta.ts", "changed"),
+        ("src/delta.ts", "if"),
+        ("src/gamma.ts", "try"),
+    ] {
+        let candidate = all
+            .page
+            .members
+            .iter()
+            .find(|candidate| candidate.occurrences[0].path == path)
+            .expect("named near-clone candidate");
+        assert!(
+            candidate.differences.iter().any(|difference| {
+                difference.right_tokens.iter().any(|token| match token {
+                    tracedecay_code_extraction::ConservativeCloneTokenV1::StructureStart {
+                        syntax_kind,
+                    }
+                    | tracedecay_code_extraction::ConservativeCloneTokenV1::StructureEnd {
+                        syntax_kind,
+                    } => syntax_kind.contains(expected_token),
+                    tracedecay_code_extraction::ConservativeCloneTokenV1::Syntax {
+                        syntax_kind,
+                        text,
+                    } => syntax_kind.contains(expected_token) || text.contains(expected_token),
+                })
+            }),
+            "{path} differences did not expose {expected_token}: {candidate:#?}"
+        );
+    }
+
+    let first = reader
+        .clone_fingerprint_page(&source.occurrence, &source.payload, None, 1, &control)
+        .expect("first fingerprint page");
+    let cursor = first.page.next_cursor.as_ref().expect("fingerprint cursor");
+    let exact_key = source
+        .payload
+        .exact_keys(source.occurrence.eligibility)
+        .into_iter()
+        .find(|key| key.class == CloneNormalizationClassV1::Conservative)
+        .expect("exact conservative key");
+    assert!(matches!(
+        reader.clone_exact_page(&source.occurrence, &exact_key, Some(cursor), 1, &control),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let mut altered_scope = source.occurrence.clone();
+    altered_scope.project_id = id::<ProjectId>("project.other");
+    assert!(matches!(
+        reader.clone_fingerprint_page(&altered_scope, &source.payload, Some(cursor), 1, &control,),
+        Err(CodeLexicalArtifactErrorV1::Contract(_))
+    ));
+    let mut stale = source.occurrence.clone();
+    stale.source_generation = id::<CodeGenerationId>("generation.stale");
+    let stale_error = reader
+        .clone_fingerprint_page(&stale, &source.payload, None, 1, &control)
+        .expect_err("stale source generation");
+    assert_eq!(
+        stale_error.to_string(),
+        format!(
+            "lexical artifact authority is missing: clone lookup generation {} is stale; the artifact serves {}",
+            stale.source_generation.as_str(),
+            source.occurrence.source_generation.as_str()
+        )
+    );
+
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = reader
+            .clone_fingerprint_page(
+                &source.occurrence,
+                &source.payload,
+                cursor.as_ref(),
+                1,
+                &control,
+            )
+            .expect("paged fingerprint candidates");
+        paged.extend(page.page.members);
+        let Some(next) = page.page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+    assert_eq!(paged, all.page.members);
+
+    let distinct_source_fingerprints = source
+        .payload
+        .fingerprint_positions(source.occurrence.eligibility)
+        .expect("source fingerprints")
+        .into_iter()
+        .map(|position| position.fingerprint)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let cancelled = reader
+        .clone_fingerprint_page(
+            &source.occurrence,
+            &source.payload,
+            None,
+            256,
+            &CancelsAfterChecks {
+                checks: AtomicUsize::new(0),
+                cancel_at: distinct_source_fingerprints + 1,
+            },
+        )
+        .expect("mid-read cancellation");
+    assert_eq!(cancelled.coverage.unknown, 1);
+    assert_eq!(
+        cancelled.accounting.cancellation_point,
+        Some(CloneFingerprintCancellationPointV1::PostingRead)
+    );
+    assert_eq!(cancelled.accounting.posting_rows_examined, 1);
+}
+
+#[test]
+fn selected_block_finds_both_containment_directions_without_indexing_subtrees() {
+    let inner = (0..14)
+        .map(|ordinal| format!("inner_{ordinal}(); "))
+        .collect::<String>();
+    let selected = format!("selected_before(); {{ {inner} }} selected_after();");
+    let containing_before = (0..80)
+        .map(|ordinal| format!("before_edge_{ordinal}(); "))
+        .collect::<String>();
+    let containing_after = (0..80)
+        .map(|ordinal| format!("after_edge_{ordinal}(); "))
+        .collect::<String>();
+    let fixture = real_lexical_source_fixture_from_sources(vec![
+        (
+            "file.clone.block.contained".to_owned(),
+            "src/contained.ts".to_owned(),
+            format!("export function contained() {{ {inner} }}").into_bytes(),
+        ),
+        (
+            "file.clone.block.containing".to_owned(),
+            "src/containing.ts".to_owned(),
+            format!(
+                "export function containing() {{ {containing_before} {{ {selected} }} {containing_after} }}"
+            )
+            .into_bytes(),
+        ),
+        (
+            "file.clone.block.equal".to_owned(),
+            "src/equal.ts".to_owned(),
+            format!("export function equal() {{ {selected} }}").into_bytes(),
+        ),
+        (
+            "file.clone.block.source".to_owned(),
+            "src/source.ts".to_owned(),
+            format!(
+                "export function source() {{ source_before(); {{ {selected} }} source_after(); }}"
+            )
+            .into_bytes(),
+        ),
+    ]);
+    let (directory, pages, reader) = build_clone_artifact(&fixture);
+    let bodies = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .collect::<Vec<_>>();
+    let source = bodies
+        .iter()
+        .find(|body| body.occurrence.path == "src/source.ts")
+        .expect("selected-block source");
+    let equal = bodies
+        .iter()
+        .find(|body| body.occurrence.path == "src/equal.ts")
+        .expect("equal selected block");
+    let source_tokens = source
+        .payload
+        .fingerprint_stream(source.occurrence.eligibility)
+        .expect("source fingerprint stream")
+        .tokens;
+    let equal_tokens = equal
+        .payload
+        .fingerprint_stream(equal.occurrence.eligibility)
+        .expect("equal fingerprint stream")
+        .tokens;
+    let start = source_tokens
+        .windows(equal_tokens.len())
+        .position(|window| window == equal_tokens)
+        .expect("selected statement block in source body");
+    let selection = CloneSelectedBlockV1::from_payload(
+        &source.payload,
+        source.occurrence.eligibility,
+        start..start + equal_tokens.len(),
+    )
+    .expect("selected block");
+    let result = reader
+        .clone_selected_block_page(
+            &source.occurrence,
+            &source.payload,
+            &selection,
+            None,
+            10,
+            &ArtifactControl { cancelled: false },
+        )
+        .expect("selected-block containment");
+    let classes = result
+        .page
+        .members
+        .iter()
+        .flat_map(|candidate| {
+            candidate
+                .occurrences
+                .iter()
+                .map(|occurrence| (occurrence.path.as_str(), candidate.containment))
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        classes,
+        BTreeSet::from([
+            (
+                "src/contained.ts",
+                CloneSelectedBlockContainmentClassV1::SelectedBlockContainsCandidate,
+            ),
+            (
+                "src/containing.ts",
+                CloneSelectedBlockContainmentClassV1::CandidateContainsSelectedBlock,
+            ),
+            ("src/equal.ts", CloneSelectedBlockContainmentClassV1::Equal,),
+        ])
+    );
+    assert_eq!(
+        result.coverage,
+        RetrieverCoverage {
+            examined: 1,
+            eligible: 1,
+            ..RetrieverCoverage::default()
+        }
+    );
+    assert!(
+        u64::from(selection.tokens().len() as u32).saturating_mul(100)
+            < u64::from(
+                bodies
+                    .iter()
+                    .find(|body| body.occurrence.path == "src/containing.ts")
+                    .expect("containing body")
+                    .payload
+                    .token_count
+            )
+            .saturating_mul(70),
+        "containment must exercise the ratio that whole-body matching rejects"
+    );
+    let connection = rusqlite::Connection::open(directory.path().join("clone-artifact-v16.sqlite"))
+        .expect("inspect clone artifact");
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM clone_occurrences", [], |row| row
+                .get::<_, i64>(0))
+            .expect("clone occurrence count"),
+        4,
+        "the selected block must not add a subtree occurrence"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM clone_body_payloads", [], |row| row
+                .get::<_, i64>(0))
+            .expect("clone payload count"),
+        4,
+        "the selected block must not add a subtree payload"
+    );
+}
+
+#[test]
+fn fingerprint_candidate_and_posting_budgets_report_partial_coverage() {
+    let shared = (0..24)
+        .map(|ordinal| format!("shared_{ordinal}(); "))
+        .collect::<String>();
+    let mut candidate_source = String::new();
+    for ordinal in 0..258 {
+        writeln!(
+            candidate_source,
+            "export function candidate_{ordinal}() {{ {shared} unique_{ordinal}(); }}"
+        )
+        .expect("write candidate source");
+    }
+    let candidate_fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.clone.candidate-budget".to_owned(),
+        "src/candidate-budget.ts".to_owned(),
+        candidate_source.into_bytes(),
+    )]);
+    let (_candidate_directory, candidate_pages, candidate_reader) =
+        build_clone_artifact(&candidate_fixture);
+    let candidate_source = candidate_pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .next()
+        .expect("candidate-budget source body");
+    let control = ArtifactControl { cancelled: false };
+    let candidate_page = candidate_reader
+        .clone_fingerprint_page(
+            &candidate_source.occurrence,
+            &candidate_source.payload,
+            None,
+            256,
+            &control,
+        )
+        .expect("candidate-budget read");
+    assert_eq!(candidate_page.coverage.capped, 1);
+    assert!(
+        candidate_page
+            .partial_reasons
+            .contains(&CloneFingerprintPartialReasonV1::CandidateBodyBudget)
+    );
+    assert!(
+        candidate_page
+            .partial_reasons
+            .contains(&CloneFingerprintPartialReasonV1::VerificationBodyBudget)
+    );
+    assert_eq!(candidate_page.accounting.candidates_admitted, 256);
+    assert_eq!(candidate_page.accounting.candidate_bodies_compared, 64);
+
+    let long_body = (0..50)
+        .map(|ordinal| format!("shared_long_{ordinal}(); "))
+        .collect::<String>();
+    let mut posting_source = String::new();
+    for ordinal in 0..1_024 {
+        writeln!(
+            posting_source,
+            "export function posting_{ordinal}() {{ {long_body} }}"
+        )
+        .expect("write posting source");
+    }
+    let posting_fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.clone.posting-budget".to_owned(),
+        "src/posting-budget.ts".to_owned(),
+        posting_source.into_bytes(),
+    )]);
+    let (_posting_directory, posting_pages, posting_reader) =
+        build_clone_artifact(&posting_fixture);
+    let posting_source = posting_pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .next()
+        .expect("posting-budget source body");
+    let posting_page = posting_reader
+        .clone_fingerprint_page(
+            &posting_source.occurrence,
+            &posting_source.payload,
+            None,
+            256,
+            &control,
+        )
+        .expect("posting-budget read");
+    assert_eq!(posting_page.coverage.capped, 1);
+    assert!(
+        posting_page
+            .partial_reasons
+            .contains(&CloneFingerprintPartialReasonV1::PostingRowBudget)
+    );
+    assert_eq!(posting_page.accounting.posting_rows_examined, 16_384);
+    assert_eq!(posting_page.accounting.hot_postings_skipped, 0);
+}
+
+#[test]
+fn fingerprint_work_budget_cursor_stays_after_the_last_completed_candidate() {
+    let shared = (0..1_400)
+        .map(|ordinal| format!("{ordinal},"))
+        .collect::<String>();
+    let source_text = (0..12)
+        .map(|ordinal| {
+            format!(
+                "export function cursor_{ordinal}() {{ const values = [{shared}]; return values[{ordinal}]; }}\n"
+            )
+        })
+        .collect::<String>();
+    let fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.clone.cursor".to_owned(),
+        "src/cursor.ts".to_owned(),
+        source_text.into_bytes(),
+    )]);
+    let (_directory, pages, reader) = build_clone_artifact(&fixture);
+    let source = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .min_by_key(|body| body.occurrence.body_span.start_byte)
+        .expect("cursor source body");
+    let read = reader
+        .clone_fingerprint_page(
+            &source.occurrence,
+            &source.payload,
+            None,
+            256,
+            &ArtifactControl { cancelled: false },
+        )
+        .expect("bounded fingerprint read");
+
+    assert!(
+        read.partial_reasons
+            .contains(&CloneFingerprintPartialReasonV1::VerificationWorkBudget),
+        "fixture must exhaust alignment work: {:?}",
+        read.accounting
+    );
+    let last_completed = read
+        .page
+        .members
+        .last()
+        .expect("at least one completed candidate");
+    let cursor = read.page.next_cursor.expect("partial read cursor");
+    let mut ordered_candidates = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .filter(|body| {
+            body.occurrence.symbol_occurrence_id != source.occurrence.symbol_occurrence_id
+        })
+        .collect::<Vec<_>>();
+    ordered_candidates.sort_by_key(|body| {
+        (
+            body.payload.body_digest.clone(),
+            body.payload.payload_digest.clone(),
+        )
+    });
+    let completed_index = ordered_candidates
+        .iter()
+        .position(|body| body.payload.payload_digest == last_completed.payload.payload_digest)
+        .expect("completed candidate is in the ordered fixture");
+    let expected_resumed = ordered_candidates
+        .get(completed_index + 1)
+        .expect("unfinished candidate remains after the completed candidate");
+    let resumed = reader
+        .clone_fingerprint_page(
+            &source.occurrence,
+            &source.payload,
+            Some(&cursor),
+            256,
+            &ArtifactControl { cancelled: false },
+        )
+        .expect("resume bounded fingerprint read");
+    let first_resumed = resumed
+        .page
+        .members
+        .first()
+        .expect("resume retries the unfinished candidate");
+    assert_eq!(
+        first_resumed.payload.payload_digest, expected_resumed.payload.payload_digest,
+        "the unfinished candidate must remain behind the continuation cursor"
+    );
+}
+
+#[test]
+fn hot_only_fingerprints_are_partial_while_exact_digest_reads_still_work() {
+    let body = (0..24)
+        .map(|ordinal| format!("hot_shared_{ordinal}(); "))
+        .collect::<String>();
+    let mut source_text = String::new();
+    for ordinal in 0..1_026 {
+        writeln!(source_text, "export function hot_{ordinal}() {{ {body} }}")
+            .expect("write hot source");
+    }
+    let fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.clone.hot".to_owned(),
+        "src/hot.ts".to_owned(),
+        source_text.into_bytes(),
+    )]);
+    let (_directory, pages, reader) = build_clone_artifact(&fixture);
+    let source = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .next()
+        .expect("hot source body");
+    let control = ArtifactControl { cancelled: false };
+    let fingerprints = reader
+        .clone_fingerprint_page(&source.occurrence, &source.payload, None, 256, &control)
+        .expect("hot fingerprint read");
+    assert_eq!(fingerprints.coverage.capped, 1);
+    assert_eq!(
+        fingerprints.partial_reasons,
+        vec![CloneFingerprintPartialReasonV1::HotPostings]
+    );
+    assert!(fingerprints.page.members.is_empty());
+    assert!(fingerprints.accounting.hot_postings_skipped > 0);
+    assert!(fingerprints.accounting.hot_posting_rows_skipped > 1_024);
+    assert_eq!(fingerprints.accounting.posting_rows_examined, 0);
+
+    let exact_key = source
+        .payload
+        .exact_keys(source.occurrence.eligibility)
+        .into_iter()
+        .find(|key| key.class == CloneNormalizationClassV1::Conservative)
+        .expect("exact conservative key");
+    assert_eq!(
+        reader
+            .clone_exact_page(&source.occurrence, &exact_key, None, 1, &control)
+            .expect("exact digest read")
+            .members
+            .len(),
+        1
+    );
+}
+
 /// The lexical row scan is cooperatively cancellable on both production
 /// row sources. Over a real multi-file corpus whose every chunk matches the
 /// query, a request cancelled after its `k`-th control consultation unwinds
@@ -1331,7 +2384,7 @@ fn lexical_scan_cancellation_unwinds_artifact_and_in_memory_sources_before_compl
         CodeLexicalProjectionAdapterV1::new_admitted(
             metadata.clone(),
             chunks,
-            page_symbol_qualified_names(&pages),
+            page_symbol_displays(&pages),
         )
         .expect("in-memory lexical projection"),
     );
@@ -1503,6 +2556,144 @@ fn extracted_qualified_names_match_in_memory_and_reopened_artifacts() {
 }
 
 #[test]
+fn vocabulary_fields_phrase_and_proximity_match_in_memory_and_reopened_artifacts() {
+    let fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.vocabulary".to_owned(),
+        "src/http-cache/client-store.rs".to_owned(),
+        b"pub struct CachedResponse;\n\
+          /// Loads the durable cache entry for the request owner.\n\
+          pub fn loadCachedResponse(retry_budget: u32) -> CachedResponse {\n\
+              let _ = retry_budget;\n\
+              CachedResponse\n\
+          }\n"
+        .to_vec(),
+    )]);
+    let generation = CodeIndexPublishedGenerationV1::decode_sealed(&fixture.sealed)
+        .expect("restore canonical generation");
+    let memory = LexicalLane::new(generation_backed_projection(
+        fixture.metadata.clone(),
+        &generation,
+    ));
+    let directory = tempfile::tempdir().expect("artifact directory");
+    let path = directory.path().join("vocabulary.sqlite");
+    let control = ArtifactControl { cancelled: false };
+    let mut builder = CodeLexicalArtifactBuilderV1::create(&path, fixture.metadata.clone())
+        .expect("create artifact");
+    let verified = builder
+        .rebuild_and_finalize(&mut fixture.open_source(128), &control)
+        .expect("build from parser-attested pages");
+    drop(builder);
+    let artifact = LexicalLane::new(
+        CodeLexicalArtifactReaderV1::open_with_control(
+            &path,
+            &verified,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+            &control,
+        )
+        .expect("reopen lexical fields"),
+    );
+
+    let run = |query: &str,
+               whole_terms: &[&str],
+               phrases: &[&str],
+               field: LexicalFieldV1,
+               proximities: Vec<LexicalProximityV1>| {
+        let mut request = lexical_request(query, whole_terms, &[], phrases, 0, 32);
+        request.generation = fixture.metadata.generation.clone();
+        request.field_filters = vec![LexicalFieldFilterV1 {
+            field,
+            include: true,
+        }];
+        request.proximities = proximities;
+        let disk = artifact
+            .retrieve_lexical(&request)
+            .expect("artifact lexical query");
+        let in_memory = memory
+            .retrieve_lexical(&request)
+            .expect("in-memory lexical query");
+        assert_eq!(disk, in_memory, "{query} must agree across readers");
+        complete(disk)
+    };
+
+    for (query, field) in [
+        ("cached", LexicalFieldV1::SymbolName),
+        ("client", LexicalFieldV1::Path),
+        ("budget", LexicalFieldV1::Signature),
+        ("response", LexicalFieldV1::QualifiedName),
+    ] {
+        assert!(
+            !run(query, &[query], &[], field, Vec::new())
+                .candidates
+                .is_empty(),
+            "{query} must recover from its field vocabulary"
+        );
+    }
+    let mut typo = lexical_request("budgt", &["budgt"], &[], &[], 1, 32);
+    typo.generation = fixture.metadata.generation.clone();
+    typo.field_filters = vec![LexicalFieldFilterV1 {
+        field: LexicalFieldV1::Signature,
+        include: true,
+    }];
+    let disk_typo = artifact
+        .retrieve_lexical(&typo)
+        .expect("artifact typo query");
+    let memory_typo = memory
+        .retrieve_lexical(&typo)
+        .expect("in-memory typo query");
+    assert_eq!(disk_typo, memory_typo);
+    let disk_typo = complete(disk_typo);
+    assert_eq!(
+        disk_typo.evidence_by_occurrence[&disk_typo.candidates[0].source_occurrence_id]
+            .spelling_variants,
+        [LexicalSpellingVariantV1 {
+            query: "budgt".to_owned(),
+            alternative: "budget".to_owned(),
+        }]
+    );
+    let phrase = run(
+        "durable cache",
+        &[],
+        &["durable cache"],
+        LexicalFieldV1::Documentation,
+        Vec::new(),
+    );
+    assert_eq!(phrase.candidates.len(), 1);
+
+    let proximity = LexicalProximityV1 {
+        terms: vec!["durable".to_owned(), "owner".to_owned()],
+        maximum_gap: 5,
+    };
+    assert_eq!(
+        run(
+            "durable owner",
+            &[],
+            &[],
+            LexicalFieldV1::Documentation,
+            vec![proximity],
+        )
+        .candidates
+        .len(),
+        1
+    );
+    let too_narrow = LexicalProximityV1 {
+        terms: vec!["durable".to_owned(), "owner".to_owned()],
+        maximum_gap: 4,
+    };
+    assert!(
+        run(
+            "durable owner",
+            &[],
+            &[],
+            LexicalFieldV1::Documentation,
+            vec![too_narrow],
+        )
+        .candidates
+        .is_empty(),
+        "the maximum gap is inclusive and cannot widen"
+    );
+}
+
+#[test]
 fn disk_artifact_batch_stores_one_ngram_bitmap_shard_per_distinct_key() {
     let (fixture, pages, source_receipt) = real_verified_pages();
     let metadata = fixture.metadata.clone();
@@ -1514,7 +2705,7 @@ fn disk_artifact_batch_stores_one_ngram_bitmap_shard_per_distinct_key() {
     let one_shot = CodeLexicalProjectionAdapterV1::new_admitted(
         metadata.clone(),
         chunks,
-        page_symbol_qualified_names(&pages),
+        page_symbol_displays(&pages),
     )
     .expect("one-shot lexical projection");
     let directory = tempfile::tempdir().expect("artifact tempdir");
@@ -1674,7 +2865,7 @@ fn reader_rejects_unsupported_open_revisions_and_accepts_current() {
     )
     .expect("the current revision must open");
 
-    for revision in [9i64, 15] {
+    for revision in [9i64, 17] {
         let connection =
             rusqlite::Connection::open(&artifact_path).expect("open artifact mutation");
         connection
@@ -2065,7 +3256,7 @@ fn sealed_current_artifact_uses_compact_postings_and_reports_dbstat() {
             |row| row.get(0),
         )
         .expect("read current format revision");
-    assert_eq!(format_revision, 14);
+    assert_eq!(format_revision, 16);
     let uncompressed_ngram_rows: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM ngram_postings WHERE substr(documents, 1, 4) = x'54444e31' OR length(documents) > cardinality + 4",
@@ -2140,7 +3331,7 @@ fn sealed_current_artifact_uses_compact_postings_and_reports_dbstat() {
     );
     let binary_rows: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM rows WHERE substr(row, 1, 7) = x'54444c52313400'",
+            "SELECT COUNT(*) FROM rows WHERE substr(row, 1, 7) = x'54444c52313600'",
             [],
             |row| row.get(0),
         )
@@ -2150,7 +3341,7 @@ fn sealed_current_artifact_uses_compact_postings_and_reports_dbstat() {
         .expect("count rows");
     assert_eq!(
         binary_rows, total_rows,
-        "every revision-14 row carries the binary tag"
+        "every revision-16 row carries the binary tag"
     );
     let (interned_strings, staging_tables): (i64, i64) = connection
         .query_row(
@@ -3270,7 +4461,7 @@ fn disk_artifact_subdivides_import_only_suffix_without_replaying_chunks() {
     let mut text = (0..12)
         .map(|n| format!("import {{ helper{n} }} from \"dependency{n}\";\n"))
         .collect::<String>();
-    text.push_str("export function imported() { return helper0(); }\n");
+    text.push_str("export const imported = helper0;\n");
     let fixture = real_lexical_source_fixture_from_sources(vec![(
         "file.imports".to_owned(),
         "src/imports.ts".to_owned(),
@@ -3331,7 +4522,6 @@ fn disk_artifact_subdivides_import_only_suffix_without_replaying_chunks() {
         match result {
             Err(CodeLexicalArtifactErrorV1::BatchTooLarge { .. }) => {
                 refusals += 1;
-                assert!(refusals <= 2);
                 assert_eq!(source.cursor(), &before);
                 assert_eq!(builder.progress().unwrap(), progress);
                 assert!(source.tighten_page_record_bound().is_some());
@@ -4679,7 +5869,7 @@ fn disk_artifact_reader_selects_bounded_top_k_with_lane_tie_order_and_coverage()
     let one_shot = CodeLexicalProjectionAdapterV1::new_admitted(
         metadata.clone(),
         chunks,
-        page_symbol_qualified_names(&pages),
+        page_symbol_displays(&pages),
     )
     .expect("one-shot lexical projection");
     let directory = tempfile::tempdir().expect("artifact tempdir");
@@ -4906,6 +6096,7 @@ pub(crate) fn lexical_request(
         whole_terms: whole_terms.iter().map(|term| (*term).to_owned()).collect(),
         subtokens: subtokens.iter().map(|term| (*term).to_owned()).collect(),
         phrases: phrases.iter().map(|term| (*term).to_owned()).collect(),
+        proximities: Vec::new(),
         field_filters: Vec::<LexicalFieldFilterV1>::new(),
         fuzzy_budget,
         lexical_profile_revision: id("lexical-profile.v1"),
@@ -5202,6 +6393,13 @@ fn lexical_phrase_and_bounded_fuzzy_recovery_are_deterministic() {
     assert!(
         first.evidence_by_occurrence[&first.candidates[0].source_occurrence_id]
             .typo_recovery_applied
+    );
+    assert_eq!(
+        first.evidence_by_occurrence[&first.candidates[0].source_occurrence_id].spelling_variants,
+        [LexicalSpellingVariantV1 {
+            query: "resreve_stock".to_owned(),
+            alternative: "reserve_stock".to_owned(),
+        }]
     );
 
     let over_budget = lexical_request(

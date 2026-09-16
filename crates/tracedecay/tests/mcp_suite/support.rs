@@ -26,11 +26,11 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
 #[cfg(feature = "test-transport")]
 use tracedecay::mcp::McpServer;
+use tracedecay::project::TraceDecay;
 #[cfg(feature = "test-transport")]
 use tracedecay::test_support::host_admission::{
     HostAdmissionTestRuntimeV1, ProjectScopedTestRuntimeV1,
 };
-use tracedecay::tracedecay::TraceDecay;
 #[cfg(feature = "test-transport")]
 use tracedecay_domain::errors::TraceDecayError;
 #[cfg(feature = "test-transport")]
@@ -330,14 +330,16 @@ pub(crate) async fn wait_for_current_graph(server: &McpServer) {
                 freshness["status"].as_str(),
                 serving["state"].as_str(),
                 serving["reason"].as_str(),
+                freshness["worktree"]["staleness_state"].as_str(),
             ) {
-                (Some("current"), Some("ready"), _) => break,
-                (Some("warming"), _, _)
-                | (_, Some("pending"), _)
-                | (_, Some("unavailable"), Some("generation_unavailable")) => {
+                (Some("current"), Some("ready"), _, _) => break,
+                (Some("warming"), _, _, _)
+                | (Some("stale"), Some("ready"), _, Some("verifying"))
+                | (_, Some("pending"), _, _)
+                | (_, Some("unavailable"), Some("generation_unavailable"), _) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                (_, Some("refused"), _) | (_, _, Some("activation_disabled")) => {
+                (_, Some("refused"), _, _) | (_, _, Some("activation_disabled"), _) => {
                     panic!("graph readiness was refused: {status}");
                 }
                 actual => panic!("graph readiness became {actual:?}: {status}"),
@@ -741,7 +743,17 @@ pub(crate) async fn handle_tool_call_with_runtime(
         obj.entry("format".to_string())
             .or_insert_with(|| serde_json::json!("json"));
     }
-    Box::pin(runtime.call_mcp_tool_for_test(cg, tool_name, args, server_stats, scope_prefix)).await
+    Box::pin(
+        tracedecay::test_support::host_admission::call_mcp_tool_for_test(
+            runtime,
+            cg,
+            tool_name,
+            args,
+            server_stats,
+            scope_prefix,
+        ),
+    )
+    .await
 }
 
 #[cfg(feature = "test-transport")]

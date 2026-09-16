@@ -1,5 +1,8 @@
 //! Project-open authority accessors installed on an MCP server.
 
+use tracedecay_contracts::ResolvedScope;
+use tracedecay_query::code_search::{CodeIndexSearchAuthorityV1, CodeIndexSimilarExecutor};
+
 use super::{CodeGraphProjectionReadPort, CodeIndexIgnoredDependencyAdmissionPort, McpServer};
 
 impl McpServer {
@@ -13,6 +16,18 @@ impl McpServer {
         self.code_graph_projection_read_port.clone()
     }
 
+    pub(crate) fn code_index_similar_executor(&self) -> Option<CodeIndexSimilarExecutor> {
+        self.code_index_similar_executor.clone()
+    }
+
+    pub(crate) fn code_index_search_authority(&self) -> Option<CodeIndexSearchAuthorityV1> {
+        self.code_index_search_authority.clone()
+    }
+
+    pub(crate) fn admitted_project_scope(&self) -> Option<ResolvedScope> {
+        self.admitted_project_scope.clone()
+    }
+
     pub(crate) fn code_index_ignored_dependency_admission(
         &self,
     ) -> Option<CodeIndexIgnoredDependencyAdmissionPort> {
@@ -21,8 +36,8 @@ impl McpServer {
 
     pub(crate) fn install_generation_census_reader(
         &self,
-        reader: tracedecay_session_memory::runtime_telemetry::GenerationCensusReader,
-    ) -> std::result::Result<(), tracedecay_session_memory::runtime_telemetry::GenerationCensusReader>
+        reader: tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader,
+    ) -> std::result::Result<(), tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader>
     {
         self.generation_census_reader
             .set(reader)
@@ -34,7 +49,7 @@ impl McpServer {
 
     pub(crate) fn generation_census_reader(
         &self,
-    ) -> Option<tracedecay_session_memory::runtime_telemetry::GenerationCensusReader> {
+    ) -> Option<tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader> {
         self.generation_census_reader.get().cloned()
     }
 }

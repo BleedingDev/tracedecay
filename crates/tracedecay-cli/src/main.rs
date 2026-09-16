@@ -54,7 +54,6 @@ mod monitor_cmd;
 mod product_runtime;
 mod project_cmd;
 mod remote_command;
-mod semantic_cmd;
 mod serve_cmd;
 mod sessions_cmd;
 mod status_cmd;
@@ -67,10 +66,10 @@ mod workflow_cli;
 mod workflow_command;
 
 use cli::*;
-use tracedecay::daemon::StderrTracingDefault;
+use tracedecay_daemon_service::logging::StderrTracingDefault;
 
 pub(crate) fn current_unix_timestamp() -> i64 {
-    tracedecay::tracedecay::current_timestamp()
+    tracedecay::project::current_timestamp()
 }
 
 /// A self-animating spinner that ticks on a background thread.
@@ -286,7 +285,7 @@ fn async_runtime_flavor(command: Option<&Commands>) -> AsyncRuntimeFlavor {
 /// most `available + MIN_SERVING_BLOCKING_RESERVE`.
 fn tokio_blocking_thread_limit() -> usize {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    let effective = tracedecay::code_index::parallelism::installed_worker_status()
+    let effective = tracedecay_code_index::parallelism::installed_worker_status()
         .map(|status| usize::from(status.effective_workers))
         .unwrap_or(available);
     tokio_blocking_thread_limit_from(available, effective)
@@ -692,7 +691,9 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
     // Installed after parsing rather than first thing: hook stderr belongs to
     // the host, so which command is running has to be known before anything
     // is allowed to write there.
-    tracedecay::daemon::install_stderr_tracing(stderr_tracing_default(cli.command.as_ref()));
+    tracedecay_daemon_service::logging::install_stderr_tracing(stderr_tracing_default(
+        cli.command.as_ref(),
+    ));
     // Bound only Rayon's global pool for daemon workloads that actually use
     // it. Code indexing owns a separately planned pool shared by semantic
     // projection, so changing this ceiling cannot silently narrow that budget.
@@ -980,7 +981,6 @@ impl CommandFamily {
             Commands::Tool { .. }
             | Commands::Work { .. }
             | Commands::Workflow { .. }
-            | Commands::Semantic { .. }
             | Commands::Lsp { .. }
             | Commands::Remote { .. }
             | Commands::Dashboard { .. }
@@ -1325,7 +1325,6 @@ async fn dispatch_runtime_command(command: Commands) -> tracedecay_domain::error
         }
         Commands::Work { invocation } => work_command::run(invocation).await?,
         Commands::Workflow { invocation } => workflow_command::run(invocation).await?,
-        Commands::Semantic { action } => semantic_cmd::run(action).await?,
         Commands::Remote { action } => {
             hotpath::measure_block!("cli.remote.run", crate::remote_command::run(action.into()))?;
         }
@@ -1982,7 +1981,6 @@ impl CommandStartupPolicy {
             Commands::Tool { .. }
             | Commands::Work { .. }
             | Commands::Workflow { .. }
-            | Commands::Semantic { .. }
             | Commands::Remote { .. }
             | Commands::Git { .. } => Self::SkipAll,
             // Explicit lifecycle/maintenance commands manage their own work.

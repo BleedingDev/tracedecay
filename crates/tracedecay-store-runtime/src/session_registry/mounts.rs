@@ -6,10 +6,10 @@ use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
-use tracedecay_application::semantic_runtime::SemanticVectorOperationTaskOwnerV1;
 use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_domain::{BrainNodeId, EnrollmentGrantV1};
 use tracedecay_graph_db::{GraphDbRegistry, GraphDbRegistryConfig};
+use tracedecay_runtime_core::RuntimeOperationTaskOwnerV1;
 #[cfg(any(test, feature = "test-helpers"))]
 use tracedecay_rusqlite_runtime::remote::RemoteRecoverySqliteAuthorityV1;
 use tracedecay_rusqlite_runtime::remote::{
@@ -207,9 +207,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             graph_registry,
             graph_manifest_provider,
             graph_lifecycle_cancelled: Arc::new(AtomicBool::new(false)),
-            semantic_vector_operation_task_owner: Arc::new(
-                SemanticVectorOperationTaskOwnerV1::new(),
-            ),
+            operation_task_owner: Arc::new(RuntimeOperationTaskOwnerV1::new()),
             profile_pin: Mutex::new(Some(profile_pin)),
             profile_database_mount: Mutex::new(()),
             profile_database: std::sync::Mutex::new(None),
@@ -221,8 +219,6 @@ impl DaemonSessionRuntimeRegistryV1 {
             remote_replay_transaction,
             remote_recovery_authorities: Mutex::new(BTreeMap::new()),
             project_owners: super::ProjectRuntimeOwnerRegistryV1::default(),
-            profile_semantic_lifecycle: super::SemanticLifecycleOwnerCell::default(),
-            semantic_lifecycle_closed: Arc::new(AtomicBool::new(false)),
             code_graph_publication_gates: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             registered_schema_convergence: RegisteredSchemaConvergenceMaintenance::new(),
             retained_hook_tasks: RetainedHookTasks::new(),
@@ -902,7 +898,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                 self.registry.clone(),
                 self.graph_registry.clone(),
                 Arc::clone(&self.graph_lifecycle_cancelled),
-                Arc::clone(&self.semantic_vector_operation_task_owner),
+                Arc::clone(&self.operation_task_owner),
                 self.profile_authority_pin("attach remote recovery authority")
                     .await?,
                 self.project_owners.clone(),
@@ -1029,8 +1025,8 @@ impl DaemonSessionRuntimeRegistryV1 {
         databases
     }
 
-    /// Releases exclusive Grafeo writers at daemon shutdown, after semantic
-    /// vector operation settlement and reconciliation workers have joined.
+    /// Releases exclusive Grafeo writers at daemon shutdown, after graph
+    /// operation settlement and reconciliation workers have joined.
     ///
     /// The shutdown close requires every graph owner to be unleased, so this
     /// first drains the retained owners out of the registry maps: dropping a
@@ -1083,10 +1079,10 @@ impl DaemonSessionRuntimeRegistryV1 {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((project_id, state)) = projects.iter().find_map(|(project_id, state)| {
                 let state = match state {
-                    ProjectRuntimeOwnerStateV1::Opening(_) => "opening",
-                    ProjectRuntimeOwnerStateV1::ReplacingSessions(_) => "replacing_sessions",
-                    ProjectRuntimeOwnerStateV1::Recovering(_) => "recovering",
-                    ProjectRuntimeOwnerStateV1::Retiring(_) => "retiring",
+                    ProjectRuntimeOwnerStateV1::Opening => "opening",
+                    ProjectRuntimeOwnerStateV1::ReplacingSessions => "replacing_sessions",
+                    ProjectRuntimeOwnerStateV1::Recovering => "recovering",
+                    ProjectRuntimeOwnerStateV1::Retiring => "retiring",
                     ProjectRuntimeOwnerStateV1::Ready(_)
                     | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                     | ProjectRuntimeOwnerStateV1::Faulted(_) => return None,
@@ -1183,10 +1179,10 @@ impl DaemonSessionRuntimeRegistryV1 {
                         ));
                     }
                 }
-                ProjectRuntimeOwnerStateV1::Opening(_)
-                | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                | ProjectRuntimeOwnerStateV1::Recovering(_)
-                | ProjectRuntimeOwnerStateV1::Retiring(_) => {
+                ProjectRuntimeOwnerStateV1::Opening
+                | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                | ProjectRuntimeOwnerStateV1::Recovering
+                | ProjectRuntimeOwnerStateV1::Retiring => {
                     return Err(session_registry_error(
                         "drain graph owners for shutdown",
                         "project runtime owner transition changed after terminal preflight"
@@ -1259,7 +1255,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                     }
                     true
                 }
-                Some(ProjectRuntimeOwnerStateV1::Opening(_)) => {
+                Some(ProjectRuntimeOwnerStateV1::Opening) => {
                     #[cfg(feature = "hotpath")]
                     hotpath::gauge!("daemon.session_registry.mount.denied_total").inc(1_u64);
                     return Err(TraceDecayError::project_route(
@@ -1269,9 +1265,9 @@ impl DaemonSessionRuntimeRegistryV1 {
                     ));
                 }
                 Some(
-                    ProjectRuntimeOwnerStateV1::Retiring(_)
-                    | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                    | ProjectRuntimeOwnerStateV1::Recovering(_)
+                    ProjectRuntimeOwnerStateV1::Retiring
+                    | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                    | ProjectRuntimeOwnerStateV1::Recovering
                     | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                     | ProjectRuntimeOwnerStateV1::Faulted(_),
                 ) => {
@@ -1425,15 +1421,15 @@ impl DaemonSessionRuntimeRegistryV1 {
                 })?;
                 issue_mounted_memory_lease(owner, access, true)
             }
-            Some(ProjectRuntimeOwnerStateV1::Opening(_)) => Err(TraceDecayError::project_route(
+            Some(ProjectRuntimeOwnerStateV1::Opening) => Err(TraceDecayError::project_route(
                 "project_runtime_opening",
                 true,
                 "Project runtime is already opening",
             )),
             Some(
-                ProjectRuntimeOwnerStateV1::Retiring(_)
-                | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                | ProjectRuntimeOwnerStateV1::Recovering(_)
+                ProjectRuntimeOwnerStateV1::Retiring
+                | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                | ProjectRuntimeOwnerStateV1::Recovering
                 | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                 | ProjectRuntimeOwnerStateV1::Faulted(_),
             ) => Err(TraceDecayError::project_route(
@@ -1476,15 +1472,15 @@ impl DaemonSessionRuntimeRegistryV1 {
                     Err(error) => Err(error),
                 }
             }
-            Some(ProjectRuntimeOwnerStateV1::Opening(_)) => Err(TraceDecayError::project_route(
+            Some(ProjectRuntimeOwnerStateV1::Opening) => Err(TraceDecayError::project_route(
                 "project_runtime_opening",
                 true,
                 "Project runtime is already opening",
             )),
             Some(
-                ProjectRuntimeOwnerStateV1::Retiring(_)
-                | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                | ProjectRuntimeOwnerStateV1::Recovering(_)
+                ProjectRuntimeOwnerStateV1::Retiring
+                | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                | ProjectRuntimeOwnerStateV1::Recovering
                 | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                 | ProjectRuntimeOwnerStateV1::Faulted(_),
             ) => Err(TraceDecayError::project_route(
@@ -1541,7 +1537,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                         Ok((true, None))
                     }
                 }
-                Some(ProjectRuntimeOwnerStateV1::Opening(_)) => {
+                Some(ProjectRuntimeOwnerStateV1::Opening) => {
                     #[cfg(feature = "hotpath")]
                     hotpath::gauge!("daemon.session_registry.mount.denied_total").inc(1_u64);
                     Err(TraceDecayError::project_route(
@@ -1551,9 +1547,9 @@ impl DaemonSessionRuntimeRegistryV1 {
                     ))
                 }
                 Some(
-                    ProjectRuntimeOwnerStateV1::Retiring(_)
-                    | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                    | ProjectRuntimeOwnerStateV1::Recovering(_)
+                    ProjectRuntimeOwnerStateV1::Retiring
+                    | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                    | ProjectRuntimeOwnerStateV1::Recovering
                     | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                     | ProjectRuntimeOwnerStateV1::Faulted(_),
                 ) => {
@@ -1656,17 +1652,15 @@ impl DaemonSessionRuntimeRegistryV1 {
                         Ok(None)
                     }
                 }
-                Some(ProjectRuntimeOwnerStateV1::Opening(_)) => {
-                    Err(TraceDecayError::project_route(
-                        "project_runtime_opening",
-                        true,
-                        "Project runtime is already opening",
-                    ))
-                }
+                Some(ProjectRuntimeOwnerStateV1::Opening) => Err(TraceDecayError::project_route(
+                    "project_runtime_opening",
+                    true,
+                    "Project runtime is already opening",
+                )),
                 Some(
-                    ProjectRuntimeOwnerStateV1::Retiring(_)
-                    | ProjectRuntimeOwnerStateV1::ReplacingSessions(_)
-                    | ProjectRuntimeOwnerStateV1::Recovering(_)
+                    ProjectRuntimeOwnerStateV1::Retiring
+                    | ProjectRuntimeOwnerStateV1::ReplacingSessions
+                    | ProjectRuntimeOwnerStateV1::Recovering
                     | ProjectRuntimeOwnerStateV1::RecoveryRequired(_)
                     | ProjectRuntimeOwnerStateV1::Faulted(_),
                 ) => Err(TraceDecayError::project_route(

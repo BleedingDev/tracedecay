@@ -21,7 +21,7 @@ use super::scheduler_automation_effect;
 use crate::daemon::DaemonEngine;
 use tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledTerminal;
 
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_automation_runtime::automation::effect_runtime::settlement::{
     AutomationEffectAdmission, AutomationEffectAuthority, DeferredProblemSettlementRequest,
     DeferredRunSettlementRequest, DeferredSettlementOutcome, DeferredSettlementRequest,
@@ -855,9 +855,9 @@ mod tests {
             std::fs::write(project_root.join("src/lib.rs"), "pub fn fixture() {}\n")
                 .expect("combined admission source");
             let memory = Arc::new(
-                TraceDecay::init_with_options(
+                TraceDecay::init_with_options_for_test(
                     &project_root,
-                    crate::tracedecay::TraceDecayOpenOptions {
+                    crate::project::TraceDecayOpenOptions {
                         profile_root: Some(profile_root.clone()),
                         global_db_path: Some(profile_root.join("global.db")),
                     },
@@ -902,8 +902,8 @@ mod tests {
             .expect("combined admission retained grant");
             let engine = DaemonEngine::default();
             let invocation_service = engine.invocation.invocation_service();
-            let retained_ports = crate::daemon::retained_owner::retained_surface_ports(
-                crate::daemon::retained_owner::ProductionRetainedAuthoritiesV1 {
+            let retained_ports = tracedecay_daemon_service::retained_owner::retained_surface_ports(
+                tracedecay_daemon_service::retained_owner::ProductionRetainedAuthoritiesV1 {
                     cg: Arc::new(tokio::sync::RwLock::new(Arc::clone(&memory))),
                     project_root: project_root.clone(),
                     project_id: project_id.clone(),
@@ -1166,7 +1166,7 @@ mod tests {
         let cancellation = CancellationSignal::active(format!("cancel.{run_id}"))
             .expect("combined recovery cancellation");
         let report =
-            crate::daemon::automation_effect::recovery_composition::reconcile_reserved_automation_effects_for_project(
+            tracedecay_daemon_service::automation_effect::recovery_composition::reconcile_reserved_automation_effects_for_project(
                 fixture.memory.as_ref(),
                 &fixture.dashboard_root,
                 &cancellation,
@@ -1187,7 +1187,7 @@ mod tests {
         assert!(!conflicting_journal.exists());
         assert!(pending_journal_files(&fixture.dashboard_root).is_empty());
         let report =
-            crate::daemon::automation_effect::recovery_composition::reconcile_reserved_automation_effects_for_project(
+            tracedecay_daemon_service::automation_effect::recovery_composition::reconcile_reserved_automation_effects_for_project(
                 fixture.memory.as_ref(),
                 &fixture.dashboard_root,
                 &cancellation,

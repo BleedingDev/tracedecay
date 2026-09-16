@@ -37,7 +37,13 @@ fn classify_sealed_generation_decode_error(
                 sealed_state_digest: sealed_state_digest.as_str().to_owned(),
             }
         }
-        error @ CodeIndexProductionErrorV1::SealedRowContractRefused { .. } => {
+        // A row shape or an envelope revision this build no longer reads is
+        // the same typed state to replay: the sealed bytes are intact, this
+        // build just cannot derive a graph from them, so replay reports
+        // unavailability and the generation is rebuilt rather than declared
+        // corrupt.
+        error @ (CodeIndexProductionErrorV1::SealedRowContractRefused { .. }
+        | CodeIndexProductionErrorV1::SupersededSealedGenerationRevision(_)) => {
             GraphDbError::SealedRevisionIncompatible {
                 sealed_state_digest: sealed_state_digest.as_str().to_owned(),
                 message: error.to_string(),
@@ -1615,9 +1621,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tracedecay_code_index_retention::code_index_generations::{
-        CodeGenerationRetentionModeV1, DEFAULT_SUPERSEDED_GENERATION_FLOOR,
-        DurablePublicationPointerV1, acquire_code_generation_store_lock,
-        run_code_generation_retention,
+        CodeGenerationRetentionModeV1, DurablePublicationPointerV1,
+        acquire_code_generation_store_lock, run_code_generation_retention,
     };
     use tracedecay_domain::{
         CodeGenerationId, ProjectId, RepositoryId, UtcMicros, sha256_hex_suffix,
@@ -2377,7 +2382,6 @@ mod tests {
                 let report = run_code_generation_retention(
                     &scoped_store,
                     &BTreeSet::new(),
-                    DEFAULT_SUPERSEDED_GENERATION_FLOOR,
                     CodeGenerationRetentionModeV1::Apply,
                     UtcMicros(1),
                     Some(&replay_root),

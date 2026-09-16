@@ -14,7 +14,7 @@ fn retired_simplify_scan_is_absent_from_the_public_catalog() {
             .all(|definition| definition.name != retired)
     );
     assert!(
-        crate::mcp::tools::binding::mcp_dispatch_catalog()
+        tracedecay_mcp::tools::binding::mcp_dispatch_catalog()
             .expect("MCP dispatch catalog")
             .contract(retired)
             .is_none()
@@ -32,10 +32,10 @@ fn terminal_application_definitions_project_canonical_request_schemas() {
         ("impact", "tracedecay_impact", true),
         ("node", "tracedecay_node", true),
         ("similar", "tracedecay_similar", false),
+        ("redundancy", "tracedecay_redundancy", false),
         ("rename_preview", "tracedecay_rename_preview", false),
         ("port_status", "tracedecay_port_status", false),
         ("port_order", "tracedecay_port_order", false),
-        ("redundancy", "tracedecay_redundancy", false),
         ("todos", "tracedecay_todos", false),
     ] {
         let operation_id = OperationId::new(format!("operation.application.{operation}"))
@@ -71,6 +71,37 @@ fn terminal_application_definitions_project_canonical_request_schemas() {
             projected,
             tracedecay_mcp::mcp_input_schema(canonical),
             "{tool_name} must project its canonical executable request schema before MCP transport fields",
+        );
+    }
+}
+
+#[test]
+fn work_proposal_tools_expose_only_the_dispositions_their_routes_accept() {
+    let tools = get_tool_definitions().expect("tool definitions");
+    for (tool_name, disposition_schema, expected) in [
+        (
+            "tracedecay_work_review_proposal",
+            "ReviewWorkProposalDispositionV1",
+            json!(["rejected", "superseded"]),
+        ),
+        (
+            "tracedecay_work_accept_proposal",
+            "AcceptWorkProposalDispositionV1",
+            json!(["accepted"]),
+        ),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} must be advertised"));
+        assert_eq!(
+            tool.input_schema["properties"]["disposition"]["$ref"],
+            format!("#/$defs/{disposition_schema}"),
+            "{tool_name} must expose its route-specific disposition schema"
+        );
+        assert_eq!(
+            tool.input_schema["$defs"][disposition_schema]["enum"], expected,
+            "{tool_name} must not advertise a disposition its handler refuses"
         );
     }
 }
@@ -292,7 +323,8 @@ fn format_capable_tools_advertise_markdown_json_without_tables() {
 
 #[test]
 fn advertised_read_only_matches_canonical_execution_effect() {
-    let catalog = crate::mcp::tools::binding::mcp_dispatch_catalog().expect("MCP dispatch catalog");
+    let catalog =
+        tracedecay_mcp::tools::binding::mcp_dispatch_catalog().expect("MCP dispatch catalog");
     for tool in get_tool_definitions().expect("tool definitions") {
         if INTERNAL_DAEMON_TOOL_NAMES.contains(&tool.name.as_str()) {
             continue;

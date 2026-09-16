@@ -1,24 +1,21 @@
 //! In-process owner for the daemon's production project composition.
 //!
 //! Test and `test-transport` builds use this to drive the same composition the
-//! daemon runs, against one isolated profile-and-projects root.
+//! daemon runs, against one isolated profile-and-projects root. The parent
+//! module mounts it behind that gate, so a default or `production` build
+//! compiles none of it.
 
-#[cfg(any(test, feature = "test-transport"))]
 use std::future::Future;
-#[cfg(any(test, feature = "test-transport"))]
 use std::pin::Pin;
-#[cfg(any(test, feature = "test-transport"))]
 use std::sync::{
     OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
-#[cfg(all(unix, any(test, feature = "test-transport")))]
+#[cfg(unix)]
 use super::bootstrap::set_owner_only_permissions;
 // The parent `daemon` module imports this under `cfg(test)` only, so
-// `use super::*` cannot carry it into a `test-transport` build. Import it
-// directly under the same gate the harness itself is compiled behind.
-#[cfg(any(test, feature = "test-transport"))]
+// `use super::*` cannot carry it into a `test-transport` build.
 use super::project_composition::daemon_transcript_source_home;
 // The interposing open path is the only caller of the explicit-selector
 // composition entry, so both are imported under exactly its gate. A build
@@ -29,18 +26,15 @@ use super::project_composition::{
     NativeApplicationPortInterpositionV1, ProjectMemoryProviderActivationSelector,
     production_project_server_with_activation,
 };
-#[cfg(any(test, feature = "test-transport"))]
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
-#[cfg(any(test, feature = "test-transport"))]
 use super::*;
-#[cfg(all(unix, any(test, feature = "test-transport")))]
+#[cfg(unix)]
 use tracedecay_application::pr_tracking::try_acquire_manual_branch_lifecycle;
 #[cfg(all(unix, feature = "test-transport"))]
 use tracedecay_code_index_runtime::git_transactions;
-#[cfg(any(test, feature = "test-transport"))]
 use tracedecay_daemon_identity::profile_identity;
 
-#[cfg(all(unix, any(test, feature = "test-transport")))]
+#[cfg(unix)]
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 /// Captures the daemon's exact native Git transaction precondition for
@@ -64,7 +58,6 @@ pub fn capture_exact_git_snapshot_for_test(
     )
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionProjectHarnessResourcesV1 {
     store_administration: StoreAdministration,
     invocation: DaemonInvocationState,
@@ -81,19 +74,16 @@ struct ProductionProjectHarnessResourcesV1 {
 /// In-process owner for the same production project composition used by the
 /// daemon. The caller supplies one isolated root containing both the profile
 /// and every project; live profile paths are rejected before any store opens.
-#[cfg(any(test, feature = "test-transport"))]
 #[doc(hidden)]
 pub struct ProductionProjectCompositionHarnessV1 {
     isolation_root: PathBuf,
     profile_root: PathBuf,
-    semantic_auto_download_enabled: bool,
     resources: Option<ProductionProjectHarnessResourcesV1>,
 }
 
 /// The isolated profile the composition owns inside one isolation root.
 ///
 /// Resolvable before `open` so a caller can predict the composed layout.
-#[cfg(any(test, feature = "test-transport"))]
 fn composed_profile_root(isolation_root: &Path) -> PathBuf {
     isolation_root.join("profile")
 }
@@ -102,7 +92,6 @@ fn composed_profile_root(isolation_root: &Path) -> PathBuf {
 ///
 /// A generic `async fn` open inlined the whole composition into every test
 /// future; rustc then overflowed the layout-query depth budget.
-#[cfg(any(test, feature = "test-transport"))]
 type ProductionHarnessOpenFuture =
     Pin<Box<dyn Future<Output = Result<ProductionProjectCompositionHarnessV1>> + Send>>;
 
@@ -113,10 +102,8 @@ type ProductionHarnessOpenFuture =
 /// available or installed worker width by 24 therefore admits only the
 /// measured four-wide load before worker-plan installation and preserves more
 /// than 2x headroom under the unchanged 20 s per-composition wait.
-#[cfg(any(test, feature = "test-transport"))]
 const PRODUCTION_COMPOSITION_CPU_DIVISOR: usize = 24;
 
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionCompositionAdmissionGateV1 {
     semaphore: tokio::sync::Semaphore,
     capacity: usize,
@@ -126,7 +113,6 @@ struct ProductionCompositionAdmissionGateV1 {
     high_water_mark: AtomicUsize,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl ProductionCompositionAdmissionGateV1 {
     fn new(capacity: usize) -> Self {
         Self {
@@ -177,12 +163,10 @@ impl ProductionCompositionAdmissionGateV1 {
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionCompositionWaitingV1 {
     gate: &'static ProductionCompositionAdmissionGateV1,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl ProductionCompositionWaitingV1 {
     fn new(gate: &'static ProductionCompositionAdmissionGateV1) -> Self {
         gate.waiting.fetch_add(1, Ordering::AcqRel);
@@ -190,19 +174,16 @@ impl ProductionCompositionWaitingV1 {
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl Drop for ProductionCompositionWaitingV1 {
     fn drop(&mut self) {
         self.gate.waiting.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionCompositionAdmittedV1 {
     gate: &'static ProductionCompositionAdmissionGateV1,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl ProductionCompositionAdmittedV1 {
     fn new(gate: &'static ProductionCompositionAdmissionGateV1) -> Self {
         let admitted = gate.admitted.fetch_add(1, Ordering::AcqRel) + 1;
@@ -214,7 +195,6 @@ impl ProductionCompositionAdmittedV1 {
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl Drop for ProductionCompositionAdmittedV1 {
     fn drop(&mut self) {
         self.gate.admitted.fetch_sub(1, Ordering::AcqRel);
@@ -225,13 +205,11 @@ impl Drop for ProductionCompositionAdmittedV1 {
 /// the semaphore permit is returned, or a waiter can be admitted while the
 /// previous composition is still counted and the high-water mark overshoots
 /// the capacity by one.
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionCompositionAdmissionPermitV1 {
     _admitted: ProductionCompositionAdmittedV1,
     _semaphore: tokio::sync::SemaphorePermit<'static>,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 #[derive(Clone, Copy)]
 struct ProductionCompositionAdmissionSnapshotV1 {
     capacity: usize,
@@ -239,7 +217,6 @@ struct ProductionCompositionAdmissionSnapshotV1 {
     waiting: usize,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 fn production_composition_admission_capacity() -> usize {
     let worker_width = tracedecay_code_index::parallelism::installed_worker_status().map_or_else(
         || std::thread::available_parallelism().map_or(1, usize::from),
@@ -248,7 +225,6 @@ fn production_composition_admission_capacity() -> usize {
     (worker_width / PRODUCTION_COMPOSITION_CPU_DIVISOR).max(1)
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 fn production_composition_admission_gate() -> &'static ProductionCompositionAdmissionGateV1 {
     static GATE: OnceLock<ProductionCompositionAdmissionGateV1> = OnceLock::new();
     GATE.get_or_init(|| {
@@ -256,14 +232,12 @@ fn production_composition_admission_gate() -> &'static ProductionCompositionAdmi
     })
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 struct IsolatedProductionCompositionRoots {
     isolation_root: PathBuf,
     profile_root: PathBuf,
     project_roots: Vec<PathBuf>,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 struct ProductionCompositionStoreHandles {
     store_administration: StoreAdministration,
     invocation: DaemonInvocationState,
@@ -271,7 +245,6 @@ struct ProductionCompositionStoreHandles {
     project_open_gates: Arc<tokio::sync::Mutex<ProjectOpenGates>>,
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 fn isolate_production_composition_roots(
     isolation_root: PathBuf,
     project_roots: Vec<PathBuf>,
@@ -354,7 +327,6 @@ fn isolate_production_composition_roots(
     })
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 fn acquire_production_composition_identity(
     profile_root: &Path,
 ) -> Result<(
@@ -377,7 +349,6 @@ fn acquire_production_composition_identity(
     })
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 async fn install_production_composition_stores(
     profile_identity: profile_identity::LocalProfileIdentityAuthorityV1,
     long_lived_session_maintenance_for_test: bool,
@@ -411,7 +382,6 @@ async fn install_production_composition_stores(
     })
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 async fn install_production_composition_profile_workers(
     store_administration: &StoreAdministration,
     invocation: &DaemonInvocationState,
@@ -455,7 +425,6 @@ async fn install_production_composition_profile_workers(
     .await
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 async fn mount_production_composition_projects(
     stores: &ProductionCompositionStoreHandles,
     project_roots: Vec<PathBuf>,
@@ -465,16 +434,15 @@ async fn mount_production_composition_projects(
     #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
         NativeApplicationPortInterpositionV1,
     >,
-) -> Result<(HashMap<PathBuf, Arc<crate::mcp::McpServer>>, bool)> {
+) -> Result<HashMap<PathBuf, Arc<crate::mcp::McpServer>>> {
     let client_identity = DaemonClientIdentity {
         profile_root: profile_root.to_path_buf(),
         global_db_path: profile_root.join("global.db"),
     };
     let mut servers = HashMap::new();
-    let mut semantic_auto_download_enabled = false;
     for (index, project_root) in project_roots.into_iter().enumerate() {
-        let (canonical_project_path, server, project_semantic) =
-            Box::pin(mount_one_production_composition_project(
+        let (canonical_project_path, server) = Box::pin(
+            mount_one_production_composition_project(
                 stores,
                 project_root,
                 &client_identity,
@@ -483,15 +451,14 @@ async fn mount_production_composition_projects(
                 wait_for_code_index,
                 #[cfg(all(test, feature = "memory-provider-host"))]
                 native_port_interposition.clone(),
-            ))
-            .await?;
-        semantic_auto_download_enabled |= project_semantic;
+            ),
+        )
+        .await?;
         servers.insert(canonical_project_path, server);
     }
-    Ok((servers, semantic_auto_download_enabled))
+    Ok(servers)
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 async fn mount_one_production_composition_project(
     stores: &ProductionCompositionStoreHandles,
     project_root: PathBuf,
@@ -502,7 +469,7 @@ async fn mount_one_production_composition_project(
     #[cfg(all(test, feature = "memory-provider-host"))] native_port_interposition: Option<
         NativeApplicationPortInterpositionV1,
     >,
-) -> Result<(PathBuf, Arc<crate::mcp::McpServer>, bool)> {
+) -> Result<(PathBuf, Arc<crate::mcp::McpServer>)> {
     let handshake = DaemonHandshake {
         client_version: binary_version()?.to_owned(),
         client_instance_id: format!("production-composition-harness-{index}"),
@@ -514,7 +481,7 @@ async fn mount_one_production_composition_project(
         allow_initialize_root_routing: false,
         tool_list_changed_capable: false,
         catalog_version: String::new(),
-        moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
+        moved_store_adoption: crate::project::MovedStoreAdoption::Never,
     };
     let (canonical_project_path, _) = project_route_for_handshake(&handshake)?;
     let composition = stores
@@ -543,7 +510,6 @@ async fn mount_one_production_composition_project(
                         canonical_project_path,
                         handshake,
                         ProductionProjectCompositionRuntime::Portable {
-                            semantic_auto_download: false,
                             startup_catch_up: false,
                         },
                         &cancellation,
@@ -551,7 +517,8 @@ async fn mount_one_production_composition_project(
                             FromRuntimeConfigurationWithNativePortInterposition(interposition),
                         None,
                     )
-                    .await;
+                    .await
+                    .map(|composition| (composition.canonical_project_path, composition.server));
                 }
                 production_project_server(
                     store_administration,
@@ -561,7 +528,6 @@ async fn mount_one_production_composition_project(
                     canonical_project_path,
                     handshake,
                     ProductionProjectCompositionRuntime::Portable {
-                        semantic_auto_download: false,
                         startup_catch_up: false,
                     },
                     &cancellation,
@@ -591,21 +557,9 @@ async fn mount_one_production_composition_project(
         ))
         .await?;
     }
-    let semantic_auto_download_enabled =
-        composition
-            .semantic_auto_download_enabled
-            .ok_or_else(|| TraceDecayError::Config {
-                message: "production-composition harness reused an unobserved semantic runtime"
-                    .to_owned(),
-            })?;
-    Ok((
-        composition.canonical_project_path,
-        composition.server,
-        semantic_auto_download_enabled,
-    ))
+    Ok((composition.canonical_project_path, composition.server))
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl ProductionProjectCompositionHarnessV1 {
     /// Where the composed daemon reads host transcripts from, resolvable
     /// before `open`.
@@ -637,14 +591,7 @@ impl ProductionProjectCompositionHarnessV1 {
     }
 
     /// Opens the same production composition as [`Self::open`], with the
-    /// caller's own interposition on the application port the enabled mount
-    /// injects into the registry.
-    ///
-    /// Everything else is the production path: the configuration gates decide
-    /// whether a host is mounted at all, the routing gate decides the recall
-    /// route, and the registry's own adapter validates the descriptor the
-    /// returned port declares. A composition whose gates are off still mounts
-    /// nothing and never calls the interposition.
+    /// caller's own interposition on the Native application port.
     #[cfg(all(test, feature = "memory-provider-host"))]
     pub(super) fn open_with_native_application_port_interposition(
         isolation_root: impl AsRef<Path>,
@@ -714,7 +661,9 @@ impl ProductionProjectCompositionHarnessV1 {
     ) -> ProductionHarnessOpenFuture {
         // Embedded compositions skip the binary logging bootstrap; surface
         // activation retry/refusal diagnostics in the product journey.
-        install_stderr_tracing(StderrTracingDefault::Warn);
+        tracedecay_daemon_service::logging::install_stderr_tracing(
+            tracedecay_daemon_service::logging::StderrTracingDefault::Warn,
+        );
         Box::pin(async move {
             let _composition_admission = production_composition_admission_gate().acquire().await?;
             // Embedded test compositions never pass through the binary's
@@ -734,21 +683,19 @@ impl ProductionProjectCompositionHarnessV1 {
                 long_lived_session_maintenance_for_test,
             ))
             .await?;
-            let (servers, semantic_auto_download_enabled) =
-                Box::pin(mount_production_composition_projects(
-                    &stores,
-                    isolated.project_roots,
-                    &isolated.profile_root,
-                    scope_prefix,
-                    wait_for_code_index,
-                    #[cfg(all(test, feature = "memory-provider-host"))]
-                    native_port_interposition,
-                ))
-                .await?;
+            let servers = Box::pin(mount_production_composition_projects(
+                &stores,
+                isolated.project_roots,
+                &isolated.profile_root,
+                scope_prefix,
+                wait_for_code_index,
+                #[cfg(all(test, feature = "memory-provider-host"))]
+                native_port_interposition,
+            ))
+            .await?;
             Ok(Self {
                 isolation_root: isolated.isolation_root,
                 profile_root: isolated.profile_root,
-                semantic_auto_download_enabled,
                 resources: Some(ProductionProjectHarnessResourcesV1 {
                     store_administration: stores.store_administration,
                     invocation: stores.invocation,
@@ -803,10 +750,6 @@ impl ProductionProjectCompositionHarnessV1 {
 
     pub fn profile_root(&self) -> &Path {
         &self.profile_root
-    }
-
-    pub fn semantic_auto_download_enabled(&self) -> bool {
-        self.semantic_auto_download_enabled
     }
 
     #[hotpath::measure(label = "daemon.harness.read_profile_analytics", future = true)]
@@ -1093,7 +1036,6 @@ impl ProductionProjectCompositionHarnessV1 {
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 #[hotpath::measure(label = "daemon.harness.wait_code_index", future = true)]
 async fn wait_for_production_composition_code_index(
     invocation: &DaemonInvocationState,
@@ -1212,7 +1154,6 @@ async fn wait_for_production_composition_code_index(
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 impl Drop for ProductionProjectCompositionHarnessV1 {
     fn drop(&mut self) {
         let Some(resources) = self.resources.take() else {
@@ -1227,7 +1168,6 @@ impl Drop for ProductionProjectCompositionHarnessV1 {
     }
 }
 
-#[cfg(any(test, feature = "test-transport"))]
 async fn shutdown_production_project_harness(mut resources: ProductionProjectHarnessResourcesV1) {
     #[cfg(unix)]
     if let Err(reason) = resources
@@ -1277,15 +1217,16 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
         label = "daemon.harness.shutdown_sessions"
     )
     .await;
-    let shutdown_deadline =
-        tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
     hotpath::future!(
-        resources.invocation.shutdown_until(shutdown_deadline),
+        resources.invocation.shutdown(),
         label = "daemon.harness.shutdown_invocation"
     )
     .await;
     hotpath::future!(
-        shutdown_detached_project_servers(shutdown_deadline, servers),
+        shutdown_detached_project_servers(
+            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
+            servers,
+        ),
         label = "daemon.harness.shutdown_detached"
     )
     .await;
@@ -1675,24 +1616,6 @@ mod configuration_idempotency_journey_test;
 
 #[cfg(test)]
 mod read_only_project_open_journey_test;
-
-#[cfg(test)]
-mod semantic_activation_journey_test;
-
-#[cfg(test)]
-mod semantic_availability_fallback_digest;
-
-#[cfg(test)]
-mod semantic_availability_journey_test;
-
-#[cfg(test)]
-mod semantic_restart_journey_test;
-
-#[cfg(test)]
-mod semantic_index_fixture_check_test;
-
-#[cfg(all(test, feature = "test-helpers"))]
-mod codex_stop_journey_test;
 
 #[cfg(test)]
 mod lcm_preserved_profile_journey_test;

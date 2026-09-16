@@ -87,28 +87,30 @@ pub use git_topology_anchor::{
     GitTopologyAnchorResolutionOutcomeV2, GitTopologyAnchorResolutionV2,
     MAX_GIT_TOPOLOGY_ANCHORS_PER_PUBLICATION_V2,
 };
-pub use grep_analysis::RedundancyResultV1;
 pub use ports::{
     AffectedTestsRetrievalPort, OperationalRetrievalPort, RetrievalPortContext,
-    RetrievalPortOutcome, SessionRetrievalBudgetStageV1, SessionRetrievalStructuralRefusalV1,
-    SourceRetrievalPort, TemporalRetrievalFailure, TemporalRetrievalFuture, TemporalRetrievalPort,
+    RetrievalPortOutcome, SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetObservationV1,
+    SessionRetrievalBudgetStageV1, SessionRetrievalStructuralRefusalV1, SourceRetrievalPort,
+    TemporalRetrievalFailure, TemporalRetrievalFuture, TemporalRetrievalPort,
 };
 pub use primitive_surface::{
     CalleeV1, CalleesResultV1, CalleesSurfaceRequestV1, ContextCodeBlockV1, ContextModeV1,
     ContextResultV1, ContextSearchMatchV1, ContextSurfaceRequestV1, ImpactNodeV1, ImpactResultV1,
-    ImpactSurfaceRequestV1, NodeDepthSurfaceRequestV1, NodeDetailsV1, NodeExpansionCostV1,
+    ImpactSurfaceRequestV1, MAX_REDUNDANCY_FAMILIES_V1, MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1,
+    MAX_REDUNDANCY_WORK_V1, NodeDepthSurfaceRequestV1, NodeDetailsV1, NodeExpansionCostV1,
     NodeResultV1, NodeSurfaceRequestV1, PortCycleAnchorV1, PortCycleFileV1, PortCycleSymbolV1,
     PortCycleV1, PortMatchedSymbolV1, PortOrderLevelV1, PortOrderResultV1,
     PortOrderSurfaceRequestV1, PortOrderSymbolV1, PortStatusResultV1, PortStatusSurfaceRequestV1,
     PortTargetOnlySymbolV1, PortUnmatchedSymbolV1, PrimitiveFreshnessStateV1,
     PrimitiveIndexingStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStateV1, PrimitiveLaneStatusV1,
     PrimitiveNotFoundV1, PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
-    PrimitiveSemanticModeV1, PrimitiveSymbolLocationV1, PrimitiveUnavailableEvidenceV1,
-    PrimitiveUnavailableStatusV1, RedundancySurfaceRequestV1, RenamePreviewNodeV1,
+    PrimitiveSymbolLocationV1, PrimitiveUnavailableEvidenceV1, PrimitiveUnavailableStatusV1,
+    RedundancyCoverageV1, RedundancyFamilyV1, RedundancyPartialReasonV1, RedundancyRankingV1,
+    RedundancyResultV1, RedundancyScopeV1, RedundancySurfaceRequestV1, RenamePreviewNodeV1,
     RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1,
     RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1,
-    SimilarResultV1, SimilarSurfaceRequestV1, SimilarSymbolV1, TodoMarkerV1, TodosResultV1,
-    TodosSurfaceRequestV1,
+    SimilarCoverageV1, SimilarFamilyV1, SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1,
+    SimilarSurfaceRequestV1, SimilarTargetV1, TodoMarkerV1, TodosResultV1, TodosSurfaceRequestV1,
 };
 pub use primitive_surface::{
     ContextMemoryContributionV1, ContextMemoryFactIdentityV1, ContextMemoryTemporalCoverageV1,

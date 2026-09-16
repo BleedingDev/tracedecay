@@ -10,12 +10,15 @@ use serde_json::{Value, json};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_contracts::retrieval::{
     ContextCodeBlockV1, ContextMemoryContributionV1, ContextModeV1, ContextResultV1,
-    ContextSearchMatchV1, ContextSurfaceRequestV1, RenamePreviewNodeV1,
-    RenamePreviewPrimitiveRequestV1, RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1,
-    RenamePreviewTextOnlyMatchV1, SimilarSurfaceRequestV1, SimilarSymbolV1,
+    ContextSearchMatchV1, ContextSurfaceRequestV1, RedundancyScopeV1, RedundancySurfaceRequestV1,
+    RenamePreviewNodeV1, RenamePreviewPrimitiveRequestV1, RenamePreviewPrimitiveResultV1,
+    RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1, SimilarCoverageV1, SimilarFamilyV1,
+    SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1, SimilarSurfaceRequestV1,
+    SimilarTargetV1,
 };
 use tracedecay_domain::ExactClass;
 use tracedecay_domain::errors::{Result, TraceDecayError};
+#[cfg(test)]
 use tracedecay_query::retrieval::lexical::LexicalRoutingV1;
 
 use crate::context_headings::CONTEXT_SEEN_NODE_IDS_LABEL;
@@ -35,9 +38,7 @@ use super::context_support::{
     context_memory_read_control, insert_context_memory_section,
 };
 use super::primitive_surface::{
-    search_coverage as primitive_search_coverage,
-    semantic_search_mode as primitive_semantic_search_mode,
-    symbol_location as primitive_symbol_location,
+    search_coverage as primitive_search_coverage, symbol_location as primitive_symbol_location,
 };
 use super::search_evidence::{
     SearchGraphEvidence, bind_verified_graph_to_search, race_primary_search_with_graph,
@@ -56,22 +57,6 @@ use super::{lexical_routing, search_evidence};
 #[cfg(test)]
 use super::context_support::context_memory_section;
 
-fn semantic_search_mode(
-    args: &Value,
-) -> Result<tracedecay_query::code_search::CodeIndexSearchModeV1> {
-    match args.get("semantic_mode").and_then(Value::as_str) {
-        None | Some("fallback_allowed") => {
-            Ok(tracedecay_query::code_search::CodeIndexSearchModeV1::FallbackAllowed)
-        }
-        Some("strict_semantic") => {
-            Ok(tracedecay_query::code_search::CodeIndexSearchModeV1::StrictSemantic)
-        }
-        Some(_) => Err(TraceDecayError::Config {
-            message: "semantic_mode must be one of fallback_allowed, strict_semantic".to_owned(),
-        }),
-    }
-}
-
 async fn execute_code_index_search(
     executor: Option<&tracedecay_query::code_search::CodeIndexSearchExecutor>,
     request: tracedecay_query::code_search::CodeIndexSearchRequestV1,
@@ -83,9 +68,6 @@ async fn execute_code_index_search(
                 code_generation: None,
                 reason:
                     tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable,
-                semantic: tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-                    reason: "code_index_unavailable",
-                },
                 coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::unavailable(
                     "code_index_unavailable",
                 ),
@@ -109,27 +91,6 @@ fn preserve_complete_search_after_lazy_admission(result: Result<()>) -> Result<(
             Ok(())
         }
         result => result,
-    }
-}
-
-fn semantic_status_value(
-    mode: tracedecay_query::code_search::CodeIndexSearchModeV1,
-    status: &tracedecay_query::code_search::CodeIndexSemanticStatusV1,
-) -> Value {
-    let mode = match mode {
-        tracedecay_query::code_search::CodeIndexSearchModeV1::FallbackAllowed => "fallback_allowed",
-        tracedecay_query::code_search::CodeIndexSearchModeV1::StrictSemantic => "strict_semantic",
-    };
-    match status {
-        tracedecay_query::code_search::CodeIndexSemanticStatusV1::Complete => json!({
-            "status": "complete",
-            "mode": mode,
-        }),
-        tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable { reason } => json!({
-            "status": "unavailable",
-            "mode": mode,
-            "reason": reason,
-        }),
     }
 }
 
@@ -166,7 +127,6 @@ fn coverage_value(coverage: &tracedecay_query::code_search::CodeIndexSearchCover
         "exact": lane(&coverage.exact),
         "lexical": lane(&coverage.lexical),
         "graph": lane(&coverage.graph),
-        "semantic": lane(&coverage.semantic),
         "recall": if coverage.is_degraded() { "partial" } else { "full" },
     })
 }
@@ -250,7 +210,6 @@ where
                 message: "missing required parameter: query".to_string(),
             })?;
 
-    let semantic_mode = semantic_search_mode(&args)?;
     let lexical_routing = lexical_routing::routing_from_args(&args)?;
     let lazy_indexing_requested = dependency_hints::lazy_indexing_requested(&args);
     let cursor = retrieval_cursor(&args)?;
@@ -273,7 +232,6 @@ where
         source_reference: None,
         limit,
         cursor,
-        mode: semantic_mode,
         lexical_routing,
         authority: search_authority.cloned(),
         deadline: deadline.clone(),
@@ -389,7 +347,6 @@ where
                 "freshness": freshness,
                 "code_generation": complete.code_generation,
                 "query_fallback_digest": &complete.query_fallback.digest,
-                "semantic": semantic_status_value(semantic_mode, &complete.semantic),
                 "next_cursor": complete.next_cursor
                     .as_ref()
                     .map(serde_json::to_string)
@@ -447,7 +404,6 @@ where
                     "results": [],
                     "code_generation": unavailable.code_generation,
                     "query_fallback_digest": Value::Null,
-                    "semantic": semantic_status_value(semantic_mode, &unavailable.semantic),
                     "status": "unavailable",
                     "reason": reason,
                     "coverage": coverage_value(&unavailable.coverage),
@@ -457,19 +413,14 @@ where
                 output["verified_graph_evidence"] = unavailable_graph.clone();
             }
             let failure = format!("code-index search unavailable: {reason}");
-            let mut result = rendered_tool_result(ctx, &args, &output, Vec::new(), || {
+            Ok(rendered_tool_result(ctx, &args, &output, Vec::new(), || {
                 format!(
                     "{}{}",
                     freshness_lines(&freshness),
                     render_search_md(&output)
                 )
             })
-            .with_failure_message(failure);
-            if semantic_mode == tracedecay_query::code_search::CodeIndexSearchModeV1::StrictSemantic
-            {
-                result = result.with_semantic_error(true);
-            }
-            Ok(result)
+            .with_failure_message(failure))
         }
     }
 }
@@ -485,7 +436,7 @@ fn append_coverage_md(md: &mut Md, value: &Value) {
         return;
     }
     let mut notes = Vec::new();
-    for lane in ["exact", "lexical", "graph", "semantic"] {
+    for lane in ["exact", "lexical", "graph"] {
         let status = coverage.get(lane);
         match status
             .and_then(|status| status.get("status"))
@@ -591,14 +542,6 @@ fn render_search_md(value: &Value) -> String {
     }
     lexical_routing::append_routes_md(&mut md, value);
     append_coverage_md(&mut md, value);
-    if let Some(semantic) = value.get("semantic")
-        && semantic.get("status").and_then(Value::as_str) == Some("unavailable")
-        && let Some(reason) = semantic.get("reason").and_then(Value::as_str)
-    {
-        md.blank()
-            .heading(3, "Semantic")
-            .line(&format!("Semantic lane unavailable: {reason}."));
-    }
     if let Some(msg) = value
         .get("index_coverage_hint")
         .and_then(|h| h.get("message"))
@@ -781,19 +724,6 @@ fn append_context_search_matches(output: &mut String, matches: &[ContextSearchMa
     }
 }
 
-fn append_context_semantic_pending(output: &mut String, value: &Value) {
-    let semantic = &value["coverage"]["semantic"];
-    let reason = semantic.get("reason").and_then(Value::as_str);
-    if semantic.get("status").and_then(Value::as_str) == Some("unavailable")
-        && matches!(
-            reason,
-            Some("semantic_generation_warming" | "generation_rebuilding")
-        )
-    {
-        output.push_str("\n### Semantic\nSemantic results pending while the generation warms; available fallback and memory results are shown above.\n");
-    }
-}
-
 #[hotpath::measure(label = "mcp.graph.context.total")]
 pub async fn handle_context<F>(
     ctx: &McpToolContext<'_>,
@@ -827,7 +757,6 @@ where
     let max_code_blocks = request
         .max_code_blocks
         .map_or(5, |value| value.clamp(1, 20) as usize);
-    let semantic_mode = primitive_semantic_search_mode(request.semantic_mode);
     let lexical_routing = lexical_routing::routing_from_parts(
         request.lexical_anchors.clone().unwrap_or_default(),
         request.prefer_symbol.unwrap_or(false),
@@ -848,7 +777,6 @@ where
             source_reference: None,
             limit: max_nodes,
             cursor: None,
-            mode: semantic_mode,
             lexical_routing,
             authority: search_authority.cloned(),
             deadline,
@@ -866,12 +794,6 @@ where
     // state at serve time, not a snapshot taken before the lanes ran.
     let freshness_payload = ctx.freshness().await;
     let worktree_freshness = worktree_freshness_from_payload(freshness_payload.as_ref());
-    let strict_semantic_unavailable = semantic_mode
-        == tracedecay_query::code_search::CodeIndexSearchModeV1::StrictSemantic
-        && matches!(
-            &outcome,
-            tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(_)
-        );
     let (complete, code_generation, coverage, freshness, search_matches) = match outcome {
         tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete) => {
             let search_matches = context_search_matches(&complete, scope_prefix);
@@ -1040,7 +962,6 @@ where
             }),
         );
     }
-    append_context_semantic_pending(&mut output, &value);
     let mut degradation = Md::new();
     append_coverage_md(&mut degradation, &value);
     search_evidence::append_verified_graph_evidence_md(&mut degradation, &value);
@@ -1057,7 +978,7 @@ where
         ),
     );
     let preview = (!render::wants_json(&args)).then(|| context_markdown_lane_preview(&output));
-    let result = rendered_context_tool_result(
+    Ok(rendered_context_tool_result(
         ctx.project_root(),
         &args,
         value,
@@ -1065,12 +986,7 @@ where
         output,
         preview.as_deref(),
         memory_contribution,
-    );
-    if strict_semantic_unavailable {
-        Ok(result.with_semantic_error(true))
-    } else {
-        Ok(result)
-    }
+    ))
 }
 
 /// Bare-name lookup against `idx_nodes_name` — no BM25 scoring, no fuzzy
@@ -1150,90 +1066,292 @@ pub async fn handle_find_exact_symbol(
 }
 
 #[hotpath::measure(label = "mcp.graph.similar.total")]
-pub async fn handle_similar(
-    ctx: &McpToolContext<'_>,
-    graph: &tracedecay_graph_query::VerifiedGraphQuery,
-    args: Value,
-) -> Result<ToolResult> {
+pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
     let request: SimilarSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_similar")?;
-    let limit = request.limit.map_or(10, |value| value.min(100) as usize);
-    let semantic_mode = primitive_semantic_search_mode(request.semantic_mode);
-
-    let outcome = hotpath::future!(
-        execute_code_index_search(
-            ctx.code_index_search_executor(),
-            tracedecay_query::code_search::CodeIndexSearchRequestV1 {
-                project_root: ctx.project_root().to_path_buf(),
-                query: request.symbol,
-                source_revision: None,
-                source_tree: None,
-                source_reference: None,
-                limit,
-                cursor: None,
-                mode: semantic_mode,
-                lexical_routing: LexicalRoutingV1::query_only(),
-                authority: ctx.code_index_search_authority().cloned(),
-                deadline: ctx.deadline().cloned(),
-                cancellation: ctx.cancellation().cloned(),
-            }
+    let project_id = request.project_id;
+    let repository_id = request.repository_id;
+    let target = match request.target {
+        SimilarTargetV1::SymbolOccurrence {
+            symbol_occurrence_id,
+        } => tracedecay_query::code_search::CodeIndexSimilarTargetV1::SymbolOccurrence(
+            symbol_occurrence_id,
         ),
-        label = "mcp.graph.similar.query"
-    )
-    .await;
-    let complete = match outcome {
-        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete) => complete,
-        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(_) => {
-            return Err(TraceDecayError::ProjectRoute {
-                reason_code: "verified-code-similarity-unavailable".to_owned(),
-                retryable: false,
-                detail: "the maintained code-index search lanes are unavailable".to_owned(),
-            });
+        SimilarTargetV1::SourceRange { path, span } => {
+            tracedecay_query::code_search::CodeIndexSimilarTargetV1::SourceRange { path, span }
         }
     };
-    let mut results = Vec::new();
-    hotpath::measure_block!("mcp.graph.similar.graph", {
-        for ranked in &complete.ordered_candidates {
-            let Some(display) = complete.display_by_anchor.get(&ranked.candidate.anchor_id) else {
-                continue;
-            };
-            let candidates =
-                graph.resolve_qualified_name(&display.qualified_name, Some(&display.kind), 16)?;
-            let mut matched = None;
-            for node in candidates {
-                if required_graph_file_path(&node)? == display.path.as_str() {
-                    matched = Some(node);
-                    break;
-                }
+    let match_classes = request
+        .match_classes
+        .iter()
+        .map(|class| match class {
+            SimilarMatchClassV1::ConservativeExact => {
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative
             }
-            if let Some(node) = matched {
-                results.push((node, ranked.candidate.utility_micros));
+            SimilarMatchClassV1::RenameNormalizedExact => {
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename
             }
+        })
+        .collect();
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::decode)
+        .transpose()
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("invalid tracedecay_similar cursor: {error}"),
+        })?;
+    let executor =
+        ctx.code_index_similar_executor()
+            .ok_or_else(|| TraceDecayError::ProjectRoute {
+                reason_code: "verified-code-similarity-unavailable".to_owned(),
+                retryable: false,
+                detail: "the maintained clone similarity lane is unavailable".to_owned(),
+            })?;
+    let similar = match executor(tracedecay_query::code_search::CodeIndexSimilarRequestV1 {
+        project_root: ctx.project_root().to_path_buf(),
+        target,
+        match_classes,
+        result_limit: request.result_limit as usize,
+        work_limit: request.work_limit as usize,
+        cursor,
+        authority: ctx.code_index_search_authority().cloned(),
+        deadline: ctx.deadline().cloned(),
+        cancellation: ctx.cancellation().cloned(),
+    })
+    .await
+    {
+        tracedecay_query::code_search::CodeIndexSimilarOutcomeV1::Complete(similar) => *similar,
+        tracedecay_query::code_search::CodeIndexSimilarOutcomeV1::NotFound => {
+            return Err(TraceDecayError::ProjectRoute {
+                reason_code: "similar-source-not-found".to_owned(),
+                retryable: false,
+                detail: "the selected source has no body in the verified clone index".to_owned(),
+            });
         }
-    });
-    let result_nodes = results
-        .iter()
-        .map(|(node, _)| node.clone())
-        .collect::<Vec<_>>();
-    let touched_files = graph_symbol_paths(&result_nodes)?;
-    let items = results
-        .iter()
-        .map(|(node, utility_micros)| {
-            let metadata = required_graph_metadata(node)?;
-            Ok(SimilarSymbolV1 {
-                id: node.occurrence.as_str().to_owned(),
-                name: metadata.simple_name.clone(),
-                kind: metadata.kind.clone(),
-                file: required_graph_file_path(node)?.to_owned(),
-                line: user_line(metadata.start_line),
-                signature: metadata.signature.clone(),
-                utility_micros: *utility_micros,
+        tracedecay_query::code_search::CodeIndexSimilarOutcomeV1::Unavailable(reason) => {
+            return Err(similar_unavailable_error(reason));
+        }
+    };
+    if similar.source.occurrence.project_id != project_id
+        || similar.source.occurrence.repository_id != repository_id
+    {
+        return Err(TraceDecayError::ProjectRoute {
+            reason_code: "similar-source-not-found".to_owned(),
+            retryable: false,
+            detail: "the selected source is outside the authorized repository scope".to_owned(),
+        });
+    }
+    let source = similar_occurrence(&similar.source.occurrence);
+    let mut touched_files = vec![source.path.clone()];
+    let mut complete = true;
+    let families = similar
+        .exact_groups
+        .into_iter()
+        .map(|group| -> Result<SimilarFamilyV1> {
+            complete &= group.complete;
+            let match_class = match group.key.class {
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative => {
+                    SimilarMatchClassV1::ConservativeExact
+                }
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename => {
+                    SimilarMatchClassV1::RenameNormalizedExact
+                }
+            };
+            let members = group
+                .members
+                .into_iter()
+                .filter(|member| {
+                    member.occurrence.project_id == project_id
+                        && member.occurrence.repository_id == repository_id
+                })
+                .map(|member| {
+                    let occurrence = similar_occurrence(&member.occurrence);
+                    touched_files.push(occurrence.path.clone());
+                    occurrence
+                })
+                .collect::<Vec<_>>();
+            let next_cursor = group
+                .next_cursor
+                .as_ref()
+                .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::encode)
+                .transpose()
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!("failed to encode tracedecay_similar cursor: {error}"),
+                })?;
+            Ok(SimilarFamilyV1 {
+                match_class,
+                normalization_revision: group.key.normalization_revision,
+                family_digest: group.key.digest,
+                representative_payload_digest: similar.source.payload.payload_digest.clone(),
+                member_count: members.len(),
+                members,
+                complete: group.complete,
+                next_cursor,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-
+    touched_files.sort();
+    touched_files.dedup();
+    let coverage = match similar.source.occurrence.eligibility {
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible if complete => {
+            SimilarCoverageV1::Complete
+        }
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
+            SimilarCoverageV1::Partial
+        }
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooSmall {
+            minimum_tokens,
+        } => SimilarCoverageV1::ExcludedTooSmall { minimum_tokens },
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
+            SimilarCoverageV1::ExcludedIncompleteTokenization
+        }
+    };
+    let result = SimilarResultV1 {
+        source_generation: source.source_generation.clone(),
+        source,
+        families,
+        coverage,
+    };
     let value =
-        hotpath::measure_block!("mcp.graph.similar.serialize", serde_json::to_value(items)?);
+        hotpath::measure_block!("mcp.graph.similar.serialize", serde_json::to_value(result)?);
     Ok(generic_tool_result(ctx, &args, &value, touched_files))
+}
+
+fn similar_unavailable_error(
+    reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1,
+) -> TraceDecayError {
+    TraceDecayError::ProjectRoute {
+        reason_code: reason.as_str().to_owned(),
+        retryable: matches!(
+            reason,
+            tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled
+                | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::TimedOut
+                | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable
+                | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
+                | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified
+        ),
+        detail: format!(
+            "the maintained clone similarity lane is unavailable: {}",
+            reason.as_str()
+        ),
+    }
+}
+
+#[hotpath::measure(label = "mcp.graph.redundancy.total")]
+pub async fn handle_redundancy(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
+    let request: RedundancySurfaceRequestV1 =
+        decode_primitive_request(&args, "tracedecay_redundancy")?;
+    if request.project_id != ctx.admitted_scope().project_id
+        || request.repository_id != ctx.admitted_scope().repository_id
+    {
+        return Err(TraceDecayError::ProjectRoute {
+            reason_code: "redundancy-repository-not-authorized".to_owned(),
+            retryable: false,
+            detail: "the selected repository is outside the authorized repository scope".to_owned(),
+        });
+    }
+    let match_classes = request
+        .match_classes
+        .iter()
+        .map(|class| match class {
+            SimilarMatchClassV1::ConservativeExact => {
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative
+            }
+            SimilarMatchClassV1::RenameNormalizedExact => {
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename
+            }
+        })
+        .collect();
+    let scope = match request.scope {
+        RedundancyScopeV1::Repository => {
+            tracedecay_query::code_search::CodeIndexRedundancyScopeV1::Repository
+        }
+        RedundancyScopeV1::Path { path } => {
+            tracedecay_query::code_search::CodeIndexRedundancyScopeV1::Path(path)
+        }
+        RedundancyScopeV1::PullRequest {
+            provider,
+            pull_request_id,
+            head_commit_id,
+            mut changed_paths,
+        } => {
+            changed_paths.sort();
+            changed_paths.dedup();
+            let pull_request_id = tracedecay_domain::feedback::GitHubPullRequestIdV1::new(
+                pull_request_id,
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("invalid arguments for tracedecay_redundancy: {error}"),
+            })?;
+            tracedecay_query::code_search::CodeIndexRedundancyScopeV1::PullRequest {
+                provider,
+                pull_request_id,
+                head_commit_id,
+                changed_paths,
+            }
+        }
+    };
+    let executor =
+        ctx.code_index_redundancy_executor()
+            .ok_or_else(|| TraceDecayError::ProjectRoute {
+                reason_code: "verified-code-redundancy-unavailable".to_owned(),
+                retryable: false,
+                detail: "the maintained clone family lane is unavailable".to_owned(),
+            })?;
+    let outcome = executor(tracedecay_query::code_search::CodeIndexRedundancyQueryV1 {
+        project_root: ctx.project_root().to_path_buf(),
+        project_id: request.project_id,
+        repository_id: request.repository_id,
+        match_classes,
+        scope,
+        include_generated_paths: request.include_generated_paths,
+        family_limit: request.family_limit as usize,
+        member_limit: request.member_limit as usize,
+        work_limit: request.work_limit as usize,
+        cursor: request.cursor,
+        authority: ctx.code_index_search_authority().cloned(),
+        deadline: ctx.deadline().cloned(),
+        cancellation: ctx.cancellation().cloned(),
+    })
+    .await
+    .map_err(|reason| TraceDecayError::ProjectRoute {
+                reason_code: "verified-code-redundancy-unavailable".to_owned(),
+                retryable: matches!(
+                    reason,
+                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled
+                        | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::TimedOut
+                        | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable
+                ),
+                detail: format!("the maintained clone family lane is unavailable: {}", reason.as_str()),
+            })?;
+    let mut touched_files = outcome
+        .families
+        .iter()
+        .flat_map(|group| group.family.members.iter())
+        .map(|member| member.path.clone())
+        .collect::<Vec<_>>();
+    touched_files.sort();
+    touched_files.dedup();
+    let value = hotpath::measure_block!(
+        "mcp.graph.redundancy.serialize",
+        serde_json::to_value(outcome)?
+    );
+    Ok(generic_tool_result(ctx, &args, &value, touched_files))
+}
+
+fn similar_occurrence(
+    occurrence: &tracedecay_code_index::clones::CloneBodyOccurrenceV1,
+) -> SimilarOccurrenceV1 {
+    SimilarOccurrenceV1 {
+        project_id: occurrence.project_id.clone(),
+        repository_id: occurrence.repository_id.clone(),
+        worktree_id: occurrence.worktree_id.clone(),
+        source_generation: occurrence.source_generation.clone(),
+        snapshot_digest: occurrence.snapshot_digest.clone(),
+        symbol_occurrence_id: occurrence.symbol_occurrence_id.clone(),
+        path: occurrence.path.clone(),
+        body_span: occurrence.body_span,
+    }
 }
 
 /// Reads a file's lines (0-based) for snippet extraction, memoizing by path so
@@ -1533,13 +1651,84 @@ mod tests {
     #[test]
     fn schema_anchor_bound_matches_the_retrieval_kernel_bound() {
         assert_eq!(
-            crate::tools::definitions::SEARCH_MAX_LEXICAL_ANCHORS,
+            tracedecay_mcp_catalog::SEARCH_MAX_LEXICAL_ANCHORS,
             tracedecay_query::retrieval::lexical::MAX_LEXICAL_ANCHORS_V1
         );
         assert_eq!(
-            crate::tools::definitions::SEARCH_MAX_LEXICAL_ANCHOR_BYTES,
+            tracedecay_mcp_catalog::SEARCH_MAX_LEXICAL_ANCHOR_BYTES,
             tracedecay_query::retrieval::lexical::MAX_LEXICAL_ANCHOR_BYTES_V1
         );
+    }
+
+    #[tokio::test]
+    async fn similar_unavailable_wire_preserves_reason_and_retryability() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let admitted = crate::tool_context::tests::scope("similar-unavailable");
+        let project = crate::tool_context::tests::project_bundle(temp.path(), &admitted, None);
+        let authority = tracedecay_query::code_search::CodeIndexSearchAuthorityV1 {
+            principal: tracedecay_domain::PrincipalId::new("principal.similar-unavailable")
+                .expect("principal"),
+            authorization_revision: tracedecay_domain::AuthorizationRevision::new(
+                "revision.similar-unavailable",
+            )
+            .expect("revision"),
+        };
+
+        for (reason, reason_code, retryable) in [
+            (
+                tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+                "generation_unavailable",
+                true,
+            ),
+            (
+                tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired,
+                "index_corruption_reset_required",
+                false,
+            ),
+        ] {
+            let executor: tracedecay_query::code_search::CodeIndexSimilarExecutor =
+                std::sync::Arc::new(move |_| {
+                    Box::pin(async move {
+                        tracedecay_query::code_search::CodeIndexSimilarOutcomeV1::Unavailable(reason)
+                    })
+                });
+            let code_index =
+                crate::AdmittedCodeIndex::new(&authority, None, Some(&executor), None, None)
+                    .expect("similar executor admits");
+            let ctx = crate::McpToolContext::bind(crate::McpToolBinding {
+                project: &project,
+                request: crate::McpRequestAuthoritiesV1 {
+                    code_index: Some(code_index),
+                    ..crate::McpRequestAuthoritiesV1::default()
+                },
+            })
+            .expect("admitted similar binding");
+            let result = handle_similar(
+                &ctx,
+                json!({
+                    "project_id": admitted.project_id,
+                    "repository_id": admitted.repository_id,
+                    "target": {
+                        "kind": "symbol_occurrence",
+                        "symbol_occurrence_id": "symbol.similar-unavailable",
+                    },
+                    "match_classes": ["conservative_exact"],
+                    "result_limit": 10,
+                    "work_limit": 20,
+                }),
+            )
+            .await;
+            let Err(error) = result else {
+                panic!("unavailable similar executor must remain a transport failure");
+            };
+            let response =
+                crate::tool_error_response(json!(1), "tracedecay_similar", &error);
+            let wire: Value = serde_json::from_str(&crate::serialize_response_line(&response))
+                .expect("JSON-RPC response");
+
+            assert_eq!(wire["error"]["data"]["reason_code"], reason_code);
+            assert_eq!(wire["error"]["data"]["retryable"], retryable);
+        }
     }
 
     fn context_memory_hit(content: &str) -> FactSearchHitV1 {
@@ -1668,18 +1857,15 @@ mod tests {
                         tracedecay_query::code_search::CodeIndexSearchUnavailableV1 {
                             code_generation: None,
                             reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                            semantic: tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-                                reason: "calibration_unavailable",
-                            },
                             coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::unavailable(
-                                "calibration_unavailable",
+                                "authority_unavailable",
                             ),
                         },
                     )
                 })
             },
         );
-        let freshness: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+        let freshness: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
             std::sync::Arc::new(move |_| {
                 let freshness_order = std::sync::Arc::clone(&freshness_order);
                 Box::pin(async move {
@@ -1698,8 +1884,9 @@ mod tests {
             )
             .expect("revision"),
         };
-        let code_index = crate::AdmittedCodeIndex::new(&authority, Some(&executor), None)
-            .expect("search executor admits");
+        let code_index =
+            crate::AdmittedCodeIndex::new(&authority, Some(&executor), None, None, None)
+                .expect("search executor admits");
         let ctx = crate::McpToolContext::bind(crate::McpToolBinding {
             project: &project,
             request: crate::McpRequestAuthoritiesV1 {
@@ -1734,27 +1921,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn installed_search_executor_owns_fallback_allowed_dispatch() {
+    async fn installed_search_executor_owns_dispatch() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = std::sync::Arc::clone(&calls);
         let executor: tracedecay_query::code_search::CodeIndexSearchExecutor = std::sync::Arc::new(
             move |request| {
                 observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(
-                    request.mode,
-                    tracedecay_query::code_search::CodeIndexSearchModeV1::FallbackAllowed
-                );
                 assert_eq!(request.query, "fixture");
                 Box::pin(async {
                     tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(
                         tracedecay_query::code_search::CodeIndexSearchUnavailableV1 {
                             code_generation: Some("generation.fixture".to_owned()),
                             reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                            semantic: tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-                                reason: "calibration_unavailable",
-                            },
                             coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::unavailable(
-                                "calibration_unavailable",
+                                "authority_unavailable",
                             ),
                         },
                     )
@@ -1771,8 +1951,7 @@ mod tests {
                 source_reference: None,
                 limit: 10,
                 cursor: None,
-                mode: tracedecay_query::code_search::CodeIndexSearchModeV1::FallbackAllowed,
-                lexical_routing: LexicalRoutingV1::query_only(),
+                lexical_routing: LexicalRoutingV1::default(),
                 authority: None,
                 deadline: None,
                 cancellation: None,
@@ -1804,8 +1983,7 @@ mod tests {
                 source_reference: None,
                 limit: 10,
                 cursor: None,
-                mode: tracedecay_query::code_search::CodeIndexSearchModeV1::StrictSemantic,
-                lexical_routing: LexicalRoutingV1::query_only(),
+                lexical_routing: LexicalRoutingV1::default(),
                 authority: None,
                 deadline: None,
                 cancellation: None,

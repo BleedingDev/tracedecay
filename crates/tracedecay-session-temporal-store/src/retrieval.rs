@@ -5,9 +5,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 type FrozenParticipantGenerations = HashMap<(String, i64, String), Vec<(String, String)>>;
 
 /// The largest participant batch one frozen-generation read binds. Each entry
-/// contributes three variables plus the shared project key, so this stays clear of
-/// `SQLite`'s default statement-variable ceiling.
-const FROZEN_PARTICIPANT_BATCH: usize = 300;
+/// adds one OR branch as well as three variables, so the batch stays below both
+/// SQLite's expression-depth and statement-variable ceilings.
+const FROZEN_PARTICIPANT_BATCH: usize = 64;
 
 use tracedecay_runtime_core::db::{
     DatabaseEngineReadSnapshot,
@@ -24,10 +24,11 @@ use tracedecay_temporal_query::candidates::{CandidateChannel, CandidatePlan};
 use tracedecay_temporal_query::ports::{
     CANDIDATE_READ_BUDGET, CandidateFieldCaps, CandidatePageSink, CandidateReadState,
     MeasuredTemporalValue, PageLimits, PageRequest, PageStatus, PortFuture,
-    TemporalCandidateFilterV1, TemporalExecutionSnapshot, TemporalMessageTypeFilterV1,
-    TemporalPortError, TemporalPreparedCandidateCohort, TemporalReadPort, TemporalRecordPageSink,
-    TemporalRetrievalScope, TemporalSessionScopeFilterV1, TemporalSnapshotRequest,
-    await_controlled, begin_prepared_candidate_pull, commit_prepared_candidate_pull,
+    TemporalCandidateFilterV1, TemporalCandidatePopulationCount, TemporalExecutionSnapshot,
+    TemporalMessageTypeFilterV1, TemporalPortError, TemporalPreparedCandidateCohort,
+    TemporalReadPort, TemporalRecordPageSink, TemporalRetrievalScope, TemporalSessionScopeFilterV1,
+    TemporalSnapshotRequest, await_controlled, begin_prepared_candidate_pull,
+    commit_prepared_candidate_pull,
 };
 use tracedecay_temporal_query::ranking::RankingCandidate;
 
@@ -52,6 +53,7 @@ use super::sql::{TemporalSqlRead, TemporalSqlRows};
 use super::store::execution_control_graph_cancellation;
 use candidates::*;
 use cursors::*;
+use queries::ROOT_OCCURRENCE_FTS_COUNT_QUERY;
 pub(crate) use queries::partial_summary_invalidation_exists;
 use records::*;
 use rows::*;
@@ -64,6 +66,7 @@ pub const MAX_SUMMARY_SOURCES_PER_RECORD: usize = 256;
 const MAX_SESSION_CONTEXT_RELATIONS: usize = 256;
 const FILTER_SCAN_PAGE_ITEMS: usize = 64;
 const MAX_RECORD_QUERY_CANDIDATES: usize = 8;
+const ROOT_STRICT_POPULATION_COUNT_LIMIT: usize = 4_096;
 
 fn temporal_relation_error(
     error: SessionRelationError,
@@ -76,7 +79,10 @@ fn temporal_relation_error(
         return control_error;
     }
     match error {
-        SessionRelationError::BudgetExhausted => TemporalPortError::BudgetExceeded { resource },
+        SessionRelationError::BudgetExhausted => TemporalPortError::BudgetExceeded {
+            resource,
+            accounting: None,
+        },
         SessionRelationError::Cancelled => TemporalPortError::Cancelled,
         SessionRelationError::DeadlineExceeded => TemporalPortError::DeadlineExceeded,
         SessionRelationError::Invalid
@@ -247,16 +253,14 @@ impl<'a> SessionTemporalReadPort<'a> {
     ) -> Result<TemporalPreparedCandidateCohort, TemporalPortError> {
         request.execution_control().checkpoint()?;
         let limits = request.limits();
-        let candidate_page_items = limits.candidate_limit.min(64);
         let candidate_limits = PageLimits::new(
             limits.candidate_limit,
             limits.candidate_total_bytes,
             limits.candidate_item_bytes,
-            candidate_page_items,
+            limits.candidate_limit.min(64),
         )?;
         let mut state = CandidateReadState::new(candidate_limits);
         let mut candidates = Vec::with_capacity(limits.candidate_limit.min(256));
-        let scope = TemporalRetrievalScope::AllSessionsInAuthorizedRoot;
         loop {
             let limits = begin_prepared_candidate_pull(request, &mut state)?;
             let control = request.execution_control();
@@ -275,7 +279,7 @@ impl<'a> SessionTemporalReadPort<'a> {
             let status = await_controlled(
                 control,
                 Box::pin(self.produce_candidates_from_request(
-                    &scope,
+                    &TemporalRetrievalScope::AllSessionsInAuthorizedRoot,
                     request,
                     1,
                     plan,
@@ -285,6 +289,15 @@ impl<'a> SessionTemporalReadPort<'a> {
             )
             .await?;
             let page = sink.finish(status)?;
+            if page.status() == PageStatus::More && state.consumed_items() == limits.candidate_limit
+            {
+                candidates.extend(page.into_items());
+                return TemporalPreparedCandidateCohort::partial(
+                    candidates,
+                    self.count_root_strict_population(request, plan, &page_request)
+                        .await?,
+                );
+            }
             let page = commit_prepared_candidate_pull(&mut state, page)?;
             let status = page.status();
             candidates.extend(page.into_items());
@@ -293,6 +306,149 @@ impl<'a> SessionTemporalReadPort<'a> {
             }
         }
         TemporalPreparedCandidateCohort::new(candidates)
+    }
+
+    async fn count_root_strict_population(
+        &self,
+        request: &TemporalSnapshotRequest,
+        plan: &CandidatePlan,
+        page_request: &PageRequest,
+    ) -> Result<TemporalCandidatePopulationCount, TemporalPortError> {
+        let Some((clause_index, clause)) = plan
+            .clauses()
+            .iter()
+            .enumerate()
+            .find(|(_, clause)| clause.channel == CandidateChannel::Lexical)
+        else {
+            return Ok(TemporalCandidatePopulationCount::AtLeast(
+                u64::try_from(request.limits().candidate_limit)
+                    .map_err(|error| read_error(CANDIDATE_OPERATION, error))?,
+            ));
+        };
+        let query_limit = ROOT_STRICT_POPULATION_COUNT_LIMIT.saturating_add(1);
+        if request.semantic_filter().is_empty() {
+            return self
+                .count_unfiltered_root_strict_population(request, clause, page_request, query_limit)
+                .await;
+        }
+        let cursor = CandidateCursor {
+            clause: clause_index,
+            knowledge_at: i64::MAX,
+            session_id: String::new(),
+            stable_id: String::new(),
+            strict_lexical_matched: false,
+        };
+        let scope = TemporalRetrievalScope::AllSessionsInAuthorizedRoot;
+        let project_key = request
+            .authorized_root()
+            .ok_or(TemporalPortError::UnauthorizedSnapshot)?
+            .project_key();
+        let mut rows = query_candidate_clause(
+            &self.read,
+            &scope,
+            request,
+            1,
+            clause,
+            &cursor,
+            query_limit,
+            page_request,
+            Some(project_key),
+        )
+        .await?;
+        let mut scanned = 0usize;
+        let mut anchors = HashSet::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| read_error(CANDIDATE_OPERATION, error))?
+        {
+            request.execution_control().checkpoint()?;
+            scanned += 1;
+            let candidate = candidate_from_row(&row, clause.channel, &scope, 1)?;
+            if self
+                .candidate_matches_filter(request, &candidate, request.semantic_filter())
+                .await?
+            {
+                anchors.insert(candidate.anchor_id);
+            }
+        }
+        let count =
+            u64::try_from(anchors.len()).map_err(|error| read_error(CANDIDATE_OPERATION, error))?;
+        Ok(if scanned == query_limit {
+            TemporalCandidatePopulationCount::AtLeast(count)
+        } else {
+            TemporalCandidatePopulationCount::Exact(count)
+        })
+    }
+
+    async fn count_unfiltered_root_strict_population(
+        &self,
+        request: &TemporalSnapshotRequest,
+        clause: &tracedecay_temporal_query::candidates::CandidateClause,
+        page_request: &PageRequest,
+        query_limit: usize,
+    ) -> Result<TemporalCandidatePopulationCount, TemporalPortError> {
+        let caps = page_request.candidate_field_caps();
+        let metadata_cap = caps.map_or(
+            page_request.max_item_bytes(),
+            CandidateFieldCaps::metadata_field_bytes,
+        );
+        let stable_cap = caps.map_or(
+            page_request.max_item_bytes(),
+            CandidateFieldCaps::stable_id_bytes,
+        );
+        let anchor_cap = caps.map_or(
+            page_request.max_item_bytes(),
+            CandidateFieldCaps::anchor_id_bytes,
+        );
+        let integer = |value: usize| {
+            i64::try_from(value)
+                .map(Value::Integer)
+                .map_err(|error| read_error(CANDIDATE_OPERATION, error))
+        };
+        let project_key = request
+            .authorized_root()
+            .ok_or(TemporalPortError::UnauthorizedSnapshot)?
+            .project_key();
+        let provider = request
+            .provider_scope()
+            .map_or(Value::Null, |value| Value::Text(value.to_string()));
+        let mut rows = self
+            .read
+            .query(
+                ROOT_OCCURRENCE_FTS_COUNT_QUERY,
+                vec![
+                    Value::Text(project_key.to_string()),
+                    provider,
+                    Value::Text(fts_all_terms(&clause.value)),
+                    integer(stable_cap.min(metadata_cap))?,
+                    integer(anchor_cap)?,
+                    integer(metadata_cap)?,
+                    integer(page_request.max_item_bytes())?,
+                    integer(stable_cap)?,
+                    integer(query_limit)?,
+                ],
+            )
+            .await
+            .map_err(|error| read_error(CANDIDATE_OPERATION, error))?;
+        let count = rows
+            .next()
+            .await
+            .map_err(|error| read_error(CANDIDATE_OPERATION, error))?
+            .ok_or_else(|| read_message(CANDIDATE_OPERATION, "strict count returned no row"))?
+            .get::<i64>(0)
+            .map_err(|error| read_error(CANDIDATE_OPERATION, error))?;
+        let count = u64::try_from(count).map_err(|error| read_error(CANDIDATE_OPERATION, error))?;
+        Ok(
+            if count
+                == u64::try_from(query_limit)
+                    .map_err(|error| read_error(CANDIDATE_OPERATION, error))?
+            {
+                TemporalCandidatePopulationCount::AtLeast(count)
+            } else {
+                TemporalCandidatePopulationCount::Exact(count)
+            },
+        )
     }
 
     #[hotpath::skip]
@@ -530,7 +686,8 @@ impl<'a> SessionTemporalReadPort<'a> {
             | CandidateChannel::Phrase
             | CandidateChannel::Entity
             | CandidateChannel::Time
-            | CandidateChannel::Lexical => (
+            | CandidateChannel::Lexical
+            | CandidateChannel::LexicalRelaxed => (
                 "SELECT observation.observation_json, occurrence.role
                  FROM session_occurrences occurrence
                  JOIN observations observation
@@ -559,6 +716,7 @@ impl<'a> SessionTemporalReadPort<'a> {
             if count > MAX_SUMMARY_SOURCES_PER_RECORD {
                 return Err(TemporalPortError::BudgetExceeded {
                     resource: "semantic filter source count",
+                    accounting: None,
                 });
             }
             let encoded: String = row
@@ -649,6 +807,7 @@ impl<'a> SessionTemporalReadPort<'a> {
             if count > MAX_SUMMARY_SOURCES_PER_RECORD {
                 return Err(TemporalPortError::BudgetExceeded {
                     resource: "semantic filter source count",
+                    accounting: None,
                 });
             }
             let encoded = row
@@ -1047,6 +1206,14 @@ impl<'a> SessionTemporalReadPort<'a> {
             control.checkpoint()?;
             let clause = &plan.clauses()[cursor.clause];
             validate_clause(clause, request)?;
+            // The relaxation tier is reached only after the strict tier was
+            // scanned to exhaustion under these filters and this snapshot and
+            // answered nothing. A refusal returns before advancing the clause,
+            // so a deadline or budget stop never arrives here.
+            if clause.channel == CandidateChannel::LexicalRelaxed && cursor.strict_lexical_matched {
+                cursor = cursor.advance_to_clause(cursor.clause + 1);
+                continue;
+            }
             let mut extra = false;
             let mut last_emitted = None;
             let mut scan_cursor = cursor.clone();
@@ -1060,6 +1227,7 @@ impl<'a> SessionTemporalReadPort<'a> {
                 {
                     return Err(TemporalPortError::BudgetExceeded {
                         resource: "candidate filter scans",
+                        accounting: None,
                     });
                 }
                 let query_limit = bounds
@@ -1112,6 +1280,7 @@ impl<'a> SessionTemporalReadPort<'a> {
                         knowledge_at: candidate.knowledge_at_micros,
                         session_id: candidate.session.clone().unwrap_or_default(),
                         stable_id: candidate.retriever_record_id.clone(),
+                        strict_lexical_matched: cursor.strict_lexical_matched,
                     };
                     if !self
                         .candidate_matches_filter(
@@ -1132,12 +1301,17 @@ impl<'a> SessionTemporalReadPort<'a> {
                         if sink.is_empty() {
                             return Err(TemporalPortError::BudgetExceeded {
                                 resource: "candidate bytes",
+                                accounting: None,
                             });
                         }
                         extra = true;
                         break;
                     }
                     page_bytes += encoded;
+                    if clause.channel == CandidateChannel::Lexical {
+                        cursor.strict_lexical_matched = true;
+                        scan_cursor.strict_lexical_matched = true;
+                    }
                     last_emitted = Some(scan_cursor.clone());
                     sink.push(candidate)?;
                 }
@@ -1150,12 +1324,7 @@ impl<'a> SessionTemporalReadPort<'a> {
                 sink.set_continuation_key(continuation.encode(request.max_key_bytes())?)?;
                 return Ok(PageStatus::More);
             }
-            cursor = CandidateCursor {
-                clause: cursor.clause + 1,
-                knowledge_at: i64::MAX,
-                session_id: String::new(),
-                stable_id: String::new(),
-            };
+            cursor = cursor.advance_to_clause(cursor.clause + 1);
             if sink.len() == bounds.items {
                 if cursor.clause < plan.clauses().len() {
                     sink.set_continuation_key(cursor.encode(request.max_key_bytes())?)?;
@@ -1200,6 +1369,7 @@ impl<'a> SessionTemporalReadPort<'a> {
             if window_queries > bounds.items.saturating_add(1) {
                 return Err(TemporalPortError::BudgetExceeded {
                     resource: "record candidate window scans",
+                    accounting: None,
                 });
             }
             let window_end = bounded_window_end(candidates.len(), cursor.candidate, window_size);
@@ -1229,6 +1399,7 @@ impl<'a> SessionTemporalReadPort<'a> {
                 if candidate.anchor_id.to_string().len() > request.max_key_bytes() {
                     return Err(TemporalPortError::BudgetExceeded {
                         resource: "record candidate anchor bytes",
+                        accounting: None,
                     });
                 }
             }
@@ -1283,6 +1454,7 @@ impl<'a> SessionTemporalReadPort<'a> {
                     if sink.is_empty() {
                         return Err(TemporalPortError::BudgetExceeded {
                             resource: "record bytes",
+                            accounting: None,
                         });
                     }
                     extra = true;

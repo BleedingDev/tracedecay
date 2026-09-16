@@ -16,6 +16,18 @@ export function assertNever(value: never): never {
 
 export const WIRE_SCHEMA_REVISION = 1 as const;
 
+/** The accept-proposal operation can commit acceptance only. */
+export const AcceptWorkProposalDispositionV1Schema = z.literal("accepted");
+export type AcceptWorkProposalDispositionV1 = z.infer<typeof AcceptWorkProposalDispositionV1Schema>;
+
+export const AcceptWorkProposalRequestV1Schema = z.object({
+  disposition: z.lazy(() => AcceptWorkProposalDispositionV1Schema),
+  mutation: z.lazy(() => WorkProductMutationIdentityV1Schema),
+  proposal: z.lazy(() => WorkProposalV1Schema),
+  selection: z.lazy(() => WorkProductSelectionScopeV1Schema),
+}).strict();
+export type AcceptWorkProposalRequestV1 = z.infer<typeof AcceptWorkProposalRequestV1Schema>;
+
 export const AcceptWorkTaskRequestV1Schema = z.object({
   evidence_by_criterion: z.record(z.string()),
   mutation: z.lazy(() => WorkProductMutationIdentityV1Schema),
@@ -44,6 +56,14 @@ export const AdjudicateWorkLeakCommandV1Schema = z.object({
 }).strict();
 export type AdjudicateWorkLeakCommandV1 = z.infer<typeof AdjudicateWorkLeakCommandV1Schema>;
 
+/** Execution admission together with the immutable provider snapshot licensed
+by the accepted proposal and current configuration authority. */
+export const AdmittedWorkExecutionV1Schema = z.object({
+  execution_snapshot: z.lazy(() => WorkExecutionSnapshotSchema),
+  mutation: z.lazy(() => WorkProductMutationReceiptV1Schema),
+}).strict();
+export type AdmittedWorkExecutionV1 = z.infer<typeof AdmittedWorkExecutionV1Schema>;
+
 export const AdmitWorkExecutionRequestV1Schema = z.object({
   based_on_version: z.number().int().safe().min(0),
   mutation: z.lazy(() => WorkProductMutationIdentityV1Schema),
@@ -68,6 +88,10 @@ export const AdmitWorkSynthesisCommandSchema = z.object({
   start: z.lazy(() => StartWorkAttemptCommandSchema),
 }).strict();
 export type AdmitWorkSynthesisCommand = z.infer<typeof AdmitWorkSynthesisCommandSchema>;
+
+/** Strongly typed canonical identity: `AgentInstanceId`. */
+export const AgentInstanceIdSchema = z.string();
+export type AgentInstanceId = z.infer<typeof AgentInstanceIdSchema>;
 
 export const AnalyticsAgentsPayloadV1Schema = z.object({
   available: z.boolean(),
@@ -636,6 +660,91 @@ export type CapabilityId = z.infer<typeof CapabilityIdSchema>;
 export const CatalogGenerationIdSchema = z.string();
 export type CatalogGenerationId = z.infer<typeof CatalogGenerationIdSchema>;
 
+/** Fixed per-request clone candidate and verification budgets. */
+export const CodeCloneIndexBudgetsV1Schema = z.object({
+  candidate_bodies: z.number().int().safe().min(0),
+  hot_posting_rows: z.number().int().safe().min(0),
+  minimum_body_tokens: z.number().int().safe().min(0),
+  minimum_directional_coverage_millionths: z.number().int().safe().min(0),
+  posting_rows: z.number().int().safe().min(0),
+  verification_bodies: z.number().int().safe().min(0),
+  verification_token_work: z.number().int().safe().min(0),
+});
+export type CodeCloneIndexBudgetsV1 = z.infer<typeof CodeCloneIndexBudgetsV1Schema>;
+
+/** Coverage retained by one clone-index artifact or in-progress successor.
+
+Counts are `None` until the clone artifact has observed the corresponding
+denominator. A complete empty repository reports `Some(0)`, which keeps a
+designed zero distinct from unavailable coverage. */
+export const CodeCloneIndexCoverageV1Schema = z.object({
+  completed_source_pages: z.number().int().safe().min(0),
+  conservative_normalized_bodies: z.number().int().safe().min(0).nullable(),
+  eligible_source_bodies: z.number().int().safe().min(0).nullable(),
+  exact_postings: z.number().int().safe().min(0).nullable(),
+  excluded_incomplete_tokenization_bodies: z.number().int().safe().min(0).nullable(),
+  excluded_too_small_bodies: z.number().int().safe().min(0).nullable(),
+  hot_posting_rows_skipped: z.number().int().safe().min(0).nullable(),
+  hot_postings_skipped: z.number().int().safe().min(0).nullable(),
+  near_fingerprint_bodies: z.number().int().safe().min(0).nullable(),
+  near_fingerprint_postings: z.number().int().safe().min(0).nullable(),
+  payloads_reused: z.number().int().safe().min(0).nullable(),
+  rename_normalized_bodies: z.number().int().safe().min(0).nullable(),
+  rename_partial_bodies: z.number().int().safe().min(0).nullable(),
+  rename_unsupported_bodies: z.number().int().safe().min(0).nullable(),
+  source_bodies: z.number().int().safe().min(0).nullable(),
+  total_source_pages: z.number().int().safe().min(0),
+  unique_payloads: z.number().int().safe().min(0).nullable(),
+});
+export type CodeCloneIndexCoverageV1 = z.infer<typeof CodeCloneIndexCoverageV1Schema>;
+
+/** Generation-pinned clone-index evidence shared by non-error readiness states. */
+export const CodeCloneIndexObservationV1Schema = z.object({
+  artifact_format_revision: z.number().int().min(0).nullable(),
+  budgets: z.lazy(() => CodeCloneIndexBudgetsV1Schema),
+  conservative_normalization_revision: z.number().int().min(0).max(65535),
+  coverage: z.lazy(() => CodeCloneIndexCoverageV1Schema),
+  generation_id: z.string(),
+  rename_normalization_revision: z.number().int().min(0).max(65535),
+  resources: z.lazy(() => CodeCloneIndexResourcesV1Schema),
+  source_revision: z.string().nullable(),
+});
+export type CodeCloneIndexObservationV1 = z.infer<typeof CodeCloneIndexObservationV1Schema>;
+
+/** Measured resources and update accounting for one clone-index generation. */
+export const CodeCloneIndexResourcesV1Schema = z.object({
+  bytes_on_disk: z.number().int().safe().min(0).nullable(),
+  changed_symbol_update_micros: z.number().int().safe().min(0).nullable(),
+  peak_scratch_memory_bytes: z.number().int().safe().min(0).nullable(),
+  stale_invalidations: z.number().int().safe().min(0).nullable(),
+});
+export type CodeCloneIndexResourcesV1 = z.infer<typeof CodeCloneIndexResourcesV1Schema>;
+
+/** Clone readiness, independent from lexical and graph serving. */
+export const CodeCloneIndexStatusV1Schema = z.discriminatedUnion("state", [z.object({
+  observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
+  state: z.literal("backfilling"),
+}), z.object({
+  observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
+  omission_reasons: z.array(z.string()),
+  state: z.literal("partial"),
+}), z.object({
+  observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
+  state: z.literal("ready"),
+}), z.object({
+  observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
+  reason: z.string(),
+  state: z.literal("stale"),
+}), z.object({
+  reason: z.string(),
+  state: z.literal("unavailable"),
+})]);
+export type CodeCloneIndexStatusV1 = z.infer<typeof CodeCloneIndexStatusV1Schema>;
+
+/** Strongly typed canonical identity: `CodeGenerationId`. */
+export const CodeGenerationIdSchema = z.string();
+export type CodeGenerationId = z.infer<typeof CodeGenerationIdSchema>;
+
 /** Interactive graph-serving state for the latest sealed generation.
 
 A sealed generation can expose truthful census statistics before its graph
@@ -654,7 +763,7 @@ export const CodeGraphServingReadinessV1Schema = z.discriminatedUnion("state", [
 export type CodeGraphServingReadinessV1 = z.infer<typeof CodeGraphServingReadinessV1Schema>;
 
 /** A typed reason an otherwise active generation cannot make durable progress. */
-export const CodeIndexBuildBlockedReasonV1Schema = z.enum(["artifact_store_unavailable", "resident_memory", "retry_backoff", "source_unavailable"]);
+export const CodeIndexBuildBlockedReasonV1Schema = z.enum(["artifact_store_unavailable", "publication_authority_corrupt", "resident_memory", "retry_backoff", "source_unavailable"]);
 export type CodeIndexBuildBlockedReasonV1 = z.infer<typeof CodeIndexBuildBlockedReasonV1Schema>;
 
 /** The durable build phase whose committed boundary the dashboard is reading.
@@ -769,6 +878,7 @@ export type CodeIndexWorkerStatusV1 = z.infer<typeof CodeIndexWorkerStatusV1Sche
 exactly this type back out of the daemon's `tracedecay_status` response,
 keeping one authority for the freshness shape. */
 export const CodeIndexWorktreeFreshnessV1Schema = z.object({
+  clone_index: z.union([z.lazy(() => CodeCloneIndexStatusV1Schema), z.null()]).optional(),
   code_graph_serving: z.union([z.lazy(() => CodeGraphServingReadinessV1Schema), z.null()]).optional(),
   coverage: z.string(),
   generation_recovery: z.union([z.lazy(() => CodeIndexGenerationRecoveryV1Schema), z.null()]).optional(),
@@ -817,6 +927,10 @@ export type ConfigurationRevisionId = z.infer<typeof ConfigurationRevisionIdSche
 /** Strongly typed canonical identity: `ConfigurationSnapshotId`. */
 export const ConfigurationSnapshotIdSchema = z.string();
 export type ConfigurationSnapshotId = z.infer<typeof ConfigurationSnapshotIdSchema>;
+
+/** Strongly typed algorithm-tagged integrity digest: `ContentDigest`. */
+export const ContentDigestSchema = z.string();
+export type ContentDigest = z.infer<typeof ContentDigestSchema>;
 
 export const CostsReadModelV1Schema = z.object({
   authorized_scope_ref: z.string(),
@@ -1050,6 +1164,41 @@ export const DecideWorkRelationReplanRequestV1Schema = z.object({
 }).strict();
 export type DecideWorkRelationReplanRequestV1 = z.infer<typeof DecideWorkRelationReplanRequestV1Schema>;
 
+export const DeliveryAttentionEvidenceV1Schema = z.discriminatedUnion("kind", [z.object({
+  failure_anchor: z.string(),
+  kind: z.literal("ci_failure"),
+}), z.object({
+  generation: z.string(),
+  kind: z.literal("indexed_generation"),
+}), z.object({
+  fetched_at_micros: z.number().int().safe(),
+  kind: z.literal("provider_operation"),
+  operation: z.lazy(() => DeliveryGitHubReadOperationV1Schema),
+}), z.object({
+  comment_id: z.string(),
+  kind: z.literal("review_comment"),
+  path: z.string(),
+})]);
+export type DeliveryAttentionEvidenceV1 = z.infer<typeof DeliveryAttentionEvidenceV1Schema>;
+
+export const DeliveryAttentionItemV1Schema = z.object({
+  coverage: z.lazy(() => DeliveryInboxCoverageV1Schema),
+  evidence: z.array(z.lazy(() => DeliveryAttentionEvidenceV1Schema)),
+  id: z.string(),
+  observed_at_micros: z.number().int().safe().nullable(),
+  project_id: z.string(),
+  pull_request_id: z.string(),
+  source: z.lazy(() => DeliveryAttentionSourceV1Schema),
+  state: z.lazy(() => DeliveryAttentionStateV1Schema),
+});
+export type DeliveryAttentionItemV1 = z.infer<typeof DeliveryAttentionItemV1Schema>;
+
+export const DeliveryAttentionSourceV1Schema = z.enum(["ci_failure", "confirmed_conflict", "contradiction", "divergent_shared_implementation", "evidence_gap", "new_review_comment", "overlapping_edit", "stale_provider_state", "test_risk", "unresolved_review", "unreviewed_changed_code", "unsafe_pattern", "weak_evidence"]);
+export type DeliveryAttentionSourceV1 = z.infer<typeof DeliveryAttentionSourceV1Schema>;
+
+export const DeliveryAttentionStateV1Schema = z.enum(["active", "clear", "denied", "unavailable"]);
+export type DeliveryAttentionStateV1 = z.infer<typeof DeliveryAttentionStateV1Schema>;
+
 export const DeliveryCiAnnotationLevelV1Schema = z.enum(["failure", "notice", "warning"]);
 export type DeliveryCiAnnotationLevelV1 = z.infer<typeof DeliveryCiAnnotationLevelV1Schema>;
 
@@ -1194,6 +1343,79 @@ export const DeliveryGitStatusV1Schema = z.object({
   untracked: z.number().int().min(0),
 });
 export type DeliveryGitStatusV1 = z.infer<typeof DeliveryGitStatusV1Schema>;
+
+export const DeliveryInboxCoverageV1Schema = z.enum(["complete", "denied", "partial", "stale", "unavailable", "unsupported"]);
+export type DeliveryInboxCoverageV1 = z.infer<typeof DeliveryInboxCoverageV1Schema>;
+
+export const DeliveryInboxProjectV1Schema = z.object({
+  branch_ref: z.string(),
+  git_common_dir: z.string(),
+  indexed_generation: z.string(),
+  indexed_head_commit_id: z.string(),
+  label: z.string(),
+  project_id: z.string(),
+  project_root: z.string(),
+  provider_state: z.lazy(() => DeliveryProviderStateV1Schema),
+  repository_id: z.string(),
+  worktree_id: z.string(),
+});
+export type DeliveryInboxProjectV1 = z.infer<typeof DeliveryInboxProjectV1Schema>;
+
+export const DeliveryInboxPullRequestStateV1Schema = z.enum(["current", "partial", "stale"]);
+export type DeliveryInboxPullRequestStateV1 = z.infer<typeof DeliveryInboxPullRequestStateV1Schema>;
+
+export const DeliveryInboxPullRequestV1Schema = z.object({
+  attention: z.array(z.lazy(() => DeliveryAttentionItemV1Schema)),
+  branch_ref: z.string(),
+  id: z.string(),
+  indexed_generation: z.string(),
+  indexed_head_commit_id: z.string(),
+  project_id: z.string(),
+  pull_request: z.lazy(() => DeliveryPullRequestV1Schema),
+  repository_id: z.string(),
+  shared_code: z.array(z.lazy(() => DeliverySharedCodeRefV1Schema)),
+  state: z.lazy(() => DeliveryInboxPullRequestStateV1Schema),
+  worktree_id: z.string(),
+});
+export type DeliveryInboxPullRequestV1 = z.infer<typeof DeliveryInboxPullRequestV1Schema>;
+
+export const DeliveryInboxV1Schema = z.object({
+  excluded_pull_requests: z.number().int().safe().min(0),
+  membership_edges: z.array(z.lazy(() => DeliveryMembershipEdgeV1Schema)),
+  omitted_projects: z.number().int().safe().min(0),
+  projects: z.array(z.lazy(() => DeliveryInboxProjectV1Schema)),
+  pull_requests: z.array(z.lazy(() => DeliveryInboxPullRequestV1Schema)),
+  registry_state: z.lazy(() => DeliveryRegistryStateV1Schema),
+});
+export type DeliveryInboxV1 = z.infer<typeof DeliveryInboxV1Schema>;
+
+export const DeliveryMembershipBasisV1Schema = z.discriminatedUnion("kind", [z.object({
+  branch_ref: z.string(),
+  head_commit_id: z.string(),
+  kind: z.literal("branch_pull_request_reference"),
+}), z.object({
+  handoff_id: z.string(),
+  kind: z.literal("explicit_handoff"),
+}), z.object({
+  commit_id: z.string(),
+  kind: z.literal("session_git_relation"),
+  session_id: z.string(),
+}), z.object({
+  agent_id: z.string(),
+  kind: z.literal("shared_agent"),
+}), z.object({
+  kind: z.literal("shared_work_objective"),
+  work_item_id: z.string(),
+})]);
+export type DeliveryMembershipBasisV1 = z.infer<typeof DeliveryMembershipBasisV1Schema>;
+
+export const DeliveryMembershipEdgeV1Schema = z.object({
+  basis: z.lazy(() => DeliveryMembershipBasisV1Schema),
+  id: z.string(),
+  project_id: z.string(),
+  pull_request_id: z.string(),
+});
+export type DeliveryMembershipEdgeV1 = z.infer<typeof DeliveryMembershipEdgeV1Schema>;
 
 export const DeliveryOverviewV1Schema = z.object({
   changes: z.lazy(() => DeliveryProjectionV1Schema),
@@ -1487,6 +1709,9 @@ export const DeliveryProjectionV18Schema = z.discriminatedUnion("state", [z.obje
 })]);
 export type DeliveryProjectionV18 = z.infer<typeof DeliveryProjectionV18Schema>;
 
+export const DeliveryProviderStateV1Schema = z.enum(["denied", "failed", "not_configured", "not_published", "partial", "rate_limited", "ready", "stale", "unavailable"]);
+export type DeliveryProviderStateV1 = z.infer<typeof DeliveryProviderStateV1Schema>;
+
 export const DeliveryPullRequestIdentityV1Schema = z.object({
   additions: z.number().int().safe().min(0),
   changed_files: z.number().int().safe().min(0),
@@ -1532,6 +1757,9 @@ export const DeliveryRateLimitCheckpointV1Schema = z.object({
   reset_at_micros: z.number().int().safe(),
 });
 export type DeliveryRateLimitCheckpointV1 = z.infer<typeof DeliveryRateLimitCheckpointV1Schema>;
+
+export const DeliveryRegistryStateV1Schema = z.enum(["partial", "ready", "unavailable"]);
+export type DeliveryRegistryStateV1 = z.infer<typeof DeliveryRegistryStateV1Schema>;
 
 export const DeliveryReleaseAssetV1Schema = z.object({
   asset_id: z.number().int().safe().min(0),
@@ -1626,6 +1854,20 @@ export const DeliveryReviewTimelineV1Schema = z.object({
 });
 export type DeliveryReviewTimelineV1 = z.infer<typeof DeliveryReviewTimelineV1Schema>;
 
+export const DeliverySharedCodeRefKindV1Schema = z.enum(["compare", "shared_code"]);
+export type DeliverySharedCodeRefKindV1 = z.infer<typeof DeliverySharedCodeRefKindV1Schema>;
+
+export const DeliverySharedCodeRefStateV1Schema = z.literal("requires_selection");
+export type DeliverySharedCodeRefStateV1 = z.infer<typeof DeliverySharedCodeRefStateV1Schema>;
+
+export const DeliverySharedCodeRefV1Schema = z.object({
+  href: z.string(),
+  kind: z.lazy(() => DeliverySharedCodeRefKindV1Schema),
+  source_generation: z.string(),
+  state: z.lazy(() => DeliverySharedCodeRefStateV1Schema),
+});
+export type DeliverySharedCodeRefV1 = z.infer<typeof DeliverySharedCodeRefV1Schema>;
+
 /** Whether Doctor observed all of a family's evidence sources. */
 export const DoctorCoverageCompletenessV1Schema = z.union([z.literal("complete"), z.literal("partial"), z.literal("unknown")]);
 export type DoctorCoverageCompletenessV1 = z.infer<typeof DoctorCoverageCompletenessV1Schema>;
@@ -1689,11 +1931,11 @@ export type DoctorFamilyUnavailableReasonV1 = z.infer<typeof DoctorFamilyUnavail
 The initial list covers advisory findings from
 Brain, Explorer, Loom, Code, and Observatory, plus the legacy
 `core_doctor` checks (graph quick-check, temporal/migration health,
-configuration compatibility drift, semantic runtime, session ingest).
+configuration compatibility drift, code-index mount state, session ingest).
 Each family maps to one audited typed input surface. The set is kept small
 and honest; new families are added through a future versioned enum rather
 than by widening the meaning of an existing variant. */
-export const DoctorFindingFamilyV1Schema = z.union([z.literal("advisory"), z.literal("configuration"), z.literal("storage_runtime"), z.literal("storage"), z.literal("language_server"), z.literal("semantic_index"), z.literal("observability")]);
+export const DoctorFindingFamilyV1Schema = z.union([z.literal("advisory"), z.literal("configuration"), z.literal("storage_runtime"), z.literal("storage"), z.literal("language_server"), z.literal("code_index"), z.literal("observability")]);
 export type DoctorFindingFamilyV1 = z.infer<typeof DoctorFindingFamilyV1Schema>;
 
 /** The canonical Doctor report projection for the read-only dashboard. */
@@ -1703,6 +1945,7 @@ export const DoctorFindingsPayloadV1Schema = z.object({
   known_families: z.array(z.lazy(() => DoctorFindingFamilyV1Schema)),
   note: z.string(),
   report_coverage: z.union([z.lazy(() => DoctorReportCoverageV1Schema), z.null()]),
+  schema_convergences: z.array(z.lazy(() => SchemaConvergenceFindingV1Schema)),
 });
 export type DoctorFindingsPayloadV1 = z.infer<typeof DoctorFindingsPayloadV1Schema>;
 
@@ -2145,25 +2388,17 @@ export const ExplorerSessionSizeV1Schema = z.object({
 });
 export type ExplorerSessionSizeV1 = z.infer<typeof ExplorerSessionSizeV1Schema>;
 
-export const ExplorerSourceIdV1Schema = z.enum(["code_graph", "knowledge", "semantic", "sessions"]);
+export const ExplorerSourceIdV1Schema = z.enum(["code_graph", "knowledge", "sessions"]);
 export type ExplorerSourceIdV1 = z.infer<typeof ExplorerSourceIdV1Schema>;
 
 /** What one source truthfully concluded for this run. Every member has a real
 producer; none is speculative:
 - `Partial`: the source answered with rows but its own read reported
   omitted records (LCM temporal reads).
-- `Indexing`: the provider is acquiring its model or projecting vectors
-  (semantic runtime acquisition/indexing states).
 - `Stale`: the source's store exists but does not match the current
-  generation (verified graph stale reads, LCM stale projections, semantic
-  generation staleness).
-- `TimedOut`: the source's own read exceeded the admitted deadline.
-- `Unsupported`: this dashboard surface cannot consult the source at all
-  (no daemon authority attached, or the provider state cannot be consumed
-  on this surface yet).
-- `Absent`: the source's store does not exist for this project — a typed
-  absence, not a failure (semantic search not activated). */
-export const ExplorerSourceOutcomeV1Schema = z.enum(["absent", "cancelled", "error", "indexing", "partial", "pending", "ready", "stale", "timed_out", "unavailable", "unsupported"]);
+  generation (verified graph stale reads, LCM stale projections).
+- `TimedOut`: the source's own read exceeded the admitted deadline. */
+export const ExplorerSourceOutcomeV1Schema = z.enum(["cancelled", "error", "partial", "pending", "ready", "stale", "timed_out", "unavailable"]);
 export type ExplorerSourceOutcomeV1 = z.infer<typeof ExplorerSourceOutcomeV1Schema>;
 
 export const ExplorerSourcePhaseV1Schema = z.enum(["cancelled", "completed", "queued", "reading"]);
@@ -2319,6 +2554,119 @@ export const FeedbackObservationWatermarkV1Schema = z.object({
 }).strict();
 export type FeedbackObservationWatermarkV1 = z.infer<typeof FeedbackObservationWatermarkV1Schema>;
 
+export const FeedbackProximityAccessKindV1Schema = z.enum(["read", "write"]);
+export type FeedbackProximityAccessKindV1 = z.infer<typeof FeedbackProximityAccessKindV1Schema>;
+
+export const FeedbackProximityCloneHandleV1Schema = z.object({
+  retrieval_anchor_ids: z.array(z.lazy(() => RetrievalAnchorIdSchema)),
+  source_generation: z.lazy(() => CodeGenerationIdSchema),
+  source_symbol: z.lazy(() => SymbolOccurrenceIdSchema),
+}).strict();
+export type FeedbackProximityCloneHandleV1 = z.infer<typeof FeedbackProximityCloneHandleV1Schema>;
+
+export const FeedbackProximityConflictDifferenceV1Schema = z.object({
+  difference_digest: z.lazy(() => ManifestDigestSchema),
+  file: z.lazy(() => FileOccurrenceIdSchema),
+  span: z.lazy(() => SourceSpanSchema),
+}).strict();
+export type FeedbackProximityConflictDifferenceV1 = z.infer<typeof FeedbackProximityConflictDifferenceV1Schema>;
+
+export const FeedbackProximityConflictHandleV1Schema = z.object({
+  common_base_revision: z.lazy(() => CommitIdSchema),
+  differences: z.array(z.lazy(() => FeedbackProximityConflictDifferenceV1Schema)),
+  evidence_digest: z.lazy(() => ManifestDigestSchema),
+  left_head_revision: z.lazy(() => CommitIdSchema),
+  right_head_revision: z.lazy(() => CommitIdSchema),
+}).strict();
+export type FeedbackProximityConflictHandleV1 = z.infer<typeof FeedbackProximityConflictHandleV1Schema>;
+
+export const FeedbackProximityEncounterV1Schema = z.object({
+  coverage: z.lazy(() => ProximityCoverageV1Schema),
+  encounter_id: z.lazy(() => ManifestDigestSchema),
+  expires_at: z.lazy(() => UtcMicrosSchema),
+  interval: z.lazy(() => FeedbackProximityIntervalV1Schema),
+  observed_at: z.lazy(() => UtcMicrosSchema),
+  participants: z.array(z.lazy(() => FeedbackProximityParticipantV1Schema)),
+  relation: z.lazy(() => FeedbackProximityRelationV1Schema),
+  scope: z.lazy(() => FeedbackScopeV1Schema),
+}).strict();
+export type FeedbackProximityEncounterV1 = z.infer<typeof FeedbackProximityEncounterV1Schema>;
+
+export const FeedbackProximityIntervalV1Schema = z.object({
+  end: z.lazy(() => UtcMicrosSchema),
+  start: z.lazy(() => UtcMicrosSchema),
+}).strict();
+export type FeedbackProximityIntervalV1 = z.infer<typeof FeedbackProximityIntervalV1Schema>;
+
+export const FeedbackProximityOmissionV1Schema = z.enum(["active_session_limit", "clone_coverage_partial", "code_index_revision_mismatch", "conflict_evidence_unavailable", "edited_path_limit", "encounter_limit", "missing_code_address", "missing_participant_observation", "missing_participant_revision", "missing_participant_worktree", "recent_observation_limit", "session_activity_limit"]);
+export type FeedbackProximityOmissionV1 = z.infer<typeof FeedbackProximityOmissionV1Schema>;
+
+export const FeedbackProximityParticipantV1Schema = z.object({
+  access: z.lazy(() => FeedbackProximityAccessKindV1Schema),
+  activity: z.lazy(() => FeedbackProximityIntervalV1Schema),
+  address: z.lazy(() => ProximityAddressV1Schema),
+  agent_id: z.lazy(() => AgentInstanceIdSchema),
+  branch_ref: z.union([z.lazy(() => RefIdSchema), z.null()]),
+  head_revision: z.union([z.lazy(() => CommitIdSchema), z.null()]),
+  source: z.lazy(() => ObservationSourceIdentityV1Schema),
+  worktree_id: z.union([z.lazy(() => WorktreeIdSchema), z.null()]),
+  worktree_root: z.string(),
+}).strict();
+export type FeedbackProximityParticipantV1 = z.infer<typeof FeedbackProximityParticipantV1Schema>;
+
+export const FeedbackProximityReadPageV1Schema = z.object({
+  encounters: z.array(z.lazy(() => FeedbackProximityEncounterV1Schema)),
+  expires_at: z.lazy(() => UtcMicrosSchema),
+  observed_at: z.lazy(() => UtcMicrosSchema),
+  scope: z.lazy(() => FeedbackScopeV1Schema),
+  source_generation: z.lazy(() => CodeGenerationIdSchema),
+}).strict();
+export type FeedbackProximityReadPageV1 = z.infer<typeof FeedbackProximityReadPageV1Schema>;
+
+export const FeedbackProximityReadRequestV1Schema = z.object({
+  observed_at: z.lazy(() => UtcMicrosSchema),
+}).strict();
+export type FeedbackProximityReadRequestV1 = z.infer<typeof FeedbackProximityReadRequestV1Schema>;
+
+export const FeedbackProximityReadResultV1Schema = z.discriminatedUnion("state", [z.object({
+  page: z.lazy(() => FeedbackProximityReadPageV1Schema),
+  state: z.literal("complete"),
+}).strict(), z.object({
+  page: z.lazy(() => FeedbackProximityReadPageV1Schema),
+  state: z.literal("complete_zero"),
+}).strict(), z.object({
+  observed_at: z.lazy(() => UtcMicrosSchema),
+  state: z.literal("denied"),
+}).strict(), z.object({
+  omissions: z.array(z.lazy(() => FeedbackProximityOmissionV1Schema)),
+  page: z.lazy(() => FeedbackProximityReadPageV1Schema),
+  state: z.literal("partial"),
+}).strict(), z.object({
+  omissions: z.array(z.lazy(() => FeedbackProximityOmissionV1Schema)),
+  page: z.lazy(() => FeedbackProximityReadPageV1Schema),
+  state: z.literal("stale"),
+}).strict(), z.object({
+  observed_at: z.lazy(() => UtcMicrosSchema),
+  state: z.literal("unavailable"),
+}).strict()]);
+export type FeedbackProximityReadResultV1 = z.infer<typeof FeedbackProximityReadResultV1Schema>;
+
+export const FeedbackProximityRelationV1Schema = z.discriminatedUnion("relation_kind", [z.object({
+  relation_kind: z.literal("code_neighborhood_candidate"),
+  warning_class: z.lazy(() => ProximityWarningClassV1Schema),
+}).strict(), z.object({
+  conflict_handle: z.lazy(() => FeedbackProximityConflictHandleV1Schema),
+  relation_kind: z.literal("confirmed_conflict"),
+}).strict(), z.object({
+  relation_kind: z.literal("overlapping_edit"),
+  warning_class: z.lazy(() => ProximityWarningClassV1Schema),
+}).strict(), z.object({
+  clone_handle: z.lazy(() => FeedbackProximityCloneHandleV1Schema),
+  relation_kind: z.literal("shared_code_candidate"),
+  warning_class: z.lazy(() => ProximityWarningClassV1Schema),
+}).strict()]);
+export type FeedbackProximityRelationV1 = z.infer<typeof FeedbackProximityRelationV1Schema>;
+
 /** One surface × operation × argument × error-class cell projected from
 dispatcher rejection source events. */
 export const FeedbackRejectedArgumentGroupV1Schema = z.object({
@@ -2329,6 +2677,18 @@ export const FeedbackRejectedArgumentGroupV1Schema = z.object({
   surface: z.lazy(() => RejectedArgumentSurfaceV1Schema),
 }).strict();
 export type FeedbackRejectedArgumentGroupV1 = z.infer<typeof FeedbackRejectedArgumentGroupV1Schema>;
+
+/** Exact repository scope used for a feedback evaluation. A path, current
+working directory, repository display name, or mutable branch label is not
+a substitute for this identity. */
+export const FeedbackScopeV1Schema = z.object({
+  branch_ref: z.string(),
+  head_commit_id: z.lazy(() => CommitIdSchema),
+  project_id: z.lazy(() => ProjectIdSchema),
+  repository_id: z.lazy(() => RepositoryIdSchema),
+  worktree_id: z.lazy(() => WorktreeIdSchema),
+}).strict();
+export type FeedbackScopeV1 = z.infer<typeof FeedbackScopeV1Schema>;
 
 export const FeedbackSystemMetricDenominatorV1Schema = z.enum(["eligible_observations", "eligible_source_families", "latency_samples", "outcome_observations", "relevance_labels", "returned_and_omitted_items", "revocation_observations", "stack_transition_observations"]);
 export type FeedbackSystemMetricDenominatorV1 = z.infer<typeof FeedbackSystemMetricDenominatorV1Schema>;
@@ -2360,6 +2720,10 @@ export const FeedbackSystemQualityReadModelV1Schema = z.object({
 }).strict();
 export type FeedbackSystemQualityReadModelV1 = z.infer<typeof FeedbackSystemQualityReadModelV1Schema>;
 
+/** Strongly typed canonical identity: `FileOccurrenceId`. */
+export const FileOccurrenceIdSchema = z.string();
+export type FileOccurrenceId = z.infer<typeof FileOccurrenceIdSchema>;
+
 /** A canonical product proposal and the exact verified graph that licensed it.
 
 `proposal` can be moved directly into a `DecideWorkProposalRequestV1`;
@@ -2384,6 +2748,12 @@ export type GenerateProposalRequest = z.infer<typeof GenerateProposalRequestSche
 
 export const GitHubStackedPullRequestPolicyV1Schema = z.enum(["disabled", "probe_private_preview"]);
 export type GitHubStackedPullRequestPolicyV1 = z.infer<typeof GitHubStackedPullRequestPolicyV1Schema>;
+
+/** A native Git object id (commit, tree, or blob), lowercase hex, SHA-1 or
+SHA-256 length. This is identity evidence only; it never authorizes
+object reconstruction or traversal outside native Git. */
+export const GitOidV1Schema = z.string();
+export type GitOidV1 = z.infer<typeof GitOidV1Schema>;
 
 export const GraphCappedV1Schema = z.object({
   edges: z.boolean(),
@@ -3852,6 +4222,22 @@ export const ProviderUsageSummaryV1Schema = z.object({
 });
 export type ProviderUsageSummaryV1 = z.infer<typeof ProviderUsageSummaryV1Schema>;
 
+/** A privacy-scoped code address. It identifies the coarse changed-code shape
+but carries no other actor, session, or private-source content. */
+export const ProximityAddressV1Schema = z.object({
+  file: z.lazy(() => FileOccurrenceIdSchema),
+  scope: z.lazy(() => FeedbackScopeV1Schema),
+  span: z.union([z.lazy(() => SourceSpanSchema), z.null()]),
+  symbol: z.union([z.lazy(() => SymbolOccurrenceIdSchema), z.null()]),
+}).strict();
+export type ProximityAddressV1 = z.infer<typeof ProximityAddressV1Schema>;
+
+export const ProximityCoverageV1Schema = z.enum(["complete", "denied", "partial", "private", "stale", "unavailable"]);
+export type ProximityCoverageV1 = z.infer<typeof ProximityCoverageV1Schema>;
+
+export const ProximityWarningClassV1Schema = z.enum(["incompatible_branch_worktree", "neighborhood", "overlapping_range", "same_crate", "same_file", "same_package", "same_symbol", "shared_caller", "shared_dependency", "shared_test"]);
+export type ProximityWarningClassV1 = z.infer<typeof ProximityWarningClassV1Schema>;
+
 export const PublicCodeProjectSchema = z.object({
   canonical_root: z.string(),
   created_at: z.number().int().safe(),
@@ -4127,6 +4513,79 @@ export const ReviewTopologyPolicyV1Schema = z.object({
 }).strict();
 export type ReviewTopologyPolicyV1 = z.infer<typeof ReviewTopologyPolicyV1Schema>;
 
+/** The only non-accepting dispositions the proposal-review operation can
+commit. The broader decision request remains available to the graph
+mutation operation, which owns all decision forms. */
+export const ReviewWorkProposalDispositionV1Schema = z.enum(["rejected", "superseded"]);
+export type ReviewWorkProposalDispositionV1 = z.infer<typeof ReviewWorkProposalDispositionV1Schema>;
+
+export const ReviewWorkProposalRequestV1Schema = z.object({
+  disposition: z.lazy(() => ReviewWorkProposalDispositionV1Schema),
+  mutation: z.lazy(() => WorkProductMutationIdentityV1Schema),
+  proposal: z.lazy(() => WorkProposalV1Schema),
+  selection: z.lazy(() => WorkProductSelectionScopeV1Schema),
+}).strict();
+export type ReviewWorkProposalRequestV1 = z.infer<typeof ReviewWorkProposalRequestV1Schema>;
+
+export const RevisionPairChangeV1Schema = z.enum(["added", "changed", "removed", "unchanged"]);
+export type RevisionPairChangeV1 = z.infer<typeof RevisionPairChangeV1Schema>;
+
+export const RevisionPairFileDispositionV1Schema = z.enum(["binary", "deleted", "generated", "ignored", "present", "renamed", "unsupported_language"]);
+export type RevisionPairFileDispositionV1 = z.infer<typeof RevisionPairFileDispositionV1Schema>;
+
+export const RevisionPairFileRegionV1Schema = z.object({
+  base: z.union([z.lazy(() => RevisionPairFileV1Schema), z.null()]),
+  change: z.lazy(() => RevisionPairChangeV1Schema),
+  file_identity: z.string(),
+  head: z.union([z.lazy(() => RevisionPairFileV1Schema), z.null()]),
+}).strict();
+export type RevisionPairFileRegionV1 = z.infer<typeof RevisionPairFileRegionV1Schema>;
+
+export const RevisionPairFileV1Schema = z.object({
+  content_digest: z.lazy(() => ContentDigestSchema),
+  disposition: z.lazy(() => RevisionPairFileDispositionV1Schema),
+  file_occurrence_id: z.lazy(() => FileOccurrenceIdSchema),
+  path: z.string(),
+  symbol_identities: z.array(z.string()),
+}).strict();
+export type RevisionPairFileV1 = z.infer<typeof RevisionPairFileV1Schema>;
+
+export const RevisionPairRevisionV1Schema = z.object({
+  generation: z.lazy(() => CodeGenerationIdSchema),
+  reference: z.lazy(() => RefIdSchema),
+  revision: z.lazy(() => GitOidV1Schema),
+  tree: z.lazy(() => GitOidV1Schema),
+}).strict();
+export type RevisionPairRevisionV1 = z.infer<typeof RevisionPairRevisionV1Schema>;
+
+export const RevisionPairSymbolRegionV1Schema = z.object({
+  base: z.union([z.lazy(() => RevisionPairSymbolV1Schema), z.null()]),
+  change: z.lazy(() => RevisionPairChangeV1Schema),
+  head: z.union([z.lazy(() => RevisionPairSymbolV1Schema), z.null()]),
+  symbol_identity: z.string(),
+}).strict();
+export type RevisionPairSymbolRegionV1 = z.infer<typeof RevisionPairSymbolRegionV1Schema>;
+
+export const RevisionPairSymbolV1Schema = z.object({
+  content_digest: z.string(),
+  file: z.string(),
+  file_identity: z.string(),
+  file_occurrence_id: z.lazy(() => FileOccurrenceIdSchema),
+  kind: z.string(),
+  name: z.string(),
+  qualified_name: z.string(),
+  symbol_occurrence_id: z.lazy(() => SymbolOccurrenceIdSchema),
+}).strict();
+export type RevisionPairSymbolV1 = z.infer<typeof RevisionPairSymbolV1Schema>;
+
+export const RevisionPairUnionLayoutV1Schema = z.object({
+  base: z.lazy(() => RevisionPairRevisionV1Schema),
+  files: z.array(z.lazy(() => RevisionPairFileRegionV1Schema)),
+  head: z.lazy(() => RevisionPairRevisionV1Schema),
+  symbols: z.array(z.lazy(() => RevisionPairSymbolRegionV1Schema)),
+}).strict();
+export type RevisionPairUnionLayoutV1 = z.infer<typeof RevisionPairUnionLayoutV1Schema>;
+
 /** Immutable collection and stack revisions for one exact resolved root. */
 export const RootGenerationV1Schema = z.object({
   collection_revision: z.lazy(() => ManifestDigestSchema),
@@ -4313,6 +4772,33 @@ export const SavingsSumV1Schema = z.object({
 });
 export type SavingsSumV1 = z.infer<typeof SavingsSumV1Schema>;
 
+export const SchemaConvergenceFindingV1Schema = z.object({
+  degraded_row: z.string().nullable(),
+  progress: z.union([z.lazy(() => SchemaConvergenceProgressV1Schema), z.null()]),
+  stage: z.lazy(() => SchemaConvergenceStageV1Schema),
+  started_at_micros: z.number().int().safe(),
+  state: z.lazy(() => SchemaConvergenceStateV1Schema),
+  store: z.string(),
+}).strict();
+export type SchemaConvergenceFindingV1 = z.infer<typeof SchemaConvergenceFindingV1Schema>;
+
+export const SchemaConvergenceProgressV1Schema = z.discriminatedUnion("unit", [z.object({
+  done: z.number().int().safe().min(0),
+  remaining: z.number().int().safe().min(0),
+  unit: z.literal("pages"),
+}).strict(), z.object({
+  done: z.number().int().safe().min(0),
+  remaining: z.number().int().safe().min(0),
+  unit: z.literal("rows"),
+}).strict()]);
+export type SchemaConvergenceProgressV1 = z.infer<typeof SchemaConvergenceProgressV1Schema>;
+
+export const SchemaConvergenceStageV1Schema = z.enum(["registered_schema", "runtime_writer_ledger"]);
+export type SchemaConvergenceStageV1 = z.infer<typeof SchemaConvergenceStageV1Schema>;
+
+export const SchemaConvergenceStateV1Schema = z.enum(["completed", "degraded", "pending_schema_migration", "released_shape_convergence_in_progress"]);
+export type SchemaConvergenceStateV1 = z.infer<typeof SchemaConvergenceStateV1Schema>;
+
 /** Stable, canonical catalog identity for `SchemaId`. */
 export const SchemaIdSchema = z.string();
 export type SchemaId = z.infer<typeof SchemaIdSchema>;
@@ -4418,13 +4904,42 @@ export type SensitivityV1 = z.infer<typeof SensitivityV1Schema>;
 export const SessionIdSchema = z.string();
 export type SessionId = z.infer<typeof SessionIdSchema>;
 
+/** The ceiling and count behind a budget refusal.
+
+`stage` names which budget refused; this is what tells an oversized request
+apart from a read whose cost was mis-sized for it. The ceiling value also
+distinguishes the resources inside one stage — a record read that stopped at
+1024 hit the item count, one that stopped at 16 MiB hit the byte total — so
+the kernel's resource spelling stays in the kernel instead of becoming a
+second wire vocabulary to keep in step. */
+export const SessionRetrievalBudgetAccountingV1Schema = z.object({
+  limit: z.number().int().safe().min(0),
+  observed: z.lazy(() => SessionRetrievalBudgetObservationV1Schema),
+}).strict();
+export type SessionRetrievalBudgetAccountingV1 = z.infer<typeof SessionRetrievalBudgetAccountingV1Schema>;
+
+/** What a refusing budget boundary had counted.
+
+Both variants are exact. A bounded read never counts the rows it declined to
+read, so an exhausted read reports what it consumed and that storage held
+more — never a total it would have to run the refused scan to learn. */
+export const SessionRetrievalBudgetObservationV1Schema = z.discriminatedUnion("observation", [z.object({
+  observation: z.literal("consumed_with_more_available"),
+  units: z.number().int().safe().min(0),
+}).strict(), z.object({
+  observation: z.literal("requested"),
+  units: z.number().int().safe().min(0),
+}).strict()]);
+export type SessionRetrievalBudgetObservationV1 = z.infer<typeof SessionRetrievalBudgetObservationV1Schema>;
+
 /** Structural budget boundary that rejected a session retrieval request.
 These causes are non-retryable request corrections; concurrent permit or
 queue pressure remains a separate capacity-saturation failure. */
-export const SessionRetrievalBudgetStageV1Schema = z.enum(["context_bytes", "context_tokens", "estimator_version_mismatch", "execution_work_exhausted", "hydration_bytes", "kernel_result_limit", "participant_manifest_canonical_bytes", "participant_manifest_participants", "request_candidate_bytes", "request_context_bytes", "request_hydration_bytes", "request_hydration_limit", "request_record_bytes", "request_result_limit"]);
+export const SessionRetrievalBudgetStageV1Schema = z.enum(["candidate_read_exhausted", "context_bytes", "context_tokens", "cursor_manifest_limit", "estimator_version_mismatch", "execution_work_exhausted", "hydration_bytes", "kernel_result_limit", "participant_manifest_canonical_bytes", "participant_manifest_participants", "record_read_exhausted", "request_candidate_bytes", "request_context_bytes", "request_hydration_bytes", "request_hydration_limit", "request_record_bytes", "request_result_limit"]);
 export type SessionRetrievalBudgetStageV1 = z.infer<typeof SessionRetrievalBudgetStageV1Schema>;
 
 export const SessionRetrievalStructuralRefusalV1Schema = z.discriminatedUnion("refusal", [z.object({
+  accounting: z.union([z.lazy(() => SessionRetrievalBudgetAccountingV1Schema), z.null()]),
   refusal: z.literal("budget_exhausted"),
   stage: z.lazy(() => SessionRetrievalBudgetStageV1Schema),
 }).strict(), z.object({
@@ -4475,6 +4990,61 @@ export const SignificantTableGrowthSampleV1Schema = z.object({
   table: z.string(),
 });
 export type SignificantTableGrowthSampleV1 = z.infer<typeof SignificantTableGrowthSampleV1Schema>;
+
+export const SimilarCoverageV1Schema = z.discriminatedUnion("status", [z.object({
+  status: z.literal("complete"),
+}).strict(), z.object({
+  status: z.literal("excluded_incomplete_tokenization"),
+}).strict(), z.object({
+  minimum_tokens: z.number().int().min(0),
+  status: z.literal("excluded_too_small"),
+}).strict(), z.object({
+  status: z.literal("partial"),
+}).strict()]);
+export type SimilarCoverageV1 = z.infer<typeof SimilarCoverageV1Schema>;
+
+export const SimilarFamilyV1Schema = z.object({
+  complete: z.boolean(),
+  family_digest: z.lazy(() => ManifestDigestSchema),
+  match_class: z.lazy(() => SimilarMatchClassV1Schema),
+  member_count: z.number().int().safe().min(0),
+  members: z.array(z.lazy(() => SimilarOccurrenceV1Schema)),
+  next_cursor: z.string().nullable(),
+  normalization_revision: z.number().int().min(0).max(65535),
+  representative_payload_digest: z.lazy(() => ManifestDigestSchema),
+}).strict();
+export type SimilarFamilyV1 = z.infer<typeof SimilarFamilyV1Schema>;
+
+export const SimilarMatchClassV1Schema = z.enum(["conservative_exact", "rename_normalized_exact"]);
+export type SimilarMatchClassV1 = z.infer<typeof SimilarMatchClassV1Schema>;
+
+export const SimilarOccurrenceV1Schema = z.object({
+  body_span: z.lazy(() => SourceSpanSchema),
+  path: z.string(),
+  project_id: z.lazy(() => ProjectIdSchema),
+  repository_id: z.lazy(() => RepositoryIdSchema),
+  snapshot_digest: z.lazy(() => ManifestDigestSchema),
+  source_generation: z.lazy(() => CodeGenerationIdSchema),
+  symbol_occurrence_id: z.lazy(() => SymbolOccurrenceIdSchema),
+  worktree_id: z.union([z.lazy(() => WorktreeIdSchema), z.null()]),
+}).strict();
+export type SimilarOccurrenceV1 = z.infer<typeof SimilarOccurrenceV1Schema>;
+
+export const SimilarResultV1Schema = z.object({
+  coverage: z.lazy(() => SimilarCoverageV1Schema),
+  families: z.array(z.lazy(() => SimilarFamilyV1Schema)),
+  source: z.lazy(() => SimilarOccurrenceV1Schema),
+  source_generation: z.lazy(() => CodeGenerationIdSchema),
+}).strict();
+export type SimilarResultV1 = z.infer<typeof SimilarResultV1Schema>;
+
+/** Byte range inside one sanitized source file. Mutable line numbers are
+never part of identity. */
+export const SourceSpanSchema = z.object({
+  end_byte: z.number().int().safe().min(0),
+  start_byte: z.number().int().safe().min(0),
+}).strict();
+export type SourceSpan = z.infer<typeof SourceSpanSchema>;
 
 /** Strongly typed canonical identity: `SourceStoreId`. */
 export const SourceStoreIdSchema = z.string();
@@ -4531,6 +5101,7 @@ export const StorageFindingsPayloadV1Schema = z.object({
   known_families: z.array(z.lazy(() => DoctorFindingFamilyV1Schema)),
   note: z.string(),
   report_coverage: z.union([z.lazy(() => DoctorReportCoverageV1Schema), z.null()]),
+  schema_convergences: z.array(z.lazy(() => SchemaConvergenceFindingV1Schema)),
 });
 export type StorageFindingsPayloadV1 = z.infer<typeof StorageFindingsPayloadV1Schema>;
 
@@ -4777,6 +5348,10 @@ export const StructureReadV15Schema = z.discriminatedUnion("status", [z.object({
   status: z.literal("unmeasured"),
 })]);
 export type StructureReadV15 = z.infer<typeof StructureReadV15Schema>;
+
+/** Strongly typed canonical identity: `SymbolOccurrenceId`. */
+export const SymbolOccurrenceIdSchema = z.string();
+export type SymbolOccurrenceId = z.infer<typeof SymbolOccurrenceIdSchema>;
 
 /** Nested synchronization settings patch. */
 export const SyncSettingsPatchSchema = z.object({
@@ -5965,7 +6540,6 @@ export const WorkflowRunGetRequestSchema = z.object({
 export type WorkflowRunGetRequest = z.infer<typeof WorkflowRunGetRequestSchema>;
 
 export const WorkflowRunProjectionSchema = z.object({
-  active_fan_out_attempts: z.record(z.lazy(() => WorkAttemptIdentityV1Schema)),
   definition: z.lazy(() => WorkflowDefinitionSchema),
   fan_out_plans: z.record(z.lazy(() => WorkflowFanOutPlanV1Schema)),
   history: z.array(z.lazy(() => WorkflowRunEventSchema)),
@@ -6763,6 +7337,7 @@ export type WorkProposalReasonV1 = z.infer<typeof WorkProposalReasonV1Schema>;
 export const WorkProposalV1Schema = z.object({
   based_on_version: z.number().int().safe().min(0),
   children: z.array(z.lazy(() => WorkProposedChildV1Schema)),
+  configuration_digest: z.lazy(() => ManifestDigestSchema),
   evidence_digest: z.lazy(() => ManifestDigestSchema),
   explanation: z.string(),
   proposal_id: z.lazy(() => ProposalIdSchema),

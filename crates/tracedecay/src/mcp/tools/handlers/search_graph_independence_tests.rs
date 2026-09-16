@@ -14,6 +14,9 @@ use super::dispatch_test_support::{SelectorEnv, verified_graph_options};
 use super::*;
 use crate::config::lock_user_data_dir_test_env;
 
+const LEXICAL_SYMBOL_ID: &str =
+    "symbol.v1.sha256:4ddd636456fccc2962006c7803bd94b2d7d732c6830993a429535e0b0ff0b688";
+
 struct PendingVerifiedGraphQueryPort;
 
 impl tracedecay_graph_query::VerifiedGraphQueryPort for PendingVerifiedGraphQueryPort {
@@ -46,7 +49,7 @@ impl tracedecay_graph_query::VerifiedGraphQueryPort for YieldingUnavailableVerif
 fn lexical_candidate() -> RankedCandidate {
     RankedCandidate {
         candidate: FusedCandidate {
-            anchor_id: RetrievalAnchorId::new("code-symbol:lexical-widget")
+            anchor_id: RetrievalAnchorId::new(format!("code-symbol:{LEXICAL_SYMBOL_ID}"))
                 .expect("lexical candidate anchor"),
             logical_evidence_id: LogicalEvidenceId::new("logical.lexical-widget")
                 .expect("lexical candidate logical evidence"),
@@ -76,9 +79,6 @@ fn completed_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
     )
     .expect("canonical lexical fallback payload");
     let anchor = candidate.candidate.anchor_id.clone();
-    let semantic = crate::mcp::server::CodeIndexSemanticStatusV1::Unavailable {
-        reason: "semantic_generation_warming",
-    };
     crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(
         crate::mcp::server::CodeIndexSearchCompletedV1 {
             code_generation: "generation.search-degradation.1".to_owned(),
@@ -93,8 +93,7 @@ fn completed_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
                     path: "src/lib.rs".to_owned(),
                 },
             )]),
-            coverage: crate::mcp::server::CodeIndexSearchCoverageV1::fused(&semantic),
-            semantic,
+            coverage: crate::mcp::server::CodeIndexSearchCoverageV1::warm(),
             next_cursor: None,
             lexical_routes: tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1 {
                 routes: vec![tracedecay_query::retrieval::lexical::LexicalRouteKindV1::Query],
@@ -167,7 +166,7 @@ async fn tracedecay_search_preserves_lexical_results_when_graph_admission_is_mis
     assert_eq!(payload["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["results"][0]["display"]["name"], "LexicalWidget");
     assert_eq!(payload["results"][0]["display"]["path"], "src/lib.rs");
-    assert!(payload["results"][0]["node_id"].is_null());
+    assert_eq!(payload["results"][0]["node_id"], LEXICAL_SYMBOL_ID);
     assert_eq!(
         payload["code_generation"],
         "generation.search-degradation.1"
@@ -229,7 +228,13 @@ async fn tracedecay_search_refuses_foreign_generation_graph_evidence_without_era
 
     assert_eq!(payload["results"].as_array().map(Vec::len), Some(1));
     assert_eq!(payload["results"][0]["display"]["name"], "LexicalWidget");
-    assert!(payload["results"][0]["node_id"].is_null());
+    // This ID comes from the generation-bound lexical anchor. The foreign
+    // graph remains refused below and contributes no replacement identity.
+    assert_eq!(payload["results"][0]["node_id"], LEXICAL_SYMBOL_ID);
+    assert_eq!(
+        payload["results"][0]["candidate"]["anchor_id"],
+        format!("code-symbol:{LEXICAL_SYMBOL_ID}")
+    );
     assert_eq!(
         payload["verified_graph_evidence"]["reason_code"],
         "verified-code-graph-generation-mismatch"
@@ -334,7 +339,7 @@ async fn tracedecay_search_does_not_wait_for_slow_graph_admission() {
 }
 
 #[tokio::test]
-async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_warm() {
+async fn tracedecay_context_preserves_fallback_results_while_graph_warms() {
     let _env_lock = lock_user_data_dir_test_env();
     let dir = TempDir::new().expect("context degradation isolation");
     let _env = SelectorEnv::new(dir.path());
@@ -364,7 +369,7 @@ async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_
         options,
     )
     .await
-    .expect("warming graph and semantic lanes must not erase fallback context");
+    .expect("a warming graph lane must not erase fallback context");
     let payload: Value = serde_json::from_str(
         result.value["content"][0]["text"]
             .as_str()
@@ -382,13 +387,6 @@ async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_
     assert_eq!(payload["symbols"].as_array().map(Vec::len), Some(0));
     assert_eq!(payload["coverage"]["exact"], "complete");
     assert_eq!(payload["coverage"]["lexical"], "complete");
-    assert_eq!(
-        payload["coverage"]["semantic"],
-        json!({
-            "status": "unavailable",
-            "reason": "semantic_generation_warming",
-        })
-    );
     assert_eq!(
         payload["verified_graph_evidence"]["reason_code"],
         "verified-code-graph-read-unavailable"
@@ -415,7 +413,6 @@ async fn tracedecay_context_preserves_fallback_results_while_semantic_and_graph_
         .as_str()
         .expect("context markdown text");
     assert!(text.contains("LexicalWidget"));
-    assert!(text.contains("Semantic results pending"));
     assert!(text.contains("Graph enrichment unavailable"));
     cg.close();
 }
@@ -486,9 +483,6 @@ async fn tracedecay_context_returns_typed_pending_coverage_when_every_code_lane_
                 crate::mcp::server::CodeIndexSearchUnavailableV1 {
                     code_generation: None,
                     reason: crate::mcp::server::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
-                    semantic: crate::mcp::server::CodeIndexSemanticStatusV1::Unavailable {
-                        reason: tracedecay_query::code_search::lane_reason::GENERATION_REBUILDING,
-                    },
                     coverage: crate::mcp::server::CodeIndexSearchCoverageV1::unavailable(
                         tracedecay_query::code_search::lane_reason::GENERATION_REBUILDING,
                     ),
@@ -525,7 +519,7 @@ async fn tracedecay_context_returns_typed_pending_coverage_when_every_code_lane_
     assert!(payload.get("code_generation").is_none());
     assert!(payload.get("search_matches").is_none());
     assert_eq!(payload["symbols"].as_array().map(Vec::len), Some(0));
-    for lane in ["exact", "lexical", "graph", "semantic"] {
+    for lane in ["exact", "lexical", "graph"] {
         assert_eq!(payload["coverage"][lane]["status"], "unavailable");
         assert_eq!(payload["coverage"][lane]["reason"], "generation_rebuilding");
     }
@@ -536,10 +530,8 @@ async fn tracedecay_context_returns_typed_pending_coverage_when_every_code_lane_
 fn stale_lexical_search() -> crate::mcp::server::CodeIndexSearchOutcomeV1 {
     match completed_lexical_search() {
         crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(mut complete) => {
-            complete.coverage = crate::mcp::server::CodeIndexSearchCoverageV1::fused_stale(
-                &complete.code_generation,
-                &complete.semantic,
-            );
+            complete.coverage =
+                crate::mcp::server::CodeIndexSearchCoverageV1::stale(&complete.code_generation);
             crate::mcp::server::CodeIndexSearchOutcomeV1::Complete(complete)
         }
         other @ crate::mcp::server::CodeIndexSearchOutcomeV1::Unavailable(_) => other,

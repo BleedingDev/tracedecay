@@ -37,12 +37,20 @@ fn retire_generation_read_bundle(store_root: &Path, generation_file: &str) -> Re
         .map_err(|error| error.to_string())
 }
 
+/// Every code-generation degradation is a genuine anomaly: it keeps the tick
+/// summary loud and logs on every attempt.
 pub fn log_code_generation_retention_degraded(
     observations: &crate::telemetry::StoreTelemetrySamplingRegistry,
-    project_root: &Path,
     failure: &str,
 ) {
-    observations.emit_retention_degraded(project_root, "code_generations", failure);
+    observations.mark_loud_retention_log();
+    log_daemon_event(
+        "retention_degraded",
+        &[
+            ("pass", "code_generations".to_string()),
+            ("failure", failure.to_string()),
+        ],
+    );
 }
 
 /// Shared deferral for a held graph-replay pool: the outer probe and the
@@ -54,7 +62,7 @@ pub fn defer_graph_replay_pool_busy(
 ) -> super::CodeGenerationRetentionOutcomeV1 {
     observations.record_graph_replay_release_unhealthy(project_root);
     hotpath::gauge!("daemon.git.maintenance.replay_pool_busy_total").inc(1_u64);
-    log_code_generation_retention_degraded(observations, project_root, "graph_replay_pool_busy");
+    log_code_generation_retention_degraded(observations, "graph_replay_pool_busy");
     super::CodeGenerationRetentionOutcomeV1::Failed
 }
 
@@ -124,14 +132,12 @@ pub fn replay_pool_is_held(replay_pool_root: &Path) -> bool {
 pub async fn reconcile_graph_replay_releases(
     lease: &ProjectStoreMaintenanceLeaseV1,
     store_root: &Path,
-    repository_id: &tracedecay_domain::RepositoryId,
     observations: &crate::telemetry::StoreTelemetrySamplingRegistry,
     cancellation: &tracedecay_session_memory::context::CancellationToken,
 ) -> ReconcileOutcome {
     let Some(project_id) = lease.store_layout().identity.project_id.as_ref() else {
         log_code_generation_retention_degraded(
             observations,
-            lease.project_root(),
             "graph_replay_project_identity_unavailable",
         );
         return ReconcileOutcome::Failed;
@@ -141,7 +147,6 @@ pub async fn reconcile_graph_replay_releases(
         Err(_) => {
             log_code_generation_retention_degraded(
                 observations,
-                lease.project_root(),
                 "graph_replay_project_identity_invalid",
             );
             return ReconcileOutcome::Failed;
@@ -162,8 +167,6 @@ pub async fn reconcile_graph_replay_releases(
         .store_runtime()
         .release_one_sealed_generation_staging_rows(
             project_id.clone(),
-            repository_id,
-            store_root.join("code-generations-v1"),
             lease.graph_db(),
             cancellation,
             staging_cursor,
@@ -240,7 +243,6 @@ pub async fn reconcile_graph_replay_releases(
                 if complete_code_generation_graph_replay_release(store_root, &release).is_err() {
                     log_code_generation_retention_degraded(
                         observations,
-                        project_root,
                         "graph_replay_release_checkpoint_failed",
                     );
                     return ReconcileOutcome::Failed;

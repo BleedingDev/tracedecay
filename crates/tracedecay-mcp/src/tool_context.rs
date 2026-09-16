@@ -31,21 +31,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracedecay_configuration::ProjectConfigurationRuntime;
-use tracedecay_contracts::doctor::SemanticOwnerStateV1;
-use tracedecay_contracts::{CancellationSignal, Deadline, ResolvedScope};
-use tracedecay_dashboard_api::AdmittedDoctorReportV1;
-use tracedecay_dashboard_api::code_index_freshness_api::{
+use tracedecay_contracts::code_index_freshness::{
     CodeIndexFreshnessPayloadV1, CodeIndexFreshnessReader,
 };
+use tracedecay_contracts::{CancellationSignal, Deadline, ResolvedScope};
+use tracedecay_dashboard_api::AdmittedDoctorReportV1;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_graph_query::VerifiedGraphQuery;
 use tracedecay_query::code_search::{
-    CodeIndexBranchDiffExecutor, CodeIndexSearchAuthorityV1, CodeIndexSearchExecutor,
+    CodeIndexBranchDiffExecutor, CodeIndexRedundancyExecutor, CodeIndexSearchAuthorityV1,
+    CodeIndexSearchExecutor, CodeIndexSimilarExecutor,
 };
 use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot;
 use tracedecay_runtime_core::storage::StoreLayout;
-use tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot;
 use tracedecay_store::StoreShardScopeV1;
 use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 use tracedecay_temporal_query::resolution::ValidatedAuthorization;
@@ -137,6 +137,8 @@ impl<'a> AdmittedProjectStore<'a> {
 pub struct AdmittedCodeIndex<'a> {
     authority: &'a CodeIndexSearchAuthorityV1,
     search: Option<&'a CodeIndexSearchExecutor>,
+    similar: Option<&'a CodeIndexSimilarExecutor>,
+    redundancy: Option<&'a CodeIndexRedundancyExecutor>,
     branch_diff: Option<&'a CodeIndexBranchDiffExecutor>,
 }
 
@@ -145,14 +147,18 @@ impl<'a> AdmittedCodeIndex<'a> {
     pub fn new(
         authority: &'a CodeIndexSearchAuthorityV1,
         search: Option<&'a CodeIndexSearchExecutor>,
+        similar: Option<&'a CodeIndexSimilarExecutor>,
+        redundancy: Option<&'a CodeIndexRedundancyExecutor>,
         branch_diff: Option<&'a CodeIndexBranchDiffExecutor>,
     ) -> std::result::Result<Self, McpToolBindingError> {
-        if search.is_none() && branch_diff.is_none() {
+        if search.is_none() && similar.is_none() && redundancy.is_none() && branch_diff.is_none() {
             return Err(McpToolBindingError::CodeIndexWithoutExecutor);
         }
         Ok(Self {
             authority,
             search,
+            similar,
+            redundancy,
             branch_diff,
         })
     }
@@ -268,8 +274,13 @@ impl McpAdmittedProjectV1 {
             self.identity.serving_branch.clone(),
             self.identity.fallback_warning.clone(),
             self.graph_db_path.clone(),
-            serving_source_reference.map(|reference| (reference, serving_source_revision)),
-            serving_source_is_current,
+            serving_source_reference.map(|reference| {
+                tracedecay_application::tracedecay::ServingGraphSource {
+                    reference,
+                    revision: serving_source_revision,
+                    is_current: serving_source_is_current,
+                }
+            }),
         )
     }
 
@@ -328,20 +339,6 @@ impl std::fmt::Debug for McpAdmittedProjectV1 {
     }
 }
 
-/// Semantic-owner snapshot the root computed for this request.
-///
-/// One state, not an `Option` plus a flag: a caller cannot claim the daemon
-/// service was both attached and unattached.
-#[derive(Clone, Copy, Default)]
-pub enum McpSemanticOwnerV1<'a> {
-    /// No daemon invocation service was attached to this call.
-    #[default]
-    NotAttached,
-    /// The service was attached and the owner task has no registered state.
-    AttachedAbsent,
-    Attached(&'a SemanticOwnerStateV1),
-}
-
 /// Doctor-report snapshot the root computed for this request.
 ///
 /// One state, not an `Option` plus a flag: a caller cannot claim the reader
@@ -358,8 +355,8 @@ pub enum McpDoctorReportV1<'a> {
 
 /// Per-request snapshots and admitted executors a moved handler family may read.
 ///
-/// Snapshots, not readers: the root computes freshness, census, semantic-owner,
-/// and doctor report once per call and passes the values. Absence is typed.
+/// Snapshots, not readers: the root computes freshness, census, and doctor
+/// report once per call and passes the values. Absence is typed.
 #[derive(Clone, Copy, Default)]
 pub struct McpRequestAuthoritiesV1<'a> {
     pub controls: RequestControls<'a>,
@@ -368,7 +365,6 @@ pub struct McpRequestAuthoritiesV1<'a> {
     /// Search and context call it after the lanes settle.
     pub freshness: Option<&'a CodeIndexFreshnessReader>,
     pub generation_census: Option<&'a GenerationCensusSnapshot>,
-    pub semantic_owner: McpSemanticOwnerV1<'a>,
     pub doctor_report: McpDoctorReportV1<'a>,
 }
 
@@ -400,6 +396,8 @@ pub struct McpToolContext<'a> {
     admitted_scope: &'a ResolvedScope,
     project_session_db: Option<&'a RegisteredGlobalDbLeaseV1>,
     code_index_search_executor: Option<&'a CodeIndexSearchExecutor>,
+    code_index_similar_executor: Option<&'a CodeIndexSimilarExecutor>,
+    code_index_redundancy_executor: Option<&'a CodeIndexRedundancyExecutor>,
     code_index_branch_diff_executor: Option<&'a CodeIndexBranchDiffExecutor>,
     code_index_search_authority: Option<&'a CodeIndexSearchAuthorityV1>,
 }
@@ -444,6 +442,12 @@ impl<'a> McpToolContext<'a> {
             admitted_scope,
             project_session_db: project_session_store.map(|store| store.lease),
             code_index_search_executor: request.code_index.and_then(|code_index| code_index.search),
+            code_index_similar_executor: request
+                .code_index
+                .and_then(|code_index| code_index.similar),
+            code_index_redundancy_executor: request
+                .code_index
+                .and_then(|code_index| code_index.redundancy),
             code_index_branch_diff_executor: request
                 .code_index
                 .and_then(|code_index| code_index.branch_diff),
@@ -502,11 +506,6 @@ impl<'a> McpToolContext<'a> {
     #[must_use]
     pub fn generation_census(&self) -> Option<&'a GenerationCensusSnapshot> {
         self.request.generation_census
-    }
-
-    #[must_use]
-    pub fn semantic_owner(&self) -> McpSemanticOwnerV1<'a> {
-        self.request.semantic_owner
     }
 
     #[must_use]
@@ -578,6 +577,16 @@ impl<'a> McpToolContext<'a> {
     }
 
     #[must_use]
+    pub fn code_index_similar_executor(&self) -> Option<&'a CodeIndexSimilarExecutor> {
+        self.code_index_similar_executor
+    }
+
+    #[must_use]
+    pub fn code_index_redundancy_executor(&self) -> Option<&'a CodeIndexRedundancyExecutor> {
+        self.code_index_redundancy_executor
+    }
+
+    #[must_use]
     pub fn code_index_branch_diff_executor(&self) -> Option<&'a CodeIndexBranchDiffExecutor> {
         self.code_index_branch_diff_executor
     }
@@ -614,10 +623,6 @@ impl std::fmt::Debug for McpToolContext<'_> {
                 &self.request.generation_census.is_some(),
             )
             .field(
-                "semantic_owner",
-                &matches!(self.request.semantic_owner, McpSemanticOwnerV1::Attached(_)),
-            )
-            .field(
                 "doctor_report",
                 &matches!(self.request.doctor_report, McpDoctorReportV1::Read(_)),
             )
@@ -630,6 +635,14 @@ impl std::fmt::Debug for McpToolContext<'_> {
             .field(
                 "has_code_index_search_executor",
                 &self.code_index_search_executor.is_some(),
+            )
+            .field(
+                "has_code_index_similar_executor",
+                &self.code_index_similar_executor.is_some(),
+            )
+            .field(
+                "has_code_index_redundancy_executor",
+                &self.code_index_redundancy_executor.is_some(),
             )
             .field(
                 "has_code_index_branch_diff_executor",
@@ -1014,7 +1027,7 @@ pub(crate) mod tests {
     fn a_code_index_admission_without_an_executor_is_refused() {
         let authority = authority();
 
-        let Err(error) = AdmittedCodeIndex::new(&authority, None, None) else {
+        let Err(error) = AdmittedCodeIndex::new(&authority, None, None, None, None) else {
             panic!("an executorless code index admission must be refused");
         };
 
@@ -1324,10 +1337,6 @@ pub(crate) mod tests {
             "census absence must stay None"
         );
         assert!(
-            matches!(bound.semantic_owner(), McpSemanticOwnerV1::NotAttached),
-            "semantic-owner absence must stay NotAttached"
-        );
-        assert!(
             bound.request().freshness.is_none(),
             "freshness-reader absence must stay None"
         );
@@ -1340,12 +1349,12 @@ pub(crate) mod tests {
             "session-store absence must stay None"
         );
         assert_eq!(
-            tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
-                reason: tracedecay_session_memory::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
+            tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
+                reason: tracedecay_runtime_core::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
             },
             bound.generation_census().cloned().unwrap_or(
-                tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
-                    reason: tracedecay_session_memory::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
+                tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
+                    reason: tracedecay_runtime_core::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
                 }
             ),
             "the typed unavailable census is what a handler must emit, not an empty success"

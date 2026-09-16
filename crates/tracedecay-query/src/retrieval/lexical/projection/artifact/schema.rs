@@ -19,22 +19,30 @@ use tracedecay_domain::ExactFieldV1;
 /// Revision 14 replaces the JSON row payload with a binary one whose
 /// per-file and per-symbol strings (paths, occurrence identities, display
 /// names, descriptor revisions) are interned once as `row_dictionary`
-/// entries and referenced by content-addressed id. Readers accept all
-/// shipped layouts; writers emit 14 unless an explicit benchmark revision is
-/// selected.
+/// entries and referenced by content-addressed id. Revision 15 adds
+/// content-addressed clone payloads, source-bound occurrences, and exact
+/// conservative/rename postings. Revision 16 adds signature and documentation
+/// fields without changing the shipped revision-14/15 row codec, positional
+/// winnowed fingerprint postings, and stored posting-list counts. Readers
+/// accept all shipped layouts; writers emit 16 unless an explicit benchmark
+/// revision is selected.
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V10: u32 = 10;
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V11: u32 = 11;
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V12: u32 = 12;
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V13: u32 = 13;
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14: u32 = 14;
+pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V15: u32 = 15;
+pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16: u32 = 16;
 pub(super) const CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1: u32 =
-    CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14;
+    CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16;
 
 const DIGEST_DOMAIN_V10: &[u8] = b"tracedecay.code-lexical-artifact.v10\0";
 const DIGEST_DOMAIN_V11: &[u8] = b"tracedecay.code-lexical-artifact.v11\0";
 const DIGEST_DOMAIN_V12: &[u8] = b"tracedecay.code-lexical-artifact.v12\0";
 const DIGEST_DOMAIN_V13: &[u8] = b"tracedecay.code-lexical-artifact.v13\0";
 const DIGEST_DOMAIN_V14: &[u8] = b"tracedecay.code-lexical-artifact.v14\0";
+const DIGEST_DOMAIN_V15: &[u8] = b"tracedecay.code-lexical-artifact.v15\0";
+const DIGEST_DOMAIN_V16: &[u8] = b"tracedecay.code-lexical-artifact.v16\0";
 
 const FIELD_SYMBOL_NAME: i64 = 1;
 const FIELD_QUALIFIED_NAME: i64 = 2;
@@ -43,6 +51,8 @@ const FIELD_BODY_TEXT: i64 = 4;
 const FIELD_PREAMBLE_TEXT: i64 = 5;
 const FIELD_EXACT_TERM: i64 = 6;
 const FIELD_SUBTOKEN: i64 = 7;
+const FIELD_SIGNATURE: i64 = 8;
+const FIELD_DOCUMENTATION: i64 = 9;
 
 pub(super) const REQUIRED_ARTIFACT_INDEXES_V10: [(&str, &str, &[&str]); 7] = [
     ("rows", "rows_by_chunk", &["chunk_id"]),
@@ -149,8 +159,10 @@ pub enum CodeLexicalArtifactWriterRevisionV1 {
     V11,
     V12,
     V13,
-    #[default]
     V14,
+    V15,
+    #[default]
+    V16,
 }
 
 impl CodeLexicalArtifactWriterRevisionV1 {
@@ -160,6 +172,8 @@ impl CodeLexicalArtifactWriterRevisionV1 {
             Self::V12 => LexicalArtifactLayoutV1::V12,
             Self::V13 => LexicalArtifactLayoutV1::V13,
             Self::V14 => LexicalArtifactLayoutV1::V14,
+            Self::V15 => LexicalArtifactLayoutV1::V15,
+            Self::V16 => LexicalArtifactLayoutV1::V16,
         }
     }
 }
@@ -171,6 +185,8 @@ pub(super) enum LexicalArtifactLayoutV1 {
     V12,
     V13,
     V14,
+    V15,
+    V16,
 }
 
 impl LexicalArtifactLayoutV1 {
@@ -181,6 +197,8 @@ impl LexicalArtifactLayoutV1 {
             CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V12 => Ok(Self::V12),
             CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V13 => Ok(Self::V13),
             CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14 => Ok(Self::V14),
+            CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V15 => Ok(Self::V15),
+            CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16 => Ok(Self::V16),
             _ => Err(CodeLexicalArtifactErrorV1::Incompatible(format!(
                 "format revision {revision} is unsupported"
             ))),
@@ -194,6 +212,8 @@ impl LexicalArtifactLayoutV1 {
             Self::V12 => CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V12,
             Self::V13 => CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V13,
             Self::V14 => CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14,
+            Self::V15 => CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V15,
+            Self::V16 => CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16,
         }
     }
 
@@ -204,6 +224,8 @@ impl LexicalArtifactLayoutV1 {
             Self::V12 => DIGEST_DOMAIN_V12,
             Self::V13 => DIGEST_DOMAIN_V13,
             Self::V14 => DIGEST_DOMAIN_V14,
+            Self::V15 => DIGEST_DOMAIN_V15,
+            Self::V16 => DIGEST_DOMAIN_V16,
         }
     }
 
@@ -216,32 +238,43 @@ impl LexicalArtifactLayoutV1 {
             Self::V12 => &REQUIRED_ARTIFACT_INDEXES_V12,
             // Revision 14 changes only the row payload and its string
             // dictionary; the serving indexes are revision 13's.
-            Self::V13 | Self::V14 => &REQUIRED_ARTIFACT_INDEXES_V13,
+            Self::V13 | Self::V14 | Self::V15 | Self::V16 => &REQUIRED_ARTIFACT_INDEXES_V13,
         }
     }
 
     /// Revisions 12 and later intern exact terms through `exact_vocabulary`.
     pub(super) fn interns_exact_terms(self) -> bool {
-        matches!(self, Self::V12 | Self::V13 | Self::V14)
+        matches!(
+            self,
+            Self::V12 | Self::V13 | Self::V14 | Self::V15 | Self::V16
+        )
     }
 
     /// Revisions 13 and later cluster `term_postings` by `(document_id,
     /// term_id, field)`; every earlier interned layout clusters by term.
     pub(super) fn clusters_term_postings_by_document(self) -> bool {
-        matches!(self, Self::V13 | Self::V14)
+        matches!(self, Self::V13 | Self::V14 | Self::V15 | Self::V16)
     }
 
     /// Revision 14 rows reference `row_dictionary` entries for their per-file
     /// and per-symbol strings instead of carrying the text per chunk.
     pub(super) fn interns_row_dictionary(self) -> bool {
-        self == Self::V14
+        matches!(self, Self::V14 | Self::V15 | Self::V16)
     }
 
     /// Revision 14 keeps `document_integrity` as `(document_id, digest
     /// BLOB)`: the chunk id already lives in `rows` under the same key, and
     /// the 32 digest bytes replace their 71-byte tagged hex form.
     pub(super) fn stores_document_integrity_bytes(self) -> bool {
-        self == Self::V14
+        matches!(self, Self::V14 | Self::V15 | Self::V16)
+    }
+
+    pub(super) fn has_clone_index(self) -> bool {
+        matches!(self, Self::V15 | Self::V16)
+    }
+
+    pub(super) fn has_clone_fingerprints(self) -> bool {
+        self == Self::V16
     }
 }
 
@@ -256,6 +289,8 @@ pub(super) fn field_code(field: LexicalFieldV1) -> i64 {
         LexicalFieldV1::SymbolName => FIELD_SYMBOL_NAME,
         LexicalFieldV1::QualifiedName => FIELD_QUALIFIED_NAME,
         LexicalFieldV1::Path => FIELD_PATH,
+        LexicalFieldV1::Signature => FIELD_SIGNATURE,
+        LexicalFieldV1::Documentation => FIELD_DOCUMENTATION,
         LexicalFieldV1::BodyText => FIELD_BODY_TEXT,
         LexicalFieldV1::PreambleText => FIELD_PREAMBLE_TEXT,
         LexicalFieldV1::ExactTerm => FIELD_EXACT_TERM,
@@ -268,6 +303,8 @@ pub(super) fn field_from_code(code: i64) -> Result<LexicalFieldV1, CodeLexicalAr
         FIELD_SYMBOL_NAME => Ok(LexicalFieldV1::SymbolName),
         FIELD_QUALIFIED_NAME => Ok(LexicalFieldV1::QualifiedName),
         FIELD_PATH => Ok(LexicalFieldV1::Path),
+        FIELD_SIGNATURE => Ok(LexicalFieldV1::Signature),
+        FIELD_DOCUMENTATION => Ok(LexicalFieldV1::Documentation),
         FIELD_BODY_TEXT => Ok(LexicalFieldV1::BodyText),
         FIELD_PREAMBLE_TEXT => Ok(LexicalFieldV1::PreambleText),
         FIELD_EXACT_TERM => Ok(LexicalFieldV1::ExactTerm),
@@ -408,43 +445,34 @@ pub(super) fn derive_row_dictionary(
         .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))
 }
 
+/// Intern the batch's distinct exact terms, which the insert plan already
+/// deduplicated and content-addressed while ordering its rows. `terms` is
+/// ascending by `term_id`, the order `exact_vocabulary` was always interned
+/// in, so the sealed b-tree keeps the same page layout.
 pub(super) fn intern_exact_terms(
     transaction: &Transaction<'_>,
-    pages: &[PreparedCodeLexicalArtifactPageV1],
+    terms: &[(&[u8], i64)],
     control: &dyn CodeIndexExecutionControlV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
-    let mut terms = BTreeMap::<i64, &[u8]>::new();
-    for page in pages {
-        for document in &page.documents {
-            for (_, term) in &document.exact_postings {
-                let term_id = stable_exact_term_id(term);
-                if let Some(previous) = terms.insert(term_id, term)
-                    && previous != term.as_slice()
-                {
-                    return Err(CodeLexicalArtifactErrorV1::Contract(
-                        "lexical artifact exact term identifier collided".to_owned(),
-                    ));
-                }
-            }
-        }
-    }
     let mut insert = transaction
-        .prepare(
+        .prepare_cached(
             "INSERT INTO exact_vocabulary(term_id, term) VALUES (?1, ?2) ON CONFLICT(term_id) DO NOTHING",
         )
         .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))?;
     let mut lookup = transaction
-        .prepare("SELECT term FROM exact_vocabulary WHERE term_id = ?1")
+        .prepare_cached("SELECT term FROM exact_vocabulary WHERE term_id = ?1")
         .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))?;
-    for (term_id, term) in terms {
+    for (term, term_id) in terms {
         checkpoint(control)?;
         insert
             .execute(params![term_id, term])
             .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))?;
+        // An id already held by different bytes would silently redirect this
+        // batch's postings at the stored term, so the readback stays.
         let stored: Vec<u8> = lookup
             .query_row([term_id], |row| row.get(0))
             .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))?;
-        if stored != term {
+        if stored != *term {
             return Err(CodeLexicalArtifactErrorV1::Contract(
                 "lexical artifact exact term identifier collided".to_owned(),
             ));
@@ -455,35 +483,29 @@ pub(super) fn intern_exact_terms(
 
 /// Intern the batch's distinct terms and return the ids now present in
 /// `vocabulary`, so the posting writer can confirm every planned posting's
-/// term was interned with one integer probe per row.
+/// term was interned with one integer probe per row. `terms` is ascending by
+/// term text — the order `vocabulary` was always interned in — and carries
+/// the ids the insert plan already content-addressed, so neither the digest
+/// nor the walk over every posting is repeated here.
 pub(super) fn intern_terms(
     transaction: &Transaction<'_>,
-    pages: &[PreparedCodeLexicalArtifactPageV1],
+    terms: &[(&str, i64)],
     control: &dyn CodeIndexExecutionControlV1,
 ) -> Result<HashSet<i64>, CodeLexicalArtifactErrorV1> {
-    let mut terms = BTreeSet::new();
-    for page in pages {
-        for document in &page.documents {
-            for posting in &document.term_postings {
-                terms.insert(posting.term.as_str());
-            }
-        }
-    }
     let mut assigned = HashSet::with_capacity(terms.len());
     let mut insert = transaction
-        .prepare(
+        .prepare_cached(
             "INSERT INTO vocabulary(term_id, term, in_fuzzy) VALUES (?1, ?2, 0) ON CONFLICT(term) DO NOTHING",
         )
         .map_err(|error| CodeLexicalArtifactErrorV1::Io(error.to_string()))?;
-    for term in terms {
+    for (term, term_id) in terms {
         checkpoint(control)?;
-        let term_id = stable_term_id(term);
         insert.execute(params![term_id, term]).map_err(|error| {
             CodeLexicalArtifactErrorV1::Contract(format!(
                 "lexical artifact term identifier collided or vocabulary insert failed: {error}"
             ))
         })?;
-        assigned.insert(term_id);
+        assigned.insert(*term_id);
     }
     Ok(assigned)
 }
@@ -539,11 +561,51 @@ mod tests {
     use super::{
         CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V10, CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V11,
         CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V12, CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V13,
-        CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14, LexicalArtifactLayoutV1, exact_field_code,
-        field_code, field_from_code,
+        CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V14, CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V15,
+        CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16, CodeLexicalArtifactErrorV1,
+        LexicalArtifactLayoutV1, exact_field_code, field_code, field_from_code,
     };
     use crate::retrieval::lexical::LexicalFieldV1;
+    use rusqlite::Connection;
+    use tracedecay_code_index::production::CodeIndexExecutionControlV1;
     use tracedecay_domain::ExactFieldV1;
+
+    struct ActiveControl;
+
+    impl CodeIndexExecutionControlV1 for ActiveControl {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn is_deadline_exceeded(&self) -> bool {
+            false
+        }
+    }
+
+    /// The insert plan hands `intern_exact_terms` ids it content-addressed
+    /// itself, so a second term claiming an id already held by different bytes
+    /// must be rejected by the stored-term readback: `ON CONFLICT DO NOTHING`
+    /// would otherwise silently point this batch's postings at the other term.
+    #[test]
+    fn exact_term_interning_rejects_an_identifier_already_held_by_other_bytes() {
+        let mut connection = Connection::open_in_memory().expect("open");
+        connection
+            .execute_batch(
+                "CREATE TABLE exact_vocabulary (term_id INTEGER PRIMARY KEY, term BLOB NOT NULL)",
+            )
+            .expect("schema");
+        let transaction = connection.transaction().expect("transaction");
+        super::intern_exact_terms(&transaction, &[(b"alpha", 7)], &ActiveControl).expect("intern");
+        // Idempotent for the same bytes: a replayed batch re-interns cleanly.
+        super::intern_exact_terms(&transaction, &[(b"alpha", 7)], &ActiveControl).expect("replay");
+        let error = super::intern_exact_terms(&transaction, &[(b"beta", 7)], &ActiveControl)
+            .expect_err("colliding identifier must fail closed");
+        assert!(
+            matches!(error, CodeLexicalArtifactErrorV1::Contract(ref message)
+                if message.contains("exact term identifier collided")),
+            "unexpected error: {error:?}"
+        );
+    }
 
     #[test]
     fn layout_accepts_open_revisions_and_fails_closed_otherwise() {
@@ -572,8 +634,18 @@ mod tests {
                 .expect("v14"),
             LexicalArtifactLayoutV1::V14
         );
+        assert_eq!(
+            LexicalArtifactLayoutV1::from_revision(CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V15)
+                .expect("v15"),
+            LexicalArtifactLayoutV1::V15
+        );
+        assert_eq!(
+            LexicalArtifactLayoutV1::from_revision(CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V16)
+                .expect("v16"),
+            LexicalArtifactLayoutV1::V16
+        );
         assert!(LexicalArtifactLayoutV1::from_revision(9).is_err());
-        assert!(LexicalArtifactLayoutV1::from_revision(15).is_err());
+        assert!(LexicalArtifactLayoutV1::from_revision(17).is_err());
     }
 
     #[test]
@@ -600,6 +672,8 @@ mod tests {
             LexicalFieldV1::SymbolName,
             LexicalFieldV1::QualifiedName,
             LexicalFieldV1::Path,
+            LexicalFieldV1::Signature,
+            LexicalFieldV1::Documentation,
             LexicalFieldV1::BodyText,
             LexicalFieldV1::PreambleText,
             LexicalFieldV1::ExactTerm,

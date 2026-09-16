@@ -7,14 +7,50 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use tracedecay_contracts::ResolvedScope;
+use tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1;
 use tracedecay_domain::ProjectId;
 
 use super::super::graph_activation::install_injected_activation_gate;
-use super::{CodeIndexCadenceOutcomeV1, CodeIndexSchedulerRegistryV1};
+use super::{
+    CodeIndexCadenceOutcomeV1, CodeIndexSchedulerRegistryV1, dashboard_generation_is_ready,
+};
 
 /// Failure bound on an owner pass finishing once the worker is parked. Nothing
 /// here passes because time elapsed; a pass that never ends fails loudly.
 const OWNER_PASS_QUIESCENCE_CEILING: Duration = Duration::from_mins(2);
+
+#[test]
+fn dashboard_ready_requires_text_and_graph_lane_owners() {
+    assert!(dashboard_generation_is_ready(
+        None,
+        true,
+        true,
+        &Some(CodeGraphServingReadinessV1::Ready),
+    ));
+    assert!(
+        !dashboard_generation_is_ready(
+            None,
+            false,
+            true,
+            &Some(CodeGraphServingReadinessV1::Ready),
+        ),
+        "freshness must not report ready while exact or lexical lane owners are incomplete"
+    );
+    for graph in [
+        CodeGraphServingReadinessV1::Pending,
+        CodeGraphServingReadinessV1::Refused {
+            reason: "fixture refusal".to_owned(),
+        },
+        CodeGraphServingReadinessV1::Unavailable {
+            reason: "fixture unavailable".to_owned(),
+        },
+    ] {
+        assert!(
+            !dashboard_generation_is_ready(None, true, true, &Some(graph.clone())),
+            "freshness must not report ready while graph lane coverage is incomplete: {graph:?}"
+        );
+    }
+}
 
 /// Park the background worker and wait out whatever pass is already in flight.
 ///
@@ -84,7 +120,6 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
             ProjectId::new("project.serving-readiness").expect("project identity"),
             &project,
             fixture.path().join("store"),
-            None,
         )
         .await
         .expect("mount worktree");
@@ -94,6 +129,8 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         .expect("mounted scope");
     let gate = install_injected_activation_gate(&scope.worktree_id);
     let mut publications = registry.subscribe_generation_publications();
+    let mut serving_seats = registry.subscribe_serving_seats();
+    let initial_seat = *serving_seats.borrow();
     let mut changes = registry
         .subscribe_serving_generation_changes(&project)
         .await
@@ -121,24 +158,20 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
     );
     assert!(!changes.has_changed().expect("live serving subscription"));
     gate.release();
-    let generation = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            changes
-                .changed()
-                .await
-                .expect("serving change notification");
-            if let Some(generation) = registry
-                .serving_code_scope(&project)
-                .await
-                .expect("mounted scope")
-                .serving_generation
-            {
-                break generation;
-            }
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        serving_seats.wait_for(|seat| *seat != initial_seat),
+    )
     .await
-    .expect("serving installation must wake the waiter without another seal");
+    .expect("serving installation must wake the waiter without another seal")
+    .expect("serving-seat authority stays open");
+    changes.borrow_and_update();
+    let generation = registry
+        .serving_code_scope(&project)
+        .await
+        .expect("mounted scope")
+        .serving_generation
+        .expect("serving seat contains the installed generation");
     assert_eq!(generation.manifest().generation_id, published.generation_id);
     let resolved_scope = ResolvedScope::new(
         generation.manifest().project_id.clone(),
@@ -171,6 +204,7 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
     }
     let admission = quiesced_background_reconcile_admission(&registry, &project).await;
     changes.borrow_and_update();
+    let serving_seat_before_expiry = *serving_seats.borrow_and_update();
     assert!(
         tokio::time::timeout(
             Duration::from_millis(250),
@@ -180,6 +214,11 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         .expect("expired readiness returns without walking source")
         .is_none(),
         "an expired proof cannot be promoted current before the worker renews it"
+    );
+    assert_eq!(
+        *serving_seats.borrow(),
+        serving_seat_before_expiry,
+        "expired readiness admission cannot install another serving generation"
     );
     assert!(
         registry
@@ -194,10 +233,6 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
             .await
             .is_some_and(|pending| pending != 0),
         "the read coalesces one verification wake on the retained worker"
-    );
-    assert!(
-        !changes.has_changed().expect("live serving subscription"),
-        "admission cannot fabricate a renewed source proof"
     );
     drop(admission);
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
@@ -243,7 +278,6 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         registry.latest_complete_ready(&project).await.is_none(),
         "a true source hint invalidates the seated proof even inside the fresh clock window"
     );
-    assert!(!changes.has_changed().expect("live serving subscription"));
     drop(admission);
     let revalidated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {

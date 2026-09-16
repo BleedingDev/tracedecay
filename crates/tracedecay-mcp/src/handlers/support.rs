@@ -73,6 +73,11 @@ pub fn take_internal_context_memory_analytics(value: &mut Value) -> Option<Value
     value.as_object_mut()?.remove(CONTEXT_MEMORY_ANALYTICS_KEY)
 }
 
+/// A compact JSON payload rendered as the tool's text content.
+pub fn json_result(value: &Value) -> ToolResult {
+    text_tool_result(&value.to_string(), Vec::new())
+}
+
 pub fn text_tool_result(text: &str, touched_files: Vec<String>) -> ToolResult {
     ToolResult::new(
         json!({ "content": [{ "type": "text", "text": text }] }),
@@ -106,6 +111,13 @@ pub fn generic_tool_result(
 /// [`generic_tool_result`] for handlers that touch no files.
 pub fn tool_json(project_root: Option<&Path>, args: &Value, value: &Value) -> ToolResult {
     generic_tool_result(project_root, args, value, Vec::new())
+}
+
+/// The single rejection every dispatch family returns for a name it does not own.
+pub fn unknown_tool_error(tool_name: &str) -> TraceDecayError {
+    TraceDecayError::Config {
+        message: format!("unknown tool: {tool_name}"),
+    }
 }
 
 /// Rejects tool arguments that are not a JSON object.

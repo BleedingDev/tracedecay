@@ -4,7 +4,6 @@ use axum::body::Body;
 use axum::extract::Extension;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use tracedecay::mcp::tools::dispatch::resolve_mcp_application_surface_dispatch;
 use tracedecay_api::{
     CanonicalInvocationResult, HttpApplicationControls, HttpApplicationRequest, HttpSseEvent,
     application_router,
@@ -31,6 +30,7 @@ use tracedecay_domain::{
     RepositoryId, RepositoryIndexSnapshotV1, RepositoryIndexStateV1, RepositoryStateSnapshotV1,
     RepositoryWorkingTreeSnapshotV1, RepositoryWorkingTreeStateV1, UtcMicros, WorktreeId,
 };
+use tracedecay_mcp::tools::dispatch::resolve_mcp_application_surface_dispatch;
 use tracedecay_mcp::{get_tool_definitions, mcp_input_schema};
 use tracedecay_tool_catalog::{
     ApplicationSurfaceOperation, BindingSurface, OperationId, ProfileId, SchemaId,
@@ -486,6 +486,9 @@ fn extended_primitive_reads_bind_cli_mcp_and_http() {
 #[test]
 fn mcp_primitive_definitions_use_application_contracts() {
     let definitions = get_tool_definitions().expect("tool definitions");
+    let contributions = tracedecay_contracts::application_catalog_contributions()
+        .expect("application catalog contributions");
+    let registry = tracedecay_contracts::mcp_executable_binding_registry().expect("MCP registry");
     for (operation, request, expected_properties, expected_required) in [
         (
             ApplicationSurfaceOperation::CallChain,
@@ -521,11 +524,24 @@ fn mcp_primitive_definitions_use_application_contracts() {
             .iter()
             .find(|definition| definition.name == tool_name)
             .unwrap_or_else(|| panic!("{tool_name} definition"));
-        assert!(
-            definition
-                .description
-                .contains("daemon-retained typed primitive owner"),
-            "{tool_name} must advertise its application-owned primitive contract"
+        let operation_id =
+            OperationId::new(format!("operation.application.{}", operation.as_str()))
+                .expect("operation ID");
+        let capability_id = registry
+            .get(&operation_id)
+            .and_then(|availability| availability.binding())
+            .expect("MCP executable")
+            .capability_id();
+        let canonical_description = contributions
+            .iter()
+            .flat_map(|contribution| contribution.capabilities())
+            .find(|capability| capability.capability_id() == capability_id)
+            .unwrap_or_else(|| panic!("{tool_name} application capability"))
+            .routing()
+            .description();
+        assert_eq!(
+            definition.description, canonical_description,
+            "{tool_name} must advertise its canonical application description"
         );
 
         let properties = definition.input_schema["properties"]

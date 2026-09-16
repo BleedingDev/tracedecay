@@ -32,7 +32,7 @@ async fn open_project_composition(
         allow_initialize_root_routing: false,
         tool_list_changed_capable: false,
         catalog_version: String::new(),
-        moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
+        moved_store_adoption: crate::project::MovedStoreAdoption::Never,
     };
     let (canonical_project_path, _) = project_route_for_handshake(&handshake)?;
     resources
@@ -46,7 +46,6 @@ async fn open_project_composition(
                 &canonical_project_path,
                 &handshake,
                 ProductionProjectCompositionRuntime::Portable {
-                    semantic_auto_download: false,
                     startup_catch_up: false,
                 },
                 &CancellationToken::new(),

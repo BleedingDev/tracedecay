@@ -77,14 +77,14 @@ pub(super) use runtime::spawn_with_administration;
 #[derive(Clone, Copy)]
 struct PrStoreAdministration<'a> {
     schedulers: Option<&'a CodeIndexSchedulerRegistryV1>,
-    graph: Option<&'a Arc<crate::tracedecay::TraceDecay>>,
+    graph: Option<&'a Arc<crate::project::TraceDecay>>,
     command_control: &'a PrCommandControl,
 }
 
 impl<'a> PrStoreAdministration<'a> {
     fn with_control(
         schedulers: &'a CodeIndexSchedulerRegistryV1,
-        graph: &'a Arc<crate::tracedecay::TraceDecay>,
+        graph: &'a Arc<crate::project::TraceDecay>,
         command_control: &'a PrCommandControl,
     ) -> Self {
         Self {
@@ -136,7 +136,7 @@ fn log_pr_skip(repo_root: &Path, branch_label: Option<&str>, pr: Option<u64>, re
 #[cfg(test)]
 pub(crate) async fn activate_manual_branch_head(
     repo_root: &Path,
-    graph: &Arc<crate::tracedecay::TraceDecay>,
+    graph: &Arc<crate::project::TraceDecay>,
     schedulers: Option<&CodeIndexSchedulerRegistryV1>,
     branch: &str,
 ) -> std::result::Result<ManualBranchActivation, ManualBranchActivationError> {
@@ -160,7 +160,7 @@ pub(crate) async fn activate_manual_branch_head(
 #[hotpath::measure(label = "daemon.pr_autotrack.activate", future = true)]
 pub(crate) async fn activate_manual_branch_head_with_lifecycle(
     repo_root: &Path,
-    graph: &Arc<crate::tracedecay::TraceDecay>,
+    graph: &Arc<crate::project::TraceDecay>,
     schedulers: Option<&CodeIndexSchedulerRegistryV1>,
     branch: &str,
     lifecycle: &ManualBranchLifecycleLeaseV1,
@@ -833,7 +833,7 @@ async fn track_pr(
 #[hotpath::measure(label = "daemon.pr_autotrack.activate_worktree", future = true)]
 async fn activate_linked_worktree(
     schedulers: &CodeIndexSchedulerRegistryV1,
-    graph: &crate::tracedecay::TraceDecay,
+    graph: &crate::project::TraceDecay,
     worktree: &Path,
 ) -> std::result::Result<(), String> {
     let project_id = graph
@@ -851,27 +851,17 @@ async fn activate_linked_worktree(
     })?;
     let store_root = graph.store_layout().data_root.join("code-index-v1");
     let graph_runtime = graph.retained_store_runtime_registry();
-    let semantic_lifecycle = graph_runtime
-        .project_semantic_lifecycle(&project_id)
-        .await
-        .map_err(|error| {
-            scheduler_unavailable(&format!(
-                "project semantic lifecycle is unavailable for worktree activation: {error}"
-            ))
-        })?;
     let project_database = Arc::new(graph.db().clone());
     schedulers
         .mount_worktree_with_graph_runtime(
             project_id,
             worktree,
             store_root,
-            None,
             graph_runtime.code_graph_seat_port(),
             project_database,
             tracedecay_code_index_runtime::code_index_scheduler::CodeGraphActivationPolicyV1::from_enabled(
                 graph.get_config().native_graph_activation,
             ),
-            Some(semantic_lifecycle),
         )
         .await
         .map(|_| ())

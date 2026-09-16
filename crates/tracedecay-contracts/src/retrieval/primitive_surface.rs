@@ -9,7 +9,11 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracedecay_domain::{ComplexityAnalysisV1, FactAssertionId, FactEventId, FactId, UtcMicros};
+use tracedecay_domain::{
+    CodeGenerationId, CommitId, ComplexityAnalysisV1, FactAssertionId, FactEventId, FactId,
+    ManifestDigest, ProjectId, ProviderId, RepositoryId, SourceSpan, SymbolOccurrenceId, UtcMicros,
+    WorktreeId,
+};
 
 use crate::error::ApplicationContractError;
 use crate::memory::{
@@ -17,22 +21,9 @@ use crate::memory::{
     FactCommitOwnerV1, FactIdentitySourceResultV1, FactSearchGraphCoverageV1, FactSearchHitV1,
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PrimitiveSemanticModeV1 {
-    FallbackAllowed,
-    StrictSemantic,
-}
-
-impl PrimitiveSemanticModeV1 {
-    #[hotpath::skip]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::FallbackAllowed => "fallback_allowed",
-            Self::StrictSemantic => "strict_semantic",
-        }
-    }
-}
+pub const MAX_REDUNDANCY_FAMILIES_V1: u32 = 100;
+pub const MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1: usize = 256;
+pub const MAX_REDUNDANCY_WORK_V1: u32 = 10_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +60,6 @@ pub struct ContextSurfaceRequestV1 {
     /// not invent a mapping from provider references to canonical fact identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusions: Option<CognitiveRecallExclusions>,
-    pub semantic_mode: Option<PrimitiveSemanticModeV1>,
     /// Exact identifiers or technical terms ranked through the lexical lane as
     /// additional routes fused with the task text. Bounded and validated by
     /// the retrieval kernel; a violation is a typed request rejection.
@@ -290,11 +280,34 @@ pub struct NodeSurfaceRequestV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SimilarTargetV1 {
+    SymbolOccurrence {
+        symbol_occurrence_id: SymbolOccurrenceId,
+    },
+    SourceRange {
+        path: String,
+        span: SourceSpan,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarMatchClassV1 {
+    ConservativeExact,
+    RenameNormalizedExact,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimilarSurfaceRequestV1 {
-    pub symbol: String,
-    pub limit: Option<u32>,
-    pub semantic_mode: Option<PrimitiveSemanticModeV1>,
+    pub project_id: ProjectId,
+    pub repository_id: RepositoryId,
+    pub target: SimilarTargetV1,
+    pub match_classes: Vec<SimilarMatchClassV1>,
+    pub result_limit: u32,
+    pub work_limit: u32,
+    pub cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -320,15 +333,33 @@ pub struct PortOrderSurfaceRequestV1 {
     pub limit: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RedundancyScopeV1 {
+    Repository,
+    Path {
+        path: String,
+    },
+    PullRequest {
+        provider: ProviderId,
+        pull_request_id: String,
+        head_commit_id: CommitId,
+        changed_paths: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedundancySurfaceRequestV1 {
-    pub path: Option<String>,
-    pub min_lines: Option<u32>,
-    pub max_pairs: Option<u32>,
-    pub similarity_threshold: Option<f64>,
-    pub include_naming_only: Option<bool>,
-    pub include_generated_paths: Option<bool>,
+    pub project_id: ProjectId,
+    pub repository_id: RepositoryId,
+    pub match_classes: Vec<SimilarMatchClassV1>,
+    pub scope: RedundancyScopeV1,
+    pub include_generated_paths: bool,
+    pub family_limit: u32,
+    pub member_limit: u32,
+    pub work_limit: u32,
+    pub cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -430,7 +461,6 @@ pub struct PrimitiveSearchCoverageV1 {
     pub exact: PrimitiveLaneStatusV1,
     pub lexical: PrimitiveLaneStatusV1,
     pub graph: PrimitiveLaneStatusV1,
-    pub semantic: PrimitiveLaneStatusV1,
     pub recall: PrimitiveRecallV1,
 }
 
@@ -565,17 +595,93 @@ pub enum NodeResultV1 {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SimilarSymbolV1 {
-    pub id: String,
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: u32,
-    pub signature: Option<String>,
-    pub utility_micros: u64,
+pub struct SimilarOccurrenceV1 {
+    pub project_id: ProjectId,
+    pub repository_id: RepositoryId,
+    pub worktree_id: Option<WorktreeId>,
+    pub source_generation: CodeGenerationId,
+    pub snapshot_digest: ManifestDigest,
+    pub symbol_occurrence_id: SymbolOccurrenceId,
+    pub path: String,
+    pub body_span: SourceSpan,
 }
 
-pub type SimilarResultV1 = Vec<SimilarSymbolV1>;
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarFamilyV1 {
+    pub match_class: SimilarMatchClassV1,
+    pub normalization_revision: u16,
+    pub family_digest: ManifestDigest,
+    pub representative_payload_digest: ManifestDigest,
+    pub member_count: usize,
+    pub members: Vec<SimilarOccurrenceV1>,
+    pub complete: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SimilarCoverageV1 {
+    Complete,
+    Partial,
+    ExcludedTooSmall { minimum_tokens: u32 },
+    ExcludedIncompleteTokenization,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarResultV1 {
+    pub source: SimilarOccurrenceV1,
+    pub families: Vec<SimilarFamilyV1>,
+    pub source_generation: CodeGenerationId,
+    pub coverage: SimilarCoverageV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyRankingV1 {
+    ReviewableSourceBytes,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyPartialReasonV1 {
+    FamilyLimit,
+    WorkLimit,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RedundancyCoverageV1 {
+    Complete {
+        examined_families: usize,
+        examined_members: usize,
+    },
+    Partial {
+        reason: RedundancyPartialReasonV1,
+        examined_families: usize,
+        examined_members: usize,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedundancyFamilyV1 {
+    pub family: SimilarFamilyV1,
+    pub total_member_count: usize,
+    pub reviewable_source_bytes: u64,
+    pub generated_members: Vec<SymbolOccurrenceId>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedundancyResultV1 {
+    pub source_generation: CodeGenerationId,
+    pub ranked_by: RedundancyRankingV1,
+    pub families: Vec<RedundancyFamilyV1>,
+    pub coverage: RedundancyCoverageV1,
+    pub next_cursor: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -940,7 +1046,6 @@ mod tests {
                 exact: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
                 lexical: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
                 graph: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
-                semantic: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
                 recall: PrimitiveRecallV1::Full,
             },
             memory_matches: vec![],

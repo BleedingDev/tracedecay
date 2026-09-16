@@ -128,25 +128,25 @@ mod automation_skills_api;
 pub mod cloud;
 mod code_diagnostics_api;
 pub mod code_index_freshness_api;
+pub mod code_read_api;
 pub mod config;
 #[doc(hidden)]
 pub mod contract_schema;
 mod delivery_api;
-pub use delivery_api::{DashboardDeliveryReadFutureV1, DashboardDeliveryReadPortV1};
+pub use delivery_api::{
+    DashboardDeliveryProjectV1, DashboardDeliveryReadFutureV1, DashboardDeliveryReadPortV1,
+};
 mod doctor_findings_api;
 mod events_api;
 mod events_delivery;
 mod explorer_api;
-mod remote_status_api;
-pub use explorer_api::{
-    ExplorerSemanticReadFuture, ExplorerSemanticReadV1, ExplorerSemanticReader,
-};
 pub mod feedback_api;
 mod graph_api;
 mod graph_service;
 mod graph_structure_api;
 pub mod hooks;
 mod lcm_api;
+mod remote_status_api;
 pub use lcm_api::{
     DashboardLcmCanonicalMatchesV1, DashboardLcmCanonicalMessageV1, DashboardLcmCanonicalPageV1,
     DashboardLcmCanonicalStatsV1, DashboardLcmCanonicalSummaryV1, DashboardLcmReadFutureV1,
@@ -209,6 +209,9 @@ use tracedecay_api::{WorkOperation, WorkflowOperation};
 use tracedecay_automation_runtime::automation::backend;
 use tracedecay_automation_runtime::automation::config::{AutomationBackend, AutomationHostMode};
 use tracedecay_automation_runtime::automation::host_io::HostIo;
+use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader;
+use tracedecay_contracts::doctor::DoctorReportV1;
+use tracedecay_contracts::storage::{SchemaConvergenceFindingV1, TableGrowthDoctorEvidenceV1};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -315,6 +318,9 @@ pub struct DashboardStateCompositionV1 {
     /// this exact project. Standalone dashboards leave it absent and graph
     /// structure routes report typed unavailable.
     pub code_graph_projection_read_port: Option<Arc<dyn crate::graph::CodeGraphProjectionReadPort>>,
+    /// Exact-project shared-family and revision-pair reads composed from the
+    /// daemon's verified code-index authorities.
+    pub code_read_authority: Option<code_read_api::DashboardCodeReadAuthorityV1>,
     pub registered_project_session_db: Option<RegisteredGlobalDbLeaseV1>,
     /// Exact ProfileSessions read/mutation capability for the daemon-wide
     /// code-index worker preference. This never aliases the project settings
@@ -325,9 +331,9 @@ pub struct DashboardStateCompositionV1 {
     /// Daemon-owned typed read over the verified session-git-evidence graph
     /// projection. Loom's git sources report unavailable without it.
     pub git_correlation_read_authority: Option<Arc<dyn DashboardGitCorrelationReadPortV1>>,
-    /// Daemon-owned exact-project Delivery projection. The adapter owns
-    /// application admission and provider/store access; HTTP receives only
-    /// bounded typed source outcomes.
+    /// Daemon-wide Delivery projection over exact registered project targets.
+    /// The adapter owns application admission and provider/store access; HTTP
+    /// receives only bounded typed source outcomes.
     pub delivery_read_authority: Option<Arc<dyn DashboardDeliveryReadPortV1>>,
     pub registered_savings_db: Option<RegisteredGlobalDbLeaseV1>,
     /// Exact daemon-selected profile plus its canonical automation run and
@@ -343,11 +349,7 @@ pub struct DashboardStateCompositionV1 {
     /// Daemon-owned Remote Brain operational read. Standalone dashboards leave
     /// it absent and `GET /api/remote/status` reports typed unavailable.
     pub remote_operational_status_reader: Option<RemoteOperationalStatusReader>,
-    pub code_index_freshness_reader: Option<code_index_freshness_api::CodeIndexFreshnessReader>,
-    /// Daemon-owned read over the semantic activation gate and runtime
-    /// status for the Explorer semantic source. Standalone dashboards leave
-    /// it absent and the source reports typed `unsupported`.
-    pub explorer_semantic_reader: Option<ExplorerSemanticReader>,
+    pub code_index_freshness_reader: Option<CodeIndexFreshnessReader>,
     pub feedback_status_reader: Option<feedback_api::FeedbackStatusReader>,
     /// Root-addressed read over the daemon-owned PR-autotrack state sidecar.
     /// Selected projects reuse the resolver but resolve their own exact store
@@ -364,23 +366,30 @@ pub struct DashboardStateCompositionV1 {
 
 #[derive(Clone)]
 pub struct AdmittedDoctorReportV1 {
-    pub report: tracedecay_contracts::doctor::DoctorReportV1,
-    pub table_growth_evidence: Vec<tracedecay_contracts::storage::TableGrowthDoctorEvidenceV1>,
+    pub report: DoctorReportV1,
+    pub table_growth_evidence: Vec<TableGrowthDoctorEvidenceV1>,
+    pub schema_convergences: Vec<SchemaConvergenceFindingV1>,
 }
 
 impl AdmittedDoctorReportV1 {
-    pub fn new(report: tracedecay_contracts::doctor::DoctorReportV1) -> Self {
+    pub fn new(report: DoctorReportV1) -> Self {
         Self {
             report,
             table_growth_evidence: Vec::new(),
+            schema_convergences: Vec::new(),
         }
     }
 
     pub fn with_table_growth_evidence(
         mut self,
-        evidence: Vec<tracedecay_contracts::storage::TableGrowthDoctorEvidenceV1>,
+        evidence: Vec<TableGrowthDoctorEvidenceV1>,
     ) -> Self {
         self.table_growth_evidence = evidence;
+        self
+    }
+
+    pub fn with_schema_convergences(mut self, findings: Vec<SchemaConvergenceFindingV1>) -> Self {
+        self.schema_convergences = findings;
         self
     }
 }
@@ -408,6 +417,8 @@ pub struct DashboardState {
     pub code_graph_read_admission: Option<Arc<dyn crate::graph::CodeGraphReadAdmissionPort>>,
     /// Canonical exact-project verified projection resolver.
     pub code_graph_projection_read_port: Option<Arc<dyn crate::graph::CodeGraphProjectionReadPort>>,
+    /// Canonical verified shared-family and revision-pair read authority.
+    pub code_read_authority: Option<code_read_api::DashboardCodeReadAuthorityV1>,
     /// Exact project graph retained by the daemon for this dashboard state.
     /// Absent for lightweight/profile-only states that cannot run project
     /// automation.
@@ -445,7 +456,7 @@ pub struct DashboardState {
     /// Daemon-owned typed read over the verified session-git-evidence graph
     /// projection, serving Loom's session↔commit and branch/worktree sources.
     pub git_correlation_read_authority: Option<Arc<dyn DashboardGitCorrelationReadPortV1>>,
-    /// Daemon-owned exact-project Delivery projection.
+    /// Daemon-wide Delivery projection over exact registered project targets.
     pub delivery_read_authority: Option<Arc<dyn DashboardDeliveryReadPortV1>>,
     /// Global accounting DB for the savings ledger and lifetime counters used
     /// by the Savings & Cost tab. Provider usage lives in the retained project
@@ -455,12 +466,7 @@ pub struct DashboardState {
     pub savings_db_path: String,
     pub project_root: PathBuf,
     /// Live read port over the daemon-owned code-index scheduler registry.
-    pub code_index_freshness_reader: Option<code_index_freshness_api::CodeIndexFreshnessReader>,
-    /// Root-addressed read over the daemon-owned semantic activation gate and
-    /// runtime status. Absent for standalone dashboards, whose Explorer
-    /// semantic source reports typed `unsupported` instead of guessing from
-    /// process-local state.
-    pub explorer_semantic_reader: Option<ExplorerSemanticReader>,
+    pub code_index_freshness_reader: Option<CodeIndexFreshnessReader>,
     /// Root-addressed read over the daemon-mounted canonical feedback
     /// observation owner. Selected projects reuse the resolver but resolve
     /// their own exact project root on every call.
@@ -532,6 +538,7 @@ pub struct DashboardHostAdmissionTestAuthorityV1 {
     lcm_read_authority: Option<Arc<dyn DashboardLcmReadPortV1>>,
     code_graph_read_admission: Option<Arc<dyn crate::graph::CodeGraphReadAdmissionPort>>,
     code_graph_projection_read_port: Option<Arc<dyn crate::graph::CodeGraphProjectionReadPort>>,
+    code_read_authority: Option<code_read_api::DashboardCodeReadAuthorityV1>,
     git_correlation_read_authority: Option<Arc<dyn DashboardGitCorrelationReadPortV1>>,
     delivery_read_authority: Option<Arc<dyn DashboardDeliveryReadPortV1>>,
     profile_code_index_worker_settings:
@@ -559,6 +566,7 @@ impl DashboardHostAdmissionTestAuthorityV1 {
             lcm_read_authority: None,
             code_graph_read_admission: None,
             code_graph_projection_read_port: None,
+            code_read_authority: None,
             git_correlation_read_authority: None,
             delivery_read_authority: None,
             profile_code_index_worker_settings: None,
@@ -617,6 +625,16 @@ impl DashboardHostAdmissionTestAuthorityV1 {
     ) -> Self {
         self.code_graph_read_admission = Some(admission);
         self.code_graph_projection_read_port = Some(projection);
+        self
+    }
+
+    /// Attaches the verified shared-family and revision-pair read authority.
+    #[must_use]
+    pub fn with_code_read_authority(
+        mut self,
+        authority: code_read_api::DashboardCodeReadAuthorityV1,
+    ) -> Self {
+        self.code_read_authority = Some(authority);
         self
     }
 
@@ -775,6 +793,7 @@ async fn build_state_inner(
         project_graph_resolver,
         code_graph_read_admission,
         code_graph_projection_read_port,
+        code_read_authority,
         registered_project_session_db,
         profile_code_index_worker_settings,
         lcm_read_authority,
@@ -788,7 +807,6 @@ async fn build_state_inner(
         doctor_report_reader,
         remote_operational_status_reader,
         code_index_freshness_reader,
-        explorer_semantic_reader,
         feedback_status_reader,
         pr_autotrack_reader,
         code_diagnostics_broker,
@@ -839,6 +857,7 @@ async fn build_state_inner(
         ),
         code_graph_read_admission,
         code_graph_projection_read_port,
+        code_read_authority,
         project_graph,
         project_graph_resolver,
         memory_owner,
@@ -858,7 +877,6 @@ async fn build_state_inner(
         savings_db_path,
         project_root: cg.store_layout.project_root.clone(),
         code_index_freshness_reader,
-        explorer_semantic_reader,
         feedback_status_reader,
         pr_autotrack_reader,
         storage_mode,
@@ -919,6 +937,7 @@ pub async fn build_selected_project_state(
             // selected project.
             code_graph_read_admission: None,
             code_graph_projection_read_port: None,
+            code_read_authority: None,
             registered_project_session_db: None,
             // This capability is profile-global and its route is deliberately
             // unscoped, so selected projects reuse the active dashboard's
@@ -926,7 +945,7 @@ pub async fn build_selected_project_state(
             profile_code_index_worker_settings: active.profile_code_index_worker_settings.clone(),
             lcm_read_authority: None,
             git_correlation_read_authority: None,
-            delivery_read_authority: None,
+            delivery_read_authority: active.delivery_read_authority.clone(),
             registered_savings_db: active.savings_db.clone(),
             automation_authority: active.automation_authority.clone(),
             automation_observation: active.automation_observation.clone(),
@@ -942,9 +961,6 @@ pub async fn build_selected_project_state(
             // the same admitted reader.
             remote_operational_status_reader: active.remote_operational_status_reader.clone(),
             code_index_freshness_reader: active.code_index_freshness_reader.clone(),
-            // Like freshness, the semantic reader is root-addressed and
-            // resolves the selected state's exact root on every call.
-            explorer_semantic_reader: active.explorer_semantic_reader.clone(),
             feedback_status_reader: active.feedback_status_reader.clone(),
             pr_autotrack_reader: active.pr_autotrack_reader.clone(),
             code_diagnostics_broker: None,
@@ -1067,6 +1083,8 @@ where
                 .and_then(|authority| authority.code_graph_read_admission.clone()),
             code_graph_projection_read_port: test_authority
                 .and_then(|authority| authority.code_graph_projection_read_port.clone()),
+            code_read_authority: test_authority
+                .and_then(|authority| authority.code_read_authority.clone()),
             registered_project_session_db: test_authority
                 .map(|authority| authority.project_sessions.clone()),
             profile_code_index_worker_settings: test_authority
@@ -1089,7 +1107,6 @@ where
             doctor_report_reader: None,
             remote_operational_status_reader: None,
             code_index_freshness_reader: None,
-            explorer_semantic_reader: None,
             feedback_status_reader: None,
             pr_autotrack_reader: test_authority
                 .and_then(|authority| authority.pr_autotrack_reader.clone()),
@@ -1616,6 +1633,14 @@ fn project_api_router() -> Router<DashboardState> {
         )
         .route("/api/plugins/graph/subgraph", get(graph_api::subgraph))
         .route("/api/plugins/graph/path", get(graph_api::path))
+        .route(
+            "/api/plugins/graph/shared-code/family",
+            get(code_read_api::shared_family),
+        )
+        .route(
+            "/api/plugins/graph/compare/union-layout",
+            get(code_read_api::revision_pair),
+        )
         .merge(graph_structure_api::contracted_routes())
         // Durable analytics API (hint lifecycle scaffolds + session usage rollups)
         .route(
@@ -1708,6 +1733,7 @@ fn project_api_router() -> Router<DashboardState> {
             get(code_index_freshness_api::freshness),
         )
         .route("/api/remote/status", get(remote_status_api::status))
+        .route("/api/delivery/inbox", get(delivery_api::inbox))
         .route("/api/delivery/overview", get(delivery_api::overview))
         .route("/api/events", get(events_api::events))
         .route(
@@ -1935,7 +1961,7 @@ fn selected_project_application_read(
         return None;
     }
     match tail {
-        "feedback/get" | "feedback/expand" | "feedback/list" => {
+        "feedback/get" | "feedback/expand" | "feedback/list" | "feedback/proximity" => {
             Some(SelectedProjectApplicationRead::Feedback)
         }
         _ => {
@@ -2366,6 +2392,7 @@ mod authority_tests {
                 ),
                 code_graph_read_admission: None,
                 code_graph_projection_read_port: None,
+                code_read_authority: None,
                 project_graph: None,
                 project_graph_resolver: None,
                 memory_owner,
@@ -2385,7 +2412,6 @@ mod authority_tests {
                 savings_db_path: String::new(),
                 project_root: project_root.clone(),
                 code_index_freshness_reader: None,
-                explorer_semantic_reader: None,
                 feedback_status_reader: None,
                 pr_autotrack_reader: None,
                 storage_mode: storage_mode_label(&layout.storage_mode).to_owned(),
@@ -3545,7 +3571,12 @@ mod authority_tests {
             &Method::GET,
             "events/delivery-ack"
         ));
-        for tail in ["feedback/get", "feedback/expand", "feedback/list"] {
+        for tail in [
+            "feedback/get",
+            "feedback/expand",
+            "feedback/list",
+            "feedback/proximity",
+        ] {
             assert_eq!(
                 selected_project_application_read(&Method::POST, tail),
                 Some(SelectedProjectApplicationRead::Feedback)

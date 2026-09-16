@@ -35,6 +35,7 @@ async fn partitioned_restart_rebuilds_incompatible_retained_generation() {
             published(seed.reconcile_now().expect("seed retained generation")).generation_id;
         assert!(
             seed.servable_retained_text_generation()
+                .expect("publication store")
                 .expect("seeded text generation")
                 .uses_partitioned_manifest(),
             "the restart fixture must use the lightweight partitioned restore path"
@@ -65,7 +66,6 @@ async fn partitioned_restart_rebuilds_incompatible_retained_generation() {
             test_project_id(),
             fixture.path(),
             store.path().to_path_buf(),
-            None,
         )
         .await
         .expect("restart over retained generation");
@@ -131,7 +131,7 @@ async fn partitioned_restart_rebuilds_incompatible_retained_generation() {
         .expect("replacement generation");
     assert_eq!(
         latest.code_graph_serving_readiness(),
-        tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+        tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
         "the replacement must pass through graph activation before it seats"
     );
     assert!(

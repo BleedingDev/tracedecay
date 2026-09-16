@@ -487,12 +487,18 @@ mod tests {
     use std::process::Command;
 
     use tempfile::TempDir;
+    use tracedecay_code_index_retention::code_index_generations::{
+        DurablePublicationPointerV1, durable_generation_index_digest,
+    };
     use tracedecay_contracts::ResolvedScope;
     use tracedecay_domain::{GitOidV1, ProjectId};
     use tracedecay_query::code_search;
 
     use super::*;
-    use crate::code_index_branch_diff::{bounded_diff, diff_symbols, generation_symbols};
+    use crate::code_index_branch_diff::{
+        CodeIndexRevisionPairRequestV1, bounded_diff, diff_symbols, generation_symbols,
+        revision_pair_layout_inputs,
+    };
     use crate::code_index_scheduler::{
         CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1, scoped_code_index_store_root,
     };
@@ -589,13 +595,12 @@ mod tests {
             .expect("write decoy generation");
         }
 
-        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
         registry
             .mount_worktree(
                 project_id.clone(),
                 &canonical_project,
                 store.path().to_path_buf(),
-                None,
             )
             .await
             .expect("mount sealed store");
@@ -758,6 +763,26 @@ mod tests {
             "authenticated cardinality admission must not read sealed bytes"
         );
         drop(active_decode);
+        clear_generation_cardinality(&scoped_store, &large_revision);
+        assert!(matches!(
+            revision_pair_layout_inputs(
+                &registry,
+                &scope,
+                CodeIndexRevisionPairRequestV1 {
+                    base_reference: reference.clone(),
+                    base_revision: large_revision.clone(),
+                    base_tree: large_tree.clone(),
+                    head_reference: reference.clone(),
+                    head_revision: large_revision.clone(),
+                    head_tree: large_tree.clone(),
+                    file_filter: None,
+                    kind_filter: None,
+                    control: control.clone(),
+                },
+            )
+            .await,
+            Err(CodeIndexSearchUnavailableReasonV1::CapacityUnavailable)
+        ));
         let started = std::time::Instant::now();
         let outcome = bounded_diff(
             large_generation.generation(),
@@ -895,13 +920,12 @@ mod tests {
         )
         .expect("dirty worktree source");
 
-        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
         registry
             .mount_worktree(
                 project_id.clone(),
                 &canonical_project,
                 store.path().to_path_buf(),
-                None,
             )
             .await
             .expect("mount sealed store");
@@ -1019,13 +1043,12 @@ mod tests {
         drop(dirty);
         drop(scheduler);
 
-        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
         registry
             .mount_worktree(
                 project_id.clone(),
                 &canonical_project,
                 store.path().to_path_buf(),
-                None,
             )
             .await
             .expect("mount sealed store");
@@ -1048,28 +1071,19 @@ mod tests {
             deadline: None,
             cancellation: None,
         };
-        let pair = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                match registry
-                    .generations_for_revisions(
-                        &scope,
-                        &reference,
-                        &revision,
-                        &tree,
-                        &reference,
-                        &revision,
-                        &tree,
-                        control.clone(),
-                    )
-                    .await
-                {
-                    Err(CodeIndexSearchUnavailableReasonV1::CapacityUnavailable) => {
-                        tokio::task::yield_now().await;
-                    }
-                    result => break result,
-                }
-            }
-        })
+        let pair = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            registry.generations_for_revisions(
+                &scope,
+                &reference,
+                &revision,
+                &tree,
+                &reference,
+                &revision,
+                &tree,
+                control.clone(),
+            ),
+        )
         .await
         .expect("bounded exact-generation read")
         .expect("exact generation minted from the commit tree");
@@ -1126,10 +1140,6 @@ mod tests {
     /// while keeping every entry, so the test isolates the flag itself from the
     /// question of which entries survived.
     fn latch_generation_index_truncation(scoped_store: &Path) {
-        use tracedecay_code_index_retention::code_index_generations::{
-            DurablePublicationPointerV1, durable_generation_index_digest,
-        };
-
         let pointer_path = scoped_store.join("active-code-generation-v1.json");
         let mut pointer: DurablePublicationPointerV1 =
             serde_json::from_slice(&std::fs::read(&pointer_path).expect("read pointer"))
@@ -1146,6 +1156,31 @@ mod tests {
         .expect("write truncated publication pointer");
     }
 
+    fn clear_generation_cardinality(scoped_store: &Path, revision: &GitOidV1) {
+        let pointer_path = scoped_store.join("active-code-generation-v1.json");
+        let mut pointer: DurablePublicationPointerV1 =
+            serde_json::from_slice(&std::fs::read(&pointer_path).expect("read pointer"))
+                .expect("decode publication pointer");
+        pointer
+            .generation_index
+            .iter_mut()
+            .find(|entry| entry.source_revision.as_deref() == Some(revision.as_str()))
+            .expect("revision entry")
+            .cardinality = None;
+        pointer.generation_index_digest = Some(
+            durable_generation_index_digest(
+                &pointer.generation_index,
+                pointer.generation_index_truncated,
+            )
+            .expect("digest generation index"),
+        );
+        std::fs::write(
+            &pointer_path,
+            serde_json::to_vec(&pointer).expect("encode pointer"),
+        )
+        .expect("write pointer");
+    }
+
     async fn settled_pair(
         registry: &CodeIndexSchedulerRegistryV1,
         scope: &ResolvedScope,
@@ -1154,31 +1189,19 @@ mod tests {
         control: &BranchGenerationReadControlV1,
         timeout: std::time::Duration,
     ) -> Result<BranchGenerationPairV1, CodeIndexSearchUnavailableReasonV1> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                match registry
-                    .generations_for_revisions(
-                        scope,
-                        base.0,
-                        base.1,
-                        base.2,
-                        head.0,
-                        head.1,
-                        head.2,
-                        control.clone(),
-                    )
-                    .await
-                {
-                    // Only scheduler-lock contention may be retried here: a
-                    // capacity answer that outlives the deadline is exactly the
-                    // spin these tests exist to rule out.
-                    Err(CodeIndexSearchUnavailableReasonV1::CapacityUnavailable) => {
-                        tokio::task::yield_now().await;
-                    }
-                    result => break result,
-                }
-            }
-        })
+        tokio::time::timeout(
+            timeout,
+            registry.generations_for_revisions(
+                scope,
+                base.0,
+                base.1,
+                base.2,
+                head.0,
+                head.1,
+                head.2,
+                control.clone(),
+            ),
+        )
         .await
         .expect("bounded exact-generation read")
     }
@@ -1227,13 +1250,12 @@ mod tests {
             .clone();
         drop(scheduler);
 
-        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
         registry
             .mount_worktree(
                 project_id.clone(),
                 &canonical_project,
                 store.path().to_path_buf(),
-                None,
             )
             .await
             .expect("mount sealed store");
@@ -1347,13 +1369,12 @@ mod tests {
         git(project.path(), &["branch", "-q", "-D", "main"]);
         latch_generation_index_truncation(&scoped_store);
 
-        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 0);
         registry
             .mount_worktree(
                 project_id.clone(),
                 &canonical_project,
                 store.path().to_path_buf(),
-                None,
             )
             .await
             .expect("mount sealed store");

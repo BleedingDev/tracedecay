@@ -9,6 +9,8 @@
 //! server. Supports optional `stop` action to shut down the calling project's
 //! previously-started instance.
 
+mod code_reads;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,14 +26,15 @@ use tracedecay_domain::configuration::{
 use tracedecay_global_db::configuration::contracts::types::DirectConfigurationMutation;
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 
-use super::dashboard_lcm::DashboardLcmReadAdapter;
-use super::support::generic_tool_result;
 use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::handlers::dashboard_lcm::DashboardLcmReadAdapter;
+use tracedecay_mcp::handlers::generic_tool_result;
 
+use code_reads::DashboardCodeReadAdapter;
 use tracedecay_dashboard_api::{
     AutomationSchedulerReconciler, DEFAULT_PORT, DashboardApplicationRouters,
     DashboardApplicationRuntime, DashboardAutomationWriter,
@@ -677,9 +680,8 @@ pub(super) async fn handle_dashboard(
     doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
     remote_operational_status: Option<tracedecay_contracts::RemoteOperationalStatusReaderV1>,
     code_index_freshness_reader: Option<
-        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader,
+        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader,
     >,
-    explorer_semantic_reader: Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
     feedback_status_reader: Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     pr_autotrack_reader: Option<tracedecay_dashboard_api::PrAutoTrackManagedSummaryReader>,
     code_diagnostics_broker: Option<
@@ -908,17 +910,34 @@ pub(super) async fn handle_dashboard(
             let git_correlation_read_authority =
                 registered_project_session_db.as_ref().map(|database| {
                     Arc::new(
-                        super::dashboard_git_correlation::DashboardGitCorrelationReadAdapter::new(
+                        tracedecay_mcp::handlers::dashboard_git_correlation::DashboardGitCorrelationReadAdapter::new(
                             database.clone(),
                         ),
                     )
                         as Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>
                 });
-            let delivery_read_authority = daemon_invocation_service.map(|service| {
-                let adapter = super::dashboard_delivery::DashboardDeliveryReadAdapter::new(
-                    service,
-                    retained_cg.store_layout.project_root.clone(),
+            let code_read_authority = retained_server
+                .admitted_project_scope()
+                .zip(retained_server.code_index_search_authority())
+                .zip(retained_server.code_index_similar_executor())
+                .zip(daemon_invocation_service.clone())
+                .map(
+                    |(((scope, search_authority), similar_executor), invocation_service)| {
+                        Arc::new(DashboardCodeReadAdapter::new(
+                            retained_cg.store_layout.project_root.clone(),
+                            scope,
+                            search_authority,
+                            similar_executor,
+                            invocation_service,
+                        ))
+                            as tracedecay_dashboard_api::code_read_api::DashboardCodeReadAuthorityV1
+                    },
                 );
+            let delivery_read_authority = daemon_invocation_service.clone().map(|service| {
+                let adapter =
+                    tracedecay_mcp::handlers::dashboard_delivery::DashboardDeliveryReadAdapter::new(
+                        service,
+                    );
                 Arc::new(adapter) as Arc<dyn tracedecay_dashboard_api::DashboardDeliveryReadPortV1>
             });
             crate::hooks::install_dashboard_hook_readiness_projection()?;
@@ -932,6 +951,7 @@ pub(super) async fn handle_dashboard(
                     project_graph_resolver: dashboard_project_graph_resolver,
                     code_graph_read_admission,
                     code_graph_projection_read_port,
+                    code_read_authority,
                     registered_project_session_db,
                     profile_code_index_worker_settings,
                     lcm_read_authority,
@@ -945,7 +965,6 @@ pub(super) async fn handle_dashboard(
                     doctor_report_reader,
                     remote_operational_status_reader: remote_operational_status,
                     code_index_freshness_reader,
-                    explorer_semantic_reader,
                     feedback_status_reader,
                     pr_autotrack_reader,
                     code_diagnostics_broker,

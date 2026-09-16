@@ -8,13 +8,15 @@ use tracedecay_code_extraction::{
     ImportNamespaceV1, SchemaEvidenceLanguageV1, SchemaEvidenceStatusV1, import_module_kind,
 };
 use tracedecay_domain::{
-    CanonicalRelationEdgeV1, CodeGenerationId, FileOccurrenceId, RelationEdgeKindV1, SourceSpan,
-    SymbolOccurrenceId,
+    CanonicalRelationEdgeV1, CodeGenerationId, FileOccurrenceId, ManifestDigest,
+    RelationEdgeKindV1, SourceSpan, SymbolOccurrenceId,
 };
 
-use super::{ChunkingFailureV1, CodeFileChunksV1, canonical_edge_key};
+use super::{ChunkingFailureV1, CodeFileChunksV1, canonical_edge_key, symbol_occurrence_id};
+use crate::clones::CodeIndexCloneBodyV1;
 use crate::extract::ExtractionBatchV1;
 use crate::extract::parser_import_rows_digest;
+use crate::intake::ReceiptBoundCodeFileAuthorityV1;
 use crate::lineage::LineageSymbolRecordV1;
 
 const IMPORT_AUTHORITY_MISMATCH: &str =
@@ -168,6 +170,7 @@ pub struct CodeFileIndexArtifactsV1 {
     pub edges: Vec<CanonicalRelationEdgeV1>,
     pub edge_abstentions: Vec<CodeIndexEdgeAbstentionV1>,
     pub imports: Vec<CodeIndexImportEvidenceV1>,
+    pub clone_bodies: Vec<CodeIndexCloneBodyV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema_evidence: Option<ExtractedSchemaEvidenceV1>,
     /// References this file could not bind locally, canonically ordered.
@@ -205,6 +208,7 @@ impl CodeFileIndexArtifactsV1 {
         edges: Vec<CanonicalRelationEdgeV1>,
         edge_abstentions: Vec<CodeIndexEdgeAbstentionV1>,
         unresolved_references: Vec<CodeIndexUnresolvedReferenceV1>,
+        clone_bodies: Vec<CodeIndexCloneBodyV1>,
         artifact: &ExtractionArtifactV1,
         extraction: &ExtractionBatchV1,
     ) -> Result<Self, ChunkingFailureV1> {
@@ -221,6 +225,7 @@ impl CodeFileIndexArtifactsV1 {
             edges,
             edge_abstentions,
             imports,
+            clone_bodies,
             artifact.schema_evidence.clone(),
             unresolved_references,
         )?;
@@ -238,6 +243,7 @@ impl CodeFileIndexArtifactsV1 {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             None,
             Vec::new(),
         )?;
@@ -245,16 +251,23 @@ impl CodeFileIndexArtifactsV1 {
         Ok(artifacts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         chunks: CodeFileChunksV1,
         symbols: Vec<Arc<LineageSymbolRecordV1>>,
         edges: Vec<CanonicalRelationEdgeV1>,
         edge_abstentions: Vec<CodeIndexEdgeAbstentionV1>,
         mut imports: Vec<CodeIndexImportEvidenceV1>,
+        mut clone_bodies: Vec<CodeIndexCloneBodyV1>,
         mut schema_evidence: Option<ExtractedSchemaEvidenceV1>,
         mut unresolved_references: Vec<CodeIndexUnresolvedReferenceV1>,
     ) -> Result<Self, ChunkingFailureV1> {
         imports.sort_by(canonical_import_order);
+        clone_bodies.sort_by(|left, right| {
+            left.occurrence
+                .symbol_occurrence_id
+                .cmp(&right.occurrence.symbol_occurrence_id)
+        });
         if let Some(evidence) = &mut schema_evidence {
             evidence.issues.sort();
             evidence.issues.dedup();
@@ -269,6 +282,7 @@ impl CodeFileIndexArtifactsV1 {
             edges,
             edge_abstentions,
             imports,
+            clone_bodies,
             schema_evidence,
             unresolved_references,
         };
@@ -281,8 +295,20 @@ impl CodeFileIndexArtifactsV1 {
     /// the persisted extraction batch through
     /// [`Self::validate_generation_import_authority`].
     pub fn validate(&self) -> Result<(), ChunkingFailureV1> {
+        self.validate_with_clone_payloads(true)
+    }
+
+    fn validate_reusing_clone_payloads(&self) -> Result<(), ChunkingFailureV1> {
+        self.validate_with_clone_payloads(false)
+    }
+
+    fn validate_with_clone_payloads(
+        &self,
+        validate_clone_payloads: bool,
+    ) -> Result<(), ChunkingFailureV1> {
         self.chunks.validate()?;
         self.validate_imports()?;
+        self.validate_clone_bodies(validate_clone_payloads)?;
         self.validate_schema_evidence()?;
         if self
             .symbols
@@ -341,6 +367,78 @@ impl CodeFileIndexArtifactsV1 {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
                 "unresolved references are not in strict canonical order".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_clone_bodies(&self, validate_payloads: bool) -> Result<(), ChunkingFailureV1> {
+        let occurrences = self
+            .symbols
+            .iter()
+            .map(|symbol| &symbol.occurrence)
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(pair) = self.clone_bodies.windows(2).find(|pair| {
+            pair[0].occurrence.symbol_occurrence_id >= pair[1].occurrence.symbol_occurrence_id
+        }) {
+            return Err(ChunkingFailureV1::NonCanonicalIdentity(format!(
+                "clone body evidence is not in strict symbol-occurrence order: file={} file_occurrence={} left_payload={} left_symbol={} left_bound={} right_payload={} right_symbol={} right_bound={}",
+                pair[0].occurrence.path,
+                self.chunks.document.file_occurrence_id.as_str(),
+                pair[0].occurrence.payload_digest.as_str(),
+                pair[0].occurrence.symbol_occurrence_id.as_str(),
+                occurrences.contains(&pair[0].occurrence.symbol_occurrence_id),
+                pair[1].occurrence.payload_digest.as_str(),
+                pair[1].occurrence.symbol_occurrence_id.as_str(),
+                occurrences.contains(&pair[1].occurrence.symbol_occurrence_id),
+            )));
+        }
+        for body in &self.clone_bodies {
+            if body.occurrence.path.is_empty() {
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                    "clone body evidence has an empty path".to_owned(),
+                ));
+            }
+            if body.occurrence.body_span.is_empty() {
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                    "clone body evidence has an empty body span".to_owned(),
+                ));
+            }
+            if body.occurrence.payload_digest != body.payload.payload_digest {
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                    "clone body evidence payload digest does not match its payload".to_owned(),
+                ));
+            }
+            if validate_payloads {
+                if let Err(detail) = body.payload.validate() {
+                    return Err(ChunkingFailureV1::NonCanonicalIdentity(format!(
+                        "clone body evidence payload is not canonical: {detail}"
+                    )));
+                }
+            }
+            if !occurrences.contains(&body.occurrence.symbol_occurrence_id) {
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                    "clone body evidence is not bound to a file symbol".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_generation_clone_authority(
+        &self,
+        authority: &ReceiptBoundCodeFileAuthorityV1,
+        extraction: &ExtractionBatchV1,
+        snapshot_digest: &ManifestDigest,
+    ) -> Result<(), ChunkingFailureV1> {
+        if self.clone_bodies.iter().any(|body| {
+            body.occurrence.project_id != authority.project_id
+                || body.occurrence.repository_id != authority.repository_id
+                || body.occurrence.worktree_id != authority.worktree_id
+                || body.occurrence.source_generation != extraction.generation_id
+                || body.occurrence.snapshot_digest != *snapshot_digest
+                || body.occurrence.path != authority.logical_path
+        }) {
+            return Err(ChunkingFailureV1::GenerationMismatch);
         }
         Ok(())
     }
@@ -459,42 +557,47 @@ impl CodeFileIndexArtifactsV1 {
         generation_id: CodeGenerationId,
         file_occurrence_id: FileOccurrenceId,
     ) -> Result<Self, ChunkingFailureV1> {
-        self.validate()?;
-        let chunks = self
-            .chunks
-            .rematerialize_for_generation(generation_id, file_occurrence_id.clone())?;
-        let mut occurrences = BTreeMap::new();
-        for (prior, current) in self.chunks.chunks.iter().zip(&chunks.chunks) {
-            if let Some(prior_occurrence) = &prior.anchor.symbol_occurrence_id {
-                let current_occurrence = current
-                    .anchor
-                    .symbol_occurrence_id
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ChunkingFailureV1::NonCanonicalIdentity(
-                            "rematerialized symbol occurrence is missing".to_owned(),
-                        )
-                    })?
-                    .clone();
-                match occurrences.get(prior_occurrence) {
-                    Some(existing) if existing != &current_occurrence => {
-                        return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                            "symbol occurrence rematerialized inconsistently".to_owned(),
-                        ));
-                    }
-                    _ => {
-                        occurrences.insert(prior_occurrence.clone(), current_occurrence);
-                    }
-                }
-            }
+        self.rematerialize_for_generation_inner(generation_id, file_occurrence_id, true)
+    }
+
+    pub(crate) fn rematerialize_for_generation_reusing_clone_payloads(
+        &self,
+        generation_id: CodeGenerationId,
+        file_occurrence_id: FileOccurrenceId,
+    ) -> Result<Self, ChunkingFailureV1> {
+        self.rematerialize_for_generation_inner(generation_id, file_occurrence_id, false)
+    }
+
+    fn rematerialize_for_generation_inner(
+        &self,
+        generation_id: CodeGenerationId,
+        file_occurrence_id: FileOccurrenceId,
+        validate_clone_payloads: bool,
+    ) -> Result<Self, ChunkingFailureV1> {
+        if validate_clone_payloads {
+            self.validate()?;
+        } else {
+            self.validate_reusing_clone_payloads()?;
         }
+        let mut occurrences = BTreeMap::new();
+        for symbol in &self.symbols {
+            occurrences.insert(
+                symbol.occurrence.clone(),
+                symbol_occurrence_id(&file_occurrence_id, &symbol.identity)?,
+            );
+        }
+        let chunks = self.chunks.rematerialize_for_generation(
+            generation_id.clone(),
+            file_occurrence_id.clone(),
+            &occurrences,
+        )?;
 
         let mut symbols = self.symbols.clone();
         for symbol in &mut symbols {
-            // Carried records are shared with the prior generation; rebinding
-            // writes into this generation's own copy.
-            let symbol = Arc::make_mut(symbol);
-            symbol.occurrence = rematerialized_occurrence(&occurrences, &symbol.occurrence)?;
+            let occurrence = rematerialized_occurrence(&occurrences, &symbol.occurrence)?;
+            if occurrence != symbol.occurrence {
+                Arc::make_mut(symbol).occurrence = occurrence;
+            }
         }
         symbols.sort_by(|left, right| left.occurrence.cmp(&right.occurrence));
 
@@ -515,16 +618,32 @@ impl CodeFileIndexArtifactsV1 {
                 rematerialized_occurrence(&occurrences, &reference.from_occurrence)?;
         }
         unresolved_references.sort();
+        let mut clone_bodies = self.clone_bodies.clone();
+        for body in &mut clone_bodies {
+            body.occurrence.source_generation = generation_id.clone();
+            body.occurrence.symbol_occurrence_id =
+                rematerialized_occurrence(&occurrences, &body.occurrence.symbol_occurrence_id)?;
+        }
+        clone_bodies.sort_by(|left, right| {
+            left.occurrence
+                .symbol_occurrence_id
+                .cmp(&right.occurrence.symbol_occurrence_id)
+        });
         let result = Self {
             chunks,
             symbols,
             edges,
             edge_abstentions: self.edge_abstentions.clone(),
             imports,
+            clone_bodies,
             schema_evidence: self.schema_evidence.clone(),
             unresolved_references,
         };
-        result.validate()?;
+        if validate_clone_payloads {
+            result.validate()?;
+        } else {
+            result.validate_reusing_clone_payloads()?;
+        }
         Ok(result)
     }
 }

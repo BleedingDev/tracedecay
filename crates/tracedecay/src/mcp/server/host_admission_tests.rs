@@ -72,7 +72,7 @@ fn terminal_receipt(root: PathBuf) -> Value {
 }
 
 async fn server_with_broker(
-    cg: crate::tracedecay::TraceDecay,
+    cg: crate::project::TraceDecay,
     authority: &WriterTestFixtureAuthority,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
@@ -84,7 +84,7 @@ async fn server_with_broker(
 }
 
 async fn server_with_owned_project_replay_worker(
-    cg: crate::tracedecay::TraceDecay,
+    cg: crate::project::TraceDecay,
     authority: &WriterTestFixtureAuthority,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
@@ -1079,14 +1079,13 @@ fn session_start_with_route(root: PathBuf) -> Value {
 }
 
 async fn server_with_broker_and_runtime(
-    cg: crate::tracedecay::TraceDecay,
+    cg: crate::project::TraceDecay,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
     runtime: Arc<HostAdmissionTestRuntimeV1>,
 ) -> Arc<McpServer> {
     let mut context = with_broker(
-        runtime
-            .mcp_server_context_for_test(cg, None)
+        crate::test_support::host_admission::mcp_server_context_for_test(runtime, cg, None)
             .expect("registered MCP server context"),
         broker,
         reconcile_sink,

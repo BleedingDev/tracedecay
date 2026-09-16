@@ -106,18 +106,16 @@ export function generationAnchor() { return 1; }
                     project_id(),
                     root.path(),
                     store.path().to_path_buf(),
-                    None,
                     runtime.code_graph_seat_port(),
                     database,
                     CodeGraphActivationPolicyV1::Enabled,
-                    None,
                 )
                 .await
                 .expect("mount persistent graph-backed scheduler");
             Some(scope)
         } else {
             registry
-                .mount_worktree(project_id(), root.path(), store.path().to_path_buf(), None)
+                .mount_worktree(project_id(), root.path(), store.path().to_path_buf())
                 .await
                 .expect("mount code-index scheduler");
             None
@@ -271,14 +269,6 @@ async fn writable_binding_serves_exact_scope_generation_while_catalog_warms() {
         .subscribe_serving_generation_changes(fixture.root())
         .await
         .expect("mounted serving owner");
-    assert!(
-        fixture
-            .registry
-            .request_complete_generation(fixture.root())
-            .await,
-        "mounted worktree admits complete-generation demand"
-    );
-
     let admitted = fixture
         .port(true)
         .admit(fixture.request(&context, &fixture.generation))
@@ -317,7 +307,7 @@ async fn writable_binding_serves_exact_scope_generation_while_catalog_warms() {
     );
     assert_eq!(
         serving.code_graph_serving_readiness(),
-        tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+        tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
         "admission returns only after graph activation completes for the generation it minted"
     );
     let graph = serving
@@ -399,7 +389,15 @@ async fn latest(
     // that complete state before using its imports as admission evidence.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(latest) = registry.latest_complete_fresh(project_root).await {
+            let _ = registry.latest_complete_fresh(project_root).await;
+            if registry
+                .dashboard_freshness(project_root)
+                .await
+                .and_then(|freshness| freshness.staleness_state)
+                .as_deref()
+                == Some("fresh")
+                && let Some(latest) = registry.latest_complete_fresh(project_root).await
+            {
                 return latest;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

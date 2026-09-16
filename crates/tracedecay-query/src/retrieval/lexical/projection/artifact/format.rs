@@ -43,8 +43,10 @@ pub(super) use super::schema::{
 // as columns or generation metadata. Revision 12 replaces the page-local
 // n-gram shard header/fixed-width values with canonical delta varints and
 // stores exact posting keys as collision-checked content-addressed term IDs.
+// Revision 15 adds independently digested clone payload, occurrence, and
+// exact-posting sections without changing lexical document integrity.
 pub(super) const RECEIPT_RESERVATION_BYTES: usize = 16 * 1024;
-pub(super) const SECTION_NAMES: [&str; 11] = [
+pub(super) const SECTION_NAMES: [&str; 16] = [
     "source_pages",
     "document_integrity",
     "import_integrity",
@@ -56,6 +58,11 @@ pub(super) const SECTION_NAMES: [&str; 11] = [
     "field_stats",
     "term_stats",
     "vocabulary",
+    "clone_occurrences",
+    "clone_exact_postings",
+    "clone_body_payloads",
+    "clone_fingerprint_counts",
+    "clone_fingerprint_postings",
 ];
 pub(super) const BASE_SECTION_NAMES: [&str; 7] = [
     "document_integrity",
@@ -66,6 +73,16 @@ pub(super) const BASE_SECTION_NAMES: [&str; 7] = [
     "exact_postings",
     "ngram_postings",
 ];
+
+pub(super) fn section_names(layout: LexicalArtifactLayoutV1) -> &'static [&'static str] {
+    if layout.has_clone_fingerprints() {
+        &SECTION_NAMES
+    } else if layout.has_clone_index() {
+        &SECTION_NAMES[..14]
+    } else {
+        &SECTION_NAMES[..11]
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -664,7 +681,76 @@ fn verify_interned_term_layout(
             )));
         }
     }
+    verify_clone_table_layout(connection, layout)?;
     Ok(())
+}
+
+fn verify_clone_table_layout(
+    connection: &Connection,
+    layout: LexicalArtifactLayoutV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    if !layout.has_clone_index() {
+        return Ok(());
+    }
+    let payloads = table_columns(connection, "clone_body_payloads")?;
+    let occurrences = table_columns(connection, "clone_occurrences")?;
+    let postings = table_columns(connection, "clone_exact_postings")?;
+    if !table_column_shapes(&payloads)
+        .eq([("payload_digest", "TEXT", 1, 1), ("payload", "BLOB", 1, 0)])
+        || !table_column_shapes(&occurrences).eq([
+            ("symbol_occurrence_id", "TEXT", 1, 1),
+            ("payload_digest", "TEXT", 1, 0),
+            ("path", "TEXT", 1, 0),
+            ("body_start", "INTEGER", 1, 0),
+            ("body_end", "INTEGER", 1, 0),
+            ("occurrence", "BLOB", 1, 0),
+        ])
+        || !table_column_shapes(&postings).eq([
+            ("class", "INTEGER", 1, 1),
+            ("normalization_revision", "INTEGER", 1, 2),
+            ("digest", "TEXT", 1, 3),
+            ("symbol_occurrence_id", "TEXT", 1, 4),
+            ("payload_digest", "TEXT", 1, 0),
+        ])
+    {
+        return Err(CodeLexicalArtifactErrorV1::Incompatible(
+            "revision 15 requires clone payload, occurrence, and exact-posting tables".to_owned(),
+        ));
+    }
+    if layout.has_clone_fingerprints() {
+        let counts = table_columns(connection, "clone_fingerprint_counts")?;
+        let fingerprints = table_columns(connection, "clone_fingerprint_postings")?;
+        if !table_column_shapes(&counts).eq([
+            ("language", "TEXT", 1, 1),
+            ("class", "INTEGER", 1, 2),
+            ("normalization_revision", "INTEGER", 1, 3),
+            ("fingerprint", "INTEGER", 1, 4),
+            ("posting_count", "INTEGER", 1, 0),
+        ]) || !table_column_shapes(&fingerprints).eq([
+            ("language", "TEXT", 1, 1),
+            ("class", "INTEGER", 1, 2),
+            ("normalization_revision", "INTEGER", 1, 3),
+            ("fingerprint", "INTEGER", 1, 4),
+            ("symbol_occurrence_id", "TEXT", 1, 5),
+            ("token_position", "INTEGER", 1, 6),
+            ("payload_digest", "TEXT", 1, 0),
+            ("body_digest", "TEXT", 1, 0),
+        ]) {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "revision 16 requires positional clone fingerprint postings and stored counts"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn table_column_shapes(
+    rows: &[(String, String, i64, i64)],
+) -> impl Iterator<Item = (&str, &str, i64, i64)> {
+    rows.iter().map(|(name, ty, not_null, primary_key)| {
+        (name.as_str(), ty.as_str(), *not_null, *primary_key)
+    })
 }
 
 fn table_columns(
@@ -735,7 +821,9 @@ pub(super) fn encode_ngram_bitmap(
         }
         LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13
-        | LexicalArtifactLayoutV1::V14 => encode_ngram_delta_varints_v12(bitmap),
+        | LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16 => encode_ngram_delta_varints_v12(bitmap),
     }
 }
 
@@ -823,7 +911,9 @@ pub(super) fn decode_ngram_bitmap(
         }
         LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13
-        | LexicalArtifactLayoutV1::V14 => decode_ngram_delta_varints_v12(encoded),
+        | LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16 => decode_ngram_delta_varints_v12(encoded),
     }
 }
 
@@ -1117,6 +1207,8 @@ pub(super) struct ArtifactRowV1 {
     pub symbol_simple_name: Option<String>,
     pub symbol_qualified_name: Option<String>,
     pub symbol_kind: Option<String>,
+    pub symbol_signature: Option<String>,
+    pub symbol_documentation: Option<String>,
     pub field_lengths: BTreeMap<LexicalFieldV1, usize>,
     pub normalized_text: String,
 }
@@ -1133,6 +1225,8 @@ impl From<ProjectedChunkV1> for ArtifactRowV1 {
             symbol_simple_name: row.symbol_simple_name,
             symbol_qualified_name: row.symbol_qualified_name,
             symbol_kind: row.symbol_kind,
+            symbol_signature: row.symbol_signature,
+            symbol_documentation: row.symbol_documentation,
             field_lengths: row.field_lengths,
             normalized_text: row.normalized_text,
         }

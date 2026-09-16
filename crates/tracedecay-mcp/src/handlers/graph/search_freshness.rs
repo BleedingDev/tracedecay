@@ -12,11 +12,11 @@
 
 use std::fmt::Write as _;
 
+use tracedecay_contracts::code_index_freshness::{
+    CodeIndexBuildPhaseV1, CodeIndexFreshnessPayloadV1, CodeIndexWorktreeFreshnessV1,
+};
 use tracedecay_contracts::retrieval::{
     PrimitiveFreshnessStateV1, PrimitiveIndexingStateV1, PrimitiveSearchFreshnessV1,
-};
-use tracedecay_dashboard_api::code_index_freshness_api::{
-    CodeIndexBuildPhaseV1, CodeIndexFreshnessPayloadV1, CodeIndexWorktreeFreshnessV1,
 };
 
 use tracedecay_query::code_search::{CodeIndexLaneStatusV1, CodeIndexSearchCoverageV1};
@@ -67,7 +67,6 @@ fn stale_lanes(coverage: &CodeIndexSearchCoverageV1) -> Vec<String> {
         ("exact", &coverage.exact),
         ("lexical", &coverage.lexical),
         ("graph", &coverage.graph),
-        ("semantic", &coverage.semantic),
     ]
     .into_iter()
     .filter(|(_, status)| matches!(status, CodeIndexLaneStatusV1::Stale { .. }))
@@ -182,7 +181,7 @@ pub(super) fn freshness_lines(freshness: &PrimitiveSearchFreshnessV1) -> String 
 
 #[cfg(test)]
 mod tests {
-    use tracedecay_dashboard_api::code_index_freshness_api::CodeIndexBuildProgressV1;
+    use tracedecay_contracts::code_index_freshness::CodeIndexBuildProgressV1;
 
     use super::*;
 
@@ -216,8 +215,7 @@ mod tests {
 
     #[test]
     fn executor_stale_lanes_are_possibly_stale_even_without_a_scheduler() {
-        let semantic = tracedecay_query::code_search::CodeIndexSemanticStatusV1::Complete;
-        let coverage = CodeIndexSearchCoverageV1::fused_stale("generation.0", &semantic);
+        let coverage = CodeIndexSearchCoverageV1::stale("generation.0");
         let freshness = search_freshness(
             ServedGenerationV1::Served("generation.0"),
             &coverage,

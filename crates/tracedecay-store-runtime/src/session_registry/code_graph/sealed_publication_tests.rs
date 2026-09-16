@@ -259,9 +259,12 @@ fn journal_publication_without_head(
     });
 }
 
+/// A pending replay whose sealed source this build refuses to read is
+/// discarded by the next fresh publication rather than retried forever. The
+/// archival carrier supplies such a source: it is sealed at a retired
+/// manifest revision, so hydration refuses it at the revision gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn historical_pending_replay_without_source_commitments_is_discarded_before_fresh_publication()
- {
+async fn unreadable_pending_replay_is_discarded_before_fresh_publication() {
     let temporary = tempfile::tempdir().expect("temporary fixture parent");
     let root = temporary
         .path()
@@ -421,9 +424,10 @@ async fn historical_pending_replay_without_source_commitments_is_discarded_befor
         .expect("historical sealed state digest"),
         projector_revision,
     };
-    // The historical fixture predates required documentation evidence, so the
-    // current reader refuses its rows by name before the source-commitment
-    // check can run (69df412d2 pins the same refusal in the code-index suite).
+    // The historical fixture is sealed at the retired manifest revision seven,
+    // so the current reader refuses it at the revision gate — before the row
+    // evidence it also predates, and before the source-commitment check. The
+    // code-index suite pins the same refusal against these bytes.
     let refused = runtime
         .graph_manifest_provider
         .hydrate_sealed_code_generation(
@@ -437,7 +441,7 @@ async fn historical_pending_replay_without_source_commitments_is_discarded_befor
             &refused,
             GraphDbError::SealedRevisionIncompatible { sealed_state_digest, message }
                 if sealed_state_digest == &format!("sha256:{historical_digest}")
-                    && message.contains("missing field `docstring`")
+                    && message.contains("sealed generation format revision 7 predates this build")
         ),
         "unexpected error: {refused}"
     );

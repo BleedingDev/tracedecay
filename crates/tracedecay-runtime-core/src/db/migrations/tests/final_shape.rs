@@ -10,7 +10,10 @@ use tempfile::TempDir;
 use crate::db::engine::TestConnection;
 use crate::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
 
-use super::super::{SCHEMA_VERSION, create_schema_connection};
+use super::super::{
+    PAYLOAD_DIGEST_STEP_SOURCE_VERSION, SCHEMA_VERSION, create_schema_connection,
+    verify_final_schema_connection,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 struct StoreSnapshot {
@@ -89,7 +92,9 @@ fn tamper(path: &Path, sql: &str) {
         .expect("apply literal final-shape tamper");
 }
 
-async fn assert_reset_required_without_repair(path: &Path, mutation: &str) {
+/// Opens the store through the production writer, requires the typed
+/// reset-required refusal, and returns its reason.
+async fn assert_reset_required_without_repair(path: &Path, mutation: &str) -> String {
     let before = store_snapshot(path);
     let authority = DatabaseAuthority::acquire_test(path, "final-shape admission fixture")
         .expect("acquire final-shape admission authority");
@@ -100,7 +105,7 @@ async fn assert_reset_required_without_repair(path: &Path, mutation: &str) {
             Ok(_) => panic!("a stamped final store with a structural tamper must be refused"),
             Err(error) => error,
         };
-    let (authority, _) = error
+    let (authority, reason) = error
         .reset_required_context()
         .expect("final-shape refusal must remain typed reset-required");
     assert_eq!(authority, "SQLite store", "{mutation} refusal authority");
@@ -108,6 +113,76 @@ async fn assert_reset_required_without_repair(path: &Path, mutation: &str) {
         store_snapshot(path),
         before,
         "{mutation} refusal must not repair or otherwise rewrite the store"
+    );
+    reason.to_owned()
+}
+
+/// The canonical project store exactly as every release from v0.1.0-beta.25
+/// through v0.1.0-beta.37 wrote it. The fixture header carries the
+/// tag-to-inventory table; it is assembled from the tagged DDL rather than
+/// from the current contract, because a released shape derived from the
+/// current contract agrees with whatever this binary expects and so cannot
+/// detect an admission that refuses what shipped.
+const RELEASED_V34_PROJECT_STORE_SQL: &str =
+    include_str!("../../../../tests/fixtures/project-store-released-v34.sql");
+
+/// Writes the released project store into an empty file, in the WAL mode
+/// every shipped binary ran, and stamps the `user_version` a shipped binary
+/// left, which is what selects the released admission path.
+fn released_v34_project_store(directory: &TempDir) -> PathBuf {
+    let path = directory.path().join("released-v34.db");
+    let connection = rusqlite::Connection::open(&path).expect("create released store fixture");
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("run the released store in WAL mode");
+    connection
+        .execute_batch(RELEASED_V34_PROJECT_STORE_SQL)
+        .expect("install the released project schema");
+    connection
+        .execute_batch(&format!(
+            "PRAGMA user_version = {PAYLOAD_DIGEST_STEP_SOURCE_VERSION};"
+        ))
+        .expect("stamp the released schema version");
+    path
+}
+
+/// Every release from v0.1.0-beta.25 through v0.1.0-beta.37 wrote one
+/// byte-identical project store, and every one of them carries the
+/// `semantic_vector_*` staging family v36 retired with dense code retrieval.
+/// That family has no forward path, so opening a released store must refuse
+/// with the typed reset remedy, naming the retired object, before the
+/// released-shape convergence writes anything: on the writer path and on a
+/// read-only mount, which must not promise a writer-side step that would
+/// itself refuse.
+#[tokio::test]
+async fn released_project_store_is_refused_without_mutation() {
+    let directory = tempfile::tempdir().expect("create released fixture directory");
+    let path = released_v34_project_store(&directory);
+    assert!(
+        object_sql(&path, "table", "semantic_vector_stages").is_some(),
+        "the released fixture must carry the retired staging family"
+    );
+
+    let read_only = verify_final_schema_connection(&TestConnection::open(&path))
+        .await
+        .expect_err("a read-only mount must refuse a released dense store");
+    let (authority, reason) = read_only
+        .reset_required_context()
+        .expect("read-only refusal of a released dense store is typed reset-required");
+    assert_eq!(authority, "SQLite store");
+    assert!(
+        reason.contains("semantic_vector_"),
+        "read-only refusal must name the retired family: {reason}"
+    );
+
+    let reason = assert_reset_required_without_repair(&path, "released dense store").await;
+    assert!(
+        reason.contains("semantic_vector_"),
+        "writer refusal must name the retired family: {reason}"
+    );
+    assert_eq!(
+        store_snapshot(&path).user_version,
+        i64::from(PAYLOAD_DIGEST_STEP_SOURCE_VERSION)
     );
 }
 
@@ -140,6 +215,104 @@ async fn current_final_store_is_admitted_without_mutation() {
         before,
         "current-shape admission must remain a query-only identity check"
     );
+}
+
+async fn admit_existing(path: &Path, context: &str) {
+    let authority = DatabaseAuthority::acquire_test(path, "final-shape admission fixture")
+        .expect("acquire final-shape admission authority");
+    let (database, _) =
+        Database::publish_test_runtime(path, &authority, TestDatabaseRuntimeMode::Existing)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+    drop(database);
+}
+
+fn ledger_tables(path: &Path) -> Vec<String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open final-shape fixture read-only");
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'td_runtime_writer_%' ORDER BY name",
+        )
+        .expect("prepare ledger table probe");
+    statement
+        .query_map((), |row| row.get(0))
+        .expect("query ledger tables")
+        .collect::<Result<_, _>>()
+        .expect("read ledger tables")
+}
+
+/// The runtime writer creates its ledger lazily inside the canonical store, so
+/// a store's first lifetime used to leave a shape its next open refused. The
+/// ledger is part of the exact shape now: a store that predates it gains it
+/// on open, one that already carries it is admitted unchanged, and one still
+/// holding the retired idempotency table has it folded into the current one.
+#[tokio::test]
+async fn runtime_writer_ledger_is_part_of_the_final_shape() {
+    let (_directory, path) = fresh_current_store().await;
+    let expected_ledger = ledger_tables(&path);
+    assert_eq!(expected_ledger.len(), 4, "fresh store carries the ledger");
+    let before = store_snapshot(&path);
+    admit_existing(&path, "store carrying the ledger must be admitted").await;
+    assert_eq!(
+        store_snapshot(&path),
+        before,
+        "ledger-carrying admission stays query-only"
+    );
+
+    tamper(
+        &path,
+        "DROP TABLE td_runtime_writer_checkpoint_v1;
+         DROP TABLE td_runtime_writer_idempotency_v2;
+         DROP TABLE td_runtime_writer_outbox_v1;
+         DROP TABLE td_runtime_writer_inbox_v1;",
+    );
+    assert!(ledger_tables(&path).is_empty());
+    admit_existing(&path, "store predating the ledger must be admitted").await;
+    assert_eq!(
+        ledger_tables(&path),
+        expected_ledger,
+        "open installs the ledger"
+    );
+    assert_eq!(store_snapshot(&path).schema_bytes, before.schema_bytes);
+
+    tamper(
+        &path,
+        "DROP TABLE td_runtime_writer_idempotency_v2;
+         CREATE TABLE td_runtime_writer_idempotency_v1 (
+             shard_json TEXT NOT NULL, incarnation INTEGER NOT NULL,
+             authority_epoch INTEGER NOT NULL, idempotency_key TEXT NOT NULL,
+             request_digest TEXT NOT NULL, original_receipt_json TEXT NOT NULL,
+             transaction_scope_json TEXT NOT NULL, operation_id TEXT NOT NULL,
+             durability_json TEXT NOT NULL, committed_at_micros INTEGER NOT NULL,
+             PRIMARY KEY (shard_json, incarnation, authority_epoch, idempotency_key)
+         ) WITHOUT ROWID;
+         INSERT INTO td_runtime_writer_idempotency_v1 VALUES
+             ('{}', 1, 1, 'key-1', 'digest', '{}', '{}', 'op-1', '{}', 42);",
+    );
+    admit_existing(
+        &path,
+        "store with the retired idempotency ledger must be admitted",
+    )
+    .await;
+    assert_eq!(
+        ledger_tables(&path),
+        expected_ledger,
+        "open folds the retired ledger"
+    );
+    let connection =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open final-shape fixture read-only");
+    let migrated: (String, i64) = connection
+        .query_row(
+            "SELECT idempotency_key, committed_at_micros FROM td_runtime_writer_idempotency_v2",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retired receipt survives the fold");
+    assert_eq!(migrated, ("key-1".to_owned(), 42));
 }
 
 #[tokio::test]

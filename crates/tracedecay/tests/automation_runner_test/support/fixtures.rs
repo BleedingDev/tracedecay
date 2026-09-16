@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
+use tracedecay::project::{TraceDecay, TraceDecayOpenOptions, current_timestamp};
 use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions, current_timestamp};
 use tracedecay_automation_runtime::automation::automatic_facts::record_session_automatic_facts;
 use tracedecay_automation_runtime::automation::run_ledger::{
     AutomationRunLedgerRecord, read_run_artifact_payload,
@@ -49,6 +49,7 @@ pub(crate) fn fixture_open_options(project_root: &Path) -> TraceDecayOpenOptions
 }
 
 pub(crate) async fn init_project(project_root: &Path) -> TraceDecay {
+    crate::common::register_process_runtime_ports();
     fs::create_dir_all(project_root.join("src")).unwrap();
     fs::write(project_root.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     let project_root = fs::canonicalize(project_root).unwrap();

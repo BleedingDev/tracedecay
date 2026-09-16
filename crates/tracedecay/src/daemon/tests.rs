@@ -43,6 +43,7 @@ mod remote_project_recovery;
 mod replay;
 mod restart_proxy;
 mod rmcp_route;
+mod route_discovery;
 #[cfg(unix)]
 mod runtime_identity;
 mod scheduler_config;
@@ -350,19 +351,20 @@ async fn initialize_test_project(
         &client_identity.profile_root,
         "daemon test fixture initialization",
     );
+    // The composition root registers the daemon's runtime ports before any
+    // project opens; this fixture stands in for that root.
+    crate::register_runtime_ports().expect("runtime port registration");
     // Heap-allocate the graph-init composition so every test awaiting this
     // fixture keeps a bounded resident frame (perf-profile layouts overflow
     // the test stack when the mega-future is inlined).
-    let project = Box::pin(
-        crate::tracedecay::TraceDecay::init_with_exclusive_maintenance(
-            project_root,
-            crate::tracedecay::TraceDecayOpenOptions {
-                profile_root: Some(client_identity.profile_root.clone()),
-                global_db_path: Some(client_identity.global_db_path.clone()),
-            },
-            &lifecycle,
-        ),
-    )
+    let project = Box::pin(crate::project::TraceDecay::init_with_exclusive_maintenance(
+        project_root,
+        crate::project::TraceDecayOpenOptions {
+            profile_root: Some(client_identity.profile_root.clone()),
+            global_db_path: Some(client_identity.global_db_path.clone()),
+        },
+        &lifecycle,
+    ))
     .await
     .expect("initialize project");
     let store_layout = project.store_layout().clone();
@@ -385,7 +387,7 @@ fn test_handshake_defaults() -> DaemonHandshake {
         client_instance_id: tracedecay_runtime_core::runtime_identity::process_run_id().to_string(),
         tool_list_changed_capable: false,
         catalog_version: String::new(),
-        moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
+        moved_store_adoption: crate::project::MovedStoreAdoption::Never,
     }
 }
 

@@ -21,7 +21,7 @@ use tracedecay_code_index::chunks::{
 };
 use tracedecay_code_index::production::{
     CodeIndexExecutionControlV1, VerifiedSealedLexicalCursorV1, VerifiedSealedLexicalPageV1,
-    VerifiedSealedLexicalSourceReceiptV1,
+    VerifiedSealedLexicalSourceReceiptV1, VerifiedSealedLexicalSymbolDisplayV1,
 };
 use tracedecay_domain::{
     CodeSearchChunkAnchorV1, CodeSearchChunkV1, ExactTechnicalTermV1, FileOccurrenceId,
@@ -36,7 +36,7 @@ use super::format::{
     VerifiedCodeLexicalArtifactV1, absorb_page_base_sections_receipt, artifact_digest,
     decode_padded_receipt, decode_padded_receipt_with_control, finish_base_section_receipt_fold,
     initial_base_section_receipt_fold, metadata_digest, new_verified_receipt, padded_receipt,
-    verify_artifact_table_layout, verify_required_artifact_indexes,
+    section_names, verify_artifact_table_layout, verify_required_artifact_indexes,
 };
 use super::postings::document_ngram_scratch;
 use super::prepared::{
@@ -172,6 +172,12 @@ impl Ord for PreparedTermMergeCursorV1<'_> {
 struct PreparedTermInsertPlanV1<'a> {
     entries: Vec<PreparedTermInsertRefV1<'a>>,
     merge_heap: BinaryHeap<Reverse<PreparedTermMergeCursorV1<'a>>>,
+    /// The batch's distinct terms with the ids this plan content-addressed,
+    /// ascending by term text. `vocabulary` is interned in exactly that
+    /// order, so the sealed page layout does not depend on how the plan
+    /// collected them, and the intern step neither rewalks every posting nor
+    /// recomputes a digest this pass already produced.
+    interned_terms: Vec<(&'a str, i64)>,
 }
 
 // `exact_postings` shares `term_postings`'s clustered key shape (field,
@@ -214,7 +220,9 @@ impl PreparedExactInsertRefV1<'_> {
             }
             LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => PreparedExactInsertKeyV1::V12 {
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => PreparedExactInsertKeyV1::V12 {
                 term_id: self.term_id,
                 field: self.field_code,
                 document_id: self.document_id,
@@ -259,6 +267,10 @@ impl Ord for PreparedExactMergeCursorV1<'_> {
 struct PreparedExactInsertPlanV1<'a> {
     entries: Vec<PreparedExactInsertRefV1<'a>>,
     merge_heap: BinaryHeap<Reverse<PreparedExactMergeCursorV1<'a>>>,
+    /// The batch's distinct exact terms with the ids this plan
+    /// content-addressed, ascending by id — the order `exact_vocabulary` was
+    /// always interned in.
+    interned_terms: Vec<(&'a [u8], i64)>,
 }
 
 const BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 14] = [
@@ -332,6 +344,128 @@ const EXACT_VOCABULARY_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] = [
         "builder_gate_exact_vocabulary_delete",
         "exact_vocabulary",
         "DELETE",
+    ),
+];
+const CLONE_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] = [
+    (
+        "builder_gate_clone_body_payloads_insert",
+        "clone_body_payloads",
+        "INSERT",
+    ),
+    (
+        "builder_gate_clone_occurrences_insert",
+        "clone_occurrences",
+        "INSERT",
+    ),
+    (
+        "builder_gate_clone_exact_postings_insert",
+        "clone_exact_postings",
+        "INSERT",
+    ),
+];
+const CLONE_FINGERPRINT_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 1] = [(
+    "builder_gate_clone_fingerprint_postings_insert",
+    "clone_fingerprint_postings",
+    "INSERT",
+)];
+/// Revision 16 stages fingerprint postings per batch in arrival order
+/// (`clone_fingerprint_postings_pages`) under the same private-builder gate
+/// and immutability guards as the row dictionary pages; finalization sorts
+/// them once into the keyed `clone_fingerprint_postings` tree and drops the
+/// staging table.
+const CLONE_FINGERPRINT_PAGES_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] = [
+    (
+        "builder_gate_clone_fingerprint_postings_pages_insert",
+        "clone_fingerprint_postings_pages",
+        "INSERT",
+    ),
+    (
+        "builder_gate_clone_fingerprint_postings_pages_update",
+        "clone_fingerprint_postings_pages",
+        "UPDATE",
+    ),
+    (
+        "builder_gate_clone_fingerprint_postings_pages_delete",
+        "clone_fingerprint_postings_pages",
+        "DELETE",
+    ),
+];
+const CLONE_FINGERPRINT_PAGES_IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 2] = [
+    (
+        "immutable_clone_fingerprint_postings_pages_update",
+        "clone_fingerprint_postings_pages",
+        "UPDATE",
+        "immutable clone fingerprint posting pages",
+    ),
+    (
+        "immutable_clone_fingerprint_postings_pages_delete",
+        "clone_fingerprint_postings_pages",
+        "DELETE",
+        "immutable clone fingerprint posting pages",
+    ),
+];
+const CLONE_IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 6] = [
+    (
+        "immutable_clone_body_payloads_update",
+        "clone_body_payloads",
+        "UPDATE",
+        "immutable clone body payloads",
+    ),
+    (
+        "immutable_clone_body_payloads_delete",
+        "clone_body_payloads",
+        "DELETE",
+        "immutable clone body payloads",
+    ),
+    (
+        "immutable_clone_occurrences_update",
+        "clone_occurrences",
+        "UPDATE",
+        "immutable clone occurrences",
+    ),
+    (
+        "immutable_clone_occurrences_delete",
+        "clone_occurrences",
+        "DELETE",
+        "immutable clone occurrences",
+    ),
+    (
+        "immutable_clone_exact_postings_update",
+        "clone_exact_postings",
+        "UPDATE",
+        "immutable clone exact postings",
+    ),
+    (
+        "immutable_clone_exact_postings_delete",
+        "clone_exact_postings",
+        "DELETE",
+        "immutable clone exact postings",
+    ),
+];
+const CLONE_FINGERPRINT_IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 4] = [
+    (
+        "immutable_clone_fingerprint_postings_update",
+        "clone_fingerprint_postings",
+        "UPDATE",
+        "immutable clone fingerprint postings",
+    ),
+    (
+        "immutable_clone_fingerprint_postings_delete",
+        "clone_fingerprint_postings",
+        "DELETE",
+        "immutable clone fingerprint postings",
+    ),
+    (
+        "immutable_clone_fingerprint_counts_update",
+        "clone_fingerprint_counts",
+        "UPDATE",
+        "immutable clone fingerprint counts",
+    ),
+    (
+        "immutable_clone_fingerprint_counts_delete",
+        "clone_fingerprint_counts",
+        "DELETE",
+        "immutable clone fingerprint counts",
     ),
 ];
 const IMMUTABLE_TRIGGER_LAYOUT: [(&str, &str, &str, &str); 10] = [
@@ -465,12 +599,12 @@ const FIELD_STATS_STAGING_BUILDER_GATE_TRIGGER_LAYOUT: [(&str, &str, &str); 3] =
     ),
 ];
 
-struct BuilderMutationGuardV1 {
+pub(super) struct BuilderMutationGuardV1 {
     gate: Arc<AtomicU8>,
 }
 
 impl BuilderMutationGuardV1 {
-    fn enter(gate: &Arc<AtomicU8>) -> Result<Self, CodeLexicalArtifactErrorV1> {
+    pub(super) fn enter(gate: &Arc<AtomicU8>) -> Result<Self, CodeLexicalArtifactErrorV1> {
         gate.compare_exchange(
             BUILDER_MUTATION_IDLE,
             BUILDER_MUTATION_APPEND,
@@ -494,7 +628,7 @@ impl Drop for BuilderMutationGuardV1 {
     }
 }
 
-fn register_builder_mutation_gate(
+pub(super) fn register_builder_mutation_gate(
     connection: &Connection,
 ) -> Result<Arc<AtomicU8>, CodeLexicalArtifactErrorV1> {
     let gate = Arc::new(AtomicU8::new(BUILDER_MUTATION_IDLE));
@@ -554,10 +688,15 @@ enum FinalizationSectionV1 {
     FieldStatistics,
     TermStatistics,
     Vocabulary,
+    CloneOccurrences,
+    CloneExactPostings,
+    CloneBodyPayloads,
+    CloneFingerprintCounts,
+    CloneFingerprintPostings,
 }
 
 impl FinalizationSectionV1 {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 16] = [
         Self::SourcePages,
         Self::DocumentIntegrity,
         Self::ImportIntegrity,
@@ -569,6 +708,11 @@ impl FinalizationSectionV1 {
         Self::FieldStatistics,
         Self::TermStatistics,
         Self::Vocabulary,
+        Self::CloneOccurrences,
+        Self::CloneExactPostings,
+        Self::CloneBodyPayloads,
+        Self::CloneFingerprintCounts,
+        Self::CloneFingerprintPostings,
     ];
 
     fn from_ordinal(ordinal: usize) -> Result<Self, CodeLexicalArtifactErrorV1> {
@@ -590,6 +734,11 @@ impl FinalizationSectionV1 {
             Self::TermPostings => "term_postings",
             Self::ExactPostings => "exact_postings",
             Self::NgramPostings => "ngram_postings",
+            Self::CloneOccurrences => "clone_occurrences",
+            Self::CloneExactPostings => "clone_exact_postings",
+            Self::CloneBodyPayloads => "clone_body_payloads",
+            Self::CloneFingerprintCounts => "clone_fingerprint_counts",
+            Self::CloneFingerprintPostings => "clone_fingerprint_postings",
             Self::FieldStatistics => "field_stats",
             Self::TermStatistics => "term_stats",
             Self::Vocabulary => "vocabulary",
@@ -602,9 +751,12 @@ impl FinalizationSectionV1 {
             (Self::SourcePages, _) => {
                 "SELECT page_ordinal, page_digest, cumulative_digest, chunk_count, payload_bytes, import_count, import_payload_bytes, import_dictionary_digest, ngram_digest, base_sections_receipt, next_cursor FROM source_pages ORDER BY page_ordinal"
             }
-            (Self::DocumentIntegrity, LexicalArtifactLayoutV1::V14) => {
-                "SELECT document_id, digest FROM document_integrity ORDER BY document_id"
-            }
+            (
+                Self::DocumentIntegrity,
+                LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16,
+            ) => "SELECT document_id, digest FROM document_integrity ORDER BY document_id",
             (Self::DocumentIntegrity, _) => {
                 "SELECT document_id, chunk_id, digest FROM document_integrity ORDER BY document_id"
             }
@@ -623,7 +775,9 @@ impl FinalizationSectionV1 {
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14,
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16,
             ) => {
                 "SELECT term_id, field, document_id, frequency FROM term_postings ORDER BY term_id, field, document_id"
             }
@@ -632,6 +786,21 @@ impl FinalizationSectionV1 {
             }
             (Self::NgramPostings, _) => {
                 "SELECT page_ordinal, kind, ngram, documents, cardinality FROM ngram_postings ORDER BY page_ordinal, kind, ngram"
+            }
+            (Self::CloneOccurrences, _) => {
+                "SELECT symbol_occurrence_id, payload_digest, path, body_start, body_end, occurrence FROM clone_occurrences ORDER BY symbol_occurrence_id"
+            }
+            (Self::CloneExactPostings, _) => {
+                "SELECT class, normalization_revision, digest, symbol_occurrence_id, payload_digest FROM clone_exact_postings ORDER BY class, normalization_revision, digest, symbol_occurrence_id"
+            }
+            (Self::CloneBodyPayloads, _) => {
+                "SELECT payload_digest, payload FROM clone_body_payloads ORDER BY payload_digest"
+            }
+            (Self::CloneFingerprintCounts, _) => {
+                "SELECT language, class, normalization_revision, fingerprint, posting_count FROM clone_fingerprint_counts ORDER BY language, class, normalization_revision, fingerprint"
+            }
+            (Self::CloneFingerprintPostings, _) => {
+                "SELECT language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest FROM clone_fingerprint_postings ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position"
             }
             (Self::FieldStatistics, _) => {
                 "SELECT field, total_length FROM field_stats ORDER BY field"
@@ -644,7 +813,9 @@ impl FinalizationSectionV1 {
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14,
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16,
             ) => {
                 "SELECT term_id, field, document_frequency FROM term_stats ORDER BY term_id, field"
             }
@@ -656,7 +827,9 @@ impl FinalizationSectionV1 {
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14,
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16,
             ) => "SELECT term_id, term, in_fuzzy FROM vocabulary ORDER BY term_id",
         }
     }
@@ -664,11 +837,28 @@ impl FinalizationSectionV1 {
     /// Bounded resumes seek a native table key, never a computed cursor.
     #[hotpath::skip]
     const fn seek_query(self, layout: LexicalArtifactLayoutV1, after: bool) -> &'static str {
+        if let Some(query) = self.clone_seek_query(after) {
+            return query;
+        }
         match (self, after) {
-            (Self::DocumentIntegrity, false) if matches!(layout, LexicalArtifactLayoutV1::V14) => {
+            (Self::DocumentIntegrity, false)
+                if matches!(
+                    layout,
+                    LexicalArtifactLayoutV1::V14
+                        | LexicalArtifactLayoutV1::V15
+                        | LexicalArtifactLayoutV1::V16
+                ) =>
+            {
                 "SELECT document_id, digest FROM document_integrity ORDER BY document_id LIMIT ?1"
             }
-            (Self::DocumentIntegrity, true) if matches!(layout, LexicalArtifactLayoutV1::V14) => {
+            (Self::DocumentIntegrity, true)
+                if matches!(
+                    layout,
+                    LexicalArtifactLayoutV1::V14
+                        | LexicalArtifactLayoutV1::V15
+                        | LexicalArtifactLayoutV1::V16
+                ) =>
+            {
                 "SELECT document_id, digest FROM document_integrity WHERE document_id > ?1 ORDER BY document_id LIMIT ?2"
             }
             (Self::SourcePages, false) => {
@@ -737,6 +927,52 @@ impl FinalizationSectionV1 {
             (Self::Vocabulary, true) => {
                 "SELECT term_id, term, in_fuzzy FROM vocabulary WHERE term_id > ?1 ORDER BY term_id LIMIT ?2"
             }
+            (
+                Self::CloneOccurrences
+                | Self::CloneExactPostings
+                | Self::CloneBodyPayloads
+                | Self::CloneFingerprintCounts
+                | Self::CloneFingerprintPostings,
+                _,
+            ) => {
+                unreachable!()
+            }
+        }
+    }
+
+    const fn clone_seek_query(self, after: bool) -> Option<&'static str> {
+        match (self, after) {
+            (Self::CloneOccurrences, false) => Some(
+                "SELECT symbol_occurrence_id, payload_digest, path, body_start, body_end, occurrence FROM clone_occurrences ORDER BY symbol_occurrence_id LIMIT ?1",
+            ),
+            (Self::CloneOccurrences, true) => Some(
+                "SELECT symbol_occurrence_id, payload_digest, path, body_start, body_end, occurrence FROM clone_occurrences WHERE symbol_occurrence_id > ?1 ORDER BY symbol_occurrence_id LIMIT ?2",
+            ),
+            (Self::CloneExactPostings, false) => Some(
+                "SELECT class, normalization_revision, digest, symbol_occurrence_id, payload_digest FROM clone_exact_postings ORDER BY class, normalization_revision, digest, symbol_occurrence_id LIMIT ?1",
+            ),
+            (Self::CloneExactPostings, true) => Some(
+                "SELECT class, normalization_revision, digest, symbol_occurrence_id, payload_digest FROM clone_exact_postings WHERE (class, normalization_revision, digest, symbol_occurrence_id) > (?1, ?2, ?3, ?4) ORDER BY class, normalization_revision, digest, symbol_occurrence_id LIMIT ?5",
+            ),
+            (Self::CloneBodyPayloads, false) => Some(
+                "SELECT payload_digest, payload FROM clone_body_payloads ORDER BY payload_digest LIMIT ?1",
+            ),
+            (Self::CloneBodyPayloads, true) => Some(
+                "SELECT payload_digest, payload FROM clone_body_payloads WHERE payload_digest > ?1 ORDER BY payload_digest LIMIT ?2",
+            ),
+            (Self::CloneFingerprintCounts, false) => Some(
+                "SELECT language, class, normalization_revision, fingerprint, posting_count FROM clone_fingerprint_counts ORDER BY language, class, normalization_revision, fingerprint LIMIT ?1",
+            ),
+            (Self::CloneFingerprintCounts, true) => Some(
+                "SELECT language, class, normalization_revision, fingerprint, posting_count FROM clone_fingerprint_counts WHERE (language, class, normalization_revision, fingerprint) > (?1, ?2, ?3, ?4) ORDER BY language, class, normalization_revision, fingerprint LIMIT ?5",
+            ),
+            (Self::CloneFingerprintPostings, false) => Some(
+                "SELECT language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest FROM clone_fingerprint_postings ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position LIMIT ?1",
+            ),
+            (Self::CloneFingerprintPostings, true) => Some(
+                "SELECT language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest FROM clone_fingerprint_postings WHERE (language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position) > (?1, ?2, ?3, ?4, ?5, ?6) ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position LIMIT ?7",
+            ),
+            _ => None,
         }
     }
 }
@@ -770,6 +1006,26 @@ enum PersistedFinalizationKeyV1 {
         first: i64,
         second: i64,
     },
+    ClonePosting {
+        class: i64,
+        normalization_revision: i64,
+        digest: String,
+        symbol_occurrence_id: String,
+    },
+    FingerprintCount {
+        language: String,
+        class: i64,
+        normalization_revision: i64,
+        fingerprint: i64,
+    },
+    FingerprintPosting {
+        language: String,
+        class: i64,
+        normalization_revision: i64,
+        fingerprint: i64,
+        symbol_occurrence_id: String,
+        token_position: i64,
+    },
 }
 
 impl PersistedFinalizationKeyV1 {
@@ -796,6 +1052,18 @@ impl PersistedFinalizationKeyV1 {
             ) | (
                 Self::IntegerPair { .. },
                 FinalizationSectionV1::TermStatistics
+            ) | (
+                Self::Text(_),
+                FinalizationSectionV1::CloneOccurrences | FinalizationSectionV1::CloneBodyPayloads
+            ) | (
+                Self::ClonePosting { .. },
+                FinalizationSectionV1::CloneExactPostings
+            ) | (
+                Self::FingerprintCount { .. },
+                FinalizationSectionV1::CloneFingerprintCounts
+            ) | (
+                Self::FingerprintPosting { .. },
+                FinalizationSectionV1::CloneFingerprintPostings
             )
         )
     }
@@ -965,6 +1233,28 @@ impl FinalizationWakeMetricsV1 {
             }
             FinalizationSectionV1::NgramPostings => {
                 hotpath::gauge!("query.artifact.finalization.phase.ngram_postings_total").inc(1u64);
+            }
+            FinalizationSectionV1::CloneOccurrences => {
+                hotpath::gauge!("query.artifact.finalization.phase.clone_occurrences_total")
+                    .inc(1u64);
+            }
+            FinalizationSectionV1::CloneExactPostings => {
+                hotpath::gauge!("query.artifact.finalization.phase.clone_exact_postings_total")
+                    .inc(1u64);
+            }
+            FinalizationSectionV1::CloneBodyPayloads => {
+                hotpath::gauge!("query.artifact.finalization.phase.clone_body_payloads_total")
+                    .inc(1u64);
+            }
+            FinalizationSectionV1::CloneFingerprintCounts => {
+                hotpath::gauge!("query.artifact.finalization.phase.clone_fingerprint_counts_total")
+                    .inc(1u64);
+            }
+            FinalizationSectionV1::CloneFingerprintPostings => {
+                hotpath::gauge!(
+                    "query.artifact.finalization.phase.clone_fingerprint_postings_total"
+                )
+                .inc(1u64);
             }
             FinalizationSectionV1::FieldStatistics => {
                 hotpath::gauge!("query.artifact.finalization.phase.field_stats_total").inc(1u64);
@@ -1210,6 +1500,19 @@ impl CodeLexicalArtifactBuilderV1 {
         {
             return Err(CodeLexicalArtifactErrorV1::Incompatible(
                 "lexical artifact was staged without incremental field statistics".to_owned(),
+            ));
+        }
+        // Likewise, a revision-16 staging file still accepting pages must
+        // carry the fingerprint staging table; one written straight into the
+        // keyed tree (an older builder) is refused as incompatible so the
+        // scheduler discards and restages it instead of retrying an `Io`.
+        if layout.has_clone_fingerprints()
+            && receipt.is_none()
+            && finalization.is_none()
+            && !table_exists(&connection, "clone_fingerprint_postings_pages")?
+        {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "lexical artifact was staged without fingerprint posting pages".to_owned(),
             ));
         }
         validate_contiguous_pages(&connection, control)?;
@@ -1613,6 +1916,12 @@ impl CodeLexicalArtifactBuilderV1 {
                     Ok::<(), CodeLexicalArtifactErrorV1>(())
                 })?;
                 record_batch_import_metrics(pages);
+                if self.layout.has_clone_index() {
+                    hotpath::measure_block!(
+                        "query.artifact.batch.clone_bodies",
+                        append_prepared_clone_bodies(&transaction, pages, control)
+                    )?;
+                }
                 if self.layout.interns_row_dictionary() {
                     hotpath::measure_block!(
                         "query.artifact.batch.rows.stage_dictionary",
@@ -1725,6 +2034,25 @@ impl CodeLexicalArtifactBuilderV1 {
             let transaction = self.connection.transaction().map_err(sqlite_error)?;
             let mut transaction_metrics = FinalizationTransactionMetricsV1::new();
             verify_staged_source_chain(&transaction, source, control)?;
+            if self.layout.has_clone_fingerprints() {
+                // The sorted pass and the count aggregation are the heaviest
+                // sorter statements in finalization; run them under the same
+                // sorter CPU admission as the pre-digest index wakes.
+                super::with_builder_sorter_cpu_admission(&transaction, || {
+                    hotpath::measure_block!(
+                        "query.artifact.finalization.derive_clone_fingerprint_postings",
+                        with_cancellable_sqlite_statement(&transaction, control, || {
+                            derive_clone_fingerprint_postings(&transaction, &self.mutation_gate)
+                        })
+                    )?;
+                    hotpath::measure_block!(
+                        "query.artifact.finalization.derive_clone_fingerprint_counts",
+                        with_cancellable_sqlite_statement(&transaction, control, || {
+                            derive_clone_fingerprint_counts(&transaction)
+                        })
+                    )
+                })??;
+            }
             let content_epoch = authenticated_authority_epoch(&transaction, source)?;
             install_base_freeze(&transaction, self.layout)?;
             store_finalization_state(
@@ -1749,7 +2077,7 @@ impl CodeLexicalArtifactBuilderV1 {
                 "lexical artifact finalization marker disappeared".to_owned(),
             )
         })?;
-        validate_finalization_state(&state)?;
+        validate_finalization_state(&state, self.layout)?;
         wake_metrics.digest_pass(state.phase);
         ensure_content_epoch(&transaction, state.content_epoch)?;
         if &state.source_state_digest != source.source_state_digest() {
@@ -1774,7 +2102,8 @@ impl CodeLexicalArtifactBuilderV1 {
             return Ok(step);
         }
         let mut remaining_work = maximum_work;
-        let section_count = u64::try_from(SECTION_NAMES.len()).map_err(contract_number)?;
+        let section_names = section_names(self.layout);
+        let section_count = u64::try_from(section_names.len()).map_err(contract_number)?;
         while remaining_work > 0 && state.section_ordinal < section_count {
             checkpoint(control)?;
             let section_ordinal =
@@ -1831,7 +2160,7 @@ impl CodeLexicalArtifactBuilderV1 {
             state.section_row_count = 0;
             state.section_last_key = None;
             if state.section_ordinal < section_count {
-                let next = SECTION_NAMES
+                let next = section_names
                     [usize::try_from(state.section_ordinal).map_err(contract_number)?];
                 state.section_accumulator = initial_section_accumulator(next)?.to_vec();
             }
@@ -1852,7 +2181,7 @@ impl CodeLexicalArtifactBuilderV1 {
             return Ok(step);
         }
 
-        if state.completed_sections.len() != SECTION_NAMES.len() {
+        if state.completed_sections.len() != section_names.len() {
             return Err(CodeLexicalArtifactErrorV1::Corrupt(
                 "lexical artifact finalization completed with an invalid section receipt"
                     .to_owned(),
@@ -2101,7 +2430,7 @@ fn private_staging_error(error: std::io::Error) -> CodeLexicalArtifactErrorV1 {
 /// charged on top of each entry's key/value payload.
 const BTREE_MAP_ENTRY_OVERHEAD_BYTES: usize = 16;
 const PERSISTED_CURSOR_DIGEST_FIELDS: usize = 4;
-const PERSISTED_CURSOR_U64_FIELDS: usize = 9;
+const PERSISTED_CURSOR_U64_FIELDS: usize = 12;
 const MAX_DECIMAL_U64_BYTES: usize = 20;
 const PERSISTED_CURSOR_JSON_DELIMITERS_BYTES: usize = 64;
 const PREPARED_PAGE_DIGEST_FIELDS: usize = 3;
@@ -2585,7 +2914,8 @@ fn prepare_term_insert_plan<'a>(
             }
         }
     }
-    drop(term_ids);
+    let mut interned_terms: Vec<(&str, i64)> = term_ids.into_iter().collect();
+    interned_terms.sort_unstable_by_key(|(term, _)| *term);
     for run in entries.chunks_mut(TERM_INSERT_SORT_RUN_ROWS) {
         checkpoint(control)?;
         run.sort_unstable_by_key(PreparedTermInsertRefV1::key);
@@ -2614,6 +2944,7 @@ fn prepare_term_insert_plan<'a>(
     Ok(PreparedTermInsertPlanV1 {
         entries,
         merge_heap,
+        interned_terms,
     })
 }
 
@@ -2701,22 +3032,35 @@ fn prepare_exact_insert_plan<'a>(
             "bounded lexical exact insert plan allocation failed: {error}"
         ))
     })?;
+    // One digest per distinct term rather than per posting: the same term
+    // repeats across documents, and the intern step needs the distinct set
+    // anyway.
+    let mut term_ids: HashMap<&[u8], i64> = HashMap::new();
     for page in pages {
         checkpoint(control)?;
         for document in &page.documents {
             checkpoint(control)?;
             for (field, term) in &document.exact_postings {
+                let term = term.as_slice();
+                let term_id = *term_ids
+                    .entry(term)
+                    .or_insert_with(|| stable_exact_term_id(term));
                 entries.push(PreparedExactInsertRefV1 {
                     document_id: document.document_id,
                     field: field.as_str(),
                     field_code: exact_field_code_from_encoded(field)?,
-                    term: term.as_slice(),
-                    term_id: stable_exact_term_id(term),
+                    term,
+                    term_id,
                     layout,
                 });
             }
         }
     }
+    let mut interned_terms: Vec<(&[u8], i64)> = term_ids.into_iter().collect();
+    // Ascending by id, then by bytes: two distinct terms sharing an id is the
+    // collision `intern_exact_terms` rejects, and it must reject the same one
+    // on every run rather than whichever the hash map happened to yield first.
+    interned_terms.sort_unstable_by_key(|(term, term_id)| (*term_id, *term));
     for run in entries.chunks_mut(EXACT_INSERT_SORT_RUN_ROWS) {
         checkpoint(control)?;
         run.sort_unstable_by(|left, right| left.key().cmp(&right.key()));
@@ -2745,6 +3089,7 @@ fn prepare_exact_insert_plan<'a>(
     Ok(PreparedExactInsertPlanV1 {
         entries,
         merge_heap,
+        interned_terms,
     })
 }
 
@@ -2885,10 +3230,29 @@ fn prepare_page_batch_admission(
     Ok((current, fresh_start))
 }
 
+fn symbol_field_size(display: Option<&VerifiedSealedLexicalSymbolDisplayV1>) -> (usize, usize) {
+    display.map_or((0, 0), |display| {
+        let bytes = display
+            .simple_name()
+            .len()
+            .saturating_add(display.qualified_name().len())
+            .saturating_add(display.signature().map_or(0, str::len))
+            .saturating_add(display.documentation().map_or(0, str::len));
+        // Source byte lengths bound token counts. Qualified names receive a
+        // second budget for derived owner/member spelling.
+        let entries = display
+            .simple_name()
+            .len()
+            .saturating_add(display.qualified_name().len().saturating_mul(2))
+            .saturating_add(display.signature().map_or(0, str::len))
+            .saturating_add(display.documentation().map_or(0, str::len));
+        (bytes, entries)
+    })
+}
+
 /// The widest transient upper bound one staged chunk or import can require.
 /// It is evaluated a record at a time without allocations and aborts once
-/// `abort_above` is exceeded; that returned lower bound already fails
-/// admission.
+/// `abort_above` is exceeded. The returned lower bound already fails admission.
 fn page_transient_peak_bytes(
     metadata: &CodeLexicalProjectionMetadataV1,
     page: &VerifiedSealedLexicalPageV1,
@@ -2896,13 +3260,12 @@ fn page_transient_peak_bytes(
 ) -> Result<usize, CodeLexicalArtifactErrorV1> {
     let mut peak = 0usize;
     for (admitted, display) in page.chunks().iter().zip(page.symbol_displays()) {
-        let qualified_name_bytes = display
-            .as_ref()
-            .map_or(0, |display| display.qualified_name().len());
+        let (symbol_field_bytes, symbol_field_entries) = symbol_field_size(display.as_ref());
         peak = peak.max(projected_chunk_transient_bytes(
             metadata,
             admitted,
-            qualified_name_bytes,
+            symbol_field_bytes,
+            symbol_field_entries,
         )?);
         if peak > abort_above {
             return Ok(peak);
@@ -2943,14 +3306,13 @@ fn page_prepared_retained_upper_bound_bytes(
     let chunk_bytes = page.chunks().iter().zip(page.symbol_displays()).try_fold(
         0usize,
         |total, (admitted, display)| {
-            let qualified_name_bytes = display
-                .as_ref()
-                .map_or(0, |display| display.qualified_name().len());
+            let (symbol_field_bytes, symbol_field_entries) = symbol_field_size(display.as_ref());
             total
                 .checked_add(projected_chunk_prepared_retained_upper_bound_bytes(
                     metadata,
                     admitted,
-                    qualified_name_bytes,
+                    symbol_field_bytes,
+                    symbol_field_entries,
                 )?)
                 .ok_or_else(|| {
                     CodeLexicalArtifactErrorV1::Contract(
@@ -2983,11 +3345,17 @@ fn page_prepared_retained_upper_bound_bytes(
 fn projected_chunk_prepared_retained_upper_bound_bytes(
     metadata: &CodeLexicalProjectionMetadataV1,
     admitted: &ExtractionAdmittedCodeSearchChunkV1,
-    qualified_name_bytes: usize,
+    symbol_field_bytes: usize,
+    symbol_field_entries: usize,
 ) -> Result<usize, CodeLexicalArtifactErrorV1> {
-    let transient = projected_chunk_transient_bytes(metadata, admitted, qualified_name_bytes)?;
+    let transient = projected_chunk_transient_bytes(
+        metadata,
+        admitted,
+        symbol_field_bytes,
+        symbol_field_entries,
+    )?;
     let text_bytes = admitted.chunk().sanitized_text.as_str().len();
-    let normalized_text_bytes = text_bytes;
+    let normalized_text_bytes = text_bytes.saturating_add(symbol_field_bytes);
     let (_, normalized_scratch) = document_ngram_scratch(normalized_text_bytes)?;
     let (_, raw_scratch) = document_ngram_scratch(text_bytes)?;
     // Every authorized n-gram slot may become a distinct ordered-map key with
@@ -3074,7 +3442,8 @@ fn prepared_page_authority_upper_bound_bytes(
 fn projected_chunk_transient_bytes(
     metadata: &CodeLexicalProjectionMetadataV1,
     admitted: &ExtractionAdmittedCodeSearchChunkV1,
-    qualified_name_bytes: usize,
+    symbol_field_bytes: usize,
+    symbol_field_entries: usize,
 ) -> Result<usize, CodeLexicalArtifactErrorV1> {
     let chunk = admitted.chunk();
     let clone_bytes = chunk_owned_bytes(chunk);
@@ -3099,24 +3468,25 @@ fn projected_chunk_transient_bytes(
     let exact_bytes = chunk.exact_terms.iter().fold(0usize, |total, term| {
         total.saturating_add(term.canonical_bytes().len())
     });
-    let normalized_text_bytes = text_bytes;
+    let normalized_text_bytes = text_bytes
+        .saturating_add(logical_path.len())
+        .saturating_add(symbol_field_bytes);
     // The projection indexes both the complete verified name and its symbol
     // suffix. The complete name length bounds each field string, frequency
     // entry and encoded posting.
     let field_text_bytes = normalized_text_bytes
-        .saturating_add(qualified_name_bytes.saturating_mul(2))
         .saturating_add(logical_path.len())
         .saturating_add(subtoken_bytes)
         .saturating_add(exact_bytes.saturating_mul(2));
     let field_entries = lexical_token_count(chunk.sanitized_text.as_str())
-        .saturating_add(usize::from(qualified_name_bytes != 0).saturating_mul(2))
+        .saturating_add(symbol_field_entries)
         .saturating_add(1)
         .saturating_add(chunk.subtokens.len())
         .saturating_add(chunk.exact_terms.len().saturating_mul(2));
     let field_bytes = field_text_bytes
         .saturating_add(field_entries.saturating_mul(std::mem::size_of::<String>()))
         .saturating_add(
-            6usize.saturating_mul(std::mem::size_of::<(LexicalFieldV1, Vec<String>)>()),
+            9usize.saturating_mul(std::mem::size_of::<(LexicalFieldV1, Vec<String>)>()),
         );
     let frequency_bytes = field_entries
         .saturating_mul(std::mem::size_of::<(&str, u32)>() + BTREE_MAP_ENTRY_OVERHEAD_BYTES);
@@ -3124,8 +3494,9 @@ fn projected_chunk_transient_bytes(
     let (_, raw_scratch) = document_ngram_scratch(text_bytes)?;
     let row_bytes = clone_bytes
         .saturating_add(logical_path.len())
+        .saturating_add(symbol_field_bytes)
         .saturating_add(normalized_text_bytes)
-        .saturating_add(6usize.saturating_mul(std::mem::size_of::<(LexicalFieldV1, usize)>()));
+        .saturating_add(9usize.saturating_mul(std::mem::size_of::<(LexicalFieldV1, usize)>()));
     let serialized_bytes = row_bytes
         .saturating_add(field_bytes)
         .saturating_mul(6)
@@ -3380,30 +3751,175 @@ fn sql_blob(value: &[u8]) -> ToSqlOutput<'_> {
     ToSqlOutput::Borrowed(ValueRef::Blob(value))
 }
 
+fn append_prepared_clone_bodies(
+    transaction: &Transaction<'_>,
+    pages: &[PreparedCodeLexicalArtifactPageV1],
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let mut insert_payload = transaction
+        .prepare_cached(
+            "INSERT INTO clone_body_payloads(payload_digest, payload) VALUES (?1, ?2) ON CONFLICT(payload_digest) DO NOTHING",
+        )
+        .map_err(sqlite_error)?;
+    let mut read_payload = transaction
+        .prepare_cached("SELECT payload FROM clone_body_payloads WHERE payload_digest = ?1")
+        .map_err(sqlite_error)?;
+    let mut insert_occurrence = transaction
+        .prepare_cached(
+            "INSERT INTO clone_occurrences(symbol_occurrence_id, payload_digest, path, body_start, body_end, occurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(sqlite_error)?;
+    let mut insert_posting = transaction
+        .prepare_cached(
+            "INSERT INTO clone_exact_postings(class, normalization_revision, digest, symbol_occurrence_id, payload_digest) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .map_err(sqlite_error)?;
+    for page in pages {
+        for body in &page.clone_bodies {
+            checkpoint(control)?;
+            insert_payload
+                .execute(params![body.payload_digest, body.payload])
+                .map_err(sqlite_error)?;
+            let stored: Vec<u8> = read_payload
+                .query_row(params![body.payload_digest], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            if stored != body.payload {
+                return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                    "clone payload digest collision".to_owned(),
+                ));
+            }
+            insert_occurrence
+                .execute(params![
+                    body.symbol_occurrence_id,
+                    body.payload_digest,
+                    body.path,
+                    i64::try_from(body.body_start).map_err(contract_number)?,
+                    i64::try_from(body.body_end).map_err(contract_number)?,
+                    body.occurrence,
+                ])
+                .map_err(sqlite_error)?;
+            for key in &body.exact_keys {
+                insert_posting
+                    .execute(params![
+                        i64::from(key.class as u8),
+                        i64::from(key.normalization_revision),
+                        key.digest.as_str(),
+                        body.symbol_occurrence_id,
+                        body.payload_digest,
+                    ])
+                    .map_err(sqlite_error)?;
+            }
+        }
+    }
+    append_prepared_clone_fingerprints(transaction, pages, control)
+}
+
+fn append_prepared_clone_fingerprints(
+    transaction: &Transaction<'_>,
+    pages: &[PreparedCodeLexicalArtifactPageV1],
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    if !pages.iter().any(|page| {
+        page.clone_bodies
+            .iter()
+            .any(|body| body.fingerprint_stream.is_some())
+    }) {
+        return Ok(());
+    }
+    // Staged in arrival order, not into the keyed tree: fingerprints are
+    // hashes, so a direct insert lands every row on a random leaf of
+    // `clone_fingerprint_postings` and each batch commit rewrites (and
+    // journals) most of that tree. Measured on the 1,560-file bench corpus:
+    // 273k postings, 78 MiB final table, 2.1 GiB written through 28 commits
+    // (27x amplification); staged and sorted once at finalization, 0.4 GiB.
+    let mut insert = transaction
+        .prepare_cached(
+            "INSERT INTO clone_fingerprint_postings_pages(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .map_err(sqlite_error)?;
+    for body in pages.iter().flat_map(|page| &page.clone_bodies) {
+        checkpoint(control)?;
+        let Some(stream) = &body.fingerprint_stream else {
+            continue;
+        };
+        for position in &stream.positions {
+            insert
+                .execute(params![
+                    stream.language,
+                    i64::from(stream.class as u8),
+                    i64::from(stream.normalization_revision),
+                    i64::try_from(position.fingerprint).map_err(contract_number)?,
+                    body.symbol_occurrence_id,
+                    i64::from(position.token_position),
+                    body.payload_digest,
+                    stream.body_digest,
+                ])
+                .map_err(sqlite_error)?;
+        }
+    }
+    Ok(())
+}
+
 fn append_prepared_imports(
     transaction: &Transaction<'_>,
     page: &PreparedCodeLexicalArtifactPageV1,
     control: &dyn CodeIndexExecutionControlV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let mut evidence = transaction
+        .prepare_cached("INSERT INTO import_evidence(canonical, evidence) VALUES (?1, ?1)")
+        .map_err(sqlite_error)?;
+    let mut integrity = transaction
+        .prepare_cached("INSERT INTO import_integrity(canonical, digest) VALUES (?1, ?2)")
+        .map_err(sqlite_error)?;
     for import in &page.imports {
         checkpoint(control)?;
-        transaction
-            .execute(
-                "INSERT INTO import_evidence(canonical, evidence) VALUES (?1, ?1)",
-                params![import.canonical.as_slice()],
-            )
+        evidence
+            .execute(params![import.canonical.as_slice()])
             .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-        transaction
-            .execute(
-                "INSERT INTO import_integrity(canonical, digest) VALUES (?1, ?2)",
-                params![
-                    import.canonical.as_slice(),
-                    import.integrity_digest.as_str()
-                ],
-            )
+        integrity
+            .execute(params![
+                import.canonical.as_slice(),
+                import.integrity_digest.as_str()
+            ])
             .map_err(sqlite_error)?;
     }
     Ok(())
+}
+
+/// Move the staged fingerprint postings into the keyed
+/// `clone_fingerprint_postings` tree in one sorted pass, so the tree is
+/// written sequentially once instead of being rewritten under every batch
+/// commit, then drop the staging table so its pages are reused by the
+/// serving indexes built in the same finalization phase. The keyed table
+/// keeps its private-builder insert gate, so the pass holds the mutation
+/// authority exactly as a batch append does.
+fn derive_clone_fingerprint_postings(
+    transaction: &Transaction<'_>,
+    mutation_gate: &Arc<AtomicU8>,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let _mutation_authority = BuilderMutationGuardV1::enter(mutation_gate)?;
+    transaction
+        .execute_batch(
+            "INSERT INTO clone_fingerprint_postings(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest)
+             SELECT language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest
+             FROM clone_fingerprint_postings_pages
+             ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position;
+             DROP TABLE clone_fingerprint_postings_pages;",
+        )
+        .map_err(sqlite_error)
+}
+
+fn derive_clone_fingerprint_counts(
+    transaction: &Transaction<'_>,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    transaction
+        .execute_batch(
+            "INSERT INTO clone_fingerprint_counts(language, class, normalization_revision, fingerprint, posting_count)
+             SELECT language, class, normalization_revision, fingerprint, COUNT(*)
+             FROM clone_fingerprint_postings
+             GROUP BY language, class, normalization_revision, fingerprint;",
+        )
+        .map_err(sqlite_error)
 }
 
 fn append_prepared_postings(
@@ -3416,12 +3932,12 @@ fn append_prepared_postings(
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
     let term_ids = hotpath::measure_block!(
         "query.artifact.batch.postings.intern_terms",
-        intern_terms(transaction, pages, control)
+        intern_terms(transaction, &term_insert_plan.interned_terms, control)
     )?;
     if layout.interns_exact_terms() {
         hotpath::measure_block!(
             "query.artifact.batch.postings.intern_exact",
-            intern_exact_terms(transaction, pages, control)
+            intern_exact_terms(transaction, &exact_insert_plan.interned_terms, control)
         )?;
     }
     let mut term_insert = MultiRowInsertV1::new(
@@ -3448,7 +3964,9 @@ fn append_prepared_postings(
     let exact_table_columns = match layout {
         LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13
-        | LexicalArtifactLayoutV1::V14 => "exact_postings(term_id, field, document_id)",
+        | LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16 => "exact_postings(term_id, field, document_id)",
         LexicalArtifactLayoutV1::V10 | LexicalArtifactLayoutV1::V11 => {
             "exact_postings(field, term, document_id)"
         }
@@ -3519,7 +4037,9 @@ fn append_prepared_postings(
                 }
                 LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14 => {
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16 => {
                     exact_insert.push([
                         sql_integer(entry.term_id),
                         sql_integer(entry.field_code),
@@ -3610,8 +4130,11 @@ fn insert_prepared_source_page(
     page: &PreparedCodeLexicalArtifactPageV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
     transaction
-        .execute(
+        .prepare_cached(
             "INSERT INTO source_pages(page_ordinal, page_digest, cumulative_digest, chunk_count, payload_bytes, import_count, import_payload_bytes, import_dictionary_digest, ngram_digest, base_sections_receipt, next_cursor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .map_err(sqlite_error)?
+        .execute(
             params![
                 i64::try_from(page.page_ordinal).map_err(contract_number)?,
                 page.page_digest.as_str(),
@@ -3630,7 +4153,7 @@ fn insert_prepared_source_page(
     Ok(())
 }
 
-fn sqlite_file_size(connection: &Connection) -> Result<u64, CodeLexicalArtifactErrorV1> {
+pub(super) fn sqlite_file_size(connection: &Connection) -> Result<u64, CodeLexicalArtifactErrorV1> {
     let page_count: i64 = connection
         .pragma_query_value(None, "page_count", |row| row.get(0))
         .map_err(sqlite_error)?;
@@ -3876,6 +4399,90 @@ fn create_schema(
             )
             .map_err(sqlite_error)?;
     }
+    if layout.has_clone_index() {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE clone_body_payloads (
+                    payload_digest TEXT PRIMARY KEY,
+                    payload BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE clone_occurrences (
+                    symbol_occurrence_id TEXT PRIMARY KEY,
+                    payload_digest TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    body_start INTEGER NOT NULL,
+                    body_end INTEGER NOT NULL,
+                    occurrence BLOB NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE clone_exact_postings (
+                    class INTEGER NOT NULL,
+                    normalization_revision INTEGER NOT NULL,
+                    digest TEXT NOT NULL,
+                    symbol_occurrence_id TEXT NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    PRIMARY KEY(class, normalization_revision, digest, symbol_occurrence_id)
+                ) WITHOUT ROWID;
+                CREATE TRIGGER builder_gate_clone_body_payloads_insert BEFORE INSERT ON clone_body_payloads WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_clone_occurrences_insert BEFORE INSERT ON clone_occurrences WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_clone_exact_postings_insert BEFORE INSERT ON clone_exact_postings WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER immutable_clone_body_payloads_update BEFORE UPDATE ON clone_body_payloads BEGIN SELECT RAISE(ABORT, 'immutable clone body payloads'); END;
+                CREATE TRIGGER immutable_clone_body_payloads_delete BEFORE DELETE ON clone_body_payloads BEGIN SELECT RAISE(ABORT, 'immutable clone body payloads'); END;
+                CREATE TRIGGER immutable_clone_occurrences_update BEFORE UPDATE ON clone_occurrences BEGIN SELECT RAISE(ABORT, 'immutable clone occurrences'); END;
+                CREATE TRIGGER immutable_clone_occurrences_delete BEFORE DELETE ON clone_occurrences BEGIN SELECT RAISE(ABORT, 'immutable clone occurrences'); END;
+                CREATE TRIGGER immutable_clone_exact_postings_update BEFORE UPDATE ON clone_exact_postings BEGIN SELECT RAISE(ABORT, 'immutable clone exact postings'); END;
+                CREATE TRIGGER immutable_clone_exact_postings_delete BEFORE DELETE ON clone_exact_postings BEGIN SELECT RAISE(ABORT, 'immutable clone exact postings'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
+    if layout.has_clone_fingerprints() {
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE clone_fingerprint_counts (
+                    language TEXT NOT NULL,
+                    class INTEGER NOT NULL,
+                    normalization_revision INTEGER NOT NULL,
+                    fingerprint INTEGER NOT NULL,
+                    posting_count INTEGER NOT NULL,
+                    PRIMARY KEY(language, class, normalization_revision, fingerprint)
+                ) WITHOUT ROWID;
+                CREATE TABLE clone_fingerprint_postings (
+                    language TEXT NOT NULL,
+                    class INTEGER NOT NULL,
+                    normalization_revision INTEGER NOT NULL,
+                    fingerprint INTEGER NOT NULL,
+                    symbol_occurrence_id TEXT NOT NULL,
+                    token_position INTEGER NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    body_digest TEXT NOT NULL,
+                    PRIMARY KEY(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position)
+                ) WITHOUT ROWID;
+                CREATE TABLE clone_fingerprint_postings_pages (
+                    language TEXT NOT NULL,
+                    class INTEGER NOT NULL,
+                    normalization_revision INTEGER NOT NULL,
+                    fingerprint INTEGER NOT NULL,
+                    symbol_occurrence_id TEXT NOT NULL,
+                    token_position INTEGER NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    body_digest TEXT NOT NULL
+                );
+                CREATE TRIGGER builder_gate_clone_fingerprint_postings_insert BEFORE INSERT ON clone_fingerprint_postings WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_clone_fingerprint_postings_pages_insert BEFORE INSERT ON clone_fingerprint_postings_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_clone_fingerprint_postings_pages_update BEFORE UPDATE ON clone_fingerprint_postings_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER builder_gate_clone_fingerprint_postings_pages_delete BEFORE DELETE ON clone_fingerprint_postings_pages WHEN tracedecay_lexical_builder_append_authorized() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_postings_update BEFORE UPDATE ON clone_fingerprint_postings BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint postings'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_postings_delete BEFORE DELETE ON clone_fingerprint_postings BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint postings'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_postings_pages_update BEFORE UPDATE ON clone_fingerprint_postings_pages BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint posting pages'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_postings_pages_delete BEFORE DELETE ON clone_fingerprint_postings_pages BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint posting pages'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_counts_update BEFORE UPDATE ON clone_fingerprint_counts BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint counts'); END;
+                CREATE TRIGGER immutable_clone_fingerprint_counts_delete BEFORE DELETE ON clone_fingerprint_counts BEGIN SELECT RAISE(ABORT, 'immutable clone fingerprint counts'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -3898,13 +4505,22 @@ fn verify_builder_mutation_gate_schema(
         );
         verify_trigger_schema(connection, name, table, &expected)?;
     }
+    verify_layout_dependent_triggers(connection)
+}
+
+fn verify_layout_dependent_triggers(
+    connection: &Connection,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
     // Layout-dependent tables are verified only when present: `exact_vocabulary`
     // from revision 12, and the staging tables (revision-14 dictionary, field
     // statistics) that finalization drops once their sealed table is derived.
     let has_exact_vocabulary = table_exists(connection, "exact_vocabulary")?;
     let has_row_dictionary_pages = table_exists(connection, "row_dictionary_pages")?;
     let has_field_stats_staging = table_exists(connection, "field_stats_staging")?;
-    let gated_layouts: [(bool, &[GateTriggerLayoutV1]); 3] = [
+    let has_clone_index = table_exists(connection, "clone_body_payloads")?;
+    let has_clone_fingerprints = table_exists(connection, "clone_fingerprint_postings")?;
+    let has_clone_fingerprint_pages = table_exists(connection, "clone_fingerprint_postings_pages")?;
+    let gated_layouts: [(bool, &[GateTriggerLayoutV1]); 6] = [
         (
             has_exact_vocabulary,
             &EXACT_VOCABULARY_BUILDER_GATE_TRIGGER_LAYOUT,
@@ -3917,18 +4533,17 @@ fn verify_builder_mutation_gate_schema(
             has_field_stats_staging,
             &FIELD_STATS_STAGING_BUILDER_GATE_TRIGGER_LAYOUT,
         ),
+        (has_clone_index, &CLONE_BUILDER_GATE_TRIGGER_LAYOUT),
+        (
+            has_clone_fingerprints,
+            &CLONE_FINGERPRINT_BUILDER_GATE_TRIGGER_LAYOUT,
+        ),
+        (
+            has_clone_fingerprint_pages,
+            &CLONE_FINGERPRINT_PAGES_BUILDER_GATE_TRIGGER_LAYOUT,
+        ),
     ];
-    for (name, table, operation) in gated_layouts
-        .into_iter()
-        .filter(|(present, _)| *present)
-        .flat_map(|(_, layout)| layout.iter().copied())
-    {
-        let expected = format!(
-            "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN {BUILDER_MUTATION_GATE_FUNCTION}() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END"
-        );
-        verify_trigger_schema(connection, name, table, &expected)?;
-    }
-    let immutable_layouts: [(bool, &[ImmutableTriggerLayoutV1]); 3] = [
+    let immutable_layouts: [(bool, &[ImmutableTriggerLayoutV1]); 6] = [
         (true, &IMMUTABLE_TRIGGER_LAYOUT),
         (
             has_exact_vocabulary,
@@ -3938,15 +4553,48 @@ fn verify_builder_mutation_gate_schema(
             has_row_dictionary_pages,
             &ROW_DICTIONARY_PAGES_IMMUTABLE_TRIGGER_LAYOUT,
         ),
+        (has_clone_index, &CLONE_IMMUTABLE_TRIGGER_LAYOUT),
+        (
+            has_clone_fingerprints,
+            &CLONE_FINGERPRINT_IMMUTABLE_TRIGGER_LAYOUT,
+        ),
+        (
+            has_clone_fingerprint_pages,
+            &CLONE_FINGERPRINT_PAGES_IMMUTABLE_TRIGGER_LAYOUT,
+        ),
     ];
-    for (name, table, operation, message) in immutable_layouts
-        .into_iter()
-        .filter(|(present, _)| *present)
-        .flat_map(|(_, layout)| layout.iter().copied())
-    {
-        let expected = format!(
-            "CREATE TRIGGER {name} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, '{message}'); END"
-        );
+    verify_trigger_layouts(
+        connection,
+        gated_layouts
+            .iter()
+            .filter(|(present, _)| *present)
+            .flat_map(|(_, layout)| layout.iter().copied())
+            .map(|(name, table, operation)| (name, table, operation, None))
+            .chain(
+                immutable_layouts
+                    .iter()
+                    .filter(|(present, _)| *present)
+                    .flat_map(|(_, layout)| layout.iter().copied())
+                    .map(|(name, table, operation, message)| {
+                        (name, table, operation, Some(message))
+                    }),
+            ),
+    )
+}
+
+fn verify_trigger_layouts<'a>(
+    connection: &Connection,
+    layouts: impl Iterator<Item = (&'a str, &'a str, &'a str, Option<&'a str>)>,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    for (name, table, operation, message) in layouts {
+        let expected = match message {
+            Some(message) => format!(
+                "CREATE TRIGGER {name} BEFORE {operation} ON {table} BEGIN SELECT RAISE(ABORT, '{message}'); END"
+            ),
+            None => format!(
+                "CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN {BUILDER_MUTATION_GATE_FUNCTION}() != 1 BEGIN SELECT RAISE(ABORT, 'private lexical builder mutation required'); END"
+            ),
+        };
         verify_trigger_schema(connection, name, table, &expected)?;
     }
     Ok(())
@@ -4032,6 +4680,35 @@ fn install_base_freeze(
             )
             .map_err(sqlite_error)?;
     }
+    install_clone_freeze(transaction, layout)?;
+    Ok(())
+}
+
+pub(super) fn install_clone_freeze(
+    transaction: &Transaction<'_>,
+    layout: LexicalArtifactLayoutV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    if layout.has_clone_index() {
+        transaction
+            .execute_batch(
+                "
+                CREATE TRIGGER frozen_clone_body_payloads_insert BEFORE INSERT ON clone_body_payloads BEGIN SELECT RAISE(ABORT, 'frozen clone body payloads'); END;
+                CREATE TRIGGER frozen_clone_occurrences_insert BEFORE INSERT ON clone_occurrences BEGIN SELECT RAISE(ABORT, 'frozen clone occurrences'); END;
+                CREATE TRIGGER frozen_clone_exact_postings_insert BEFORE INSERT ON clone_exact_postings BEGIN SELECT RAISE(ABORT, 'frozen clone exact postings'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
+    if layout.has_clone_fingerprints() {
+        transaction
+            .execute_batch(
+                "
+                CREATE TRIGGER frozen_clone_fingerprint_counts_insert BEFORE INSERT ON clone_fingerprint_counts BEGIN SELECT RAISE(ABORT, 'frozen clone fingerprint counts'); END;
+                CREATE TRIGGER frozen_clone_fingerprint_postings_insert BEFORE INSERT ON clone_fingerprint_postings BEGIN SELECT RAISE(ABORT, 'frozen clone fingerprint postings'); END;
+                ",
+            )
+            .map_err(sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -4067,7 +4744,92 @@ fn authenticated_authority_epoch(
             "lexical artifact authenticated authority disagrees with its source receipt".to_owned(),
         ));
     }
+    if layout_has_clone_index(transaction)? {
+        verify_clone_rows(transaction, source)?;
+    }
     Ok(actual_epoch)
+}
+
+pub(super) fn verify_clone_rows(
+    connection: &Connection,
+    source: &VerifiedSealedLexicalSourceReceiptV1,
+) -> Result<(), CodeLexicalArtifactErrorV1> {
+    let (occurrences, missing_payloads, orphan_payloads, dangling_postings): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT
+             (SELECT COUNT(*) FROM clone_occurrences),
+             (SELECT COUNT(*) FROM clone_occurrences AS occurrence LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = occurrence.payload_digest WHERE payload.payload_digest IS NULL),
+             (SELECT COUNT(*) FROM clone_body_payloads AS payload LEFT JOIN clone_occurrences AS occurrence ON occurrence.payload_digest = payload.payload_digest WHERE occurrence.symbol_occurrence_id IS NULL),
+             (SELECT COUNT(*) FROM clone_exact_postings AS posting LEFT JOIN clone_occurrences AS occurrence ON occurrence.symbol_occurrence_id = posting.symbol_occurrence_id LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = posting.payload_digest WHERE occurrence.symbol_occurrence_id IS NULL OR payload.payload_digest IS NULL OR occurrence.payload_digest != posting.payload_digest)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sqlite_error)?;
+    if u64::try_from(occurrences).map_err(contract_number)? != source.total_clone_bodies()
+        || missing_payloads != 0
+        || orphan_payloads != 0
+        || dangling_postings != 0
+    {
+        return Err(CodeLexicalArtifactErrorV1::Corrupt(
+            "clone rows disagree with their source receipt or payload bindings".to_owned(),
+        ));
+    }
+    if !layout_has_clone_fingerprints(connection)? {
+        return Ok(());
+    }
+    let (dangling, count_mismatch): (i64, bool) = connection
+        .query_row(
+            "WITH actual(language, class, normalization_revision, fingerprint, posting_count) AS (
+                SELECT language, class, normalization_revision, fingerprint, COUNT(*)
+                FROM clone_fingerprint_postings
+                GROUP BY language, class, normalization_revision, fingerprint
+             ),
+             mismatched AS (
+                SELECT * FROM actual
+                EXCEPT
+                SELECT language, class, normalization_revision, fingerprint, posting_count
+                FROM clone_fingerprint_counts
+                UNION ALL
+                SELECT language, class, normalization_revision, fingerprint, posting_count
+                FROM clone_fingerprint_counts
+                EXCEPT
+                SELECT * FROM actual
+             )
+             SELECT
+                (SELECT COUNT(*) FROM clone_fingerprint_postings AS posting
+                 LEFT JOIN clone_occurrences AS occurrence ON occurrence.symbol_occurrence_id = posting.symbol_occurrence_id
+                 LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = posting.payload_digest
+                 WHERE occurrence.symbol_occurrence_id IS NULL
+                    OR payload.payload_digest IS NULL
+                    OR occurrence.payload_digest != posting.payload_digest
+                    OR posting.token_position < 0),
+                EXISTS(SELECT 1 FROM mismatched)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sqlite_error)?;
+    if dangling != 0 || count_mismatch {
+        return Err(CodeLexicalArtifactErrorV1::Corrupt(
+            "clone fingerprint postings disagree with their payload bindings or stored counts"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn layout_has_clone_index(connection: &Connection) -> Result<bool, CodeLexicalArtifactErrorV1> {
+    Ok(read_staged_artifact_layout(connection)?.has_clone_index())
+}
+
+fn layout_has_clone_fingerprints(
+    connection: &Connection,
+) -> Result<bool, CodeLexicalArtifactErrorV1> {
+    Ok(read_staged_artifact_layout(connection)?.has_clone_fingerprints())
 }
 
 fn advance_pre_digest_work(
@@ -4366,7 +5128,9 @@ fn build_serving_index_step(
                 }
                 LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => {
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => {
                     "CREATE INDEX exact_postings_by_document ON exact_postings(document_id, field, term_id)"
                 }
             };
@@ -4529,7 +5293,9 @@ fn read_staged_artifact_layout(
         layout @ (LexicalArtifactLayoutV1::V11
         | LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13
-        | LexicalArtifactLayoutV1::V14) => Ok(layout),
+        | LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16) => Ok(layout),
     }
 }
 
@@ -4604,8 +5370,10 @@ fn store_finalization_state(
 
 fn validate_finalization_state(
     state: &PersistedFinalizationStateV1,
+    layout: LexicalArtifactLayoutV1,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
-    let section_count = u64::try_from(SECTION_NAMES.len()).map_err(contract_number)?;
+    let section_names = section_names(layout);
+    let section_count = u64::try_from(section_names.len()).map_err(contract_number)?;
     let completed_section_count = if state.phase == PersistedFinalizationPhaseV1::Digest {
         usize::try_from(state.section_ordinal).map_err(contract_number)?
     } else {
@@ -4622,7 +5390,7 @@ fn validate_finalization_state(
             && state.section_ordinal
                 < u64::try_from(1 + BASE_SECTION_NAMES.len()).map_err(contract_number)?)
         || state.completed_sections.len() != completed_section_count
-        || state.completed_sections.len() > SECTION_NAMES.len()
+        || state.completed_sections.len() > section_names.len()
         || state.section_accumulator.len() != 32
         || state.base_section_row_counts.len() != BASE_SECTION_NAMES.len()
         || state.base_section_accumulators.len() != BASE_SECTION_NAMES.len()
@@ -4639,8 +5407,8 @@ fn validate_finalization_state(
     if state
         .completed_sections
         .iter()
-        .zip(SECTION_NAMES)
-        .any(|(section, expected_name)| section.name != expected_name)
+        .zip(section_names)
+        .any(|(section, expected_name)| section.name != *expected_name)
     {
         return Err(CodeLexicalArtifactErrorV1::Corrupt(
             "persisted lexical artifact finalization sections are out of order".to_owned(),
@@ -4687,6 +5455,24 @@ fn advance_section_rows(
 ) -> Result<usize, CodeLexicalArtifactErrorV1> {
     let limit = i64::try_from(maximum_rows).map_err(contract_number)?;
     let last_key = state.section_last_key.clone();
+    if matches!(
+        section,
+        FinalizationSectionV1::CloneOccurrences
+            | FinalizationSectionV1::CloneExactPostings
+            | FinalizationSectionV1::CloneBodyPayloads
+            | FinalizationSectionV1::CloneFingerprintCounts
+            | FinalizationSectionV1::CloneFingerprintPostings
+    ) {
+        return advance_clone_section_rows(
+            transaction,
+            section,
+            layout,
+            state,
+            limit,
+            last_key.as_ref(),
+            control,
+        );
+    }
     match (section, last_key.as_ref()) {
         (FinalizationSectionV1::SourcePages, None)
         | (FinalizationSectionV1::DocumentIntegrity, None)
@@ -4794,6 +5580,113 @@ fn advance_section_rows(
     }
 }
 
+fn advance_clone_section_rows(
+    transaction: &Transaction<'_>,
+    section: FinalizationSectionV1,
+    layout: LexicalArtifactLayoutV1,
+    state: &mut PersistedFinalizationStateV1,
+    limit: i64,
+    last_key: Option<&PersistedFinalizationKeyV1>,
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<usize, CodeLexicalArtifactErrorV1> {
+    match (section, last_key) {
+        (
+            FinalizationSectionV1::CloneOccurrences
+            | FinalizationSectionV1::CloneExactPostings
+            | FinalizationSectionV1::CloneBodyPayloads
+            | FinalizationSectionV1::CloneFingerprintCounts
+            | FinalizationSectionV1::CloneFingerprintPostings,
+            None,
+        ) => advance_native_section_rows(
+            transaction,
+            section,
+            section.seek_query(layout, false),
+            params![limit],
+            state,
+            control,
+        ),
+        (
+            FinalizationSectionV1::CloneOccurrences | FinalizationSectionV1::CloneBodyPayloads,
+            Some(PersistedFinalizationKeyV1::Text(value)),
+        ) => advance_native_section_rows(
+            transaction,
+            section,
+            section.seek_query(layout, true),
+            params![value, limit],
+            state,
+            control,
+        ),
+        (
+            FinalizationSectionV1::CloneExactPostings,
+            Some(PersistedFinalizationKeyV1::ClonePosting {
+                class,
+                normalization_revision,
+                digest,
+                symbol_occurrence_id,
+            }),
+        ) => advance_native_section_rows(
+            transaction,
+            section,
+            section.seek_query(layout, true),
+            params![
+                class,
+                normalization_revision,
+                digest,
+                symbol_occurrence_id,
+                limit
+            ],
+            state,
+            control,
+        ),
+        (
+            FinalizationSectionV1::CloneFingerprintCounts,
+            Some(PersistedFinalizationKeyV1::FingerprintCount {
+                language,
+                class,
+                normalization_revision,
+                fingerprint,
+            }),
+        ) => advance_native_section_rows(
+            transaction,
+            section,
+            section.seek_query(layout, true),
+            params![language, class, normalization_revision, fingerprint, limit],
+            state,
+            control,
+        ),
+        (
+            FinalizationSectionV1::CloneFingerprintPostings,
+            Some(PersistedFinalizationKeyV1::FingerprintPosting {
+                language,
+                class,
+                normalization_revision,
+                fingerprint,
+                symbol_occurrence_id,
+                token_position,
+            }),
+        ) => advance_native_section_rows(
+            transaction,
+            section,
+            section.seek_query(layout, true),
+            params![
+                language,
+                class,
+                normalization_revision,
+                fingerprint,
+                symbol_occurrence_id,
+                token_position,
+                limit
+            ],
+            state,
+            control,
+        ),
+        _ => Err(CodeLexicalArtifactErrorV1::Corrupt(
+            "persisted lexical artifact clone finalization key does not match its section"
+                .to_owned(),
+        )),
+    }
+}
+
 fn advance_native_section_rows<P: rusqlite::Params>(
     transaction: &Transaction<'_>,
     section: FinalizationSectionV1,
@@ -4865,6 +5758,16 @@ fn native_row_key(
     section: FinalizationSectionV1,
     row: &rusqlite::Row<'_>,
 ) -> Result<PersistedFinalizationKeyV1, CodeLexicalArtifactErrorV1> {
+    if matches!(
+        section,
+        FinalizationSectionV1::CloneOccurrences
+            | FinalizationSectionV1::CloneExactPostings
+            | FinalizationSectionV1::CloneBodyPayloads
+            | FinalizationSectionV1::CloneFingerprintCounts
+            | FinalizationSectionV1::CloneFingerprintPostings
+    ) {
+        return clone_row_key(section, row);
+    }
     match section {
         FinalizationSectionV1::SourcePages
         | FinalizationSectionV1::DocumentIntegrity
@@ -4893,6 +5796,15 @@ fn native_row_key(
                 ngram: row.get(2).map_err(sqlite_error)?,
             })
         }
+        FinalizationSectionV1::CloneOccurrences
+        | FinalizationSectionV1::CloneExactPostings
+        | FinalizationSectionV1::CloneBodyPayloads
+        | FinalizationSectionV1::CloneFingerprintCounts
+        | FinalizationSectionV1::CloneFingerprintPostings => {
+            Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "clone row key bypassed its dedicated decoder".to_owned(),
+            ))
+        }
         FinalizationSectionV1::FieldStatistics | FinalizationSectionV1::Vocabulary => Ok(
             PersistedFinalizationKeyV1::Integer(row.get(0).map_err(sqlite_error)?),
         ),
@@ -4900,6 +5812,55 @@ fn native_row_key(
             first: row.get(0).map_err(sqlite_error)?,
             second: row.get(1).map_err(sqlite_error)?,
         }),
+    }
+}
+
+fn clone_row_key(
+    section: FinalizationSectionV1,
+    row: &rusqlite::Row<'_>,
+) -> Result<PersistedFinalizationKeyV1, CodeLexicalArtifactErrorV1> {
+    if matches!(
+        section,
+        FinalizationSectionV1::CloneOccurrences | FinalizationSectionV1::CloneBodyPayloads
+    ) {
+        return Ok(PersistedFinalizationKeyV1::Text(
+            row.get(0).map_err(sqlite_error)?,
+        ));
+    }
+    if section == FinalizationSectionV1::CloneExactPostings {
+        return Ok(PersistedFinalizationKeyV1::ClonePosting {
+            class: row.get(0).map_err(sqlite_error)?,
+            normalization_revision: row.get(1).map_err(sqlite_error)?,
+            digest: row.get(2).map_err(sqlite_error)?,
+            symbol_occurrence_id: row.get(3).map_err(sqlite_error)?,
+        });
+    }
+    let language = row.get(0).map_err(sqlite_error)?;
+    let class = row.get(1).map_err(sqlite_error)?;
+    let normalization_revision = row.get(2).map_err(sqlite_error)?;
+    let fingerprint = row.get(3).map_err(sqlite_error)?;
+    match section {
+        FinalizationSectionV1::CloneFingerprintCounts => {
+            Ok(PersistedFinalizationKeyV1::FingerprintCount {
+                language,
+                class,
+                normalization_revision,
+                fingerprint,
+            })
+        }
+        FinalizationSectionV1::CloneFingerprintPostings => {
+            Ok(PersistedFinalizationKeyV1::FingerprintPosting {
+                language,
+                class,
+                normalization_revision,
+                fingerprint,
+                symbol_occurrence_id: row.get(4).map_err(sqlite_error)?,
+                token_position: row.get(5).map_err(sqlite_error)?,
+            })
+        }
+        _ => Err(CodeLexicalArtifactErrorV1::Corrupt(
+            "non-fingerprint section requested a fingerprint row key".to_owned(),
+        )),
     }
 }
 
@@ -5268,7 +6229,7 @@ pub(super) fn compute_section_digests(
 ) -> Result<Vec<CodeLexicalArtifactSectionDigestV1>, CodeLexicalArtifactErrorV1> {
     let (source_pages, base_sections) =
         digest_source_pages_and_base_receipts(connection, control, layout)?;
-    let mut sections = Vec::with_capacity(SECTION_NAMES.len());
+    let mut sections = Vec::with_capacity(section_names(layout).len());
     sections.push(source_pages);
     sections.extend(base_sections);
     for section in [
@@ -5277,6 +6238,47 @@ pub(super) fn compute_section_digests(
         FinalizationSectionV1::Vocabulary,
     ] {
         sections.push(digest_query(connection, section, control, layout)?);
+    }
+    if layout.has_clone_index() {
+        for section in [
+            FinalizationSectionV1::CloneOccurrences,
+            FinalizationSectionV1::CloneExactPostings,
+            FinalizationSectionV1::CloneBodyPayloads,
+        ] {
+            sections.push(digest_query(connection, section, control, layout)?);
+        }
+    }
+    if layout.has_clone_fingerprints() {
+        for section in [
+            FinalizationSectionV1::CloneFingerprintCounts,
+            FinalizationSectionV1::CloneFingerprintPostings,
+        ] {
+            sections.push(digest_query(connection, section, control, layout)?);
+        }
+    }
+    Ok(sections)
+}
+
+pub(super) fn compute_clone_section_digests(
+    connection: &Connection,
+    control: &dyn CodeIndexExecutionControlV1,
+    layout: LexicalArtifactLayoutV1,
+) -> Result<Vec<CodeLexicalArtifactSectionDigestV1>, CodeLexicalArtifactErrorV1> {
+    let mut sections = [
+        FinalizationSectionV1::CloneOccurrences,
+        FinalizationSectionV1::CloneExactPostings,
+        FinalizationSectionV1::CloneBodyPayloads,
+    ]
+    .into_iter()
+    .map(|section| digest_query(connection, section, control, layout))
+    .collect::<Result<Vec<_>, _>>()?;
+    if layout.has_clone_fingerprints() {
+        for section in [
+            FinalizationSectionV1::CloneFingerprintCounts,
+            FinalizationSectionV1::CloneFingerprintPostings,
+        ] {
+            sections.push(digest_query(connection, section, control, layout)?);
+        }
     }
     Ok(sections)
 }
@@ -5806,6 +6808,95 @@ mod tests {
         BuilderMutationGuardV1::enter(&gate).expect("enter test builder mutation authority")
     }
 
+    /// Fingerprint postings are appended to an arrival-ordered staging table
+    /// and reach the keyed tree only through the sorted finalization pass:
+    /// the staging table is gated like every other builder table, the pass
+    /// preserves every row in key order, and nothing of the staging table
+    /// survives it (so a finalized artifact verifies without it).
+    #[test]
+    fn fingerprint_postings_stage_in_arrival_order_and_seal_sorted_once() {
+        let mut connection = Connection::open_in_memory().expect("fingerprint database");
+        let gate =
+            register_builder_mutation_gate(&connection).expect("register builder mutation gate");
+        create_schema(&connection, LexicalArtifactLayoutV1::V16).expect("create v16 schema");
+        verify_builder_mutation_gate_schema(&connection).expect("staging triggers present");
+
+        let refused = connection.execute(
+            "INSERT INTO clone_fingerprint_postings_pages(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest) VALUES ('rust', 1, 1, 9, 'symbol.b', 0, 'payload.b', 'body.b')",
+            [],
+        );
+        assert!(
+            refused
+                .expect_err("ungated staging insert must be refused")
+                .to_string()
+                .contains("private lexical builder mutation required")
+        );
+
+        // Arrival order deliberately disagrees with key order.
+        let arrivals = [
+            ("rust", 9_i64, "symbol.b", 3_i64),
+            ("rust", 2, "symbol.b", 1),
+            ("go", 5, "symbol.a", 0),
+            ("rust", 2, "symbol.a", 7),
+        ];
+        {
+            let _authority = BuilderMutationGuardV1::enter(&gate).expect("enter authority");
+            for (language, fingerprint, symbol, position) in arrivals {
+                connection
+                    .execute(
+                        "INSERT INTO clone_fingerprint_postings_pages(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest) VALUES (?1, 1, 1, ?2, ?3, ?4, 'payload', 'body')",
+                        params![language, fingerprint, symbol, position],
+                    )
+                    .expect("stage fingerprint posting");
+            }
+        }
+        let keyed_before: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM clone_fingerprint_postings",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count keyed rows");
+        assert_eq!(keyed_before, 0, "appends must not touch the keyed tree");
+
+        let transaction = connection.transaction().expect("finalization transaction");
+        derive_clone_fingerprint_postings(&transaction, &gate).expect("sorted pass");
+        transaction.commit().expect("commit sorted pass");
+
+        assert!(
+            !table_exists(&connection, "clone_fingerprint_postings_pages").expect("table probe"),
+            "staging table must not survive finalization"
+        );
+        verify_builder_mutation_gate_schema(&connection)
+            .expect("finalized layout verifies without the staging table");
+        let mut statement = connection
+            .prepare(
+                "SELECT language, fingerprint, symbol_occurrence_id, token_position FROM clone_fingerprint_postings ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position",
+            )
+            .expect("prepare keyed read");
+        let sealed = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("read keyed rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect keyed rows");
+        assert_eq!(
+            sealed,
+            vec![
+                ("go".to_owned(), 5, "symbol.a".to_owned(), 0),
+                ("rust".to_owned(), 2, "symbol.a".to_owned(), 7),
+                ("rust".to_owned(), 2, "symbol.b".to_owned(), 1),
+                ("rust".to_owned(), 9, "symbol.b".to_owned(), 3),
+            ]
+        );
+    }
+
     #[test]
     fn field_statistics_preserve_posting_sums_and_omit_absent_fields() {
         for empty in [false, true] {
@@ -5888,6 +6979,38 @@ mod tests {
                 &ActiveControl,
             ) {
                 Ok(_) => panic!("resume must not seal statistics without staged totals"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, CodeLexicalArtifactErrorV1::Incompatible(_)));
+    }
+
+    /// A revision-16 staging file written by the builder that inserted
+    /// fingerprint postings straight into the keyed tree has no staging table;
+    /// resuming it must be a typed incompatibility (discard and restage), not
+    /// a missing-table `Io` the scheduler would retry forever.
+    #[test]
+    fn resume_refuses_staging_without_fingerprint_posting_pages() {
+        let directory = tempfile::tempdir().expect("artifact tempdir");
+        let path = directory.path().join("no-fingerprint-staging.sqlite");
+        let metadata = test_metadata();
+        drop(
+            CodeLexicalArtifactBuilderV1::create(&path, metadata.clone())
+                .expect("create current staging artifact"),
+        );
+        let connection = Connection::open(&path).expect("open staging artifact for fixture setup");
+        connection
+            .execute_batch("DROP TABLE clone_fingerprint_postings_pages;")
+            .expect("install pre-staging fingerprint layout");
+        drop(connection);
+
+        let error =
+            match CodeLexicalArtifactBuilderV1::open_or_resume_with_memory_budget_and_control(
+                &path,
+                metadata,
+                CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+                &ActiveControl,
+            ) {
+                Ok(_) => panic!("resume must not accept a staging file without fingerprint pages"),
                 Err(error) => error,
             };
         assert!(matches!(error, CodeLexicalArtifactErrorV1::Incompatible(_)));
@@ -5982,7 +7105,7 @@ mod tests {
                 .iter()
                 .map(|section| section.name.as_str())
                 .collect::<Vec<_>>(),
-            SECTION_NAMES
+            section_names(LexicalArtifactLayoutV1::V11)
         );
     }
 
@@ -6419,7 +7542,16 @@ mod tests {
             .expect("build ngram serving index before digest verification");
         transaction.commit().expect("commit ngram serving index");
 
-        for section in FinalizationSectionV1::ALL {
+        for section in FinalizationSectionV1::ALL.into_iter().filter(|section| {
+            !matches!(
+                section,
+                FinalizationSectionV1::CloneOccurrences
+                    | FinalizationSectionV1::CloneExactPostings
+                    | FinalizationSectionV1::CloneBodyPayloads
+                    | FinalizationSectionV1::CloneFingerprintCounts
+                    | FinalizationSectionV1::CloneFingerprintPostings
+            )
+        }) {
             let plan = explain_native_seek_plan(&connection, section)
                 .expect("explain bounded finalization resume query");
             assert!(
@@ -6463,6 +7595,18 @@ mod tests {
             }
             FinalizationSectionV1::FieldStatistics | FinalizationSectionV1::Vocabulary => {
                 statement.query(params![0i64, 1i64])
+            }
+            FinalizationSectionV1::CloneOccurrences | FinalizationSectionV1::CloneBodyPayloads => {
+                statement.query(params!["", 1i64])
+            }
+            FinalizationSectionV1::CloneExactPostings => {
+                statement.query(params![0i64, 0i64, "", "", 1i64])
+            }
+            FinalizationSectionV1::CloneFingerprintCounts => {
+                statement.query(params!["", 0i64, 0i64, 0i64, 1i64])
+            }
+            FinalizationSectionV1::CloneFingerprintPostings => {
+                statement.query(params!["", 0i64, 0i64, 0i64, "", 0i64, 1i64])
             }
         }
         .map_err(sqlite_error)?;

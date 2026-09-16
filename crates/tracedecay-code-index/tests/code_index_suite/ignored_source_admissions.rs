@@ -6,8 +6,8 @@ use tracedecay_code_index::{
     production::{
         CodeIndexAtomicPublicationPort, CodeIndexBuildRequestV1, CodeIndexCapturedFileV1,
         CodeIndexGenerationScopeV1, CodeIndexIgnoredSourceAdmissionV1, CodeIndexProductionOwnerV1,
-        CodeIndexPublishedGenerationV1, SEALED_GENERATION_FORMAT_REVISION_V1,
-        sealed_generation_payload_digest,
+        CodeIndexPublishedGenerationV1, MINIMUM_SEALED_GENERATION_FORMAT_REVISION,
+        SEALED_GENERATION_FORMAT_REVISION_V1, sealed_generation_payload_digest,
     },
 };
 use tracedecay_domain::{
@@ -450,17 +450,17 @@ fn sealed_state_digest_changes_when_ignored_source_roster_changes() {
 }
 
 #[test]
-fn sealed_format_refuses_superseded_revisions_beside_partitioned_revision_seven() {
-    assert_eq!(SEALED_GENERATION_FORMAT_REVISION_V1, 7);
+fn sealed_format_refuses_superseded_revisions_beside_the_partitioned_revision() {
+    assert_eq!(SEALED_GENERATION_FORMAT_REVISION_V1, 11);
     let generation = publish(request_with_ignored_sources(vec![admission(
         PRIMARY_IGNORED_PATH,
     )]));
     let sealed = generation
         .encode_sealed()
-        .expect("revision-six generation seals");
+        .expect("current monolithic generation seals");
     assert!(
         CodeIndexPublishedGenerationV1::sealed_format_is_compatible(&sealed)
-            .expect("revision-six compatibility probe")
+            .expect("current monolithic compatibility probe")
     );
 
     let mut superseded = sealed_envelope(&generation);
@@ -479,7 +479,7 @@ fn sealed_format_refuses_superseded_revisions_beside_partitioned_revision_seven(
         "superseded revision reached the wrong rejection: {error}"
     );
 
-    for incompatible_revision in [4, 8] {
+    for incompatible_revision in [4, 12] {
         let mut incompatible = sealed_envelope(&generation);
         incompatible["generation"]["format_revision"] = Value::from(incompatible_revision);
         let incompatible =
@@ -500,7 +500,14 @@ fn sealed_format_refuses_superseded_revisions_beside_partitioned_revision_seven(
     assert!(
         CodeIndexPublishedGenerationV1::decode_sealed_if_compatible(&partitioned)
             .expect("partitioned revision classification")
-            .is_none(),
-        "the monolithic decoder must refuse revision seven without a segment resolver"
+            .is_none()
     );
+
+    let mut retired = sealed_envelope(&generation);
+    retired["generation"]["format_revision"] =
+        Value::from(MINIMUM_SEALED_GENERATION_FORMAT_REVISION - 1);
+    let retired = serde_json::to_vec(&retired).expect("retired generation manifest");
+    let error = CodeIndexPublishedGenerationV1::decode_sealed_if_compatible(&retired)
+        .expect_err("pre-clone manifest must be rebuilt");
+    assert!(error.to_string().contains("will be rebuilt from source"));
 }

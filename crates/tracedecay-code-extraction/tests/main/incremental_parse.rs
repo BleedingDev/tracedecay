@@ -95,6 +95,7 @@ fn assert_artifact_rows_match_fresh_parse(
     );
     assert_eq!(incremental_result.errors, fresh_result.errors);
     assert_eq!(incremental.imports, fresh.imports);
+    assert_eq!(incremental.clone_bodies, fresh.clone_bodies);
 }
 
 #[test]
@@ -376,6 +377,52 @@ fn canonical_reextraction_visits_only_changed_top_level_syntax() {
         document.extract_canonical(&RustExtractor, &opened, Some(&initial.result)),
         Err(ParseError::StaleReport)
     ));
+}
+
+#[test]
+fn incremental_artifact_replaces_only_the_changed_clone_body() {
+    let before = "fn stable() { keep(); }\nfn edited() { before(); }\n";
+    let after = "fn stable() { keep(); }\nfn edited() { after(); }\n";
+    let (mut document, opened) = RetainedParseDocument::open(
+        identity("commit-a", "tree-a", RepositoryDirtyStateV1::Clean),
+        "rust",
+        before,
+        ParseLimits::default(),
+    )
+    .expect("initial parse");
+    let initial = document
+        .extract_canonical_artifact(&RustExtractor, &opened, None)
+        .expect("initial artifact");
+    let stable_before = initial
+        .artifact
+        .clone_bodies
+        .iter()
+        .find(|body| {
+            initial
+                .artifact
+                .result
+                .nodes
+                .iter()
+                .any(|node| node.id == body.symbol_occurrence_id && node.name == "stable")
+        })
+        .expect("stable clone body")
+        .clone();
+
+    let report = document
+        .reparse(
+            identity("commit-b", "tree-b", RepositoryDirtyStateV1::Dirty),
+            after,
+        )
+        .expect("incremental parse");
+    let changed = document
+        .extract_canonical_artifact(&RustExtractor, &report, Some(&initial.artifact))
+        .expect("incremental artifact");
+    let fresh = RustExtractor.extract_artifact("src/lib.rs", after);
+    assert_artifact_rows_match_fresh_parse(&changed.artifact, &fresh);
+    assert!(
+        changed.artifact.clone_bodies.contains(&stable_before),
+        "unchanged clone row must be reused byte-for-byte"
+    );
 }
 
 #[test]

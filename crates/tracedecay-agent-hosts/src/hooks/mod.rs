@@ -38,6 +38,7 @@ pub use dispatch::project_and_worktree_locators_for_scope as hook_scope_locators
 pub use dispatch::project_id_for_layout as hook_project_id_for_layout;
 pub use dispatch::protected_session_id_for_native as protected_native_session_id;
 pub use dispatch::publish_daemon_bindings as publish_hook_bindings;
+pub use dispatch::worktree_id_for_layout as hook_worktree_id_for_layout;
 pub use tracedecay_hooks::NativeContextScoutLifecycleV1;
 
 pub use claude::{
@@ -1067,8 +1068,13 @@ fn nearest_project_like_root(start: &Path) -> Option<PathBuf> {
     if let Some(root) = tracedecay_runtime_core::worktree::git_worktree_root(start) {
         return Some(root);
     }
+    let temp_root =
+        tracedecay_runtime_core::path_safety::canonical_root_identity(&std::env::temp_dir());
     let mut dir = start.to_path_buf();
     loop {
+        if tracedecay_runtime_core::path_safety::canonical_root_identity(&dir) == temp_root {
+            return None;
+        }
         if project_marker_exists(&dir) {
             return Some(dir);
         }

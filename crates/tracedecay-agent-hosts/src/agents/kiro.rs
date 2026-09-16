@@ -7,12 +7,11 @@
 //! host-capability doctrine forbids. The binary is therefore a hard
 //! requirement for the global lifecycle, with no config-editing fallback.
 //!
-//! The rest of the integration has no CLI equivalent and stays
-//! TraceDecay-written: global tracedecay steering
-//! (`~/.kiro/steering/tracedecay.md`), a tracedecay-managed Kiro agent
-//! (`~/.kiro/agents/tracedecay.json`) selected as the default when doing so
-//! does not overwrite a user's existing default-agent choice, and the
-//! workspace-local `.kiro/settings/mcp.json`.
+//! The canonical global integration is MCP-only. Older releases also wrote
+//! global steering, a managed agent, and a default-agent selection, but the
+//! catalog-native lifecycle no longer owns or grades those retired artifacts.
+//! Workspace-local registration still writes its MCP entry, steering, and
+//! managed agent because Kiro has no project-path-aware registry operation.
 //!
 //! User-owned Kiro agents remain user-managed. If `~/.kiro/agents/tracedecay.json`
 //! already exists and is not the file tracedecay writes, install and uninstall
@@ -408,9 +407,6 @@ impl AgentIntegration for KiroIntegration {
             &ctx.project_path,
             global_server.as_ref(),
         );
-        doctor_check_steering(dc, &ctx.home);
-        doctor_check_managed_agent(dc, &ctx.home);
-        doctor_check_default_agent(dc, &ctx.home);
     }
 
     fn reports_absence_to_doctor(&self) -> bool {
@@ -701,10 +697,6 @@ fn remove_kiro_managed_skill_index(home: &Path, index_path: &Path) -> Result<()>
     super::remove_managed_skill_prompt_index(home, index_path, SkillInstallTarget::Kiro)
 }
 
-fn is_builtin_default_agent(agent: &str) -> bool {
-    matches!(agent, "kiro_default" | "default")
-}
-
 /// Add or refresh tracedecay's global steering resource for default Kiro
 /// sessions. Every owned block — the current sentinel-delimited shape or a
 /// historical heading-marked one — converges onto exactly one copy of the
@@ -730,31 +722,23 @@ This project has a TraceDecay code graph exposed as `tracedecay_*` MCP tools. Us
 when the task is about code structure, callers, impact, or where something lives; use \
 Kiro's native file reads and edits for known files, ordinary local edits, and \
 non-indexed material.\n\n\
-Routing:\n\
-- Literal or regex text in code: `tracedecay_grep`.\n\
-- A symbol by name: `tracedecay_search`; a concept or \"how does X work\": `tracedecay_context`.\n\
-- A source file you have not seen: `tracedecay_outline`, then `tracedecay_body` / \
-`tracedecay_read` slices.\n\
-- Callers, callees, call chains: `tracedecay_callers` / `tracedecay_callees`.\n\
-- What a change breaks: `tracedecay_impact`, `tracedecay_diff_context`, `tracedecay_affected`.\n\
-- Project or storage identity: `tracedecay_active_project` / `tracedecay_storage_status`, \
-not repo-local marker files or database paths.\n\
-- Prior decisions or conversations: `tracedecay_message_search` / `tracedecay_lcm_expand_query`.\n\n\
+Use `tracedecay_context` for concepts, `tracedecay_search` for symbols, `tracedecay_grep` \
+for literal or regex text, and `tracedecay_callers`, `tracedecay_callees`, or \
+`tracedecay_impact` for relationships. Use `tracedecay_active_project` or \
+`tracedecay_storage_status` for identity and `tracedecay_message_search` when prior \
+conversation context matters.\n\n\
 Read the freshness and coverage line that opens each result; an empty result does not \
-prove absence. When you were handed the exact files, symbols, or excerpts to act on, act \
-on them instead of re-running discovery. Explicit user instructions and project rules win \
-over this guidance.\n\n\
-Kiro's `delegate` fits long-running execution such as builds, tests, generated reports, \
-and independent implementation; code research is usually answered faster by the graph.\n\n\
+prove absence. Preserve exact project/worktree selectors and opaque continuation or \
+mutation identities. Explicit user instructions and project rules win over this guidance.\n\n\
 For durable project/user facts, `tracedecay_fact_store_add` persists and \
 `tracedecay_fact_store_search` recalls or deduplicates them; prefer `tracedecay_fact_feedback` \
 and read-only `tracedecay_memory_status` over ad-hoc notes. Use `memory_scope=user` for \
 durable preferences or projectless chat and `memory_scope=project` for active-codebase \
 facts. Do not store secrets, credentials, or unnecessary PII in persistent facts.\n\n\
 {cli_fallback}\n\n\
-If an extractor, schema, or tracedecay tool could answer a question natively but does \
-not, propose opening an issue at https://github.com/ScriptedAlchemy/tracedecay and remind \
-the user to strip sensitive or proprietary code from the description first.",
+A preview or read result does not authorize mutation. Once the user has authorized a \
+change, continue through implementation and relevant verification; pause only for a \
+missing decision or an external or destructive action outside that authority.",
         cli_fallback = super::CLI_FALLBACK_PROMPT_RULES,
     )
 }
@@ -1016,6 +1000,7 @@ fn doctor_check_workspace_mcp_override(
     }
 }
 
+#[cfg(test)]
 fn doctor_check_steering(dc: &mut DoctorCounters, home: &Path) {
     let path = steering_path(home);
     if !path.exists() {
@@ -1049,184 +1034,6 @@ fn doctor_check_steering(dc: &mut DoctorCounters, home: &Path) {
             "Kiro global tracedecay.md carries {} outdated or duplicate tracedecay block(s) -- run `tracedecay install --agent kiro` to converge them",
             ranges.len()
         ));
-    }
-}
-
-fn doctor_check_managed_agent(dc: &mut DoctorCounters, home: &Path) {
-    let path = managed_agent_path(home);
-    if !path.exists() {
-        dc.fail(&format!(
-            "Kiro tracedecay agent NOT installed at {} -- run `tracedecay install --agent kiro`",
-            path.display()
-        ));
-        return;
-    }
-
-    let config = load_json_file(&path);
-    if !is_owned_agent_config(&config) {
-        dc.warn(&format!(
-            "{} is user-managed; tracedecay hooks were not installed there",
-            path.display()
-        ));
-        return;
-    }
-
-    dc.pass(&format!("Kiro tracedecay agent: {}", path.display()));
-
-    if config
-        .get("includeMcpJson")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        dc.pass("Kiro tracedecay agent includes global/workspace MCP config");
-    } else {
-        dc.fail("Kiro tracedecay agent missing includeMcpJson=true -- run `tracedecay install --agent kiro`");
-    }
-
-    doctor_check_agent_tools(dc, &config);
-    doctor_check_agent_allowed_tools(dc, &config);
-
-    let expected_resource = file_resource_uri(&steering_path(home));
-    if config
-        .get("resources")
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|v| v.as_str() == Some(expected_resource.as_str()))
-        })
-    {
-        dc.pass("Kiro tracedecay agent loads global steering as a resource");
-    } else {
-        dc.fail(
-            "Kiro tracedecay agent missing global steering resource -- run `tracedecay install --agent kiro`",
-        );
-    }
-
-    for hook in KIRO_MANAGED_HOOKS {
-        doctor_check_agent_hook(dc, &config, hook.event, hook.matcher, hook.subcommand);
-    }
-}
-
-fn doctor_check_agent_tools(dc: &mut DoctorCounters, config: &serde_json::Value) {
-    if json_array_contains_str(config, "tools", KIRO_AGENT_ALL_TOOLS) {
-        dc.pass("Kiro tracedecay agent exposes all configured tools");
-    } else {
-        dc.warn(
-            "Kiro tracedecay agent tools list is not permissive -- run `tracedecay install --agent kiro`",
-        );
-    }
-}
-
-fn doctor_check_agent_allowed_tools(dc: &mut DoctorCounters, config: &serde_json::Value) {
-    let required = [KIRO_ALLOWED_BUILTIN_TOOLS, KIRO_ALLOWED_TRACEDECAY_TOOLS];
-    let missing: Vec<&str> = required
-        .iter()
-        .copied()
-        .filter(|tool| !json_array_contains_str(config, "allowedTools", tool))
-        .collect();
-
-    if missing.is_empty() {
-        dc.pass("Kiro tracedecay agent pre-approves built-in and tracedecay tools");
-    } else {
-        dc.warn(
-            "Kiro tracedecay agent allowedTools is not permissive -- run `tracedecay install --agent kiro`",
-        );
-        for tool in missing {
-            dc.info(&format!("missing allowedTools entry: {tool}"));
-        }
-    }
-}
-
-fn json_array_contains_str(config: &serde_json::Value, field: &str, expected: &str) -> bool {
-    config
-        .get(field)
-        .and_then(|v| v.as_array())
-        .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(expected)))
-}
-
-fn doctor_check_agent_hook(
-    dc: &mut DoctorCounters,
-    config: &serde_json::Value,
-    event: &str,
-    matcher: Option<&str>,
-    subcommand: &str,
-) {
-    let hook = find_agent_hook(config, event, matcher, subcommand);
-    let Some(hook) = hook else {
-        let matcher_label = matcher.map_or(String::new(), |m| format!(" ({m})"));
-        dc.fail(&format!(
-            "Kiro {event}{matcher_label} hook missing {subcommand} -- run `tracedecay install --agent kiro`"
-        ));
-        return;
-    };
-
-    // Kiro's hook schema is `command` + optional `matcher` only. A stray
-    // `timeout_ms` is residue from an older tracedecay version that wrote an
-    // undocumented field; a reinstall rewrites the entry to the exact schema.
-    if hook.get("timeout_ms").is_some() {
-        dc.warn(&format!(
-            "Kiro {event} hook carries an undocumented timeout_ms field from an older \
-             tracedecay version -- run `tracedecay install --agent kiro` to rewrite it"
-        ));
-        return;
-    }
-    let matcher_label = matcher.map_or(String::new(), |m| format!(" ({m})"));
-    dc.pass(&format!("Kiro {event}{matcher_label} hook installed"));
-}
-
-fn find_agent_hook<'a>(
-    config: &'a serde_json::Value,
-    event: &str,
-    matcher: Option<&str>,
-    subcommand: &str,
-) -> Option<&'a serde_json::Value> {
-    config
-        .get("hooks")
-        .and_then(|v| v.get(event))
-        .and_then(serde_json::Value::as_array)?
-        .iter()
-        .find(|hook| {
-            let matcher_ok = match matcher {
-                Some(expected) => {
-                    hook.get("matcher").and_then(serde_json::Value::as_str) == Some(expected)
-                }
-                None => hook.get("matcher").is_none(),
-            };
-            matcher_ok
-                && hook
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|cmd| cmd.split_whitespace().any(|part| part == subcommand))
-        })
-}
-
-fn doctor_check_default_agent(dc: &mut DoctorCounters, home: &Path) {
-    let path = cli_config_path(home);
-    if !path.exists() {
-        dc.fail(&format!(
-            "{} not found -- run `tracedecay install --agent kiro`",
-            path.display()
-        ));
-        return;
-    }
-
-    let config = load_json_file(&path);
-    let default_agent = config
-        .get("chat")
-        .and_then(|v| v.get("defaultAgent"))
-        .and_then(serde_json::Value::as_str);
-
-    match default_agent {
-        Some(KIRO_AGENT_NAME) => dc.pass("Kiro default agent is tracedecay"),
-        Some(agent) if is_builtin_default_agent(agent) => dc.warn(
-            "Kiro default agent is still the built-in default -- run `tracedecay install --agent kiro`",
-        ),
-        Some(agent) => dc.warn(&format!(
-            "Kiro default agent is \"{agent}\"; tracedecay hooks run only when the tracedecay agent is selected"
-        )),
-        None => dc.warn(
-            "Kiro default agent is not set; tracedecay hooks run only when the tracedecay agent is selected",
-        ),
     }
 }
 

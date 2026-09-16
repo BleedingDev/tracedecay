@@ -22,7 +22,6 @@ mod git_surface;
 mod handoff;
 mod lsp;
 mod problem_response;
-mod semantic;
 mod work;
 mod workflow;
 
@@ -30,7 +29,6 @@ pub use feedback::DaemonFeedbackResult;
 pub use git::{DaemonGitEffectResult, DaemonGitPreviewResult};
 pub use handoff::{HandoffApplicationInvocationV1, HandoffApplicationOutcomeV1};
 pub use lsp::DaemonLspSessionAccess;
-pub use semantic::{CanonicalQualificationBlob, CanonicalQualificationBlobError};
 use serde::{Deserialize, Serialize};
 use tracedecay_contracts::{
     ApplicationOutcome, ApplicationProblem, AuthorizedScopeSet, CancellationContext, Deadline,
@@ -47,6 +45,7 @@ use crate::lsp_wire::{MAX_LSP_FRAME_BYTES, MAX_LSP_WORKSPACE_ROOTS};
 use crate::surface::GitReadSurfaceRequest;
 use tracedecay_contracts::ConfigurationWireRequestV1;
 use tracedecay_contracts::context_scout::ContextScoutSurfaceRequestV1;
+use tracedecay_contracts::feedback::FeedbackProximityReadRequestV1;
 use tracedecay_contracts::feedback::observations::{
     FeedbackDeliveryRouteV1, FeedbackSourceEventV1,
 };
@@ -384,6 +383,7 @@ pub enum DaemonInvocationOperation {
     FeedbackExpand,
     FeedbackList,
     FeedbackAdvisoryCycle,
+    FeedbackProximity,
     FeedbackImpact,
     AffectedTests,
     FeedbackObserve,
@@ -409,9 +409,6 @@ pub enum DaemonInvocationOperation {
     WorkApplication,
     WorkflowApplication,
     HandoffApplication,
-    SemanticEvaluateAndPublish,
-    SemanticActivate,
-    SemanticQualify,
     LspOpen,
     LspFrame,
     LspPoll,
@@ -451,6 +448,7 @@ impl DaemonInvocationOperation {
             Self::FeedbackExpand => "feedback_expand",
             Self::FeedbackList => "feedback_list",
             Self::FeedbackAdvisoryCycle => "feedback_advisory_cycle",
+            Self::FeedbackProximity => "feedback_proximity",
             Self::FeedbackImpact => "feedback_impact",
             Self::AffectedTests => "affected_tests",
             Self::FeedbackObserve => "feedback_observe",
@@ -476,9 +474,6 @@ impl DaemonInvocationOperation {
             Self::WorkApplication => "work_application",
             Self::WorkflowApplication => "workflow_application",
             Self::HandoffApplication => "handoff_application",
-            Self::SemanticEvaluateAndPublish => "semantic_evaluate_and_publish",
-            Self::SemanticActivate => "semantic_activate",
-            Self::SemanticQualify => "semantic_qualify",
             Self::LspOpen => "lsp_open",
             Self::LspFrame => "lsp_frame",
             Self::LspPoll => "lsp_poll",
@@ -569,6 +564,11 @@ pub enum DaemonInvocationPayload {
     FeedbackAdvisoryCycle {
         document_uri: String,
         observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    },
+    FeedbackProximity {
+        request: FeedbackProximityReadRequestV1,
         deadline: Deadline,
         cancellation: CancellationContext,
     },
@@ -692,32 +692,6 @@ pub enum DaemonInvocationPayload {
     },
     HandoffApplication {
         request: HandoffApplicationInvocationV1,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    },
-    SemanticEvaluateAndPublish {
-        evaluated_profile_id: String,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    },
-    /// One operator journey: evaluate the named profile natively, publish the
-    /// accepted evaluation, and compare-and-swap it into `active_profile` of
-    /// the project's semantic runtime configuration. The daemon composes the
-    /// installed-model material and the configuration revision itself; the
-    /// caller authors only the profile selection.
-    SemanticActivate {
-        evaluated_profile_id: String,
-        /// Record the previously active profile as `rollback_profile` when
-        /// one exists and differs from the newly activated selection.
-        set_rollback: bool,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    },
-    SemanticQualify {
-        evaluated_profile_id: String,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -858,6 +832,7 @@ impl DaemonInvocationRequest {
             ApplicationSurfaceOperation::TestResults
             | ApplicationSurfaceOperation::ObservatoryRead
             | ApplicationSurfaceOperation::FeedbackAdvisoryCycle
+            | ApplicationSurfaceOperation::FeedbackProximity
             | ApplicationSurfaceOperation::SessionLookup
             | ApplicationSurfaceOperation::QualifiedName
             | ApplicationSurfaceOperation::CallChain
@@ -963,6 +938,25 @@ impl DaemonInvocationRequest {
             payload: DaemonInvocationPayload::FeedbackAdvisoryCycle {
                 document_uri,
                 observed_at,
+                deadline,
+                cancellation,
+            },
+        }
+    }
+
+    pub fn feedback_proximity(
+        request_id: impl Into<String>,
+        request: FeedbackProximityReadRequestV1,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    ) -> Self {
+        Self {
+            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
+            revision: DAEMON_INVOCATION_REVISION,
+            request_id: request_id.into(),
+            delivery_route: None,
+            payload: DaemonInvocationPayload::FeedbackProximity {
+                request,
                 deadline,
                 cancellation,
             },
@@ -1304,71 +1298,6 @@ impl DaemonInvocationRequest {
         }
     }
 
-    pub fn semantic_evaluate_and_publish(
-        request_id: impl Into<String>,
-        evaluated_profile_id: String,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    ) -> Self {
-        Self {
-            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
-            revision: DAEMON_INVOCATION_REVISION,
-            request_id: request_id.into(),
-            delivery_route: None,
-            payload: DaemonInvocationPayload::SemanticEvaluateAndPublish {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            },
-        }
-    }
-
-    pub fn semantic_activate(
-        request_id: impl Into<String>,
-        evaluated_profile_id: String,
-        set_rollback: bool,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    ) -> Self {
-        Self {
-            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
-            revision: DAEMON_INVOCATION_REVISION,
-            request_id: request_id.into(),
-            delivery_route: None,
-            payload: DaemonInvocationPayload::SemanticActivate {
-                evaluated_profile_id,
-                set_rollback,
-                observed_at,
-                deadline,
-                cancellation,
-            },
-        }
-    }
-
-    pub fn semantic_qualify(
-        request_id: impl Into<String>,
-        evaluated_profile_id: String,
-        observed_at: UtcMicros,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-    ) -> Self {
-        Self {
-            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
-            revision: DAEMON_INVOCATION_REVISION,
-            request_id: request_id.into(),
-            delivery_route: None,
-            payload: DaemonInvocationPayload::SemanticQualify {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            },
-        }
-    }
-
     pub fn callable_code(
         request_id: impl Into<String>,
         surface_operation: ApplicationSurfaceOperation,
@@ -1674,6 +1603,9 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::FeedbackAdvisoryCycle { .. } => {
                 DaemonInvocationOperation::FeedbackAdvisoryCycle
             }
+            DaemonInvocationPayload::FeedbackProximity { .. } => {
+                DaemonInvocationOperation::FeedbackProximity
+            }
             DaemonInvocationPayload::FeedbackImpact { .. } => {
                 DaemonInvocationOperation::FeedbackImpact
             }
@@ -1758,15 +1690,6 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::HandoffApplication { .. } => {
                 DaemonInvocationOperation::HandoffApplication
             }
-            DaemonInvocationPayload::SemanticEvaluateAndPublish { .. } => {
-                DaemonInvocationOperation::SemanticEvaluateAndPublish
-            }
-            DaemonInvocationPayload::SemanticActivate { .. } => {
-                DaemonInvocationOperation::SemanticActivate
-            }
-            DaemonInvocationPayload::SemanticQualify { .. } => {
-                DaemonInvocationOperation::SemanticQualify
-            }
             DaemonInvocationPayload::LspOpen { .. } => DaemonInvocationOperation::LspOpen,
             DaemonInvocationPayload::LspFrame { .. } => DaemonInvocationOperation::LspFrame,
             DaemonInvocationPayload::LspPoll { .. } => DaemonInvocationOperation::LspPoll,
@@ -1812,6 +1735,7 @@ impl DaemonInvocationRequest {
                 | DaemonInvocationOperation::FeedbackExpand
                 | DaemonInvocationOperation::FeedbackList
                 | DaemonInvocationOperation::FeedbackAdvisoryCycle
+                | DaemonInvocationOperation::FeedbackProximity
                 | DaemonInvocationOperation::FeedbackImpact
                 | DaemonInvocationOperation::AffectedTests
                 | DaemonInvocationOperation::FeedbackObserve
@@ -1837,9 +1761,6 @@ impl DaemonInvocationRequest {
                 | DaemonInvocationOperation::WorkApplication
                 | DaemonInvocationOperation::WorkflowApplication
                 | DaemonInvocationOperation::HandoffApplication
-                | DaemonInvocationOperation::SemanticEvaluateAndPublish
-                | DaemonInvocationOperation::SemanticActivate
-                | DaemonInvocationOperation::SemanticQualify
                 | DaemonInvocationOperation::LspOpen
                 | DaemonInvocationOperation::SourceEdit
                 | DaemonInvocationOperation::SourceEditReconcile
@@ -2080,45 +2001,6 @@ impl DaemonInvocationRequest {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
             }
-            DaemonInvocationPayload::SemanticEvaluateAndPublish {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            }
-            | DaemonInvocationPayload::SemanticActivate {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-                ..
-            } => {
-                if evaluated_profile_id.trim() != evaluated_profile_id
-                    || evaluated_profile_id.is_empty()
-                    || evaluated_profile_id.len() > MAX_OPAQUE_HANDLE_BYTES
-                    || observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
-                    return Err(DaemonInvocationProblem::InvalidRequest);
-                }
-            }
-            DaemonInvocationPayload::SemanticQualify {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            } => {
-                if evaluated_profile_id.trim() != evaluated_profile_id
-                    || evaluated_profile_id.is_empty()
-                    || evaluated_profile_id.len() > MAX_OPAQUE_HANDLE_BYTES
-                    || observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
-                    return Err(DaemonInvocationProblem::InvalidRequest);
-                }
-            }
             DaemonInvocationPayload::CallableCode {
                 surface_operation,
                 request,
@@ -2254,6 +2136,18 @@ impl DaemonInvocationRequest {
             } => {
                 if !valid_printable(document_uri, MAX_ROOT_HINT_BYTES)
                     || observed_at.0 <= 0
+                    || deadline.expires_at.0 <= 0
+                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                {
+                    return Err(DaemonInvocationProblem::InvalidRequest);
+                }
+            }
+            DaemonInvocationPayload::FeedbackProximity {
+                request,
+                deadline,
+                cancellation,
+            } => {
+                if request.observed_at.0 <= 0
                     || deadline.expires_at.0 <= 0
                     || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
                 {
@@ -2470,7 +2364,7 @@ mod invocation_wire_revision_tests {
     #[test]
     fn foreign_revision_frames_refuse_as_unsupported_revision() {
         let line = format!(
-            r#"{{"protocol":"{DAEMON_INVOCATION_PROTOCOL}","revision":2,"request_id":"request.future","operation":"semantic_activate_v3"}}"#
+            r#"{{"protocol":"{DAEMON_INVOCATION_PROTOCOL}","revision":2,"request_id":"request.future","operation":"future_operation"}}"#
         );
         assert_eq!(
             parse_problem(&line),
@@ -2610,34 +2504,6 @@ pub enum DaemonInvocationOutcome {
     HandoffApplication {
         scope: ResolvedScope,
         outcome: HandoffApplicationOutcomeV1,
-    },
-    SemanticEvaluatedProfilePublished {
-        scope: ResolvedScope,
-        profile_digest: ManifestDigest,
-        report_digest: ManifestDigest,
-        report: serde_json::Value,
-        source_generation: tracedecay_domain::CodeGenerationId,
-        snapshot_digest: ManifestDigest,
-    },
-    /// Terminal receipt of the composed evaluate → publish → activate journey.
-    ///
-    /// `configuration_revision` is the revision produced by the activation
-    /// compare-and-swap; `runtime_state` is the serialized
-    /// `SemanticRuntimeStateV1` observed immediately after that revision
-    /// applied (the daemon serializes the typed state; like the evaluation
-    /// `report` above, it crosses this wire as JSON), so a caller can
-    /// distinguish "activation recorded, runtime converging" from "ready".
-    SemanticProfileActivated {
-        scope: ResolvedScope,
-        profile_digest: ManifestDigest,
-        report_digest: ManifestDigest,
-        configuration_revision: tracedecay_domain::configuration::ConfigurationRevisionId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        rollback_profile_id: Option<String>,
-        runtime_state: serde_json::Value,
-    },
-    SemanticEvaluatedProfileQualified {
-        qualification: CanonicalQualificationBlob,
     },
     ObservationAccepted,
     ApplicationProblem {

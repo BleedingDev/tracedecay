@@ -46,7 +46,7 @@ impl tracedecay_mcp::server::McpConnectionContext for ProductionMcpConnectionCon
     }
 
     fn tool_is_read_only(&self, tool_name: &str) -> bool {
-        crate::mcp::tools::mcp_dispatch_contract(tool_name)
+        tracedecay_mcp::tools::binding::mcp_dispatch_contract(tool_name)
             .is_ok_and(tracedecay_tool_catalog::McpDispatchContractV1::read_only)
     }
 
@@ -59,12 +59,12 @@ impl tracedecay_mcp::server::McpConnectionContext for ProductionMcpConnectionCon
         request: tracedecay_mcp::server::McpDispatchRequest<'a>,
         timings_enabled: bool,
         connection: &'a mut Self::Connection,
-        pre_cancelled: bool,
+        cancellation: tracedecay_session_memory::context::CancellationToken,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<JsonRpcResponse>> + Send + 'a>>
     {
         Box::pin(
             self.server
-                .dispatch_envelope(request, timings_enabled, connection, pre_cancelled),
+                .dispatch_envelope(request, timings_enabled, connection, cancellation),
         )
     }
 
@@ -503,7 +503,7 @@ impl McpServer {
         let guard = self.project_host_admission_replay.lock().await;
         guard.as_ref().map_or(
             0,
-            project_host_admission_replay::ProjectHostAdmissionReplayTask::pass_count,
+            tracedecay_mcp::server::ProjectHostAdmissionReplayTask::pass_count,
         )
     }
 
@@ -513,7 +513,7 @@ impl McpServer {
         let guard = self.project_host_admission_replay.lock().await;
         guard.as_ref().map_or(
             0,
-            project_host_admission_replay::ProjectHostAdmissionReplayTask::backoff_count,
+            tracedecay_mcp::server::ProjectHostAdmissionReplayTask::backoff_count,
         )
     }
 }

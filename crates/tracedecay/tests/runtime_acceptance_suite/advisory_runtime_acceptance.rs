@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracedecay::tracedecay::TraceDecay;
+use tracedecay::project::TraceDecay;
 use tracedecay_application::advisory::ci_runtime::GitHubCiOfficialResponseDecoderV1;
 #[cfg(feature = "test-transport")]
 use tracedecay_application::advisory::ci_runtime::{
@@ -72,7 +72,9 @@ use tracedecay_contracts::feedback::{
     FeedbackCycleAdvisoryV1, FeedbackCycleControl, FeedbackCycleExecutionRequest,
     FeedbackCycleService, FeedbackDiagnosticsPort, FeedbackDiagnosticsRequest, FeedbackImpactPort,
     FeedbackImpactPortOutcome, FeedbackImpactRequest, FeedbackObservationPort,
-    FeedbackRuntimeStateV1, ProximityEvaluationRequestV1, feedback_surface_operation,
+    FeedbackProximityAccessKindV1, FeedbackProximityEncounterV1, FeedbackProximityIntervalV1,
+    FeedbackProximityParticipantV1, FeedbackProximityRelationV1, FeedbackRuntimeStateV1,
+    ProximityEvaluationRequestV1, feedback_surface_operation,
 };
 #[cfg(feature = "test-transport")]
 use tracedecay_contracts::{
@@ -99,10 +101,10 @@ use tracedecay_domain::feedback::{
 };
 #[cfg(feature = "test-transport")]
 use tracedecay_domain::{
-    CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
-    CanonicalObservationFactV1, CanonicalObservationRelationsV1, CodeGenerationId,
-    ComponentVersion, LocatorDigest, ObservationId, ObservationOrderingDomainV1,
-    ObservationSourceRangeV1, SessionId, SymbolOccurrenceId,
+    AgentInstanceId, CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1,
+    CanonicalObservationEvidenceV1, CanonicalObservationFactV1, CanonicalObservationRelationsV1,
+    CodeGenerationId, ComponentVersion, LocatorDigest, ObservationId, ObservationOrderingDomainV1,
+    ObservationSourceIdentityV1, ObservationSourceRangeV1, SessionId, SymbolOccurrenceId,
 };
 
 mod code_graph;
@@ -976,10 +978,9 @@ async fn packaged_host_ingest_delivers_a_registered_advisory_cycle() {
         "format": "json",
     })
     .to_string();
-    // The first tool call triggers the daemon's cold project open, and the
-    // hook tool surface deliberately returns the typed warming state instead
-    // of retrying internally. Waiting that documented retryable state out is
-    // the client protocol, so only a non-warming failure is a test failure.
+    // Project opening and observation projection are both deferred. Retry
+    // their typed progress states within the same fixed deadline; a terminal
+    // successful response must still prove that this pass committed data.
     let ingest_deadline = std::time::Instant::now() + Duration::from_secs(60);
     let output = loop {
         let output = common::tracedecay_command_with_home(environment.home())
@@ -996,17 +997,34 @@ async fn packaged_host_ingest_delivers_a_registered_advisory_cycle() {
             .output()
             .expect("invoke registered daemon observation path");
         if output.status.success() {
-            break output;
+            let response: Value =
+                serde_json::from_slice(&output.stdout).expect("registered daemon ingest response");
+            let payload: Value = serde_json::from_str(
+                response["content"][0]["text"]
+                    .as_str()
+                    .expect("registered daemon ingest response text"),
+            )
+            .expect("registered daemon ingest payload");
+            if payload["completed"] != false {
+                break output;
+            }
+            assert_eq!(
+                payload["admission"]["retryable"], true,
+                "incomplete ingest must carry a retryable admission: {response}"
+            );
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                stderr.contains("is warming in the background"),
+                "registered daemon ingest failed\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout),
+            );
         }
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        assert!(
-            stderr.contains("is warming in the background"),
-            "registered daemon ingest failed\nstdout:\n{}\nstderr:\n{stderr}",
-            String::from_utf8_lossy(&output.stdout),
-        );
         assert!(
             std::time::Instant::now() < ingest_deadline,
-            "registered daemon project stayed warming past the ingest deadline\nstderr:\n{stderr}",
+            "registered daemon ingest did not complete before its deadline\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
@@ -1746,6 +1764,44 @@ async fn one_saved_edit_cycle_returns_all_four_advisory_pillars_together() {
         scope: scope.clone(),
         observed_at: now,
     };
+    let participant = |ordinal: usize| FeedbackProximityParticipantV1 {
+        source: ObservationSourceIdentityV1::for_provider(
+            ProviderId::new("provider.cursor").unwrap(),
+            peers[ordinal].clone(),
+        )
+        .unwrap(),
+        agent_id: AgentInstanceId::new(format!("agent.advisory.peer.{}", ordinal + 1)).unwrap(),
+        worktree_id: Some(scope.worktree_id.clone()),
+        worktree_root: project.to_string_lossy().into_owned(),
+        branch_ref: Some(RefId::new(scope.branch_ref.clone()).unwrap()),
+        head_revision: Some(scope.head_commit_id.clone()),
+        access: FeedbackProximityAccessKindV1::Write,
+        activity: FeedbackProximityIntervalV1 {
+            start: UtcMicros(now.0.saturating_sub(2_000_000)),
+            end: now,
+        },
+        address: tracedecay_domain::feedback::ProximityAddressV1 {
+            scope: scope.clone(),
+            file: ci_symbol.file.clone(),
+            span: Some(ci_symbol.span),
+            symbol: Some(ci_symbol.symbol.clone()),
+        },
+    };
+    let encounter = FeedbackProximityEncounterV1 {
+        encounter_id: four_pillar_digest('3'),
+        scope: scope.clone(),
+        interval: FeedbackProximityIntervalV1 {
+            start: UtcMicros(now.0.saturating_sub(1_000_000)),
+            end: now,
+        },
+        participants: vec![participant(0), participant(1)],
+        relation: FeedbackProximityRelationV1::OverlappingEdit {
+            warning_class: ProximityWarningClassV1::SameFile,
+        },
+        observed_at: UtcMicros(now.0.saturating_sub(1_000_000)),
+        expires_at: UtcMicros(now.0.saturating_add(600_000_000)),
+        coverage: ProximityCoverageV1::Complete,
+    };
     let proximity_evidence = fixture
         .proximity_evidence(AdvisoryProximityFixtureEvidenceV1 {
             observations: peers
@@ -1756,6 +1812,7 @@ async fn one_saved_edit_cycle_returns_all_four_advisory_pillars_together() {
             retrieval_anchor_ids: vec![
                 RetrievalAnchorId::new("anchor.advisory.four-pillar.proximity").unwrap(),
             ],
+            encounter,
             address: tracedecay_domain::feedback::ProximityAddressV1 {
                 scope: scope.clone(),
                 file: ci_symbol.file.clone(),
@@ -1783,10 +1840,18 @@ async fn one_saved_edit_cycle_returns_all_four_advisory_pillars_together() {
     let proximity_owner = ProximityRuntimeOwnerV1::new(
         scope.clone(),
         RecordedProximityEvidenceAuthority {
-            batch: CanonicalProximityEvidenceBatchV1::new(
-                vec![proximity_evidence],
-                ProximityCoverageV1::Complete,
-            )
+            batch: CanonicalProximityEvidenceBatchV1 {
+                evidence: vec![proximity_evidence],
+                coverage: ProximityCoverageV1::Complete,
+                source_generation: CodeGenerationId::new(
+                    "generation.advisory.four-pillar.proximity",
+                )
+                .unwrap(),
+                observed_at: now,
+                expires_at: UtcMicros(now.0.saturating_add(600_000_000)),
+                omissions: Vec::new(),
+            }
+            .validated()
             .expect("proximity evidence batch"),
         },
         (),

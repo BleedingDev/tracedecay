@@ -10,13 +10,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock},
 };
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracedecay_code_extraction::ExtractionArtifactV1;
+use tracedecay_code_extraction::{ExtractedCloneBodyV1, ExtractionArtifactV1};
 use tracedecay_domain::{
     BoundedSanitizedText, CanonicalRelationEdgeV1, ChunkLogicalIdentityV1, ChunkerRevision,
     CodeGenerationId, CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId,
@@ -32,6 +32,10 @@ use super::{
     extract::{ExtractedCodeFileV1, ExtractionCancellation},
     intake::ReceiptBoundCodeFileV1,
     lineage::LineageSymbolRecordV1,
+};
+use crate::clones::{
+    CloneBodyOccurrenceV1, ClonePayloadBuildContextV1, ClonePayloadBuildStatsV1,
+    CodeIndexCloneBodyV1,
 };
 use crate::extract::{ExtractionBatchV1, ParseOutcomeV1};
 
@@ -128,23 +132,45 @@ pub struct ExactExtractionAuthorityV1 {
     chunk_digests: BTreeMap<CodeSearchChunkId, MintedChunkAuthorityV1>,
 }
 
-/// One minted chunk: its canonical digest and the row allocation the digest
-/// was computed over.
+/// One minted chunk: the row allocation the mint covered, and its canonical
+/// digest once some admission has needed one.
 ///
 /// Every production admission presents the very rows the authority was minted
 /// from (a file's `artifacts.chunks` next to its `exact_authority`), so
 /// re-digesting them proved nothing the mint had not already proved and cost
 /// one canonical serialization plus SHA-256 per chunk per pass. A
-/// `CodeSearchChunkV1` has no interior mutability and a shared `Arc` cannot
-/// be written in place while this weak reference is live (`Arc::get_mut`
-/// refuses, `Arc::make_mut` moves the value to a fresh allocation), so a row
-/// that still upgrades to the minted allocation carries the minted bytes.
-/// Any other row — a fresh allocation, a row minted elsewhere, a forgery —
-/// is digested and compared as before.
+/// `CodeSearchChunkV1` has no interior mutability and a shared `Arc` cannot be
+/// written in place while this reference is live (`Arc::get_mut` refuses,
+/// `Arc::make_mut` moves the value to a fresh allocation), so a row that is
+/// still this allocation carries the minted bytes and allocation identity
+/// alone admits it.
+///
+/// The digest is therefore what a row the authority did *not* mint — a fresh
+/// allocation, a row minted elsewhere, a forgery — is compared against, and
+/// only such a row makes the mint pay for one. Minting it up front cost a
+/// corpus-scale digest sweep per generation for a comparison most rows never
+/// reach. The minted row is held, not weakly referenced, so the digest stays
+/// derivable for as long as the authority itself is: it is one more pointer to
+/// an allocation the authority's own file artifacts already share.
 #[derive(Clone, Debug)]
 struct MintedChunkAuthorityV1 {
-    digest: String,
-    minted_row: Weak<CodeSearchChunkV1>,
+    minted_row: Arc<CodeSearchChunkV1>,
+    digest: OnceLock<String>,
+}
+
+impl MintedChunkAuthorityV1 {
+    /// The minted row's canonical digest, derived on the first admission that
+    /// cannot settle on allocation identity and reused after that.
+    fn digest(&self) -> Result<&str, ChunkingFailureV1> {
+        if let Some(digest) = self.digest.get() {
+            return Ok(digest);
+        }
+        let digest = canonical_digest(
+            EXACT_EXTRACTION_AUTHORITY_SEPARATOR,
+            self.minted_row.as_ref(),
+        )?;
+        Ok(self.digest.get_or_init(|| digest))
+    }
 }
 
 /// One chunk re-admitted through parser-backed extraction authority.
@@ -187,32 +213,6 @@ unsafe impl ExtractionAdmittedChunkV1 for ExtractionAdmittedCodeSearchChunkV1 {
 /// for the coarser per-file fan-out above this layer.
 const PARALLEL_CHUNK_THRESHOLD: usize = 16;
 
-/// Map `operation` over every chunk, fanning out across the pool once the batch
-/// is large enough. Each parallel unit runs through `admit`, which meters it
-/// against the CPU authority the caller executes under. Results are returned
-/// in chunk order and the reported failure is always the lowest-index one, so
-/// the outcome is identical to the sequential sweep this replaces.
-#[hotpath::measure(label = "code_index.chunk.map_ordered")]
-fn map_chunks_ordered<T, F, A>(
-    admit: A,
-    chunks: &[Arc<CodeSearchChunkV1>],
-    operation: F,
-) -> Result<Vec<T>, ChunkingFailureV1>
-where
-    T: Send,
-    F: Fn(&CodeSearchChunkV1) -> Result<T, ChunkingFailureV1> + Send + Sync,
-    A: Fn(&mut dyn FnMut() -> Result<T, ChunkingFailureV1>) -> Result<T, ChunkingFailureV1> + Sync,
-{
-    if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
-        return chunks.iter().map(|chunk| operation(chunk)).collect();
-    }
-    let results: Vec<Result<T, ChunkingFailureV1>> = chunks
-        .par_iter()
-        .map(|chunk| admit(&mut || operation(chunk)))
-        .collect::<Vec<_>>();
-    results.into_iter().collect()
-}
-
 /// Run `operation` over every chunk for its failure only, fanning out across
 /// the pool once the batch is large enough. The lowest-index failure is
 /// returned, matching the sequential sweep's short-circuit outcome.
@@ -245,30 +245,28 @@ where
 }
 
 impl ExactExtractionAuthorityV1 {
-    fn mint(chunks: &[Arc<CodeSearchChunkV1>]) -> Result<Self, ChunkingFailureV1> {
-        let digests = map_chunks_ordered(
-            |unit| crate::parallelism::with_background_cpu_permit(unit),
-            chunks,
-            |chunk| canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk),
-        )?;
-        let mut chunk_digests = BTreeMap::new();
-        for (chunk, digest) in chunks.iter().zip(digests) {
-            chunk_digests.insert(
-                chunk.id.clone(),
-                MintedChunkAuthorityV1 {
-                    digest,
-                    minted_row: Arc::downgrade(chunk),
-                },
-            );
+    fn mint(chunks: &[Arc<CodeSearchChunkV1>]) -> Self {
+        Self {
+            chunk_digests: chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.id.clone(),
+                        MintedChunkAuthorityV1 {
+                            minted_row: Arc::clone(chunk),
+                            digest: OnceLock::new(),
+                        },
+                    )
+                })
+                .collect(),
         }
-        Ok(Self { chunk_digests })
     }
 
     #[cfg(test)]
-    fn digests(&self) -> BTreeMap<CodeSearchChunkId, String> {
+    fn digests(&self) -> Result<BTreeMap<CodeSearchChunkId, String>, ChunkingFailureV1> {
         self.chunk_digests
             .iter()
-            .map(|(id, minted)| (id.clone(), minted.digest.clone()))
+            .map(|(id, minted)| Ok((id.clone(), minted.digest()?.to_owned())))
             .collect()
     }
 
@@ -289,7 +287,7 @@ impl ExactExtractionAuthorityV1 {
     /// ```
     pub(crate) fn restore(chunks: &CodeFileChunksV1) -> Result<Self, ChunkingFailureV1> {
         chunks.validate()?;
-        Self::mint(&chunks.chunks)
+        Ok(Self::mint(&chunks.chunks))
     }
 
     fn validate_chunk(&self, chunk: &Arc<CodeSearchChunkV1>) -> Result<(), ChunkingFailureV1> {
@@ -302,14 +300,11 @@ impl ExactExtractionAuthorityV1 {
             )
         };
         let minted = self.chunk_digests.get(&chunk.id).ok_or_else(mismatch)?;
-        if minted
-            .minted_row
-            .upgrade()
-            .is_some_and(|minted_row| Arc::ptr_eq(&minted_row, chunk))
-        {
+        if Arc::ptr_eq(&minted.minted_row, chunk) {
             return Ok(());
         }
-        if canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk.as_ref())? != minted.digest
+        if canonical_digest(EXACT_EXTRACTION_AUTHORITY_SEPARATOR, chunk.as_ref())?
+            != minted.digest()?
         {
             return Err(mismatch());
         }
@@ -392,7 +387,7 @@ impl ExactExtractionAuthorityV1 {
             ));
         }
         self.validate_all(&prior.chunks)?;
-        Self::mint(&current.chunks)
+        Ok(Self::mint(&current.chunks))
     }
 }
 
@@ -442,13 +437,12 @@ impl CodeFileChunksV1 {
     }
 
     /// Rebind carried-forward chunks to their next generation without
-    /// changing logical chunk identity or content evidence. Symbol occurrence
-    /// IDs are rematerialized from the prior exact occurrence so they cannot
-    /// cross the generation boundary.
-    pub fn rematerialize_for_generation(
+    /// changing logical chunk identity or content evidence.
+    pub(crate) fn rematerialize_for_generation(
         &self,
         generation_id: CodeGenerationId,
         file_occurrence_id: FileOccurrenceId,
+        occurrences: &BTreeMap<SymbolOccurrenceId, SymbolOccurrenceId>,
     ) -> Result<Self, ChunkingFailureV1> {
         self.validate()?;
         if self.document.generation_id == generation_id
@@ -461,7 +455,6 @@ impl CodeFileChunksV1 {
         rematerialized.document.generation_id = generation_id.clone();
         rematerialized.document.file_occurrence_id = file_occurrence_id.clone();
 
-        let mut occurrences: BTreeMap<SymbolOccurrenceId, SymbolOccurrenceId> = BTreeMap::new();
         for chunk in &mut rematerialized.chunks {
             // Carried rows are shared with the prior generation; rebinding
             // writes into this generation's own copy.
@@ -469,17 +462,12 @@ impl CodeFileChunksV1 {
             chunk.anchor.generation_id = generation_id.clone();
             chunk.anchor.file_occurrence_id = file_occurrence_id.clone();
             if let Some(prior_occurrence) = chunk.anchor.symbol_occurrence_id.clone() {
-                let current_occurrence = if let Some(current) = occurrences.get(&prior_occurrence) {
-                    current.clone()
-                } else {
-                    let current = rematerialized_symbol_occurrence_id(
-                        &generation_id,
-                        &file_occurrence_id,
-                        &prior_occurrence,
-                    )?;
-                    occurrences.insert(prior_occurrence, current.clone());
-                    current
-                };
+                let current_occurrence =
+                    occurrences.get(&prior_occurrence).cloned().ok_or_else(|| {
+                        ChunkingFailureV1::NonCanonicalIdentity(
+                            "carried chunk occurrence has no logical symbol binding".to_owned(),
+                        )
+                    })?;
                 chunk.anchor.symbol_occurrence_id = Some(current_occurrence.clone());
                 for term in &mut chunk.exact_terms {
                     if term.kind() == ExactTechnicalTermKindV1::WholeSymbol {
@@ -517,10 +505,6 @@ pub const SYMBOL_IDENTITY_SEPARATOR: &str = "tracedecay.code-symbol-identity.v1"
 
 /// Domain separator for symbol occurrence identity digests.
 pub const SYMBOL_OCCURRENCE_SEPARATOR: &str = "tracedecay.code-symbol-occurrence.v1";
-
-/// Domain separator for carried symbol-occurrence rematerialization.
-pub const SYMBOL_OCCURRENCE_REMATERIALIZATION_SEPARATOR: &str =
-    "tracedecay.code-symbol-occurrence-rematerialization.v1";
 
 /// Domain separator for parser-backed exact extraction authority.
 pub const EXACT_EXTRACTION_AUTHORITY_SEPARATOR: &str = "tracedecay.exact-extraction-authority.v1";
@@ -623,7 +607,7 @@ impl DeterministicCodeChunker {
         cancellation: &dyn ExtractionCancellation,
     ) -> Result<(CodeFileIndexArtifactsV1, ExactExtractionAuthorityV1), ChunkingFailureV1> {
         let result = self.index_file(file, batch, descriptor, cancellation)?;
-        let authority = ExactExtractionAuthorityV1::mint(&result.chunks.chunks)?;
+        let authority = ExactExtractionAuthorityV1::mint(&result.chunks.chunks);
         Ok((result, authority))
     }
 
@@ -639,6 +623,34 @@ impl DeterministicCodeChunker {
         sensitivity_level: SensitivityLevelV1,
         cancellation: &dyn ExtractionCancellation,
     ) -> Result<(CodeFileIndexArtifactsV1, ExactExtractionAuthorityV1), ChunkingFailureV1> {
+        let (artifacts, authority, _) = self.index_file_with_authority_from_extraction_reusing(
+            file,
+            extraction,
+            descriptor,
+            sensitivity_level,
+            cancellation,
+            None,
+        )?;
+        Ok((artifacts, authority))
+    }
+
+    pub(crate) fn index_file_with_authority_from_extraction_reusing(
+        &self,
+        file: &ReceiptBoundCodeFileV1,
+        extraction: &ExtractedCodeFileV1,
+        descriptor: &LanguageDescriptorV1,
+        sensitivity_level: SensitivityLevelV1,
+        cancellation: &dyn ExtractionCancellation,
+        prior_clone_bodies: Option<&[CodeIndexCloneBodyV1]>,
+    ) -> Result<
+        (
+            CodeFileIndexArtifactsV1,
+            ExactExtractionAuthorityV1,
+            ClonePayloadBuildStatsV1,
+        ),
+        ChunkingFailureV1,
+    > {
+        let mut clone_build = ClonePayloadBuildContextV1::new(prior_clone_bodies);
         let result = self.build_file_artifacts_with_parse(
             file,
             extraction.batch(),
@@ -646,12 +658,13 @@ impl DeterministicCodeChunker {
             Some(extraction.parse_artifact()),
             sensitivity_level,
             cancellation,
+            &mut clone_build,
         )?;
         let authority = hotpath::measure_block!(
             "code_index.chunk.mint_authority",
             ExactExtractionAuthorityV1::mint(&result.chunks.chunks)
-        )?;
-        Ok((result, authority))
+        );
+        Ok((result, authority, clone_build.stats()))
     }
 
     /// Chunk one receipt-bound file and return the opaque capability required
@@ -718,37 +731,13 @@ fn canonical_digest<T: serde::Serialize>(
         .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
 }
 
-fn symbol_occurrence_id(
-    generation_id: &CodeGenerationId,
+pub(crate) fn symbol_occurrence_id(
     file_occurrence_id: &FileOccurrenceId,
     identity: &SymbolIdentityDigest,
 ) -> Result<SymbolOccurrenceId, ChunkingFailureV1> {
     canonical_digest(
         SYMBOL_OCCURRENCE_SEPARATOR,
-        &(
-            generation_id.as_str(),
-            file_occurrence_id.as_str(),
-            identity.as_str(),
-        ),
-    )
-    .and_then(|digest| {
-        SymbolOccurrenceId::new(format!("symbol.v1.{digest}"))
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
-    })
-}
-
-pub(crate) fn rematerialized_symbol_occurrence_id(
-    generation_id: &CodeGenerationId,
-    file_occurrence_id: &FileOccurrenceId,
-    prior_occurrence: &SymbolOccurrenceId,
-) -> Result<SymbolOccurrenceId, ChunkingFailureV1> {
-    canonical_digest(
-        SYMBOL_OCCURRENCE_REMATERIALIZATION_SEPARATOR,
-        &(
-            generation_id.as_str(),
-            file_occurrence_id.as_str(),
-            prior_occurrence.as_str(),
-        ),
+        &(file_occurrence_id.as_str(), identity.as_str()),
     )
     .and_then(|digest| {
         SymbolOccurrenceId::new(format!("symbol.v1.{digest}"))
@@ -796,6 +785,56 @@ struct SymbolRow {
     parent: Option<usize>,
     identity: SymbolIdentityDigest,
     occurrence: SymbolOccurrenceId,
+}
+
+fn bind_clone_bodies(
+    extracted: &[ExtractedCloneBodyV1],
+    symbols: &[SymbolRow],
+    file: &ValidatedCodeFileV1,
+    authority: &crate::intake::ReceiptBoundCodeFileAuthorityV1,
+    batch: &ExtractionBatchV1,
+    clone_build: &mut ClonePayloadBuildContextV1<'_>,
+) -> Result<Vec<CodeIndexCloneBodyV1>, ChunkingFailureV1> {
+    let mut occurrences = HashMap::with_capacity(symbols.len());
+    for symbol in symbols {
+        if occurrences
+            .insert(symbol.node_id.as_str(), &symbol.occurrence)
+            .is_some()
+        {
+            return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                "one parser node id names multiple symbol occurrences".to_owned(),
+            ));
+        }
+    }
+    let mut bound = Vec::with_capacity(extracted.len());
+    for body in extracted {
+        let symbol_occurrence_id = occurrences
+            .get(body.symbol_occurrence_id.as_str())
+            .ok_or_else(|| {
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    "clone body is not bound to an indexed symbol".to_owned(),
+                )
+            })?;
+        let payload = clone_build
+            .payload(body)
+            .map_err(ChunkingFailureV1::NonCanonicalIdentity)?;
+        bound.push(CodeIndexCloneBodyV1 {
+            occurrence: CloneBodyOccurrenceV1 {
+                project_id: authority.project_id.clone(),
+                repository_id: authority.repository_id.clone(),
+                worktree_id: authority.worktree_id.clone(),
+                source_generation: batch.generation_id.clone(),
+                snapshot_digest: file.snapshot_digest.clone(),
+                symbol_occurrence_id: (*symbol_occurrence_id).clone(),
+                path: body.logical_path.clone(),
+                body_span: body.body_span,
+                payload_digest: payload.payload_digest.clone(),
+                eligibility: body.eligibility,
+            },
+            payload,
+        });
+    }
+    Ok(bound)
 }
 
 /// Byte offset of one line start for every line in the source.
@@ -1079,6 +1118,7 @@ impl DeterministicCodeChunker {
         descriptor: &LanguageDescriptorV1,
         cancellation: &dyn ExtractionCancellation,
     ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
+        let mut clone_build = ClonePayloadBuildContextV1::new(None);
         self.build_file_artifacts_with_parse(
             file,
             batch,
@@ -1086,6 +1126,7 @@ impl DeterministicCodeChunker {
             None,
             self.sensitivity_level,
             cancellation,
+            &mut clone_build,
         )
     }
 
@@ -1098,10 +1139,12 @@ impl DeterministicCodeChunker {
         parse_artifact: Option<&ExtractionArtifactV1>,
         sensitivity_level: SensitivityLevelV1,
         cancellation: &dyn ExtractionCancellation,
+        clone_build: &mut ClonePayloadBuildContextV1<'_>,
     ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
         if cancellation.is_cancelled() {
             return Err(ChunkingFailureV1::Cancelled);
         }
+        let authority = file.authority();
         let file = file.validated_file();
         if batch.language != descriptor.language
             || batch.descriptor_revision != descriptor.descriptor_revision
@@ -1126,12 +1169,14 @@ impl DeterministicCodeChunker {
             ParseOutcomeV1::Partial { reason } => {
                 return self.build_partial_artifacts(
                     file,
+                    authority,
                     batch,
                     descriptor,
                     parse_artifact,
                     sensitivity_level,
                     cancellation,
                     reason.clone(),
+                    clone_build,
                 );
             }
             ParseOutcomeV1::TimedOut => {
@@ -1162,12 +1207,14 @@ impl DeterministicCodeChunker {
         }
         self.build_partial_artifacts(
             file,
+            authority,
             batch,
             descriptor,
             parse_artifact,
             sensitivity_level,
             cancellation,
             String::new(),
+            clone_build,
         )
     }
 
@@ -1177,12 +1224,14 @@ impl DeterministicCodeChunker {
     fn build_partial_artifacts(
         &self,
         file: &ValidatedCodeFileV1,
+        authority: &crate::intake::ReceiptBoundCodeFileAuthorityV1,
         batch: &ExtractionBatchV1,
         descriptor: &LanguageDescriptorV1,
         parse_artifact: Option<&ExtractionArtifactV1>,
         sensitivity_level: SensitivityLevelV1,
         cancellation: &dyn ExtractionCancellation,
         partial_reason: String,
+        clone_build: &mut ClonePayloadBuildContextV1<'_>,
     ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
         let full_source = std::str::from_utf8(&file.sanitized_bytes).map_err(|error| {
             ChunkingFailureV1::NonCanonicalIdentity(format!(
@@ -1273,6 +1322,14 @@ impl DeterministicCodeChunker {
                 &published_symbol_spans(chunks.iter()),
             )
         })?;
+        let clone_bodies = bind_clone_bodies(
+            &artifact.clone_bodies,
+            &symbol_rows,
+            file,
+            authority,
+            batch,
+            clone_build,
+        )?;
         let (mut edges, edge_abstentions) = canonical_relation_edges(&result.edges, &symbol_rows);
         let (same_file_edges, unresolved_references) =
             resolve_file_references(source, &offsets, &result.unresolved_refs, &symbol_rows);
@@ -1302,6 +1359,7 @@ impl DeterministicCodeChunker {
             edges,
             edge_abstentions,
             unresolved_references,
+            clone_bodies,
             artifact,
             batch,
         )
@@ -1447,8 +1505,7 @@ impl DeterministicCodeChunker {
                 SymbolIdentityDigest::new(digest)
                     .expect("canonical digest is a valid symbol identity digest")
             })?;
-            let occurrence =
-                symbol_occurrence_id(&self.generation_id, file_occurrence_id, &identity)?;
+            let occurrence = symbol_occurrence_id(file_occurrence_id, &identity)?;
             rows.push(SymbolRow {
                 node_id: node.node_id.clone(),
                 span: node.span,
@@ -2832,15 +2889,52 @@ mod tests {
             .expect("digests outlive the minted allocations");
     }
 
-    /// The fanned-out digest sweep must produce byte-identical digests, in the
-    /// same association, as the single-threaded reference it replaced.
+    /// A restored authority admits its own rows on allocation identity alone,
+    /// so a generation's worth of rows must come back without deriving one
+    /// canonical digest.
     #[test]
-    fn parallel_digest_sweep_matches_the_sequential_reference() {
+    fn minting_derives_no_digest_until_an_admission_needs_one() {
+        let chunks = wide_chunks(48);
+        let authority = ExactExtractionAuthorityV1::restore(&chunks).expect("sealed authority");
+        authority
+            .validate_all(&chunks.chunks)
+            .expect("the minted rows are admitted");
+        assert!(
+            authority
+                .chunk_digests
+                .values()
+                .all(|minted| minted.digest.get().is_none()),
+            "admitting the minted rows must not derive a digest"
+        );
+
+        let copy = Arc::new((*chunks.chunks[7]).clone());
+        authority
+            .admit(copy)
+            .expect("an equal row in a fresh allocation is admitted by digest");
+        assert_eq!(
+            authority
+                .chunk_digests
+                .values()
+                .filter(|minted| minted.digest.get().is_some())
+                .count(),
+            1,
+            "only the row an admission could not settle by identity is digested"
+        );
+    }
+
+    /// Digests derived on demand must be byte-identical, in the same
+    /// association, to the single-threaded reference sweep.
+    #[test]
+    fn derived_digests_and_admission_match_the_sequential_reference() {
         let chunks = wide_chunks(48);
         let reference = sequential_digest_reference(&chunks.chunks);
 
         let authority = ExactExtractionAuthorityV1::restore(&chunks).expect("sealed authority");
-        assert_eq!(authority.digests(), reference);
+        assert_eq!(
+            authority.digests().expect("derived digests"),
+            reference,
+            "a digest derived on demand must equal the one the mint used to compute"
+        );
 
         authority
             .validate_all(&chunks.chunks)

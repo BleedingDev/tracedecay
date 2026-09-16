@@ -40,7 +40,6 @@
 //! actually owns: the forwarded argv, the instructions on stdin, the sealed
 //! terminal state, and the requested-versus-actual route.
 
-use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read;
@@ -54,12 +53,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay_domain::{
-    CommitId, ConfigurationRevisionId, ConfigurationSnapshotId, ManifestDigest, ProposalId,
-    ProviderId, RefId, TaskId, UtcMicros, WorkApprovalPolicy, WorkEffectStateV1, WorkEgressPolicy,
-    WorkExecutableReference, WorkExecutionLimits, WorkExecutionSnapshot,
-    WorkExecutionSnapshotInput, WorkFallbackTopology, WorkFilesystemPolicy, WorkGraphVersionV1,
-    WorkProviderBackendV1, WorkProviderProtocol, WorkProviderRouteId, WorkProviderRouteV1,
-    WorkRelationReplanProposalV1, WorkSandboxPolicy, WorkflowOperationRef,
+    CommitId, ManifestDigest, ProposalId, RefId, TaskId, WorkEffectStateV1, WorkGraphVersionV1,
+    WorkRelationReplanProposalV1, WorkflowOperationRef,
 };
 use tracedecay_runtime_core::storage::PrivateStoreIo;
 
@@ -80,7 +75,6 @@ const CANCELLED_ATTEMPT_ID: &str = "attempt.work-loop-journey.cancelled";
 /// Executable ids pinned through the configuration control plane. They sort
 /// ascending, which the setting's own validator requires.
 const FAST_EXECUTABLE_ID: &str = "executable.work-loop-journey.fast";
-const SLOW_EXECUTABLE_ID: &str = "executable.work-loop-journey.slow";
 
 /// A symbol name the fixture defines exactly once, used as the source anchor
 /// step two retrieves and expands.
@@ -89,6 +83,7 @@ const ANCHOR_SYMBOL: &str = "work_loop_journey_anchor";
 /// Instructions written to the provider's stdin; asserted byte-exact on the
 /// other side.
 const INSTRUCTIONS: &str = "Execute the admitted Work-loop journey step.";
+const CANCELLATION_INSTRUCTIONS: &str = "Execute the admitted Work-loop cancellation step.";
 
 /// How long a poll may wait for an eventually consistent publication (project
 /// runtime mount, code index generation, background attempt settlement).
@@ -141,6 +136,7 @@ struct ProductionDaemon {
     origin: String,
     authorization: String,
     agent: ureq::Agent,
+    retired_project: Option<PathBuf>,
     _home: TempDir,
     _guards: Vec<EnvVarGuard>,
     _env_lock: MutexGuard<'static, ()>,
@@ -180,7 +176,8 @@ impl ProductionDaemon {
 
         run_ok(
             Command::new("git")
-                .args(["init", "--quiet"])
+                .args(["init", "--quiet", "--separate-git-dir"])
+                .arg(root.join("repository.git"))
                 .current_dir(&project),
             "git init",
         );
@@ -238,7 +235,6 @@ impl ProductionDaemon {
             "repository.daemon.{}",
             hex::encode(Sha256::digest(git_common_dir.to_string_lossy().as_bytes()))
         );
-
         let endpoint = authority["http_application_endpoint"]
             .as_str()
             .expect("published HTTP application endpoint")
@@ -261,10 +257,113 @@ impl ProductionDaemon {
                 .timeout_global(Some(Duration::from_secs(60)))
                 .build()
                 .into(),
+            retired_project: None,
             _home: home,
             _guards: guards,
             _env_lock: env_lock,
         }
+    }
+
+    fn restart(&mut self) {
+        if self
+            .daemon
+            .try_wait()
+            .expect("query daemon status")
+            .is_none()
+        {
+            self.daemon.kill().expect("stop daemon before restart");
+            self.daemon.wait().expect("reap daemon before restart");
+        }
+        let profile = self._home.path().join(".tracedecay");
+        let root = self._home.path();
+        let authority_path = daemon_authority_path(&profile);
+        if authority_path.exists() {
+            fs::remove_file(&authority_path).expect("remove stale daemon authority before restart");
+        }
+        let mut daemon = isolated(root, &profile)
+            .args(["daemon", "run"])
+            .current_dir(&self.project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("daemon should restart");
+        let authority = wait_for_authority(&mut daemon, &authority_path);
+        let endpoint = authority["http_application_endpoint"]
+            .as_str()
+            .expect("restarted HTTP application endpoint");
+        let token = authority["auth_token"]
+            .as_str()
+            .expect("restarted auth token");
+        self.base_url = format!("http://{endpoint}");
+        self.origin = format!("http://{endpoint}");
+        self.authorization = format!("Bearer {token}");
+        self.daemon = daemon;
+    }
+
+    fn reopen_from_linked_worktree(&mut self) {
+        let linked = self._home.path().join("linked-project");
+        run_ok(
+            Command::new("git")
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&linked)
+                .arg("HEAD")
+                .current_dir(&self.project),
+            "git worktree add",
+        );
+        self.daemon
+            .kill()
+            .expect("stop daemon before linked-worktree reopen");
+        self.daemon
+            .wait()
+            .expect("reap daemon before linked-worktree reopen");
+        let retired = self._home.path().join("retired-project");
+        fs::rename(&self.project, &retired).expect("retire primary fixture worktree");
+        self.retired_project = Some(retired);
+        self.project = linked;
+        self.restart();
+        run_ok(
+            isolated(self._home.path(), &self._home.path().join(".tracedecay"))
+                .arg("init")
+                .current_dir(&self.project),
+            "tracedecay init linked worktree",
+        );
+        let context = run_ok(
+            isolated(self._home.path(), &self._home.path().join(".tracedecay"))
+                .args(["projects", "context"])
+                .arg(&self.project)
+                .arg("--json")
+                .current_dir(&self.project),
+            "tracedecay projects context linked worktree",
+        );
+        let context: Value = serde_json::from_slice(&context).expect("linked project context JSON");
+        assert_eq!(
+            context["project"]["project_id"], self.project_id,
+            "linked worktree must retain the registered project identity: {context}"
+        );
+    }
+
+    fn restore_primary_worktree(&mut self) {
+        self.daemon
+            .kill()
+            .expect("stop daemon before primary-worktree restore");
+        self.daemon
+            .wait()
+            .expect("reap daemon before primary-worktree restore");
+        let primary = self._home.path().join("project");
+        let retired = self
+            .retired_project
+            .take()
+            .expect("retired primary fixture worktree");
+        fs::rename(retired, &primary).expect("restore primary fixture worktree");
+        self.project = primary;
+        self.restart();
+        run_ok(
+            isolated(self._home.path(), &self._home.path().join(".tracedecay"))
+                .arg("init")
+                .current_dir(&self.project),
+            "tracedecay init restored primary worktree",
+        );
     }
 
     /// External URL for a canonical route path, which already starts with
@@ -594,70 +693,11 @@ fn pinned_executable(directory: &Path, name: &str, body: &str) -> (PathBuf, Mani
     )
 }
 
-/// The execution snapshot a start-attempt command pins. Every configuration
-/// identity in it is read back out of the live control plane, so the attempt
-/// records the snapshot that actually governed it rather than a literal.
-struct PinnedConfiguration {
-    revision_id: String,
-    snapshot_id: String,
-    effective_behavior_digest: String,
-    resolution_provenance_digest: String,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execution_snapshot(
-    configuration: &PinnedConfiguration,
-    executable_id: &str,
-    artifact_digest: &ManifestDigest,
-    deadline: UtcMicros,
-) -> Value {
-    let snapshot = WorkExecutionSnapshot::new(WorkExecutionSnapshotInput {
-        configuration_revision_id: typed::<ConfigurationRevisionId>(&configuration.revision_id),
-        configuration_snapshot_id: typed::<ConfigurationSnapshotId>(&configuration.snapshot_id),
-        effective_behavior_digest: ManifestDigest::new(
-            configuration.effective_behavior_digest.clone(),
-        )
-        .expect("effective behavior digest"),
-        resolution_provenance_digest: ManifestDigest::new(
-            configuration.resolution_provenance_digest.clone(),
-        )
-        .expect("resolution provenance digest"),
-        route: requested_route(),
-        backend: WorkProviderBackendV1::ClaudeCodeCli,
-        protocol: WorkProviderProtocol::ClaudeStreamJson,
-        model: "model.work-loop-journey".to_owned(),
-        executable: WorkExecutableReference::new(executable_id.to_owned(), artifact_digest.clone())
-            .expect("pinned executable reference"),
-        sandbox: WorkSandboxPolicy::Required,
-        approval: WorkApprovalPolicy::Never,
-        filesystem: WorkFilesystemPolicy::WorkspaceWrite,
-        egress: WorkEgressPolicy::Deny,
-        environment_allowlist: BTreeSet::new(),
-        credential_references: BTreeSet::new(),
-        limits: WorkExecutionLimits::new(128_000, 8_192, 65_536, 65_536, 65_536, 1)
-            .expect("execution limits"),
-        deadline,
-        fallback: WorkFallbackTopology::Disabled,
-        topology: tracedecay_domain::safe_work_topology_policy_v1(),
-    })
-    .expect("valid execution snapshot");
-    serde_json::to_value(snapshot).expect("execution snapshot encodes")
-}
-
-/// The route the attempt requests. `work_attempt_exec` reports the actual
-/// route alongside it on the receipt, which is what step six compares.
-fn requested_route() -> WorkProviderRouteV1 {
-    WorkProviderRouteV1::new(
-        typed::<ProviderId>("provider.work.claude-code-cli"),
-        typed::<WorkProviderRouteId>("route.work-loop-journey.v1"),
-    )
-    .expect("provider route")
-}
-
 fn start_attempt_body(
     project: &Path,
     attempt_id: &str,
     execution_snapshot: Value,
+    instructions: &str,
     occurred_at: i64,
 ) -> Value {
     json!({
@@ -669,7 +709,7 @@ fn start_attempt_body(
         "worktree_root": project.to_string_lossy(),
         "reference": typed::<RefId>("refs/heads/work-loop-journey"),
         "commit": typed::<CommitId>("0123456789abcdef0123456789abcdef01234567"),
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
         "effect_state": WorkEffectStateV1::Observational,
         "occurred_at": occurred_at,
     })
@@ -679,7 +719,7 @@ fn start_attempt_body(
 #[cfg(unix)]
 #[test]
 fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
-    let fixture = ProductionDaemon::start();
+    let mut fixture = ProductionDaemon::start();
     let scripts = tempfile::tempdir().expect("provider script directory");
 
     // Warming. Mutation preparation is the first product-authority handoff.
@@ -730,19 +770,6 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
     assert_eq!(
         replayed["event"], created["event"],
         "replaying a prepared command must return the same durable event"
-    );
-
-    // Hold one valid command at version one. A later committed proposal
-    // decision advances the graph; submitting this exact prepared command
-    // afterwards must prove the CAS rather than being silently re-anchored.
-    let stale_accept = prepare_product_mutation(
-        &fixture,
-        "prepare future stale acceptance",
-        json!({
-            "change": "accept_task",
-            "task_id": TASK_ID,
-            "evidence_by_criterion": {},
-        }),
     );
 
     // =====================================================================
@@ -799,6 +826,109 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         "the expanded anchor must carry the fixture's own source: {expanded}"
     );
 
+    // Publish the provider route before proposal generation. The accepted
+    // proposal and later execution admission must therefore describe the same
+    // exact configured route rather than allowing start-attempt to invent one.
+    let argv_marker = scripts.path().join("argv");
+    let stdin_marker = scripts.path().join("stdin");
+    let started_marker = scripts.path().join("started");
+    let (provider_path, provider_digest) = pinned_executable(
+        scripts.path(),
+        "provider",
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$*\" > {argv}\ninput=$(cat)\nprintf '%s' \"$input\" > {stdin}\n\
+             case \"$input\" in\n  *cancellation*) printf x > {started}; i=0; while [ $i -lt 300 ]; do sleep 1; i=$((i+1)); done;;\n\
+             esac\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
+             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\nexit 0\n",
+            argv = argv_marker.display(),
+            stdin = stdin_marker.display(),
+            started = started_marker.display(),
+        ),
+    );
+    let observed = fixture.payload(
+        "configuration observed state",
+        "/application/configuration/configuration_observed_state",
+        &json!({}),
+    );
+    let base_revision = observed
+        .as_array()
+        .and_then(|components| components.first())
+        .and_then(|component| component["desired_revision_id"].as_str())
+        .unwrap_or_else(|| panic!("configuration observed state: {observed}"))
+        .to_owned();
+    let bindings_key = "work.executable_bindings.v1";
+    let set = fixture.payload(
+        "configuration set (work executable bindings)",
+        "/application/configuration/configuration_set",
+        &json!({
+            "layer": { "kind": "project", "project_id": fixture.project_id },
+            "key": bindings_key,
+            "value": {
+                "kind": "work_executable_bindings",
+                "value": [{
+                    "executable": {
+                        "executable_id": FAST_EXECUTABLE_ID,
+                        "artifact_digest": provider_digest,
+                    },
+                    "canonical_path": provider_path,
+                    "capabilities": ["claude_code_stream_json"],
+                    "routes": [{
+                        "route_id": "route.work-loop-journey.v1",
+                        "provider_capability_id": "provider.work.claude-code-cli",
+                        "model_id": "model.work-loop-journey",
+                        "effort": "standard",
+                        "declared_budget_ceiling": 128000,
+                        "content_location": "local",
+                        "correctness": "high",
+                        "sensitive_data_fitness": "high",
+                        "latency": "moderate",
+                        "cost": "moderate",
+                        "autonomy": "high",
+                        "evidence_quality": "high",
+                        "execution": {
+                            "sandbox": "required",
+                            "approval": "never",
+                            "filesystem": "workspace_write",
+                            "egress": "deny",
+                            "environment_allowlist": [],
+                            "credential_references": [],
+                            "limits": {
+                                "max_input_tokens": 128000,
+                                "max_output_tokens": 8192,
+                                "max_stdout_bytes": 65536,
+                                "max_stderr_bytes": 65536,
+                                "max_protocol_bytes": 65536,
+                                "max_concurrency": 1
+                            },
+                            "maximum_duration_micros": 600000000,
+                            "fallback": { "kind": "disabled" }
+                        }
+                    }],
+                }],
+            },
+            "expected_revision": base_revision,
+            "idempotency_key": "configuration.idempotency.work-loop-journey.bindings",
+        }),
+    );
+    assert_ne!(
+        set["result_revision_id"], set["base_revision_id"],
+        "a committed configuration write must advance the revision: {set}"
+    );
+    fixture.restart();
+
+    // Hold one valid command at version one and at the newly mounted
+    // configuration revision. A later proposal decision advances only the
+    // graph, so submitting this command isolates the product graph CAS.
+    let stale_accept = prepare_product_mutation(
+        &fixture,
+        "prepare future stale acceptance",
+        json!({
+            "change": "accept_task",
+            "task_id": TASK_ID,
+            "evidence_by_criterion": {},
+        }),
+    );
+
     // =====================================================================
     // 3. The explained proposal, over the pinned redacted configuration.
     // =====================================================================
@@ -806,7 +936,6 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
     // A sensitive setting is readable as an effective value with its snapshot
     // identity and provenance, and the plaintext of a credential never is —
     // this reads the setting the provider step will later be pinned to.
-    let bindings_key = "work.executable_bindings.v1";
     let resolved = fixture.payload(
         "configuration get (work executable bindings)",
         "/application/configuration/configuration_get",
@@ -820,17 +949,26 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         "a resolved setting must carry its snapshot identity and provenance: {resolved}"
     );
 
-    let proposal = fixture.payload(
-        "generate proposal",
-        "/application/work/generate-proposal",
-        &json!({
-            "selection": product_selection(&fixture),
-            "task_id": TASK_ID,
-            "proposal_id": "proposal.work-loop-journey.acceptance",
-            "live_git_evidence": Value::Null,
-            "occurred_at": now_micros(),
-        }),
-    );
+    let proposal_request = json!({
+        "selection": product_selection(&fixture),
+        "task_id": TASK_ID,
+        "proposal_id": "proposal.work-loop-journey.acceptance",
+        "live_git_evidence": Value::Null,
+        "occurred_at": now_micros(),
+    });
+    let proposal = poll_until("the configured Work route", || {
+        let (status, answer) =
+            fixture.post("/application/work/generate-proposal", &proposal_request);
+        if answer["kind"] != "success" {
+            return Err(format!("{status} {answer}"));
+        }
+        let payload = answer["value"]["outcome"]["value"]["payload"].clone();
+        if payload["proposal"]["route"]["decision"] == "selected" {
+            Ok(payload)
+        } else {
+            Err(format!("{payload}"))
+        }
+    });
     assert_eq!(proposal["proposal"]["based_on_version"], 1, "{proposal}");
     assert_eq!(
         proposal["decision"]["disposition"], "allow",
@@ -905,33 +1043,6 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
     assert_eq!(stale["retry"], "after_revalidate", "{stale}");
     assert_eq!(stale["retry_scope"], "fresh_request", "{stale}");
 
-    // Acceptance is not admission: a start refuses until admission happens.
-    let unadmitted = fixture.problem(
-        "start before admission",
-        "/application/work/start-attempt",
-        &start_attempt_body(
-            &fixture.project,
-            SETTLED_ATTEMPT_ID,
-            execution_snapshot(
-                &PinnedConfiguration {
-                    revision_id: "configuration.work-loop-journey.probe".to_owned(),
-                    snapshot_id: "configuration-snapshot.work-loop-journey.probe".to_owned(),
-                    effective_behavior_digest: format!("sha256:{}", "1".repeat(64)),
-                    resolution_provenance_digest: format!("sha256:{}", "2".repeat(64)),
-                },
-                FAST_EXECUTABLE_ID,
-                &ManifestDigest::new(format!("sha256:{}", "3".repeat(64))).expect("probe digest"),
-                UtcMicros(now_micros().saturating_add(120 * 1_000_000)),
-            ),
-            now_micros(),
-        ),
-    );
-    assert_eq!(
-        unadmitted["code"], "application.work-attempt.execution-not-admitted",
-        "starting an attempt before execution admission must be refused by the \
-         admission gate, not by anything downstream of it: {unadmitted}"
-    );
-
     // The proposal recommendation now moves to admission, on its own evidence.
     let admission_proposal = fixture.payload(
         "generate proposal after acceptance",
@@ -957,8 +1068,24 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         "prepare execution admission",
         json!({ "change": "admit_execution", "task_id": TASK_ID }),
     );
-    let admitted = commit_product_mutation(&fixture, "admit execution", &prepared_admission);
-    assert_eq!(admitted["verified_graph_version"]["graph_version"], 3);
+    let admitted = fixture.payload(
+        "admit execution",
+        "/application/work/admit-execution",
+        &prepared_admission["request"],
+    );
+    assert_eq!(
+        admitted["mutation"]["verified_graph_version"]["graph_version"],
+        3
+    );
+    assert_eq!(
+        admitted["execution_snapshot"]["effective_behavior_digest"],
+        resolved["effective_behavior_digest"],
+        "execution admission must pin the configuration read by the public control plane: {admitted}"
+    );
+    assert_eq!(
+        admitted["execution_snapshot"]["route"], proposal["proposal"]["route"]["recommended"],
+        "execution admission must pin the route the user accepted: {admitted}"
+    );
     let admitted_graph = product_graph(&fixture, "product graph after execution admission");
     let admitted_item = task_item(&admitted_graph);
     assert!(
@@ -971,119 +1098,11 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         "admitting execution must not accept the task: {admitted_graph}"
     );
 
-    // Pin two provider executables through the production control plane. The
-    // resolver canonicalizes the path and re-digests the bytes at spawn time,
-    // so this is the same fail-closed admission a shipped provider goes
-    // through — the only fixture-shaped part is which bytes are pinned.
-    let argv_marker = scripts.path().join("argv");
-    let stdin_marker = scripts.path().join("stdin");
-    let (fast_path, fast_digest) = pinned_executable(
-        scripts.path(),
-        "fast-provider",
-        &format!(
-            "#!/bin/sh\nprintf '%s' \"$*\" > {argv}\ncat > {stdin}\n\
-             printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
-             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\n\
-             exit 0\n",
-            argv = argv_marker.display(),
-            stdin = stdin_marker.display(),
-        ),
-    );
-    let started_marker = scripts.path().join("started");
-    let (slow_path, slow_digest) = pinned_executable(
-        scripts.path(),
-        "slow-provider",
-        &format!(
-            "#!/bin/sh\nprintf x > {started}\ncat > /dev/null\n\
-             i=0\nwhile [ $i -lt 300 ]; do sleep 1; i=$((i+1)); done\nexit 0\n",
-            started = started_marker.display(),
-        ),
-    );
-
-    let observed = fixture.payload(
-        "configuration observed state",
-        "/application/configuration/configuration_observed_state",
-        &json!({}),
-    );
-    let base_revision = observed
-        .as_array()
-        .and_then(|components| components.first())
-        .and_then(|component| component["desired_revision_id"].as_str())
-        .unwrap_or_else(|| panic!("configuration observed state: {observed}"))
-        .to_owned();
-
-    let set = fixture.payload(
-        "configuration set (work executable bindings)",
-        "/application/configuration/configuration_set",
-        &json!({
-            "layer": { "kind": "project", "project_id": fixture.project_id },
-            "key": bindings_key,
-            "value": {
-                "kind": "work_executable_bindings",
-                "value": [
-                    {
-                        "executable": {
-                            "executable_id": FAST_EXECUTABLE_ID,
-                            "artifact_digest": fast_digest,
-                        },
-                        "canonical_path": fast_path,
-                        "capabilities": ["claude_code_stream_json"],
-                        "routes": [],
-                    },
-                    {
-                        "executable": {
-                            "executable_id": SLOW_EXECUTABLE_ID,
-                            "artifact_digest": slow_digest,
-                        },
-                        "canonical_path": slow_path,
-                        "capabilities": ["claude_code_stream_json"],
-                        "routes": [],
-                    },
-                ],
-            },
-            "expected_revision": base_revision,
-            "idempotency_key": "configuration.idempotency.work-loop-journey.bindings",
-        }),
-    );
-    assert_ne!(
-        set["result_revision_id"], set["base_revision_id"],
-        "a committed configuration write must advance the revision: {set}"
-    );
-
-    // Read the pinned snapshot back and carry its exact identity into the
-    // attempt, so the attempt records the configuration that governed it.
-    let pinned_setting = fixture.payload(
-        "configuration get after pinning",
-        "/application/configuration/configuration_get",
-        &json!({ "key": bindings_key }),
-    );
-    let pinned = PinnedConfiguration {
-        revision_id: set["result_revision_id"]
-            .as_str()
-            .expect("result revision id")
-            .to_owned(),
-        snapshot_id: pinned_setting["snapshot_id"]
-            .as_str()
-            .expect("pinned snapshot id")
-            .to_owned(),
-        effective_behavior_digest: pinned_setting["effective_behavior_digest"]
-            .as_str()
-            .expect("effective behavior digest")
-            .to_owned(),
-        resolution_provenance_digest: pinned_setting["resolution_provenance_digest"]
-            .as_str()
-            .expect("resolution provenance digest")
-            .to_owned(),
-    };
-
-    // A run's first attempt seals its immutable deadline and topology. Every
-    // later attempt in the same run must carry that exact authority rather
-    // than silently extending the run by minting a fresh relative deadline.
-    let run_deadline = UtcMicros(now_micros().saturating_add(600 * 1_000_000));
     let start = start_attempt_body(
         &fixture.project,
         SETTLED_ATTEMPT_ID,
-        execution_snapshot(&pinned, FAST_EXECUTABLE_ID, &fast_digest, run_deadline),
+        admitted["execution_snapshot"].clone(),
+        INSTRUCTIONS,
         now_micros(),
     );
     let leased = fixture.payload("start attempt", "/application/work/start-attempt", &start);
@@ -1244,7 +1263,8 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
     let slow_start = start_attempt_body(
         &fixture.project,
         CANCELLED_ATTEMPT_ID,
-        execution_snapshot(&pinned, SLOW_EXECUTABLE_ID, &slow_digest, run_deadline),
+        admitted["execution_snapshot"].clone(),
+        CANCELLATION_INSTRUCTIONS,
         now_micros(),
     );
     fixture.payload(
@@ -1305,11 +1325,91 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         "a cancelled attempt seals a cancelled receipt, never a success: {cancelled}"
     );
 
-    // A completed *runtime* is not an accepted *task*. The product graph read
-    // does not own a verified executor-topology join to the attempt rows, so it
-    // reports that runtime projection as unavailable instead of joining by a
-    // matching-looking identity. The exact attempt authority above remains the
-    // terminal-evidence source.
+    let complete_runtime = product_graph(&fixture, "product graph with complete runtime coverage");
+    assert_eq!(
+        complete_runtime["snapshot"]["runtime"]["coverage"],
+        json!({ "coverage": "complete" }),
+        "the primary worktree authority must hydrate its exact attempts: {complete_runtime}"
+    );
+    assert_eq!(
+        complete_runtime["snapshot"]["runtime"]["attempts"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "complete coverage must include both accepted attempts: {complete_runtime}"
+    );
+    let complete_replan = fixture.payload(
+        "generate a replan proposal with complete runtime coverage",
+        "/application/work/generate-proposal",
+        &json!({
+            "selection": product_selection(&fixture),
+            "task_id": TASK_ID,
+            "proposal_id": "proposal.work-loop-journey.replan.complete",
+            "live_git_evidence": Value::Null,
+            "occurred_at": now_micros(),
+        }),
+    );
+    assert_eq!(
+        complete_replan["decision"]["disposition"], "allow",
+        "complete terminal coverage must support a product decision: {complete_replan}"
+    );
+    assert_eq!(
+        complete_replan["decision"]["recommended_action"], "replan",
+        "complete terminal coverage must recommend replanning: {complete_replan}"
+    );
+
+    let version_before_applied_replan = graph_version(&complete_runtime);
+    let relation_proposal = WorkRelationReplanProposalV1::new(
+        typed::<ProposalId>("proposal.work-loop-journey.relation-replan"),
+        typed::<TaskId>(TASK_ID),
+        WorkGraphVersionV1::new(version_before_applied_replan).expect("current graph version"),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("valid relation replan proposal");
+    let prepared_replan_decision = prepare_product_mutation(
+        &fixture,
+        "prepare relation replan decision",
+        json!({
+            "change": "decide_relation_replan",
+            "proposal": serde_json::to_value(&relation_proposal).expect("relation proposal JSON"),
+            "disposition": "accepted",
+        }),
+    );
+    let decided_replan = commit_product_mutation(
+        &fixture,
+        "accept relation replan",
+        &prepared_replan_decision,
+    );
+    assert_eq!(
+        decided_replan["verified_graph_version"]["graph_version"],
+        version_before_applied_replan + 1,
+        "accepting the replan proposal advances one graph version: {decided_replan}"
+    );
+    let prepared_replan = prepare_product_mutation(
+        &fixture,
+        "prepare accepted relation replan",
+        json!({
+            "change": "apply_relation_replan",
+            "proposal_id": "proposal.work-loop-journey.relation-replan",
+        }),
+    );
+    let applied = commit_product_mutation(
+        &fixture,
+        "apply the accepted relation replan",
+        &prepared_replan,
+    );
+    assert_eq!(
+        applied["verified_graph_version"]["graph_version"],
+        version_before_applied_replan + 2,
+        "applying the accepted replan advances the next graph version: {applied}"
+    );
+
+    // The linked worktree shares the repository-scoped product graph but owns
+    // a distinct exact runtime authority. With the primary checkout absent,
+    // this route cannot read the primary worktree's accepted attempt receipts.
+    fixture.reopen_from_linked_worktree();
     let with_evidence = product_graph(&fixture, "product graph after terminal runtime evidence");
     assert_eq!(
         with_evidence["snapshot"]["runtime"]["coverage"],
@@ -1372,6 +1472,7 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
         version_before_replan,
         "an indeterminate proposal must not be applied: {after_replan_proposal}"
     );
+    fixture.restore_primary_worktree();
     let attempts_after_replan = fixture.payload(
         "attempt status after the replan proposal",
         "/application/work/attempt-status",
@@ -1380,56 +1481,6 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
     assert_eq!(
         attempts_after_replan["terminal"], settled["terminal"],
         "an indeterminate proposal must not disturb runtime receipts: {attempts_after_replan}"
-    );
-
-    // Applying it is a two-event, version-checked product mutation: first the
-    // relation proposal is explicitly accepted, then that accepted proposal is
-    // applied. No direct dependency command survives this authority boundary.
-    let relation_proposal = WorkRelationReplanProposalV1::new(
-        typed::<ProposalId>("proposal.work-loop-journey.relation-replan"),
-        typed::<TaskId>(TASK_ID),
-        WorkGraphVersionV1::new(version_before_replan).expect("current graph version"),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )
-    .expect("valid relation replan proposal");
-    let prepared_replan_decision = prepare_product_mutation(
-        &fixture,
-        "prepare relation replan decision",
-        json!({
-            "change": "decide_relation_replan",
-            "proposal": serde_json::to_value(&relation_proposal).expect("relation proposal JSON"),
-            "disposition": "accepted",
-        }),
-    );
-    let decided_replan = commit_product_mutation(
-        &fixture,
-        "accept relation replan",
-        &prepared_replan_decision,
-    );
-    assert_eq!(
-        decided_replan["verified_graph_version"]["graph_version"],
-        version_before_replan + 1,
-        "accepting the replan proposal advances one graph version: {decided_replan}"
-    );
-    let prepared_replan = prepare_product_mutation(
-        &fixture,
-        "prepare accepted relation replan",
-        json!({
-            "change": "apply_relation_replan",
-            "proposal_id": "proposal.work-loop-journey.relation-replan",
-        }),
-    );
-    let applied = commit_product_mutation(
-        &fixture,
-        "apply the accepted relation replan",
-        &prepared_replan,
-    );
-    assert_eq!(
-        applied["verified_graph_version"]["graph_version"],
-        version_before_replan + 2,
-        "applying the accepted replan advances the next graph version: {applied}"
     );
 
     // Acceptance closes the loop, and only acceptance does.

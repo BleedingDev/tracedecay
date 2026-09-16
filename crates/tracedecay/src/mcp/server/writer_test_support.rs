@@ -6,8 +6,8 @@ use tracedecay_runtime_core::path_safety::{plain_git_args, plain_host_path};
 
 use crate::config::PinnedUserDataDir;
 use crate::mcp::server::McpServerConstructionContext;
+use crate::project::TraceDecay;
 use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use crate::tracedecay::TraceDecay;
 
 pub(super) fn git(root: &Path, args: &[&str]) {
     let output = std::process::Command::new(
@@ -35,7 +35,7 @@ impl WriterTestFixtureAuthority {
         self.runtime
             .open_project_graph_for_test(
                 project_root,
-                crate::tracedecay::TraceDecayOpenOptions {
+                crate::project::TraceDecayOpenOptions {
                     profile_root: Some(self.runtime.profile_root_for_test().to_path_buf()),
                     global_db_path: None,
                 },
@@ -73,9 +73,12 @@ pub(super) fn registered_context(
     cg: TraceDecay,
     authority: &WriterTestFixtureAuthority,
 ) -> McpServerConstructionContext {
-    let mut context = registered_runtime(authority)
-        .mcp_server_context_for_test(cg, None)
-        .expect("registered MCP server context");
+    let mut context = crate::test_support::host_admission::mcp_server_context_for_test(
+        registered_runtime(authority),
+        cg,
+        None,
+    )
+    .expect("registered MCP server context");
     // These fixtures assert exact code-index reconcile-sink accounting.
     // Startup catch-up admits one reconciliation through that same sink
     // (its contract is covered by `background_refresh_writer_tests`), so it

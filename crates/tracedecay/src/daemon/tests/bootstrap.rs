@@ -360,11 +360,11 @@ async fn orphaned_store_with_repository_identity_is_readopted_without_aliasing()
         .registered_profile_database()
         .await
         .expect("profile registry");
-    let open_options = crate::tracedecay::TraceDecayOpenOptions {
+    let open_options = crate::project::TraceDecayOpenOptions {
         profile_root: Some(profile_root.clone()),
         global_db_path: None,
     };
-    let store_layout = crate::tracedecay::TraceDecay::resolve_registered_configuration_layout(
+    let store_layout = crate::project::TraceDecay::resolve_registered_configuration_layout(
         &project,
         &open_options,
         registry.as_ref(),
@@ -450,8 +450,8 @@ fn enroll_nongit_project_on_disk(
 #[cfg(unix)]
 fn moved_nongit_open_options(
     profile_root: &std::path::Path,
-) -> crate::tracedecay::TraceDecayOpenOptions {
-    crate::tracedecay::TraceDecayOpenOptions {
+) -> crate::project::TraceDecayOpenOptions {
+    crate::project::TraceDecayOpenOptions {
         profile_root: Some(profile_root.to_path_buf()),
         global_db_path: None,
     }
@@ -494,11 +494,11 @@ async fn moved_nongit_project_is_readopted_only_when_confirmed() {
     // Ambient first-touch (`Never`) mints a fresh path-derived identity and
     // must not touch the moved project's registration.
     let ambient =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
             &moved,
             &moved_nongit_open_options(&profile_root),
             registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::Never,
+            &crate::project::MovedStoreAdoption::Never,
         )
         .await
         .expect("ambient first-touch mints fresh");
@@ -513,15 +513,14 @@ async fn moved_nongit_project_is_readopted_only_when_confirmed() {
     // Explicit init without adoption flags refuses with the candidate and
     // the explicit choices instead of silently remapping or silently
     // splitting identity.
-    let offer =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
-            &moved,
-            &moved_nongit_open_options(&profile_root),
-            registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::OfferCandidates,
-        )
-        .await
-        .expect_err("explicit init without flags must refuse when a candidate exists");
+    let offer = crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        &moved,
+        &moved_nongit_open_options(&profile_root),
+        registry.as_ref(),
+        &crate::project::MovedStoreAdoption::OfferCandidates,
+    )
+    .await
+    .expect_err("explicit init without flags must refuse when a candidate exists");
     let message = offer.to_string();
     assert!(
         message.contains(project_id)
@@ -542,11 +541,11 @@ async fn moved_nongit_project_is_readopted_only_when_confirmed() {
 
     // `init --yes` confirms adopting the unique candidate.
     let store_layout =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
             &moved,
             &moved_nongit_open_options(&profile_root),
             registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::AdoptUnique,
+            &crate::project::MovedStoreAdoption::AdoptUnique,
         )
         .await
         .expect("confirmed unique moved nongit project must be adopted");
@@ -614,11 +613,11 @@ async fn ambient_first_touch_never_adopts_a_moved_nongit_store() {
     let scratch_canonical = scratch.canonicalize().expect("canonical scratch root");
 
     let layout =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
             &scratch,
             &moved_nongit_open_options(&profile_root),
             registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::Never,
+            &crate::project::MovedStoreAdoption::Never,
         )
         .await
         .expect("ambient first-touch on a fresh directory mints a fresh identity");
@@ -680,15 +679,14 @@ async fn moved_nongit_adoption_is_refused_when_ambiguous() {
     let target = root.join("nongit-new");
     std::fs::create_dir_all(&target).expect("create adoption target");
 
-    let error =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
-            &target,
-            &moved_nongit_open_options(&profile_root),
-            registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::AdoptUnique,
-        )
-        .await
-        .expect_err("ambiguous moved nongit adoption must refuse");
+    let error = crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        &target,
+        &moved_nongit_open_options(&profile_root),
+        registry.as_ref(),
+        &crate::project::MovedStoreAdoption::AdoptUnique,
+    )
+    .await
+    .expect_err("ambiguous moved nongit adoption must refuse");
     let message = error.to_string();
     assert!(
         message.contains("ambiguous") && message.contains("--adopt-project"),
@@ -701,15 +699,14 @@ async fn moved_nongit_adoption_is_refused_when_ambiguous() {
 
     // The stale stores must not brick a genuinely new project: opting out of
     // adoption (`--fresh`, and every ambient first-touch) mints fresh.
-    let fresh =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
-            &target,
-            &moved_nongit_open_options(&profile_root),
-            registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::Never,
-        )
-        .await
-        .expect("fresh init must stay possible with stale moved stores present");
+    let fresh = crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        &target,
+        &moved_nongit_open_options(&profile_root),
+        registry.as_ref(),
+        &crate::project::MovedStoreAdoption::Never,
+    )
+    .await
+    .expect("fresh init must stay possible with stale moved stores present");
     let target_canonical = target.canonicalize().expect("canonical target");
     assert_eq!(
         fresh.identity.project_id.as_deref(),
@@ -760,11 +757,11 @@ async fn moved_nongit_adoption_honors_explicit_project_id() {
     std::fs::create_dir_all(&target).expect("create adoption target");
 
     let store_layout =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
             &target,
             &moved_nongit_open_options(&profile_root),
             registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::AdoptNamed("proj_nongit_flag_a".to_owned()),
+            &crate::project::MovedStoreAdoption::AdoptNamed("proj_nongit_flag_a".to_owned()),
         )
         .await
         .expect("flagged adoption must select the named project");
@@ -820,15 +817,14 @@ async fn moved_nongit_adoption_refuses_conflicting_registered_root() {
         .expect("register moved project");
     std::fs::rename(&original, root.join("nongit-moved")).expect("move conflicting project");
 
-    let error =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
-            &occupant,
-            &moved_nongit_open_options(&profile_root),
-            registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::AdoptNamed("proj_nongit_conflict".to_owned()),
-        )
-        .await
-        .expect_err("adoption onto another project's root must refuse");
+    let error = crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        &occupant,
+        &moved_nongit_open_options(&profile_root),
+        registry.as_ref(),
+        &crate::project::MovedStoreAdoption::AdoptNamed("proj_nongit_conflict".to_owned()),
+    )
+    .await
+    .expect_err("adoption onto another project's root must refuse");
     let message = error.to_string();
     assert!(
         message.contains("proj_nongit_conflict") && message.contains("proj_nongit_occupant"),
@@ -883,11 +879,11 @@ async fn interrupted_moved_nongit_remap_resumes_on_next_explicit_init() {
         .expect("journal manifest write");
 
     let resumed =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
             &moved,
             &moved_nongit_open_options(&profile_root),
             registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::OfferCandidates,
+            &crate::project::MovedStoreAdoption::OfferCandidates,
         )
         .await
         .expect("a torn remap must resume from its manifest journal record");
@@ -949,15 +945,14 @@ async fn unreadable_moved_store_evidence_is_a_typed_refusal() {
         .expect("profile-sharded layout carries a manifest path");
     std::fs::write(manifest_path, b"not a manifest").expect("corrupt the manifest");
 
-    let error =
-        crate::tracedecay::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
-            &moved,
-            &moved_nongit_open_options(&profile_root),
-            registry.as_ref(),
-            &crate::tracedecay::MovedStoreAdoption::AdoptUnique,
-        )
-        .await
-        .expect_err("unreadable evidence must be a typed error, not a silent non-match");
+    let error = crate::project::TraceDecay::resolve_first_touch_configuration_layout_with_adoption(
+        &moved,
+        &moved_nongit_open_options(&profile_root),
+        registry.as_ref(),
+        &crate::project::MovedStoreAdoption::AdoptUnique,
+    )
+    .await
+    .expect_err("unreadable evidence must be a typed error, not a silent non-match");
     let message = error.to_string();
     assert!(
         message.contains("moved-store adoption evidence") && message.contains("--fresh"),
@@ -2309,6 +2304,16 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
     let (_, route) =
         super::super::DaemonEngine::project_route(&ordinary_handshake).expect("project route");
     let tasks = super::super::project_open_tasks(&engine.project_open_gates).await;
+    // The terminal watch value is visible before the spawned route task's
+    // JoinHandle necessarily reports finished. Let pruning observe both
+    // before this fixture claims the same route for its controlled open.
+    while tasks.status(&route).is_some() {
+        assert!(
+            tokio::time::Instant::now() < warmup_give_up,
+            "the warm-up route task did not finish after publishing its refusal"
+        );
+        tokio::task::yield_now().await;
+    }
     let (release, blocked) = tokio::sync::oneshot::channel();
     let inflight = match tasks.start_cancellable(route, move |_| async move {
         blocked.await.expect("release ordinary open");
@@ -3007,8 +3012,8 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
         })
         .and_then(|tool| tool["description"].as_str())
         .expect("portable context tool description");
-    assert!(portable_context_description.contains("3 calls maximum"));
-    assert!(portable_context_description.contains("project graph is warming"));
+    assert!(portable_context_description.contains("3 broad context calls"));
+    assert!(portable_context_description.contains("graph is still warming"));
 
     tokio::time::timeout(PHASE_TIMEOUT, async {
         while attempts.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -3398,8 +3403,8 @@ async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
         .find(|tool| tool["name"] == json!("tracedecay_context"))
         .and_then(|tool| tool["description"].as_str())
         .expect("context tool description");
-    assert!(context_description.contains("3 calls maximum"));
-    assert!(context_description.contains("project graph is warming"));
+    assert!(context_description.contains("3 broad context calls"));
+    assert!(context_description.contains("graph is still warming"));
 
     tokio::time::timeout(PHASE_TIMEOUT, async {
         while engine
@@ -3809,10 +3814,6 @@ async fn production_composition_harness_dispatches_application_invocations_in_pr
     let harness = ProductionProjectCompositionHarnessV1::open(temp.path(), vec![project.clone()])
         .await
         .expect("production composition");
-    assert!(
-        !harness.semantic_auto_download_enabled(),
-        "the effective semantic startup policy used by production composition must disable auto-download"
-    );
     let response = harness
         .call_tool(
             &project,

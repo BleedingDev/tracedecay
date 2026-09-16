@@ -221,9 +221,8 @@ impl RemoteRecoveryProjectLifecycleV1 {
             })?;
         // Remote recovery drains the same invocation runtime owners every
         // other project drain does. Calling `service.quiesce_project` alone
-        // left the code-index scheduler root, the query authority and the
-        // semantic projection work mounted, and the code-index observability
-        // lane keeps a counted client on the project-session store, so the
+        // left the code-index scheduler root and the query authority mounted,
+        // and the code-index observability lane keeps a counted client on the project-session store, so the
         // store retirement this quiescence exists to admit was refused.
         let invocation = self
             .invocation
@@ -483,6 +482,17 @@ pub(super) async fn retire_runtime_work(
     retire_maintenance_tasks(automation, tracked_retirements, profile_root, project_id).await;
     for (owner, servers) in server_retirements {
         let task = tokio::spawn(async move {
+            // Replay is a data-root owner outside the MCP server task set and
+            // retains the exact ProjectSessions client used for native lifecycle
+            // delivery. Join it inside the tracked retirement deadline before
+            // store retirement inspects live clients.
+            for server in &servers {
+                let graph = server.cg().await;
+                crate::daemon::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(
+                    &graph.hook_store_layout().data_root,
+                )
+                .await;
+            }
             super::super::project_server_lifecycle::retire_project_servers_now(servers).await;
         });
         super::project_retirement::track_retirement_task(tracked_retirements, owner, task).await;

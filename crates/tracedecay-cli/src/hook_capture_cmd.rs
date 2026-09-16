@@ -1,9 +1,13 @@
 use std::ffi::OsString;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracedecay_domain::UtcMicros;
-use tracedecay_hooks::{HookHostV1, NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1};
+use tracedecay_hooks::delivery_spool::HookDeliverySpoolError;
+use tracedecay_hooks::{
+    HookDeliveryReceiptSpoolV1, HookHostV1, NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1,
+};
 
 use crate::cli::Commands;
 
@@ -149,11 +153,6 @@ pub(crate) fn try_run(args: &[OsString]) -> Option<i32> {
         return None;
     }
     let source = capture_source_from_name(command)?;
-    if std::env::var_os("RUST_LOG").is_some() {
-        tracedecay::daemon::install_stderr_tracing(
-            tracedecay::daemon::StderrTracingDefault::Silent,
-        );
-    }
     Some(if args.len() == 2 {
         run_native_capture(source)
     } else {
@@ -235,12 +234,28 @@ fn capture_command_name(command: &Commands) -> Option<&'static str> {
     }
 }
 
+/// Every bounded lock wait on the capture path gets one synchronous budget
+/// measured from its own lock attempt, not from hook start: the analytics
+/// row, enrolled-layout lookup, decode, and spool-root creation that precede
+/// admission must not spend the budget an uncontended spool lock would then
+/// be refused for. The response hooks' output write waits the same way.
+fn open_delivery_receipt_spool(
+    data_root: &Path,
+    host: HookHostV1,
+) -> Result<HookDeliveryReceiptSpoolV1, HookDeliverySpoolError> {
+    HookDeliveryReceiptSpoolV1::open_within(
+        tracedecay_hooks::hook_delivery_receipt_spool_root(data_root, host),
+        tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
+    )
+}
+
 pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
     let payload = match read_bounded_stdin() {
         Ok(payload) => payload,
         Err(()) => return refused("stdin was unreadable or exceeded the payload bound"),
     };
     let mut delivery_writer = None;
+    let mut delivery_open_error = None;
     let mut delivery_material = None;
     let mut rejection = None;
     let working_directory = std::env::current_dir();
@@ -259,40 +274,51 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
             match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
                 &project_root,
             ) {
-                Ok(Some(layout)) => match current_time() {
-                    Some(now) => {
-                        match tracedecay_agent_hosts::hooks::native_capture_material(
-                            source, &payload, now,
-                        ) {
-                            Ok(material) => {
-                                match tracedecay_hooks::capture_native_event_with_delivery_writer(
-                                    &layout.data_root,
-                                    source,
-                                    &payload,
-                                    material,
-                                    now,
-                                    tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
-                                ) {
-                                    Ok(writer) => {
-                                        delivery_writer = Some(writer);
+                Ok(Some(layout)) => {
+                    let worktree_id = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
+                        &tracedecay::hook_runtime(),
+                        &layout,
+                    );
+                    match (current_time(), worktree_id) {
+                        (Some(now), Ok(worktree_id)) => {
+                            match tracedecay_agent_hosts::hooks::native_capture_material(
+                                source, &payload, now,
+                            ) {
+                                Ok(material) => {
+                                    let outcome = tracedecay_hooks::capture::capture_native_event_for_replay(
+                                        &layout.data_root,
+                                        worktree_id,
+                                        source,
+                                        &payload,
+                                        material,
+                                        now,
+                                        tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
+                                    );
+                                    if outcome == NativeHookCaptureOutcomeV1::Captured {
+                                        match open_delivery_receipt_spool(
+                                            &layout.data_root,
+                                            source.host(),
+                                        ) {
+                                            Ok(writer) => delivery_writer = Some(writer),
+                                            Err(error) => delivery_open_error = Some(error),
+                                        }
                                         delivery_material = Some(material);
-                                        NativeHookCaptureOutcomeV1::Captured
                                     }
-                                    Err(outcome) => outcome,
+                                    outcome
+                                }
+                                Err(
+                                    tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeEvent
+                                    | tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeFamily,
+                                ) => NativeHookCaptureOutcomeV1::Unsupported,
+                                Err(error) => {
+                                    rejection = Some(error.to_string());
+                                    NativeHookCaptureOutcomeV1::Rejected
                                 }
                             }
-                            Err(
-                                tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeEvent
-                                | tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeFamily,
-                            ) => NativeHookCaptureOutcomeV1::Unsupported,
-                            Err(error) => {
-                                rejection = Some(error.to_string());
-                                NativeHookCaptureOutcomeV1::Rejected
-                            }
                         }
+                        _ => NativeHookCaptureOutcomeV1::Unavailable,
                     }
-                    None => NativeHookCaptureOutcomeV1::Unavailable,
-                },
+                }
                 Ok(None) => NativeHookCaptureOutcomeV1::Unbound,
                 Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
             }
@@ -312,14 +338,15 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
     drop(stdout);
     if outcome == NativeHookCaptureOutcomeV1::Captured {
         let Some(writer) = delivery_writer else {
-            return refused("native delivery receipt writer unavailable");
+            return refused(match delivery_open_error {
+                Some(error) => format!("native delivery receipt spool unavailable: {error}"),
+                None => "native delivery receipt writer unavailable".to_string(),
+            });
         };
         let (Some(material), Some(delivered_at)) = (delivery_material, current_time()) else {
             return refused("native delivery receipt material unavailable");
         };
-        let Some(settlement) =
-            tracedecay_hooks::native_hook_delivery_settlement(source, material, delivered_at)
-        else {
+        let Some(settlement) = native_hook_delivery_settlement(source, material, delivered_at) else {
             return refused("native delivery settlement identity could not be derived");
         };
         let Ok(receipt) = tracedecay_hooks::HookDeliverySourceReceiptV1::new(settlement) else {
@@ -344,6 +371,51 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
             None => format!("native capture did not land: {outcome:?}"),
         }),
     }
+}
+
+fn native_hook_delivery_settlement(
+    source: NativeHookCaptureSourceV1,
+    material: tracedecay_hooks::NativeEnvelopeMaterialV1,
+    delivered_at: UtcMicros,
+) -> Option<tracedecay_domain::DeliverySettlementV1> {
+    let host = source.host();
+    let owner = tracedecay_domain::canonical_sha256(&(
+        "tracedecay.native-hook-output-delivery.v1",
+        host.hook_key(),
+        material.event_id,
+    ))
+    .ok()?;
+    let channel = tracedecay_domain::canonical_sha256(&(
+        "tracedecay.native-hook-output-channel.v1",
+        host.hook_key(),
+        material.protected_session_id,
+    ))
+    .ok()?;
+    let attempted_at = std::cmp::max(material.observed_at, delivered_at);
+    Some(tracedecay_domain::DeliverySettlementV1 {
+        attempt: tracedecay_domain::DeliverySettlementAttemptV1 {
+            owner_event_id: format!(
+                "hook:native:{}",
+                owner.as_str().trim_start_matches("sha256:")
+            ),
+            event_class: tracedecay_domain::DeliveryEventClassV1::Activity,
+            channel: tracedecay_domain::DeliveryChannelIdentityV1 {
+                surface: tracedecay_domain::DeliverySurfaceFamilyV1::Hook,
+                channel_ref: format!(
+                    "hook:{}:{}",
+                    host.hook_key(),
+                    channel.as_str().trim_start_matches("sha256:")
+                ),
+            },
+            work_attempt: None,
+            eligible: 1,
+            valid_at: material.observed_at,
+            attempted_at,
+        },
+        outcome: tracedecay_domain::DeliverySettlementOutcomeV1::Delivered,
+        settled_at: attempted_at,
+        drop_reason: None,
+    })
 }
 
 /// The one exit-1 site of the capture fast path. A successful hook is silent

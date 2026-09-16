@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
+use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions};
 
 use crate::common::canonical_existing_path as canonical_temp_path;
 use crate::home_env_lock::HOME_ENV_LOCK;
@@ -78,6 +78,7 @@ struct Fixture {
 }
 
 fn build_fixture() -> Fixture {
+    crate::common::register_process_runtime_ports();
     let tmp = TempDir::new().unwrap();
     let root = canonical_temp_path(tmp.path());
     let profile_root = root.join("profile");

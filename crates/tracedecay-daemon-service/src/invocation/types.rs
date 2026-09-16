@@ -89,6 +89,7 @@ type HookOrchestrationCompletionV1 = Arc<dyn Fn() + Send + Sync + 'static>;
 
 struct HookOrchestrationInFlightEntryV1 {
     event: HookOrchestrationEventKeyV1,
+    lifecycle: Option<ContextScoutLifecycleAddressV1>,
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     superseded: std::sync::atomic::AtomicBool,
     completions: StdMutex<Vec<HookOrchestrationCompletionV1>>,
@@ -271,7 +272,12 @@ impl BoundedHookOrchestratorV1 {
             }
             let permit = if let Some(incumbent) = in_flight.addresses.remove(&address) {
                 // A newer boundary at the same stable address supersedes the
-                // incumbent: cancel it and inherit its permit once it settles.
+                // incumbent. A host boundary without its own call identity
+                // retains the exact admitted lifecycle already bound to this
+                // session; an explicit successor lifecycle remains authoritative.
+                if request.lifecycle.is_none() {
+                    request.lifecycle.clone_from(&incumbent.lifecycle);
+                }
                 incumbent
                     .superseded
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -286,6 +292,7 @@ impl BoundedHookOrchestratorV1 {
             let work_cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
             let operation = Arc::new(HookOrchestrationInFlightEntryV1 {
                 event,
+                lifecycle: request.lifecycle.clone(),
                 cancellation: work_cancellation,
                 superseded: std::sync::atomic::AtomicBool::new(false),
                 completions: StdMutex::new(completion.into_iter().collect()),
@@ -672,6 +679,7 @@ pub struct RegisteredWorkRuntime {
     pub(super) database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     pub(super) actor: ActorId,
     pub(super) grant: CapabilityGrantSnapshot,
+    pub(super) authority: tracedecay_domain::WorkAuthority,
     pub(super) authority_digest: ManifestDigest,
     pub(super) policy_digest: ManifestDigest,
     pub(super) configuration_digest: ManifestDigest,
@@ -848,22 +856,7 @@ pub struct RegisteredConfigurationRuntime {
     pub(super) project_identity: InvocationProjectRuntimeIdentityV1,
     pub(super) actor: ActorId,
     pub(super) grants: DaemonConfigurationGrantAuthority,
-    pub(super) semantic_operation: Arc<OnceLock<Arc<ProductionSemanticConfigurationOperationV1>>>,
-    pub(super) semantic_activation_committed: Arc<Notify>,
-    pub(super) semantic_evaluation_workers: Arc<
-        tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1,
-    >,
     pub(super) feedback_refresh: Arc<RwLock<Option<Arc<dyn ConfigurationRuntimeRefreshPort>>>>,
-}
-
-impl RegisteredConfigurationRuntime {
-    pub fn semantic_evaluation_workers(
-        &self,
-    ) -> &Arc<
-        tracedecay_code_index_runtime::semantic_evaluation::DaemonSemanticEvaluationWorkerOwnerV1,
-    > {
-        &self.semantic_evaluation_workers
-    }
 }
 
 pub struct RuntimeLspSession {

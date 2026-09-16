@@ -22,6 +22,7 @@
 //! reported seam in the storage runtime crate (see [`telemetry`]).
 
 pub mod compaction;
+pub mod convergence;
 pub mod debris;
 pub mod findings;
 pub mod identity;
@@ -29,6 +30,10 @@ pub mod inventory;
 pub mod telemetry;
 
 pub use compaction::{CompactionDecisionV1, CompactionPlacementV1, CompactionTriggerPolicyV1};
+pub use convergence::{
+    SchemaConvergenceFindingV1, SchemaConvergenceProgressV1, SchemaConvergenceStageV1,
+    SchemaConvergenceStateV1,
+};
 pub use debris::{
     IncidentDebrisArtifactV1, IncidentDebrisKindV1, IncidentDebrisScanV1, QuarantineContractV1,
     QuarantinedArtifactV1,
@@ -36,7 +41,7 @@ pub use debris::{
 pub use findings::{
     code_generation_retention_finding, incident_debris_finding, orphan_store_finding,
     over_budget_finding, pending_schema_migration_finding, retention_backlog_finding,
-    semantic_vector_retention_finding, table_growth_finding,
+    table_growth_finding,
 };
 pub use identity::{
     FreePageRatioV1, QuarantineLocationV1, RelativeArtifactPathV1, StorageByteSizeV1, StoreKeyV1,
@@ -44,7 +49,6 @@ pub use identity::{
 };
 pub use inventory::{
     CodeGenerationRetentionRecordV1, OrphanStoreRecordV1, RetentionBacklogRecordV1,
-    SemanticVectorRetentionRecordV1,
 };
 pub use telemetry::{
     SIGNIFICANT_TABLE_GROWTH_ABSOLUTE_BYTES, SIGNIFICANT_TABLE_GROWTH_PERCENT,

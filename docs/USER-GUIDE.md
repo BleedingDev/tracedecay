@@ -282,7 +282,7 @@ When changing generated Hermes plugin or context-engine behavior, start with
 TraceDecay's read-only analysis tools before rebuilding or reinstalling
 anything: use `tracedecay_diff_context` to inspect modified symbols,
 dependencies, and affected tests; use `tracedecay_complexity`,
-`tracedecay_redundancy`, `tracedecay_dead_code`, and `tracedecay_coupling` for
+`tracedecay_dead_code`, and `tracedecay_coupling` for
 focused quality checks; `tracedecay_test_risk` for
 untested hot spots; `tracedecay_diagnostics` for structured compiler/type
 feedback; and `tracedecay_run_affected_tests` for the focused test set when test
@@ -882,14 +882,6 @@ pricing cache, or consult a pricing environment override. Missing native usage,
 unknown models, unavailable observations, or unavailable pricing remain typed
 unknown/unavailable results; TraceDecay never fills them with zero or a stale
 fallback estimate.
-
-### Semantic-model acquisition
-
-When semantic auto-download is enabled, TraceDecay can download missing,
-revision-pinned semantic-model artifacts from Hugging Face hosts. Artifacts are
-verified against catalog-pinned lengths and SHA-256 digests before publication.
-If acquisition is unavailable or disabled, semantic retrieval reports its model
-state or failure while exact, lexical, and graph retrieval remain available.
 
 ### Configured remote authority
 

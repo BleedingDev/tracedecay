@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
-use tracedecay::tracedecay::TraceDecay;
+use tracedecay::project::TraceDecay;
 use tracedecay_domain::errors::{Result as TraceDecayResult, TraceDecayError};
 use tracedecay_mcp::ToolResult;
 use tracedecay_runtime_core::storage::resolve_layout_for_current_profile;
@@ -1041,6 +1041,39 @@ async fn test_port_order() {
 }
 
 #[tokio::test]
+async fn port_order_sorts_a_tied_level_before_applying_the_limit() {
+    let dir = test_temp_dir();
+    let project_root = dir.path().join("project");
+    fs::create_dir_all(project_root.join("src")).unwrap();
+    fs::write(
+        project_root.join("src/lib.rs"),
+        "pub fn zeta() {}\npub fn alpha() {}\npub fn middle() {}\n",
+    )
+    .unwrap();
+    let (cg, _env) = init_test_project(&project_root).await;
+
+    let result = handle_tool_call(
+        &cg,
+        "tracedecay_port_order",
+        json!({"source_dir": "src", "kinds": ["function"], "limit": 2}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+    let names = output["levels"][0]["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|symbol| symbol["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, ["zeta", "alpha"]);
+    assert_eq!(output["returned"], json!(2));
+}
+
+#[tokio::test]
 async fn test_rename_preview_not_found() {
     let (cg, _env, _dir) = setup_empty_analysis_project().await;
     let result = handle_tool_call(
@@ -1188,133 +1221,6 @@ async fn test_gini() {
         parsed.get("interpretation").is_some(),
         "interpretation field should exist"
     );
-}
-
-/// `tracedecay_redundancy` must surface AST-isomorphic duplicate pairs and
-/// rank them by composite similarity. Plant two structurally identical
-/// functions in a fixture and assert the pair surfaces in the top hit with
-/// the `definite` severity bucket.
-#[tokio::test]
-async fn test_redundancy_finds_planted_duplicate() {
-    let dir = test_temp_dir();
-    let project_root = dir.path().join("project");
-    fs::create_dir_all(&project_root).unwrap();
-    let project = project_root.as_path();
-    fs::create_dir_all(project.join("src")).unwrap();
-
-    // Two functions: identical structure, renamed identifiers.
-    let source = r#"
-pub fn compute_a(value: i32) -> i32 {
-    let mut acc = 0;
-    for i in 0..value {
-        if i % 2 == 0 {
-            acc += i;
-        } else {
-            acc -= i;
-        }
-    }
-    acc
-}
-
-pub fn compute_b(input: i32) -> i32 {
-    let mut total = 0;
-    for j in 0..input {
-        if j % 2 == 0 {
-            total += j;
-        } else {
-            total -= j;
-        }
-    }
-    total
-}
-
-pub fn unrelated(x: i32) -> i32 {
-    x * 2
-}
-"#;
-    fs::write(project.join("src/lib.rs"), source).unwrap();
-
-    let (cg, _env) = init_test_project(project).await;
-    wait_for_current_graph(&cg).await;
-    let result = handle_tool_call(
-        &cg,
-        "tracedecay_redundancy",
-        json!({ "min_lines": 5, "similarity_threshold": 0.5 }),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-
-    let pair_count = parsed["pair_count"].as_u64().unwrap_or(0);
-    assert!(
-        pair_count >= 1,
-        "expected at least 1 duplicate pair, got: {text}"
-    );
-
-    let pairs = parsed["pairs"].as_array().expect("pairs array");
-    let top = &pairs[0];
-    assert!(
-        top["ranking_score"].as_f64().unwrap_or(0.0) > 0.0,
-        "top pair should expose ranking_score; full output: {text}"
-    );
-    assert!(
-        top["signals"]["body_vector_cosine"].as_f64().is_some(),
-        "top pair should expose body_vector_cosine; full output: {text}"
-    );
-    let kind = top["overlap_kind"].as_str().unwrap_or("");
-    assert_eq!(
-        kind, "ast_isomorphic",
-        "top pair should be AST-isomorphic; full output: {text}"
-    );
-    let severity = top["severity"].as_str().unwrap_or("");
-    assert_eq!(
-        severity, "definite",
-        "AST-identical pair should be 'definite'"
-    );
-    let names: Vec<&str> = vec![
-        top["a"]["name"].as_str().unwrap_or(""),
-        top["b"]["name"].as_str().unwrap_or(""),
-    ];
-    assert!(
-        names.contains(&"compute_a") && names.contains(&"compute_b"),
-        "expected compute_a/compute_b in pair, got {names:?}"
-    );
-    for endpoint in [&top["a"], &top["b"]] {
-        let name = endpoint["name"].as_str().expect("endpoint name");
-        let expected_line = source
-            .lines()
-            .position(|line| line.starts_with(&format!("pub fn {name}")))
-            .map(|line| line as u64 + 1)
-            .expect("function declaration in source fixture");
-        assert_eq!(
-            endpoint["line"].as_u64(),
-            Some(expected_line),
-            "public redundancy locations must use one-based source lines"
-        );
-    }
-    let groups = parsed["groups"].as_array().expect("groups array");
-    assert!(
-        groups
-            .iter()
-            .any(|group| group["size"].as_u64().unwrap_or(0) >= 2),
-        "expected at least one duplicate group, got: {text}"
-    );
-
-    // Calling again against the same sealed generation is deterministic.
-    let result2 = handle_tool_call(
-        &cg,
-        "tracedecay_redundancy",
-        json!({ "min_lines": 5, "similarity_threshold": 0.5 }),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let parsed2: serde_json::Value = serde_json::from_str(extract_text(&result2.value)).unwrap();
-    assert_eq!(parsed2["pair_count"], parsed["pair_count"]);
 }
 
 /// `details=true` must surface raw counts + interpretation per dimension,
@@ -3079,7 +2985,7 @@ async fn changelog_filters_deleted_directory_entries() {
 /// .toml/.yaml/.json config file) into one symbol per `[name]`,
 /// `[version]`, `[dependencies]` key. A Cargo.toml change with ~30
 /// dependency lines produced ~70 entries that pushed the response past
-/// 760k tokens. Config files should collapse to a single summary symbol.
+/// 760k tokens. Config keys should collapse to one summary per change class.
 #[tokio::test]
 async fn pr_context_collapses_cargo_toml_keys() {
     let dir = test_temp_dir();
@@ -3098,6 +3004,7 @@ async fn pr_context_collapses_cargo_toml_keys() {
     fs::write(project.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
     git_run(project, &["add", "."]);
     git_run(project, &["commit", "-m", "init"]);
+    git_run(project, &["branch", "base"]);
     // Second commit: bloat Cargo.toml with many deps.
     let mut bloated = String::from(
         "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
@@ -3114,7 +3021,7 @@ async fn pr_context_collapses_cargo_toml_keys() {
     let result = handle_tool_call(
         &cg,
         "tracedecay_pr_context",
-        json!({"base_ref": "HEAD~1", "head_ref": "HEAD"}),
+        json!({"base_ref": "base", "head_ref": "HEAD"}),
         None,
         None,
     )
@@ -3122,30 +3029,13 @@ async fn pr_context_collapses_cargo_toml_keys() {
     .unwrap();
     let text = extract_text(&result.value);
     let output: Value = serde_json::from_str(text).unwrap();
-    let added = output["added"].as_array().unwrap();
-    let modified = output["modified"].as_array().unwrap();
-    let count_cargo = |arr: &[Value]| -> usize {
-        arr.iter()
-            .filter(|v| v["file"].as_str() == Some("Cargo.toml"))
-            .count()
-    };
-    let cargo_total = count_cargo(added) + count_cargo(modified);
-    assert!(
-        cargo_total <= 1,
-        "Cargo.toml should collapse to at most one summary symbol; got {cargo_total} entries. added={added:?}, modified={modified:?}"
-    );
-    // And the surviving entry must be a config summary, not a regular key.
-    let summary = modified
-        .iter()
-        .find(|v| v["file"].as_str() == Some("Cargo.toml"));
-    assert!(
-        summary.is_some(),
-        "expected one config_summary entry for Cargo.toml in modified; got {modified:?}"
+    assert_eq!(
+        output["added"],
+        json!([{"file": "Cargo.toml", "kind": "config_summary", "config_keys": 50}])
     );
     assert_eq!(
-        summary.unwrap()["kind"].as_str(),
-        Some("config_summary"),
-        "Cargo.toml entry should be kind=config_summary"
+        output["modified"],
+        json!([{"file": "Cargo.toml", "kind": "config_summary", "config_keys": 1}])
     );
 }
 

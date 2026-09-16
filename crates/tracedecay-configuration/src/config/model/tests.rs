@@ -12,9 +12,6 @@ use tracedecay_runtime_core::config::{
     discover_project_root, get_project_db_path, get_tracedecay_dir, is_ambient_project_root,
     is_generated_dir_segment, lock_user_data_dir_test_env, user_data_dir,
 };
-use tracedecay_semantic_contracts::{
-    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticProfileSelection,
-};
 
 struct EnvRestore {
     key: &'static str,
@@ -279,92 +276,6 @@ fn test_explicit_global_excludes_ignores_comments_and_blank_lines() {
 }
 
 #[test]
-fn semantic_config_defaults_to_offline_healthy_baseline() {
-    let config = TraceDecayConfig::default();
-    assert_eq!(config.semantic, SemanticConfig::default());
-    assert_eq!(
-        config.semantic.selected_model.as_deref(),
-        Some(DEFAULT_FASTEMBED_MODEL_ID)
-    );
-    assert!(config.semantic.auto_download);
-    assert!(config.semantic.active_profile.is_none());
-    assert!(config.semantic.rollback_profile.is_none());
-    assert!(config.semantic.validate().is_ok());
-    assert!(config.semantic.resources.max_concurrent_sessions >= 1);
-
-    let json = serde_json::to_string(&config).unwrap();
-    let parsed: TraceDecayConfig = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.semantic, config.semantic);
-}
-
-/// Host-absolute fixture path: `artifact_path` validation requires
-/// `Path::is_absolute`, which a bare `/...` literal fails on Windows.
-fn absolute_fixture_path(posix: &str) -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
-    } else {
-        PathBuf::from(posix)
-    }
-}
-
-#[test]
-fn semantic_config_accepts_only_explicit_local_installed_profiles() {
-    let local = SemanticProfileSelection {
-        profile_id: "code-embedding.v1".to_owned(),
-        accepted_profile_digest: tracedecay_domain::ManifestDigest::new(format!(
-            "sha256:{}",
-            "1".repeat(64)
-        ))
-        .unwrap(),
-        artifact_digest: "a".repeat(64),
-        artifact_path: absolute_fixture_path("/var/lib/tracedecay/models/code-embedding"),
-    };
-    let mut semantic = SemanticConfig {
-        active_profile: Some(local.clone()),
-        rollback_profile: Some(SemanticProfileSelection {
-            profile_id: "code-embedding.previous".to_owned(),
-            accepted_profile_digest: tracedecay_domain::ManifestDigest::new(format!(
-                "sha256:{}",
-                "2".repeat(64)
-            ))
-            .unwrap(),
-            artifact_digest: "b".repeat(64),
-            artifact_path: absolute_fixture_path(
-                "/var/lib/tracedecay/models/code-embedding-previous",
-            ),
-        }),
-        ..SemanticConfig::default()
-    };
-    assert!(semantic.validate().is_ok());
-
-    semantic.active_profile.as_mut().unwrap().artifact_path =
-        std::path::PathBuf::from("https://models.example/code-embedding");
-    assert!(
-        semantic.validate().is_err(),
-        "runtime configuration must not admit network or ambient-cache discovery"
-    );
-    semantic.active_profile = Some(local.clone());
-    semantic.rollback_profile = Some(local);
-    assert!(
-        semantic.validate().is_err(),
-        "active and rollback selections must remain distinct"
-    );
-}
-
-#[test]
-fn semantic_resource_ceilings_reject_zero_or_incoherent_limits() {
-    let mut semantic = SemanticConfig::default();
-    semantic.resources.max_threads = 0;
-    assert!(semantic.validate().is_err());
-
-    semantic = SemanticConfig::default();
-    semantic.resources.max_resident_bytes = Some(semantic.resources.max_model_bytes);
-    assert!(semantic.validate().is_ok());
-    semantic.resources.max_model_bytes += 1;
-    assert!(semantic.validate().is_err());
-}
-
-#[test]
 fn telemetry_timing_defaults_on_and_round_trips() {
     let config = TraceDecayConfig::default();
     assert!(config.telemetry.timings);
@@ -561,13 +472,8 @@ fn implicit_discovery_never_selects_the_user_profile_root() {
 // ---------------------------------------------------------------------------
 // Shared generated/vendored segment list
 //
-// GENERATED_DIR_SEGMENTS unifies what used to be four independently
-// hand-maintained lists: this module's own DEFAULT_EXCLUDE_PATTERNS,
-// tracedecay::scan's is_skipped_dir_hint, migrate::inventory's
-// should_prune_dir, and mcp::tools::handlers::redundancy's
-// is_generated_path. These tests pin the union those four call sites need
-// and spot-check that segments unique to one of the formerly-separate lists
-// are now recognized everywhere.
+// GENERATED_DIR_SEGMENTS is the one list shared by this module's
+// DEFAULT_EXCLUDE_PATTERNS, scan, and migrate inventory paths.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -595,7 +501,7 @@ fn generated_dir_segments_cover_the_union_all_call_sites_need() {
     }
     // Formerly migrate::inventory-only addition beyond the scan.rs set.
     assert!(GENERATED_DIR_SEGMENTS.contains(&"target"));
-    // Formerly redundancy.rs-only addition beyond the scan.rs set.
+    // Worktree build directories are generated paths too.
     assert!(GENERATED_DIR_SEGMENTS.contains(&".worktrees"));
     // `.git` is intentionally NOT part of the shared list — it stays a
     // site-local addition in migrate::inventory::should_prune_dir (see its
@@ -623,7 +529,7 @@ fn is_generated_path_segment_matches_segments_and_minified_suffix() {
     assert!(is_generated_path_segment(".worktrees/feature/src/lib.rs"));
     assert!(is_generated_path_segment("assets/app.min.js"));
     assert!(is_generated_path_segment("assets/app.min.css"));
-    assert!(!is_generated_path_segment("src/redundancy.rs"));
+    assert!(!is_generated_path_segment("src/helpers.rs"));
     assert!(!is_generated_path_segment("builder/mod.rs"));
 }
 

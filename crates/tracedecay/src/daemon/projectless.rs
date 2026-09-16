@@ -116,6 +116,7 @@ fn admit_projectless_connection(
 pub(super) async fn serve_projectless_client(
     transport: &mut (impl McpTransport + Send),
     client_identity: &DaemonClientIdentity,
+    timings_enabled: bool,
     lifecycle: &DaemonLifecycle,
     store_administration: &StoreAdministration,
 ) -> Result<()> {
@@ -136,6 +137,7 @@ pub(super) async fn serve_projectless_client(
                 boxed_projectless_phase(projectless_response(
                     &request,
                     &connection,
+                    timings_enabled,
                     store_administration,
                 ))
                 .await
@@ -155,6 +157,7 @@ pub(super) async fn serve_projectless_client(
 async fn projectless_response(
     request: &tracedecay_mcp::JsonRpcRequest,
     connection: &ProjectlessConnectionStateV1,
+    timings_enabled: bool,
     store_administration: &StoreAdministration,
 ) -> Option<tracedecay_mcp::JsonRpcResponse> {
     let id = request.id.clone()?;
@@ -177,21 +180,51 @@ async fn projectless_response(
             ),
             Err(error) => JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string()),
         }),
-        "tools/call" => Some(
-            boxed_projectless_phase(projectless_tools_call_response_with_connection(
-                id,
-                request.params.as_ref(),
-                connection,
-                store_administration,
-            ))
-            .await,
-        ),
+        "tools/call" => {
+            let started = timings_enabled.then(std::time::Instant::now);
+            let mut response =
+                boxed_projectless_phase(projectless_tools_call_response_with_connection(
+                    id,
+                    request.params.as_ref(),
+                    connection,
+                    store_administration,
+                ))
+                .await;
+            attach_projectless_tool_timing(
+                &mut response,
+                started.map(|started| started.elapsed().as_micros() as u64),
+            );
+            Some(response)
+        }
         "ping" | "logging/setLevel" => Some(JsonRpcResponse::success(id, json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
             ErrorCode::MethodNotFound,
             format!("Method not found: {}", request.method),
         )),
+    }
+}
+
+fn attach_projectless_tool_timing(response: &mut JsonRpcResponse, duration_us: Option<u64>) {
+    let Some(duration_us) = duration_us else {
+        return;
+    };
+    let Some(result) = response
+        .result
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let meta = result
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if meta.is_null() {
+        *meta = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        meta.entry("duration_us")
+            .or_insert_with(|| serde_json::json!(duration_us));
     }
 }
 
@@ -260,6 +293,11 @@ async fn projectless_tools_call_response_with_connection(
                 connection,
                 store_administration,
             )),
+            tool_name @ ("tracedecay_project_list"
+            | "tracedecay_project_search"
+            | "tracedecay_project_context") => boxed_projectless_phase(
+                projectless_registry_response(id, tool_name, arguments, connection),
+            ),
             _ => {
                 if let Some(operation) =
                     tracedecay_contracts::RetainedSurfaceOperation::from_tool_name(tool_name)
@@ -282,6 +320,51 @@ async fn projectless_tools_call_response_with_connection(
             }
         };
     response.await
+}
+
+async fn projectless_registry_response(
+    id: serde_json::Value,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    connection: &ProjectlessConnectionStateV1,
+) -> tracedecay_mcp::JsonRpcResponse {
+    let result = match tool_name {
+        "tracedecay_project_list" => {
+            tracedecay_mcp::handlers::info::handle_project_list(
+                &connection.client_identity.profile_root,
+                arguments,
+                None,
+            )
+            .await
+        }
+        "tracedecay_project_search" => {
+            tracedecay_mcp::handlers::info::handle_project_search(
+                &connection.client_identity.profile_root,
+                arguments,
+                None,
+            )
+            .await
+        }
+        "tracedecay_project_context" => {
+            tracedecay_mcp::handlers::info::handle_project_context(
+                &connection.client_identity.profile_root,
+                arguments,
+                None,
+            )
+            .await
+        }
+        _ => {
+            return JsonRpcResponse::error(
+                id,
+                ErrorCode::MethodNotFound,
+                format!("unknown projectless registry tool: {tool_name}"),
+            );
+        }
+    };
+    match result {
+        Ok(result) => JsonRpcResponse::success(id, result.value),
+        Err(error) => tool_error_response(id, tool_name, &error),
+    }
 }
 
 async fn projectless_admin_project_response(
@@ -345,58 +428,6 @@ async fn projectless_admin_project_response(
     )
 }
 
-/// Resolve terminal work from the session route already published by the host.
-/// A root carried by Stop only checks that binding; it never selects another project.
-fn codex_stop_project_route(
-    arguments: &serde_json::Value,
-    store_administration: &StoreAdministration,
-) -> Result<Option<crate::mcp::project_route::ResolvedProjectRoute>> {
-    use crate::mcp::project_route::WorkspaceProjectRoute;
-
-    let expected_root = match arguments.get("project_root") {
-        Some(serde_json::Value::String(root)) if !root.is_empty() => Some(Path::new(root)),
-        Some(_) => {
-            return Err(TraceDecayError::project_route(
-                "project_route_invalid_root",
-                false,
-                "Codex Stop project_root must be a nonempty path",
-            ));
-        }
-        None => None,
-    };
-    let routes = store_administration.project_routes().snapshot()?;
-    match routes.workspace_route_for_arguments(arguments) {
-        Some(WorkspaceProjectRoute::Resolved(route)) => {
-            let profile = store_administration.profile_identity()?;
-            if &route.profile_id != profile.profile_id() {
-                return Err(TraceDecayError::project_route(
-                    "project_route_profile_mismatch",
-                    false,
-                    "Codex Stop session route belongs to another profile",
-                ));
-            }
-            if let Some(root) = expected_root
-                && authority::canonical_identity_path(root)?
-                    != authority::canonical_identity_path(&route.requested_root)?
-            {
-                return Err(TraceDecayError::project_route(
-                    "project_route_root_mismatch",
-                    false,
-                    "Codex Stop root does not match its registered session route",
-                ));
-            }
-            Ok(Some(route.as_ref().clone()))
-        }
-        Some(WorkspaceProjectRoute::Failed(failure)) => Err(failure.clone().into_error()),
-        None if expected_root.is_some() => Err(TraceDecayError::project_route(
-            "project_route_not_found",
-            true,
-            "Codex Stop project session has no registered route",
-        )),
-        None => Ok(None),
-    }
-}
-
 async fn projectless_hook_runtime_response(
     id: serde_json::Value,
     arguments: serde_json::Value,
@@ -442,15 +473,6 @@ async fn projectless_hook_runtime_response(
             }
         };
     let host_admission_broker = Ok(&host_admission_broker);
-    let codex_project_route =
-        if arguments.get("action").and_then(serde_json::Value::as_str) == Some("codex_stop") {
-            match codex_stop_project_route(&arguments, store_administration) {
-                Ok(route) => route,
-                Err(error) => return tool_error_response(id, "tracedecay_hook_runtime", &error),
-            }
-        } else {
-            None
-        };
     let refresh_wake = boxed_projectless_phase(
         store_administration
             .session_temporal_refresh_schedulers()
@@ -460,21 +482,22 @@ async fn projectless_hook_runtime_response(
             ),
     )
     .await;
-    match boxed_projectless_phase(crate::mcp::tools::handle_projectless_hook_runtime(
-        arguments.clone(),
-        &connection.client_identity.profile_root,
-        session_runtime_registry,
-        global_db.as_ref(),
-        crate::mcp::tools::SessionAuthorities::new(None, Some(&user_session_db))
-            .with_profile_identity(Some(std::sync::Arc::new(profile_identity.clone())))
-            .with_background_cpu(
-                store_administration
-                    .session_temporal_refresh_schedulers()
-                    .background_cpu(),
-            ),
-        host_admission_broker,
-        codex_project_route,
-    ))
+    match boxed_projectless_phase(
+        tracedecay_mcp::handlers::hook_runtime::handle_projectless_hook_runtime(
+            arguments.clone(),
+            &connection.client_identity.profile_root,
+            session_runtime_registry,
+            global_db.as_ref(),
+            tracedecay_mcp::handlers::SessionAuthorities::new(None, Some(&user_session_db))
+                .with_profile_identity(Some(std::sync::Arc::new(profile_identity.clone())))
+                .with_background_cpu(
+                    store_administration
+                        .session_temporal_refresh_schedulers()
+                        .background_cpu(),
+                ),
+            host_admission_broker,
+        ),
+    )
     .await
     {
         Ok(result) if tool_result_has_semantic_error(&result) => {
@@ -522,12 +545,14 @@ async fn projectless_admin_cli_response(
                 return JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string());
             }
         };
-    match boxed_projectless_phase(crate::mcp::tools::handle_projectless_admin_cli(
-        arguments,
-        &global_db,
-        tracedecay_global_db::global_accounting_enabled().then_some(accounting_db.as_ref()),
-        &connection.client_identity.profile_root,
-    ))
+    match boxed_projectless_phase(
+        tracedecay_mcp::handlers::admin_cli::handle_projectless_admin_cli(
+            arguments,
+            &global_db,
+            tracedecay_global_db::global_accounting_enabled().then_some(accounting_db.as_ref()),
+            &connection.client_identity.profile_root,
+        ),
+    )
     .await
     {
         Ok(result) => JsonRpcResponse::success(id, result.value),
@@ -667,52 +692,6 @@ pub(super) fn projectless_user_session_request(request: Option<&JsonRpcRequest>)
         || crate::mcp::tools::session_refresh_profile_scope_requested(tool_name, &arguments)
 }
 
-/// Selects the retained project server named by route-only session/thread
-/// metadata on a projectless registered-project reader request.
-///
-/// The daemon transport chooses its serving MCP server before that server can
-/// run the ordinary per-request private-route dispatch. Without this bridge, a
-/// hook can publish a valid daemon-wide route while the next projectless socket
-/// still falls into the profile-only dispatcher and rejects every code reader
-/// as requiring an initialized project.
-pub(super) fn projectless_registered_project_reader_server(
-    request_line: &str,
-    client_identity: &DaemonClientIdentity,
-    store_administration: &StoreAdministration,
-) -> Result<Option<std::sync::Arc<crate::mcp::McpServer>>> {
-    let Ok(request) = serde_json::from_str::<JsonRpcRequest>(request_line.trim()) else {
-        return Ok(None);
-    };
-    if request.method != "tools/call" {
-        return Ok(None);
-    }
-    let Ok((tool_name, arguments)) = projectless_tool_call(request.params.as_ref()) else {
-        return Ok(None);
-    };
-    if !crate::mcp::tools::tool_dispatches_registered_project_reader(tool_name)
-        || !crate::mcp::project_route::arguments_have_structural_route_identity(&arguments)
-    {
-        return Ok(None);
-    }
-    // Same admission the profile-only dispatcher applies: a private route is
-    // never handed to a socket authenticated for another profile.
-    admit_projectless_connection(client_identity, store_administration)?;
-    let routes = store_administration.project_routes().snapshot()?;
-    match routes.workspace_route_for_arguments(&arguments) {
-        Some(crate::mcp::project_route::WorkspaceProjectRoute::Resolved(route)) => {
-            route.retained_server().map(Some)
-        }
-        Some(crate::mcp::project_route::WorkspaceProjectRoute::Failed(failure)) => {
-            Err(failure.clone().into_error())
-        }
-        None => Err(TraceDecayError::project_route(
-            "project_route_not_found",
-            false,
-            "explicit session or thread identity has no registered private project route",
-        )),
-    }
-}
-
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod projectless_admission_tests {
@@ -795,54 +774,6 @@ mod projectless_admission_tests {
             admit_projectless_connection(&client, &administration).is_err(),
             "a profile root that resolves to nothing must stay refused"
         );
-    }
-
-    #[test]
-    fn registered_project_reader_bridge_uses_profile_admission() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let (real_root, linked_root) = linked_profile_root(temp.path());
-        let foreign_root = temp.path().join("foreign").join(".tracedecay");
-        std::fs::create_dir_all(&foreign_root).expect("create foreign root");
-        let missing_root = temp.path().join("never-created").join(".tracedecay");
-        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&real_root)
-            .expect("pin profile identity");
-        let administration = StoreAdministration::default().with_profile_identity(identity);
-        let request = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "tracedecay_context",
-                "arguments": { "task": "inspect", "session_id": "session.bridge-admission" }
-            }
-        })
-        .to_string();
-
-        for (root, admitted) in [
-            (real_root, true),
-            (linked_root, true),
-            (foreign_root, false),
-            (missing_root, false),
-        ] {
-            let client = DaemonClientIdentity::new(root.clone(), root.join("global.db"));
-            let Err(error) =
-                projectless_registered_project_reader_server(&request, &client, &administration)
-            else {
-                panic!("a reader with no registered route must not select a server or fall through")
-            };
-            // Both spellings of this profile must reach route selection. Foreign
-            // and unresolvable profiles must be refused before inspecting routes.
-            let expected = if admitted {
-                "explicit session or thread identity has no registered private project route"
-            } else {
-                "projectless connection profile does not match its authenticated identity"
-            };
-            assert!(
-                error.to_string().contains(expected),
-                "unexpected bridge refusal for {}: {error}",
-                root.display()
-            );
-        }
     }
 
     #[tokio::test]

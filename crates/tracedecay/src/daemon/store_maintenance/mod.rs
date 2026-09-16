@@ -8,11 +8,8 @@ use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegis
 use tracedecay_runtime_core::branch::BranchAdminAction;
 
 use super::branch_admin::StoreAdministration;
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_runtime_core::logging::log_daemon_event;
-
-#[cfg(test)]
-mod vector_retention_tests;
 
 /// Runs branch-store GC for a project through the daemon administration
 /// coordinator, logging what it removed. Returns `false` when layout resolution

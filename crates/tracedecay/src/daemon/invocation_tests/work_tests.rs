@@ -130,7 +130,11 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
         ManifestDigest::new(format!("sha256:{}", "f".repeat(64))).expect("configuration digest");
     let service = DaemonInvocationService::default();
     let (proposal_routing, configuration_digest) =
-        empty_work_proposal_routing(scope.clone(), &grant);
+        super::work_evidence_journey_tests::configured_work_proposal_routing(
+            project.path(),
+            scope.clone(),
+            &grant,
+        );
     let policy_digest = mount_test_work_observability(
         &service,
         project.path(),
@@ -300,10 +304,10 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
         .decision
         .route_plan
         .as_ref()
-        .expect("an empty pinned route set remains an explained decision");
-    assert!(route_plan.ranked.is_empty());
+        .expect("the configured route remains in the explained decision");
+    assert!(!route_plan.ranked.is_empty());
     assert!(
-        generated
+        !generated
             .decision
             .ordered_reason_codes
             .contains(&WorkProposalReasonV1::NoEligibleRoutes)
@@ -319,7 +323,7 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
             .configuration_revision
             .as_ref()
             .map(tracedecay_domain::ConfigurationRevisionId::as_str),
-        Some("configuration.revision.work-empty-routing")
+        Some("configuration.revision.work-evidence-routing")
     );
 
     let proposal = WorkProposalV1::new(
@@ -330,10 +334,16 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
         WorkSizingV1::new(WorkScoreKindV1::Ordinal, 1, 1, 1, "explicit fixture work")
             .expect("proposal sizing"),
         Vec::new(),
-        WorkRouteDecisionV1::abstain("test route has no provider selection")
-            .expect("proposal route"),
+        WorkRouteDecisionV1::selected(
+            super::work_evidence_journey_tests::provider_route(),
+            Vec::new(),
+            BTreeSet::new(),
+            "no fallback in the core lifecycle".to_owned(),
+        )
+        .expect("proposal route"),
         "Admit the explicitly declared Work task".to_owned(),
         proposal_digest,
+        configuration_digest.clone(),
     )
     .expect("proposal");
     let prepared_accept = invoke!(
@@ -402,7 +412,7 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
     );
     let admitted = invoke!(
         "request.work.admit",
-        WorkApplicationInvocationV1::AdmitExecution(admission)
+        WorkApplicationInvocationV1::AdmitExecution(admission.clone())
     );
     let DaemonInvocationOutcome::WorkApplication {
         outcome: WorkApplicationOutcomeV1::AdmitExecution(ApplicationOutcome::Effect(effect)),
@@ -412,7 +422,39 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
         panic!("execution admission must return a product mutation effect: {admitted:?}");
     };
     let admitted = effect.payload.expect("execution admission receipt");
-    assert!(!admitted.replayed());
+    assert!(!admitted.mutation.replayed());
+
+    // Committing the admission advances the Work head past the version the
+    // admission command itself pinned. A byte-identical resubmission is the
+    // same command, so it owes the retained receipt and the same licensed
+    // execution snapshot; answering `stale` there would make the admission
+    // non-idempotent and strand a caller that lost the first response.
+    let replayed_admission = invoke!(
+        "request.work.admit-replay",
+        WorkApplicationInvocationV1::AdmitExecution(admission)
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome: WorkApplicationOutcomeV1::AdmitExecution(ApplicationOutcome::Effect(effect)),
+        ..
+    } = replayed_admission
+    else {
+        panic!(
+            "replayed execution admission must return a product mutation effect: \
+             {replayed_admission:?}"
+        );
+    };
+    let replayed_admission = effect
+        .payload
+        .expect("replayed execution admission receipt");
+    assert!(replayed_admission.mutation.replayed());
+    assert_eq!(
+        replayed_admission.mutation.event(),
+        admitted.mutation.event()
+    );
+    assert_eq!(
+        replayed_admission.execution_snapshot, admitted.execution_snapshot,
+        "the replayed admission must license the identical execution snapshot"
+    );
 
     let prepared_task_acceptance = invoke!(
         "request.work.prepare-accept-task",
@@ -452,7 +494,7 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
     let read = invoke!(
         "request.work.product-view",
         WorkApplicationInvocationV1::Views(WorkGraphReadRequestV1::current(
-            product_selection,
+            product_selection.clone(),
             UtcMicros(100),
         ))
     );
@@ -484,6 +526,151 @@ async fn registered_work_services_dispatch_the_core_lifecycle() {
         .expect("created task remains in the product graph");
     assert!(item.is_execution_admitted());
     assert!(item.is_accepted());
+
+    // An accepted proposal that abstained names no provider route, so there is
+    // no execution snapshot to admit. The refusal must say the request cannot
+    // be satisfied, not that the graph authority is unavailable after a delay:
+    // every authority here is mounted, and no wait produces a route the
+    // proposal never recommended.
+    let unrouted_task_id =
+        tracedecay_domain::TaskId::new("task.work.core-invocation-unrouted").expect("task id");
+    let (initiative, plan, milestone, item) = product_task(
+        "core-invocation-unrouted",
+        unrouted_task_id.clone(),
+        UtcMicros(10),
+    );
+    let prepared_unrouted = invoke!(
+        "request.work.prepare-create-unrouted",
+        WorkApplicationInvocationV1::PrepareGraphMutation(PrepareWorkProductMutationRequestV1 {
+            selection: product_selection.clone(),
+            change: WorkProductChangeDraftV1::CreateTask {
+                initiative,
+                plan,
+                milestone,
+                item: Box::new(item),
+            },
+            causation_event_id: None,
+            evidence: Vec::new(),
+        })
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome:
+            WorkApplicationOutcomeV1::PrepareGraphMutation(ApplicationOutcome::Evidence(packet)),
+        ..
+    } = prepared_unrouted
+    else {
+        panic!("unrouted task preparation must return Work evidence: {prepared_unrouted:?}");
+    };
+    let created_unrouted = invoke!(
+        "request.work.create-unrouted",
+        WorkApplicationInvocationV1::MutateGraph(packet.payload.expect("prepared unrouted task"))
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome: WorkApplicationOutcomeV1::MutateGraph(ApplicationOutcome::Effect(effect)),
+        ..
+    } = created_unrouted
+    else {
+        panic!("unrouted task creation must return a Work effect: {created_unrouted:?}");
+    };
+    let created_unrouted = effect.payload.expect("created unrouted task receipt");
+
+    let unrouted_proposal = WorkProposalV1::new(
+        ProposalId::new("proposal.work.core-invocation-unrouted").expect("proposal id"),
+        unrouted_task_id.clone(),
+        created_unrouted.verified_graph_version().graph_version(),
+        WorkShapeAssessmentV1::new(WorkScoreKindV1::Ordinal, 1, 1, 1, 1).expect("proposal shape"),
+        WorkSizingV1::new(WorkScoreKindV1::Ordinal, 1, 1, 1, "unrouted fixture work")
+            .expect("proposal sizing"),
+        Vec::new(),
+        WorkRouteDecisionV1::abstain("no provider route is eligible for this task")
+            .expect("proposal route"),
+        "Accept a task no configured route can execute".to_owned(),
+        ManifestDigest::new(format!("sha256:{}", "2".repeat(64))).expect("proposal digest"),
+        configuration_digest.clone(),
+    )
+    .expect("unrouted proposal");
+    let prepared_unrouted_accept = invoke!(
+        "request.work.prepare-accept-unrouted",
+        WorkApplicationInvocationV1::PrepareGraphMutation(PrepareWorkProductMutationRequestV1 {
+            selection: product_selection.clone(),
+            change: WorkProductChangeDraftV1::DecideProposal {
+                proposal: unrouted_proposal,
+                disposition: WorkProposalDispositionV1::Accepted,
+            },
+            causation_event_id: None,
+            evidence: Vec::new(),
+        })
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome:
+            WorkApplicationOutcomeV1::PrepareGraphMutation(ApplicationOutcome::Evidence(packet)),
+        ..
+    } = prepared_unrouted_accept
+    else {
+        panic!(
+            "unrouted proposal preparation must return Work evidence: \
+             {prepared_unrouted_accept:?}"
+        );
+    };
+    let accepted_unrouted = invoke!(
+        "request.work.accept-unrouted",
+        WorkApplicationInvocationV1::MutateGraph(
+            packet.payload.expect("prepared unrouted proposal")
+        )
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome: WorkApplicationOutcomeV1::MutateGraph(ApplicationOutcome::Effect(_)),
+        ..
+    } = accepted_unrouted
+    else {
+        panic!("unrouted proposal acceptance must return a Work effect: {accepted_unrouted:?}");
+    };
+    let prepared_unrouted_admission = invoke!(
+        "request.work.prepare-admit-unrouted",
+        WorkApplicationInvocationV1::PrepareGraphMutation(PrepareWorkProductMutationRequestV1 {
+            selection: product_selection,
+            change: WorkProductChangeDraftV1::AdmitExecution {
+                task_id: unrouted_task_id,
+            },
+            causation_event_id: None,
+            evidence: Vec::new(),
+        })
+    );
+    let DaemonInvocationOutcome::WorkApplication {
+        outcome:
+            WorkApplicationOutcomeV1::PrepareGraphMutation(ApplicationOutcome::Evidence(packet)),
+        ..
+    } = prepared_unrouted_admission
+    else {
+        panic!(
+            "unrouted admission preparation must return Work evidence: \
+             {prepared_unrouted_admission:?}"
+        );
+    };
+    let unrouted_admission = invoke!(
+        "request.work.admit-unrouted",
+        WorkApplicationInvocationV1::AdmitExecution(
+            match packet.payload.expect("prepared unrouted admission") {
+                WorkProductMutationRequestV1::AdmitExecution(admission) => admission,
+                other => panic!("preparation must produce an execution admission: {other:?}"),
+            }
+        )
+    );
+    let DaemonInvocationOutcome::ApplicationProblem { problem } = unrouted_admission else {
+        panic!("admitting an abstained proposal must be refused: {unrouted_admission:?}");
+    };
+    assert_eq!(
+        problem,
+        tracedecay_contracts::ApplicationProblem::InvalidRequest {
+            diagnostic: tracedecay_contracts::SafeDiagnostic {
+                code: "work.invalid_graph_operation".to_owned(),
+                message: "The Work graph request is invalid".to_owned(),
+            },
+            retry: tracedecay_contracts::RetryDirective::Never,
+            legal_actions: vec![tracedecay_contracts::LegalAction::CorrectRequest],
+        },
+        "an unroutable admission is a request to correct, not an authority to retry"
+    );
 }
 
 /// The Task-family activity producer behind the dashboard's `task_activity`

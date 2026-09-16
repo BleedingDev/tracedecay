@@ -9,9 +9,10 @@ use tracedecay_contracts::retained_surfaces::{
     SessionCoverageIntervalV1, SessionCoverageModeV1, SessionCoverageReasonV1,
     SessionCoverageRequestV1, SessionCoverageStateV1, SessionMessageV1, SessionRecordV1,
     SessionRefreshRequestV1, SessionRefreshScopeV1,
-    SessionSourceCoverageV1 as WireSourceCoverageV1, SessionsForRequestV1, TemporalCoverageV1,
-    TemporalExplanationV1, TemporalFreshnessV1, TemporalMetadataV1, TemporalOmissionV1,
-    TemporalWatermarksV1, ValidCoverageIntervalV1, WorkflowsRequestV1,
+    SessionSourceCoverageV1 as WireSourceCoverageV1, SessionsForRequestV1,
+    TemporalCoverageOmissionV1, TemporalCoverageV1, TemporalExplanationV1, TemporalFreshnessV1,
+    TemporalMetadataV1, TemporalOmissionV1, TemporalPopulationCountV1, TemporalWatermarksV1,
+    ValidCoverageIntervalV1, WorkflowsRequestV1,
 };
 use tracedecay_contracts::{
     ApplicationOutcome, RequestAdmission, RetainedSessionExecutionPortV1, RetainedSessionRequestV1,
@@ -36,7 +37,8 @@ use tracedecay_sessions::runtime::{
 };
 use tracedecay_temporal_query::context::ContextBudget;
 use tracedecay_temporal_query::ports::{
-    TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalSessionScopeFilterV1,
+    TemporalCandidateFilterV1, TemporalCandidatePopulationCount, TemporalMessageTypeFilterV1,
+    TemporalSessionScopeFilterV1,
 };
 use tracedecay_temporal_query::ranking::DiversityLimits;
 
@@ -45,8 +47,9 @@ use super::session_refresh::{
     admitted_session_refresh_command,
 };
 use crate::session_retrieval::{
-    DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1, SessionRetrievalPageView,
-    SessionRetrievalServiceOutcome, SessionRetrievalStoreScope, SessionTemporalMetadataView,
+    DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1,
+    SessionRetrievalCoverageOmissionView, SessionRetrievalPageView, SessionRetrievalServiceOutcome,
+    SessionRetrievalStoreScope, SessionTemporalMetadataView,
 };
 use tracedecay_contracts::retained_receipts::{evidence_outcome, session_refresh_effect_outcome};
 use tracedecay_domain::errors::TraceDecayError;
@@ -112,22 +115,15 @@ impl<'a> DirectRetainedSessionPortV1<'a> {
         configuration_digest: &ManifestDigest,
         refresh: Option<&dyn RetainedSessionRefreshPortV1>,
     ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
-        let selector = &request.request;
-        let SessionRefreshScopeV1::Profile { profile_id } = &selector.scope else {
+        let SessionRefreshScopeV1::Profile {} = &request.request.scope else {
             return Err(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized);
         };
-        if profile_id != identity.profile_id().as_str()
-            || selector.session.store_id != identity.store_id().as_str()
-            || selector.session.root_id != identity.root_id().as_str()
-        {
-            return Err(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized);
-        }
         let refresh = refresh.ok_or_else(|| {
             RetainedSurfaceExecutionErrorV1::unavailable(
                 "the profile session refresh authority is not mounted for this connection",
             )
         })?;
-        let profile_id = UserProfileId::new(profile_id.as_str())
+        let profile_id = UserProfileId::new(identity.profile_id().as_str())
             .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?;
         execute_admitted_session_refresh(
             context,
@@ -698,8 +694,10 @@ impl MessageSearchInput {
                     kind, observed, maximum,
                 ));
             }
-            SessionRetrievalServiceOutcome::BudgetExhausted { .. } => {
-                return Err(RetainedSurfaceExecutionErrorV1::structural_budget_refusal());
+            SessionRetrievalServiceOutcome::BudgetExhausted { stage, accounting } => {
+                return Err(RetainedSurfaceExecutionErrorV1::structural_budget_refusal(
+                    stage, accounting,
+                ));
             }
             SessionRetrievalServiceOutcome::TimedOut => {
                 return Err(RetainedSurfaceExecutionErrorV1::TimedOut(
@@ -824,27 +822,12 @@ fn ensure_session_refresh_identity(
     authorities: &ProjectRetainedSessionAuthoritiesV1,
 ) -> Result<(), RetainedSurfaceExecutionErrorV1> {
     ensure_mounted_project_context(context, authorities)?;
-    let selector = &request.request;
     // A profile-owned refresh is served by the profile session authority; the
     // project owner never redirects it through its own store.
-    let SessionRefreshScopeV1::Project { project } = &selector.scope else {
+    let SessionRefreshScopeV1::Project {} = &request.request.scope else {
         return Err(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized);
     };
-    let scope = context.request_context.scope();
-    let branch_matches = scope
-        .reference
-        .as_ref()
-        .and_then(|reference| reference.as_str().strip_prefix("refs/heads/"))
-        .is_some_and(|branch| branch == project.branch_id);
-    (project.id == authorities.project_id.as_str()
-        && project.profile_id == authorities.profile_id.as_str()
-        && project.repository_id == scope.repository_id.as_str()
-        && project.worktree_id == scope.worktree_id.as_str()
-        && branch_matches
-        && selector.session.store_id == authorities.session_store_id.as_str()
-        && selector.session.root_id == authorities.session_root_id.as_str())
-    .then_some(())
-    .ok_or(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized)
+    Ok(())
 }
 
 fn ensure_mounted_project_context(
@@ -1069,6 +1052,11 @@ fn temporal(
                 reason: hydration(omission.reason),
             })
             .collect(),
+        coverage_omissions: value
+            .coverage_omissions
+            .into_iter()
+            .map(coverage_omission)
+            .collect(),
         next_cursor: value.cursor,
         freshness: Some(match freshness {
             SessionDataFreshness::Fresh => TemporalFreshnessV1::Fresh,
@@ -1079,6 +1067,26 @@ fn temporal(
                 TemporalFreshnessV1::Partial { generation_lag }
             }
         }),
+    }
+}
+
+fn coverage_omission(omission: SessionRetrievalCoverageOmissionView) -> TemporalCoverageOmissionV1 {
+    match omission {
+        SessionRetrievalCoverageOmissionView::RootContinuationUnavailable {
+            strict_population,
+        } => {
+            TemporalCoverageOmissionV1::RootContinuationUnavailable {
+                strict_population: match strict_population {
+                    TemporalCandidatePopulationCount::Exact(count) => {
+                        TemporalPopulationCountV1::Exact { count }
+                    }
+                    TemporalCandidatePopulationCount::AtLeast(count) => {
+                        TemporalPopulationCountV1::AtLeast { count }
+                    }
+                },
+                detail: "root continuation unavailable: strict population exceeds the supported window; narrow the scope".to_owned(),
+            }
+        }
     }
 }
 
@@ -1202,8 +1210,13 @@ mod refusal_tests {
         ApplicationProblemKind, LegalAction, RetryDirective, retained_surface_execution_problem,
     };
     use tracedecay_domain::CursorManifestLimitKindV1;
+    use tracedecay_temporal_query::ports::TemporalCandidatePopulationCount;
 
-    use super::message_search_cursor_manifest_refusal;
+    use crate::session_retrieval::{
+        SessionRetrievalCoverageOmissionView, SessionTemporalMetadataView,
+    };
+
+    use super::{message_search_cursor_manifest_refusal, temporal};
 
     #[test]
     fn message_search_cursor_manifest_kinds_have_distinct_invalid_request_diagnostics() {
@@ -1233,5 +1246,34 @@ mod refusal_tests {
                 Some(expected_code)
             );
         }
+    }
+
+    #[test]
+    fn root_continuation_omission_carries_scope_guidance() {
+        let metadata = temporal(
+            SessionTemporalMetadataView {
+                coverage_omissions: vec![
+                    SessionRetrievalCoverageOmissionView::RootContinuationUnavailable {
+                        strict_population: TemporalCandidatePopulationCount::Exact(280),
+                    },
+                ],
+                ..SessionTemporalMetadataView::default()
+            },
+            super::SessionDataFreshness::Fresh,
+        );
+        let wire = serde_json::to_value(metadata).expect("temporal metadata");
+
+        assert_eq!(
+            wire["coverage_omissions"][0]["kind"],
+            "root_continuation_unavailable"
+        );
+        assert_eq!(
+            wire["coverage_omissions"][0]["detail"],
+            "root continuation unavailable: strict population exceeds the supported window; narrow the scope"
+        );
+        assert_eq!(
+            wire["coverage_omissions"][0]["strict_population"],
+            serde_json::json!({"kind": "exact", "count": 280})
+        );
     }
 }

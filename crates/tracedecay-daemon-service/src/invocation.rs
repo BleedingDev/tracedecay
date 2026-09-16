@@ -18,8 +18,11 @@ use std::time::Duration;
 
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, Semaphore};
-use tracedecay_contracts::feedback::{FeedbackReadPort, FeedbackRouteAuthorizationPort};
+use tokio::sync::{Mutex, Semaphore};
+use tracedecay_contracts::feedback::{
+    FeedbackProximityReadRequestV1, FeedbackProximityReadResultV1, FeedbackReadPort,
+    FeedbackRouteAuthorizationPort,
+};
 use tracedecay_contracts::{
     ApplicationContractError, ApplicationOperation, ApplicationOutcome, ApplicationProblem,
     ApplicationProblemKind, ApplicationResult, AuthorityReceipt, AuthorizedScopeSet,
@@ -72,10 +75,8 @@ use tracedecay_tool_catalog::{CapabilityId, EffectClass, SortContractId, UseCase
 
 use crate::project_runtime::{
     FeedbackCyclePublicationError, ProjectRuntimeAlreadyRegistered, ProjectRuntimeRegistryError,
-    ProjectRuntimeRegistryV1, RegisteredObservabilityProducerV1,
-    RegisteredSemanticActivationOwnerV1, RegisteredSemanticOwnerTaskV1,
-    SemanticActivationOwnerWithdrawalV1, StoreObservabilityMountErrorV1, StoreObservabilityMountV1,
-    StoreObservabilityRegistryV1,
+    ProjectRuntimeRegistryV1, RegisteredObservabilityProducerV1, StoreObservabilityMountErrorV1,
+    StoreObservabilityMountV1, StoreObservabilityRegistryV1,
 };
 use tracedecay_agent_hosts::agents::context_scout::ports::{
     AdmittedContextScoutHookV1, ContextScoutLifecycleAddressV1,
@@ -84,6 +85,9 @@ use tracedecay_agent_hosts::agents::context_scout::ports::{
 use tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationOwner;
 use tracedecay_application::CallableCodeAuthorizationSourcePort;
 use tracedecay_application::ProjectSourceAccessSnapshot;
+use tracedecay_code_index_runtime::code_index_branch_diff::{
+    CodeIndexRevisionPairRequestV1, CodeIndexRevisionPairV1, revision_pair_layout_inputs,
+};
 use tracedecay_code_index_runtime::git_transactions::{
     DaemonGitAuthorityStateV1, DaemonGitInvocationOwner, DaemonProjectGitIndexTransactionService,
     capture_exact_snapshot,
@@ -103,6 +107,7 @@ use tracedecay_global_db::configuration::contracts::types::{
     AuthorizedActor, ConfigurationAuditQuery, ConfigurationError, ConfigurationMutationAuthority,
     ConfigurationRollbackRequest, DirectConfigurationMutation, configuration_layer_scope_digest,
 };
+use tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1;
 
 use tracedecay_application::advisory::{
     AdvisoryDaemonStartupErrorV1, AdvisoryProductionOpenErrorV1, AdvisoryProductionOpenV1,
@@ -129,10 +134,6 @@ use tracedecay_application::operation_stream::{
     OperationEmitter, OperationEventAuthority, OperationKind, operation_event_authority,
 };
 use tracedecay_application::primitives::{PrimitiveDispatch, PrimitiveProjectRuntime};
-use tracedecay_application::semantic_runtime::{
-    ProductionSemanticConfigurationOperationV1, SemanticActivationCoordinationErrorV1,
-    SemanticProtectedActivationOperationV1, SemanticProtectedRollbackOperationV1,
-};
 use tracedecay_contracts::feedback::observations::{
     FeedbackAnchorOperationV1, FeedbackArgumentRejectionClassV1, FeedbackDeliveryRouteV1,
     FeedbackOperationV1, FeedbackOutcomeV1, FeedbackRejectedArgumentV1, FeedbackSourceEventV1,
@@ -183,8 +184,6 @@ pub use primitive::callable_code_request_context;
 mod recovery_schedule;
 mod registrars;
 mod retained;
-mod semantic_activation;
-pub mod semantic_evaluation;
 mod source_edit;
 #[cfg(test)]
 mod tests;
@@ -222,12 +221,12 @@ use types::*;
 use work::*;
 pub use work_routing::DaemonWorkProposalRoutingAuthorityV1;
 
-pub use configuration::{DaemonSemanticRuntimeRegistrar, DaemonSemanticRuntimeRegistrationError};
 pub use feedback::{
     DaemonAdvisoryCycleInvocationFuture, DaemonAdvisoryCycleInvocationOwner,
     DaemonAdvisoryCycleInvocationPort, DaemonAdvisoryCycleInvocationRequest,
-    DaemonFeedbackInvocationOwner, advisory_cycle_invocation_result,
-    daemon_operation_event_authority,
+    DaemonFeedbackInvocationOwner, DaemonFeedbackProximityInvocationFuture,
+    DaemonFeedbackProximityInvocationRequest, advisory_cycle_invocation_result,
+    daemon_operation_event_authority, feedback_proximity_invocation_result,
 };
 pub use primitive::{
     DaemonContextScoutRuntimeRegistrar, DaemonContextScoutRuntimeRegistrationError,
@@ -257,9 +256,8 @@ pub use registrars::{
     DaemonConfigurationGrantAuthority, DaemonConfigurationRuntimeRegistrar,
     DaemonFeedbackRuntimeRegistrar, DaemonFeedbackRuntimeRegistrationError,
     DaemonLspOwnerRegistrar, DaemonNativeIntegrationRuntimeRegistrar,
-    DaemonRetainedRuntimeRegistrar, DaemonSemanticOwnerRuntimeRegistrar,
-    DaemonSourceEditOwnerRegistrationError, DaemonWorkRuntimeRegistrar,
-    FeedbackCycleRuntimeBuilderV1,
+    DaemonRetainedRuntimeRegistrar, DaemonSourceEditOwnerRegistrationError,
+    DaemonWorkRuntimeRegistrar, FeedbackCycleRuntimeBuilderV1,
 };
 #[cfg(any(test, feature = "test-helpers"))]
 pub use types::{
@@ -419,6 +417,15 @@ impl DaemonInvocationService {
             #[cfg(any(test, feature = "test-helpers"))]
             configuration_runtime_registration_pause: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Reads both immutable generations through this daemon's scheduler owner.
+    pub async fn code_index_revision_pair_layout_inputs(
+        &self,
+        scope: &ResolvedScope,
+        request: CodeIndexRevisionPairRequestV1,
+    ) -> Result<CodeIndexRevisionPairV1, CodeIndexSearchUnavailableReasonV1> {
+        revision_pair_layout_inputs(&self.code_index_schedulers, scope, request).await
     }
 
     #[cfg(any(test, feature = "test-helpers"))]

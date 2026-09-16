@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tracedecay_application::semantic_runtime::project_lifecycle_status;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
 
@@ -129,14 +128,17 @@ fn attach_doctor_report(value: &mut Value, report: McpDoctorReportV1<'_>) {
             "kind": "observed",
             "report": admitted.report,
             "table_growth_evidence": admitted.table_growth_evidence,
+            "schema_convergences": admitted.schema_convergences,
         }),
         McpDoctorReportV1::ReadFailed => json!({
             "kind": "unknown",
             "table_growth_evidence": [],
+            "schema_convergences": [],
         }),
         McpDoctorReportV1::NotAttached => json!({
             "kind": "unsupported",
             "table_growth_evidence": [],
+            "schema_convergences": [],
         }),
     };
 }
@@ -145,9 +147,9 @@ pub async fn collect_database_snapshot(
     ctx: &McpToolContext<'_>,
     include_integrity: bool,
     generation_census: Option<
-        &tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot,
+        &tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot,
     >,
-) -> Result<tracedecay_session_memory::runtime_telemetry::DatabaseSnapshot> {
+) -> Result<tracedecay_runtime_core::runtime_telemetry::DatabaseSnapshot> {
     let database = ctx.graph_database();
     let db_path = ctx.graph_db_path();
     let store_runtime = ctx.store_runtime();
@@ -159,18 +161,18 @@ pub async fn collect_database_snapshot(
     )
     .await?;
     let generation_census = generation_census.cloned().unwrap_or(
-        tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
-            reason: tracedecay_session_memory::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
+        tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot::Unavailable {
+            reason: tracedecay_runtime_core::runtime_telemetry::GenerationCensusUnavailableReason::AuthorityUnavailable,
         },
     );
     Ok(
-        tracedecay_session_memory::runtime_telemetry::DatabaseSnapshot::from_collected(
+        tracedecay_runtime_core::runtime_telemetry::DatabaseSnapshot::from_collected(
             collected,
-            tracedecay_session_memory::runtime_telemetry::read_dirty_marker(
-                &tracedecay_session_memory::runtime_telemetry::with_suffix(db_path, ".dirty"),
+            tracedecay_runtime_core::runtime_telemetry::read_dirty_marker(
+                &tracedecay_runtime_core::runtime_telemetry::with_suffix(db_path, ".dirty"),
             ),
             generation_census,
-            tracedecay_session_memory::runtime_telemetry::RuntimeRegistrySnapshot::from_projection(
+            tracedecay_runtime_core::runtime_telemetry::RuntimeRegistrySnapshot::from_projection(
                 store_runtime.runtime_telemetry(),
             ),
         ),
@@ -181,15 +183,15 @@ async fn collect_runtime_snapshot(
     ctx: &McpToolContext<'_>,
     include_integrity: bool,
     tracedecay_version: &str,
-) -> Result<tracedecay_session_memory::runtime_telemetry::RuntimeSnapshot> {
-    tracedecay_session_memory::runtime_telemetry::read_cached_process_sample();
+) -> Result<tracedecay_runtime_core::runtime_telemetry::RuntimeSnapshot> {
+    tracedecay_runtime_core::runtime_telemetry::read_cached_process_sample();
     let database =
         collect_database_snapshot(ctx, include_integrity, ctx.generation_census()).await?;
-    let process = tracedecay_session_memory::runtime_telemetry::read_cached_process_sample_at_response_boundary()
+    let process = tracedecay_runtime_core::runtime_telemetry::read_cached_process_sample_at_response_boundary()
         .await;
     Ok(
-        tracedecay_session_memory::runtime_telemetry::RuntimeSnapshot {
-            captured_at: tracedecay_session_memory::runtime_telemetry::unix_epoch_secs()?,
+        tracedecay_runtime_core::runtime_telemetry::RuntimeSnapshot {
+            captured_at: tracedecay_runtime_core::runtime_telemetry::unix_epoch_secs()?,
             tracedecay_version: tracedecay_version.to_owned(),
             host_os: std::env::consts::OS.to_owned(),
             process,
@@ -341,26 +343,6 @@ pub async fn handle_runtime(
     {
         attach_doctor_report(&mut value, ctx.doctor_report());
     }
-    let semantic_configuration = hotpath::future!(
-        ctx.configuration_runtime().client().current(),
-        label = "mcp.health.runtime.semantic"
-    )
-    .await
-    .ok()
-    .and_then(|pinned| {
-        tracedecay_application::semantic_runtime::SemanticConfigurationPinV1::from_current(
-            &pinned.into_current_state(),
-        )
-        .ok()
-    });
-    value["semantic_runtime"] = serde_json::to_value(
-        tracedecay_application::semantic_runtime::resolve_project_semantic_runtime_status(
-            Some(ctx.project_root()),
-            semantic_configuration,
-        ),
-    )
-    .unwrap_or_else(|_| json!({}));
-    value["semantic_model"] = json!(project_lifecycle_status(ctx.project_root()));
     Ok(generic_tool_result(
         Some(ctx.project_root()),
         &args,
@@ -384,6 +366,7 @@ mod tests {
             json!({
                 "kind": "unsupported",
                 "table_growth_evidence": [],
+                "schema_convergences": [],
             })
         );
     }

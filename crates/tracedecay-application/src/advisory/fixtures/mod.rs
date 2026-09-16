@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tracedecay_contracts::feedback::FeedbackProximityEncounterV1;
 use tracedecay_domain::feedback::{
     CiFailureCallerEvidenceV1, CiFailureCoverageV1, CiFailureGenerationEvidenceV1, CiFailureKindV1,
     CiFailureLocalizationStateV1, CiFailureParserIdentityV1, CiFailureRunIdentityV1,
@@ -30,25 +31,6 @@ use super::github_runtime::{
     RestReviewCommentV1, RestReviewV1,
 };
 use super::proximity_runtime::CanonicalProximityEvidenceV1;
-
-pub const ADVISORY_FIXTURE_ROOT_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review";
-pub const ADVISORY_SCENARIO_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/scenario.json";
-pub const ADVISORY_PULL_REQUEST_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/pull_request.json";
-pub const ADVISORY_REVIEW_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/review.json";
-pub const ADVISORY_REVIEW_COMMENT_FIXTURE_V1: &str = "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/review_comment.json";
-pub const ADVISORY_REVIEW_THREAD_FIXTURE_V1: &str = "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/review_thread.graphql.json";
-pub const ADVISORY_WORKFLOW_RUN_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/workflow_run.json";
-pub const ADVISORY_WORKFLOW_JOB_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/workflow_job.json";
-pub const ADVISORY_CHECK_RUN_FIXTURE_V1: &str =
-    "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/check_run.json";
-pub const ADVISORY_CHECK_ANNOTATIONS_FIXTURE_V1: &str = "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/check_annotations.json";
-pub const ADVISORY_PROXIMITY_SESSIONS_FIXTURE_V1: &str = "crates/tracedecay-application/src/advisory/fixtures/provider_branch_review/proximity_sessions.json";
 
 const SCENARIO_JSON: &str = include_str!("provider_branch_review/scenario.json");
 const PULL_REQUEST_JSON: &str = include_str!("provider_branch_review/pull_request.json");
@@ -151,6 +133,7 @@ pub struct AdvisoryCiFixtureEvidenceV1 {
 pub struct AdvisoryProximityFixtureEvidenceV1 {
     pub observations: Vec<CanonicalObservationEnvelopeV1>,
     pub retrieval_anchor_ids: Vec<RetrievalAnchorId>,
+    pub encounter: FeedbackProximityEncounterV1,
     pub address: ProximityAddressV1,
     pub relation_paths: Vec<ProximityRelationPathV1>,
     pub risk_inputs: ProximityRiskInputsV1,
@@ -191,6 +174,7 @@ impl AdvisorySourceBackedCompositeFixtureV1 {
         Some(CanonicalProximityEvidenceV1 {
             observations: evidence.observations,
             retrieval_anchor_ids: evidence.retrieval_anchor_ids,
+            encounter: evidence.encounter,
             address: evidence.address,
             relation_paths: evidence.relation_paths,
             risk_inputs: evidence.risk_inputs,

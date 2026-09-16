@@ -13,14 +13,18 @@ use tracedecay_domain::{
 };
 use tracedecay_lcm::contracts::LcmRetrievalOutcome;
 use tracedecay_temporal_query::ports::{
-    TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalSessionScopeFilterV1,
+    TemporalCandidateFilterV1, TemporalCandidatePopulationCount, TemporalMessageTypeFilterV1,
+    TemporalSessionScopeFilterV1,
 };
 
 use tracedecay_global_db::WorkflowScopeFilter;
 use tracedecay_lcm::{
     LcmContentSlice, LcmDescribeResponse, LcmDescribeTarget, LcmExpandResponse, LcmExpandTarget,
 };
-use tracedecay_session_memory::session::{SessionDataFreshness, SessionTemporalQuery};
+use tracedecay_session_memory::session::{
+    SessionDataFreshness, SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetStageV1,
+    SessionTemporalQuery,
+};
 use tracedecay_sessions::runtime::git_correlation::GitScopeFilter;
 use tracedecay_sessions::runtime::{
     SessionMessageSearchResult, SessionMessageType, SessionSearchScope, SessionSearchTimeRange,
@@ -268,6 +272,14 @@ pub struct SessionRetrievalOmissionView {
     pub reason: HydrationStateV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRetrievalCoverageOmissionView {
+    RootContinuationUnavailable {
+        strict_population: TemporalCandidatePopulationCount,
+    },
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SessionTemporalWatermarksView {
     pub generation: u64,
@@ -288,6 +300,8 @@ pub struct SessionTemporalMetadataView {
     pub explanations: Vec<SessionRetrievalExplanationView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omissions: Vec<SessionRetrievalOmissionView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_omissions: Vec<SessionRetrievalCoverageOmissionView>,
     pub authorized_root: Option<String>,
 }
 
@@ -302,6 +316,10 @@ pub enum SessionRetrievalUnavailableReason {
     HistoricalRetry,
     HistoricalBlocked,
     TemporalStoreUnavailable,
+    /// A temporal store read failed. Distinct from `TemporalStoreUnavailable`:
+    /// the store is there and answered with an error, which is a different
+    /// operator problem from a store that is not present at all.
+    TemporalStoreReadFailed,
     HydrationUnavailable,
 }
 
@@ -394,7 +412,11 @@ pub enum LcmDescribeServiceOutcome {
         observed: usize,
         maximum: usize,
     },
-    BudgetExhausted,
+    BudgetExhausted {
+        stage: SessionRetrievalBudgetStageV1,
+        /// The ceiling and count the refusing boundary kept, where it keeps one.
+        accounting: Option<SessionRetrievalBudgetAccountingV1>,
+    },
     TimedOut,
     Cancelled,
 }
@@ -435,7 +457,11 @@ pub enum LcmExpandServiceOutcome {
         observed: usize,
         maximum: usize,
     },
-    BudgetExhausted,
+    BudgetExhausted {
+        stage: SessionRetrievalBudgetStageV1,
+        /// The ceiling and count the refusing boundary kept, where it keeps one.
+        accounting: Option<SessionRetrievalBudgetAccountingV1>,
+    },
     TimedOut,
     Cancelled,
 }
@@ -481,7 +507,9 @@ pub enum SessionRetrievalServiceOutcome {
         maximum: usize,
     },
     BudgetExhausted {
-        stage: tracedecay_session_memory::session::SessionRetrievalBudgetStageV1,
+        stage: SessionRetrievalBudgetStageV1,
+        /// The ceiling and count the refusing boundary kept, where it keeps one.
+        accounting: Option<SessionRetrievalBudgetAccountingV1>,
     },
     TimedOut,
     Cancelled,

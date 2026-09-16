@@ -393,9 +393,9 @@ impl ProjectContextScoutOwnerV1 {
             .await
     }
 
-    /// Claims only one caller-resolved full-lifecycle address and the exact
-    /// current publication watermark. Callers obtain `address` from the
-    /// current-admission registry path immediately before invoking this.
+    /// Claims only one caller-resolved full-lifecycle address. The current
+    /// publication watermark proves that authority is mounted; queued guidance
+    /// can predate the boundary that makes it deliverable.
     pub async fn claim_ready_guidance_exact(
         &self,
         hook: &HookEventEnvelopeV2,
@@ -412,15 +412,16 @@ impl ProjectContextScoutOwnerV1 {
         }
         let configuration = self.configuration.read().await;
         let control = configuration.as_ref()?.control();
-        let ready = self.store.startup(now, STARTUP_RECOVERY_LIMIT).await;
-        let entries = match ready {
-            ContextScoutDurableStartupOutcomeV1::Ready { entries, .. } => entries,
-            ContextScoutDurableStartupOutcomeV1::Unavailable => return None,
+        let recent = match self
+            .store
+            .recent(address, control.configuration_revision, now, 1)
+            .await
+        {
+            ContextScoutRecentReadOutcomeV1::Ready(recent) => recent,
+            ContextScoutRecentReadOutcomeV1::Unavailable => return None,
         };
-        let entry = entries.into_iter().find(|entry| {
+        let entry = recent.pending.into_iter().find(|entry| {
             entry.work.address == address
-                && entry.work.input_watermark == current_input_watermark
-                && entry.envelope.input_watermark == current_input_watermark
                 && entry.envelope.configuration_revision == control.configuration_revision
                 && entry.envelope.candidate.expires_at.0 > now.0
         })?;
@@ -1154,7 +1155,6 @@ mod tests {
     use super::super::ports::ContextScoutAddressBindOutcomeV1;
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use tracedecay_application::configuration::ConfigurationCurrentStateV1;
     use tracedecay_contracts::{
         CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
         RequestId, ResolvedScope,
@@ -1167,6 +1167,7 @@ mod tests {
     };
     use tracedecay_domain::feedback::FeedbackScopeV1;
     use tracedecay_domain::{ActorId, RepositoryId, WorktreeId};
+    use tracedecay_global_db::configuration::contracts::ConfigurationCurrentStateV1;
     use tracedecay_hooks::{
         HookCapabilityV1, HookEventFamily, HookHostV1, HookScopeBindingV1,
         NativeEnvelopeMaterialV1, decode_bound_native_hook_event, stock_event_support,
@@ -1632,6 +1633,107 @@ mod tests {
             "more than one mounted producer in the session must remain ambiguous"
         );
         unregister(project_id, &owner);
+    }
+
+    #[tokio::test]
+    async fn exact_hook_event_reclaims_its_lease_and_foreign_event_cannot() {
+        let (_registry_temporary, registry_database) = test_database().await;
+        let (_registry, admitted, pin, _context, observed_at) =
+            claim_mount_authority(registry_database);
+        let address = ContextScoutAddressV1 {
+            profile_id: [1; 16],
+            provider_id: [2; 16],
+            protected_session_id: admitted.envelope().protected_session_id,
+            thread_id: [3; 16],
+            turn_id: [4; 16],
+            agent_id: [5; 16],
+            logical_message_id: [6; 16],
+            project_id: admitted.envelope().project_id,
+        };
+        let (_owner_temporary, owner_database) = test_database().await;
+        let owner = ProjectContextScoutOwnerV1::startup(
+            owner_database,
+            address.project_id,
+            UtcMicros(1),
+            None,
+        )
+        .await
+        .expect("owner");
+        owner
+            .install_configuration(pin.configuration().clone(), None)
+            .await
+            .expect("current configuration");
+        let input_watermark = [14; 32];
+        let boundary_watermark = [15; 32];
+        let entry = ContextScoutDurableQueueEntryV1 {
+            work: ContextScoutWorkV1 {
+                address,
+                generation: 1,
+                input_watermark,
+            },
+            route: super::super::ContextScoutRouteV1::Deterministic,
+            model_outcome: ContextScoutModelOutcomeV1::NotRequested,
+            model_receipt: None,
+            envelope: tracedecay_contracts::context_scout::ContextScoutSuggestionEnvelopeV1 {
+                envelope_id: [17; 16],
+                address,
+                input_watermark,
+                configuration_revision: pin.configuration().control().configuration_revision,
+                delivery_window: ContextScoutDeliveryWindowV1::Immediate,
+                candidate: tracedecay_contracts::context_scout::ContextScoutCandidateV1 {
+                    dedupe_key: [18; 32],
+                    category:
+                        tracedecay_contracts::context_scout::ContextScoutCategoryV1::Retrieval,
+                    relevance_score: 10,
+                    suggestion_text: "Use the saved diagnostic anchor.".to_owned(),
+                    evidence: super::super::evidence::fixture_context_scout_evidence(),
+                    expires_at: UtcMicros(1_000),
+                },
+            },
+        };
+        assert_eq!(
+            owner.store().enqueue(entry.clone()).await,
+            ContextScoutDurableStoreOutcomeV1::Stored
+        );
+
+        let first = owner
+            .claim_ready_guidance_exact(
+                admitted.envelope(),
+                address,
+                boundary_watermark,
+                1,
+                UtcMicros(observed_at.0 + 1),
+            )
+            .await
+            .expect("first claim");
+        let replay = owner
+            .claim_ready_guidance_exact(
+                admitted.envelope(),
+                address,
+                boundary_watermark,
+                1,
+                UtcMicros(observed_at.0 + 2),
+            )
+            .await
+            .expect("same event reclaims its durable lease");
+        assert_eq!(replay, first);
+
+        let mut foreign = admitted.envelope().clone();
+        foreign.event_id = [99; 16];
+        assert!(
+            owner
+                .claim_ready_guidance_exact(
+                    &foreign,
+                    address,
+                    boundary_watermark,
+                    1,
+                    UtcMicros(observed_at.0 + 3),
+                )
+                .await
+                .is_none(),
+            "a foreign event must not acquire an active lease"
+        );
+        unregister(address.project_id, &owner);
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 use std::os::unix::fs::symlink;
 
 use tempfile::TempDir;
-use tracedecay_dashboard_api::code_index_freshness_api::{
+use tracedecay_contracts::code_index_freshness::{
     CodeGraphServingReadinessV1, CodeIndexWorktreeFreshnessV1,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken;
@@ -19,7 +19,6 @@ async fn mounted_registry(fixture: &GitFixture, store: &TempDir) -> CodeIndexSch
             test_project_id(),
             fixture.path(),
             store.path().to_path_buf(),
-            None,
         )
         .await
         .expect("mount worktree");
@@ -213,6 +212,54 @@ async fn transient_serving_claim_does_not_erase_pending_branch_tracking() {
         tracedecay_runtime_core::branch_meta::load_branch_meta(store.path())
             .is_some_and(|meta| meta.is_query_eligible("feature/replay")),
         "a transient serving handoff must preserve and finish pending branch tracking"
+    );
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_branch_publication_completes_from_a_retained_graph_head() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let project_id = test_project_id();
+    let seeded = mounted_registry(&fixture, &store).await;
+    seeded.shutdown().await;
+
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            project_id.clone(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("remount retained worktree");
+    let context =
+        BranchPublicationContextV1::new(Some(project_id.as_str()), fixture.path(), store.path())
+            .expect("branch publication context");
+    let cancellation = CancellationToken::new();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        context.track_exact_worktree_branch(
+            &registry,
+            fixture.path(),
+            fixture.path(),
+            "retained-main",
+            &cancellation,
+        ),
+    )
+    .await
+    .expect("retained exact branch publication must keep its queued continuation live")
+    .expect("retained exact branch publication");
+
+    assert_eq!(
+        outcome,
+        tracedecay_runtime_core::branch::BranchAddOutcome::Added
+    );
+    assert!(
+        tracedecay_runtime_core::branch_meta::load_branch_meta(store.path())
+            .is_some_and(|meta| meta.is_query_eligible("retained-main")),
+        "the exact retained generation must become query eligible"
     );
     registry.shutdown().await;
 }

@@ -132,12 +132,7 @@ async fn cold_mount_defers_sealed_decode_and_truth_verification_to_the_retained_
     let mount_started = std::time::Instant::now();
     assert!(
         registry
-            .mount_worktree(
-                project_id(),
-                project.path(),
-                store.path().to_path_buf(),
-                None,
-            )
+            .mount_worktree(project_id(), project.path(), store.path().to_path_buf())
             .await
             .expect("mount the exact worktree"),
         "the cold route is newly mounted"
@@ -237,7 +232,7 @@ fn activation_releases_exact_staging_without_cooling_query_owners() {
         "activation must build the record lookup indices"
     );
     assert!(
-        latest.query_owners_are_warm(),
+        latest.query_owners_are_ready(),
         "activation must build the exact/lexical/graph lane owners"
     );
 

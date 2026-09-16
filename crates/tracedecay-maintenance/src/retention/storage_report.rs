@@ -32,9 +32,8 @@ use tracedecay_runtime_core::sqlite_read_snapshot::{
 };
 
 use tracedecay_code_index_retention::code_index_generations::{
-    CodeGenerationRetentionGenerationV1, DEFAULT_SUPERSEDED_GENERATION_FLOOR,
-    GenerationDigestVerificationV1, plan_code_generation_retention_with_verification,
-    scoped_code_index_store_root,
+    CodeGenerationRetentionGenerationV1, GenerationDigestVerificationV1,
+    plan_code_generation_retention_with_verification, scoped_code_index_store_root,
 };
 
 const GLOBAL_DB_FILENAME: &str = "global.db";
@@ -215,7 +214,6 @@ pub struct CodeGenerationRetentionDryRunEntry {
     pub active_generation_id: Option<String>,
     pub active_generation_file: Option<String>,
     pub vector_readable_sources: Vec<String>,
-    pub rollback_floor: usize,
     pub superseded_generation_count: usize,
     pub superseded_generation_bytes: u64,
     pub collectable_generation_count: usize,
@@ -391,7 +389,8 @@ fn sample_registered_storage(
     for (project_id, canonical_root) in registered_projects {
         registered_ids.insert(project_id.clone());
         // Offline reports have no mounted scheduler identity authority, so
-        // vector pins are unavailable rather than inferred from a path.
+        // the retention protection set is unavailable rather than inferred
+        // from a path.
         append_project_report(
             profile_root,
             &project_id,
@@ -456,10 +455,10 @@ pub async fn build_storage_report_page_from_registered_global_db(
                 ..StorageReport::default()
             };
             for project in projects {
-                // This paged surface has no mounted code-graph inventory
-                // authority, so the vector protection set is unresolved and
-                // the retention dry run reports itself unavailable rather
-                // than planning against an unproven protection set.
+                // This paged surface has no mounted scheduler or native
+                // binding authority, so the retention protection set is
+                // unresolved and the dry run reports itself unavailable
+                // rather than planning against an unproven protection set.
                 append_project_report(
                     &profile_root,
                     &project.project_id,
@@ -595,11 +594,12 @@ fn list_project_directories_page(
 /// read-only `SQLite` samples cannot stall the async authority loop.
 ///
 /// This admin-CLI wrapper is inventory-less: it has no mounted code-index
-/// scheduler, so it cannot call `project_vector_readable_sources`. The
-/// retention dry run therefore reports
-/// `generation_retention_graph_inventory_unavailable` rather than planning
-/// against an unproven protection set. Callers that already hold a resolved
-/// set must use [`build_project_storage_report`] directly.
+/// scheduler, so it cannot resolve the serving generation or the live
+/// native-preview bindings the daemon retention pass protects. The retention
+/// dry run therefore reports `generation_retention_graph_inventory_unavailable`
+/// rather than planning against an unproven protection set. Callers that
+/// already hold a resolved set must use [`build_project_storage_report`]
+/// directly.
 pub async fn build_project_storage_report_from_daemon(
     profile_root: &Path,
     project_id: &str,
@@ -618,9 +618,9 @@ pub async fn build_project_storage_report_from_daemon(
 /// Build the same read-only report for one explicitly identified shard without
 /// opening `global.db`. This is the daemon-independent path for maintenance
 /// when the global registry's exclusive-maintenance authority is unavailable.
-/// Vector liveness lives in the mounted code graph: callers that have already
-/// resolved `vector_readable_sources` (doctor / store-maintenance) pass that
-/// set here. Inventory-less surfaces — including
+/// The protection set (the serving generation plus live native-preview
+/// bindings) is only resolvable from mounted daemon authorities; a caller that
+/// holds it passes it here. Inventory-less surfaces — including
 /// [`build_project_storage_report_from_daemon`] — pass `None` and the
 /// retention dry run reports itself unavailable rather than planning against
 /// an unproven protection set.
@@ -715,10 +715,10 @@ fn append_project_report(
     } else {
         GenerationDigestVerificationV1::Full
     };
-    // Published vectors live in the mounted code graph, so liveness is only
-    // provable when the caller resolved the graph inventory (daemon paths).
-    // Without it the dry run is reported unavailable rather than planned
-    // against an empty protection set.
+    // The serving generation and live native-preview bindings are only
+    // provable from mounted daemon authorities. Without them the dry run is
+    // reported unavailable rather than planned against an empty protection
+    // set.
     let Some(readable_sources) = vector_readable_sources else {
         code_generation_retention_availability.push(CodeGenerationRetentionAvailabilityEntry {
             project_id: project_id.to_owned(),
@@ -731,7 +731,6 @@ fn append_project_report(
     let plan = match plan_code_generation_retention_with_verification(
         &code_index_store_root,
         &readable_sources,
-        DEFAULT_SUPERSEDED_GENERATION_FLOOR,
         verification,
     ) {
         Ok(plan) => plan,
@@ -758,7 +757,6 @@ fn append_project_report(
             .iter()
             .map(|source| source.as_str().to_owned())
             .collect(),
-        rollback_floor: plan.rollback_floor,
         superseded_generation_count: plan.superseded_generations.len(),
         superseded_generation_bytes: plan.superseded_generation_bytes(),
         collectable_generation_count: plan.collectable_generations.len(),

@@ -3,6 +3,7 @@
 mod connection;
 mod dispatch;
 mod live_transcript_refresh;
+mod project_host_admission_replay;
 mod protocol;
 mod read_coalescing;
 mod rmcp;
@@ -20,6 +21,9 @@ pub use dispatch::{
 };
 pub use live_transcript_refresh::{
     LiveTranscriptRefreshJoin, join_required_live_transcript_refresh,
+};
+pub use project_host_admission_replay::{
+    ProjectHostAdmissionReplayTask, ProjectHostAdmissionReplayWorker,
 };
 pub use protocol::{McpMethod, classify_mcp_method, initialize_result, resources_list_result};
 pub use read_coalescing::{

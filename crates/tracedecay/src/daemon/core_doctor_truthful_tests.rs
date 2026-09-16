@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::daemon::{DaemonHandshake, StoreAdministration};
 use crate::mcp::McpServer;
 use crate::mcp::server::McpServerConstructionContext;
-use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use crate::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_daemon_protocol::DaemonClientIdentity;
 
 static REGISTERED_RUNTIME_NONCE: AtomicU64 = AtomicU64::new(1);
@@ -14,6 +14,7 @@ async fn initialize_test_project(
     project_root: &Path,
     profile_root: &Path,
 ) -> tracedecay_runtime_core::storage::StoreLayout {
+    crate::register_runtime_ports().expect("runtime port registration");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -63,7 +64,7 @@ fn handshake(
         client_instance_id: "truthful-core-doctor-test".to_string(),
         tool_list_changed_capable: false,
         catalog_version: String::new(),
-        moved_store_adoption: crate::tracedecay::MovedStoreAdoption::Never,
+        moved_store_adoption: crate::project::MovedStoreAdoption::Never,
     }
 }
 
@@ -114,6 +115,7 @@ async fn live_runtime_snapshot_does_not_fabricate_store_metadata_after_observati
     let value = super::doctor_runtime_value(
         &handshake,
         &store_administration,
+        None,
         false,
         None,
         build_version,

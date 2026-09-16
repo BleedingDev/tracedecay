@@ -14,6 +14,7 @@ fn graph_handlers_that_await_query() -> &'static [&'static str] {
         "tracedecay_impact",
         "tracedecay_node",
         "tracedecay_similar",
+        "tracedecay_redundancy",
         "tracedecay_rename_preview",
         "tracedecay_implementations",
         "tracedecay_callers_for",
@@ -60,7 +61,6 @@ fn graph_handlers_that_await_query() -> &'static [&'static str] {
         "tracedecay_dsm",
         "tracedecay_gini",
         "tracedecay_dependency_depth",
-        "tracedecay_redundancy",
         "tracedecay_diagnose",
         "tracedecay_run_affected_tests",
     ]

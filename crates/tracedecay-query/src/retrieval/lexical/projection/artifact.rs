@@ -7,9 +7,13 @@
 use std::path::Path;
 
 use thiserror::Error;
+pub use tracedecay_code_index::clones::CloneSelectedBlockV1;
 use tracedecay_code_index::production::{CodeIndexExecutionControlV1, CodeIndexInterruptionV1};
 
 mod builder;
+mod clone_census;
+mod clone_successor;
+mod fingerprints;
 mod format;
 mod postings;
 mod prepared;
@@ -22,12 +26,28 @@ pub use builder::{
     CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
     PreparedCodeLexicalArtifactBatchV1,
 };
+pub use clone_census::CodeLexicalCloneIndexCensusV1;
+pub use clone_successor::CodeLexicalCloneSuccessorV1;
+pub use fingerprints::{
+    CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
+    CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
+    CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
+    CloneFingerprintArtifactReadV1, CloneFingerprintCancellationPointV1,
+    CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
+    CloneFingerprintStreamDescriptorV1, CloneNearMatchArtifactV1, CloneNearMatchExtentV1,
+    CloneSelectedBlockArtifactCandidateV1, CloneSelectedBlockArtifactReadV1,
+    CloneSelectedBlockContainmentClassV1, MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1,
+};
 pub use format::{
     CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactSectionDigestV1,
     CodeLexicalImportMembershipWitnessV1, VerifiedCodeLexicalArtifactV1,
 };
 pub use prepared::PreparedCodeLexicalArtifactPageV1;
-pub use reader::{CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactReaderV1};
+pub use reader::{
+    CloneArtifactCursorV1, CloneArtifactPageV1, CloneExactArtifactMemberV1,
+    CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1,
+    CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactReaderV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
+};
 pub use schema::CodeLexicalArtifactWriterRevisionV1;
 
 /// Floor for the artifact build memory ledger.
@@ -51,7 +71,7 @@ pub const CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_CAP_BYTES_V1: usize = 16 * 1024 * 1
 ///
 /// Small hosts retain the established 1.5 GiB behavior. Larger hosts grant
 /// one eighth of the process resident authority, capped so one background
-/// artifact cannot crowd out graph, semantic, and serving residents.
+/// artifact cannot crowd out graph, shared-code, and serving residents.
 #[must_use]
 pub fn code_lexical_artifact_build_memory_budget_for(admitted_process_bytes: u64) -> usize {
     let floor = CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1 as u64;

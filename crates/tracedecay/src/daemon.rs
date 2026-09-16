@@ -22,9 +22,6 @@ use crate::mcp::server::{
     McpMethod, ProductionMcpConnectionContext, RmcpInitializeResponseDecorator,
     SERVER_INSTRUCTIONS, classify_mcp_method, initialize_result,
 };
-use crate::mcp::tools::{
-    catalog_discovery_tools_list_payload, default_catalog_discovery_authority,
-};
 use branch_add::{branch_add_response, parse_branch_add_request};
 use branch_admin::{StoreAdministration, parse_branch_admin_request, write_branch_admin_response};
 #[cfg(all(unix, test))]
@@ -45,6 +42,9 @@ pub(crate) use tracedecay_daemon_protocol::{
     ensure_private_socket_parent, unix_socket_path_within_limit,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_mcp::tools::catalog_discovery::{
+    catalog_discovery_tools_list_payload, default_catalog_discovery_authority,
+};
 use tracedecay_mcp::transport::ReplayTransport;
 use tracedecay_mcp::{
     BrokerStreamTransport, ErrorCode, JsonRpcRequest, JsonRpcResponse, McpTransport,
@@ -63,6 +63,14 @@ const MAX_CACHED_PROJECT_SERVERS: usize = 8;
 const MAX_TRACKED_PROJECT_OPEN_TASKS: usize = MAX_CACHED_PROJECT_SERVERS;
 const MAX_CACHED_PROJECT_OPEN_FAILURES: usize = 64;
 const PROJECT_OPEN_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
+/// One budget for every blocking repository probe a route resolution runs.
+///
+/// Route resolution reads the repository's topology, enrollment marker, and
+/// HEAD. Those are filesystem operations whose cost belongs to the volume the
+/// checkout lives on, not to this daemon, so they run off the async workers
+/// and a probe that outlives this budget becomes the retryable deferred
+/// discovery refusal instead of holding the caller.
+const REPOSITORY_DISCOVERY_DEADLINE: Duration = Duration::from_secs(2);
 const PROJECT_OPEN_FAILURE_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const PROJECT_OPEN_RESOURCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// Backoff for a persisted-row authority defect, which only an operator can
@@ -197,7 +205,6 @@ pub fn error_is_read_deadline(error: &TraceDecayError) -> bool {
     ) || error_message_is_read_deadline(&error.to_string())
 }
 
-pub(crate) mod automation_effect;
 mod bootstrap;
 mod bootstrap_route;
 use bootstrap_route::{
@@ -207,15 +214,15 @@ use bootstrap_route::{
 mod branch_add;
 mod branch_admin;
 use tracedecay_code_index_runtime::code_index_branch_diff::code_index_branch_diff_executor;
-use tracedecay_code_index_runtime::code_index_executor::code_index_search_executor;
+use tracedecay_code_index_runtime::code_index_executor::{
+    code_index_redundancy_executor, code_index_search_executor, code_index_similar_executor,
+};
 #[cfg(test)]
 use tracedecay_code_index_runtime::code_index_executor::{
     code_index_search_display_binding, mcp_search_request_termination,
 };
 #[cfg(test)]
-use tracedecay_code_index_runtime::code_index_task_support::{
-    code_index_scope_unavailable, code_index_search_hydration_budget,
-};
+use tracedecay_code_index_runtime::code_index_task_support::code_index_scope_unavailable;
 mod connection_serving;
 #[cfg(feature = "rmcp-benchmark")]
 #[doc(hidden)]
@@ -231,7 +238,6 @@ use connection_serving::{
     await_project_owner_or_disconnect, serve_routed_rmcp_connection, serve_windows_broker_client,
     serve_windows_broker_client_with_class,
 };
-pub(crate) mod context_scout_lifecycle;
 mod core_admission;
 mod engine;
 #[cfg(unix)]
@@ -240,9 +246,7 @@ use engine::{
     ensure_context_scout_owner_before_advertising,
     ensure_git_index_transactions_for_mutation_owners,
 };
-mod adoption_observation;
-mod automation_observation;
-pub(crate) use automation_observation::{
+pub(crate) use tracedecay_daemon_service::automation_observation::{
     project_run_observation_producer as project_automation_observation_producer,
     record_project_run as record_project_automation_run,
 };
@@ -250,8 +254,6 @@ mod core_client;
 mod core_doctor;
 mod core_handshake;
 mod core_hooks;
-mod core_lifecycle;
-mod core_logging;
 mod core_proxy;
 mod database_owner_registry;
 use database_owner_registry::DatabaseOwnerRegistry;
@@ -259,7 +261,6 @@ pub(crate) mod dashboard_automation;
 #[cfg(feature = "test-transport")]
 #[path = "../tests/common/dashboard_configuration_test_runtime.rs"]
 mod dashboard_configuration_test_runtime;
-pub(crate) mod doctor_kernel;
 pub(crate) mod hook_v2_replay_consumer;
 pub(crate) mod project_open_owners;
 #[cfg(feature = "test-transport")]
@@ -268,27 +269,29 @@ pub(crate) use dashboard_configuration_test_runtime::{
 };
 #[cfg(any(test, feature = "test-transport"))]
 pub(crate) mod retained_test_support;
-mod shutdown_coordination;
-mod shutdown_orchestration;
-mod shutdown_watchdog;
 pub(crate) use core_admission::*;
 pub use core_client::*;
 pub(crate) use core_doctor::*;
 pub use core_handshake::*;
 pub use core_hooks::*;
-pub(crate) use core_lifecycle::*;
-pub use core_logging::*;
 pub use core_proxy::*;
-pub(crate) use shutdown_coordination::ShutdownStatus;
+// Daemon process lifecycle and logging live in `tracedecay-daemon-service`;
+// the root's engine, bootstrap, and connection serving still read them by
+// these names until they move.
+#[cfg(unix)]
+pub(crate) use tracedecay_daemon_service::logging::recent_watcher_events;
+pub(crate) use tracedecay_daemon_service::logging::unavailable_error;
 #[cfg(feature = "hotpath")]
-pub use shutdown_watchdog::install_hotpath_shutdown_finalizer;
+pub use tracedecay_daemon_service::shutdown::install_hotpath_shutdown_finalizer;
+pub(crate) use tracedecay_daemon_service::shutdown::{
+    DAEMON_CLIENT_DRAIN_DEADLINE, DAEMON_TASK_ABORT_DEADLINE, DaemonLifecycle, ShutdownStatus,
+};
 mod github_credential_lifecycle;
 mod graph_resolution;
 use graph_resolution::retained_project_server_resolver;
 mod http_application;
 pub use http_application::live_remote_operational_status;
 mod http_application_router;
-pub(crate) mod retained_owner;
 use http_application_router::{
     install_http_application_cold_resolver, install_remote_http_application_router,
     mount_http_application_router,
@@ -322,7 +325,8 @@ use lsp_sessions::{
 };
 mod maintenance;
 pub mod pr_autotrack;
-#[cfg_attr(any(test, feature = "test-transport"), allow(clippy::too_many_lines))]
+#[cfg(any(test, feature = "test-transport"))]
+#[allow(clippy::too_many_lines)]
 mod production_harness;
 mod store_maintenance;
 #[cfg(any(test, feature = "test-transport"))]
@@ -383,11 +387,12 @@ use project_routing::portable_database_owner_reconciler;
 #[cfg(unix)]
 use project_routing::{CatalogRefreshClientKey, maintenance_transition_gate};
 use project_routing::{
-    bind_authenticated_profile_identity, cached_or_bind_ready_project_server,
-    prefer_recorded_open_failure, project_open_cancellation_checkpoint,
-    project_open_cancellation_error, project_open_capacity_gate, project_open_gate,
-    project_open_task_capacity_error, project_open_tasks, project_route_for_handshake,
-    project_server_capacity_error, project_warming_error, resolved_project_server_key,
+    bind_authenticated_profile_identity, bounded_repository_probe,
+    cached_or_bind_ready_project_server, prefer_recorded_open_failure,
+    project_open_cancellation_checkpoint, project_open_cancellation_error,
+    project_open_capacity_gate, project_open_gate, project_open_task_capacity_error,
+    project_open_tasks, project_route_for_handshake, project_server_capacity_error,
+    project_warming_error, resolved_project_server_key,
 };
 #[cfg(test)]
 use project_server_lifecycle::replay_user_profile_host_admission_for_identity;
@@ -422,12 +427,6 @@ mod invocation_tests;
 mod tests;
 
 #[cfg(test)]
-#[path = "../../tracedecay-code-index-runtime/src/code_index_scheduler/ignored_dependencies_tests.rs"]
-#[allow(clippy::expect_used)]
-mod code_index_ignored_dependencies_tests;
-
-#[cfg(test)]
-#[path = "../../tracedecay-code-index-runtime/src/code_index_scheduler/registry/runtime_generation_census_tests.rs"]
 #[allow(clippy::expect_used)]
 mod code_index_runtime_generation_census_tests;
 

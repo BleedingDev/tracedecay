@@ -12,16 +12,16 @@ use serde_json::{Value, json};
 use crate::mcp::project_route::{
     HookProjectRouteCache, SharedHookProjectRouteCache, mcp_analytics_session_id,
 };
-use crate::mcp::tool_analytics::{
-    McpToolAnalyticsEvent, hook_route_analytics_event, mcp_tool_analytics_event,
-};
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_contracts::request_identity::McpConnectionIdentityAuthority;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_host_admission::TerminalReason;
 use tracedecay_mcp::response_handles::{
     cleanup_expired_response_handles, response_handle_stats_json,
+};
+use tracedecay_mcp::tool_analytics::{
+    McpToolAnalyticsEvent, hook_route_analytics_event, mcp_tool_analytics_event,
 };
 use tracedecay_session_runtime::lcm_authority::{
     MountedLcmAuthorityPort, mount_registered_lcm_authority,
@@ -36,9 +36,9 @@ use tracedecay_sessions::runtime::git_correlation::{
     SpanObservation, SpanSource,
 };
 
-use super::tools::default_catalog_discovery_authority;
 use tracedecay_contracts::ProjectRegistryReadPort;
 use tracedecay_mcp::hook_events::{self, HookAgent, HookEventPlan};
+use tracedecay_mcp::tools::catalog_discovery::default_catalog_discovery_authority;
 use tracedecay_mcp::{
     ErrorCode, JsonRpcRequest, JsonRpcResponse, ToolRegistryMode, explore_call_budget,
     project_catalog_discovery_scope,
@@ -56,7 +56,6 @@ mod requests;
 pub use requests::TOKEN_ACCOUNTING_FOOTER_PREFIX;
 mod rmcp;
 mod routing;
-mod session_refresh;
 mod status_resource;
 
 pub(crate) use connection::ProductionMcpConnectionContext;
@@ -68,37 +67,27 @@ pub(crate) use rmcp::RmcpInitializeResponseDecorator;
 #[cfg(test)]
 pub(crate) use rmcp::{RmcpSelectedProjectResponseAuthority, RmcpWorkDeliverySettlement};
 pub(crate) use routing::*;
-pub(crate) use session_refresh::*;
+use tracedecay_daemon_service::DaemonSessionRefreshService;
 use tracedecay_daemon_service::{DaemonProjectRegistryReadService, DaemonWorkflowIndexReadService};
 pub(crate) use tracedecay_mcp::server::ProjectServerResponseLifecycle;
 use tracedecay_mcp::server::{
-    IdenticalReadCoalescer, McpBackgroundTaskOwner, McpDispatchRequest, RetainedDispatchAuthority,
-    StartupCatchUpMachineV1, ToolCallParams, join_required_live_transcript_refresh,
-    needs_lazy_sync_before_dispatch,
+    IdenticalReadCoalescer, McpBackgroundTaskOwner, McpDispatchRequest,
+    ProjectHostAdmissionReplayTask, RetainedDispatchAuthority, StartupCatchUpMachineV1,
+    ToolCallParams, join_required_live_transcript_refresh, needs_lazy_sync_before_dispatch,
 };
 pub(crate) use tracedecay_mcp::server::{McpMethod, classify_mcp_method};
 
 /// The steering instructions advertised from the `initialize` handshake of a
 /// healthy server.
 pub(crate) const SERVER_INSTRUCTIONS: &str = concat!(
-    "tracedecay is a code-graph MCP server. \
-    Start with tracedecay_context for any code exploration task \
-    — it returns relevant symbols, relationships, and code \
-    snippets for a natural-language query. Use tracedecay_search \
-    to find specific symbols by name. Discovery and analysis \
-    tools are read-only and safe to call in parallel. Edit \
-    and session-memory tools can mutate local project state \
-    and declare readOnlyHint=false. \
-    Every tool is also available from the shell: ",
+    "TraceDecay provides code-graph, session, memory, workflow, diagnostics, \
+    and project tools. Choose the tool whose description matches the task. \
+    Tool annotations distinguish read-only operations from tools that mutate \
+    local project state. The same tools are available from the shell: ",
     tracedecay_agent_hosts::cli_fallback_args_invocation_lit!(),
-    " \
-    — run `tracedecay tool` to list tools, \
-    `tracedecay tool <name> --help` for parameters). If an MCP \
-    call errors, times out, or this server disconnects, fall \
-    back to that CLI instead of querying .tracedecay databases \
-    directly or abandoning tracedecay. \
-    When a tool result contains a `tracedecay_metrics:` line, \
-    report the savings to the user (e.g. 'TraceDecay\\'d ~N tokens')."
+    " (`tracedecay tool` lists them and `tracedecay tool <name> --help` \
+    shows parameters). Use that interface for shell workflows or when MCP \
+    is unavailable. Do not query .tracedecay databases directly."
 );
 
 pub(crate) fn initialize_result(
@@ -314,8 +303,7 @@ pub struct McpServer {
     user_lcm_authority: Option<Arc<dyn MountedLcmAuthorityPort>>,
     /// Owned cancellable project replay worker (daemon-owned servers). Joined on
     /// [`Self::shutdown`] so Unix and Windows drain the same way.
-    project_host_admission_replay:
-        tokio::sync::Mutex<Option<project_host_admission_replay::ProjectHostAdmissionReplayTask>>,
+    project_host_admission_replay: tokio::sync::Mutex<Option<ProjectHostAdmissionReplayTask>>,
     /// Registry used for project-selector reads. This remains available even
     /// when global accounting is disabled so daemon clients do not fall back
     /// to the daemon process profile for selector resolution.
@@ -331,8 +319,7 @@ pub struct McpServer {
     dashboard_doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
     doctor_report_published: AtomicBool,
     dashboard_code_index_freshness_reader:
-        Option<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader>,
-    dashboard_explorer_semantic_reader: Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
+        Option<tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader>,
     dashboard_feedback_status_reader:
         Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     dashboard_pr_autotrack_reader:
@@ -349,6 +336,9 @@ pub struct McpServer {
     code_index_publication_identity: Option<CodeIndexPublicationIdentityResolver>,
     /// Daemon-owned, authority-gated search bridge.
     code_index_search_executor: Option<CodeIndexSearchExecutor>,
+    /// Daemon-owned, authority-gated clone similarity bridge.
+    code_index_similar_executor: Option<CodeIndexSimilarExecutor>,
+    code_index_redundancy_executor: Option<CodeIndexRedundancyExecutor>,
     /// Daemon-owned exact sealed-generation branch comparison bridge.
     code_index_branch_diff_executor: Option<CodeIndexBranchDiffExecutor>,
     code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
@@ -359,7 +349,7 @@ pub struct McpServer {
     /// Exact-scope sealed-generation census authority. It is installed only
     /// by daemon project-open after the route identity has resolved.
     generation_census_reader:
-        tokio::sync::OnceCell<tracedecay_session_memory::runtime_telemetry::GenerationCensusReader>,
+        tokio::sync::OnceCell<tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader>,
     /// Admission supplied by an authenticated daemon application route. It is
     /// deliberately absent until such a route/grant is available.
     code_index_search_authority: Option<CodeIndexSearchAuthorityV1>,
@@ -626,7 +616,11 @@ impl McpServer {
         retained_servers: Vec<Arc<McpServer>>,
     ) -> tracedecay_domain::errors::Result<Arc<Self>> {
         let runtime = runtime.into_runtime();
-        let mut context = runtime.mcp_server_context_for_test(cg, scope_prefix)?;
+        let mut context = crate::test_support::host_admission::mcp_server_context_for_test(
+            runtime,
+            cg,
+            scope_prefix,
+        )?;
         // Hook notifications require a durable admission spool before their
         // plans replay and their post-commit side writes (route analytics,
         // span observations) run. Mount one on the runtime's project
@@ -713,62 +707,11 @@ impl McpServer {
         // the active project as unmounted.
         let active_server_slot: Arc<std::sync::OnceLock<std::sync::Weak<McpServer>>> =
             Arc::new(std::sync::OnceLock::new());
-        let resolver_slot = Arc::clone(&active_server_slot);
-        let active_root =
-            tracedecay_runtime_core::lifecycle_lease::canonical_or_original(&retained_root);
-        let resolver: RetainedProjectServerResolver =
-            install_retained_project_server_resolver(move |request| {
-                let retained_servers = retained_servers.clone();
-                let resolver_slot = Arc::clone(&resolver_slot);
-                let active_root = active_root.clone();
-                Box::pin(async move {
-                    let requested = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
-                        &request.requested_worktree_root,
-                    );
-                    let registered =
-                        tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
-                            &request.registered_root,
-                        );
-                    let project_id = request
-                        .owner
-                        .as_ref()
-                        .map(|owner| owner.project.project_id.as_str());
-                    let mut matches = Vec::new();
-                    for server in &retained_servers {
-                        let graph = server.cg_snapshot().await;
-                        let root = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
-                            graph.project_root(),
-                        );
-                        let identity_matches = project_id.is_none_or(|project_id| {
-                            graph.store_layout().identity.project_id.as_deref() == Some(project_id)
-                        });
-                        if (root == requested || root == registered) && identity_matches {
-                            matches.push(Arc::clone(server));
-                        }
-                    }
-                    if matches.len() == 1 {
-                        return Ok(matches.pop());
-                    }
-                    if !matches.is_empty() {
-                        return Err(tracedecay_domain::errors::TraceDecayError::project_route(
-                            "project_route_ambiguous",
-                            false,
-                            "multiple retained test servers match one registered project route",
-                        ));
-                    }
-                    let active = resolver_slot.get().and_then(std::sync::Weak::upgrade);
-                    let Some(active) = active else {
-                        return Ok(None);
-                    };
-                    let graph = active.cg_snapshot().await;
-                    let identity_matches = project_id.is_none_or(|project_id| {
-                        graph.store_layout().identity.project_id.as_deref() == Some(project_id)
-                    });
-                    Ok(((active_root == requested || active_root == registered)
-                        && identity_matches)
-                        .then_some(active))
-                })
-            });
+        let resolver = retained_test_project_server_resolver(
+            retained_servers,
+            Arc::clone(&active_server_slot),
+            &retained_root,
+        );
         context = context.with_retained_project_server_resolver(resolver);
         let server = Self::new_with_context(context).await;
         if let Some(transport) = retained_owner_transport {
@@ -845,7 +788,6 @@ impl McpServer {
             remote_operational_status,
             dashboard_doctor_report_reader,
             dashboard_code_index_freshness_reader,
-            dashboard_explorer_semantic_reader,
             dashboard_feedback_status_reader,
             dashboard_pr_autotrack_reader,
             diagnostics_lsp,
@@ -855,6 +797,8 @@ impl McpServer {
             code_index_freshness_probe_sink,
             code_index_publication_identity,
             code_index_search_executor,
+            code_index_similar_executor,
+            code_index_redundancy_executor,
             code_index_branch_diff_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
@@ -1131,7 +1075,6 @@ impl McpServer {
             dashboard_doctor_report_reader,
             doctor_report_published: AtomicBool::new(false),
             dashboard_code_index_freshness_reader,
-            dashboard_explorer_semantic_reader,
             dashboard_feedback_status_reader,
             dashboard_pr_autotrack_reader,
             background_refresh_writer,
@@ -1140,6 +1083,8 @@ impl McpServer {
             code_index_freshness_probe_sink,
             code_index_publication_identity,
             code_index_search_executor,
+            code_index_similar_executor,
+            code_index_redundancy_executor,
             code_index_branch_diff_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
@@ -1197,7 +1142,7 @@ impl McpServer {
         tokio::task::spawn_blocking(move || {
             let _ = cleanup_expired_response_handles(
                 &response_handle_project_root,
-                crate::tracedecay::current_timestamp(),
+                crate::project::current_timestamp(),
             );
         });
         if own_project_host_admission_replay
@@ -1218,8 +1163,7 @@ impl McpServer {
                         Box<dyn std::future::Future<Output = HostAdmissionOutcome> + Send>,
                     >
             });
-            let worker =
-                project_host_admission_replay::ProjectHostAdmissionReplayTask::start(broker, pass);
+            let worker = ProjectHostAdmissionReplayTask::start(broker, pass);
             *server.project_host_admission_replay.lock().await = Some(worker);
         }
 
@@ -1423,8 +1367,8 @@ impl McpServer {
             Arc::new(DaemonWorkflowIndexReadService::new(database.clone()))
                 as Arc<dyn tracedecay_sessions::WorkflowIndexReadPort>
         });
-        crate::daemon::retained_owner::retained_surface_ports(
-            crate::daemon::retained_owner::ProductionRetainedAuthoritiesV1 {
+        tracedecay_daemon_service::retained_owner::retained_surface_ports(
+            tracedecay_daemon_service::retained_owner::ProductionRetainedAuthoritiesV1 {
                 cg: Arc::clone(&self.cg),
                 project_root: project_root.to_path_buf(),
                 project_id,
@@ -1600,8 +1544,6 @@ mod work_evidence_mount_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod lcm_claude_recall_tests;
 
-mod project_host_admission_replay;
-
 /// Staleness-banner, startup catch-up, and sync-on-read behavioural tests.
 /// The pure-logic banner tests need no server; the server tests build
 /// a real indexed `TraceDecay` over a temp git repo, mirroring the
@@ -1627,3 +1569,68 @@ mod staleness_banner_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub(crate) mod writer_test_support;
+
+/// Routes a registered project request to the retained test server whose
+/// checkout and project identity match it, or to the active server when no
+/// retained server does.
+#[cfg(any(test, feature = "test-transport"))]
+fn retained_test_project_server_resolver(
+    retained_servers: Vec<Arc<McpServer>>,
+    resolver_slot: Arc<std::sync::OnceLock<std::sync::Weak<McpServer>>>,
+    retained_root: &std::path::Path,
+) -> RetainedProjectServerResolver {
+    let active_root =
+        tracedecay_runtime_core::lifecycle_lease::canonical_or_original(retained_root);
+    install_retained_project_server_resolver(move |request| {
+        let retained_servers = retained_servers.clone();
+        let resolver_slot = Arc::clone(&resolver_slot);
+        let active_root = active_root.clone();
+        Box::pin(async move {
+            let requested = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
+                &request.requested_worktree_root,
+            );
+            let registered = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
+                &request.registered_root,
+            );
+            let project_id = request
+                .owner
+                .as_ref()
+                .map(|owner| owner.project.project_id.as_str());
+            let mut matches = Vec::new();
+            for server in &retained_servers {
+                let graph = server.cg_snapshot().await;
+                let root = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
+                    graph.project_root(),
+                );
+                let identity_matches = project_id.is_none_or(|project_id| {
+                    graph.store_layout().identity.project_id.as_deref() == Some(project_id)
+                });
+                if (root == requested || root == registered) && identity_matches {
+                    matches.push(Arc::clone(server));
+                }
+            }
+            if matches.len() == 1 {
+                return Ok(matches.pop());
+            }
+            if !matches.is_empty() {
+                return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                    "project_route_ambiguous",
+                    false,
+                    "multiple retained test servers match one registered project route",
+                ));
+            }
+            let active = resolver_slot.get().and_then(std::sync::Weak::upgrade);
+            let Some(active) = active else {
+                return Ok(None);
+            };
+            let graph = active.cg_snapshot().await;
+            let identity_matches = project_id.is_none_or(|project_id| {
+                graph.store_layout().identity.project_id.as_deref() == Some(project_id)
+            });
+            Ok(
+                ((active_root == requested || active_root == registered) && identity_matches)
+                    .then_some(active),
+            )
+        })
+    })
+}

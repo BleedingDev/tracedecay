@@ -13,7 +13,6 @@ use tracedecay_daemon_control::RemoteBrainTlsConfig;
 use tracedecay_daemon_identity::authority;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
-use tracedecay_store_runtime::spawn_semantic_artifact_gc_maintenance;
 
 use super::*;
 use tracedecay_runtime_core::logging::log_daemon_event;
@@ -22,24 +21,6 @@ use tracedecay_runtime_core::logging::log_daemon_event;
 /// receipts to the daemon log after the coordinator returns.
 pub(super) const DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE: tokio::time::Duration =
     tokio::time::Duration::from_millis(100);
-
-async fn cancel_retained_session_history_until<F>(deadline: tokio::time::Instant, cancellation: F)
-where
-    F: std::future::Future<Output = ()>,
-{
-    if tokio::time::timeout_at(deadline, cancellation)
-        .await
-        .is_err()
-    {
-        log_daemon_event(
-            "daemon_shutdown",
-            &[(
-                "outcome",
-                "retained_session_history_cancellation_timeout".to_owned(),
-            )],
-        );
-    }
-}
 
 #[hotpath::measure(label = "daemon.bootstrap.catalog_prewarm")]
 fn prewarm_static_daemon_bootstrap_catalog() {
@@ -181,10 +162,6 @@ async fn run_foreground_loopback(
             &[("endpoint", format!("https://{endpoint}/remote/"))],
         );
     }
-    let semantic_artifact_gc = spawn_semantic_artifact_gc_maintenance(
-        store_administration.session_runtime_registry().await?,
-    );
-
     let lifecycle = DaemonLifecycle::default();
     let sync_config = tracedecay_configuration::SyncConfig::default().with_env_overrides();
     let profile_database = store_administration.registered_profile_database().await?;
@@ -264,18 +241,12 @@ async fn run_foreground_loopback(
         ));
     }
     lifecycle.begin_draining();
-    shutdown_watchdog::arm_shutdown_exit_bound();
+    tracedecay_daemon_service::shutdown::arm_shutdown_exit_bound();
+    drop(listener);
+    cancel_retained_session_history(&store_administration).await;
     let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
         - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
-    drop(listener);
-    cancel_retained_session_history_until(
-        shutdown_deadline,
-        cancel_retained_session_history(&store_administration),
-    )
-    .await;
     let endpoint_cleanup = authority.cleanup_owned_endpoint();
-    let semantic_artifact_gc_cancel = semantic_artifact_gc.clone();
-    let semantic_artifact_gc_join = semantic_artifact_gc;
     let maintenance_join = maintenance.clone();
     let project_open = project_open_tasks(project_open_gates.as_ref()).await;
     let session_refresh = Arc::clone(store_administration.session_temporal_refresh_schedulers());
@@ -287,12 +258,7 @@ async fn run_foreground_loopback(
     let native_integration_join = Arc::clone(store_administration.native_integration_services());
     let owner_phases = vec![
         vec![
-            shutdown_coordination::ShutdownOwner::with_deadline_result(
-                "semantic_artifact_gc",
-                move || semantic_artifact_gc_cancel.cancel(),
-                move |_| async move { semantic_artifact_gc_join.shutdown().await },
-            ),
-            shutdown_coordination::ShutdownOwner::new(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::new(
                 "maintenance",
                 {
                     let maintenance_cancel = maintenance.clone();
@@ -302,13 +268,13 @@ async fn run_foreground_loopback(
                     maintenance_join.shutdown().await;
                 },
             ),
-            shutdown_coordination::ShutdownOwner::with_deadline_result(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
                 "http_application",
                 || {},
                 move |_| async move { http_application_service.shutdown().await },
             ),
             hosted_dashboard_shutdown_owner(),
-            shutdown_coordination::ShutdownOwner::with_deadline_status(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_status(
                 "project_open",
                 || {},
                 move |_| async move {
@@ -319,14 +285,14 @@ async fn run_foreground_loopback(
                     }
                 },
             ),
-            shutdown_coordination::ShutdownOwner::new(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::new(
                 "session_temporal_refresh",
                 || {},
                 async move {
                     session_refresh.shutdown().await;
                 },
             ),
-            shutdown_coordination::ShutdownOwner::new(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::new(
                 "host_admission_replay",
                 {
                     let replay_cancel = store_administration.clone();
@@ -342,15 +308,17 @@ async fn run_foreground_loopback(
         // after the producer owners settle, so nothing can admit a provider
         // process after the execution registry is emptied and leave it
         // running past shutdown.
-        vec![shutdown_coordination::ShutdownOwner::with_deadline_status(
-            "invocation",
-            {
-                let invocation_cancel = invocation.clone();
-                move || invocation_cancel.cancel_admissions()
-            },
-            move |deadline| async move { invocation_join.shutdown_until(deadline).await },
-        )],
-        vec![shutdown_coordination::ShutdownOwner::new(
+        vec![
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_status(
+                "invocation",
+                {
+                    let invocation_cancel = invocation.clone();
+                    move || invocation_cancel.cancel_admissions()
+                },
+                move |_| async move { invocation_join.shutdown().await },
+            ),
+        ],
+        vec![tracedecay_daemon_service::shutdown::ShutdownOwner::new(
             "session_sync",
             || {},
             async move {
@@ -358,7 +326,7 @@ async fn run_foreground_loopback(
             },
         )],
         vec![
-            shutdown_coordination::ShutdownOwner::with_deadline_result(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
                 "git_index_transactions",
                 || {},
                 move |_| async move {
@@ -369,7 +337,7 @@ async fn run_foreground_loopback(
                         .map_err(|error| format!("{error:?}"))
                 },
             ),
-            shutdown_coordination::ShutdownOwner::with_deadline_result(
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
                 "native_integration_transactions",
                 || {},
                 move |_| async move {
@@ -382,32 +350,33 @@ async fn run_foreground_loopback(
             ),
         ],
     ];
-    let memory_graph_reconciliation = shutdown_coordination::ShutdownOwner::with_deadline_result(
-        "memory_graph_reconciliation",
-        || {},
-        move |_| async move {
-            // Same ordering contract as the engine owner: cancel, join the
-            // reconciliation workers while their runtimes are alive, then
-            // drain the retained owners and close the graphs. Closing before
-            // the join conflicts on the standing owner attachments.
-            let owner = memory_graph_reconciliation_join
-                .prepare_memory_graph_reconciliation_shutdown()
-                .await
-                .map_err(|error| error.to_string())?;
-            owner.cancel();
-            owner.shutdown().await?;
-            memory_graph_reconciliation_join
-                .close_retained_graph_runtimes_for_shutdown()
-                .await
-                .map_err(|error| error.to_string())
-        },
-    );
+    let memory_graph_reconciliation =
+        tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
+            "memory_graph_reconciliation",
+            || {},
+            move |_| async move {
+                // Same ordering contract as the engine owner: cancel, join the
+                // reconciliation workers while their runtimes are alive, then
+                // drain the retained owners and close the graphs. Closing before
+                // the join conflicts on the standing owner attachments.
+                let owner = memory_graph_reconciliation_join
+                    .prepare_memory_graph_reconciliation_shutdown()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                owner.cancel();
+                owner.shutdown().await?;
+                memory_graph_reconciliation_join
+                    .close_retained_graph_runtimes_for_shutdown()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+        );
     let server_store_administration = store_administration.clone();
-    let shutdown = shutdown_orchestration::coordinate_daemon_shutdown(
+    let shutdown = tracedecay_daemon_service::shutdown::coordinate_daemon_shutdown(
         &lifecycle,
         shutdown_deadline,
         async move {
-            shutdown_orchestration::DaemonShutdownPlan::new(
+            tracedecay_daemon_service::shutdown::DaemonShutdownPlan::new(
                 clients,
                 owner_phases,
                 move |project_server_deadline| async move {
@@ -429,7 +398,9 @@ async fn run_foreground_loopback(
     endpoint_cleanup
 }
 
-fn log_client_drain_shutdown_receipt(receipt: &shutdown_orchestration::DaemonShutdownReceipt) {
+fn log_client_drain_shutdown_receipt(
+    receipt: &tracedecay_daemon_service::shutdown::DaemonShutdownReceipt,
+) {
     if receipt.in_flight.is_clean() && receipt.clients.is_clean() {
         return;
     }
@@ -449,7 +420,7 @@ fn log_client_drain_shutdown_receipt(receipt: &shutdown_orchestration::DaemonShu
     );
 }
 
-fn log_background_shutdown_receipt(receipt: &shutdown_coordination::ShutdownReceipt) {
+fn log_background_shutdown_receipt(receipt: &tracedecay_daemon_service::shutdown::ShutdownReceipt) {
     for owner in receipt.unfinished() {
         // The receipt keeps each owner's typed status; the log must carry it
         // too, or every unfinished owner reads as the same anonymous hang.
@@ -460,9 +431,15 @@ fn log_background_shutdown_receipt(receipt: &shutdown_coordination::ShutdownRece
             .map_or_else(
                 || "unreported".to_owned(),
                 |entry| match &entry.status {
-                    shutdown_coordination::ShutdownStatus::Clean => "clean".to_owned(),
-                    shutdown_coordination::ShutdownStatus::Failed(error) => error.clone(),
-                    shutdown_coordination::ShutdownStatus::TimedOut => "timed_out".to_owned(),
+                    tracedecay_daemon_service::shutdown::ShutdownStatus::Clean => {
+                        "clean".to_owned()
+                    }
+                    tracedecay_daemon_service::shutdown::ShutdownStatus::Failed(error) => {
+                        error.clone()
+                    }
+                    tracedecay_daemon_service::shutdown::ShutdownStatus::TimedOut => {
+                        "timed_out".to_owned()
+                    }
                 },
             );
         log_daemon_event(
@@ -505,8 +482,8 @@ fn log_project_server_shutdown_receipt(receipt: &tracedecay_store_runtime::Shutd
     }
 }
 
-fn hosted_dashboard_shutdown_owner() -> shutdown_coordination::ShutdownOwner {
-    shutdown_coordination::ShutdownOwner::with_deadline_result(
+fn hosted_dashboard_shutdown_owner() -> tracedecay_daemon_service::shutdown::ShutdownOwner {
+    tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
         "hosted_dashboard",
         || {},
         move |_| async move {
@@ -656,12 +633,6 @@ async fn run_foreground_unix(
             &[("endpoint", format!("https://{endpoint}/remote/"))],
         );
     }
-    let semantic_artifact_gc = spawn_semantic_artifact_gc_maintenance(
-        engine
-            .store_administration
-            .session_runtime_registry()
-            .await?,
-    );
     let sync_config = tracedecay_configuration::SyncConfig::default().with_env_overrides();
     let profile_database = engine
         .store_administration
@@ -763,20 +734,16 @@ async fn run_foreground_unix(
         ));
     }
     engine.lifecycle.begin_draining();
-    shutdown_watchdog::arm_shutdown_exit_bound();
-    let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
-        - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
+    tracedecay_daemon_service::shutdown::arm_shutdown_exit_bound();
     // Stop accepting and unlink the socket before draining so clients that
     // connect during shutdown get NotFound/ConnectionRefused (which they retry
     // via `connect_with_restart_grace`) instead of a queued connection that
     // will never be served.
     drop(listener);
     let endpoint_cleanup = authority.cleanup_owned_endpoint();
-    cancel_retained_session_history_until(
-        shutdown_deadline,
-        cancel_retained_session_history(&engine.store_administration),
-    )
-    .await;
+    cancel_retained_session_history(&engine.store_administration).await;
+    let shutdown_deadline = tokio::time::Instant::now() + DAEMON_SHUTDOWN_DEADLINE
+        - DAEMON_SHUTDOWN_RECEIPT_LOG_RESERVE;
     // Keep auxiliary process creation blocked until every scheduler and client
     // task is drained or abandoned. A killed app-server call may retry before
     // unwinding, so a shorter guard leaves a shutdown-time respawn race. The
@@ -791,41 +758,29 @@ async fn run_foreground_unix(
     );
     let shutdown_lifecycle = engine.lifecycle.clone();
     let shutdown_engine = engine.clone();
-    let semantic_artifact_gc_cancel = semantic_artifact_gc.clone();
-    let semantic_artifact_gc_join = semantic_artifact_gc;
-    let shutdown = shutdown_orchestration::coordinate_daemon_shutdown(
+    let shutdown = tracedecay_daemon_service::shutdown::coordinate_daemon_shutdown(
         &shutdown_lifecycle,
         shutdown_deadline,
         async move {
             let mut owner_phases = shutdown_engine.shutdown_owner_phases().await;
             let memory_graph_reconciliation =
                 shutdown_engine.memory_graph_reconciliation_shutdown_owner();
-            let semantic_artifact_gc_owner =
-                shutdown_coordination::ShutdownOwner::with_deadline_result(
-                    "semantic_artifact_gc",
-                    move || semantic_artifact_gc_cancel.cancel(),
-                    move |_| async move { semantic_artifact_gc_join.shutdown().await },
+            let http_application_owner =
+                tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_result(
+                    "http_application",
+                    || {},
+                    move |_| async move { http_application_service.shutdown().await },
                 );
-            let http_application_owner = shutdown_coordination::ShutdownOwner::with_deadline_result(
-                "http_application",
-                || {},
-                move |_| async move { http_application_service.shutdown().await },
-            );
             let hosted_dashboard_owner = hosted_dashboard_shutdown_owner();
             match owner_phases.first_mut() {
                 Some(producers) => {
-                    producers.push(semantic_artifact_gc_owner);
                     producers.push(http_application_owner);
                     producers.push(hosted_dashboard_owner);
                 }
-                None => owner_phases.push(vec![
-                    semantic_artifact_gc_owner,
-                    http_application_owner,
-                    hosted_dashboard_owner,
-                ]),
+                None => owner_phases.push(vec![http_application_owner, hosted_dashboard_owner]),
             }
             let server_engine = shutdown_engine.clone();
-            shutdown_orchestration::DaemonShutdownPlan::new(
+            tracedecay_daemon_service::shutdown::DaemonShutdownPlan::new(
                 client_tasks,
                 owner_phases,
                 move |project_server_deadline| async move {
@@ -967,44 +922,6 @@ async fn prepare_socket_path(authority: &authority::DaemonAuthority) -> Result<(
 mod tests {
     #[cfg(unix)]
     use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
-    async fn retained_session_history_cancellation_cannot_overrun_shutdown_deadline() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct CancellationDropProbe(Arc<AtomicBool>);
-
-        impl Drop for CancellationDropProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        let contention = Arc::new(tokio::sync::Mutex::new(()));
-        let held = contention.lock().await;
-        let contended_cancellation_lock = Arc::clone(&contention);
-        let cancellation_dropped = Arc::new(AtomicBool::new(false));
-        let cancellation_dropped_by_task = Arc::clone(&cancellation_dropped);
-        let contended_cancellation = async move {
-            let _drop_probe = CancellationDropProbe(cancellation_dropped_by_task);
-            let _guard = contended_cancellation_lock.lock().await;
-        };
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(25);
-
-        cancel_retained_session_history_until(deadline, contended_cancellation).await;
-
-        assert_eq!(
-            tokio::time::Instant::now(),
-            deadline,
-            "the contended cancellation prefix must stop at the absolute shutdown deadline"
-        );
-        assert!(
-            cancellation_dropped.load(Ordering::Acquire),
-            "timing out must cancel the pending cancellation future"
-        );
-        drop(held);
-    }
 
     #[cfg(unix)]
     #[test]

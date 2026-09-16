@@ -33,6 +33,7 @@
 //!   <physical-namespace-hex>/
 //!     generation.grafeo         <- compact single-generation store
 //!     sealed.json               <- receipt binding the recovered digest
+//!     sealed.checked            <- written only after post-reopen proof
 //! ```
 //!
 //! # Sealed-read-bundle integration point
@@ -174,15 +175,15 @@ const SEALED_COPY_GUARD_CHUNK_ROWS: usize = 4096;
 const SEALED_STORE_RECEIPT_VERSION: u32 = 1;
 const SEALED_STORE_DATABASE_FILE: &str = "generation.grafeo";
 const SEALED_STORE_RECEIPT_FILE: &str = "sealed.json";
+/// Digest recorded only after a successful post-reopen proof. A `sealed.json`
+/// written before that proof is not release authority.
+const SEALED_STORE_CHECKED_FILE: &str = "sealed.checked";
 const SEALED_STORE_DISABLE_ENV: &str = "TRACEDECAY_GRAPH_SEALED_STORE";
 
 /// The one form a sealed store is built in. Every value TraceDecay persists
-/// round-trips through the columnar codecs: scalars natively, Bytes through
-/// the dictionary's marked entries, and vectors through the `Float32Vector`
-/// codec — [`crate::schema::vector_property_key`] carries the dimension in
-/// the column name, so no column ever mixes dimensions, and
-/// [`crate::limits::MAX_GRAPH_VECTOR_DIMENSION`] sits inside the codec's
-/// `u16` stride. The post-reopen digest proof re-checks every row regardless.
+/// round-trips through the columnar codecs: scalars natively and Bytes through
+/// the dictionary's marked entries. The post-reopen digest proof re-checks
+/// every row regardless.
 const SEALED_STORE_FORM_COMPACT: &str = "compact";
 
 /// Receipt binding a sealed store directory to the exact generation and
@@ -203,6 +204,30 @@ struct SealedStoreReceiptV1 {
     recovered_digest: String,
     entities: usize,
     relations: usize,
+}
+
+impl SealedStoreReceiptV1 {
+    fn binds(
+        &self,
+        locator: &GenerationLocator,
+        physical_namespace: &str,
+        expected_digest: &str,
+    ) -> bool {
+        self.version == SEALED_STORE_RECEIPT_VERSION
+            && self.recovered_digest == expected_digest
+            && self.physical_namespace == physical_namespace
+            && self.namespace == locator.projection.namespace.as_str()
+            && self.projection == locator.projection.projection.as_str()
+            && self.generation == locator.generation.as_str()
+    }
+}
+
+/// Digest and row counts that authorize a staging-row release without opening
+/// the sealed engine.
+pub(crate) struct SealedReleaseEvidence {
+    pub recovered_digest: String,
+    pub entities: usize,
+    pub relations: usize,
 }
 
 /// How [`GraphDb::ensure_sealed_generation_store`] satisfied a publication's
@@ -824,6 +849,48 @@ impl GraphDb {
         sealed.get(locator).cloned()
     }
 
+    /// Receipt evidence that `locator`'s on-disk sealed artifact matches
+    /// `expected` digest, without opening the sealed engine.
+    ///
+    /// Staging-row release is cleanup, not serving. The relational head plus
+    /// a post-reopen `sealed.checked` digest already name a proven artifact.
+    /// A `sealed.json` written before that proof is not enough: a crash after
+    /// the install rename and before proof would otherwise delete the only
+    /// reconstructable staging rows. Serving and activation still prove
+    /// before they read, and a successful proof persists the check.
+    pub(crate) fn matching_sealed_release_receipt(
+        &self,
+        locator: &GenerationLocator,
+        expected: &str,
+    ) -> Result<Option<SealedReleaseEvidence>, GraphDbError> {
+        if sealed_store_disabled() {
+            return Ok(None);
+        }
+        let Some(reopen) = self.inner.reopen.as_ref() else {
+            return Ok(None);
+        };
+        let Some(database_path) = reopen.config.path.clone() else {
+            return Ok(None);
+        };
+        let physical_namespace = locator.physical_namespace()?;
+        let directory =
+            sealed_generation_directory(&sealed_store_root(&database_path), &physical_namespace);
+        let Some(receipt) = load_sealed_store_receipt(&directory)? else {
+            return Ok(None);
+        };
+        if !receipt.binds(locator, physical_namespace.as_str(), expected) {
+            return Ok(None);
+        }
+        if !sealed_store_check_matches(&directory, expected)? {
+            return Ok(None);
+        }
+        Ok(Some(SealedReleaseEvidence {
+            recovered_digest: receipt.recovered_digest,
+            entities: receipt.entities,
+            relations: receipt.relations,
+        }))
+    }
+
     #[cfg(any(test, feature = "test-helpers", feature = "eval-helpers"))]
     pub fn discard_sealed_generation_reader(
         &self,
@@ -998,6 +1065,7 @@ impl GraphDb {
         &self,
         identity: &GraphGenerationManifestIdentity,
         expected: &GraphRecoveredGenerationDigestV1,
+        check: &dyn Fn() -> Result<(), GraphDbError>,
     ) -> Result<(), GraphDbError> {
         if sealed_store_disabled() {
             return Ok(());
@@ -1024,9 +1092,10 @@ impl GraphDb {
         let physical_namespace = identity.physical_namespace()?;
         let root = sealed_store_root(&database_path);
         let directory = sealed_generation_directory(&root, &physical_namespace);
-        match open_sealed_store(&directory, identity, expected) {
+        match open_sealed_store_checked(&directory, identity, expected, check) {
             Ok(Some(store)) => self.install_sealed_generation_store(locator, store),
             Ok(None) => Ok(()),
+            Err(error @ (GraphDbError::Cancelled | GraphDbError::DeadlineExceeded)) => Err(error),
             Err(_) => {
                 // A stale or corrupt artifact never outranks the verified
                 // staging rows; discard it so a later seal can rebuild.
@@ -1034,26 +1103,6 @@ impl GraphDb {
                 Ok(())
             }
         }
-    }
-
-    pub(crate) fn open_installed_sealed_generation_store_if_present(
-        &self,
-        lease: &crate::lease::VerifiedGenerationLease,
-    ) -> Result<(), GraphDbError> {
-        if self.sealed_generation_reader(&lease.locator).is_some() {
-            return Ok(());
-        }
-        let Some(commit) = self.generation_commit(&lease.locator)? else {
-            return Ok(());
-        };
-        let identity = GraphGenerationManifestIdentity::new(
-            lease.locator.projection.clone(),
-            lease.locator.generation.clone(),
-            commit.source_generation,
-            commit.watermark,
-            lease.dependency_identities.clone(),
-        );
-        self.open_sealed_generation_store_if_present(&identity, &lease.head.recovered_digest)
     }
 
     fn install_sealed_generation_store(
@@ -1666,23 +1715,56 @@ fn open_sealed_store(
     identity: &GraphGenerationManifestIdentity,
     expected: &GraphRecoveredGenerationDigestV1,
 ) -> Result<Option<Arc<SealedGenerationStore>>, GraphDbError> {
+    open_sealed_store_checked(directory, identity, expected, &|| Ok(()))
+}
+
+fn load_sealed_store_receipt(
+    directory: &Path,
+) -> Result<Option<SealedStoreReceiptV1>, GraphDbError> {
     let receipt_path = directory.join(SEALED_STORE_RECEIPT_FILE);
-    let database_path = directory.join(SEALED_STORE_DATABASE_FILE);
     let receipt_bytes = match std::fs::read(&receipt_path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(sealed_store_io_failure("receipt read failed", error)),
     };
-    let receipt: SealedStoreReceiptV1 = serde_json::from_slice(&receipt_bytes)
-        .map_err(|error| GraphDbError::unavailable(format!("sealed receipt decode: {error}")))?;
+    serde_json::from_slice(&receipt_bytes)
+        .map(Some)
+        .map_err(|error| GraphDbError::unavailable(format!("sealed receipt decode: {error}")))
+}
+
+fn sealed_store_check_matches(
+    directory: &Path,
+    expected_digest: &str,
+) -> Result<bool, GraphDbError> {
+    let path = directory.join(SEALED_STORE_CHECKED_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(digest) => Ok(digest == expected_digest),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(sealed_store_io_failure("sealed check read failed", error)),
+    }
+}
+
+fn persist_sealed_store_check(directory: &Path, expected_digest: &str) -> Result<(), GraphDbError> {
+    if sealed_store_check_matches(directory, expected_digest)? {
+        return Ok(());
+    }
+    std::fs::write(directory.join(SEALED_STORE_CHECKED_FILE), expected_digest)
+        .map_err(|error| sealed_store_io_failure("sealed check persist failed", error))
+}
+
+fn open_sealed_store_checked(
+    directory: &Path,
+    identity: &GraphGenerationManifestIdentity,
+    expected: &GraphRecoveredGenerationDigestV1,
+    check: &dyn Fn() -> Result<(), GraphDbError>,
+) -> Result<Option<Arc<SealedGenerationStore>>, GraphDbError> {
+    let database_path = directory.join(SEALED_STORE_DATABASE_FILE);
+    let Some(receipt) = load_sealed_store_receipt(directory)? else {
+        return Ok(None);
+    };
+    let locator = GenerationLocator::new(identity.projection.clone(), identity.generation.clone());
     let physical_namespace = identity.physical_namespace()?;
-    if receipt.version != SEALED_STORE_RECEIPT_VERSION
-        || receipt.recovered_digest != expected.as_str()
-        || receipt.physical_namespace != physical_namespace.as_str()
-        || receipt.namespace != identity.projection.namespace.as_str()
-        || receipt.projection != identity.projection.projection.as_str()
-        || receipt.generation != identity.generation.as_str()
-    {
+    if !receipt.binds(&locator, physical_namespace.as_str(), expected.as_str()) {
         return Err(GraphDbError::unavailable(
             "sealed generation store receipt does not bind this generation".to_owned(),
         ));
@@ -1710,7 +1792,7 @@ fn open_sealed_store(
     // the full row proof and files the marker for the next open. `expected`
     // still comes from the relational authority, exactly as on the staging
     // container.
-    let canonical_bytes = match sealed_copy_proof(&database, identity, expected, &|| Ok(())) {
+    let canonical_bytes = match sealed_copy_proof(&database, identity, expected, check) {
         Ok(canonical_bytes) => canonical_bytes,
         Err(error) => {
             let _ = database.close();
@@ -1731,6 +1813,10 @@ fn open_sealed_store(
     ) {
         let _ = database.close();
         return Err(sealed_store_failure("post-proof hibernation failed", error));
+    }
+    if let Err(error) = persist_sealed_store_check(directory, expected.as_str()) {
+        let _ = database.close();
+        return Err(error);
     }
     Ok(Some(Arc::new(SealedGenerationStore {
         locator: GenerationLocator::new(identity.projection.clone(), identity.generation.clone()),
@@ -2196,72 +2282,6 @@ mod build_tests {
             payload(&parallel_bytes) == payload(&direct_bytes),
             "parallel and serial direct builds must write the same sealed payload"
         );
-    }
-
-    /// Vector-carrying generations seal in compact form and reproduce their
-    /// recovered digest exactly: the vector property key carries the
-    /// dimension, so a column never mixes dimensions and the `Float32Vector`
-    /// codec round-trips every value.
-    #[test]
-    fn vector_carrying_generation_seals_compact_and_proves_its_digest() {
-        let check: &dyn Fn() -> Result<(), GraphDbError> = &|| Ok(());
-        let temp = tempfile::tempdir().unwrap();
-        let database_path = temp.path().join("source.grafeo");
-        let database = open_source(&database_path);
-        let projection = GraphProjectionIdentity::new(
-            GraphNamespace::new("sealed-vectors").unwrap(),
-            GraphProjectionId::new("semantic").unwrap(),
-        );
-        let entity_rows = (0..600_usize)
-            .map(|index| {
-                let values: Vec<f32> = (0..8).map(|d| (index * 8 + d) as f32 * 0.25).collect();
-                let mut properties = BTreeMap::from([(
-                    GraphPropertyName::new("vector").unwrap(),
-                    GraphProperty::Vector(
-                        crate::GraphVector::new(values, 8, crate::VectorMetric::Cosine).unwrap(),
-                    ),
-                )]);
-                // Sparse scalar alongside the vector, on its own label set.
-                if index % 3 == 0 {
-                    properties.insert(
-                        GraphPropertyName::new("score").unwrap(),
-                        GraphProperty::F64(index as f64 / 7.0),
-                    );
-                }
-                let mut labels = BTreeSet::from([GraphLabel::new("chunk").unwrap()]);
-                if index % 3 == 0 {
-                    labels.insert(GraphLabel::new("scored").unwrap());
-                }
-                GraphEntity::new(entity_identity(index), labels, properties).unwrap()
-            })
-            .collect();
-        let manifest = GraphGenerationManifest::new(
-            projection,
-            GraphGenerationId::new("generation:vectors").unwrap(),
-            SourceGeneration::new("source:vectors").unwrap(),
-            GraphWatermark::new("watermark:vectors").unwrap(),
-            Vec::new(),
-            entity_rows,
-            Vec::new(),
-        )
-        .unwrap();
-        let identity = manifest.identity();
-        let expected = manifest.expected_recovered_digest(check).unwrap();
-        database
-            .apply_generation_unverified_with_digest(Arc::new(manifest), &expected, check)
-            .unwrap();
-        let (store, staging_proof) = build_or_open_sealed_store(
-            SealedRowSource::Staging(&database),
-            &identity,
-            &expected,
-            &database_path,
-            check,
-        )
-        .unwrap();
-        assert!(staging_proof.is_some());
-        assert_eq!(store.recovered_digest(), expected.as_str());
-        assert_eq!(store.row_counts(), (600, 0));
-        let _ = store.database().close();
     }
 }
 

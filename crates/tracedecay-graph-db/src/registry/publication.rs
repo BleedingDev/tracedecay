@@ -26,7 +26,9 @@ use super::publication_support::{
 };
 use super::{GraphDbRegistration, GraphDbRegistry, check_registration_request};
 use crate::generation::{metadata_manifest_from_source, validate_supplied_manifest_binding};
-use crate::generation_runtime::{GenerationContentsDeletion, GenerationStageOutcome};
+use crate::generation_runtime::{
+    GenerationContentsDeletion, GenerationStageOutcome, SealedReleaseReceiptAuthority,
+};
 use crate::lease::{
     GenerationLocator, VerifiedGenerationLease, VerifiedGraphSnapshot, generation_lease,
 };
@@ -36,18 +38,6 @@ use crate::{
     GraphReplayCollectionOutcome, SealedStagingRelease, SealedStagingRetentionReason,
     SupersededReplayRetirement, VerifiedGraphCommit,
 };
-
-/// The publication mode choices `publish_verified_inner` varies on.
-///
-/// Grouped because passing them positionally put the function at 8 arguments,
-/// and adjacent bools at a call site read as noise: `false, true` says
-/// nothing about which knob is which.
-struct GraphPublishModeV1 {
-    /// A manifest supplied by the caller instead of one derived from replay.
-    supplied_manifest: Option<Arc<GraphGenerationManifest>>,
-    /// Reopen metadata rather than treating the existing handle as current.
-    reopen_metadata: bool,
-}
 
 /// Exact persisted identity emitted by the shipped per-generation code-graph
 /// layout. This predicate gates destructive cleanup, so the broader reporting
@@ -104,7 +94,7 @@ mod legacy_cleanup_identity_tests {
         )));
         assert!(!is_shipped_legacy_code_graph_projection(&projection(
             format!("{prefix}{}", "b".repeat(64)),
-            "semantic-vector",
+            "other-projection",
         )));
     }
 }
@@ -352,61 +342,22 @@ impl GraphDbRegistry {
         // artifact may stand in for the staging rows: normally the verified
         // head, or the unique cleanup tombstone for a shipped legacy
         // per-generation projection after its head and replay were retired.
-        // The runtime
-        // verifies the sealed store's recovered digest against that evidence,
-        // opens the staging engine if it is hibernated, releases, and
-        // re-hibernates. Requiring an installed lease here left every scope a
-        // freshly opened daemon had not activated (only the memory head and
-        // the serving generation are) answering NoVerifiedLease forever,
-        // which is how a multi-gigabyte staging container accumulated fifteen
-        // sealed generations' rows.
-        if database.installed_verified_generation(&locator)?.is_none() {
-            if relational_head.is_some() {
-                let recovered = self.recover_verified_snapshot(
-                    registration.clone(),
-                    authority,
-                    context,
-                    projection,
-                );
-                match recovered {
-                    Ok(snapshot) => drop(snapshot),
-                    // Recovery may quarantine the generation durably on its
-                    // way to this error; a sweep that swallowed it left no
-                    // record at the site that asked for it.
-                    Err(error) => tracing::warn!(
-                        event = "graph_staging_release_recovery_failed",
-                        projection = %locator.projection,
-                        generation = locator.generation.as_str(),
-                        error = %error,
-                        "sealed-row release could not recover the verified head; rows stay retained"
-                    ),
-                }
-            } else if let Some(commit) = database.staging_generation_commit(&locator)? {
-                let identity = GraphGenerationManifestIdentity::new(
-                    locator.projection.clone(),
-                    locator.generation.clone(),
-                    commit.source_generation,
-                    commit.watermark,
-                    Vec::new(),
-                );
-                database.open_sealed_generation_store_if_present(
-                    &identity,
-                    &relational_recovered_digest,
-                )?;
-            } else if database.sealed_generation_reader(&locator).is_none() {
-                // No staging trace and no installed reader: the retired
-                // generation was sealed straight from its manifest, or its
-                // rows were already released. Either way there is nothing
-                // left in the staging database for this sweep to delete.
-                return Ok(SealedStagingRelease::AlreadyReleased);
-            }
-        }
-        if let Some(installed) = database.installed_verified_generation(&locator)? {
-            database.open_installed_sealed_generation_store_if_present(&installed)?;
+        // Release authorizes from that evidence plus the on-disk receipt or a
+        // seated reader already in this process. It does not recover or prove
+        // the sealed generation; that work belongs to activation.
+        if database.installed_verified_generation(&locator)?.is_none()
+            && database.staging_generation_commit(&locator)?.is_none()
+            && database.sealed_generation_reader(&locator).is_none()
+        {
+            // No staging commit means there are no rows for this sweep:
+            // the generation was sealed straight from its manifest, or a
+            // prior release already removed them.
+            return Ok(SealedStagingRelease::AlreadyReleased);
         }
         database.release_sealed_generation_staging_rows_with(
             &locator,
             Some(relational_recovered_digest.as_str()),
+            SealedReleaseReceiptAuthority::Permitted,
             &|| check_all(&registration, context, "generation.release_sealed_staging"),
         )
     }
@@ -1389,8 +1340,8 @@ impl GraphDbRegistry {
     /// nothing is served until the recovered digest matches.
     ///
     /// A supplied manifest carries the native rows already in the caller's
-    /// hands (a sealed code generation's projection, or a semantic-vector
-    /// manifest whose canonical source is metadata-only) so first publication
+    /// hands (a sealed code generation's projection, or a manifest whose
+    /// canonical source is metadata-only) so first publication
     /// does not re-read and re-project the canonical replay source. It is
     /// validated against the journaled replay binding before any row is
     /// applied; a foreign manifest for the same journaled replay conflicts.
@@ -1410,10 +1361,7 @@ impl GraphDbRegistry {
             authority,
             context,
             publication_key,
-            GraphPublishModeV1 {
-                supplied_manifest,
-                reopen_metadata: false,
-            },
+            supplied_manifest,
         )
     }
 
@@ -1441,10 +1389,7 @@ impl GraphDbRegistry {
             authority,
             context,
             publication_key,
-            GraphPublishModeV1 {
-                supplied_manifest,
-                reopen_metadata: false,
-            },
+            supplied_manifest,
         )
     }
 
@@ -1478,36 +1423,7 @@ impl GraphDbRegistry {
         publication_key: &GraphPublicationKeyV1,
     ) -> Result<VerifiedGraphCommit, GraphDbError> {
         let operation = self.registered_operation_with_lease(database)?;
-        self.publish_verified_inner(
-            &operation,
-            authority,
-            context,
-            publication_key,
-            GraphPublishModeV1 {
-                supplied_manifest: None,
-                reopen_metadata: false,
-            },
-        )
-    }
-
-    pub(super) fn publish_ready_staged_generation(
-        &self,
-        registration: GraphDbRegistration,
-        authority: &mut dyn GraphPublicationStoreV1,
-        context: &GraphPublicationOperationContextV1<'_>,
-        publication_key: &GraphPublicationKeyV1,
-    ) -> Result<VerifiedGraphCommit, GraphDbError> {
-        let operation = self.registered_operation(registration)?;
-        self.publish_verified_inner(
-            &operation,
-            authority,
-            context,
-            publication_key,
-            GraphPublishModeV1 {
-                supplied_manifest: None,
-                reopen_metadata: true,
-            },
-        )
+        self.publish_verified_inner(&operation, authority, context, publication_key, None)
     }
 
     #[hotpath::measure(label = "graph_db.generation.publish", impl_type = "GraphDbRegistry")]
@@ -1517,14 +1433,14 @@ impl GraphDbRegistry {
         authority: &mut dyn GraphPublicationStoreV1,
         context: &GraphPublicationOperationContextV1<'_>,
         publication_key: &GraphPublicationKeyV1,
-        mode: GraphPublishModeV1,
+        supplied_manifest: Option<Arc<GraphGenerationManifest>>,
     ) -> Result<VerifiedGraphCommit, GraphDbError> {
         match self.prepare_verified_publication_inner(
             operation,
             authority,
             context,
             publication_key,
-            mode,
+            supplied_manifest,
         )? {
             GraphPublicationPreparationV1::Settled(commit) => Ok(*commit),
             GraphPublicationPreparationV1::Proven(proven) => {
@@ -1549,12 +1465,8 @@ impl GraphDbRegistry {
         authority: &mut dyn GraphPublicationStoreV1,
         context: &GraphPublicationOperationContextV1<'_>,
         publication_key: &GraphPublicationKeyV1,
-        mode: GraphPublishModeV1,
+        supplied_manifest: Option<Arc<GraphGenerationManifest>>,
     ) -> Result<GraphPublicationPreparationV1, GraphDbError> {
-        let GraphPublishModeV1 {
-            supplied_manifest,
-            reopen_metadata,
-        } = mode;
         operation.check(self, context)?;
         operation.require_publication_binding(publication_key)?;
         let database = operation.database().clone();
@@ -1878,6 +1790,7 @@ impl GraphDbRegistry {
                                         database.open_sealed_generation_store_if_present(
                                             &identity,
                                             sealed_digest,
+                                            &check,
                                         )?;
                                         (commit, recovered)
                                     }
@@ -1885,16 +1798,6 @@ impl GraphDbRegistry {
                             }
                         }
                         (false, true) => {
-                            drop(manifest);
-                            database.verify_generation_for_publication(
-                                &identity,
-                                sealed_digest,
-                                row_counts,
-                                true,
-                                &check,
-                            )?
-                        }
-                        (false, false) if reopen_metadata => {
                             drop(manifest);
                             database.verify_generation_for_publication(
                                 &identity,
@@ -1978,8 +1881,8 @@ impl GraphDbRegistry {
         let row_counts = (entity_rows, relation_rows);
         let verified = match (apply_native, has_supplied_manifest) {
             // A supplied manifest for a metadata-only replay carries the
-            // native rows (vectors) the canonical source omits; a first
-            // commit must install them natively before verification.
+            // native rows the canonical source omits; a first commit must
+            // install them natively before verification.
             //
             // Staging consumes the manifest and releases its bulk rows at the
             // last durable page commit, so the artifact proof below runs
@@ -2019,16 +1922,6 @@ impl GraphDbRegistry {
                     }
                     Err(error) => Err(error),
                 }
-            }
-            (false, false) if reopen_metadata => {
-                drop(manifest);
-                database.verify_generation_for_publication(
-                    &identity,
-                    sealed_digest,
-                    row_counts,
-                    true,
-                    &check,
-                )
             }
             (false, false) => {
                 drop(manifest);
@@ -2550,7 +2443,11 @@ impl GraphDbRegistry {
                     message: "dependency-bearing graph generation lost its staging rows; republish from the canonical manifest".to_owned(),
                 });
             }
-            database.open_sealed_generation_store_if_present(&identity, &head.recovered_digest)?;
+            database.open_sealed_generation_store_if_present(
+                &identity,
+                &head.recovered_digest,
+                &check,
+            )?;
             let sealed = database.sealed_generation_reader(&locator).ok_or_else(|| {
                 GraphDbError::ResetRequired {
                     message: "graph generation has neither a complete staged row set nor a usable sealed artifact; republish from the canonical manifest".to_owned(),
@@ -2601,7 +2498,11 @@ impl GraphDbRegistry {
         // Recovery adopts a matching sealed compact artifact from disk when
         // one exists; anything stale or unreadable is discarded and reads
         // stay on the staging rows just verified above.
-        database.open_sealed_generation_store_if_present(&identity, &head.recovered_digest)?;
+        database.open_sealed_generation_store_if_present(
+            &identity,
+            &head.recovered_digest,
+            &check,
+        )?;
         let lease = generation_lease(&identity, head, dependencies);
         database.remember_verified_generation(&lease)?;
         visiting.remove(&locator);

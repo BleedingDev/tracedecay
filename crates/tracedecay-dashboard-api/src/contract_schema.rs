@@ -3,23 +3,27 @@
 use schemars::JsonSchema;
 use schemars::generate::SchemaSettings;
 use tracedecay_api::read_model::multi_root::{MultiRootCapabilityV1, MultiRootQueryReadModelV1};
+use tracedecay_contracts::feedback::{
+    FeedbackProximityReadRequestV1, FeedbackProximityReadResultV1,
+};
 use tracedecay_contracts::retained_surfaces::{
     AutomationRunProblemV1, AutomationRunResultV1, FactStoreCurateRequestV1,
 };
+use tracedecay_contracts::retrieval::SimilarResultV1;
 use tracedecay_contracts::{
-    AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1, AdmitWorkPlacementCommand,
-    AdmitWorkSynthesisCommand, AuthorizedScopeSet, CancelWorkAttemptCommand, CostsReadModelV1,
-    CreateWorkTaskRequestV1, DecideWorkProposalRequestV1, ExecutionTopologyMetricsRequestV1,
-    ExecutionTopologyMetricsV1, ExecutionTopologyViewV1, GenerateProposalRequest,
-    GeneratedWorkProposal, ListTaskHandoffsRequestV1, ListTaskHandoffsResultV1,
-    MultiRootExecuteRequestV1, MultiRootScopeSetCasRequestV1, MultiRootScopeSetCasResultV1,
-    MultiRootScopeSetReadRequestV1, ObservatoryReadModelV1, PauseWorkRunCommand,
-    PrepareWorkDuplicateAdjudicationRequestV1, PrepareWorkProductMutationRequestV1,
-    ReleaseWorkPlacementCommand, ResumeWorkAttemptsCommand, ResumeWorkRunCommand,
-    RetryWorkAttemptCommandV1, StartWorkAttemptCommand, WorkArtifactHydrationRequestV1,
-    WorkArtifactHydrationV1, WorkAttemptListRequestV1, WorkAttemptListV1,
-    WorkAttemptRecoveryReportV1, WorkAttemptStatusRequestV1,
-    WorkDuplicateAdjudicationAppendOutcomeV1, WorkEvidenceRetrievalV1,
+    AcceptWorkProposalRequestV1, AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1,
+    AdmitWorkPlacementCommand, AdmitWorkSynthesisCommand, AdmittedWorkExecutionV1,
+    AuthorizedScopeSet, CancelWorkAttemptCommand, CostsReadModelV1, CreateWorkTaskRequestV1,
+    ExecutionTopologyMetricsRequestV1, ExecutionTopologyMetricsV1, ExecutionTopologyViewV1,
+    GenerateProposalRequest, GeneratedWorkProposal, ListTaskHandoffsRequestV1,
+    ListTaskHandoffsResultV1, MultiRootExecuteRequestV1, MultiRootScopeSetCasRequestV1,
+    MultiRootScopeSetCasResultV1, MultiRootScopeSetReadRequestV1, ObservatoryReadModelV1,
+    PauseWorkRunCommand, PrepareWorkDuplicateAdjudicationRequestV1,
+    PrepareWorkProductMutationRequestV1, ReleaseWorkPlacementCommand, ResumeWorkAttemptsCommand,
+    ResumeWorkRunCommand, RetryWorkAttemptCommandV1, ReviewWorkProposalRequestV1,
+    StartWorkAttemptCommand, WorkArtifactHydrationRequestV1, WorkArtifactHydrationV1,
+    WorkAttemptListRequestV1, WorkAttemptListV1, WorkAttemptRecoveryReportV1,
+    WorkAttemptStatusRequestV1, WorkDuplicateAdjudicationAppendOutcomeV1, WorkEvidenceRetrievalV1,
     WorkEvidenceRetrieveRequestV1, WorkExecutionHistoryV1, WorkExperienceRequestV1,
     WorkExperienceV1, WorkGraphReadRequestV1, WorkGraphReadV1, WorkLeakAdjudicationOutcomeV1,
     WorkPlacementPreflightRequestV1, WorkPlacementReadingV1, WorkPlacementStatusRequestV1,
@@ -41,8 +45,8 @@ use super::analytics_api::{
     AnalyticsUsageSummaryV1,
 };
 use super::automation_scheduler_api::AutomationSchedulerStatusV1;
-use super::code_index_freshness_api::CodeIndexFreshnessPayloadV1;
-use super::delivery_api::DeliveryOverviewV1;
+use super::code_read_api::RevisionPairUnionLayoutV1;
+use super::delivery_api::{DeliveryInboxV1, DeliveryOverviewV1};
 use super::doctor_findings_api::DoctorFindingsPayloadV1;
 use super::explorer_api::{ExplorerQueryRunV1, ExplorerReadContextV1, ExplorerSessionSizeV1};
 use super::graph_service::{
@@ -71,6 +75,7 @@ use super::storage_findings_api::StorageFindingsPayloadV1;
 use super::storage_telemetry_api::StorageTelemetryPayloadV1;
 use super::work_api::registered_route_contracts as registered_work_route_contracts;
 use crate::application::feedback::observations::FeedbackObservationReadModelV1;
+use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessPayloadV1;
 
 #[derive(JsonSchema)]
 #[allow(dead_code)]
@@ -91,6 +96,8 @@ struct DashboardContractCatalogV1 {
     graph_neighbors: DashboardEnvelopeV1<Option<GraphNeighborsPayloadV1>>,
     graph_subgraph: DashboardEnvelopeV1<Option<GraphSubgraphPayloadV1>>,
     graph_path: DashboardEnvelopeV1<Option<GraphPathPayloadV1>>,
+    shared_code_family: DashboardEnvelopeV1<Option<SimilarResultV1>>,
+    revision_pair_union_layout: DashboardEnvelopeV1<Option<RevisionPairUnionLayoutV1>>,
     memory_overview: DashboardEnvelopeV1<Option<MemoryOverviewPayloadV1>>,
     memory_status: DashboardEnvelopeV1<Option<MemoryStatusPayloadV1>>,
     memory_fact_detail: DashboardEnvelopeV1<Option<MemoryFactDetailPayloadV1>>,
@@ -114,8 +121,11 @@ struct DashboardContractCatalogV1 {
     lcm_overview: DashboardEnvelopeV1<Option<LcmOverviewPayloadV1>>,
     lcm_search: DashboardEnvelopeV1<Option<LcmSearchPayloadV1>>,
     loom_temporal: LoomTemporalPayloadV1,
+    delivery_inbox: DeliveryInboxV1,
     delivery_overview: DeliveryOverviewV1,
     feedback_status: DashboardEnvelopeV1<FeedbackObservationReadModelV1>,
+    feedback_proximity_request: FeedbackProximityReadRequestV1,
+    feedback_proximity: FeedbackProximityReadResultV1,
     code_index_freshness: CodeIndexFreshnessPayloadV1,
     settings: SettingsPayloadV1,
     settings_project_patch: ProjectSettingsPatch,
@@ -131,8 +141,10 @@ struct DashboardContractCatalogV1 {
     work_generate_proposal_request: GenerateProposalRequest,
     work_generated_proposal: GeneratedWorkProposal,
     work_create_task_request: CreateWorkTaskRequestV1,
-    work_decide_proposal_request: DecideWorkProposalRequestV1,
+    work_review_proposal_request: ReviewWorkProposalRequestV1,
+    work_accept_proposal_request: AcceptWorkProposalRequestV1,
     work_admit_execution_request: AdmitWorkExecutionRequestV1,
+    work_admitted_execution: AdmittedWorkExecutionV1,
     work_start_attempt_command: StartWorkAttemptCommand,
     work_admit_synthesis_command: AdmitWorkSynthesisCommand,
     work_synthesis_attempt: WorkSynthesisAttemptV1,
@@ -351,13 +363,18 @@ mod tests {
             ("work_generated_proposal", "GeneratedWorkProposal"),
             ("work_create_task_request", "CreateWorkTaskRequestV1"),
             (
-                "work_decide_proposal_request",
-                "DecideWorkProposalRequestV1",
+                "work_review_proposal_request",
+                "ReviewWorkProposalRequestV1",
+            ),
+            (
+                "work_accept_proposal_request",
+                "AcceptWorkProposalRequestV1",
             ),
             (
                 "work_admit_execution_request",
                 "AdmitWorkExecutionRequestV1",
             ),
+            ("work_admitted_execution", "AdmittedWorkExecutionV1"),
             ("work_start_attempt_command", "StartWorkAttemptCommand"),
             ("work_admit_synthesis_command", "AdmitWorkSynthesisCommand"),
             ("work_synthesis_attempt", "WorkSynthesisAttemptV1"),
@@ -567,9 +584,34 @@ mod tests {
             "LcmMessageV1",
             "LcmSummaryNodeV1",
             "LoomTemporalPayloadV1",
+            "DeliveryInboxV1",
             "DeliveryOverviewV1",
             "ExplorerSessionSizeV1",
             "ExplorerReadContextV1",
+        ] {
+            assert!(
+                definitions.contains_key(response),
+                "dashboard response {response} is absent from the contract catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn code_family_and_revision_pair_routes_are_contracted() {
+        let schema: serde_json::Value = serde_json::from_str(
+            &render_dashboard_contract_schema().expect("render validated dashboard contracts"),
+        )
+        .expect("parse dashboard contract schema");
+        let definitions = schema["$defs"]
+            .as_object()
+            .expect("dashboard contracts expose schema definitions");
+
+        for response in [
+            "SimilarResultV1",
+            "SimilarFamilyV1",
+            "RevisionPairUnionLayoutV1",
+            "RevisionPairFileRegionV1",
+            "RevisionPairSymbolRegionV1",
         ] {
             assert!(
                 definitions.contains_key(response),

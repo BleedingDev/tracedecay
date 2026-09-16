@@ -10,8 +10,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::RequestContext;
 use tracedecay_domain::{
-    ActorId, HydrationStateV1, ProjectId, RetrievalGrainV1, SessionId, TemporalCoverageCountsV1,
-    TemporalModeV1,
+    ActorId, ContextOmissionReasonV1, HydrationStateV1, ProjectId, RetrievalGrainV1, SessionId,
+    TemporalCoverageCountsV1, TemporalModeV1,
 };
 use tracedecay_session_memory::context::{
     BranchId, ProfileId, ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
@@ -36,7 +36,7 @@ use tracedecay_sessions::runtime::SessionMessageSearchResult;
 use tracedecay_temporal_query::context::{ContextError, TokenPolicy, VersionedTokenEstimator};
 use tracedecay_temporal_query::hydration::HydrationError;
 use tracedecay_temporal_query::ports::{
-    ExecutionLimits, TemporalExecutionSnapshot, TemporalPortError,
+    ExecutionLimits, TemporalCandidatePopulationCount, TemporalExecutionSnapshot, TemporalPortError,
 };
 use tracedecay_temporal_query::ranking::RankedCandidate;
 use tracedecay_temporal_query::{
@@ -101,10 +101,10 @@ pub use admitted::{
 pub use contract::{
     LcmDescribeServiceCommand, LcmDescribeServiceFuture, LcmDescribeServiceOutcome,
     LcmExpandServiceCommand, LcmExpandServiceFuture, LcmExpandServiceOutcome,
-    SessionRetrievalCommand, SessionRetrievalExplanationView, SessionRetrievalFilters,
-    SessionRetrievalOmissionView, SessionRetrievalPageView, SessionRetrievalServiceOutcome,
-    SessionRetrievalStoreScope, SessionRetrievalUnavailable, SessionRetrievalUnavailableReason,
-    SessionTemporalMetadataView, SessionTemporalWatermarksView,
+    SessionRetrievalCommand, SessionRetrievalCoverageOmissionView, SessionRetrievalExplanationView,
+    SessionRetrievalFilters, SessionRetrievalOmissionView, SessionRetrievalPageView,
+    SessionRetrievalServiceOutcome, SessionRetrievalStoreScope, SessionRetrievalUnavailable,
+    SessionRetrievalUnavailableReason, SessionTemporalMetadataView, SessionTemporalWatermarksView,
 };
 pub use primitive::DaemonSessionLookupPrimitiveV1;
 
@@ -283,7 +283,10 @@ impl DaemonSessionRetrievalRoot {
                     && scope.store_id == store.store.store_id
                     && scope.store_id == serving.store_id.as_str()
                     && scope.graph_scope_id == serving.root_id.as_str()
-                    && profile_root.join(&scope.db_relpath) == serving.serving_db
+                    && tracedecay_runtime_core::path_safety::same_canonical_path(
+                        &profile_root.join(&scope.db_relpath),
+                        &serving.serving_db,
+                    )
                 {
                     if selected.is_some() {
                         return None;
@@ -633,8 +636,8 @@ impl DaemonSessionRetrievalService {
                 observed,
                 maximum,
             },
-            SessionRetrievalOutcome::BudgetExhausted { stage } => {
-                SessionRetrievalServiceOutcome::BudgetExhausted { stage }
+            SessionRetrievalOutcome::BudgetExhausted { stage, accounting } => {
+                SessionRetrievalServiceOutcome::BudgetExhausted { stage, accounting }
             }
             SessionRetrievalOutcome::TimedOut => SessionRetrievalServiceOutcome::TimedOut,
             SessionRetrievalOutcome::Cancelled => SessionRetrievalServiceOutcome::Cancelled,
@@ -663,14 +666,22 @@ impl DaemonSessionRetrievalService {
                     store_scope: self.root.store_scope,
                 }
             }
-            SessionTemporalExecutionError::BudgetExhausted => {
-                SessionRetrievalServiceOutcome::BudgetExhausted {
-                    stage: tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
-                }
+            SessionTemporalExecutionError::BudgetExhausted { stage, accounting } => {
+                SessionRetrievalServiceOutcome::BudgetExhausted { stage, accounting }
             }
             SessionTemporalExecutionError::Cancelled => SessionRetrievalServiceOutcome::Cancelled,
+            SessionTemporalExecutionError::DeadlineExceeded => {
+                SessionRetrievalServiceOutcome::TimedOut
+            }
             SessionTemporalExecutionError::Kernel(error) if temporal_kernel_deadline(&error) => {
                 SessionRetrievalServiceOutcome::TimedOut
+            }
+            SessionTemporalExecutionError::Storage { .. } => {
+                SessionRetrievalServiceOutcome::Unavailable(
+                    SessionRetrievalUnavailable::without_worker(
+                        SessionRetrievalUnavailableReason::TemporalStoreReadFailed,
+                    ),
+                )
             }
             SessionTemporalExecutionError::Stale { generation_lag } => {
                 SessionRetrievalServiceOutcome::Stale {
@@ -704,6 +715,7 @@ impl DaemonSessionRetrievalService {
         let mut anchors = Vec::new();
         let mut explanations = Vec::new();
         let mut omissions = Vec::new();
+        let mut coverage_omissions = Vec::new();
         let mut coverage = TemporalCoverageCountsV1::default();
         let mut source_coverage = Vec::new();
         let mut watermarks = SessionTemporalWatermarksView::default();
@@ -723,6 +735,13 @@ impl DaemonSessionRetrievalService {
             coverage.hidden = coverage.hidden.saturating_add(item.coverage.hidden);
             coverage.unknown = coverage.unknown.saturating_add(item.coverage.unknown);
             coverage.redacted = coverage.redacted.saturating_add(item.coverage.redacted);
+            if let Some(strict_population) = root_continuation_population(item) {
+                coverage_omissions.push(
+                    SessionRetrievalCoverageOmissionView::RootContinuationUnavailable {
+                        strict_population,
+                    },
+                );
+            }
             if let Ok(receipt) = item.snapshot.source_coverage() {
                 source_coverage.extend(receipt.sources().iter().cloned());
             }
@@ -814,6 +833,7 @@ impl DaemonSessionRetrievalService {
                     cursor,
                     explanations,
                     omissions,
+                    coverage_omissions,
                     authorized_root: self.root.authorized_root.clone(),
                 },
             },
@@ -972,6 +992,20 @@ impl<'a> SessionPageReconstructionInputs<'a> {
     fn into_requests(self) -> Vec<SessionPageReconstructionRequest<'a>> {
         self.requests
     }
+}
+
+fn root_continuation_population(
+    item: &TemporalKernelResult,
+) -> Option<TemporalCandidatePopulationCount> {
+    if !item.context.bundle.omissions.iter().any(|omission| {
+        omission.anchor_id.is_none()
+            && omission.reason == ContextOmissionReasonV1::RootContinuationUnavailable
+    }) {
+        return None;
+    }
+    item.snapshot
+        .prepared_candidate_cohort()
+        .and_then(|cohort| cohort.strict_population())
 }
 
 fn reconstruction_or_omission(

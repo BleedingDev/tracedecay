@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use roaring::RoaringBitmap;
 use sha2::{Digest, Sha256};
+use tracedecay_code_index::clones::{
+    CloneExactKeyV1, CloneFingerprintPositionV1, CloneNormalizationClassV1, CodeIndexCloneBodyV1,
+};
 use tracedecay_code_index::production::{CodeIndexExecutionControlV1, VerifiedSealedLexicalPageV1};
 use tracedecay_domain::{ExactFieldV1, ManifestDigest};
 
 use super::super::{
     CodeLexicalProjectionMetadataV1, ProjectedChunkV1, canonical_projected_exact_term,
-    exact_field_for_kind,
+    exact_field_for_kind, normalized_search_text,
 };
 use super::format::{
     ArtifactRowV1, BASE_SECTION_NAMES, PageBaseSectionReceiptBuilderV1, encode_exact_field,
@@ -37,6 +40,7 @@ pub struct PreparedCodeLexicalArtifactPageV1 {
     pub(super) previous_cursor: Option<Vec<u8>>,
     pub(super) next_cursor: Vec<u8>,
     pub(super) imports: Vec<PreparedImportV1>,
+    pub(super) clone_bodies: Vec<PreparedCloneBodyV1>,
     pub(super) documents: Vec<PreparedDocumentV1>,
     pub(super) ngram_shards: Vec<PreparedNgramShardV1>,
     pub(super) ngram_digest: ManifestDigest,
@@ -100,6 +104,28 @@ impl PreparedCodeLexicalArtifactPageV1 {
 pub(super) struct PreparedImportV1 {
     pub(super) canonical: Vec<u8>,
     pub(super) integrity_digest: ManifestDigest,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedCloneBodyV1 {
+    pub(super) payload_digest: String,
+    pub(super) payload: Vec<u8>,
+    pub(super) occurrence: Vec<u8>,
+    pub(super) symbol_occurrence_id: String,
+    pub(super) path: String,
+    pub(super) body_start: u64,
+    pub(super) body_end: u64,
+    pub(super) exact_keys: Vec<CloneExactKeyV1>,
+    pub(super) fingerprint_stream: Option<PreparedCloneFingerprintStreamV1>,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedCloneFingerprintStreamV1 {
+    pub(super) language: String,
+    pub(super) class: CloneNormalizationClassV1,
+    pub(super) normalization_revision: u16,
+    pub(super) body_digest: String,
+    pub(super) positions: Vec<CloneFingerprintPositionV1>,
 }
 
 #[derive(Debug)]
@@ -213,6 +239,11 @@ pub(super) fn prepare_page(
             integrity_digest,
         });
     }
+    let mut clone_bodies = Vec::with_capacity(page.clone_bodies().len());
+    for body in page.clone_bodies() {
+        checkpoint(control)?;
+        clone_bodies.push(prepare_clone_body(layout, body)?);
+    }
     let next_cursor = page
         .next_cursor()
         .persisted_bytes()
@@ -273,6 +304,7 @@ pub(super) fn prepare_page(
         previous_cursor,
         next_cursor,
         imports,
+        clone_bodies,
         documents,
         ngram_shards,
         ngram_digest,
@@ -290,6 +322,44 @@ pub(super) fn prepare_page(
         prepared.estimated_write_bytes,
     ) = estimated_sqlite_writes(&prepared)?;
     Ok(prepared)
+}
+
+fn prepare_clone_body(
+    layout: LexicalArtifactLayoutV1,
+    body: &CodeIndexCloneBodyV1,
+) -> Result<PreparedCloneBodyV1, CodeLexicalArtifactErrorV1> {
+    let fingerprint_stream = if layout.has_clone_fingerprints() {
+        body.payload
+            .fingerprint_stream(body.occurrence.eligibility)
+            .map(|stream| {
+                Ok(PreparedCloneFingerprintStreamV1 {
+                    language: body.payload.language.clone(),
+                    class: stream.class,
+                    normalization_revision: stream.normalization_revision,
+                    body_digest: body.payload.body_digest.as_str().to_owned(),
+                    positions: body
+                        .payload
+                        .fingerprint_positions(body.occurrence.eligibility)
+                        .map_err(CodeLexicalArtifactErrorV1::Contract)?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(PreparedCloneBodyV1 {
+        payload_digest: body.payload.payload_digest.as_str().to_owned(),
+        payload: serde_json::to_vec(&body.payload)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?,
+        occurrence: serde_json::to_vec(&body.occurrence)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?,
+        symbol_occurrence_id: body.occurrence.symbol_occurrence_id.as_str().to_owned(),
+        path: body.occurrence.path.clone(),
+        body_start: body.occurrence.body_span.start_byte,
+        body_end: body.occurrence.body_span.end_byte,
+        exact_keys: body.payload.exact_keys(body.occurrence.eligibility),
+        fingerprint_stream,
+    })
 }
 
 fn prepare_base_sections_receipt(
@@ -452,7 +522,8 @@ fn prepare_document(
         ));
     }
 
-    let mut ngram_postings = document_ngrams(row.normalized_text.as_bytes(), control)?
+    let search_text = normalized_search_text(&row);
+    let mut ngram_postings = document_ngrams(search_text.as_bytes(), control)?
         .into_iter()
         .map(|ngram| (NGRAM_NORMALIZED, i64::from(ngram)))
         .collect::<Vec<_>>();
@@ -599,6 +670,7 @@ fn integrity_digest(hasher: Sha256) -> Result<ManifestDigest, CodeLexicalArtifac
 fn prepared_retained_bytes(
     page: &PreparedCodeLexicalArtifactPageV1,
 ) -> Result<usize, CodeLexicalArtifactErrorV1> {
+    let clone_body_bytes = prepared_clone_body_retained_bytes(&page.clone_bodies)?;
     let mut bytes = page
         .page_digest
         .as_str()
@@ -614,6 +686,7 @@ fn prepared_retained_bytes(
                     .saturating_mul(std::mem::size_of::<PreparedImportV1>()),
             )
         })
+        .and_then(|bytes| bytes.checked_add(clone_body_bytes))
         .and_then(|bytes| {
             bytes.checked_add(
                 page.documents
@@ -691,6 +764,50 @@ fn prepared_retained_bytes(
     Ok(bytes)
 }
 
+fn prepared_clone_body_retained_bytes(
+    bodies: &[PreparedCloneBodyV1],
+) -> Result<usize, CodeLexicalArtifactErrorV1> {
+    bodies
+        .iter()
+        .try_fold(std::mem::size_of_val(bodies), |bytes, body| {
+            bytes
+                .checked_add(body.payload_digest.capacity())
+                .and_then(|bytes| bytes.checked_add(body.payload.capacity()))
+                .and_then(|bytes| bytes.checked_add(body.occurrence.capacity()))
+                .and_then(|bytes| bytes.checked_add(body.symbol_occurrence_id.capacity()))
+                .and_then(|bytes| bytes.checked_add(body.path.capacity()))
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        body.exact_keys
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<CloneExactKeyV1>()),
+                    )
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        body.exact_keys
+                            .iter()
+                            .map(|key| key.digest.as_str().len())
+                            .sum::<usize>(),
+                    )
+                })
+                .and_then(|bytes| match &body.fingerprint_stream {
+                    Some(stream) => {
+                        bytes
+                            .checked_add(stream.language.capacity())
+                            .and_then(|bytes| bytes.checked_add(stream.body_digest.capacity()))
+                            .and_then(|bytes| {
+                                bytes.checked_add(stream.positions.capacity().saturating_mul(
+                                    std::mem::size_of::<CloneFingerprintPositionV1>(),
+                                ))
+                            })
+                    }
+                    None => Some(bytes),
+                })
+                .ok_or_else(prepared_charge_overflow)
+        })
+}
+
 fn estimated_sqlite_writes(
     page: &PreparedCodeLexicalArtifactPageV1,
 ) -> Result<(usize, usize), CodeLexicalArtifactErrorV1> {
@@ -710,6 +827,13 @@ fn estimated_sqlite_writes(
             .and_then(|bytes| bytes.checked_add(import.integrity_digest.as_str().len()))
             .ok_or_else(prepared_write_overflow)?;
     }
+    let (clone_rows, clone_bytes) = estimated_clone_body_writes(&page.clone_bodies)?;
+    rows = rows
+        .checked_add(clone_rows)
+        .ok_or_else(prepared_write_overflow)?;
+    bytes = bytes
+        .checked_add(clone_bytes)
+        .ok_or_else(prepared_write_overflow)?;
     for document in &page.documents {
         rows = rows.checked_add(2).ok_or_else(prepared_write_overflow)?;
         bytes = bytes
@@ -752,6 +876,53 @@ fn estimated_sqlite_writes(
             .ok_or_else(prepared_write_overflow)?;
     }
     Ok((rows, bytes))
+}
+
+fn estimated_clone_body_writes(
+    bodies: &[PreparedCloneBodyV1],
+) -> Result<(usize, usize), CodeLexicalArtifactErrorV1> {
+    bodies
+        .iter()
+        .try_fold((0usize, 0usize), |(rows, bytes), body| {
+            let rows = rows
+                .checked_add(
+                    2usize.saturating_add(body.exact_keys.len()).saturating_add(
+                        body.fingerprint_stream
+                            .as_ref()
+                            .map_or(0, |stream| stream.positions.len()),
+                    ),
+                )
+                .ok_or_else(prepared_write_overflow)?;
+            let bytes = bytes
+                .checked_add(body.payload_digest.len().saturating_mul(2))
+                .and_then(|bytes| bytes.checked_add(body.payload.len()))
+                .and_then(|bytes| bytes.checked_add(body.occurrence.len()))
+                .and_then(|bytes| bytes.checked_add(body.symbol_occurrence_id.len()))
+                .and_then(|bytes| bytes.checked_add(body.path.len()))
+                .and_then(|bytes| {
+                    bytes.checked_add(body.exact_keys.iter().fold(0usize, |total, key| {
+                        total
+                            .saturating_add(key.digest.as_str().len())
+                            .saturating_add(16)
+                    }))
+                })
+                .and_then(|bytes| match &body.fingerprint_stream {
+                    Some(stream) => bytes.checked_add(
+                        stream.positions.len().saturating_mul(
+                            stream
+                                .language
+                                .len()
+                                .saturating_add(stream.body_digest.len())
+                                .saturating_add(body.symbol_occurrence_id.len())
+                                .saturating_add(body.payload_digest.len())
+                                .saturating_add(32),
+                        ),
+                    ),
+                    None => Some(bytes),
+                })
+                .ok_or_else(prepared_write_overflow)?;
+            Ok((rows, bytes))
+        })
 }
 
 fn estimated_source_page_receipt_write_bytes(

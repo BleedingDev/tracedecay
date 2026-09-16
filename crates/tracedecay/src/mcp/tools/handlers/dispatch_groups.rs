@@ -1,42 +1,36 @@
 use serde_json::Value;
-use tracedecay_code_index::intake::content_digest;
-use tracedecay_contracts::retrieval::{CallableCodeOperationKind, callable_code_operation};
 use tracedecay_contracts::{
     ApplicationOperation, ApplicationProblem, ResultContractRef, RetainedSurfaceOperation,
 };
 use tracedecay_graph_query::VerifiedGraphQueryRequest;
-use tracedecay_privacy::{CodeSourceShapeV1, sanitize_code_source_bytes};
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_daemon_protocol::InvocationCancellationPolicy;
 use tracedecay_daemon_service::application_surface::resolve_catalog_tool_binding;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 
-use tracedecay_contracts::doctor::SemanticOwnerStateV1;
+use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader;
 use tracedecay_dashboard_api::AdmittedDoctorReportV1;
-use tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader;
 use tracedecay_mcp::handlers::analysis as portable_analysis;
-use tracedecay_mcp::handlers::ast_grep as portable_ast_grep;
 use tracedecay_mcp::handlers::git;
 use tracedecay_mcp::handlers::graph as portable_graph;
-use tracedecay_mcp::handlers::grep as portable_grep;
 use tracedecay_mcp::handlers::info as portable_info;
+use tracedecay_mcp::handlers::{
+    VerifiedGraphOpenFuture, unknown_tool_error, verified_read_operation,
+};
 use tracedecay_mcp::{
     AdmittedCodeIndex, McpAdmittedProjectV1, McpDoctorReportV1, McpProjectIdentityV1,
-    McpRequestAuthoritiesV1, McpSemanticOwnerV1, McpToolBinding, McpToolContext, RequestControls,
-    ToolResult,
+    McpRequestAuthoritiesV1, McpToolBinding, McpToolContext, RequestControls, ToolResult,
 };
-use tracedecay_session_memory::runtime_telemetry::GenerationCensusSnapshot;
+use tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot;
 
 use super::ToolCallRegistryOptions;
-use super::support::effective_path;
 use super::tool_call_support::handle_retrieve;
-use super::unknown_tool_error;
-use super::{
-    admin_cli, admin_project, application_surface, automation_runs, dashboard, dispatch_controls,
-    edit, hook_runtime, info, skills, workflow,
+use super::{application_surface, dashboard, dispatch_controls, info};
+use tracedecay_mcp::handlers::{
+    admin_cli, admin_project, automation_runs, edit, hook_runtime, skills, workflow,
 };
 
 mod health_dispatch;
@@ -53,150 +47,28 @@ fn graph_read_unavailable(detail: &str) -> TraceDecayError {
     }
 }
 
-const DOC_COVERAGE_SYMBOL_BUDGET: usize = 500_000;
-
-fn doc_coverage_unavailable(detail: impl Into<String>) -> TraceDecayError {
-    TraceDecayError::project_route("verified-doc-coverage-unavailable", false, detail.into())
-}
-
-fn admitted_doc_source(project_root: &std::path::Path, path: &str) -> Result<Vec<u8>> {
-    let raw = std::fs::read(project_root.join(path)).map_err(|error| {
-        doc_coverage_unavailable(format!(
-            "verified documentation source `{path}` could not be read: {error}"
-        ))
-    })?;
-    let shape = match path.rsplit('.').next() {
-        Some("json" | "toml" | "yaml" | "yml") => CodeSourceShapeV1::StructuredData,
-        _ => CodeSourceShapeV1::CodeOrProse,
-    };
-    let sanitized = sanitize_code_source_bytes(&raw, shape).map_err(|error| {
-        doc_coverage_unavailable(format!(
-            "verified documentation source `{path}` could not be admitted through the code sanitizer: {error}"
-        ))
-    })?;
-    Ok(sanitized.into_parts().0)
-}
-
-fn verify_doc_coverage_sources_current(
-    cg: &TraceDecay,
-    graph: &tracedecay_graph_query::VerifiedGraphQuery,
-    args: &Value,
-    scope_prefix: Option<&str>,
-) -> Result<()> {
-    let path_prefix = effective_path(args, scope_prefix);
-    let page = graph.symbols_page(None, DOC_COVERAGE_SYMBOL_BUDGET)?;
-    if page.has_more {
-        return Err(doc_coverage_unavailable(
-            "verified documentation census exceeded its declared symbol budget",
-        ));
-    }
-    let mut candidates = Vec::new();
-    for symbol in page.symbols {
-        let metadata = symbol.metadata.as_ref().ok_or_else(|| {
-            doc_coverage_unavailable(format!(
-                "symbol {} has no admitted documentation metadata",
-                symbol.occurrence.as_str()
-            ))
-        })?;
-        let path = symbol
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.logical_path.as_deref())
-            .ok_or_else(|| {
-                doc_coverage_unavailable(format!(
-                    "symbol {} has no admitted logical file binding",
-                    symbol.occurrence.as_str()
-                ))
-            })?;
-        if metadata.visibility == "public"
-            && portable_analysis::is_documentable_kind(&metadata.kind)
-            && tracedecay_runtime_core::path_scope::path_matches_scope(path, path_prefix)
-        {
-            candidates.push(symbol);
-        }
-    }
-    candidates.sort_by(|left, right| {
-        left.binding
-            .as_ref()
-            .and_then(|binding| binding.logical_path.as_deref())
-            .cmp(
-                &right
-                    .binding
-                    .as_ref()
-                    .and_then(|binding| binding.logical_path.as_deref()),
-            )
-            .then_with(|| left.occurrence.cmp(&right.occurrence))
-    });
-
-    let mut admitted_path = None::<String>;
-    let mut admitted_bytes = Vec::new();
-    for symbol in candidates {
-        let metadata = symbol.metadata.as_ref().ok_or_else(|| {
-            doc_coverage_unavailable("documentation candidate metadata disappeared")
-        })?;
-        let binding = symbol.binding.as_ref().ok_or_else(|| {
-            doc_coverage_unavailable("documentation candidate file binding disappeared")
-        })?;
-        let path = binding.logical_path.as_deref().ok_or_else(|| {
-            doc_coverage_unavailable("documentation candidate logical path disappeared")
-        })?;
-        if admitted_path.as_deref() != Some(path) {
-            admitted_bytes = admitted_doc_source(cg.project_root(), path)?;
-            admitted_path = Some(path.to_owned());
-        }
-        let source_span = binding.source_span.ok_or_else(|| {
-            doc_coverage_unavailable(format!(
-                "public symbol {} has no admitted source span",
-                symbol.occurrence.as_str()
-            ))
-        })?;
-        let start = usize::try_from(source_span.start_byte).map_err(|error| {
-            doc_coverage_unavailable(format!(
-                "public symbol {} source start does not fit this host: {error}",
-                symbol.occurrence.as_str()
-            ))
-        })?;
-        let end = usize::try_from(source_span.end_byte).map_err(|error| {
-            doc_coverage_unavailable(format!(
-                "public symbol {} source end does not fit this host: {error}",
-                symbol.occurrence.as_str()
-            ))
-        })?;
-        let source = admitted_bytes.get(start..end).ok_or_else(|| {
-            doc_coverage_unavailable(format!(
-                "public symbol {} source span is outside `{path}`",
-                symbol.occurrence.as_str()
-            ))
-        })?;
-        if content_digest(source) != metadata.content_digest {
-            return Err(doc_coverage_unavailable(format!(
-                "documentation source for symbol {} no longer matches the admitted graph generation",
-                symbol.occurrence.as_str()
-            )));
-        }
-    }
-    Ok(())
-}
-
 async fn admitted_graph_query(
-    _cg: &TraceDecay,
     options: &ToolCallRegistryOptions<'_>,
     operation_name: &str,
 ) -> Result<tracedecay_graph_query::VerifiedGraphQuery> {
-    let operation =
-        tracedecay_contracts::retrieval::catalog::primitive_read_operation(operation_name)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("invalid graph read operation: {error}"),
-            })?
-            .ok_or_else(|| TraceDecayError::Config {
-                message: format!("unregistered graph read operation: {operation_name}"),
-            })?;
-    admitted_graph_query_for_operation(options, &operation).await
+    admitted_graph_query_for_operation(options, verified_read_operation(operation_name)?).await
+}
+
+/// Lends the root's verified-graph admission funnel to a portable dispatch
+/// table for one tool call. The borrow of `options` is the whole lifetime of
+/// the table's dispatch, so every lazy open it issues reports back through
+/// the same `served_stale_graph_generation` slot.
+fn verified_graph_open<'o>(
+    options: &'o ToolCallRegistryOptions<'_>,
+) -> impl Fn(ApplicationOperation) -> VerifiedGraphOpenFuture<'o> + Sync + 'o {
+    move |operation| -> VerifiedGraphOpenFuture<'o> {
+        Box::pin(admitted_graph_query_for_operation(options, operation))
+    }
 }
 
 async fn admitted_graph_query_for_operation(
     options: &ToolCallRegistryOptions<'_>,
-    operation: &ApplicationOperation,
+    operation: ApplicationOperation,
 ) -> Result<tracedecay_graph_query::VerifiedGraphQuery> {
     let Some(port) = options.verified_graph_query_port.as_deref() else {
         return Err(graph_read_unavailable(
@@ -221,7 +93,7 @@ async fn admitted_graph_query_for_operation(
     // stale generation, never handler work.
     let query = hotpath::future!(
         port.open(VerifiedGraphQueryRequest::new(
-            operation,
+            &operation,
             request_id,
             deadline,
             cancellation,
@@ -248,98 +120,6 @@ async fn admitted_graph_query_for_operation(
     Ok(query)
 }
 
-/// The hard ceiling every MCP tool call is bounded by, regardless of dispatch
-/// group, when admission carried no client deadline.
-///
-/// Principle 6 of `docs/SERVING-PATH-PERFORMANCE.md`: deadlines bound failure,
-/// not work. Before this existed only the git and memory groups were wrapped,
-/// so `dispatch_deadline_horizon_micros` returning `None` for a graph tool meant
-/// `tracedecay_context` dispatched with no bound at all — a live Codex call once
-/// hung for 900 seconds against a daemon grinding a failing publish loop, and
-/// only the client's own timeout ended it. A firing ceiling is always a bug
-/// somewhere above it; the fix is that bug, never a larger ceiling.
-pub(crate) const TOOL_DISPATCH_CEILING: std::time::Duration = std::time::Duration::from_mins(2);
-
-/// The ceiling for the few tools whose *requested work* is itself a long job —
-/// running a test suite, an admin index/sync — rather than an interactive read.
-///
-/// These are still bounded: nothing may run unbounded, and nothing may reach the
-/// 900 seconds that motivated this wrap. They simply cannot share the
-/// interactive ceiling without failing correct, user-requested work.
-pub(crate) const LONG_RUNNING_TOOL_DISPATCH_CEILING: std::time::Duration =
-    std::time::Duration::from_mins(10);
-
-/// Tools whose ceiling is [`LONG_RUNNING_TOOL_DISPATCH_CEILING`].
-///
-/// Deliberately tiny and explicit: membership is a statement that the tool's
-/// duration is the caller's own job, not a serving-path stall. Everything not
-/// listed here — every graph, info, analysis, health, session, and memory read —
-/// inherits [`TOOL_DISPATCH_CEILING`] automatically, so a tool added tomorrow is
-/// bounded without touching this file.
-const LONG_RUNNING_DISPATCH_TOOLS: &[&str] = &[
-    "tracedecay_run_affected_tests",
-    "tracedecay_fact_store_curate",
-    "tracedecay_admin_cli",
-    "tracedecay_admin_project",
-    "tracedecay_admin_sync",
-    "tracedecay_admin_branch_add",
-];
-
-/// The ceiling that applies to `tool_name` in the absence of a shorter carried
-/// deadline.
-pub(crate) fn tool_dispatch_ceiling(tool_name: &str) -> std::time::Duration {
-    if LONG_RUNNING_DISPATCH_TOOLS.contains(&tool_name) {
-        LONG_RUNNING_TOOL_DISPATCH_CEILING
-    } else {
-        TOOL_DISPATCH_CEILING
-    }
-}
-
-/// The bound one tool call dispatches under: the admission-carried client
-/// deadline when it is present and shorter, otherwise the tool's own ceiling.
-///
-/// `None` means the carried deadline has already elapsed, which must be
-/// rejected rather than dispatched — the same rule the git and memory wraps
-/// apply to a non-positive budget.
-pub(crate) fn tool_dispatch_budget(
-    tool_name: &str,
-    deadline: Option<&tracedecay_contracts::Deadline>,
-) -> Option<std::time::Duration> {
-    let ceiling = tool_dispatch_ceiling(tool_name);
-    match deadline {
-        // A carried deadline is preferred whenever it is shorter; the ceiling
-        // still clamps a pathologically distant one so it can never be a way
-        // out of the bound.
-        Some(deadline) => tracedecay_daemon_protocol::deadline_remaining(deadline)
-            .map(|remaining| remaining.min(ceiling)),
-        None => Some(ceiling),
-    }
-}
-
-/// The typed, retryable problem a tool call reports when it exhausts the
-/// universal dispatch ceiling.
-///
-/// Its stable `reason_code`, retryability bit, and human detail let the MCP
-/// boundary surface a structured error instead of holding the transport open.
-/// Retry is safe: the ceiling is a
-/// backstop over work that was already admitted, never a commit signal.
-pub(crate) fn tool_dispatch_deadline_error(
-    tool_name: &str,
-    budget: std::time::Duration,
-) -> TraceDecayError {
-    // A firing ceiling is a defect signal upstream; count every occurrence so
-    // profiling sees the refusals, not only the successful dispatches.
-    hotpath::gauge!("mcp.tool_call.dispatch_deadline_total").inc(1_u64);
-    TraceDecayError::project_route(
-        "tool_dispatch_deadline_exceeded",
-        true,
-        format!(
-            "tool '{tool_name}' exceeded its {}s dispatch ceiling and was cancelled",
-            budget.as_secs()
-        ),
-    )
-}
-
 /// Dispatch code-graph navigation and lookup tools (`tracedecay_search`,
 /// `tracedecay_callers`, ...). Returns `None` when `tool_name` belongs to a
 /// different domain so the caller can try the next dispatch group.
@@ -354,10 +134,6 @@ pub(super) async fn dispatch_graph_tools(
     dispatch_graph_tools_inner(tool_name, cg, args, selected_scope_prefix, options).await
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Graph-tool dispatch is one name match onto the verified graph ports."
-)]
 fn dispatch_graph_tools_inner<'a>(
     tool_name: &'a str,
     cg: &'a TraceDecay,
@@ -373,112 +149,20 @@ fn dispatch_graph_tools_inner<'a>(
         let freshness = graph_freshness_reader(tool_name, &options);
         let ctx = admitted_tool_context(&options, &project, &snapshots, freshness)?;
         match tool_name {
-            "tracedecay_search" => {
-                portable_graph::handle_search(
-                    &ctx,
-                    admitted_graph_query(cg, &options, "code_symbol_search"),
-                    args,
-                    selected_scope_prefix,
-                    options.code_index_ignored_dependency_admission.as_deref(),
-                )
-                .await
-            }
-            "tracedecay_grep" => {
-                let graph = admitted_graph_query(cg, &options, "source_lines").await;
-                portable_grep::handle_grep(
-                    cg.project_root(),
-                    graph.as_ref(),
-                    args,
-                    selected_scope_prefix,
-                    options.application_deadline.clone(),
-                    options.application_cancellation.clone(),
-                )
-                .await
-            }
-            "tracedecay_ast_grep_search" => {
-                portable_ast_grep::handle_ast_grep_search(
-                    cg.project_root(),
-                    args,
-                    selected_scope_prefix,
-                    options.application_deadline.clone(),
-                    options.application_cancellation.clone(),
-                )
-                .await
-            }
+            // Retrieval reads the live `TraceDecay` store directly rather than
+            // a verified graph open, so it stays with the composition root.
             "tracedecay_retrieve" => handle_retrieve(cg, &args).await,
-            "tracedecay_context" => {
-                portable_graph::handle_context(
+            _ => {
+                portable_graph::dispatch_tool(
                     &ctx,
-                    admitted_graph_query(cg, &options, "context"),
-                    args,
-                    selected_scope_prefix,
-                )
-                .await
-            }
-            "tracedecay_callers" => {
-                let graph_query = admitted_graph_query(cg, &options, "code_callers").await?;
-                portable_graph::handle_callers(&graph_query, args).await
-            }
-            "tracedecay_callees" => {
-                let graph_query = admitted_graph_query(cg, &options, "callees").await?;
-                portable_graph::handle_callees(&graph_query, args).await
-            }
-            "tracedecay_impact" => {
-                let graph_query = admitted_graph_query(cg, &options, "impact").await?;
-                portable_graph::handle_impact(&graph_query, args).await
-            }
-            "tracedecay_node" => {
-                let graph_query = admitted_graph_query(cg, &options, "node").await?;
-                portable_graph::handle_node(&graph_query, args).await
-            }
-            "tracedecay_similar" => {
-                let graph_query = admitted_graph_query(cg, &options, "similar").await?;
-                portable_graph::handle_similar(&ctx, &graph_query, args).await
-            }
-            "tracedecay_rename_preview" => {
-                let graph_query = admitted_graph_query(cg, &options, "rename_preview").await?;
-                portable_graph::handle_rename_preview(&ctx, &graph_query, args).await
-            }
-            "tracedecay_implementations" => {
-                let graph_query =
-                    admitted_graph_query(cg, &options, "code_implementations").await?;
-                portable_graph::handle_implementations(&graph_query, args, selected_scope_prefix)
-                    .await
-            }
-            "tracedecay_callers_for" => {
-                let graph_query = admitted_graph_query(cg, &options, "code_callers").await?;
-                portable_graph::handle_callers_for(&graph_query, args).await
-            }
-            "tracedecay_find_exact_symbol" => {
-                let graph_query = admitted_graph_query(cg, &options, "qualified_name").await?;
-                portable_graph::handle_find_exact_symbol(
-                    &ctx,
-                    &graph_query,
+                    &verified_graph_open(&options),
+                    tool_name,
                     args,
                     selected_scope_prefix,
                     options.code_index_ignored_dependency_admission.as_deref(),
                 )
                 .await
             }
-            "tracedecay_by_qualified_name" => {
-                let graph_query = admitted_graph_query(cg, &options, "qualified_name").await?;
-                portable_graph::handle_by_qualified_name(&graph_query, args).await
-            }
-            "tracedecay_signature" => {
-                let graph_query =
-                    admitted_graph_query(cg, &options, "code_signature_search").await?;
-                portable_graph::handle_signature(&graph_query, args).await
-            }
-            "tracedecay_impls" => {
-                let graph_query =
-                    admitted_graph_query(cg, &options, "code_implementations").await?;
-                portable_graph::handle_impls(&graph_query, args).await
-            }
-            "tracedecay_derives" => {
-                let graph_query = admitted_graph_query(cg, &options, "code_type_hierarchy").await?;
-                portable_graph::handle_derives(&graph_query, args).await
-            }
-            _ => Err(unknown_tool_error(tool_name)),
         }
     })
 }
@@ -524,6 +208,10 @@ fn dispatch_info_tools_inner<'a>(
     // Erase the deeply nested match-arm futures before they reach the
     // measured wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
+        // Registry, status, and remote-status reads bind daemon authorities
+        // only the root holds (registry port, status snapshots, remote
+        // status reader, reconcile sink); the graph-backed file inspections
+        // dispatch through the portable table.
         match tool_name {
             "tracedecay_remote_status" => portable_info::handle_remote_status(
                 cg.project_root(),
@@ -532,24 +220,14 @@ fn dispatch_info_tools_inner<'a>(
             ),
             "tracedecay_status" => {
                 let project = admitted_project_authorities(cg, &options)?;
-                let snapshots = admitted_status_snapshots(cg, &options).await;
-                let ctx = admitted_tool_context(
-                    &options,
-                    &project,
-                    &snapshots,
-                    options.code_index_freshness_reader.as_ref(),
-                )?;
+                let snapshots = admitted_status_snapshots(&options).await;
+                let ctx = admitted_tool_context_for(&options, &project, &snapshots)?;
                 portable_info::handle_status(&ctx, args, server_stats, scope_prefix).await
             }
             "tracedecay_active_project" => {
                 let project = admitted_project_authorities(cg, &options)?;
                 let snapshots = AdmittedRequestSnapshotsV1::default();
-                let ctx = admitted_tool_context(
-                    &options,
-                    &project,
-                    &snapshots,
-                    options.code_index_freshness_reader.as_ref(),
-                )?;
+                let ctx = admitted_tool_context_for(&options, &project, &snapshots)?;
                 portable_info::handle_active_project(&ctx, &args, server_stats, scope_prefix).await
             }
             "tracedecay_project_list" => {
@@ -576,56 +254,19 @@ fn dispatch_info_tools_inner<'a>(
                 )
                 .await
             }
-            "tracedecay_files" => {
-                let operation = callable_code_operation(CallableCodeOperationKind::SourceMetadata)
-                    .map_err(|error| TraceDecayError::Config {
-                        message: format!("invalid source metadata operation: {error}"),
-                    })?;
-                let graph = admitted_graph_query_for_operation(&options, &operation).await?;
-                portable_info::handle_files(&graph, args, selected_scope_prefix).await
-            }
             "tracedecay_admin_sync" => {
                 info::handle_admin_sync(cg, args, options.code_index_reconcile_sink.as_ref()).await
             }
-            "tracedecay_port_status" => {
-                let graph = admitted_graph_query(cg, &options, "port_status").await?;
-                portable_info::handle_port_status(&graph, args).await
+            _ => {
+                portable_info::dispatch_tool(
+                    cg.project_root(),
+                    &verified_graph_open(&options),
+                    tool_name,
+                    args,
+                    selected_scope_prefix,
+                )
+                .await
             }
-            "tracedecay_port_order" => {
-                let graph = admitted_graph_query(cg, &options, "port_order").await?;
-                portable_info::handle_port_order(&graph, args).await
-            }
-            "tracedecay_type_hierarchy" => {
-                let graph = admitted_graph_query(cg, &options, "code_type_hierarchy").await?;
-                portable_info::handle_type_hierarchy(&graph, args).await
-            }
-            "tracedecay_body" => {
-                let graph = admitted_graph_query(cg, &options, "source_body").await?;
-                portable_info::handle_body(&graph, args, selected_scope_prefix).await
-            }
-            "tracedecay_todos" => {
-                let graph = admitted_graph_query(cg, &options, "todos").await?;
-                portable_info::handle_todos(&graph, args, scope_prefix).await
-            }
-            "tracedecay_read" => {
-                let operation = match args.get("mode").and_then(Value::as_str).unwrap_or("full") {
-                    "map" => "source_outline",
-                    "signatures" => "code_signature_search",
-                    _ => "source_lines",
-                };
-                let graph = admitted_graph_query(cg, &options, operation).await?;
-                portable_info::handle_read(&graph, args).await
-            }
-            "tracedecay_outline" => {
-                let graph = admitted_graph_query(cg, &options, "source_outline").await?;
-                portable_info::handle_outline(&graph, args).await
-            }
-            "tracedecay_config" => portable_info::handle_config(cg.project_root(), &args).await,
-            "tracedecay_signature_search" => {
-                let graph = admitted_graph_query(cg, &options, "code_signature_search").await?;
-                portable_info::handle_signature_search(&graph, args, selected_scope_prefix).await
-            }
-            _ => Err(unknown_tool_error(tool_name)),
         }
     })
 }
@@ -771,87 +412,17 @@ fn dispatch_analysis_tools_inner<'a>(
     scope_prefix: Option<&'a str>,
     options: ToolCallRegistryOptions<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-    // Erase the deeply nested match-arm futures before they reach the
-    // measured wrapper so every profiling feature can compute its layout.
+    // Erase the portable dispatch future before it reaches the measured
+    // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
-        match tool_name {
-            "tracedecay_dead_code" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_dead_code(&graph, args, scope_prefix).await
-            }
-            "tracedecay_circular" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_circular(&graph, args).await
-            }
-            "tracedecay_hotspots" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_hotspots(&graph, args, scope_prefix).await
-            }
-            // The one analysis tool that opens no graph query: its whole finding is
-            // that the graph and the compiler disagree, so taking the graph's file
-            // set as input would answer the question with the very source that is
-            // under suspicion.
-            "tracedecay_unmounted_files" => {
-                portable_analysis::handle_unmounted_files(cg.project_root(), args, scope_prefix)
-                    .await
-            }
-            "tracedecay_rank" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_rank(&graph, args, scope_prefix).await
-            }
-            "tracedecay_largest" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_largest(&graph, args, scope_prefix).await
-            }
-            "tracedecay_coupling" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_coupling(&graph, args, scope_prefix).await
-            }
-            "tracedecay_inheritance_depth" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_inheritance_depth(&graph, args, scope_prefix).await
-            }
-            "tracedecay_distribution" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_distribution(&graph, args, scope_prefix).await
-            }
-            "tracedecay_recursion" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_recursion(&graph, args, scope_prefix).await
-            }
-            "tracedecay_complexity" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_complexity(&graph, args, scope_prefix).await
-            }
-            "tracedecay_doc_coverage" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                verify_doc_coverage_sources_current(cg, &graph, &args, scope_prefix)?;
-                portable_analysis::handle_doc_coverage(&graph, args, scope_prefix).await
-            }
-            "tracedecay_god_class" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_god_class(&graph, args, scope_prefix).await
-            }
-            "tracedecay_unsafe_patterns" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_unsafe_patterns(
-                    cg.project_root(),
-                    &graph,
-                    args,
-                    scope_prefix,
-                )
-                .await
-            }
-            "tracedecay_constructors" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_constructors(&graph, args, scope_prefix).await
-            }
-            "tracedecay_field_sites" => {
-                let graph = admitted_graph_query(cg, &options, "health_read").await?;
-                portable_analysis::handle_field_sites(&graph, args, scope_prefix).await
-            }
-            _ => Err(unknown_tool_error(tool_name)),
-        }
+        portable_analysis::dispatch_tool(
+            cg.project_root(),
+            &verified_graph_open(&options),
+            tool_name,
+            args,
+            scope_prefix,
+        )
+        .await
     })
 }
 
@@ -873,62 +444,13 @@ fn dispatch_git_tools_inner<'a>(
     args: Value,
     options: ToolCallRegistryOptions<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-    // Erase the deeply nested match-arm futures before they reach the
-    // measured wrapper so every profiling feature can compute its layout.
+    // Erase the portable dispatch future before it reaches the measured
+    // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
-        // Tree walks and revwalks still need a uniform dispatch deadline. Branch
-        // generation reads additionally carry this deadline into their bounded
-        // blocking/ref and daemon-generation executors, so timing out this future
-        // also tells the underlying operation to stop at its next checkpoint.
-        let carried_deadline = options.application_deadline.as_ref();
-        let remaining = carried_deadline.and_then(tracedecay_daemon_protocol::deadline_remaining);
         let project = admitted_project_authorities(cg, &options)?;
         let snapshots = AdmittedRequestSnapshotsV1::default();
         let ctx = admitted_tool_context(&options, &project, &snapshots, None)?;
-
-        let handler = async {
-            match tool_name {
-                "tracedecay_affected" => {
-                    let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
-                    git::handle_affected(&ctx, &graph, args).await
-                }
-                "tracedecay_diff_context" => {
-                    let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
-                    git::handle_diff_context(&ctx, &graph, args).await
-                }
-                "tracedecay_changelog" => git::handle_changelog(&ctx, args).await,
-                "tracedecay_commit_context" => {
-                    let graph = admitted_graph_query(cg, &options, "file_dependents").await?;
-                    git::handle_commit_context(&ctx, &graph, args).await
-                }
-                "tracedecay_pr_context" => {
-                    git::handle_pr_context(
-                        &ctx,
-                        admitted_graph_query(cg, &options, "file_dependents"),
-                        args,
-                    )
-                    .await
-                }
-                "tracedecay_branch_search" => git::handle_branch_search(&ctx, args).await,
-                "tracedecay_branch_diff" => git::handle_branch_diff(&ctx, args).await,
-                "tracedecay_branch_list" => git::handle_branch_list(&ctx, args).await,
-                _ => Err(unknown_tool_error(tool_name)),
-            }
-        };
-
-        match (carried_deadline.is_some(), remaining) {
-            (_, Some(remaining)) => match tokio::time::timeout(remaining, handler).await {
-                Ok(result) => result,
-                Err(_elapsed) => Ok(git::git_dispatch_deadline_result(&ctx, tool_name)),
-            },
-            // `deadline_remaining` yields `None` for a non-positive budget, so a
-            // carried deadline that already elapsed must be rejected rather than
-            // dispatched unbounded.
-            (true, None) => Ok(git::git_dispatch_deadline_result(&ctx, tool_name)),
-            // Standalone / non-admission callers carry no deadline and stay
-            // unbounded.
-            (false, None) => handler.await,
-        }
+        git::dispatch_tool(&ctx, &verified_graph_open(&options), tool_name, args).await
     })
 }
 
@@ -971,14 +493,6 @@ fn admitted_project_authorities(
 }
 
 #[derive(Default)]
-enum SemanticOwnerSnapshotV1 {
-    #[default]
-    NotAttached,
-    AttachedAbsent,
-    Attached(SemanticOwnerStateV1),
-}
-
-#[derive(Default)]
 enum DoctorReportSnapshotV1 {
     #[default]
     NotAttached,
@@ -989,7 +503,6 @@ enum DoctorReportSnapshotV1 {
 #[derive(Default)]
 struct AdmittedRequestSnapshotsV1 {
     generation_census: Option<GenerationCensusSnapshot>,
-    semantic_owner: SemanticOwnerSnapshotV1,
     doctor_report: DoctorReportSnapshotV1,
 }
 
@@ -999,24 +512,6 @@ async fn admitted_generation_census(
     match options.generation_census_reader.as_ref() {
         Some(reader) => Some(reader().await),
         None => None,
-    }
-}
-
-async fn admitted_semantic_owner(
-    cg: &TraceDecay,
-    options: &ToolCallRegistryOptions<'_>,
-) -> SemanticOwnerSnapshotV1 {
-    match options.daemon_invocation_service {
-        Some(service) => {
-            match tracedecay_daemon_service::DaemonSemanticOwnerRuntimeRegistrar::new(service)
-                .state(cg.project_root())
-                .await
-            {
-                Some(state) => SemanticOwnerSnapshotV1::Attached(state),
-                None => SemanticOwnerSnapshotV1::AttachedAbsent,
-            }
-        }
-        None => SemanticOwnerSnapshotV1::NotAttached,
     }
 }
 
@@ -1032,11 +527,10 @@ async fn admitted_doctor_report(options: &ToolCallRegistryOptions<'_>) -> Doctor
     }
 }
 
-/// Status needs census and the semantic-owner snapshot. Freshness is a
-/// lazy reader on the binding so the handler reads it when it renders.
-/// It does not run the doctor reader — that report is runtime-only.
+/// Status needs the census. Freshness is a lazy reader on the binding so
+/// the handler reads it when it renders. It does not run the doctor reader:
+/// that report is runtime-only.
 async fn admitted_status_snapshots(
-    cg: &TraceDecay,
     options: &ToolCallRegistryOptions<'_>,
 ) -> AdmittedRequestSnapshotsV1 {
     AdmittedRequestSnapshotsV1 {
@@ -1045,7 +539,6 @@ async fn admitted_status_snapshots(
             label = "mcp.info.status.generation_census"
         )
         .await,
-        semantic_owner: admitted_semantic_owner(cg, options).await,
         ..AdmittedRequestSnapshotsV1::default()
     }
 }
@@ -1067,7 +560,6 @@ async fn admitted_runtime_snapshots(
         } else {
             DoctorReportSnapshotV1::NotAttached
         },
-        ..AdmittedRequestSnapshotsV1::default()
     }
 }
 
@@ -1093,6 +585,20 @@ fn graph_freshness_reader<'a>(
 ///
 /// The snapshot comes from [`admitted_project_authorities`]; this function
 /// is the binding constructor, not a second admission.
+/// [`admitted_tool_context`] with the registry's own freshness reader.
+fn admitted_tool_context_for<'a>(
+    options: &'a ToolCallRegistryOptions<'a>,
+    project: &'a McpAdmittedProjectV1,
+    snapshots: &'a AdmittedRequestSnapshotsV1,
+) -> Result<McpToolContext<'a>> {
+    admitted_tool_context(
+        options,
+        project,
+        snapshots,
+        options.code_index_freshness_reader.as_ref(),
+    )
+}
+
 fn admitted_tool_context<'a>(
     options: &'a ToolCallRegistryOptions<'a>,
     project: &'a McpAdmittedProjectV1,
@@ -1109,13 +615,15 @@ fn admitted_tool_context<'a>(
     let code_index = match (
         scope.and(options.code_index_search_authority.as_ref()),
         options.code_index_search_executor.as_ref(),
+        options.code_index_similar_executor.as_ref(),
+        options.code_index_redundancy_executor.as_ref(),
         options.code_index_branch_diff_executor.as_ref(),
     ) {
-        (Some(authority), search, branch_diff) => {
-            Some(AdmittedCodeIndex::new(authority, search, branch_diff)?)
-        }
-        (None, None, None) => None,
-        (None, _, _) => {
+        (Some(authority), search, similar, redundancy, branch_diff) => Some(
+            AdmittedCodeIndex::new(authority, search, similar, redundancy, branch_diff)?,
+        ),
+        (None, None, None, None, None) => None,
+        (None, _, _, _, _) => {
             return Err(TraceDecayError::project_route(
                 "mcp_tool_binding_code_index_without_authority",
                 false,
@@ -1131,11 +639,6 @@ fn admitted_tool_context<'a>(
         code_index,
         freshness,
         generation_census: snapshots.generation_census.as_ref(),
-        semantic_owner: match &snapshots.semantic_owner {
-            SemanticOwnerSnapshotV1::Attached(state) => McpSemanticOwnerV1::Attached(state),
-            SemanticOwnerSnapshotV1::AttachedAbsent => McpSemanticOwnerV1::AttachedAbsent,
-            SemanticOwnerSnapshotV1::NotAttached => McpSemanticOwnerV1::NotAttached,
-        },
         doctor_report: match &snapshots.doctor_report {
             DoctorReportSnapshotV1::Read(report) => McpDoctorReportV1::Read(report),
             DoctorReportSnapshotV1::ReadFailed => McpDoctorReportV1::ReadFailed,
@@ -1429,7 +932,7 @@ fn dispatch_session_workflow_tools_inner<'a>(
     Box::pin(async move {
         match tool_name {
             "tracedecay_diagnose" => {
-                let graph = admitted_graph_query(cg, &options, "diagnostics_read").await?;
+                let graph = admitted_graph_query(&options, "diagnostics_read").await?;
                 workflow::handle_diagnose(
                     cg,
                     &graph,
@@ -1441,10 +944,9 @@ fn dispatch_session_workflow_tools_inner<'a>(
             "tracedecay_run_affected_tests" => {
                 workflow::handle_run_affected_tests(
                     cg,
-                    admitted_graph_query(cg, &options, "file_dependents"),
+                    admitted_graph_query(&options, "file_dependents"),
                     args,
                     options.application_cancellation.clone(),
-                    options.code_index_publication_identity.as_deref(),
                 )
                 .await
             }
@@ -1467,7 +969,6 @@ fn dispatch_session_workflow_tools_inner<'a>(
                     options.doctor_report_reader.clone(),
                     options.remote_operational_status.clone(),
                     options.code_index_freshness_reader.clone(),
-                    options.explorer_semantic_reader.clone(),
                     options.feedback_status_reader.clone(),
                     options.pr_autotrack_reader.clone(),
                     options.diagnostics_lsp.clone(),

@@ -41,7 +41,6 @@ mod remote;
 mod retained_exact_sql;
 mod retrieval_anchor;
 mod scope_set;
-mod semantic_vector_staging;
 mod support;
 
 use rusqlite::{Savepoint, Transaction};
@@ -62,7 +61,8 @@ pub use evidence_assembly::EvidenceAssemblyExecutor;
 #[doc(hidden)]
 pub use evidence_assembly::tests::write_fixture_for_project;
 pub use external_source::{
-    EXTERNAL_SOURCE_SCHEMA_V1, ExternalSourceExecutor, RETIRED_MUTATION_COPY_TABLES,
+    EXTERNAL_SOURCE_SCHEMA_V1, ExternalSourceExecutor, RETIRED_MUTATION_COPY_CHUNK_ROWS,
+    RETIRED_MUTATION_COPY_TABLES,
 };
 pub use fact::FactExecutor;
 pub use graph_publication::{GRAPH_PUBLICATION_SCHEMA_V1, GraphPublicationExactSqlStorage};
@@ -76,9 +76,6 @@ pub use retrieval_anchor::RetrievalAnchorExecutor;
 pub use scope_set::{
     AUTHORIZED_SCOPE_SET_SCHEMA_V1, AuthorizedScopeSetExecutor, AuthorizedScopeSetSqliteStorage,
     AuthorizedScopeSetStoreError,
-};
-pub use semantic_vector_staging::{
-    SEMANTIC_VECTOR_STAGING_SCHEMA, SemanticVectorStagingExactSqlStorage,
 };
 
 pub use tracedecay_store::{

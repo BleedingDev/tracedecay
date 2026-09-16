@@ -30,7 +30,6 @@ use tracedecay_runtime_core::config::{
     GENERATED_DIR_SEGMENTS, active_data_dir_name, discover_project_root, get_tracedecay_dir,
     is_generated_dir_segment,
 };
-use tracedecay_semantic_contracts::SemanticConfig;
 
 use super::{
     PinnedRuntimeConfiguration, optional_text_setting, required_bool, required_unsigned,
@@ -57,7 +56,7 @@ pub const SYNC_RETENTION_SETTING_KEY: &str = "sync.retention.v1";
 /// exclude pattern built by [`default_exclude_patterns`].
 ///
 /// Path-level (not just directory-level) so callers can filter a flat list
-/// of file paths in one pass, e.g. the redundancy scanner's candidate list.
+/// of file paths in one pass.
 pub fn is_generated_path_segment(path: &str) -> bool {
     has_minified_suffix(path) || path.split('/').any(is_generated_dir_segment)
 }
@@ -78,8 +77,8 @@ fn has_minified_suffix(path: &str) -> bool {
 /// - `.git/**`, `.tracedecay/**` — VCS and `TraceDecay`'s own metadata dirs;
 ///   these are tool/repo bookkeeping, not generated *code*, so they stay
 ///   local to the config's default patterns rather than joining
-///   [`GENERATED_DIR_SEGMENTS`] (which the migrate/scan/redundancy call
-///   sites also consult for non-config-driven decisions).
+///   [`GENERATED_DIR_SEGMENTS`] (which migrate and scan call sites also
+///   consult for non-config-driven decisions).
 /// - `bin/**` — historically excluded here by default, but not treated as
 ///   "generated" elsewhere: a `bin/` directory can hold real source in some
 ///   project layouts, so it isn't added to the shared segment list.
@@ -157,10 +156,6 @@ pub struct TraceDecayConfig {
     /// promotes a provider to active output.
     #[serde(default)]
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
-    /// Optional installed local semantic profile selection. Missing or
-    /// unavailable semantics never disables exact, lexical, or graph search.
-    #[serde(default)]
-    pub semantic: SemanticConfig,
     /// Index-freshness auto-sync settings (git-metadata watcher, serve-stale,
     /// branch lifecycle). Absent in older `config.json` files, so defaulted.
     #[serde(default)]
@@ -588,7 +583,6 @@ impl Default for TraceDecayConfig {
             memory_provider_native_enabled: false,
             memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
-            semantic: SemanticConfig::default(),
             sync: SyncConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
@@ -620,7 +614,6 @@ impl TraceDecayConfig {
             memory_provider_native_enabled: shared.memory_provider_native_enabled,
             memory_provider_ncm_observer: shared.memory_provider_ncm_observer.clone(),
             memory_provider_recall_routing: shared.memory_provider_recall_routing.clone(),
-            semantic: shared.semantic.clone(),
             sync: SyncConfig {
                 auto_watch: required_bool(snapshot, SYNC_AUTO_WATCH_SETTING_KEY)?,
                 watch_linked_worktrees: required_bool(

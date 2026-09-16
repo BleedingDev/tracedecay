@@ -15,7 +15,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracedecay_contracts::retrieval::grep_analysis::{
     AstGrepAuthorityV1, ComplexityAuthorityV1, DependencyDepthAuthorityV1, GrepAnalysisProblemV1,
     LexicalGrepAuthorityV1, PrimitiveCoverageV1, PrimitiveOutcomeV1, PrimitivePortContextV1,
-    RedundancyAuthorityV1,
 };
 use tracedecay_contracts::retrieval::{
     AffectedFileTestsPrimitiveResultV1, HealthDeltaRequest, HealthDeltaResult,
@@ -239,7 +238,6 @@ struct PrimitiveProjectServices {
     pub lexical_grep: Arc<dyn LexicalGrepAuthorityV1 + Send + Sync>,
     pub ast_grep: Arc<dyn AstGrepAuthorityV1 + Send + Sync>,
     pub complexity: Arc<dyn ComplexityAuthorityV1 + Send + Sync>,
-    pub redundancy: Arc<dyn RedundancyAuthorityV1 + Send + Sync>,
     pub dependency_depth: Arc<dyn DependencyDepthAuthorityV1 + Send + Sync>,
     pub temporal: Arc<dyn TemporalRetrievalPort + Send + Sync>,
     pub source_lines: Arc<dyn SourceRetrievalPort + Send + Sync>,
@@ -256,7 +254,6 @@ impl PrimitiveProjectServices {
         lexical_grep: Arc<dyn LexicalGrepAuthorityV1 + Send + Sync>,
         ast_grep: Arc<dyn AstGrepAuthorityV1 + Send + Sync>,
         complexity: Arc<dyn ComplexityAuthorityV1 + Send + Sync>,
-        redundancy: Arc<dyn RedundancyAuthorityV1 + Send + Sync>,
         dependency_depth: Arc<dyn DependencyDepthAuthorityV1 + Send + Sync>,
         temporal: Arc<dyn TemporalRetrievalPort + Send + Sync>,
         source_lines: Arc<dyn SourceRetrievalPort + Send + Sync>,
@@ -270,7 +267,6 @@ impl PrimitiveProjectServices {
             lexical_grep,
             ast_grep,
             complexity,
-            redundancy,
             dependency_depth,
             temporal,
             source_lines,
@@ -512,7 +508,6 @@ pub fn open_primitive_project_runtime(
     ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
     tests: Arc<dyn TestPrimitivePort + Send + Sync>,
     lexical_grep: Arc<dyn LexicalGrepAuthorityV1 + Send + Sync>,
-    redundancy: Arc<dyn RedundancyAuthorityV1 + Send + Sync>,
     temporal: Arc<dyn TemporalRetrievalPort + Send + Sync>,
     source_lines: Arc<dyn SourceRetrievalPort + Send + Sync>,
     health: Arc<dyn OperationalRetrievalPort + Send + Sync>,
@@ -553,7 +548,6 @@ pub fn open_primitive_project_runtime(
             Arc::clone(&code_graph),
         )),
         Arc::new(TraceDecayComplexityAuthorityV1),
-        redundancy,
         Arc::new(TraceDecayDependencyDepthAuthorityV1::new(Arc::clone(
             &code_graph,
         ))),
@@ -807,21 +801,6 @@ async fn dispatch_admitted(
                 outcome,
             )
         }
-        PrimitiveRequest::Redundancy(request) => {
-            let port_context = grep_context(&context, &operation, observed_at);
-            let outcome = runtime
-                .project_runtime
-                .redundancy
-                .redundancy(&port_context, &request)
-                .await;
-            grep_outcome(
-                &runtime.access,
-                &context,
-                &operation,
-                EvidenceDomain::Operational,
-                outcome,
-            )
-        }
         PrimitiveRequest::DependencyDepth(request) => {
             let port_context = grep_context(&context, &operation, observed_at);
             let outcome = runtime
@@ -1005,7 +984,7 @@ fn session_structural_refusal_problem(
             "application.retrieval.session-cursor-manifest-canonical-bytes-limit-exceeded",
             "The authorized session scope exceeds the cursor manifest byte limit.",
         ),
-        SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage } => (
+        SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage, .. } => (
             session_budget_diagnostic_code(stage),
             "The request exceeds its admitted session retrieval budget.",
         ),
@@ -1043,8 +1022,17 @@ const fn session_budget_diagnostic_code(stage: SessionRetrievalBudgetStageV1) ->
         SessionRetrievalBudgetStageV1::ExecutionWorkExhausted => {
             "application.retrieval.session-budget-execution-work-exhausted"
         }
+        SessionRetrievalBudgetStageV1::CandidateReadExhausted => {
+            "application.retrieval.session-budget-candidate-read-exhausted"
+        }
+        SessionRetrievalBudgetStageV1::RecordReadExhausted => {
+            "application.retrieval.session-budget-record-read-exhausted"
+        }
         SessionRetrievalBudgetStageV1::KernelResultLimit => {
             "application.retrieval.session-budget-kernel-result-limit"
+        }
+        SessionRetrievalBudgetStageV1::CursorManifestLimit => {
+            "application.retrieval.session-budget-cursor-manifest-limit"
         }
         SessionRetrievalBudgetStageV1::ParticipantManifestParticipants => {
             "application.retrieval.session-budget-participant-manifest-participants"
@@ -2150,6 +2138,7 @@ mod tests {
             (
                 SessionRetrievalStructuralRefusalV1::BudgetExhausted {
                     stage: SessionRetrievalBudgetStageV1::ContextTokens,
+                    accounting: None,
                 },
                 "application.retrieval.session-budget-context-tokens",
             ),

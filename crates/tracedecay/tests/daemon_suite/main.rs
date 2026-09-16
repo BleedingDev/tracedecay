@@ -19,6 +19,7 @@ mod common;
 mod advanced_workflow_journey_test;
 #[cfg(unix)]
 mod authentication_refusal_test;
+mod code_index_ignored_dependencies_test;
 #[cfg(unix)]
 mod code_index_journey;
 #[cfg(unix)]
@@ -33,3 +34,34 @@ mod invocation_primitives;
 #[cfg(unix)]
 mod stale_client_resilience_test;
 mod workflow_handoff_test;
+
+#[test]
+fn missing_cli_binary_reports_fixture_error() {
+    if std::env::var_os("TRACEDECAY_TEST_MISSING_CLI_CHILD").is_some() {
+        common::tracedecay_bin();
+        return;
+    }
+
+    let scratch = tempfile::tempdir().expect("missing CLI test directory");
+    let missing_binary = scratch.path().join("tracedecay");
+    let output =
+        std::process::Command::new(std::env::current_exe().expect("daemon suite executable path"))
+            .args([
+                "--exact",
+                "missing_cli_binary_reports_fixture_error",
+                "--nocapture",
+            ])
+            .env("TRACEDECAY_TEST_MISSING_CLI_CHILD", "1")
+            .env("TRACEDECAY_TEST_BIN", &missing_binary)
+            .output()
+            .expect("missing CLI child process");
+
+    assert!(!output.status.success(), "missing CLI child succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("CLI binary not built:")),
+        "missing CLI failure was not typed:\n{stderr}"
+    );
+}

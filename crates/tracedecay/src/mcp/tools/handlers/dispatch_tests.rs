@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -78,7 +79,7 @@ async fn retired_file_metadata_is_absent_and_refused_by_public_dispatch() {
             .all(|definition| definition.name != retired)
     );
     assert!(
-        crate::mcp::tools::binding::mcp_dispatch_catalog()
+        tracedecay_mcp::tools::binding::mcp_dispatch_catalog()
             .expect("MCP dispatch catalog")
             .contract(retired)
             .is_none()
@@ -319,12 +320,13 @@ async fn advertised_tools_resolve_one_concrete_dispatch_entry() {
                 definition.name
             ),
             McpToolDispatchGroup::Work => assert!(
-                crate::mcp::tools::binding::work_operation_for_tool(&definition.name).is_some(),
+                tracedecay_mcp::tools::binding::work_operation_for_tool(&definition.name).is_some(),
                 "{} has no canonical Work operation entry",
                 definition.name
             ),
             McpToolDispatchGroup::Workflow => assert!(
-                crate::mcp::tools::binding::workflow_operation_for_tool(&definition.name).is_some(),
+                tracedecay_mcp::tools::binding::workflow_operation_for_tool(&definition.name)
+                    .is_some(),
                 "{} has no canonical Workflow operation entry",
                 definition.name
             ),
@@ -642,10 +644,7 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
     let meta = tracedecay_runtime_core::branch_meta::BranchMeta::new("main");
     tracedecay_runtime_core::branch_meta::save_branch_meta(&layout.data_root, &meta).unwrap();
     let cg = runtime
-        .open_project_graph_for_test(
-            &project,
-            crate::tracedecay::TraceDecayOpenOptions::default(),
-        )
+        .open_project_graph_for_test(&project, crate::project::TraceDecayOpenOptions::default())
         .await
         .unwrap();
     assert_eq!(
@@ -659,15 +658,16 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                             rebuild_in_flight: bool| {
         let latest_generation_id = latest_generation_id.map(str::to_owned);
         let staleness_state = staleness_state.map(str::to_owned);
-        let reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+        let reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
             std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
-                let freshness = tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
-                    worktree_root: worktree_root.display().to_string(),
-                    latest_generation_id: latest_generation_id.clone(),
-                    staleness_state: staleness_state.clone(),
-                    rebuild_in_flight,
-                    ..Default::default()
-                };
+                let freshness =
+                    tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
+                        worktree_root: worktree_root.display().to_string(),
+                        latest_generation_id: latest_generation_id.clone(),
+                        staleness_state: staleness_state.clone(),
+                        rebuild_in_flight,
+                        ..Default::default()
+                    };
                 Box::pin(async move { Some(freshness) })
             });
         reader
@@ -747,9 +747,9 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
     run_git_in(&project, &["checkout", "-b", "public-feature"]);
     let public_revision = git_stdout_in(&project, &["rev-parse", "HEAD"]);
     let public_freshness_reader = |revision: Option<String>, staleness: &'static str| {
-        let reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+        let reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
             std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
-                let freshness = tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
                     worktree_root: worktree_root.display().to_string(),
                     source_reference: Some("refs/heads/public-feature".to_owned()),
                     source_revision: revision.clone(),
@@ -757,7 +757,7 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                         "generation.status-serving-truth.public-feature".to_owned(),
                     ),
                     code_graph_serving: Some(
-                        tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+                        tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
                     ),
                     coverage: if staleness == "fresh" {
                         "complete".to_owned()
@@ -889,16 +889,15 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
         tracedecay_runtime_core::branch_meta::BranchGraphSourcePublishOutcomeV1::Published(_)
     ));
     let feature_reference = feature_reference.to_owned();
-    let feature_reader:
-        tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+    let feature_reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
         std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
-            let freshness = tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+            let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
                 worktree_root: worktree_root.display().to_string(),
                 source_reference: Some(feature_reference.clone()),
                 source_revision: Some(feature_revision.clone()),
                 latest_generation_id: Some("generation.status-serving-truth.feature".to_owned()),
                 code_graph_serving: Some(
-                    tracedecay_dashboard_api::code_index_freshness_api::CodeGraphServingReadinessV1::Ready,
+                    tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
                 ),
                 staleness_state: Some("fresh".to_owned()),
                 ..Default::default()
@@ -1003,10 +1002,10 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
         .unwrap()
         .as_micros() as i64
         - 3 * 86_400 * 1_000_000;
-    let aged_reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader =
+    let aged_reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
         std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
             let freshness =
-                tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
+                tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
                     worktree_root: worktree_root.display().to_string(),
                     latest_generation_id: Some("generation.status-serving-truth.1".to_owned()),
                     sealed_at_micros: Some(sealed_at_micros),
@@ -1672,7 +1671,7 @@ async fn graph_tools_reject_blank_node_ids_and_zero_depth_with_typed_errors() {
 // Universal dispatch ceiling
 // ---------------------------------------------------------------------------
 
-use super::dispatch_groups::{
+use tracedecay_mcp::tools::dispatch_ceiling::{
     LONG_RUNNING_TOOL_DISPATCH_CEILING, TOOL_DISPATCH_CEILING, tool_dispatch_budget,
     tool_dispatch_ceiling, tool_dispatch_deadline_error,
 };
@@ -2007,11 +2006,10 @@ async fn user_lcm_doctor_reports_a_missing_store_without_opening_it() {
     cg.close();
 }
 
-/// The MCP root handler routes a canonical `scope.kind=profile` refresh to
+/// The MCP root handler routes a public `scope.kind=profile` refresh to
 /// the profile session authority (never the active project's store): begin
-/// issues a handle bound to the profile store, status reads it back through
-/// the same daemon-wide refresh service, and an unmounted refresh service is
-/// a typed unavailable terminal rather than a project fallback.
+/// issues a handle bound to the profile store, status reads it, cancel returns
+/// a durable terminal receipt, and an unmounted service is typed unavailable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_scoped_session_refresh_dispatches_to_the_profile_authority() {
     let _env_lock = lock_user_data_dir_test_env();
@@ -2063,18 +2061,14 @@ async fn profile_scoped_session_refresh_dispatches_to_the_profile_authority() {
             profile_database.clone(),
         )
         .await;
-    let refresh = crate::mcp::server::DaemonSessionRefreshService::new(
+    let refresh = tracedecay_daemon_service::DaemonSessionRefreshService::new(
         profile_database,
         std::sync::Arc::new(wake),
         None,
     );
     let selectors = json!({
-        "scope": { "kind": "profile", "profile_id": profile_id },
-        "session": {
-            "id": "session.mcp.profile-refresh",
-            "store_id": store_id,
-            "root_id": root_id
-        },
+        "scope": { "kind": "profile" },
+        "session": { "id": "session.mcp.profile-refresh" },
         "source": { "scope": "codex" },
         "target": {
             "temporal_mode": { "kind": "current" },
@@ -2139,7 +2133,7 @@ async fn profile_scoped_session_refresh_dispatches_to_the_profile_authority() {
     assert!(handle.starts_with("srh_"), "{handle}");
 
     let mut status_arguments = selectors.clone();
-    status_arguments["handle"] = json!(handle);
+    status_arguments["handle"] = json!(handle.clone());
     let observed = call("tracedecay_session_refresh_status", status_arguments, true).await;
     let envelope: tracedecay_contracts::ApplicationEnvelope<Value> =
         serde_json::from_value(observed.clone()).unwrap_or_else(|error| {
@@ -2154,6 +2148,23 @@ async fn profile_scoped_session_refresh_dispatches_to_the_profile_authority() {
         "{status}"
     );
     assert_eq!(status["scope"], "profile");
+
+    let mut cancel_arguments = selectors.clone();
+    cancel_arguments["handle"] = json!(handle);
+    let cancelled = call("tracedecay_session_refresh_cancel", cancel_arguments, true).await;
+    let envelope: tracedecay_contracts::ApplicationEnvelope<Value> =
+        serde_json::from_value(cancelled.clone()).unwrap_or_else(|error| {
+            panic!("cancel must answer an application envelope: {error}\n{cancelled}")
+        });
+    let tracedecay_contracts::ApplicationOutcome::Effect(effect) = envelope.outcome else {
+        panic!("cancel must be an effect: {cancelled}");
+    };
+    let cancel = effect.payload.expect("cancel payload");
+    assert!(
+        matches!(cancel["outcome"].as_str(), Some("cancelled" | "complete")),
+        "{cancel}"
+    );
+    assert!(cancel["receipt"].is_object(), "{cancel}");
 
     let unmounted = call("tracedecay_session_refresh_begin", selectors, false).await;
     assert_eq!(
@@ -2215,6 +2226,110 @@ async fn unavailable_user_lcm_effect_is_rejected_before_profile_store_open() {
     assert!(
         !sessions_db.exists(),
         "unavailable LCM must not open its profile store"
+    );
+    cg.close();
+}
+
+#[tokio::test]
+async fn admin_sync_reports_terminal_publication_corruption_without_queueing() {
+    let _env_lock = lock_user_data_dir_test_env();
+    let dir = TempDir::new().expect("temporary project");
+    let _env = SelectorEnv::new(dir.path());
+    let project = dir.path().join("terminal-code-index-sync");
+    fs::create_dir_all(project.join("src")).expect("project source");
+    fs::write(project.join("src/lib.rs"), "pub fn terminal_sync() {}\n").expect("project source");
+    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
+        &project,
+        "project.terminal-code-index-sync",
+    )
+    .await
+    .expect("TraceDecay fixture");
+    let queued = std::sync::Arc::new(AtomicUsize::new(0));
+    let reconcile_sink: crate::mcp::server::CodeIndexReconcileSink = {
+        let queued = std::sync::Arc::clone(&queued);
+        std::sync::Arc::new(move |_, _| {
+            let queued = std::sync::Arc::clone(&queued);
+            Box::pin(async move {
+                queued.fetch_add(1, Ordering::AcqRel);
+                crate::mcp::server::CodeIndexAdmission::Accepted
+            })
+        })
+    };
+    let freshness_reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
+        std::sync::Arc::new(move |worktree_root| {
+            Box::pin(async move {
+                Some(
+                    tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
+                        worktree_root: worktree_root.display().to_string(),
+                        progress: Some(
+                            tracedecay_contracts::code_index_freshness::CodeIndexBuildProgressV1 {
+                                generation_id: "generation.terminal-sync".to_owned(),
+                                daemon_incarnation: 1,
+                                producer_incarnation: 1,
+                                progress_epoch: 1,
+                                sealed_source_digest: format!("sha256:{}", "a".repeat(64)),
+                                phase: tracedecay_contracts::code_index_freshness::CodeIndexBuildPhaseV1::SourceScan,
+                                committed_pages: 0,
+                                committed_chunks: 0,
+                                committed_imports: 0,
+                                committed_payload_bytes: 0,
+                                completed_files: 0,
+                                total_files: 1,
+                                completed_lexical_units: 0,
+                                total_lexical_units: 1,
+                                current_batch_pages: 0,
+                                current_batch_payload_bytes: 0,
+                                elapsed_micros: 1,
+                                last_commit_latency_micros: None,
+                                files_per_second: None,
+                                lexical_units_per_second: None,
+                                estimated_remaining_seconds: None,
+                                last_progress_micros: 1,
+                                blocked_reason: Some(
+                                    tracedecay_contracts::code_index_freshness::CodeIndexBuildBlockedReasonV1::PublicationAuthorityCorrupt,
+                                ),
+                            },
+                        ),
+                        parked: Some(
+                            tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1 {
+                                reason: "the publication authority is corrupt and requires an index reset: injected sync refusal".to_owned(),
+                                remediation: "reset the code-index publication authority".to_owned(),
+                                parked_at_micros: 1,
+                                observed_passes: 1,
+                                retries_on_wake: false,
+                            },
+                        ),
+                        ..Default::default()
+                    },
+                )
+            })
+        });
+
+    let error = handle_tool_call_with_registry_options(
+        &cg,
+        "tracedecay_admin_sync",
+        json!({"format": "json"}),
+        None,
+        None,
+        ToolCallRegistryOptions {
+            code_index_reconcile_sink: Some(reconcile_sink),
+            code_index_freshness_reader: Some(freshness_reader),
+            ..Default::default()
+        }
+        .admit_opened_project(&cg)
+        .expect("opened fixture admits"),
+    )
+    .await
+    .expect_err("terminal publication corruption must refuse sync");
+
+    assert!(
+        error.to_string().contains("injected sync refusal"),
+        "sync must report the terminal cause: {error}"
+    );
+    assert_eq!(
+        queued.load(Ordering::Acquire),
+        0,
+        "terminal sync must not queue work"
     );
     cg.close();
 }

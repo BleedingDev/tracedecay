@@ -24,7 +24,6 @@ use super::StoreOwnerKey;
 #[cfg(unix)]
 use super::scheduler::AutomationSchedulerHandle;
 use super::{DaemonHandshake, DatabaseOwnerRegistry, write_json_rpc_response};
-use crate::mcp::tools::replay_projectless_hermes_host_admission;
 #[cfg(unix)]
 use tracedecay_automation_runtime::automation::maintenance_termination::MaintenanceTaskTermination;
 use tracedecay_code_index_runtime::git_transactions::DaemonGitIndexTransactionServiceRegistry;
@@ -34,6 +33,7 @@ use tracedecay_daemon_service::{
     ProfileHostAdmissionBootstrapOperation, ProfileHostAdmissionBootstrapStatus,
     ProfileHostAdmissionReplayRegistry,
 };
+use tracedecay_mcp::handlers::hook_runtime::replay_projectless_hermes_host_admission;
 use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
 use tracedecay_store_runtime::StoreWriterGates;
@@ -58,8 +58,11 @@ type HostAdmissionBrokers =
 /// owns the opaque refresh handles it issued, so every route that reaches the
 /// same store (project MCP servers and the projectless client) must share the
 /// instance for `status`/`cancel` to resolve a `begin` handle.
-type ProfileSessionRefreshServices =
-    Arc<ProfiledTokioMutex<HashMap<PathBuf, Arc<crate::mcp::server::DaemonSessionRefreshService>>>>;
+type ProfileSessionRefreshServices = Arc<
+    ProfiledTokioMutex<
+        HashMap<PathBuf, Arc<tracedecay_daemon_service::DaemonSessionRefreshService>>,
+    >,
+>;
 
 /// Resolves the writer scope for one store family.
 ///
@@ -87,7 +90,7 @@ pub(super) fn owner_writer_scope(key: &ProjectServerKey) -> WriterScope {
 
 /// [`store_writer_scope`] for the store an open graph is serving.
 pub(super) fn graph_writer_scope(
-    cg: &crate::tracedecay::TraceDecay,
+    cg: &crate::project::TraceDecay,
     class: StoreWriterClass,
 ) -> WriterScope {
     store_writer_scope(&cg.store_layout().data_root, class)
@@ -964,7 +967,7 @@ impl StoreAdministration {
     }
 
     #[hotpath::measure(label = "daemon.branch_admin.mounted_project_graphs", future = true)]
-    pub(super) async fn mounted_project_graphs(&self) -> Vec<Arc<crate::tracedecay::TraceDecay>> {
+    pub(super) async fn mounted_project_graphs(&self) -> Vec<Arc<crate::project::TraceDecay>> {
         let servers = self.mounted_project_servers().await;
         let mut graphs = Vec::with_capacity(servers.len());
         for server in &servers {
@@ -1295,7 +1298,7 @@ impl StoreAdministration {
     pub(super) async fn profile_session_refresh_service(
         &self,
         database: &tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    ) -> Arc<crate::mcp::server::DaemonSessionRefreshService> {
+    ) -> Arc<tracedecay_daemon_service::DaemonSessionRefreshService> {
         let path = database.db_path().to_path_buf();
         let mut services = self.profile_session_refresh_services.lock().await;
         if let Some(service) = services.get(&path) {
@@ -1305,7 +1308,7 @@ impl StoreAdministration {
             .session_temporal_refresh_schedulers
             .ensure_profile(path.clone(), database.clone())
             .await;
-        let service = Arc::new(crate::mcp::server::DaemonSessionRefreshService::new(
+        let service = Arc::new(tracedecay_daemon_service::DaemonSessionRefreshService::new(
             database.clone(),
             Arc::new(wake),
             None,

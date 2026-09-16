@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 use tracedecay_contracts::{
     ProfileIdentityReadPort, SessionTemporalRefreshWakePort,
     remote::status::RemoteOperationalStatusReaderV1,
@@ -168,9 +168,7 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) remote_operational_status: Option<RemoteOperationalStatusReaderV1>,
     pub(crate) dashboard_doctor_report_reader: Option<tracedecay_dashboard_api::DoctorReportReader>,
     pub(crate) dashboard_code_index_freshness_reader:
-        Option<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader>,
-    pub(crate) dashboard_explorer_semantic_reader:
-        Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
+        Option<tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader>,
     pub(crate) dashboard_feedback_status_reader:
         Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     pub(crate) dashboard_pr_autotrack_reader:
@@ -183,6 +181,8 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) code_index_freshness_probe_sink: Option<super::CodeIndexFreshnessProbeSink>,
     pub(crate) code_index_publication_identity: Option<super::CodeIndexPublicationIdentityResolver>,
     pub(crate) code_index_search_executor: Option<super::CodeIndexSearchExecutor>,
+    pub(crate) code_index_similar_executor: Option<super::CodeIndexSimilarExecutor>,
+    pub(crate) code_index_redundancy_executor: Option<super::CodeIndexRedundancyExecutor>,
     pub(crate) code_index_branch_diff_executor: Option<super::CodeIndexBranchDiffExecutor>,
     pub(crate) code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
     pub(crate) code_graph_read_admission_port: Option<CodeGraphReadAdmissionPort>,
@@ -308,7 +308,6 @@ impl McpServerConstructionContext {
             remote_operational_status: None,
             dashboard_doctor_report_reader: None,
             dashboard_code_index_freshness_reader: None,
-            dashboard_explorer_semantic_reader: None,
             dashboard_feedback_status_reader: None,
             dashboard_pr_autotrack_reader: None,
             diagnostics_lsp: None,
@@ -318,6 +317,8 @@ impl McpServerConstructionContext {
             code_index_freshness_probe_sink: None,
             code_index_publication_identity: None,
             code_index_search_executor: None,
+            code_index_similar_executor: None,
+            code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
@@ -423,7 +424,6 @@ impl McpServerConstructionContext {
             remote_operational_status: None,
             dashboard_doctor_report_reader: None,
             dashboard_code_index_freshness_reader: None,
-            dashboard_explorer_semantic_reader: None,
             dashboard_feedback_status_reader: None,
             dashboard_pr_autotrack_reader: None,
             diagnostics_lsp: None,
@@ -433,6 +433,8 @@ impl McpServerConstructionContext {
             code_index_freshness_probe_sink: None,
             code_index_publication_identity: None,
             code_index_search_executor: None,
+            code_index_similar_executor: None,
+            code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
@@ -499,7 +501,6 @@ impl McpServerConstructionContext {
             remote_operational_status: None,
             dashboard_doctor_report_reader: None,
             dashboard_code_index_freshness_reader: None,
-            dashboard_explorer_semantic_reader: None,
             dashboard_feedback_status_reader: None,
             dashboard_pr_autotrack_reader: None,
             diagnostics_lsp: None,
@@ -509,6 +510,8 @@ impl McpServerConstructionContext {
             code_index_freshness_probe_sink: None,
             code_index_publication_identity: None,
             code_index_search_executor: None,
+            code_index_similar_executor: None,
+            code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
@@ -572,6 +575,22 @@ impl McpServerConstructionContext {
         executor: super::CodeIndexSearchExecutor,
     ) -> Self {
         self.code_index_search_executor = Some(executor);
+        self
+    }
+
+    pub(crate) fn with_code_index_similar_executor(
+        mut self,
+        executor: super::CodeIndexSimilarExecutor,
+    ) -> Self {
+        self.code_index_similar_executor = Some(executor);
+        self
+    }
+
+    pub(crate) fn with_code_index_redundancy_executor(
+        mut self,
+        executor: super::CodeIndexRedundancyExecutor,
+    ) -> Self {
+        self.code_index_redundancy_executor = Some(executor);
         self
     }
 
@@ -694,17 +713,9 @@ impl McpServerConstructionContext {
 
     pub(crate) fn with_dashboard_code_index_freshness_reader(
         mut self,
-        reader: tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader,
+        reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader,
     ) -> Self {
         self.dashboard_code_index_freshness_reader = Some(reader);
-        self
-    }
-
-    pub(crate) fn with_dashboard_explorer_semantic_reader(
-        mut self,
-        reader: tracedecay_dashboard_api::ExplorerSemanticReader,
-    ) -> Self {
-        self.dashboard_explorer_semantic_reader = Some(reader);
         self
     }
 
@@ -818,9 +829,6 @@ mod tests {
                     crate::mcp::server::CodeIndexSearchUnavailableV1 {
                         code_generation: None,
                         reason: crate::mcp::server::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                        semantic: crate::mcp::server::CodeIndexSemanticStatusV1::Unavailable {
-                            reason: "authority_unavailable",
-                        },
                         coverage: crate::mcp::server::CodeIndexSearchCoverageV1::unavailable(
                             "authority_unavailable",
                         ),

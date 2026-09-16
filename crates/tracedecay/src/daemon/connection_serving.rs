@@ -891,6 +891,7 @@ async fn serve_broker_socket_client(
 
 /// LSP sessions this connection owns are cleaned up exactly once, on every
 /// exit path of the invocation loop.
+#[cfg(unix)]
 #[expect(
     clippy::too_many_lines,
     reason = "LSP sessions this connection owns are cleaned up exactly once, on every exit path of the invocation loop."
@@ -1319,13 +1320,25 @@ fn serve_broker_socket_client_inner(
                 } else {
                     None
                 };
+                let project_open = match handshake.project_path.as_deref() {
+                    Some(project_path) => {
+                        let route = ProjectRouteKey::from_handshake(project_path, &handshake)?;
+                        project_open_tasks(engine.project_open_gates.as_ref())
+                            .await
+                            .status(&route)
+                    }
+                    None => None,
+                };
                 let Some(setup_activity) = Box::pin(serve_core_doctor_runtime_request(
                     &mut transport,
                     &handshake,
                     &engine.store_administration,
+                    CoreDoctorStatusV1 {
+                        project_open,
+                        git_watcher_health,
+                    },
                     setup_activity,
                     &first_request,
-                    git_watcher_health,
                     || {
                         Box::pin(async {
                             Ok(engine
@@ -1724,6 +1737,7 @@ fn serve_broker_socket_client_inner(
                     Box::pin(serve_projectless_client(
                         &mut transport,
                         &handshake.client_identity,
+                        handshake.timings,
                         &engine.lifecycle,
                         &engine.store_administration,
                     ))
@@ -1924,13 +1938,25 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
         drop(setup_activity);
         return Ok(());
     }
+    let project_open = match handshake.project_path.as_deref() {
+        Some(project_path) => {
+            let route = ProjectRouteKey::from_handshake(project_path, &handshake)?;
+            project_open_tasks(project_open_gates.as_ref())
+                .await
+                .status(&route)
+        }
+        None => None,
+    };
     let Some(setup_activity) = Box::pin(serve_core_doctor_runtime_request(
         &mut transport,
         &handshake,
         &store_administration,
+        CoreDoctorStatusV1 {
+            project_open,
+            git_watcher_health: None,
+        },
         setup_activity,
         &first_request,
-        None,
         || async {
             let (canonical_project_path, _) = project_route_for_handshake(&handshake)?;
             Ok(Box::pin(portable_cached_project_server(
@@ -2463,6 +2489,7 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
         Box::pin(serve_projectless_client(
             &mut transport,
             &handshake.client_identity,
+            handshake.timings,
             lifecycle,
             &store_administration,
         ))

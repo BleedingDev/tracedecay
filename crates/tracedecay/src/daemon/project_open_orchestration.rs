@@ -198,10 +198,16 @@ pub(super) async fn ensure_registered_project_route(
                         project_path.display()
                     ),
                 })?;
-        if let Some(layout) = tracedecay_runtime_core::storage::resolve_persisted_layout(
-            &project_path,
-            store_administration.profile_identity()?.profile_root(),
-        )? {
+        let profile_root = store_administration
+            .profile_identity()?
+            .profile_root()
+            .to_path_buf();
+        let probe_path = project_path.clone();
+        if let Some(layout) = bounded_repository_probe(&project_path, move || {
+            tracedecay_runtime_core::storage::resolve_persisted_layout(&probe_path, &profile_root)
+        })
+        .await??
+        {
             let project_id =
                 layout
                     .identity
@@ -220,7 +226,7 @@ pub(super) async fn ensure_registered_project_route(
                 return Err(remote_deleted_project_route_error(project_id));
             }
         }
-        if durable_enrollment_resolves_existing_store(store_administration, &project_path) {
+        if durable_enrollment_resolves_existing_store(store_administration, &project_path).await? {
             return Ok(());
         }
         // Explicit initialization is valid from the root of any checkout,
@@ -261,7 +267,7 @@ fn remote_deleted_project_route_error(identity: &str) -> TraceDecayError {
 /// manufacturing a new identity.
 ///
 /// The profile registry is a *derived* index: the authoritative identity chain
-/// in [`crate::tracedecay::TraceDecay::resolve_registered_configuration_layout`]
+/// in [`crate::project::TraceDecay::resolve_registered_configuration_layout`]
 /// consults the project's own enrollment marker (and the repository-identity
 /// marker) BEFORE it ever asks the registry, and a successful open republishes
 /// the registry rows via `register_project_store_in_global_registry`. A guard
@@ -276,25 +282,33 @@ fn remote_deleted_project_route_error(identity: &str) -> TraceDecayError {
 /// existing store is required to be present on disk, so an ambient directory
 /// (a bare `$HOME`, a checkout whose store really is gone) is still rejected
 /// and no path-derived authority is minted here.
-pub(super) fn durable_enrollment_resolves_existing_store(
+/// Resolving the layout reads the repository identity marker through `gix`
+/// discovery and then stats the store files, so it runs off the async workers
+/// under the shared repository-probe bound; a probe that outlives it is
+/// deferred discovery, never "this project is not enrolled".
+pub(super) async fn durable_enrollment_resolves_existing_store(
     store_administration: &StoreAdministration,
     project_path: &Path,
-) -> bool {
+) -> Result<bool> {
     let Ok(identity) = store_administration.profile_identity() else {
-        return false;
+        return Ok(false);
     };
-    let Ok(Some(layout)) = tracedecay_runtime_core::storage::resolve_persisted_layout(
-        project_path,
-        identity.profile_root(),
-    ) else {
-        return false;
-    };
-    layout.graph_db_path.is_file()
-        || layout.sessions_db_path.is_file()
-        || layout
-            .manifest_path
-            .as_deref()
-            .is_some_and(std::path::Path::is_file)
+    let profile_root = identity.profile_root().to_path_buf();
+    let probe_path = project_path.to_path_buf();
+    bounded_repository_probe(project_path, move || {
+        let Ok(Some(layout)) =
+            tracedecay_runtime_core::storage::resolve_persisted_layout(&probe_path, &profile_root)
+        else {
+            return false;
+        };
+        layout.graph_db_path.is_file()
+            || layout.sessions_db_path.is_file()
+            || layout
+                .manifest_path
+                .as_deref()
+                .is_some_and(std::path::Path::is_file)
+    })
+    .await
 }
 
 fn unenrolled_project_route_error(project_path: &Path) -> TraceDecayError {
@@ -370,7 +384,6 @@ async fn begin_portable_project_open(
                 &open_project_path,
                 &handshake,
                 ProductionProjectCompositionRuntime::Portable {
-                    semantic_auto_download: true,
                     startup_catch_up: true,
                 },
                 &cancellation,

@@ -155,11 +155,11 @@ struct ApplicationSurfaceDispatch<'a> {
 /// executor before the request is admitted to its typed owner.
 fn requires_application_invocation_executor(tool_name: &str) -> bool {
     ApplicationSurfaceOperation::from_tool_name(tool_name).is_some()
-        || crate::mcp::tools::binding::work_operation_for_tool(tool_name).is_some()
-        || crate::mcp::tools::binding::workflow_operation_for_tool(tool_name).is_some()
+        || tracedecay_mcp::tools::binding::work_operation_for_tool(tool_name).is_some()
+        || tracedecay_mcp::tools::binding::workflow_operation_for_tool(tool_name).is_some()
         || matches!(
-            crate::mcp::tools::binding::dispatch_group_for_tool(tool_name),
-            Some(crate::mcp::tools::binding::McpToolDispatchGroup::MultiRoot)
+            tracedecay_mcp::tools::binding::dispatch_group_for_tool(tool_name),
+            Some(tracedecay_mcp::tools::binding::McpToolDispatchGroup::MultiRoot)
         )
         || tracedecay_contracts::RetainedSurfaceOperation::from_tool_name(tool_name).is_some()
         || is_source_edit_tool(tool_name)
@@ -172,7 +172,7 @@ pub(super) fn mcp_now_micros() -> tracedecay_domain::UtcMicros {
 }
 
 pub(super) fn is_source_edit_tool(tool_name: &str) -> bool {
-    crate::mcp::tools::tool_dispatches_source_edit_effect(tool_name)
+    tracedecay_mcp::tools::binding::tool_dispatches_source_edit_effect(tool_name)
 }
 
 /// Reads that walk a git tree or the whole code graph, and so must not run
@@ -197,7 +197,7 @@ pub(super) fn is_controlled_read_tool(tool_name: &str) -> bool {
 }
 
 pub(super) fn tool_supports_live_cancellation(tool_name: &str) -> bool {
-    crate::mcp::tools::tool_supports_live_cancellation(tool_name)
+    tracedecay_mcp::tools::binding::tool_supports_live_cancellation(tool_name)
 }
 
 pub(super) fn dispatch_deadline_horizon_micros(bounded_operation: bool) -> Option<i64> {
@@ -208,7 +208,7 @@ pub(super) fn dispatch_deadline_horizon_micros(bounded_operation: bool) -> Optio
 }
 
 fn tool_carries_effect(tool_name: &str) -> bool {
-    crate::mcp::tools::binding::mcp_dispatch_contract(tool_name)
+    tracedecay_mcp::tools::binding::mcp_dispatch_contract(tool_name)
         .is_ok_and(|contract| !contract.read_only())
 }
 
@@ -221,7 +221,7 @@ impl McpServer {
         pre_cancelled: bool,
         caller_deadline: Option<tracedecay_contracts::Deadline>,
     ) -> Result<PreparedDispatchControl<'a>> {
-        let ceiling = crate::mcp::tools::binding::canonical_tool_dispatch_ceiling(tool_name)
+        let ceiling = tracedecay_mcp::tools::binding::canonical_tool_dispatch_ceiling(tool_name)
             .map_err(|error| TraceDecayError::Config {
                 message: format!("could not resolve MCP dispatch deadline: {error}"),
             })?;
@@ -246,7 +246,7 @@ impl McpServer {
                     live_cancellable: tool_supports_live_cancellation(tool_name),
                     carries_effect: tool_carries_effect(tool_name),
                     canonical_effect_settlement:
-                        crate::mcp::tools::binding::tool_requires_canonical_effect_settlement(
+                        tracedecay_mcp::tools::binding::tool_requires_canonical_effect_settlement(
                             tool_name,
                         ),
                 },
@@ -309,11 +309,6 @@ Unique constraint: `(source, target, kind, COALESCE(line, -1))`. Indexes on `sou
 
 ### `metadata` — key/value store
 Common keys: `tokens_saved`, schema-version markers.
-
-### `node_fingerprints` — redundancy cache
-- `node_id` PRIMARY KEY FK → `nodes.id`
-- `ast_hash`, `cfg_hash`, `call_seq_hash`, `shingles`
-- `body_tokens`, `source_hash`
 
 ### `read_cache` — rendered `tracedecay_read` responses
 - primary key: `(project_id, session_id, file_path, mode, args_hash)`
@@ -444,11 +439,15 @@ impl McpServer {
         connection: &mut ConnectionRouteState,
         pre_cancelled: bool,
     ) -> Option<JsonRpcResponse> {
+        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        if pre_cancelled {
+            cancellation.cancel();
+        }
         Box::pin(self.dispatch_envelope(
             McpDispatchRequest::from_legacy(request),
             timings_enabled,
             connection,
-            pre_cancelled,
+            cancellation,
         ))
         .await
     }
@@ -465,7 +464,7 @@ impl McpServer {
         request: McpDispatchRequest<'_>,
         timings_enabled: bool,
         connection: &mut ConnectionRouteState,
-        pre_cancelled: bool,
+        cancellation: tracedecay_session_memory::context::CancellationToken,
     ) -> Option<JsonRpcResponse> {
         // Expired prepare reservations own zeroized proof keys; sweep them on
         // every MCP request so an abandoned reservation does not remain until
@@ -545,7 +544,7 @@ impl McpServer {
                     request.into_tool_call(),
                     timings_enabled,
                     connection,
-                    pre_cancelled,
+                    cancellation,
                 ))
                 .await,
             ),
@@ -775,7 +774,7 @@ impl McpServer {
         };
         match hotpath::measure_block!(
             "mcp.server.tools_list.compose",
-            crate::mcp::tools::catalog_discovery_tools_list_payload(
+            tracedecay_mcp::tools::catalog_discovery::catalog_discovery_tools_list_payload(
                 None,
                 budget,
                 &profile_id,
@@ -1372,8 +1371,9 @@ impl McpServer {
         // a full project walk; on very large indexes (especially when
         // node_modules was intentionally included) that turns diagnostics and
         // search into sync operations.
-        let skip_graph_freshness = crate::mcp::tools::binding::tool_branch_sensitivity(tool_name)
-            == crate::mcp::tools::binding::BranchSensitivity::Independent;
+        let skip_graph_freshness =
+            tracedecay_mcp::tools::binding::tool_branch_sensitivity(tool_name)
+                == tracedecay_mcp::tools::binding::BranchSensitivity::Independent;
         if !skip_graph_freshness
             && !project_reader_preselected
             && needs_lazy_sync_before_dispatch(tool_name)
@@ -1441,10 +1441,31 @@ impl McpServer {
             && let Some(map) = result.value.as_object_mut()
         {
             let meta = map.entry("_meta").or_insert_with(|| json!({}));
+            if meta.is_null() {
+                *meta = json!({});
+            }
             if let Some(meta_obj) = meta.as_object_mut() {
                 meta_obj.insert("duration_us".to_string(), json!(us));
             }
         }
+    }
+
+    fn attach_missing_response_timing(response: &mut JsonRpcResponse, elapsed_us: Option<u64>) {
+        let Some(elapsed_us) = elapsed_us else {
+            return;
+        };
+        let Some(result) = response.result.as_mut().and_then(Value::as_object_mut) else {
+            return;
+        };
+        let meta = result.entry("_meta").or_insert_with(|| json!({}));
+        if meta.is_null() {
+            *meta = json!({});
+        }
+        let Some(meta) = meta.as_object_mut() else {
+            return;
+        };
+        meta.entry("duration_us")
+            .or_insert_with(|| json!(elapsed_us));
     }
 
     fn response_token_count(result: &ToolResult) -> u64 {
@@ -1591,7 +1612,7 @@ impl McpServer {
             let project_path_str =
                 RegisteredGlobalDb::canonical_project_key(accounting_project_root);
             let tool_name_owned = tool_name.to_string();
-            let ts = crate::tracedecay::current_timestamp();
+            let ts = crate::project::current_timestamp();
             let failure_reason = (analytics_outcome == "error")
                 .then(|| semantic_failure_reason(result))
                 .flatten();
@@ -1926,17 +1947,37 @@ impl McpServer {
     }
 
     #[hotpath::measure(label = "mcp.server.tools_call", future = true)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "The response-gate lease and cancellation registrations are RAII-scoped to the frame and must span dispatch."
-    )]
     pub(crate) async fn handle_tools_call(
         &self,
         id: Value,
         params: ToolCallParams<'_>,
         timings_enabled: bool,
         connection: &mut ConnectionRouteState,
-        pre_cancelled: bool,
+        cancellation: tracedecay_session_memory::context::CancellationToken,
+    ) -> JsonRpcResponse {
+        let started = timings_enabled.then(std::time::Instant::now);
+        let mut response = self
+            .handle_tools_call_inner(id, params, timings_enabled, connection, cancellation)
+            .await;
+        Self::attach_missing_response_timing(
+            &mut response,
+            started.map(|started| started.elapsed().as_micros() as u64),
+        );
+        response
+    }
+
+    #[hotpath::skip]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The response-gate lease and cancellation registrations are RAII-scoped to the frame and must span dispatch."
+    )]
+    async fn handle_tools_call_inner(
+        &self,
+        id: Value,
+        params: ToolCallParams<'_>,
+        timings_enabled: bool,
+        connection: &mut ConnectionRouteState,
+        cancellation: tracedecay_session_memory::context::CancellationToken,
     ) -> JsonRpcResponse {
         let PreparedToolCall {
             tool_name,
@@ -1997,7 +2038,7 @@ impl McpServer {
             &id,
             &tool_name,
             &memory_request_scope,
-            pre_cancelled,
+            cancellation.is_cancelled(),
             caller_deadline,
         ) {
             Ok(prepared) => prepared,
@@ -2196,6 +2237,20 @@ impl McpServer {
 mod tool_call_preparation_tests {
     use super::*;
     use ::rmcp::model::CallToolRequestParams;
+
+    #[test]
+    fn shared_tool_boundary_fills_only_missing_timing_metadata() {
+        let mut missing = JsonRpcResponse::success(json!(1), json!({"content": []}));
+        McpServer::attach_missing_response_timing(&mut missing, Some(17));
+        assert_eq!(missing.result.unwrap()["_meta"]["duration_us"], 17);
+
+        let mut existing = JsonRpcResponse::success(
+            json!(2),
+            json!({"_meta": {"duration_us": 11}, "content": []}),
+        );
+        McpServer::attach_missing_response_timing(&mut existing, Some(29));
+        assert_eq!(existing.result.unwrap()["_meta"]["duration_us"], 11);
+    }
 
     fn arguments_object() -> serde_json::Map<String, Value> {
         json!({"query": "typed dispatch", "limit": 5})
@@ -2577,8 +2632,8 @@ mod git_read_control_tests {
     #[test]
     fn all_retained_tools_request_the_daemon_invocation_executor() {
         for definition in tracedecay_mcp::get_tool_definitions().expect("tool definitions") {
-            if crate::mcp::tools::binding::dispatch_group_for_tool(&definition.name)
-                == Some(crate::mcp::tools::binding::McpToolDispatchGroup::MultiRoot)
+            if tracedecay_mcp::tools::binding::dispatch_group_for_tool(&definition.name)
+                == Some(tracedecay_mcp::tools::binding::McpToolDispatchGroup::MultiRoot)
             {
                 assert!(
                     requires_application_invocation_executor(&definition.name),

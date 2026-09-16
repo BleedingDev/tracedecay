@@ -3,8 +3,7 @@
 //! This module is the production side of the retrieval half of Plan 26
 //! ("Retrieval, planner, and context measurement" and "Adoption analytics and
 //! retention"): planner admission, per-retriever accounting, fusion synthesis,
-//! source census, context-outcome linkage, frozen ablations, and the analytics
-//! consent receipt. [`super::export`] projects each of them into the
+//! source census, context-outcome linkage, and the analytics consent receipt. [`super::export`] projects each of them into the
 //! aggregate-share rollup.
 //!
 //! Three disciplines are deliberately repeated per family:
@@ -30,17 +29,18 @@
 //! stays coherent per stream. Unifying them is safe only once both streams
 //! share one sequence.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tracedecay_contracts::{ApplicationContractError, now_micros};
+use tracedecay_contracts::now_micros;
+#[cfg(test)]
 use tracedecay_domain::{
     AnalyticsConsentChangedV1, AnalyticsModeV1, ContextOutcomeObservedV1, CoverageStateV1,
-    ObservabilityEnvelopeV1, ObservabilityPayloadV1, ObservabilityRetentionClassV1,
-    ObservabilityTerminalResultV1, RetrievalAblationObservedV1, RetrievalPlannerObservedV1,
-    RetrievalSourceObservedV1, RetrievalSynthesisObservedV1, RetrieverObservedV1,
 };
-use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_domain::{
+    ObservabilityEnvelopeV1, ObservabilityPayloadV1, ObservabilityRetentionClassV1,
+    ObservabilityTerminalResultV1, RetrievalPlannerObservedV1, RetrievalSourceObservedV1,
+    RetrievalSynthesisObservedV1, RetrieverObservedV1,
+};
 use tracedecay_query::retrieval::observation::{
     ObservedWithCoverageV1, RetrievalPipelineObservationV1,
 };
@@ -49,50 +49,22 @@ use super::emit::{ObservabilityEnvelopeSpec, assemble_observability_envelope};
 use super::producer::{
     BoundedObservabilityProducerV1, ObservabilityEmissionOutcomeV1, ObservabilityProducerIdentityV1,
 };
-use tracedecay_session_memory::event_lane::record_observability;
 
 const SCHEMA_REVISION: u32 = 1;
-const CONFIGURATION_REVISION: &str = "registered-project-session.v1";
+#[cfg(test)]
 const RETRIEVAL_POLICY_REVISION: &str = "retrieval-measurement.v1";
+#[cfg(test)]
+const RETRIEVAL_PRODUCER_REVISION_V1: &str = "retrieval-observer.v1";
+#[cfg(test)]
+const CONFIGURATION_REVISION: &str = "registered-project-session.v1";
+#[cfg(test)]
 const ANALYTICS_POLICY_REVISION: &str = "adoption-analytics.v1";
-pub const RETRIEVAL_PRODUCER_REVISION_V1: &str = "retrieval-observer.v1";
-pub const ANALYTICS_CONSENT_PRODUCER_REVISION_V1: &str = "analytics-consent-observer.v1";
-
-/// One process-wide identity for this producer lane, distinct from
-/// [`super::emit`]'s so the two totally ordered streams never interleave
-/// sequence numbers under a shared boot id.
-fn boot_id() -> &'static str {
-    static BOOT: OnceLock<String> = OnceLock::new();
-    BOOT.get_or_init(|| {
-        format!(
-            "retrieval-observability-{}-{}",
-            std::process::id(),
-            now_micros().0
-        )
-    })
-}
+#[cfg(test)]
+const ANALYTICS_CONSENT_PRODUCER_REVISION_V1: &str = "analytics-consent-observer.v1";
 
 fn next_sequence() -> u64 {
     static SEQUENCE: AtomicU64 = AtomicU64::new(1);
     SEQUENCE.fetch_add(1, Ordering::Relaxed)
-}
-
-fn contract_error(reason: &'static str) -> ApplicationContractError {
-    ApplicationContractError::Domain(reason.to_owned())
-}
-
-/// Resolves the one project scope this database is bound to. A supplied id
-/// that disagrees with the binding is refused rather than silently
-/// reattributed.
-fn bound_project_id(db: &RegisteredGlobalDb) -> Result<String, ApplicationContractError> {
-    db.binding()
-        .shard_id
-        .scope
-        .project_id()
-        .map(|id| id.as_str().to_owned())
-        .ok_or(ApplicationContractError::Inconsistent {
-            field: "retrieval_observability_emit.project_scope",
-        })
 }
 
 /// Identity fields an envelope must carry to pass
@@ -114,6 +86,7 @@ impl<'a> LaneIdentity<'a> {
         }
     }
 
+    #[cfg(test)]
     const fn direct(
         scope_ref: &'a str,
         producer_revision: &'a str,
@@ -270,6 +243,7 @@ fn source_envelope(
     })
 }
 
+#[cfg(test)]
 fn context_outcome_envelope(
     identity: &LaneIdentity<'_>,
     boot: &str,
@@ -308,37 +282,7 @@ fn context_outcome_envelope(
     })
 }
 
-fn ablation_envelope(
-    identity: &LaneIdentity<'_>,
-    boot: &str,
-    sequence: u64,
-    observed_at_micros: i64,
-    observation: RetrievalAblationObservedV1,
-) -> Result<ObservabilityEnvelopeV1, &'static str> {
-    let coverage = observation.coverage;
-    let unit = observation.unit.clone();
-    let delta = observation.candidate_value - observation.baseline_value;
-    assemble_observability_envelope(ObservabilityEnvelopeSpec {
-        scope_ref: identity.scope_ref,
-        boot_id: boot,
-        producer_sequence: sequence,
-        event_prefix: "retrieval-ablation",
-        capability: "retrieval",
-        operation: "ablation",
-        quantity: Some(delta),
-        unit: Some(&unit),
-        terminal_result: Some(ObservabilityTerminalResultV1::Succeeded),
-        producer_revision: identity.producer_revision,
-        configuration_revision: identity.configuration_revision,
-        policy_revision: identity.policy_revision,
-        coverage,
-        retention_class: ObservabilityRetentionClassV1::LocalRollup395d,
-        observed_at_micros,
-        schema_revision: SCHEMA_REVISION,
-        payload: ObservabilityPayloadV1::RetrievalAblation(observation),
-    })
-}
-
+#[cfg(test)]
 fn consent_envelope(
     identity: &LaneIdentity<'_>,
     boot: &str,
@@ -459,261 +403,17 @@ pub fn emit_retrieval_pipeline(
     summary
 }
 
-/// Records one planner admission decision through the project-bound
-/// observation authority.
-#[hotpath::measure(label = "usecases.observability.record_planner", future = true)]
-pub async fn record_retrieval_planner(
-    db: &RegisteredGlobalDb,
-    observation: ObservedWithCoverageV1<RetrievalPlannerObservedV1>,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = planner_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one lane's candidate accounting.
-#[hotpath::measure(label = "usecases.observability.record_retriever", future = true)]
-pub async fn record_retriever(
-    db: &RegisteredGlobalDb,
-    observation: ObservedWithCoverageV1<RetrieverObservedV1>,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = retriever_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one fusion-synthesis result.
-#[hotpath::measure(label = "usecases.observability.record_synthesis", future = true)]
-pub async fn record_retrieval_synthesis(
-    db: &RegisteredGlobalDb,
-    observation: ObservedWithCoverageV1<RetrievalSynthesisObservedV1>,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = synthesis_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one cataloged source's census for a query.
-#[hotpath::measure(label = "usecases.observability.record_source", future = true)]
-pub async fn record_retrieval_source(
-    db: &RegisteredGlobalDb,
-    observation: ObservedWithCoverageV1<RetrievalSourceObservedV1>,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = source_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one context packet's observed linkage to a downstream outcome.
-#[hotpath::measure(label = "usecases.observability.record_context_outcome", future = true)]
-pub async fn record_context_outcome(
-    db: &RegisteredGlobalDb,
-    observation: ObservedWithCoverageV1<ContextOutcomeObservedV1>,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = context_outcome_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one frozen baseline-versus-candidate retrieval ablation.
-#[hotpath::measure(label = "usecases.observability.record_ablation", future = true)]
-pub async fn record_retrieval_ablation(
-    db: &RegisteredGlobalDb,
-    observation: RetrievalAblationObservedV1,
-) -> Result<String, ApplicationContractError> {
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        RETRIEVAL_PRODUCER_REVISION_V1,
-        RETRIEVAL_POLICY_REVISION,
-    );
-    let envelope = ablation_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        observation,
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await
-}
-
-/// Records one analytics consent transition.
-///
-/// `Ok(None)` means there was no transition to record: re-asserting the mode
-/// already in force is a configuration no-op, and minting a consent receipt for
-/// it would overstate how often consent actually changed.
-#[hotpath::measure(label = "usecases.observability.record_consent", future = true)]
-pub async fn record_analytics_consent(
-    db: &RegisteredGlobalDb,
-    previous: AnalyticsModeV1,
-    current: AnalyticsModeV1,
-    share_staging_age_seconds: Option<u64>,
-) -> Result<Option<String>, ApplicationContractError> {
-    if previous == current {
-        return Ok(None);
-    }
-    let project_id = bound_project_id(db)?;
-    let lane = LaneIdentity::direct(
-        &project_id,
-        ANALYTICS_CONSENT_PRODUCER_REVISION_V1,
-        ANALYTICS_POLICY_REVISION,
-    );
-    let envelope = consent_envelope(
-        &lane,
-        boot_id(),
-        next_sequence(),
-        now_micros().0,
-        AnalyticsConsentChangedV1 {
-            previous,
-            current,
-            share_staging_age_seconds,
-        },
-    )
-    .map_err(contract_error)?;
-    record_observability(db, envelope).await.map(Some)
-}
-
-/// The dimension a retrieval ablation compares two frozen profiles on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AblationDimensionV1 {
-    /// Wall-clock cost of the compared stage, in microseconds.
-    StageLatencyMicros,
-    /// Fraction of a stage's input candidates it carried forward.
-    CandidateRetentionRatio,
-}
-
-impl AblationDimensionV1 {
-    const fn unit(self) -> &'static str {
-        match self {
-            Self::StageLatencyMicros => "microseconds",
-            Self::CandidateRetentionRatio => "ratio",
-        }
-    }
-}
-
-/// Project one Plan 15 ablation pair into the Plan 26 ablation family.
-///
-/// Plan 26 requires an ablation to pin its descriptor revision and to compare
-/// a baseline against a candidate under equal, frozen budgets. The caller
-/// supplies the two stage measurements the evaluation harness already
-/// produced; nothing here re-runs an evaluation.
-///
-/// A retention ratio over zero input candidates is *undefined*, not zero: the
-/// projection reports the value it can and drops coverage to
-/// [`CoverageStateV1::Unknown`] so the rollup will not publish a point value
-/// derived from an empty denominator.
-#[hotpath::measure(label = "usecases.observability.observe_ablation")]
-pub fn observe_stage_ablation(
-    descriptor_revision: &str,
-    dimension: AblationDimensionV1,
-    baseline: tracedecay_query::search_quality::semantic_native::SemanticNativeStageMeasurementV1,
-    candidate: tracedecay_query::search_quality::semantic_native::SemanticNativeStageMeasurementV1,
-) -> RetrievalAblationObservedV1 {
-    let ratio =
-        |measurement: tracedecay_query::search_quality::semantic_native::SemanticNativeStageMeasurementV1| {
-            (measurement.input_candidates > 0)
-                .then(|| measurement.output_candidates as f64 / measurement.input_candidates as f64)
-        };
-    let (baseline_value, candidate_value, coverage) = match dimension {
-        AblationDimensionV1::StageLatencyMicros => (
-            baseline.elapsed_micros as f64,
-            candidate.elapsed_micros as f64,
-            CoverageStateV1::Known,
-        ),
-        AblationDimensionV1::CandidateRetentionRatio => {
-            match (ratio(baseline), ratio(candidate)) {
-                (Some(baseline_value), Some(candidate_value)) => {
-                    (baseline_value, candidate_value, CoverageStateV1::Known)
-                }
-                // An empty denominator on either side makes the comparison
-                // undefined. Reporting 0.0 as a known ratio would invent a
-                // measurement neither run produced.
-                _ => (0.0, 0.0, CoverageStateV1::Unknown),
-            }
-        }
-    };
-    RetrievalAblationObservedV1 {
-        descriptor_revision: descriptor_revision.to_owned(),
-        baseline_value,
-        candidate_value,
-        unit: dimension.unit().to_owned(),
-        coverage,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use tracedecay_contracts::{
         AggregateCapabilityV1, AggregateShareCellV1, AggregateShareDimensionV1,
-        AggregateShareExportRequestV1, AggregateShareMetricV1, AggregateShareUnitV1,
+        AggregateShareExportRequestV1, AggregateShareMetricV1,
         ObservabilityAggregateExportApplicationV1, ObservabilityHorizonV1, ObservabilityQueryPort,
         ObservabilityQueryV1, ObservabilityRecordPort,
     };
     use tracedecay_query::retrieval::observation::{ContextUseOutcomeV1, observe_context_outcome};
-    use tracedecay_query::search_quality::semantic_native::SemanticNativeStageMeasurementV1;
 
     use crate::observability::{RegisteredAggregateShareExporterV1, RegisteredObservabilityPortV1};
 
@@ -819,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn planner_admission_reaches_the_rollup_with_requested_as_its_denominator() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.planner").await;
         let cells = rollup_cells(&harness, |day| {
             // Half the windows admit one of three requested lanes; the rest
@@ -871,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn retriever_contributions_are_denominated_by_what_the_lane_returned() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.retriever").await;
         let cells = rollup_cells(&harness, |day| {
             retriever_envelope(
@@ -908,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn unhydrated_synthesis_publishes_no_point_value() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.synthesis").await;
         // Token accounting is unavailable before hydration, so the projection
         // reports partial coverage. The rollup must refuse a point value
@@ -945,7 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_denied_source_is_censored_in_the_rollup_and_never_a_zero_match() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.source").await;
         // Two eligible sources per window: one searched, one denied. The
         // denied one must land in `censored`, leaving the searched numerator
@@ -986,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_independently_observed_context_use_enters_the_numerator() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.context").await;
         // One window in three is an independently verified use, one is a
         // censored linkage, one is a cited-but-unverified use. Only the first
@@ -1030,58 +730,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_ablation_over_an_empty_denominator_is_unknown_not_zero() {
-        let _pin = crate::config::PinnedUserDataDir::new();
-        let harness = harness("project.retrieval.ablation").await;
-        let measurement = |input: u64, output: u64| SemanticNativeStageMeasurementV1 {
-            elapsed_micros: 100,
-            input_candidates: input,
-            output_candidates: output,
-        };
-
-        let undefined = observe_stage_ablation(
-            "ablation.retention.v1",
-            AblationDimensionV1::CandidateRetentionRatio,
-            measurement(0, 0),
-            measurement(8, 4),
-        );
-        assert_eq!(
-            undefined.coverage,
-            CoverageStateV1::Unknown,
-            "an empty baseline denominator makes the comparison undefined"
-        );
-
-        // The measurable case does reach the rollup as a ratio delta.
-        let cells = rollup_cells(&harness, |day| {
-            ablation_envelope(
-                &lane(&harness.scope),
-                "retrieval-test-ablation",
-                day as u64 + 1,
-                0,
-                observe_stage_ablation(
-                    "ablation.retention.v1",
-                    AblationDimensionV1::CandidateRetentionRatio,
-                    measurement(8, 2),
-                    measurement(8, 4),
-                ),
-            )
-            .expect("ablation envelope")
-        })
-        .await;
-
-        let delta = cell(&cells, AggregateShareMetricV1::RetrievalAblationDelta);
-        assert_eq!(delta.unit, AggregateShareUnitV1::Ratio);
-        assert_eq!(delta.observed, WINDOWS as u64);
-        assert_eq!(
-            delta.value,
-            Some(0.25 * WINDOWS as f64),
-            "0.50 candidate retention against a 0.25 baseline"
-        );
-    }
-
-    #[tokio::test]
     async fn a_full_queue_accounts_the_drop_instead_of_losing_it_silently() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let harness = harness("project.retrieval.bounded").await;
         let db = harness
             .runtime
@@ -1152,7 +802,7 @@ mod tests {
 
     #[tokio::test]
     async fn opting_in_is_shared_and_opting_out_is_retained_locally_only() {
-        let _pin = crate::config::PinnedUserDataDir::new();
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let consent_for = |scope: &str, previous, current, day: i64| {
             consent_envelope(
                 &LaneIdentity::direct(

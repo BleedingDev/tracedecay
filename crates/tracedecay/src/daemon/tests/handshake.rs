@@ -74,7 +74,7 @@ fn daemon_handshake_defaults_missing_moved_store_adoption_to_never() {
     let decoded = DaemonHandshake::from_line(&encoded).expect("legacy handshake should decode");
     assert_eq!(
         decoded.moved_store_adoption,
-        crate::tracedecay::MovedStoreAdoption::Never
+        crate::project::MovedStoreAdoption::Never
     );
 }
 
@@ -323,7 +323,7 @@ async fn wire_drifted_handshake_reads_typed_refusal_then_clean_eof() {
         .write_all(
             b"{\"protocol\":\"tracedecay.daemon.invocation\",\"revision\":1,\
               \"request_id\":\"request.after-drifted-handshake\",\
-              \"operation\":\"semantic_evaluate_and_publish\"}\n",
+              \"operation\":\"git_status\"}\n",
         )
         .await
         .expect("write pipelined request");
@@ -445,7 +445,7 @@ async fn rejected_auth_preface_reads_typed_refusal_then_clean_eof() {
         .write_all(
             b"{\"protocol\":\"tracedecay.daemon.invocation\",\"revision\":1,\
               \"request_id\":\"request.after-rejected-auth\",\
-              \"operation\":\"semantic_evaluate_and_publish\"}\n",
+              \"operation\":\"git_status\"}\n",
         )
         .await
         .expect("write pipelined request");
@@ -950,7 +950,7 @@ async fn saturated_daemon_refuses_wire_drifted_handshake_instead_of_resetting() 
         .write_all(
             b"{\"protocol\":\"tracedecay.daemon.invocation\",\"revision\":1,\
               \"request_id\":\"request.saturated-drifted-handshake\",\
-              \"operation\":\"semantic_evaluate_and_publish\"}\n",
+              \"operation\":\"git_status\"}\n",
         )
         .await
         .expect("write pipelined request");

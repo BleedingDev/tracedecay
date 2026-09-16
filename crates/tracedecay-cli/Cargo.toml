@@ -93,13 +93,6 @@ token-counting = ["tracedecay/token-counting"]
 lite = ["tracedecay/lite"]
 medium = ["tracedecay/medium"]
 full = ["tracedecay/full"]
-semantic-fastembed = ["tracedecay/semantic-fastembed"]
-semantic-model2vec = ["tracedecay/semantic-model2vec"]
-# Opt-in GPU execution providers for the embedded FastEmbed/ORT runtime.
-# A compiled provider is selected automatically on its supported platform;
-# `TRACEDECAY_EMBED_EXECUTION_PROVIDER=cpu` opts out.
-semantic-gpu-cuda = ["tracedecay/semantic-gpu-cuda"]
-semantic-gpu-webgpu = ["tracedecay/semantic-gpu-webgpu"]
 test-transport = ["tracedecay/test-transport"]
 lang-dart = ["tracedecay/lang-dart"]
 lang-pascal = ["tracedecay/lang-pascal"]
@@ -177,6 +170,9 @@ tracedecay-agent-hosts = { path = "../tracedecay-agent-hosts", version = "0.1.0"
 tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
 tracedecay-automation-runtime = { path = "../tracedecay-automation-runtime", version = "0.1.0" }
 tracedecay-api = { path = "../tracedecay-api", version = "0.1.0" }
+# Language tiers stay selected through `tracedecay/{lite,medium,full}` above;
+# the direct edge only names the parallelism status the runtime installs.
+tracedecay-code-index = { path = "../tracedecay-code-index", version = "0.1.0", default-features = false }
 tracedecay-configuration = { path = "../tracedecay-configuration", version = "0.1.0" }
 tracedecay-contracts = { path = "../tracedecay-contracts", version = "0.1.0" }
 tracedecay-daemon-control = { path = "../tracedecay-daemon-control", version = "0.1.0" }
@@ -232,8 +228,6 @@ tracedecay-lcm = { path = "../tracedecay-lcm", version = "0.1.0" }
 tracedecay-memory-observation = { path = "../tracedecay-memory-observation", version = "0.1.0-beta.37" }
 tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0", features = ["test-helpers"] }
-tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0", features = ["test-helpers"] }
-tracedecay-semantic-contracts.workspace = true
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
 ureq = { version = "3", features = ["json"] }
 

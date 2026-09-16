@@ -514,6 +514,20 @@ impl DaemonInvocationService {
                 )
                 .await
             }
+            DaemonInvocationPayload::FeedbackProximity {
+                request,
+                deadline,
+                cancellation,
+            } => {
+                execute_feedback_proximity(
+                    request_id,
+                    advisory_cycle,
+                    request,
+                    deadline,
+                    cancellation,
+                )
+                .await
+            }
             DaemonInvocationPayload::FeedbackImpact {
                 request_handle,
                 observed_at,
@@ -881,59 +895,6 @@ impl DaemonInvocationService {
                 ))
                 .await
             }
-            DaemonInvocationPayload::SemanticEvaluateAndPublish {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            } => {
-                self.execute_semantic_evaluation(
-                    project_root,
-                    request_id,
-                    evaluated_profile_id,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                    request_cancellation.clone(),
-                )
-                .await
-            }
-            DaemonInvocationPayload::SemanticActivate {
-                evaluated_profile_id,
-                set_rollback,
-                observed_at,
-                deadline,
-                cancellation,
-            } => {
-                self.execute_semantic_activation(
-                    project_root,
-                    request_id,
-                    evaluated_profile_id,
-                    set_rollback,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                    request_cancellation.clone(),
-                )
-                .await
-            }
-            DaemonInvocationPayload::SemanticQualify {
-                evaluated_profile_id,
-                observed_at,
-                deadline,
-                cancellation,
-            } => {
-                self.execute_semantic_qualification(
-                    project_root,
-                    request_id,
-                    evaluated_profile_id,
-                    observed_at,
-                    deadline,
-                    cancellation,
-                    request_cancellation.clone(),
-                )
-                .await
-            }
             DaemonInvocationPayload::LspOpen {
                 client_revision,
                 requested_root_uri,
@@ -1018,7 +979,7 @@ impl DaemonInvocationService {
                 deadline,
                 cancellation,
             } => {
-                execute_source_edit(
+                let response = execute_source_edit(
                     request_id,
                     source_edit_owner,
                     request,
@@ -1026,7 +987,22 @@ impl DaemonInvocationService {
                     deadline,
                     cancellation,
                 )
-                .await
+                .await;
+                if let (
+                    Some(project_root),
+                    DaemonInvocationOutcome::SourceEdit { result, .. },
+                ) = (registered_project_root.as_deref(), &response.outcome)
+                    && !result.replayed
+                    && result.outcome.success()
+                {
+                    let touched = result.outcome.touched_files();
+                    if !touched.is_empty() {
+                        self.code_index_schedulers
+                            .notify_hook_paths(project_root, &touched)
+                            .await;
+                    }
+                }
+                response
             }
             DaemonInvocationPayload::SourceEditReconcile {
                 request,
@@ -1050,7 +1026,7 @@ impl DaemonInvocationService {
                 deadline,
                 cancellation,
             } => {
-                execute_source_edit_rollback(
+                let response = execute_source_edit_rollback(
                     request_id,
                     source_edit_owner,
                     request,
@@ -1058,7 +1034,19 @@ impl DaemonInvocationService {
                     deadline,
                     cancellation,
                 )
-                .await
+                .await;
+                if let (
+                    Some(project_root),
+                    DaemonInvocationOutcome::SourceEdit { result, .. },
+                ) = (registered_project_root.as_deref(), &response.outcome)
+                    && !result.replayed
+                    && result.outcome.success()
+                {
+                    self.code_index_schedulers
+                        .notify_hook_overflow(project_root)
+                        .await;
+                }
+                response
             }
         };
         if is_observable_operation(operation) {

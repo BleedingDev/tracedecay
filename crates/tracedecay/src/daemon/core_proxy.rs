@@ -195,7 +195,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
 ///
 /// This is *not* a timeout invented here: it is the daemon's own published
 /// dispatch ceiling for that exact request — "nothing may run unbounded", per
-/// [`tool_dispatch_ceiling`](crate::mcp::tools::handlers::tool_dispatch_ceiling)
+/// [`tool_dispatch_ceiling`](tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling)
 /// — plus
 /// [`DAEMON_TOOL_RESPONSE_GRACE`](tracedecay_daemon_protocol::DAEMON_TOOL_RESPONSE_GRACE), the grace
 /// this crate already keeps reading for beyond a request deadline. A daemon
@@ -206,7 +206,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
 ///
 /// A line that is not a `tools/call` (initialize, tools/list, resources/*) has
 /// no tool of its own and takes the unnamed-tool default ceiling
-/// ([`tool_dispatch_ceiling`](crate::mcp::tools::handlers::tool_dispatch_ceiling)
+/// ([`tool_dispatch_ceiling`](tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling)
 /// with an empty name), not a named catalog tool's possibly shorter deadline.
 struct DaemonProxyRequest<'a> {
     raw: &'a str,
@@ -225,8 +225,10 @@ impl<'a> DaemonProxyRequest<'a> {
 #[cfg(unix)]
 fn disconnect_drain_bound(request: &DaemonProxyRequest<'_>) -> Duration {
     let ceiling = request_tool_name(request.parsed.as_ref())
-        .and_then(|tool| crate::mcp::tools::binding::canonical_tool_dispatch_ceiling(&tool).ok())
-        .unwrap_or_else(|| crate::mcp::tools::handlers::tool_dispatch_ceiling(""));
+        .and_then(|tool| {
+            tracedecay_mcp::tools::binding::canonical_tool_dispatch_ceiling(&tool).ok()
+        })
+        .unwrap_or_else(|| tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling(""));
     ceiling.saturating_add(DAEMON_TOOL_RESPONSE_GRACE)
 }
 
@@ -533,7 +535,7 @@ pub(super) async fn bounded_repository_identity(
     path: &Path,
 ) -> tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome {
     let deadline = tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
-        std::time::Instant::now() + Duration::from_secs(2),
+        std::time::Instant::now() + super::REPOSITORY_DISCOVERY_DEADLINE,
     );
     tracedecay_runtime_core::git_discovery::discover_repository_identity(
         path,
@@ -547,19 +549,39 @@ pub(super) async fn bounded_repository_identity(
 /// unresolved and the caller retries within its own budget, exactly like a
 /// warming project open. Spawn and probe failures are terminal because retrying
 /// them until the caller's budget expires only hides the actionable error.
+///
+/// A deferral names when to come back and, when one is still running, that a
+/// resolution is in progress — the difference between "this root is being
+/// resolved" and "this root is unresolved", which is what a client staring at
+/// a repeated deferral cannot otherwise tell.
 pub(super) fn repository_discovery_deferred(
     path: &Path,
     reason: tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown,
 ) -> TraceDecayError {
-    let retry_hint = matches!(
+    let deferred = matches!(
         reason,
         tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown::DeadlineExceeded
-    )
-    .then_some(PROJECT_WARMING_RETRY_HINT)
-    .unwrap_or("cannot be resolved");
+    );
+    let retry_hint = if deferred {
+        PROJECT_WARMING_RETRY_HINT
+    } else {
+        "cannot be resolved"
+    };
+    let progress = if deferred {
+        let retry_after_ms = super::REPOSITORY_DISCOVERY_DEADLINE.as_millis();
+        match tracedecay_runtime_core::git_discovery::identity_resolution_elapsed(path) {
+            Some(elapsed) => format!(
+                "; resolution in progress for {:.1}s and publishing its result, retry after {retry_after_ms}ms",
+                elapsed.as_secs_f64()
+            ),
+            None => format!("; retry after {retry_after_ms}ms"),
+        }
+    } else {
+        String::new()
+    };
     TraceDecayError::Config {
         message: format!(
-            "repository discovery for '{}' is deferred ({reason:?}); the project route {retry_hint}",
+            "repository discovery for '{}' is deferred ({reason:?}){progress}; the project route {retry_hint}",
             path.display()
         ),
     }
@@ -1000,7 +1022,7 @@ mod tests {
         for line in [&long, &interactive] {
             let tool =
                 request_tool_name(line.parsed.as_ref()).expect("a tools/call names its tool");
-            let ceiling = crate::mcp::tools::binding::canonical_tool_dispatch_ceiling(&tool)
+            let ceiling = tracedecay_mcp::tools::binding::canonical_tool_dispatch_ceiling(&tool)
                 .expect("every tool has a dispatch ceiling");
             assert!(
                 disconnect_drain_bound(line) > ceiling,
@@ -1014,7 +1036,7 @@ mod tests {
         // the longest bound that actually applies to this request — rather
         // than a hardcoded catalog value.
         assert_eq!(request_tool_name(non_tool.parsed.as_ref()), None);
-        let unnamed_ceiling = crate::mcp::tools::handlers::tool_dispatch_ceiling("");
+        let unnamed_ceiling = tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling("");
         assert!(
             disconnect_drain_bound(&non_tool) > unnamed_ceiling,
             "tools/list must drain past the unnamed-tool default ceiling {unnamed_ceiling:?}"

@@ -1,5 +1,36 @@
 {
   "$defs": {
+    "AcceptWorkProposalDispositionV1": {
+      "description": "The accept-proposal operation can commit acceptance only.",
+      "enum": [
+        "accepted"
+      ],
+      "type": "string"
+    },
+    "AcceptWorkProposalRequestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "$ref": "#/$defs/AcceptWorkProposalDispositionV1"
+        },
+        "mutation": {
+          "$ref": "#/$defs/WorkProductMutationIdentityV1"
+        },
+        "proposal": {
+          "$ref": "#/$defs/WorkProposalV1"
+        },
+        "selection": {
+          "$ref": "#/$defs/WorkProductSelectionScopeV1"
+        }
+      },
+      "required": [
+        "selection",
+        "proposal",
+        "disposition",
+        "mutation"
+      ],
+      "type": "object"
+    },
     "AcceptWorkTaskRequestV1": {
       "additionalProperties": false,
       "properties": {
@@ -177,6 +208,27 @@
         "sources"
       ],
       "type": "object"
+    },
+    "AdmittedWorkExecutionV1": {
+      "additionalProperties": false,
+      "description": "Execution admission together with the immutable provider snapshot licensed\nby the accepted proposal and current configuration authority.",
+      "properties": {
+        "execution_snapshot": {
+          "$ref": "#/$defs/WorkExecutionSnapshot"
+        },
+        "mutation": {
+          "$ref": "#/$defs/WorkProductMutationReceiptV1"
+        }
+      },
+      "required": [
+        "mutation",
+        "execution_snapshot"
+      ],
+      "type": "object"
+    },
+    "AgentInstanceId": {
+      "description": "Strongly typed canonical identity: `AgentInstanceId`.",
+      "type": "string"
     },
     "AnalyticsAgentUsageV1": {
       "properties": {
@@ -2168,6 +2220,435 @@
       "description": "Strongly typed canonical identity: `CatalogGenerationId`.",
       "type": "string"
     },
+    "CodeCloneIndexBudgetsV1": {
+      "description": "Fixed per-request clone candidate and verification budgets.",
+      "properties": {
+        "candidate_bodies": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hot_posting_rows": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_body_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_directional_coverage_millionths": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "posting_rows": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verification_bodies": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verification_token_work": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "posting_rows",
+        "candidate_bodies",
+        "verification_bodies",
+        "verification_token_work",
+        "hot_posting_rows",
+        "minimum_body_tokens",
+        "minimum_directional_coverage_millionths"
+      ],
+      "type": "object"
+    },
+    "CodeCloneIndexCoverageV1": {
+      "description": "Coverage retained by one clone-index artifact or in-progress successor.\n\nCounts are `None` until the clone artifact has observed the corresponding\ndenominator. A complete empty repository reports `Some(0)`, which keeps a\ndesigned zero distinct from unavailable coverage.",
+      "properties": {
+        "completed_source_pages": {
+          "description": "Sealed source pages committed to clone indexing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "conservative_normalized_bodies": {
+          "description": "Eligible bodies with a conservative exact posting.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eligible_source_bodies": {
+          "description": "Source bodies admitted for automatic clone discovery.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exact_postings": {
+          "description": "Conservative and rename-normalized exact posting rows.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "excluded_incomplete_tokenization_bodies": {
+          "description": "Bodies excluded because conservative tokenization was incomplete.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "excluded_too_small_bodies": {
+          "description": "Bodies excluded because they are below the automatic-discovery minimum.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hot_posting_rows_skipped": {
+          "description": "Positional rows omitted when those hot posting lists are skipped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hot_postings_skipped": {
+          "description": "Fingerprint posting lists above the interactive read threshold.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "near_fingerprint_bodies": {
+          "description": "Eligible bodies represented by positional fingerprints.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "near_fingerprint_postings": {
+          "description": "Positional fingerprint posting rows retained by the artifact.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "payloads_reused": {
+          "description": "Current payload occurrences reused from the preceding generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rename_normalized_bodies": {
+          "description": "Eligible bodies with a complete rename-normalized exact posting.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rename_partial_bodies": {
+          "description": "Eligible bodies whose rename normalization is partial.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rename_unsupported_bodies": {
+          "description": "Eligible bodies whose language has no rename normalization.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source_bodies": {
+          "description": "Clone body occurrences observed in the sealed lexical source.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_source_pages": {
+          "description": "Sealed source pages in the generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unique_payloads": {
+          "description": "Distinct content-addressed payloads retained by the artifact.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source_bodies",
+        "eligible_source_bodies",
+        "conservative_normalized_bodies",
+        "rename_normalized_bodies",
+        "unique_payloads",
+        "payloads_reused",
+        "exact_postings",
+        "near_fingerprint_bodies",
+        "near_fingerprint_postings",
+        "hot_postings_skipped",
+        "hot_posting_rows_skipped",
+        "excluded_too_small_bodies",
+        "excluded_incomplete_tokenization_bodies",
+        "rename_partial_bodies",
+        "rename_unsupported_bodies",
+        "completed_source_pages",
+        "total_source_pages"
+      ],
+      "type": "object"
+    },
+    "CodeCloneIndexObservationV1": {
+      "description": "Generation-pinned clone-index evidence shared by non-error readiness states.",
+      "properties": {
+        "artifact_format_revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "budgets": {
+          "$ref": "#/$defs/CodeCloneIndexBudgetsV1"
+        },
+        "conservative_normalization_revision": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "coverage": {
+          "$ref": "#/$defs/CodeCloneIndexCoverageV1"
+        },
+        "generation_id": {
+          "type": "string"
+        },
+        "rename_normalization_revision": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resources": {
+          "$ref": "#/$defs/CodeCloneIndexResourcesV1"
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "generation_id",
+        "source_revision",
+        "artifact_format_revision",
+        "conservative_normalization_revision",
+        "rename_normalization_revision",
+        "coverage",
+        "budgets",
+        "resources"
+      ],
+      "type": "object"
+    },
+    "CodeCloneIndexResourcesV1": {
+      "description": "Measured resources and update accounting for one clone-index generation.",
+      "properties": {
+        "bytes_on_disk": {
+          "description": "Current durable artifact or staging-file bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "changed_symbol_update_micros": {
+          "description": "Latest observed source-edit arrival through clone-ready publication.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "peak_scratch_memory_bytes": {
+          "description": "Largest measured clone-row serialization scratch during the build.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stale_invalidations": {
+          "description": "Prior clone payload bindings invalidated by the latest publication.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "bytes_on_disk",
+        "peak_scratch_memory_bytes",
+        "changed_symbol_update_micros",
+        "stale_invalidations"
+      ],
+      "type": "object"
+    },
+    "CodeCloneIndexStatusV1": {
+      "description": "Clone readiness, independent from lexical and graph serving.",
+      "oneOf": [
+        {
+          "description": "The sealed lexical artifact or its clone rows cannot be read.",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A restartable clone successor is consuming sealed source pages.",
+          "properties": {
+            "observation": {
+              "$ref": "#/$defs/CodeCloneIndexObservationV1"
+            },
+            "state": {
+              "const": "backfilling",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observation"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Some clone evidence is readable, but required postings are missing.",
+          "properties": {
+            "observation": {
+              "$ref": "#/$defs/CodeCloneIndexObservationV1"
+            },
+            "omission_reasons": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "partial",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observation",
+            "omission_reasons"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Required exact and fingerprint postings cover every eligible body.",
+          "properties": {
+            "observation": {
+              "$ref": "#/$defs/CodeCloneIndexObservationV1"
+            },
+            "state": {
+              "const": "ready",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observation"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The artifact is readable but belongs to a superseded source generation.",
+          "properties": {
+            "observation": {
+              "$ref": "#/$defs/CodeCloneIndexObservationV1"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "stale",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observation",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CodeGenerationId": {
+      "description": "Strongly typed canonical identity: `CodeGenerationId`.",
+      "type": "string"
+    },
     "CodeGraphServingReadinessV1": {
       "description": "Interactive graph-serving state for the latest sealed generation.\n\nA sealed generation can expose truthful census statistics before its graph\nprojection is ready to serve queries, so readiness is reported separately.",
       "oneOf": [
@@ -2639,6 +3120,17 @@
     "CodeIndexWorktreeFreshnessV1": {
       "description": "Freshness/generation state for one mounted worktree.\n\n`Deserialize` is part of the wire contract: the CLI status command decodes\nexactly this type back out of the daemon's `tracedecay_status` response,\nkeeping one authority for the freshness shape.",
       "properties": {
+        "clone_index": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodeCloneIndexStatusV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Clone readiness from the same sealed lexical artifact."
+        },
         "code_graph_serving": {
           "anyOf": [
             {
@@ -2828,6 +3320,10 @@
     },
     "ConfigurationSnapshotId": {
       "description": "Strongly typed canonical identity: `ConfigurationSnapshotId`.",
+      "type": "string"
+    },
+    "ContentDigest": {
+      "description": "Strongly typed algorithm-tagged integrity digest: `ContentDigest`.",
       "type": "string"
     },
     "CostsReadModelV1": {
@@ -3456,7 +3952,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/MemoryOverviewPayloadV1"
+              "$ref": "#/$defs/SimilarResultV1"
             },
             {
               "type": "null"
@@ -3527,7 +4023,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/MemoryStatusPayloadV1"
+              "$ref": "#/$defs/RevisionPairUnionLayoutV1"
             },
             {
               "type": "null"
@@ -3598,7 +4094,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/MemoryFactDetailPayloadV1"
+              "$ref": "#/$defs/MemoryOverviewPayloadV1"
             },
             {
               "type": "null"
@@ -3669,7 +4165,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsOverviewPayloadV1"
+              "$ref": "#/$defs/MemoryStatusPayloadV1"
             },
             {
               "type": "null"
@@ -3740,7 +4236,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsUsageSummaryV1"
+              "$ref": "#/$defs/MemoryFactDetailPayloadV1"
             },
             {
               "type": "null"
@@ -3811,7 +4307,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsAgentsPayloadV1"
+              "$ref": "#/$defs/AnalyticsOverviewPayloadV1"
             },
             {
               "type": "null"
@@ -3882,7 +4378,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsSubagentTreePayloadV1"
+              "$ref": "#/$defs/AnalyticsUsageSummaryV1"
             },
             {
               "type": "null"
@@ -3953,7 +4449,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsHintsPayloadV1"
+              "$ref": "#/$defs/AnalyticsAgentsPayloadV1"
             },
             {
               "type": "null"
@@ -4095,7 +4591,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsUnderusedPayloadV1"
+              "$ref": "#/$defs/AnalyticsSubagentTreePayloadV1"
             },
             {
               "type": "null"
@@ -4166,7 +4662,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AnalyticsDiagnosticsPayloadV1"
+              "$ref": "#/$defs/AnalyticsHintsPayloadV1"
             },
             {
               "type": "null"
@@ -4237,7 +4733,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/SavingsOverviewPayloadV1"
+              "$ref": "#/$defs/AnalyticsUnderusedPayloadV1"
             },
             {
               "type": "null"
@@ -4308,7 +4804,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/LcmSessionPayloadV1"
+              "$ref": "#/$defs/AnalyticsDiagnosticsPayloadV1"
             },
             {
               "type": "null"
@@ -4379,7 +4875,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/LcmTimelinePayloadV1"
+              "$ref": "#/$defs/SavingsOverviewPayloadV1"
             },
             {
               "type": "null"
@@ -4450,7 +4946,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/LcmOverviewPayloadV1"
+              "$ref": "#/$defs/LcmSessionPayloadV1"
             },
             {
               "type": "null"
@@ -4521,7 +5017,7 @@
         "payload": {
           "anyOf": [
             {
-              "$ref": "#/$defs/LcmSearchPayloadV1"
+              "$ref": "#/$defs/LcmTimelinePayloadV1"
             },
             {
               "type": "null"
@@ -4569,6 +5065,148 @@
       "type": "object"
     },
     "DashboardEnvelopeV127": {
+      "description": "The normative read-model envelope. Every V2 read-model route returns exactly\nthis shape; only `payload` varies by route.",
+      "properties": {
+        "authorization": {
+          "$ref": "#/$defs/DashboardAuthorizationV1"
+        },
+        "coverage": {
+          "$ref": "#/$defs/DashboardCoverageV1"
+        },
+        "domain_state": {
+          "$ref": "#/$defs/DashboardDomainStateV1"
+        },
+        "freshness": {
+          "$ref": "#/$defs/DashboardFreshnessV1"
+        },
+        "legal_actions": {
+          "items": {
+            "$ref": "#/$defs/DashboardLegalActionRefV1"
+          },
+          "type": "array"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LcmOverviewPayloadV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/DashboardScopeV1"
+        },
+        "source_watermark": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DashboardWatermarkV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time": {
+          "$ref": "#/$defs/DashboardTimeV1"
+        },
+        "version": {
+          "$ref": "#/$defs/DashboardVersionV1"
+        }
+      },
+      "required": [
+        "schema_revision",
+        "scope",
+        "version",
+        "time",
+        "source_watermark",
+        "authorization",
+        "coverage",
+        "freshness",
+        "domain_state",
+        "legal_actions",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "DashboardEnvelopeV128": {
+      "description": "The normative read-model envelope. Every V2 read-model route returns exactly\nthis shape; only `payload` varies by route.",
+      "properties": {
+        "authorization": {
+          "$ref": "#/$defs/DashboardAuthorizationV1"
+        },
+        "coverage": {
+          "$ref": "#/$defs/DashboardCoverageV1"
+        },
+        "domain_state": {
+          "$ref": "#/$defs/DashboardDomainStateV1"
+        },
+        "freshness": {
+          "$ref": "#/$defs/DashboardFreshnessV1"
+        },
+        "legal_actions": {
+          "items": {
+            "$ref": "#/$defs/DashboardLegalActionRefV1"
+          },
+          "type": "array"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LcmSearchPayloadV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_revision": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/DashboardScopeV1"
+        },
+        "source_watermark": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DashboardWatermarkV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time": {
+          "$ref": "#/$defs/DashboardTimeV1"
+        },
+        "version": {
+          "$ref": "#/$defs/DashboardVersionV1"
+        }
+      },
+      "required": [
+        "schema_revision",
+        "scope",
+        "version",
+        "time",
+        "source_watermark",
+        "authorization",
+        "coverage",
+        "freshness",
+        "domain_state",
+        "legal_actions",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "DashboardEnvelopeV129": {
       "description": "The normative read-model envelope. Every V2 read-model route returns exactly\nthis shape; only `payload` varies by route.",
       "properties": {
         "authorization": {
@@ -5321,6 +5959,156 @@
       ],
       "type": "object"
     },
+    "DeliveryAttentionEvidenceV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "fetched_at_micros": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "kind": {
+              "const": "provider_operation",
+              "type": "string"
+            },
+            "operation": {
+              "$ref": "#/$defs/DeliveryGitHubReadOperationV1"
+            }
+          },
+          "required": [
+            "kind",
+            "operation",
+            "fetched_at_micros"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "comment_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "review_comment",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "comment_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "failure_anchor": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "ci_failure",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "failure_anchor"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "generation": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "indexed_generation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "generation"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DeliveryAttentionItemV1": {
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/DeliveryInboxCoverageV1"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/DeliveryAttentionEvidenceV1"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "observed_at_micros": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "pull_request_id": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/DeliveryAttentionSourceV1"
+        },
+        "state": {
+          "$ref": "#/$defs/DeliveryAttentionStateV1"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "pull_request_id",
+        "source",
+        "state",
+        "evidence",
+        "coverage",
+        "observed_at_micros"
+      ],
+      "type": "object"
+    },
+    "DeliveryAttentionSourceV1": {
+      "enum": [
+        "ci_failure",
+        "unresolved_review",
+        "new_review_comment",
+        "contradiction",
+        "unsafe_pattern",
+        "test_risk",
+        "unreviewed_changed_code",
+        "weak_evidence",
+        "evidence_gap",
+        "overlapping_edit",
+        "confirmed_conflict",
+        "divergent_shared_implementation",
+        "stale_provider_state"
+      ],
+      "type": "string"
+    },
+    "DeliveryAttentionStateV1": {
+      "enum": [
+        "active",
+        "clear",
+        "unavailable",
+        "denied"
+      ],
+      "type": "string"
+    },
     "DeliveryCiAnnotationLevelV1": {
       "enum": [
         "notice",
@@ -5852,6 +6640,288 @@
         "ignored",
         "changed_paths",
         "schema_version"
+      ],
+      "type": "object"
+    },
+    "DeliveryInboxCoverageV1": {
+      "enum": [
+        "complete",
+        "partial",
+        "stale",
+        "denied",
+        "unavailable",
+        "unsupported"
+      ],
+      "type": "string"
+    },
+    "DeliveryInboxProjectV1": {
+      "properties": {
+        "branch_ref": {
+          "type": "string"
+        },
+        "git_common_dir": {
+          "type": "string"
+        },
+        "indexed_generation": {
+          "type": "string"
+        },
+        "indexed_head_commit_id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "project_root": {
+          "type": "string"
+        },
+        "provider_state": {
+          "$ref": "#/$defs/DeliveryProviderStateV1"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "worktree_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "label",
+        "project_root",
+        "git_common_dir",
+        "repository_id",
+        "worktree_id",
+        "branch_ref",
+        "indexed_head_commit_id",
+        "indexed_generation",
+        "provider_state"
+      ],
+      "type": "object"
+    },
+    "DeliveryInboxPullRequestStateV1": {
+      "enum": [
+        "current",
+        "partial",
+        "stale"
+      ],
+      "type": "string"
+    },
+    "DeliveryInboxPullRequestV1": {
+      "properties": {
+        "attention": {
+          "items": {
+            "$ref": "#/$defs/DeliveryAttentionItemV1"
+          },
+          "type": "array"
+        },
+        "branch_ref": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "indexed_generation": {
+          "type": "string"
+        },
+        "indexed_head_commit_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/DeliveryPullRequestV1"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "shared_code": {
+          "items": {
+            "$ref": "#/$defs/DeliverySharedCodeRefV1"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/DeliveryInboxPullRequestStateV1"
+        },
+        "worktree_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "repository_id",
+        "worktree_id",
+        "branch_ref",
+        "indexed_head_commit_id",
+        "indexed_generation",
+        "state",
+        "pull_request",
+        "attention",
+        "shared_code"
+      ],
+      "type": "object"
+    },
+    "DeliveryInboxV1": {
+      "properties": {
+        "excluded_pull_requests": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "membership_edges": {
+          "items": {
+            "$ref": "#/$defs/DeliveryMembershipEdgeV1"
+          },
+          "type": "array"
+        },
+        "omitted_projects": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/DeliveryInboxProjectV1"
+          },
+          "type": "array"
+        },
+        "pull_requests": {
+          "items": {
+            "$ref": "#/$defs/DeliveryInboxPullRequestV1"
+          },
+          "type": "array"
+        },
+        "registry_state": {
+          "$ref": "#/$defs/DeliveryRegistryStateV1"
+        }
+      },
+      "required": [
+        "registry_state",
+        "projects",
+        "pull_requests",
+        "membership_edges",
+        "omitted_projects",
+        "excluded_pull_requests"
+      ],
+      "type": "object"
+    },
+    "DeliveryMembershipBasisV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "shared_work_objective",
+              "type": "string"
+            },
+            "work_item_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "work_item_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "commit_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "session_git_relation",
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "session_id",
+            "commit_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "handoff_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "explicit_handoff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "handoff_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agent_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "shared_agent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "agent_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "branch_ref": {
+              "type": "string"
+            },
+            "head_commit_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "branch_pull_request_reference",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "branch_ref",
+            "head_commit_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DeliveryMembershipEdgeV1": {
+      "properties": {
+        "basis": {
+          "$ref": "#/$defs/DeliveryMembershipBasisV1"
+        },
+        "id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "pull_request_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "pull_request_id",
+        "basis"
       ],
       "type": "object"
     },
@@ -7494,6 +8564,20 @@
         }
       ]
     },
+    "DeliveryProviderStateV1": {
+      "enum": [
+        "ready",
+        "partial",
+        "stale",
+        "rate_limited",
+        "failed",
+        "denied",
+        "not_published",
+        "not_configured",
+        "unavailable"
+      ],
+      "type": "string"
+    },
     "DeliveryPullRequestIdentityV1": {
       "properties": {
         "additions": {
@@ -7670,6 +8754,14 @@
         "reset_at_micros"
       ],
       "type": "object"
+    },
+    "DeliveryRegistryStateV1": {
+      "enum": [
+        "ready",
+        "partial",
+        "unavailable"
+      ],
+      "type": "string"
     },
     "DeliveryReleaseAssetV1": {
       "properties": {
@@ -8041,6 +9133,42 @@
       ],
       "type": "object"
     },
+    "DeliverySharedCodeRefKindV1": {
+      "enum": [
+        "shared_code",
+        "compare"
+      ],
+      "type": "string"
+    },
+    "DeliverySharedCodeRefStateV1": {
+      "enum": [
+        "requires_selection"
+      ],
+      "type": "string"
+    },
+    "DeliverySharedCodeRefV1": {
+      "properties": {
+        "href": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/DeliverySharedCodeRefKindV1"
+        },
+        "source_generation": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/DeliverySharedCodeRefStateV1"
+        }
+      },
+      "required": [
+        "kind",
+        "state",
+        "href",
+        "source_generation"
+      ],
+      "type": "object"
+    },
     "DoctorCoverageCompletenessV1": {
       "description": "Whether Doctor observed all of a family's evidence sources.",
       "oneOf": [
@@ -8239,7 +9367,7 @@
       ]
     },
     "DoctorFindingFamilyV1": {
-      "description": "Stable Doctor finding families.\n\nThe initial list covers advisory findings from\nBrain, Explorer, Loom, Code, and Observatory, plus the legacy\n`core_doctor` checks (graph quick-check, temporal/migration health,\nconfiguration compatibility drift, semantic runtime, session ingest).\nEach family maps to one audited typed input surface. The set is kept small\nand honest; new families are added through a future versioned enum rather\nthan by widening the meaning of an existing variant.",
+      "description": "Stable Doctor finding families.\n\nThe initial list covers advisory findings from\nBrain, Explorer, Loom, Code, and Observatory, plus the legacy\n`core_doctor` checks (graph quick-check, temporal/migration health,\nconfiguration compatibility drift, code-index mount state, session ingest).\nEach family maps to one audited typed input surface. The set is kept small\nand honest; new families are added through a future versioned enum rather\nthan by widening the meaning of an existing variant.",
       "oneOf": [
         {
           "const": "advisory",
@@ -8267,8 +9395,8 @@
           "type": "string"
         },
         {
-          "const": "semantic_index",
-          "description": "Semantic search / index runtime state (indexing, stale, unavailable).",
+          "const": "code_index",
+          "description": "Code index mount state (mounted, indexing, stale, unmounted,\nincompatible, parked).",
           "type": "string"
         },
         {
@@ -8342,6 +9470,12 @@
               "type": "null"
             }
           ]
+        },
+        "schema_convergences": {
+          "items": {
+            "$ref": "#/$defs/SchemaConvergenceFindingV1"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -8349,6 +9483,7 @@
         "entries",
         "report_coverage",
         "known_families",
+        "schema_convergences",
         "note"
       ],
       "type": "object"
@@ -9664,8 +10799,8 @@
           "items": {
             "$ref": "#/$defs/ExplorerSourceIdV1"
           },
-          "maxItems": 4,
-          "minItems": 4,
+          "maxItems": 3,
+          "minItems": 3,
           "type": "array"
         },
         "run_id": {
@@ -9879,23 +11014,19 @@
       "enum": [
         "code_graph",
         "sessions",
-        "knowledge",
-        "semantic"
+        "knowledge"
       ],
       "type": "string"
     },
     "ExplorerSourceOutcomeV1": {
-      "description": "What one source truthfully concluded for this run. Every member has a real\nproducer; none is speculative:\n- `Partial`: the source answered with rows but its own read reported\n  omitted records (LCM temporal reads).\n- `Indexing`: the provider is acquiring its model or projecting vectors\n  (semantic runtime acquisition/indexing states).\n- `Stale`: the source's store exists but does not match the current\n  generation (verified graph stale reads, LCM stale projections, semantic\n  generation staleness).\n- `TimedOut`: the source's own read exceeded the admitted deadline.\n- `Unsupported`: this dashboard surface cannot consult the source at all\n  (no daemon authority attached, or the provider state cannot be consumed\n  on this surface yet).\n- `Absent`: the source's store does not exist for this project — a typed\n  absence, not a failure (semantic search not activated).",
+      "description": "What one source truthfully concluded for this run. Every member has a real\nproducer; none is speculative:\n- `Partial`: the source answered with rows but its own read reported\n  omitted records (LCM temporal reads).\n- `Stale`: the source's store exists but does not match the current\n  generation (verified graph stale reads, LCM stale projections).\n- `TimedOut`: the source's own read exceeded the admitted deadline.",
       "enum": [
         "pending",
         "ready",
         "partial",
-        "indexing",
         "stale",
         "timed_out",
         "unavailable",
-        "unsupported",
-        "absent",
         "error",
         "cancelled"
       ],
@@ -10496,6 +11627,467 @@
       ],
       "type": "object"
     },
+    "FeedbackProximityAccessKindV1": {
+      "enum": [
+        "read",
+        "write"
+      ],
+      "type": "string"
+    },
+    "FeedbackProximityCloneHandleV1": {
+      "additionalProperties": false,
+      "properties": {
+        "retrieval_anchor_ids": {
+          "items": {
+            "$ref": "#/$defs/RetrievalAnchorId"
+          },
+          "type": "array"
+        },
+        "source_generation": {
+          "$ref": "#/$defs/CodeGenerationId"
+        },
+        "source_symbol": {
+          "$ref": "#/$defs/SymbolOccurrenceId"
+        }
+      },
+      "required": [
+        "source_generation",
+        "source_symbol",
+        "retrieval_anchor_ids"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityConflictDifferenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "difference_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
+        "file": {
+          "$ref": "#/$defs/FileOccurrenceId"
+        },
+        "span": {
+          "$ref": "#/$defs/SourceSpan"
+        }
+      },
+      "required": [
+        "file",
+        "span",
+        "difference_digest"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityConflictHandleV1": {
+      "additionalProperties": false,
+      "properties": {
+        "common_base_revision": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "differences": {
+          "items": {
+            "$ref": "#/$defs/FeedbackProximityConflictDifferenceV1"
+          },
+          "type": "array"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
+        "left_head_revision": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "right_head_revision": {
+          "$ref": "#/$defs/CommitId"
+        }
+      },
+      "required": [
+        "common_base_revision",
+        "left_head_revision",
+        "right_head_revision",
+        "evidence_digest",
+        "differences"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityEncounterV1": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/ProximityCoverageV1"
+        },
+        "encounter_id": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/UtcMicros"
+        },
+        "interval": {
+          "$ref": "#/$defs/FeedbackProximityIntervalV1"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/UtcMicros"
+        },
+        "participants": {
+          "items": {
+            "$ref": "#/$defs/FeedbackProximityParticipantV1"
+          },
+          "type": "array"
+        },
+        "relation": {
+          "$ref": "#/$defs/FeedbackProximityRelationV1"
+        },
+        "scope": {
+          "$ref": "#/$defs/FeedbackScopeV1"
+        }
+      },
+      "required": [
+        "encounter_id",
+        "scope",
+        "interval",
+        "participants",
+        "relation",
+        "observed_at",
+        "expires_at",
+        "coverage"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityIntervalV1": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "$ref": "#/$defs/UtcMicros"
+        },
+        "start": {
+          "$ref": "#/$defs/UtcMicros"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityOmissionV1": {
+      "enum": [
+        "active_session_limit",
+        "session_activity_limit",
+        "recent_observation_limit",
+        "edited_path_limit",
+        "encounter_limit",
+        "missing_participant_observation",
+        "missing_participant_worktree",
+        "missing_participant_revision",
+        "missing_code_address",
+        "clone_coverage_partial",
+        "conflict_evidence_unavailable",
+        "code_index_revision_mismatch"
+      ],
+      "type": "string"
+    },
+    "FeedbackProximityParticipantV1": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "$ref": "#/$defs/FeedbackProximityAccessKindV1"
+        },
+        "activity": {
+          "$ref": "#/$defs/FeedbackProximityIntervalV1"
+        },
+        "address": {
+          "$ref": "#/$defs/ProximityAddressV1"
+        },
+        "agent_id": {
+          "$ref": "#/$defs/AgentInstanceId"
+        },
+        "branch_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RefId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "head_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommitId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/ObservationSourceIdentityV1"
+        },
+        "worktree_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorktreeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "worktree_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "agent_id",
+        "worktree_id",
+        "worktree_root",
+        "branch_ref",
+        "head_revision",
+        "access",
+        "activity",
+        "address"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityReadPageV1": {
+      "additionalProperties": false,
+      "properties": {
+        "encounters": {
+          "items": {
+            "$ref": "#/$defs/FeedbackProximityEncounterV1"
+          },
+          "type": "array"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/UtcMicros"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/UtcMicros"
+        },
+        "scope": {
+          "$ref": "#/$defs/FeedbackScopeV1"
+        },
+        "source_generation": {
+          "$ref": "#/$defs/CodeGenerationId"
+        }
+      },
+      "required": [
+        "scope",
+        "source_generation",
+        "observed_at",
+        "expires_at",
+        "encounters"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityReadRequestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "observed_at": {
+          "$ref": "#/$defs/UtcMicros"
+        }
+      },
+      "required": [
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "FeedbackProximityReadResultV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "page": {
+              "$ref": "#/$defs/FeedbackProximityReadPageV1"
+            },
+            "state": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "page"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "page": {
+              "$ref": "#/$defs/FeedbackProximityReadPageV1"
+            },
+            "state": {
+              "const": "complete_zero",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "page"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "omissions": {
+              "items": {
+                "$ref": "#/$defs/FeedbackProximityOmissionV1"
+              },
+              "type": "array"
+            },
+            "page": {
+              "$ref": "#/$defs/FeedbackProximityReadPageV1"
+            },
+            "state": {
+              "const": "partial",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "page",
+            "omissions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "omissions": {
+              "items": {
+                "$ref": "#/$defs/FeedbackProximityOmissionV1"
+              },
+              "type": "array"
+            },
+            "page": {
+              "$ref": "#/$defs/FeedbackProximityReadPageV1"
+            },
+            "state": {
+              "const": "stale",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "page",
+            "omissions"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "observed_at": {
+              "$ref": "#/$defs/UtcMicros"
+            },
+            "state": {
+              "const": "denied",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observed_at"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "observed_at": {
+              "$ref": "#/$defs/UtcMicros"
+            },
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "observed_at"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "FeedbackProximityRelationV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "relation_kind": {
+              "const": "code_neighborhood_candidate",
+              "type": "string"
+            },
+            "warning_class": {
+              "$ref": "#/$defs/ProximityWarningClassV1"
+            }
+          },
+          "required": [
+            "relation_kind",
+            "warning_class"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "clone_handle": {
+              "$ref": "#/$defs/FeedbackProximityCloneHandleV1"
+            },
+            "relation_kind": {
+              "const": "shared_code_candidate",
+              "type": "string"
+            },
+            "warning_class": {
+              "$ref": "#/$defs/ProximityWarningClassV1"
+            }
+          },
+          "required": [
+            "relation_kind",
+            "warning_class",
+            "clone_handle"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "relation_kind": {
+              "const": "overlapping_edit",
+              "type": "string"
+            },
+            "warning_class": {
+              "$ref": "#/$defs/ProximityWarningClassV1"
+            }
+          },
+          "required": [
+            "relation_kind",
+            "warning_class"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "conflict_handle": {
+              "$ref": "#/$defs/FeedbackProximityConflictHandleV1"
+            },
+            "relation_kind": {
+              "const": "confirmed_conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "relation_kind",
+            "conflict_handle"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "FeedbackRejectedArgumentGroupV1": {
       "additionalProperties": false,
       "description": "One surface × operation × argument × error-class cell projected from\ndispatcher rejection source events.",
@@ -10524,6 +12116,35 @@
         "argument",
         "error_class",
         "count"
+      ],
+      "type": "object"
+    },
+    "FeedbackScopeV1": {
+      "additionalProperties": false,
+      "description": "Exact repository scope used for a feedback evaluation. A path, current\nworking directory, repository display name, or mutable branch label is not\na substitute for this identity.",
+      "properties": {
+        "branch_ref": {
+          "type": "string"
+        },
+        "head_commit_id": {
+          "$ref": "#/$defs/CommitId"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "repository_id": {
+          "$ref": "#/$defs/RepositoryId"
+        },
+        "worktree_id": {
+          "$ref": "#/$defs/WorktreeId"
+        }
+      },
+      "required": [
+        "project_id",
+        "repository_id",
+        "worktree_id",
+        "branch_ref",
+        "head_commit_id"
       ],
       "type": "object"
     },
@@ -10658,6 +12279,10 @@
       ],
       "type": "object"
     },
+    "FileOccurrenceId": {
+      "description": "Strongly typed canonical identity: `FileOccurrenceId`.",
+      "type": "string"
+    },
     "GenerateProposalRequest": {
       "additionalProperties": false,
       "description": "Read-only proposal generation over one exact current product graph.",
@@ -10725,6 +12350,10 @@
         "disabled",
         "probe_private_preview"
       ],
+      "type": "string"
+    },
+    "GitOidV1": {
+      "description": "A native Git object id (commit, tree, or blob), lowercase hex, SHA-1 or\nSHA-256 length. This is identity evidence only; it never authorizes\nobject reconstruction or traversal outside native Git.",
       "type": "string"
     },
     "GraphCappedV1": {
@@ -16436,6 +18065,71 @@
       ],
       "type": "object"
     },
+    "ProximityAddressV1": {
+      "additionalProperties": false,
+      "description": "A privacy-scoped code address. It identifies the coarse changed-code shape\nbut carries no other actor, session, or private-source content.",
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/FileOccurrenceId"
+        },
+        "scope": {
+          "$ref": "#/$defs/FeedbackScopeV1"
+        },
+        "span": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceSpan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "symbol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SymbolOccurrenceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "scope",
+        "file",
+        "span",
+        "symbol"
+      ],
+      "type": "object"
+    },
+    "ProximityCoverageV1": {
+      "enum": [
+        "complete",
+        "partial",
+        "stale",
+        "unavailable",
+        "denied",
+        "private"
+      ],
+      "type": "string"
+    },
+    "ProximityWarningClassV1": {
+      "enum": [
+        "same_file",
+        "overlapping_range",
+        "same_symbol",
+        "same_package",
+        "same_crate",
+        "neighborhood",
+        "shared_caller",
+        "shared_dependency",
+        "shared_test",
+        "incompatible_branch_worktree"
+      ],
+      "type": "string"
+    },
     "PublicCodeProject": {
       "properties": {
         "canonical_root": {
@@ -17312,6 +19006,260 @@
       ],
       "type": "object"
     },
+    "ReviewWorkProposalDispositionV1": {
+      "description": "The only non-accepting dispositions the proposal-review operation can\ncommit. The broader decision request remains available to the graph\nmutation operation, which owns all decision forms.",
+      "enum": [
+        "rejected",
+        "superseded"
+      ],
+      "type": "string"
+    },
+    "ReviewWorkProposalRequestV1": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "$ref": "#/$defs/ReviewWorkProposalDispositionV1"
+        },
+        "mutation": {
+          "$ref": "#/$defs/WorkProductMutationIdentityV1"
+        },
+        "proposal": {
+          "$ref": "#/$defs/WorkProposalV1"
+        },
+        "selection": {
+          "$ref": "#/$defs/WorkProductSelectionScopeV1"
+        }
+      },
+      "required": [
+        "selection",
+        "proposal",
+        "disposition",
+        "mutation"
+      ],
+      "type": "object"
+    },
+    "RevisionPairChangeV1": {
+      "enum": [
+        "unchanged",
+        "added",
+        "removed",
+        "changed"
+      ],
+      "type": "string"
+    },
+    "RevisionPairFileDispositionV1": {
+      "enum": [
+        "present",
+        "deleted",
+        "renamed",
+        "ignored",
+        "binary",
+        "generated",
+        "unsupported_language"
+      ],
+      "type": "string"
+    },
+    "RevisionPairFileRegionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevisionPairFileV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "change": {
+          "$ref": "#/$defs/RevisionPairChangeV1"
+        },
+        "file_identity": {
+          "type": "string"
+        },
+        "head": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevisionPairFileV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "file_identity",
+        "change",
+        "base",
+        "head"
+      ],
+      "type": "object"
+    },
+    "RevisionPairFileV1": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": {
+          "$ref": "#/$defs/ContentDigest"
+        },
+        "disposition": {
+          "$ref": "#/$defs/RevisionPairFileDispositionV1"
+        },
+        "file_occurrence_id": {
+          "$ref": "#/$defs/FileOccurrenceId"
+        },
+        "path": {
+          "type": "string"
+        },
+        "symbol_identities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "file_occurrence_id",
+        "path",
+        "content_digest",
+        "disposition",
+        "symbol_identities"
+      ],
+      "type": "object"
+    },
+    "RevisionPairRevisionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "$ref": "#/$defs/CodeGenerationId"
+        },
+        "reference": {
+          "$ref": "#/$defs/RefId"
+        },
+        "revision": {
+          "$ref": "#/$defs/GitOidV1"
+        },
+        "tree": {
+          "$ref": "#/$defs/GitOidV1"
+        }
+      },
+      "required": [
+        "reference",
+        "revision",
+        "tree",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "RevisionPairSymbolRegionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevisionPairSymbolV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "change": {
+          "$ref": "#/$defs/RevisionPairChangeV1"
+        },
+        "head": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RevisionPairSymbolV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "symbol_identity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol_identity",
+        "change",
+        "base",
+        "head"
+      ],
+      "type": "object"
+    },
+    "RevisionPairSymbolV1": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string"
+        },
+        "file_identity": {
+          "type": "string"
+        },
+        "file_occurrence_id": {
+          "$ref": "#/$defs/FileOccurrenceId"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "qualified_name": {
+          "type": "string"
+        },
+        "symbol_occurrence_id": {
+          "$ref": "#/$defs/SymbolOccurrenceId"
+        }
+      },
+      "required": [
+        "symbol_occurrence_id",
+        "file_identity",
+        "file_occurrence_id",
+        "qualified_name",
+        "name",
+        "kind",
+        "file",
+        "content_digest"
+      ],
+      "type": "object"
+    },
+    "RevisionPairUnionLayoutV1": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "$ref": "#/$defs/RevisionPairRevisionV1"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/RevisionPairFileRegionV1"
+          },
+          "type": "array"
+        },
+        "head": {
+          "$ref": "#/$defs/RevisionPairRevisionV1"
+        },
+        "symbols": {
+          "items": {
+            "$ref": "#/$defs/RevisionPairSymbolRegionV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "base",
+        "head",
+        "files",
+        "symbols"
+      ],
+      "type": "object"
+    },
     "RootGenerationV1": {
       "additionalProperties": false,
       "description": "Immutable collection and stack revisions for one exact resolved root.",
@@ -17992,6 +19940,119 @@
       ],
       "type": "object"
     },
+    "SchemaConvergenceFindingV1": {
+      "additionalProperties": false,
+      "properties": {
+        "degraded_row": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progress": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SchemaConvergenceProgressV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "$ref": "#/$defs/SchemaConvergenceStageV1"
+        },
+        "started_at_micros": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/SchemaConvergenceStateV1"
+        },
+        "store": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "store",
+        "stage",
+        "state",
+        "progress",
+        "started_at_micros",
+        "degraded_row"
+      ],
+      "type": "object"
+    },
+    "SchemaConvergenceProgressV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unit": {
+              "const": "rows",
+              "type": "string"
+            }
+          },
+          "required": [
+            "unit",
+            "done",
+            "remaining"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "remaining": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "unit": {
+              "const": "pages",
+              "type": "string"
+            }
+          },
+          "required": [
+            "unit",
+            "done",
+            "remaining"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SchemaConvergenceStageV1": {
+      "enum": [
+        "registered_schema",
+        "runtime_writer_ledger"
+      ],
+      "type": "string"
+    },
+    "SchemaConvergenceStateV1": {
+      "enum": [
+        "pending_schema_migration",
+        "released_shape_convergence_in_progress",
+        "degraded",
+        "completed"
+      ],
+      "type": "string"
+    },
     "SchemaId": {
       "description": "Stable, canonical catalog identity for `SchemaId`.",
       "type": "string"
@@ -18333,6 +20394,70 @@
       "description": "Strongly typed canonical identity: `SessionId`.",
       "type": "string"
     },
+    "SessionRetrievalBudgetAccountingV1": {
+      "additionalProperties": false,
+      "description": "The ceiling and count behind a budget refusal.\n\n`stage` names which budget refused; this is what tells an oversized request\napart from a read whose cost was mis-sized for it. The ceiling value also\ndistinguishes the resources inside one stage — a record read that stopped at\n1024 hit the item count, one that stopped at 16 MiB hit the byte total — so\nthe kernel's resource spelling stays in the kernel instead of becoming a\nsecond wire vocabulary to keep in step.",
+      "properties": {
+        "limit": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observed": {
+          "$ref": "#/$defs/SessionRetrievalBudgetObservationV1"
+        }
+      },
+      "required": [
+        "limit",
+        "observed"
+      ],
+      "type": "object"
+    },
+    "SessionRetrievalBudgetObservationV1": {
+      "description": "What a refusing budget boundary had counted.\n\nBoth variants are exact. A bounded read never counts the rows it declined to\nread, so an exhausted read reports what it consumed and that storage held\nmore — never a total it would have to run the refused scan to learn.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The request asked for more units than the admitted maximum.",
+          "properties": {
+            "observation": {
+              "const": "requested",
+              "type": "string"
+            },
+            "units": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "observation",
+            "units"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The read consumed its whole budget and storage still held more.",
+          "properties": {
+            "observation": {
+              "const": "consumed_with_more_available",
+              "type": "string"
+            },
+            "units": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "observation",
+            "units"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SessionRetrievalBudgetStageV1": {
       "description": "Structural budget boundary that rejected a session retrieval request.\nThese causes are non-retryable request corrections; concurrent permit or\nqueue pressure remains a separate capacity-saturation failure.",
       "enum": [
@@ -18344,9 +20469,12 @@
         "request_hydration_bytes",
         "estimator_version_mismatch",
         "execution_work_exhausted",
+        "candidate_read_exhausted",
+        "record_read_exhausted",
         "kernel_result_limit",
         "participant_manifest_participants",
         "participant_manifest_canonical_bytes",
+        "cursor_manifest_limit",
         "hydration_bytes",
         "context_bytes",
         "context_tokens"
@@ -18387,6 +20515,17 @@
         {
           "additionalProperties": false,
           "properties": {
+            "accounting": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SessionRetrievalBudgetAccountingV1"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present when the refusing boundary keeps a counter. A request-shape\ncheck has none and reports `None` rather than inventing numbers."
+            },
             "refusal": {
               "const": "budget_exhausted",
               "type": "string"
@@ -18397,7 +20536,8 @@
           },
           "required": [
             "refusal",
-            "stage"
+            "stage",
+            "accounting"
           ],
           "type": "object"
         }
@@ -18527,6 +20667,221 @@
         "growth_bytes",
         "previous_observed_at",
         "current_observed_at"
+      ],
+      "type": "object"
+    },
+    "SimilarCoverageV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "partial",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "minimum_tokens": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "const": "excluded_too_small",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "minimum_tokens"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "excluded_incomplete_tokenization",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SimilarFamilyV1": {
+      "additionalProperties": false,
+      "properties": {
+        "complete": {
+          "type": "boolean"
+        },
+        "family_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
+        "match_class": {
+          "$ref": "#/$defs/SimilarMatchClassV1"
+        },
+        "member_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/SimilarOccurrenceV1"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "normalization_revision": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "representative_payload_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        }
+      },
+      "required": [
+        "match_class",
+        "normalization_revision",
+        "family_digest",
+        "representative_payload_digest",
+        "member_count",
+        "members",
+        "complete",
+        "next_cursor"
+      ],
+      "type": "object"
+    },
+    "SimilarMatchClassV1": {
+      "enum": [
+        "conservative_exact",
+        "rename_normalized_exact"
+      ],
+      "type": "string"
+    },
+    "SimilarOccurrenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "body_span": {
+          "$ref": "#/$defs/SourceSpan"
+        },
+        "path": {
+          "type": "string"
+        },
+        "project_id": {
+          "$ref": "#/$defs/ProjectId"
+        },
+        "repository_id": {
+          "$ref": "#/$defs/RepositoryId"
+        },
+        "snapshot_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
+        "source_generation": {
+          "$ref": "#/$defs/CodeGenerationId"
+        },
+        "symbol_occurrence_id": {
+          "$ref": "#/$defs/SymbolOccurrenceId"
+        },
+        "worktree_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorktreeId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "project_id",
+        "repository_id",
+        "worktree_id",
+        "source_generation",
+        "snapshot_digest",
+        "symbol_occurrence_id",
+        "path",
+        "body_span"
+      ],
+      "type": "object"
+    },
+    "SimilarResultV1": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/SimilarCoverageV1"
+        },
+        "families": {
+          "items": {
+            "$ref": "#/$defs/SimilarFamilyV1"
+          },
+          "type": "array"
+        },
+        "source": {
+          "$ref": "#/$defs/SimilarOccurrenceV1"
+        },
+        "source_generation": {
+          "$ref": "#/$defs/CodeGenerationId"
+        }
+      },
+      "required": [
+        "source",
+        "families",
+        "source_generation",
+        "coverage"
+      ],
+      "type": "object"
+    },
+    "SourceSpan": {
+      "additionalProperties": false,
+      "description": "Byte range inside one sanitized source file. Mutable line numbers are\nnever part of identity.",
+      "properties": {
+        "end_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start_byte": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start_byte",
+        "end_byte"
       ],
       "type": "object"
     },
@@ -18678,6 +21033,12 @@
               "type": "null"
             }
           ]
+        },
+        "schema_convergences": {
+          "items": {
+            "$ref": "#/$defs/SchemaConvergenceFindingV1"
+          },
+          "type": "array"
         }
       },
       "required": [
@@ -18685,6 +21046,7 @@
         "entries",
         "report_coverage",
         "known_families",
+        "schema_convergences",
         "note",
         "kind_statuses"
       ],
@@ -19631,6 +21993,10 @@
           "type": "object"
         }
       ]
+    },
+    "SymbolOccurrenceId": {
+      "description": "Strongly typed canonical identity: `SymbolOccurrenceId`.",
+      "type": "string"
     },
     "SyncSettingsPatch": {
       "additionalProperties": false,
@@ -26214,6 +28580,9 @@
           },
           "type": "array"
         },
+        "configuration_digest": {
+          "$ref": "#/$defs/ManifestDigest"
+        },
         "evidence_digest": {
           "$ref": "#/$defs/ManifestDigest"
         },
@@ -26245,7 +28614,8 @@
         "children",
         "route",
         "explanation",
-        "evidence_digest"
+        "evidence_digest",
+        "configuration_digest"
       ],
       "type": "object"
     },
@@ -29000,12 +31370,6 @@
     "WorkflowRunProjection": {
       "additionalProperties": false,
       "properties": {
-        "active_fan_out_attempts": {
-          "additionalProperties": {
-            "$ref": "#/$defs/WorkAttemptIdentityV1"
-          },
-          "type": "object"
-        },
         "definition": {
           "$ref": "#/$defs/WorkflowDefinition"
         },
@@ -29070,7 +31434,6 @@
         "fan_out_plans",
         "released_fan_out_attempts",
         "settled_fan_out_attempts",
-        "active_fan_out_attempts",
         "history"
       ],
       "type": "object"
@@ -29423,25 +31786,25 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "analytics_agents": {
-      "$ref": "#/$defs/DashboardEnvelopeV117"
-    },
-    "analytics_diagnostics": {
-      "$ref": "#/$defs/DashboardEnvelopeV121"
-    },
-    "analytics_hints": {
       "$ref": "#/$defs/DashboardEnvelopeV119"
     },
+    "analytics_diagnostics": {
+      "$ref": "#/$defs/DashboardEnvelopeV123"
+    },
+    "analytics_hints": {
+      "$ref": "#/$defs/DashboardEnvelopeV121"
+    },
     "analytics_overview": {
-      "$ref": "#/$defs/DashboardEnvelopeV115"
+      "$ref": "#/$defs/DashboardEnvelopeV117"
     },
     "analytics_subagent_tree": {
-      "$ref": "#/$defs/DashboardEnvelopeV118"
-    },
-    "analytics_underused": {
       "$ref": "#/$defs/DashboardEnvelopeV120"
     },
+    "analytics_underused": {
+      "$ref": "#/$defs/DashboardEnvelopeV122"
+    },
     "analytics_usage": {
-      "$ref": "#/$defs/DashboardEnvelopeV116"
+      "$ref": "#/$defs/DashboardEnvelopeV118"
     },
     "automation_problem": {
       "$ref": "#/$defs/AutomationRunProblemV1"
@@ -29458,6 +31821,9 @@
     },
     "costs": {
       "$ref": "#/$defs/CostsReadModelV1"
+    },
+    "delivery_inbox": {
+      "$ref": "#/$defs/DeliveryInboxV1"
     },
     "delivery_overview": {
       "$ref": "#/$defs/DeliveryOverviewV1"
@@ -29480,8 +31846,14 @@
     "fact_store_curate_request": {
       "$ref": "#/$defs/FactStoreCurateRequestV1"
     },
+    "feedback_proximity": {
+      "$ref": "#/$defs/FeedbackProximityReadResultV1"
+    },
+    "feedback_proximity_request": {
+      "$ref": "#/$defs/FeedbackProximityReadRequestV1"
+    },
     "feedback_status": {
-      "$ref": "#/$defs/DashboardEnvelopeV127"
+      "$ref": "#/$defs/DashboardEnvelopeV129"
     },
     "graph_call_chain": {
       "$ref": "#/$defs/StructureReadV1"
@@ -29524,28 +31896,28 @@
       "description": "The handoff-token frontier. Contracted here because the Agents surface\nreads it directly off the mounted application route; the two `open_*`\noperations stay uncontracted for the dashboard because it never redeems\na bearer and must not grow a client that could."
     },
     "lcm_overview": {
-      "$ref": "#/$defs/DashboardEnvelopeV125"
+      "$ref": "#/$defs/DashboardEnvelopeV127"
     },
     "lcm_search": {
-      "$ref": "#/$defs/DashboardEnvelopeV126"
+      "$ref": "#/$defs/DashboardEnvelopeV128"
     },
     "lcm_session": {
-      "$ref": "#/$defs/DashboardEnvelopeV123"
+      "$ref": "#/$defs/DashboardEnvelopeV125"
     },
     "lcm_timeline": {
-      "$ref": "#/$defs/DashboardEnvelopeV124"
+      "$ref": "#/$defs/DashboardEnvelopeV126"
     },
     "loom_temporal": {
       "$ref": "#/$defs/LoomTemporalPayloadV1"
     },
     "memory_fact_detail": {
-      "$ref": "#/$defs/DashboardEnvelopeV114"
+      "$ref": "#/$defs/DashboardEnvelopeV116"
     },
     "memory_overview": {
-      "$ref": "#/$defs/DashboardEnvelopeV112"
+      "$ref": "#/$defs/DashboardEnvelopeV114"
     },
     "memory_status": {
-      "$ref": "#/$defs/DashboardEnvelopeV113"
+      "$ref": "#/$defs/DashboardEnvelopeV115"
     },
     "multi_root_capability": {
       "$ref": "#/$defs/MultiRootCapabilityV1"
@@ -29587,8 +31959,11 @@
     "remote_operational_status": {
       "$ref": "#/$defs/RemoteOperationalStatusPayloadV1"
     },
+    "revision_pair_union_layout": {
+      "$ref": "#/$defs/DashboardEnvelopeV113"
+    },
     "savings_overview": {
-      "$ref": "#/$defs/DashboardEnvelopeV122"
+      "$ref": "#/$defs/DashboardEnvelopeV124"
     },
     "savings_sessions": {
       "$ref": "#/$defs/SavingsSessionsPayloadV1"
@@ -29605,11 +31980,17 @@
     "settings_user_patch": {
       "$ref": "#/$defs/UserSettingsPatch"
     },
+    "shared_code_family": {
+      "$ref": "#/$defs/DashboardEnvelopeV112"
+    },
     "storage_findings": {
       "$ref": "#/$defs/StorageFindingsPayloadV1"
     },
     "storage_telemetry": {
       "$ref": "#/$defs/StorageTelemetryPayloadV1"
+    },
+    "work_accept_proposal_request": {
+      "$ref": "#/$defs/AcceptWorkProposalRequestV1"
     },
     "work_admit_execution_request": {
       "$ref": "#/$defs/AdmitWorkExecutionRequestV1"
@@ -29619,6 +32000,9 @@
     },
     "work_admit_synthesis_command": {
       "$ref": "#/$defs/AdmitWorkSynthesisCommand"
+    },
+    "work_admitted_execution": {
+      "$ref": "#/$defs/AdmittedWorkExecutionV1"
     },
     "work_artifact_hydration": {
       "$ref": "#/$defs/WorkArtifactHydrationV1"
@@ -29646,9 +32030,6 @@
     },
     "work_create_task_request": {
       "$ref": "#/$defs/CreateWorkTaskRequestV1"
-    },
-    "work_decide_proposal_request": {
-      "$ref": "#/$defs/DecideWorkProposalRequestV1"
     },
     "work_duplicate_adjudication_command": {
       "$ref": "#/$defs/WorkDuplicateAdjudicationCommandV1"
@@ -29740,6 +32121,9 @@
     "work_retry_attempt_outcome": {
       "$ref": "#/$defs/WorkRetryAttemptOutcomeV1"
     },
+    "work_review_proposal_request": {
+      "$ref": "#/$defs/ReviewWorkProposalRequestV1"
+    },
     "work_run_control": {
       "$ref": "#/$defs/WorkRunControlV1"
     },
@@ -29816,6 +32200,8 @@
     "graph_neighbors",
     "graph_subgraph",
     "graph_path",
+    "shared_code_family",
+    "revision_pair_union_layout",
     "memory_overview",
     "memory_status",
     "memory_fact_detail",
@@ -29835,8 +32221,11 @@
     "lcm_overview",
     "lcm_search",
     "loom_temporal",
+    "delivery_inbox",
     "delivery_overview",
     "feedback_status",
+    "feedback_proximity_request",
+    "feedback_proximity",
     "code_index_freshness",
     "settings",
     "settings_project_patch",
@@ -29852,8 +32241,10 @@
     "work_generate_proposal_request",
     "work_generated_proposal",
     "work_create_task_request",
-    "work_decide_proposal_request",
+    "work_review_proposal_request",
+    "work_accept_proposal_request",
     "work_admit_execution_request",
+    "work_admitted_execution",
     "work_start_attempt_command",
     "work_admit_synthesis_command",
     "work_synthesis_attempt",

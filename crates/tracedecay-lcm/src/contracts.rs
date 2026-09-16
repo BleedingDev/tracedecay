@@ -231,6 +231,7 @@ impl LcmRetrievalOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LcmExpandTarget {
+    CanonicalOccurrence { message_id: String },
     RawMessage { store_id: i64 },
     SummaryNode { node_id: String },
     ExternalPayload { payload_ref: String },
@@ -527,6 +528,12 @@ pub enum LcmError {
     /// instead of scheduling a retry.
     SanitizationRefused {
         reason: String,
+        /// Set when the sanitizer reached a quarantine verdict — it withheld
+        /// content it proved it cannot serve — rather than failing to run.
+        /// A verdict is the sanitizer's current rendering of these bytes, so a
+        /// re-render of already-captured content converges to the withheld
+        /// state; a fault stays fail-closed.
+        quarantined: bool,
     },
     Db(String),
     Io(String),
@@ -631,7 +638,7 @@ impl std::fmt::Display for LcmError {
             Self::BudgetExhausted => {
                 write!(f, "LCM payload verification budget was exhausted")
             }
-            Self::SanitizationRefused { reason } => {
+            Self::SanitizationRefused { reason, .. } => {
                 write!(f, "content sanitization refused: {reason}")
             }
             Self::Db(message) => write!(f, "payload database error: {message}"),

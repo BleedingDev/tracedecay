@@ -2734,6 +2734,87 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn kiro_doctor_accepts_the_canonical_mcp_only_install() {
+        use tracedecay_agent_hosts::agents::{
+            AgentIntegration, DoctorCounters, HealthcheckContext, KiroIntegration,
+        };
+
+        let _profile = pinned_host_profile();
+        let kiro_cli_dir = tempfile::tempdir().unwrap();
+        write_fake_kiro_cli(&kiro_cli_dir.path().join("kiro-cli"));
+        let _kiro_path =
+            tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(kiro_cli_dir.path());
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let lifecycle = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".kiro/steering")).unwrap();
+        std::fs::create_dir_all(home.path().join(".kiro/agents")).unwrap();
+        let legacy_steering = home.path().join(".kiro/steering/tracedecay.md");
+        let legacy_agent = home.path().join(".kiro/agents/tracedecay.json");
+        std::fs::write(
+            &legacy_steering,
+            "## Prefer tracedecay MCP tools\nold rules\n<!-- tracedecay:kiro:end -->\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &legacy_agent,
+            serde_json::to_vec(&serde_json::json!({
+                "name": "tracedecay",
+                "description": "Default Kiro agent with tracedecay MCP tools and code-research guardrails.",
+                "hooks": {"userPromptSubmit": [{
+                    "command": "tracedecay hook-kiro-prompt-submit",
+                    "timeout_ms": 5_000
+                }]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let component_set =
+            canonical_host_component_set_with_tracedecay_bin("kiro", None, 0, KIRO_FIXTURE_BIN)
+                .unwrap()
+                .unwrap();
+        apply_canonical_component_set(
+            "kiro",
+            HostBundleCliOperation::Install,
+            &component_set,
+            &crate::cli::HostBundleCliOptions {
+                component: None,
+                dry_run: false,
+                yes: true,
+                adopt: false,
+            },
+            home.path(),
+            lifecycle.path(),
+            &ComponentSetApplyContext::with_tracedecay_bin(KIRO_FIXTURE_BIN),
+        )
+        .unwrap();
+
+        assert!(
+            std::fs::read_to_string(&legacy_steering)
+                .unwrap()
+                .contains("old rules")
+        );
+        assert!(
+            std::fs::read_to_string(&legacy_agent)
+                .unwrap()
+                .contains("timeout_ms")
+        );
+
+        let mut counters = DoctorCounters::new();
+        KiroIntegration.healthcheck(
+            &mut counters,
+            &HealthcheckContext {
+                home: home.path().to_path_buf(),
+                project_path: project.path().to_path_buf(),
+            },
+        );
+        assert_eq!(counters.issues, 0);
+        assert_eq!(counters.warnings, 0);
+    }
+
     /// A transaction interrupted after it staged registration leaves a journal
     /// behind. The non-interactive path must recover that journal itself, or a
     /// single transient fault wedges every later run behind a manual
@@ -3938,10 +4019,12 @@ mod tests {
             tracedecay_agent_hosts::agents::kimi::KIMI_CODE_HOME_ENV,
             &code_home,
         );
+        let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay()
+            .unwrap_or_else(|| "tracedecay".to_string());
         let integration = tracedecay_agent_hosts::agents::get_integration("kimi").unwrap();
         let ctx = tracedecay_agent_hosts::agents::InstallContext {
             home: home.path().to_path_buf(),
-            tracedecay_bin: "new-tracedecay".to_string(),
+            tracedecay_bin: tracedecay_bin.clone(),
             tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()
                 .expect("tool catalog"),
             project_root: None,
@@ -3956,6 +4039,8 @@ mod tests {
             .join(".tracedecay/host-bundle-stage/kimi/tracedecay")
             .canonicalize()
             .unwrap();
+        let managed = code_home.join("plugins/managed/tracedecay");
+        copy_test_bundle(&staged, &managed);
         let installed_path = code_home.join("plugins/installed.json");
         std::fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
         std::fs::write(
@@ -3966,7 +4051,8 @@ mod tests {
                     "id": "tracedecay",
                     "enabled": true,
                     "source": "local-path",
-                    "root": staged,
+                    "root": managed,
+                    "originalSource": staged,
                 }],
             })
             .to_string(),
@@ -3976,7 +4062,7 @@ mod tests {
         let results = reinstall_agent_integrations_with_persisted_dashboard_policies(
             &["kimi".to_string()],
             home.path(),
-            "new-tracedecay",
+            &tracedecay_bin,
         )
         .await;
         assert!(matches!(

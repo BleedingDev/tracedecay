@@ -40,6 +40,7 @@ async fn join_abandoned_maintenance_task(task: Option<JoinHandle<()>>, owner: &'
     }
 }
 
+#[hotpath::measure(label = "daemon.maintenance.registered_store_retention", future = true)]
 async fn run_registered_store_retention(
     database: &tracedecay_global_db::RegisteredGlobalDb,
     config: &tracedecay_configuration::RetentionConfig,
@@ -142,6 +143,10 @@ async fn run_registered_store_retention(
     succeeded
 }
 
+#[hotpath::measure(
+    label = "daemon.maintenance.profile_observability_retention",
+    future = true
+)]
 async fn run_profile_observability_retention(
     database: &tracedecay_global_db::RegisteredGlobalDb,
 ) -> bool {
@@ -235,6 +240,7 @@ const BRANCH_STORE_GC_PERIOD: Duration = Duration::from_hours(24);
 #[derive(Clone)]
 pub(super) struct MaintenanceCoordinator {
     cancellation: tracedecay_session_memory::context::CancellationToken,
+    background_cpu: Option<Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>>,
     wake: Arc<MaintenanceWake>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
     metrics: Arc<Mutex<MaintenanceMetricsV1>>,
@@ -257,6 +263,7 @@ impl Default for MaintenanceCoordinator {
     fn default() -> Self {
         Self {
             cancellation: tracedecay_session_memory::context::CancellationToken::new(),
+            background_cpu: None,
             wake: Arc::new(MaintenanceWake::default()),
             task: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
@@ -275,7 +282,7 @@ impl Default for MaintenanceCoordinator {
 /// store stays alive for the duration of the writer-held critical section.
 enum MaintenanceStoreWork {
     Session(tracedecay_global_db::RegisteredGlobalDbLeaseV1),
-    Graph(Arc<crate::tracedecay::TraceDecay>),
+    Graph(Arc<crate::project::TraceDecay>),
 }
 
 impl MaintenanceStoreWork {
@@ -288,14 +295,13 @@ impl MaintenanceStoreWork {
 }
 
 pub(crate) fn project_store_maintenance_lease(
-    graph: &crate::tracedecay::TraceDecay,
+    graph: &crate::project::TraceDecay,
 ) -> ProjectStoreMaintenanceLeaseV1 {
     ProjectStoreMaintenanceLeaseV1::new(
         graph.project_root().to_path_buf(),
         graph.store_layout().clone(),
         graph.db().clone(),
         graph.retained_store_runtime_registry(),
-        std::sync::Arc::clone(graph.configuration_runtime()),
         graph.profile_database().clone(),
     )
 }
@@ -310,7 +316,12 @@ impl MaintenanceCoordinator {
         retention: tracedecay_configuration::RetentionConfig,
         branch_gc: BranchStoreGcCadenceV1,
     ) -> Self {
-        let coordinator = Self::default();
+        let coordinator = Self {
+            background_cpu: administration
+                .session_temporal_refresh_schedulers()
+                .background_cpu(),
+            ..Self::default()
+        };
         // Measured RSS is a process fact that admission trusts, so it is
         // sampled on its own short cadence regardless of whether retention
         // maintenance runs: the retention tick is hours apart, and a cold
@@ -484,6 +495,20 @@ impl MaintenanceCoordinator {
         branch_gc: BranchStoreGcCadenceV1,
         continuation: Option<MaintenanceContinuation>,
     ) -> MaintenanceTickOutcome {
+        let Some(background_cpu) = self.background_cpu.as_ref() else {
+            log_daemon_event(
+                "retention_degraded",
+                &[
+                    ("pass", "maintenance_tick".to_owned()),
+                    ("failure", "background_cpu_authority_unavailable".to_owned()),
+                ],
+            );
+            return MaintenanceTickOutcome::Retry;
+        };
+        let Some(_background_cpu) = background_cpu.try_acquire() else {
+            hotpath::gauge!("daemon.maintenance.background_cpu_deferred_total").inc(1_u64);
+            return MaintenanceTickOutcome::Retry;
+        };
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
@@ -555,9 +580,9 @@ impl MaintenanceCoordinator {
 
         // Bounded, round-robin slice of mounted stores. Writer admission is
         // per unit so one busy store defers only itself, and the cursor
-        // advances past attempted units even on cancellation. A semantic
-        // continuation omits session stores, but remains phase-scoped over the
-        // same bounded graph window rather than pinning one project.
+        // advances past attempted units even on cancellation. A continuation
+        // omits session stores, but remains phase-scoped over the same bounded
+        // graph window rather than pinning one project.
         let mut attempted = 0usize;
         let mut deferred = 0u64;
         let mut outcome = MaintenanceTickOutcome::Complete;
@@ -607,8 +632,8 @@ impl MaintenanceCoordinator {
             cursor_after_attempted_units(&keys, &window, attempted, after.as_deref());
 
         // Profile-wide maintenance is intentionally excluded from a bounded
-        // semantic-vector continuation: only the owning phase is eligible
-        // for the short cadence.
+        // continuation: only the owning phase is eligible for the short
+        // cadence.
         if continuation.is_none() && !self.cancellation.is_cancelled() {
             match administration
                 .try_with_writer(|| async {
@@ -914,9 +939,7 @@ mod tests {
         MaintenanceWake, maintenance_futures_active, run_maintenance_loop,
     };
     use tracedecay_maintenance::telemetry::{
-        RetentionOperatorLogLaneV1, SemanticVectorRetentionCensusOutcome,
-        SemanticVectorRetentionReadV1, StoreTelemetrySamplingRegistry, TableGrowthObservation,
-        compare_table_growth, retention_failure_is_by_design,
+        StoreTelemetrySamplingRegistry, TableGrowthObservation, compare_table_growth,
     };
     use tracedecay_maintenance::tick::{
         CadenceInstant, MaintenanceCadence, MaintenanceContinuation, MaintenanceTickOutcome,
@@ -999,7 +1022,7 @@ mod tests {
     #[test]
     fn retry_outcome_takes_precedence_over_bounded_progress() {
         let progress =
-            MaintenanceTickOutcome::Continue(MaintenanceContinuation::SemanticVectorRetention);
+            MaintenanceTickOutcome::Continue(MaintenanceContinuation::CodeGenerationRetention);
 
         assert_eq!(
             progress.combine(MaintenanceTickOutcome::Retry),
@@ -1012,17 +1035,10 @@ mod tests {
     }
 
     #[test]
-    fn code_generation_continuation_dominates_the_semantic_phase() {
-        // A code-generation continuation tick re-runs the bounded semantic
-        // page, so it must win when both phases report bounded progress; the
-        // reverse would starve the code-generation backlog.
-        let semantic =
-            MaintenanceTickOutcome::Continue(MaintenanceContinuation::SemanticVectorRetention);
+    fn code_generation_continuation_dominates_a_complete_tick() {
         let code_generation =
             MaintenanceTickOutcome::Continue(MaintenanceContinuation::CodeGenerationRetention);
 
-        assert_eq!(semantic.combine(code_generation), code_generation);
-        assert_eq!(code_generation.combine(semantic), code_generation);
         assert_eq!(
             code_generation.combine(MaintenanceTickOutcome::Complete),
             code_generation
@@ -1070,78 +1086,6 @@ mod tests {
         registry.record_graph_replay_release_unhealthy(project);
         assert!(!registry.graph_replay_release_attempt_admitted(project));
         assert!(registry.graph_replay_release_attempt_admitted(project));
-    }
-
-    #[test]
-    fn by_design_retention_failures_are_the_unavailable_and_offline_lanes() {
-        assert!(retention_failure_is_by_design(
-            RetentionOperatorLogLaneV1::Semantic,
-            "unavailable:semantic retrieval is not calibrated",
-        ));
-        assert!(retention_failure_is_by_design(
-            RetentionOperatorLogLaneV1::Semantic,
-            "configuration_inventory_unavailable",
-        ));
-        assert!(!retention_failure_is_by_design(
-            RetentionOperatorLogLaneV1::Semantic,
-            "corrupt:index page",
-        ));
-        assert!(retention_failure_is_by_design(
-            RetentionOperatorLogLaneV1::CodeGeneration,
-            "vector_inventory_offline:vector_census_incomplete",
-        ));
-        assert!(!retention_failure_is_by_design(
-            RetentionOperatorLogLaneV1::CodeGeneration,
-            "graph_replay_pool_busy",
-        ));
-    }
-
-    #[test]
-    fn by_design_retention_logs_once_then_counts_on_the_quiet_gauge() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let failure = "unavailable:semantic retrieval is not calibrated";
-
-        assert!(
-            registry.admit_by_design_retention_log(
-                RetentionOperatorLogLaneV1::Semantic,
-                project,
-                failure,
-            ),
-            "the first by-design state must log"
-        );
-        assert!(
-            !registry.admit_by_design_retention_log(
-                RetentionOperatorLogLaneV1::Semantic,
-                project,
-                failure,
-            ),
-            "an unchanged by-design state must stay quiet"
-        );
-        assert!(
-            registry.admit_by_design_retention_log(
-                RetentionOperatorLogLaneV1::Semantic,
-                project,
-                "unavailable:model missing",
-            ),
-            "a changed by-design reason must log again"
-        );
-
-        registry.mark_loud_retention_log();
-        registry.begin_retention_tick_log_window();
-        assert!(
-            registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
-            "the first by-design retry tick must log"
-        );
-        assert!(
-            !registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
-            "a repeated by-design retry tick must stay quiet"
-        );
-        registry.mark_loud_retention_log();
-        assert!(
-            registry.admit_retention_tick_log(MaintenanceTickOutcome::Retry),
-            "a genuine anomaly on the same tick must keep the tick line loud"
-        );
     }
 
     #[test]
@@ -1355,7 +1299,7 @@ mod tests {
                         phases.push(continuation);
                         if phases.len() == 1 {
                             MaintenanceTickOutcome::Continue(
-                                MaintenanceContinuation::SemanticVectorRetention,
+                                MaintenanceContinuation::CodeGenerationRetention,
                             )
                         } else {
                             MaintenanceTickOutcome::Complete
@@ -1376,8 +1320,8 @@ mod tests {
             *phases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![None, Some(MaintenanceContinuation::SemanticVectorRetention)],
-            "bounded progress must resume its semantic-vector phase instead of a full tick"
+            vec![None, Some(MaintenanceContinuation::CodeGenerationRetention)],
+            "bounded progress must resume its code-generation phase instead of a full tick"
         );
 
         cancellation.cancel();
@@ -1419,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_release_clears_retained_telemetry_handles_and_progress() {
+    async fn shutdown_release_clears_retained_telemetry_handles() {
         let temporary = tempfile::tempdir().expect("telemetry registry fixture root");
         let database_path = temporary.path().join("project.db");
         let other_database_path = temporary.path().join("other.db");
@@ -1454,22 +1398,12 @@ mod tests {
         assert!(registry.register_port(&other_database_path, &scope, || {
             database.storage_telemetry_handle()
         }));
-        registry.record_semantic_vector_retention_unseated(&database_path);
-        registry.record_semantic_vector_retention_unseated(&other_database_path);
         assert!(registry.registered_port(&database_path, &scope).is_some());
-        assert_eq!(
-            registry.semantic_vector_retention_read(&database_path),
-            SemanticVectorRetentionReadV1::SemanticUnseated
-        );
 
         registry.release_retained_handle(&database_path);
         assert!(
             registry.registered_port(&database_path, &scope).is_none(),
             "project retirement must drop the exact maintenance-owned database client"
-        );
-        assert_eq!(
-            registry.semantic_vector_retention_read(&database_path),
-            SemanticVectorRetentionReadV1::Unknown
         );
         assert!(
             registry
@@ -1477,14 +1411,9 @@ mod tests {
                 .is_some(),
             "exact project retirement must preserve unrelated telemetry clients"
         );
-        assert_eq!(
-            registry.semantic_vector_retention_read(&other_database_path),
-            SemanticVectorRetentionReadV1::SemanticUnseated
-        );
         assert!(registry.register_port(&database_path, &scope, || {
             database.storage_telemetry_handle()
         }));
-        registry.record_semantic_vector_retention_unseated(&database_path);
 
         registry.release_retained_handles_for_shutdown();
 
@@ -1492,9 +1421,11 @@ mod tests {
             registry.registered_port(&database_path, &scope).is_none(),
             "shutdown must drop maintenance-owned database clients"
         );
-        assert_eq!(
-            registry.semantic_vector_retention_read(&database_path),
-            SemanticVectorRetentionReadV1::Unknown
+        assert!(
+            registry
+                .registered_port(&other_database_path, &scope)
+                .is_none(),
+            "shutdown must drop every maintenance-owned database client"
         );
     }
 
@@ -1517,388 +1448,6 @@ mod tests {
         assert_eq!(
             cursor_after_attempted_units(&keys, &window, 0, Some("s:007")).as_deref(),
             Some("s:007")
-        );
-    }
-
-    #[test]
-    fn semantic_vector_census_cursor_advances_and_resets_at_end() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(7).unwrap();
-        let first_counts = tracedecay_store::SemanticVectorStageCensusCounts {
-            pending: 2,
-            ready: 3,
-            published: 4,
-            cancelled: 5,
-        };
-        let first_digest = tracedecay_domain::canonical_sha256(&"first-page").unwrap();
-        let cursor = tracedecay_store::SemanticVectorStageCensusCursor::new(
-            shard_id.clone(),
-            None,
-            revision,
-            256,
-            first_counts,
-            first_digest,
-        )
-        .expect("valid semantic vector cursor");
-        let first = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id: shard_id.clone(),
-            revision,
-            pending: 2,
-            ready: 3,
-            published: 4,
-            cancelled: 5,
-            complete_receipt: None,
-            continuation: Some(cursor.clone()),
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &first),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert_eq!(
-            registry.semantic_vector_retention_cursor(project),
-            Some(cursor)
-        );
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Scanning
-        );
-
-        let second = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id: shard_id.clone(),
-            revision,
-            pending: 7,
-            ready: 11,
-            published: 13,
-            cancelled: 17,
-            complete_receipt: Some(tracedecay_store::SemanticVectorProjectCensusReceipt {
-                shard_id,
-                revision,
-                counts: tracedecay_store::SemanticVectorStageCensusCounts {
-                    pending: 9,
-                    ready: 14,
-                    published: 17,
-                    cancelled: 22,
-                },
-                record_digest: tracedecay_domain::canonical_sha256(&"complete").unwrap(),
-            }),
-            continuation: None,
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &second),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Observed {
-                receipt: second.complete_receipt.unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn semantic_vector_mutation_and_failure_restart_census() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(7).unwrap();
-        let cursor = tracedecay_store::SemanticVectorStageCensusCursor::new(
-            shard_id.clone(),
-            None,
-            revision,
-            256,
-            tracedecay_store::SemanticVectorStageCensusCounts {
-                pending: 1,
-                ready: 0,
-                published: 1,
-                cancelled: 0,
-            },
-            tracedecay_domain::canonical_sha256(&"page").unwrap(),
-        )
-        .expect("valid semantic vector cursor");
-        let page = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id,
-            revision,
-            pending: 1,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: None,
-            continuation: Some(cursor),
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &page),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-
-        let generation = tracedecay_domain::VectorGenerationIdV1::new(
-            tracedecay_domain::canonical_sha256(&"retired-generation")
-                .expect("canonical generation digest"),
-        );
-        let mutated = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::Retired(generation),
-            ..page.clone()
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &mutated),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Unknown
-        );
-
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &page),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        registry.record_semantic_vector_retention_failure(project);
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Unknown
-        );
-    }
-
-    #[test]
-    fn semantic_unseated_read_is_distinct_and_cleared_by_census_and_failure() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-
-        registry.record_semantic_vector_retention_unseated(project);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::SemanticUnseated
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-
-        // A failure reset is Unknown, not unseated: the census could not be
-        // read even though a semantic runtime is seated.
-        registry.record_semantic_vector_retention_failure(project);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Unknown
-        );
-
-        // A census page proves a seated runtime and clears the unseated pin.
-        registry.record_semantic_vector_retention_unseated(project);
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(3).unwrap();
-        let complete = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id: shard_id.clone(),
-            revision,
-            pending: 0,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: Some(tracedecay_store::SemanticVectorProjectCensusReceipt {
-                shard_id,
-                revision,
-                counts: tracedecay_store::SemanticVectorStageCensusCounts {
-                    pending: 0,
-                    ready: 0,
-                    published: 1,
-                    cancelled: 0,
-                },
-                record_digest: tracedecay_domain::canonical_sha256(&"unseated-clear").unwrap(),
-            }),
-            continuation: None,
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &complete),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert!(matches!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Observed { .. }
-        ));
-
-        // Re-pinning unseated discards a stale observed receipt: an unseated
-        // runtime cannot vouch for a census taken while it was seated.
-        registry.record_semantic_vector_retention_unseated(project);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::SemanticUnseated
-        );
-        assert!(!registry.semantic_vector_scope_collection_ready(project));
-    }
-
-    #[test]
-    fn retained_terminal_census_with_receipt_is_observed() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(7).unwrap();
-        let receipt = tracedecay_store::SemanticVectorProjectCensusReceipt {
-            shard_id: shard_id.clone(),
-            revision,
-            counts: tracedecay_store::SemanticVectorStageCensusCounts {
-                pending: 0,
-                ready: 0,
-                published: 1,
-                cancelled: 0,
-            },
-            record_digest: tracedecay_domain::canonical_sha256(&"retained-head").unwrap(),
-        };
-        let generation = tracedecay_domain::VectorGenerationIdV1::new(
-            tracedecay_domain::canonical_sha256(&"retained-generation")
-                .expect("canonical generation digest"),
-        );
-        let census = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id,
-            revision,
-            pending: 0,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: Some(receipt.clone()),
-            continuation: None,
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::Retained(generation),
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &census),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Observed { receipt }
-        );
-    }
-
-    #[test]
-    fn incomplete_terminal_census_resets_progress() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(7).unwrap();
-        let cursor = tracedecay_store::SemanticVectorStageCensusCursor::new(
-            shard_id.clone(),
-            None,
-            revision,
-            256,
-            tracedecay_store::SemanticVectorStageCensusCounts {
-                pending: 0,
-                ready: 0,
-                published: 1,
-                cancelled: 0,
-            },
-            tracedecay_domain::canonical_sha256(&"paging").unwrap(),
-        )
-        .expect("valid semantic vector cursor");
-        let paging = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id: shard_id.clone(),
-            revision,
-            pending: 0,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: None,
-            continuation: Some(cursor.clone()),
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &paging),
-            SemanticVectorRetentionCensusOutcome::Accepted
-        );
-        assert_eq!(
-            registry.semantic_vector_retention_cursor(project),
-            Some(cursor)
-        );
-
-        let incomplete = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id,
-            revision,
-            pending: 0,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: None,
-            continuation: None,
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::Retained(
-                tracedecay_domain::VectorGenerationIdV1::new(
-                    tracedecay_domain::canonical_sha256(&"retained-incomplete")
-                        .expect("canonical generation digest"),
-                ),
-            ),
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &incomplete),
-            SemanticVectorRetentionCensusOutcome::IncompleteTerminalPage
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Unknown
-        );
-    }
-
-    #[test]
-    fn invalid_sum_receipt_is_census_count_overflow() {
-        let registry = StoreTelemetrySamplingRegistry::default();
-        let project = std::path::Path::new("/project");
-        let shard_id = tracedecay_store::StoreShardIdV1::project(
-            tracedecay_domain::BrainId::new("brain.maintenance").unwrap(),
-            tracedecay_domain::UserProfileId::new("profile.maintenance").unwrap(),
-            tracedecay_domain::ProjectId::new("project.maintenance").unwrap(),
-        );
-        let revision = tracedecay_store::SemanticVectorStageCensusRevision::new(7).unwrap();
-        let census = tracedecay_graph_db::SemanticVectorRetentionCensus {
-            shard_id: shard_id.clone(),
-            revision,
-            pending: 0,
-            ready: 0,
-            published: 1,
-            cancelled: 0,
-            complete_receipt: Some(tracedecay_store::SemanticVectorProjectCensusReceipt {
-                shard_id,
-                revision,
-                counts: tracedecay_store::SemanticVectorStageCensusCounts {
-                    pending: u64::MAX,
-                    ready: 1,
-                    published: 0,
-                    cancelled: 0,
-                },
-                record_digest: tracedecay_domain::canonical_sha256(&"overflow").unwrap(),
-            }),
-            continuation: None,
-            action: tracedecay_graph_db::SemanticVectorRetentionAction::None,
-        };
-        assert_eq!(
-            registry.record_semantic_vector_retention_census(project, &census),
-            SemanticVectorRetentionCensusOutcome::CensusCountOverflow
-        );
-        assert_eq!(registry.semantic_vector_retention_cursor(project), None);
-        assert_eq!(
-            registry.semantic_vector_retention_read(project),
-            SemanticVectorRetentionReadV1::Unknown
         );
     }
 

@@ -19,7 +19,10 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tracedecay_code_extraction::incremental::{ParseChangedRange, ParsePoint};
-use tracedecay_code_extraction::parsed_extraction::{ParsedExtraction, ParsedExtractionScope};
+use tracedecay_code_extraction::parsed_extraction::{
+    ParsedExtraction, ParsedExtractionDisposition, ParsedExtractionResetReason,
+    ParsedExtractionScope,
+};
 use tracedecay_code_extraction::{
     BashExtractor, BatchExtractor, CExtractor, CSharpExtractor, ClojureExtractor, CobolExtractor,
     CppExtractor, DartExtractor, DockerfileExtractor, ElixirExtractor, ErlangExtractor,
@@ -31,7 +34,7 @@ use tracedecay_code_extraction::{
     RExtractor, RubyExtractor, RustExtractor, ScalaExtractor, SqlExtractor, SwiftExtractor,
     TomlExtractor, TypeScriptExtractor, VbNetExtractor, WgslExtractor, ZigExtractor, ts_provider,
 };
-use tracedecay_domain::{ExtractionResult, NodeKind};
+use tracedecay_domain::{EdgeKind, ExtractionResult, NodeKind};
 use tree_sitter::{Parser, Tree};
 
 /// Counts bytes handed out by the Rust allocator on the current thread.
@@ -247,6 +250,21 @@ fn signature_of<'r>(result: &'r ExtractionResult, kind: NodeKind, name: &str) ->
         .unwrap_or_else(|| panic!("{name} has no signature"))
 }
 
+fn call_bindings(result: &ExtractionResult) -> Vec<(&str, &str)> {
+    result
+        .unresolved_refs
+        .iter()
+        .filter(|reference| reference.reference_kind == EdgeKind::Calls)
+        .filter_map(|reference| {
+            let owner = result
+                .nodes
+                .iter()
+                .find(|node| node.id == reference.from_node_id)?;
+            Some((owner.name.as_str(), reference.reference_name.as_str()))
+        })
+        .collect()
+}
+
 /// A byte range covering the small trailing item that starts at `needle`,
 /// shaped as one incremental changed region.
 fn trailing_region(source: &str, needle: &str) -> ParseChangedRange {
@@ -306,9 +324,13 @@ fn extract_both_and_compare(
         })
         .min()
         .expect("at least one timed walk");
-    println!(
-        "{file_path}: source={} bytes, extract_parsed walk allocated {walk_bytes} bytes, best walk {best_walk_time:?}",
-        source.len()
+    measure_clone_delta(
+        extractor,
+        file_path,
+        source,
+        &tree,
+        walk_bytes,
+        best_walk_time,
     );
     assert!(
         parsed.result.errors.is_empty(),
@@ -321,6 +343,51 @@ fn extract_both_and_compare(
         "extract and extract_parsed must emit identical signature strings"
     );
     (parsed, walk_bytes)
+}
+
+fn measure_clone_delta(
+    extractor: &dyn LanguageExtractor,
+    file_path: &str,
+    source: &str,
+    tree: &Tree,
+    graph_bytes: usize,
+    graph_time: std::time::Duration,
+) {
+    let (with_clones, clone_bytes) = measure_allocation(|| {
+        extractor.extract_parsed_artifact(
+            file_path,
+            source,
+            source,
+            tree,
+            ParsedExtractionScope::FullDocument,
+        )
+    });
+    assert!(
+        !with_clones.artifact.clone_bodies.is_empty(),
+        "{file_path} must emit clone bodies"
+    );
+    let best_clone_walk_time = (0..10)
+        .map(|_| {
+            let started = Instant::now();
+            let repeat = extractor.extract_parsed_artifact(
+                file_path,
+                source,
+                source,
+                tree,
+                ParsedExtractionScope::FullDocument,
+            );
+            let elapsed = started.elapsed();
+            assert!(repeat.artifact.result.errors.is_empty());
+            elapsed
+        })
+        .min()
+        .expect("at least one timed clone walk");
+    println!(
+        "{file_path}: source={} bytes, graph walk allocated {graph_bytes} bytes in {graph_time:?}; graph+clone walk allocated {clone_bytes} bytes in {best_clone_walk_time:?}; clone delta={} bytes/{:?}",
+        source.len(),
+        clone_bytes.saturating_sub(graph_bytes),
+        best_clone_walk_time.saturating_sub(graph_time),
+    );
 }
 
 #[test]
@@ -452,6 +519,7 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
         expected_kind: NodeKind,
         expected_name: &'static str,
         expected_signature: &'static str,
+        expected_clone_bodies: usize,
     }
     let cases = [
         Case {
@@ -463,6 +531,7 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
             expected_kind: NodeKind::Struct,
             expected_name: "Marker",
             expected_signature: "pub struct Marker;",
+            expected_clone_bodies: 0,
         },
         Case {
             extractor: &TypeScriptExtractor,
@@ -473,6 +542,7 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
             expected_kind: NodeKind::TypeAlias,
             expected_name: "MarkerAlias",
             expected_signature: "type MarkerAlias = number;",
+            expected_clone_bodies: 0,
         },
         Case {
             extractor: &PythonExtractor,
@@ -483,6 +553,7 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
             expected_kind: NodeKind::Class,
             expected_name: "Marker",
             expected_signature: "class Marker",
+            expected_clone_bodies: 1,
         },
     ];
 
@@ -490,15 +561,26 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
         let tree = parse_with_grammar(case.grammar_key, &case.source);
         let region = trailing_region(&case.source, case.needle);
         let regions = [region];
-        let (parsed, walk_bytes) = measure_allocation(|| {
-            extract_parsed(
-                case.extractor,
+        let (artifact, walk_bytes) = measure_allocation(|| {
+            case.extractor.extract_parsed_artifact(
                 case.file_path,
+                &case.source,
                 &case.source,
                 &tree,
                 ParsedExtractionScope::ChangedRegions(&regions),
             )
         });
+        assert_eq!(
+            artifact.artifact.clone_bodies.len(),
+            case.expected_clone_bodies,
+            "{}: clone emission must stay inside the selected region",
+            case.file_path,
+        );
+        let parsed = ParsedExtraction {
+            result: artifact.artifact.result,
+            disposition: artifact.disposition,
+            metrics: artifact.metrics,
+        };
         println!(
             "{}: incremental walk allocated {walk_bytes} bytes for a {} byte source",
             case.file_path,
@@ -526,7 +608,7 @@ fn incremental_walk_of_tiny_item_pays_only_for_that_item() {
     }
 }
 
-/// Representative lite, medium, and full extractors must retain the caller's
+/// Representative changed-region extractors must retain the caller's
 /// source during a one-line incremental walk. The fixed allowance covers the
 /// canonical file/item rows; the variable allowance scales only with bytes in
 /// the selected syntax node, never with the 1–2 MiB source.
@@ -551,15 +633,6 @@ fn representative_language_walks_allocate_by_changed_region() {
             source: regional_fixture("func tiny() int { return 1 }\n"),
             needle: "func tiny",
             expected_digest: "7bc4d1d7e778bf2c40976672e63f12a7c5817dd8d8c34c28129105988dafef3c",
-        },
-        Case {
-            tier: "medium",
-            extractor: &BashExtractor,
-            file_path: "region.sh",
-            grammar_key: "bash",
-            source: regional_fixture("tiny() { :; }\n"),
-            needle: "tiny()",
-            expected_digest: "d1b8003a5b51fbeaa81bc03dc58ff38ad4f8ebd7af74533882cbabe8c47a2eb1",
         },
         Case {
             tier: "full",
@@ -660,6 +733,61 @@ fn representative_language_walks_allocate_by_changed_region() {
         }
     }
     assert!(over_budget.is_empty(), "{}", over_budget.join("\n"));
+}
+
+/// Bash rebuilds its document-spanning script module after an edit. The
+/// reset walk must borrow the caller's source and still bind script-level
+/// calls that sit outside the selected region.
+#[test]
+fn bash_changed_region_reset_walk_does_not_copy_source() {
+    let source = regional_fixture("kept() { echo kept; }\nkept\ntiny() { echo tiny; }\n");
+    let cold = BashExtractor.extract("region.sh", &source);
+    let tree = parse_with_grammar("bash", &source);
+    let region = trailing_region(&source, "tiny()");
+    let (incremental, walk_bytes) = measure_allocation(|| {
+        extract_parsed(
+            &BashExtractor,
+            "region.sh",
+            &source,
+            &tree,
+            ParsedExtractionScope::ChangedRegions(&[region]),
+        )
+    });
+
+    assert_eq!(
+        incremental.disposition,
+        ParsedExtractionDisposition::Reset {
+            reason: ParsedExtractionResetReason::ChangedRootIdentity,
+        }
+    );
+    assert_eq!(incremental.metrics.visited_bytes, source.len());
+    assert!(
+        walk_bytes < source.len(),
+        "Bash reset walk allocated {walk_bytes} bytes for a {} byte source",
+        source.len()
+    );
+    assert!(
+        incremental
+            .result
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Function && node.name == "kept"),
+        "reset walk must re-extract kept, which sits outside the selected region"
+    );
+    let mut calls = call_bindings(&incremental.result);
+    calls.sort_unstable();
+    assert_eq!(
+        calls,
+        [("kept", "echo"), ("region", "kept"), ("tiny", "echo")]
+    );
+    assert_eq!(
+        canonical_digest(&cold),
+        canonical_digest(&incremental.result)
+    );
+    assert_eq!(
+        canonical_digest(&cold),
+        "76508d90a7d59faee962e7f556d49f80c06953c2ea3891516131bf65ee871437"
+    );
 }
 
 /// One migrated language: extractor, fixture item, grammar, and the canonical

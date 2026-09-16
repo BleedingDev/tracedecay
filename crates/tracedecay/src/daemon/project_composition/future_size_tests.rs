@@ -103,7 +103,7 @@ fn awaited_sizes() -> Vec<(&'static str, usize)> {
         ),
         (
             "TraceDecay::register_project_store_in_global_registry",
-            future_size(crate::tracedecay::TraceDecay::register_project_store_in_global_registry),
+            future_size(crate::project::TraceDecay::register_project_store_in_global_registry),
         ),
         (
             "McpServer::new_with_context",
@@ -112,10 +112,6 @@ fn awaited_sizes() -> Vec<(&'static str, usize)> {
         (
             "McpServer::shutdown",
             future_size(crate::mcp::McpServer::shutdown),
-        ),
-        (
-            "spawn_semantic_owner_registration",
-            future_size(project_open_owners::spawn_semantic_owner_registration),
         ),
         (
             "StoreAdministration::registered_project_session_database",
@@ -158,8 +154,8 @@ const COMPOSITION_ENTRY_CEILING: usize = 4 * 1024;
 /// time. Measured maxima: 21,200 B (`mount_full_server_owners`, ordinary
 /// build) and 175,424 B (the same phase under `--features hotpath`). The
 /// next-widest phases are `construct_full_server` (7,208 B) and `open_graph`
-/// (6,200 B); the semantic lifecycle registry read and the background-CPU
-/// authority handle each cost their phase well under 128 B.
+/// (6,200 B); the background-CPU authority handle costs its phase well under
+/// 128 B.
 const PHASE_CEILING: usize = if cfg!(feature = "hotpath") {
     256 * 1024
 } else {
@@ -191,11 +187,10 @@ fn shared_owner_futures_stay_below_large_future_threshold() {
     let owners = [
         ("source edit", future_size(tracedecay_daemon_service::project_owner_registration::ProjectSourceEditOwnerV1::execute)),
         ("production owner registration", future_size(crate::daemon::project_open_owners::register_project_open_production_owners)),
-        ("automation admission", future_size(crate::daemon::automation_effect::prepare)),
+        ("automation admission", future_size(tracedecay_daemon_service::automation_effect::prepare)),
         ("invocation admission", future_size(tracedecay_daemon_service::DaemonInvocationService::invoke_with_project_admission)),
         ("Work dispatch", future_size(tracedecay_daemon_service::invocation::execute_work_application)),
         ("observation persistence", future_size(<tracedecay_global_db::GlobalDbObservationStore as tracedecay_store::ObservationStore>::persist_observation)),
-        ("vector retirement", future_size(tracedecay_code_index_runtime::code_index_scheduler::semantic_vector_graph::retire_one_project_vector_generation)),
     ];
     for (name, size) in owners {
         eprintln!("{size:>10} B  {name}");

@@ -9,14 +9,14 @@ use tracedecay_graph_db::GraphDbError;
 use tracedecay_graph_db::{GraphCancellation, SealedGraphStateDigest};
 
 use super::{
-    CodeGraphProjectionError, CodeGraphServingAuthorityV1, CodeIndexProductionErrorV1,
-    CodeIndexPublicationStoreErrorV1, CodeIndexSchedulerErrorV1, CodeIndexWorktreeSchedulerV1,
+    CodeGraphServingAuthorityV1, CodeIndexSchedulerErrorV1, CodeIndexWorktreeSchedulerV1,
     DaemonCodeIndexPublicationStoreV1, LatestCodeTextGenerationV1, LatestCompleteCodeIndexV1,
 };
 use crate::code_graph_seat::{
     CodeGraphReplayBindingV1, CodeGraphSeatLeaseV1, CodeGraphSeatRuntimePortV1,
 };
-use crate::code_index::graph_projection::CodeGraphProjectionStore;
+use crate::code_index::graph_projection::{CodeGraphProjectionError, CodeGraphProjectionStore};
+use crate::code_index::production::{CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1};
 
 /// Test-only injected retryable activation failures, keyed by worktree id.
 /// The worktree id is unique per test fixture, while generation ids are
@@ -329,6 +329,50 @@ impl CodeGraphActivationAuthorityV1 {
         replay_binding: CodeGraphReplayBindingV1,
         cancellation: Arc<AtomicBool>,
     ) -> Result<bool, CodeIndexSchedulerErrorV1> {
+        self.recover_verified_generation_inner(
+            project_id,
+            repository_id,
+            worktree_id,
+            latest,
+            replay_binding,
+            cancellation,
+            true,
+        )
+        .await
+    }
+
+    pub async fn recover_verified_generation(
+        &self,
+        project_id: &ProjectId,
+        repository_id: &RepositoryId,
+        worktree_id: &WorktreeId,
+        latest: LatestCodeTextGenerationV1,
+        replay_binding: CodeGraphReplayBindingV1,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<bool, CodeIndexSchedulerErrorV1> {
+        self.recover_verified_generation_inner(
+            project_id,
+            repository_id,
+            worktree_id,
+            latest,
+            replay_binding,
+            cancellation,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_verified_generation_inner(
+        &self,
+        project_id: &ProjectId,
+        repository_id: &RepositoryId,
+        worktree_id: &WorktreeId,
+        latest: LatestCodeTextGenerationV1,
+        replay_binding: CodeGraphReplayBindingV1,
+        cancellation: Arc<AtomicBool>,
+        require_current_head: bool,
+    ) -> Result<bool, CodeIndexSchedulerErrorV1> {
         if self.policy() == CodeGraphActivationPolicyV1::RefusedByConfiguration {
             return Ok(false);
         }
@@ -360,7 +404,11 @@ impl CodeGraphActivationAuthorityV1 {
                         CodeIndexSchedulerErrorV1::GraphActivation(error.to_string())
                     })?;
                 let pending_catalog_warm = tokio::task::spawn_blocking(move || {
-                    latest.activate_persistent_graph_head(retained, cancellation)
+                    latest.activate_persistent_graph_generation(
+                        retained,
+                        cancellation,
+                        require_current_head,
+                    )
                 })
                 .await
                 .map_err(|error| {
@@ -401,11 +449,10 @@ impl CodeGraphActivationAuthorityV1 {
             latest.refuse_graph_activation(reason);
             return Err(CodeIndexSchedulerErrorV1::GraphActivationRefused(reason));
         }
-        // Graph activation consumes the sealed generation directly. Text
-        // serving is a separate bounded projection advanced by the mounted
-        // scheduler after this generation is seated; requiring it here makes
-        // the first partial text pass enter graph-retry backoff before that
-        // worker can continue the projection.
+        // Graph activation consumes the sealed generation directly. The
+        // mounted scheduler therefore admits a full replay only after text
+        // projection is ready; verified-head recovery has its own path above
+        // and does not replay the sealed source.
         match self {
             Self::Persistent {
                 runtime,
@@ -489,7 +536,7 @@ impl CodeGraphActivationAuthorityV1 {
                         CodeGraphProjectionError::DeadlineExceeded,
                     ));
                 }
-                latest.warm_serving_caches();
+                latest.prewarm_serving_derivations();
                 Ok(())
             }
         }
@@ -620,18 +667,22 @@ impl PendingInteractiveCatalogWarmV1 {
 }
 
 impl LatestCodeTextGenerationV1 {
-    #[hotpath::measure(label = "code_graph.activation.persistent_head")]
-    fn activate_persistent_graph_head(
+    #[hotpath::measure(label = "code_graph.activation.persistent_generation")]
+    fn activate_persistent_graph_generation(
         &self,
         retained: Box<dyn CodeGraphSeatLeaseV1 + Send>,
         cancellation: Arc<AtomicBool>,
+        require_current_head: bool,
     ) -> Result<Option<PendingInteractiveCatalogWarmV1>, CodeIndexSchedulerErrorV1> {
         let generation_id = self.metadata().manifest().generation_id.clone();
         let snapshot = hotpath::measure_block!(
             "code_graph.activation.validate_verified_head",
-            retained
-                .recover_verified_snapshot_from_head(Arc::clone(&cancellation))
-                .map_err(CodeGraphProjectionError::from)
+            if require_current_head {
+                retained.recover_verified_snapshot_from_head(Arc::clone(&cancellation))
+            } else {
+                retained.recover_verified_generation(Arc::clone(&cancellation))
+            }
+            .map_err(CodeGraphProjectionError::from)
         )?;
         let store = Arc::new(CodeGraphProjectionStore::from_verified_snapshot(
             snapshot,

@@ -594,7 +594,10 @@ const fn budget_hydration_refusal(
     stage: tracedecay_session_memory::session::SessionRetrievalBudgetStageV1,
 ) -> WorkEvidenceHydrationErrorV1 {
     WorkEvidenceHydrationErrorV1::StructuralRefusal(
-        SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage },
+        SessionRetrievalStructuralRefusalV1::BudgetExhausted {
+            stage,
+            accounting: None,
+        },
     )
 }
 
@@ -793,7 +796,6 @@ pub mod tests {
                 .map(|lane| (lane, 100_000))
                 .collect(),
             diversity_policy_id: id("diversity.work-task-session"),
-            rerank_policy_id: None,
             retrieval_budget: budget,
         };
         let diversity = DiversityPolicy {
@@ -914,6 +916,7 @@ mod unit_tests {
                 SessionRetrievalStructuralRefusalV1::BudgetExhausted {
                     stage:
                         tracedecay_session_memory::session::SessionRetrievalBudgetStageV1::ContextTokens,
+                    accounting: None,
                 }
             )
         );

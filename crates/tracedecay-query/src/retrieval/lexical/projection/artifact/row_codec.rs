@@ -17,6 +17,7 @@ use super::schema::{LexicalArtifactLayoutV1, stable_row_dictionary_id};
 
 const ROW_CODEC_V11_MAGIC: &[u8] = b"TDLR11\0";
 const ROW_CODEC_V14_MAGIC: &[u8] = b"TDLR14\0";
+const ROW_CODEC_V16_MAGIC: &[u8] = b"TDLR16\0";
 
 /// Chunk identities the chunker mints: `chunk.v1.` followed by a tagged
 /// lowercase SHA-256. Revision 14 stores such a parent as its 32 digest bytes
@@ -33,10 +34,7 @@ const TERM_SYMBOL_NONE: u8 = 0;
 const TERM_SYMBOL_ROW: u8 = 1;
 const TERM_SYMBOL_REFERENCE: u8 = 2;
 
-/// Field order for the `field_lengths` presence bitmap. Appending a field
-/// here is a layout change: the bitmap is one byte and decoders index it by
-/// position.
-const FIELD_LENGTH_ORDER: [LexicalFieldV1; 7] = [
+const LEGACY_FIELD_LENGTH_ORDER: [LexicalFieldV1; 7] = [
     LexicalFieldV1::SymbolName,
     LexicalFieldV1::QualifiedName,
     LexicalFieldV1::Path,
@@ -44,6 +42,20 @@ const FIELD_LENGTH_ORDER: [LexicalFieldV1; 7] = [
     LexicalFieldV1::PreambleText,
     LexicalFieldV1::ExactTerm,
     LexicalFieldV1::Subtoken,
+];
+
+/// Field order for the revision-16 `field_lengths` presence bitmap. New fields
+/// append after the revision-14/15 prefix.
+const FIELD_LENGTH_ORDER: [LexicalFieldV1; 9] = [
+    LexicalFieldV1::SymbolName,
+    LexicalFieldV1::QualifiedName,
+    LexicalFieldV1::Path,
+    LexicalFieldV1::BodyText,
+    LexicalFieldV1::PreambleText,
+    LexicalFieldV1::ExactTerm,
+    LexicalFieldV1::Subtoken,
+    LexicalFieldV1::Signature,
+    LexicalFieldV1::Documentation,
 ];
 
 const GRAIN_ORDER: [CodeSearchChunkGrainV1; 5] = [
@@ -86,12 +98,14 @@ struct ArtifactRowCompactV11 {
     symbol_simple_name: Option<String>,
     symbol_qualified_name: Option<String>,
     symbol_kind: Option<String>,
+    symbol_signature: Option<String>,
+    symbol_documentation: Option<String>,
     field_lengths: BTreeMap<LexicalFieldV1, usize>,
 }
 
 /// Dictionary entries a revision-14 row references by content-addressed id:
 /// one per file (occurrence identity, logical path, descriptor revision) and
-/// one per symbol display (occurrence identity and parser-attested names).
+/// one per symbol display (occurrence identity and parser-attested fields).
 /// The encoder fills one table per prepared page; the batch writer stages
 /// the union and finalization derives the sealed `row_dictionary`.
 pub(super) type RowDictionaryTableV1 = BTreeMap<i64, Vec<u8>>;
@@ -113,11 +127,16 @@ pub(super) enum RowDictionaryEntryV1 {
         simple_name: Option<String>,
         qualified_name: Option<String>,
         kind: Option<String>,
+        signature: Option<String>,
+        documentation: Option<String>,
     },
 }
 
 impl RowDictionaryEntryV1 {
-    fn encode(&self) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
+    fn encode(
+        &self,
+        include_vocabulary_fields: bool,
+    ) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
         let mut out = Vec::with_capacity(256);
         match self {
             Self::File {
@@ -135,6 +154,8 @@ impl RowDictionaryEntryV1 {
                 simple_name,
                 qualified_name,
                 kind,
+                signature,
+                documentation,
             } => {
                 out.push(ENTRY_SYMBOL);
                 for field in [symbol_occurrence_id, simple_name, qualified_name, kind] {
@@ -143,6 +164,17 @@ impl RowDictionaryEntryV1 {
                         Some(value) => {
                             out.push(OPTIONAL_PRESENT);
                             put_bytes(&mut out, value.as_bytes())?;
+                        }
+                    }
+                }
+                if include_vocabulary_fields {
+                    for field in [signature, documentation] {
+                        match field {
+                            None => out.push(OPTIONAL_ABSENT),
+                            Some(value) => {
+                                out.push(OPTIONAL_PRESENT);
+                                put_bytes(&mut out, value.as_bytes())?;
+                            }
                         }
                     }
                 }
@@ -159,12 +191,28 @@ impl RowDictionaryEntryV1 {
                 logical_path: cursor.take_string()?,
                 language_descriptor_revision: cursor.take_string()?,
             },
-            ENTRY_SYMBOL => Self::Symbol {
-                symbol_occurrence_id: cursor.take_optional_string()?,
-                simple_name: cursor.take_optional_string()?,
-                qualified_name: cursor.take_optional_string()?,
-                kind: cursor.take_optional_string()?,
-            },
+            ENTRY_SYMBOL => {
+                let symbol_occurrence_id = cursor.take_optional_string()?;
+                let simple_name = cursor.take_optional_string()?;
+                let qualified_name = cursor.take_optional_string()?;
+                let kind = cursor.take_optional_string()?;
+                let (signature, documentation) = if cursor.bytes.is_empty() {
+                    (None, None)
+                } else {
+                    (
+                        cursor.take_optional_string()?,
+                        cursor.take_optional_string()?,
+                    )
+                };
+                Self::Symbol {
+                    symbol_occurrence_id,
+                    simple_name,
+                    qualified_name,
+                    kind,
+                    signature,
+                    documentation,
+                }
+            }
             _ => {
                 return Err(CodeLexicalArtifactErrorV1::Corrupt(
                     "lexical artifact dictionary entry kind is unknown".to_owned(),
@@ -252,7 +300,18 @@ pub(super) fn encode_artifact_row(
         LexicalArtifactLayoutV1::V11
         | LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13 => encode_compact_v11(row),
-        LexicalArtifactLayoutV1::V14 => encode_binary_v14(row, dictionary),
+        // Admission bases (V14/V15) and the fingerprint-complete revision
+        // (V16) share the current compact row codec. Clone fingerprints stay
+        // deferred via `has_clone_fingerprints`, not via a weaker row encoding.
+        LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16 => encode_binary(
+            row,
+            dictionary,
+            ROW_CODEC_V16_MAGIC,
+            &FIELD_LENGTH_ORDER,
+            true,
+        ),
     }
 }
 
@@ -271,6 +330,8 @@ fn encode_compact_v11(row: &ArtifactRowV1) -> Result<Vec<u8>, CodeLexicalArtifac
         symbol_simple_name: row.symbol_simple_name.clone(),
         symbol_qualified_name: row.symbol_qualified_name.clone(),
         symbol_kind: row.symbol_kind.clone(),
+        symbol_signature: row.symbol_signature.clone(),
+        symbol_documentation: row.symbol_documentation.clone(),
         field_lengths: row.field_lengths.clone(),
     };
     let payload = serde_json::to_vec(&compact)
@@ -293,7 +354,38 @@ pub(super) fn decode_artifact_row(
         LexicalArtifactLayoutV1::V11
         | LexicalArtifactLayoutV1::V12
         | LexicalArtifactLayoutV1::V13 => decode_compact_v11(generation, chunk_id, bytes),
-        LexicalArtifactLayoutV1::V14 => decode_binary_v14(generation, chunk_id, bytes, dictionary),
+        // Row bytes carry their codec tag. Clone-successor bumps may label an
+        // artifact V16 before rows are rewritten; dispatch on the tag so
+        // seated lexical owners stay readable either way.
+        LexicalArtifactLayoutV1::V14
+        | LexicalArtifactLayoutV1::V15
+        | LexicalArtifactLayoutV1::V16 => {
+            if bytes.starts_with(ROW_CODEC_V16_MAGIC) {
+                decode_binary(
+                    generation,
+                    chunk_id,
+                    bytes,
+                    dictionary,
+                    ROW_CODEC_V16_MAGIC,
+                    &FIELD_LENGTH_ORDER,
+                    true,
+                )
+            } else if bytes.starts_with(ROW_CODEC_V14_MAGIC) {
+                decode_binary(
+                    generation,
+                    chunk_id,
+                    bytes,
+                    dictionary,
+                    ROW_CODEC_V14_MAGIC,
+                    &LEGACY_FIELD_LENGTH_ORDER,
+                    false,
+                )
+            } else {
+                Err(CodeLexicalArtifactErrorV1::Corrupt(
+                    "lexical artifact row is missing its binary codec tag".to_owned(),
+                ))
+            }
+        }
     }
 }
 
@@ -345,16 +437,18 @@ fn decode_compact_v11(
         symbol_simple_name: compact.symbol_simple_name,
         symbol_qualified_name: compact.symbol_qualified_name,
         symbol_kind: compact.symbol_kind,
+        symbol_signature: compact.symbol_signature,
+        symbol_documentation: compact.symbol_documentation,
         field_lengths: compact.field_lengths,
         normalized_text,
     })
 }
 
 // ---------------------------------------------------------------------------
-// Revision 14: binary row with a per-file / per-symbol dictionary
+// Binary row with a per-file / per-symbol dictionary
 // ---------------------------------------------------------------------------
 //
-// magic `TDLR14\0`, then in order:
+// Legacy magic `TDLR14\0` (still decoded), then in order:
 //   ref file entry · opt-ref symbol entry · parent (tag, digest | literal)
 //   varint span start/end · u8 grain · varint ordinal
 //   varint term count × (u8 kind, bytes, varint span start/end, symbol tag [ref])
@@ -364,13 +458,19 @@ fn decode_compact_v11(
 // presence byte followed by the ref when present. `bytes` is a varint length
 // followed by the bytes. Decoders consume the whole payload and fail closed
 // on any trailing byte.
+// Current codec uses `TDLR16\0`, appends signature and documentation to symbol
+// dictionary entries, and widens the field bitmap to `u16`. Admission bases
+// (V14/V15) emit this codec while clone fingerprints remain V16-only.
 
-fn encode_binary_v14(
+fn encode_binary(
     row: &ArtifactRowV1,
     dictionary: &mut RowDictionaryTableV1,
+    magic: &[u8],
+    field_order: &[LexicalFieldV1],
+    include_vocabulary_fields: bool,
 ) -> Result<Vec<u8>, CodeLexicalArtifactErrorV1> {
     let mut out = Vec::with_capacity(96 + row.sanitized_text.as_str().len());
-    out.extend_from_slice(ROW_CODEC_V14_MAGIC);
+    out.extend_from_slice(magic);
     put_reference(
         &mut out,
         dictionary,
@@ -379,6 +479,7 @@ fn encode_binary_v14(
             logical_path: row.logical_path.clone(),
             language_descriptor_revision: row.language_descriptor_revision.as_str().to_owned(),
         },
+        include_vocabulary_fields,
     )?;
     let symbol = RowDictionaryEntryV1::Symbol {
         symbol_occurrence_id: row
@@ -389,14 +490,18 @@ fn encode_binary_v14(
         simple_name: row.symbol_simple_name.clone(),
         qualified_name: row.symbol_qualified_name.clone(),
         kind: row.symbol_kind.clone(),
+        signature: row.symbol_signature.clone(),
+        documentation: row.symbol_documentation.clone(),
     };
     let has_symbol = row.anchor.symbol_occurrence_id.is_some()
         || row.symbol_simple_name.is_some()
         || row.symbol_qualified_name.is_some()
-        || row.symbol_kind.is_some();
+        || row.symbol_kind.is_some()
+        || row.symbol_signature.is_some()
+        || row.symbol_documentation.is_some();
     if has_symbol {
         out.push(OPTIONAL_PRESENT);
-        put_reference(&mut out, dictionary, &symbol)?;
+        put_reference(&mut out, dictionary, &symbol, include_vocabulary_fields)?;
     } else {
         out.push(OPTIONAL_ABSENT);
     }
@@ -442,26 +547,38 @@ fn encode_binary_v14(
                         simple_name: None,
                         qualified_name: None,
                         kind: None,
+                        signature: None,
+                        documentation: None,
                     },
+                    include_vocabulary_fields,
                 )?;
             }
         }
     }
     put_bytes(&mut out, row.sanitized_text.as_str().as_bytes())?;
-    let mut bitmap = 0u8;
-    for (bit, field) in FIELD_LENGTH_ORDER.iter().enumerate() {
+    let mut bitmap = 0u16;
+    for (bit, field) in field_order.iter().enumerate() {
         if row.field_lengths.contains_key(field) {
             bitmap |= 1 << bit;
         }
     }
-    if row.field_lengths.len() != bitmap.count_ones() as usize {
+    let expected_fields = row
+        .field_lengths
+        .keys()
+        .filter(|field| field_order.contains(field))
+        .count();
+    if expected_fields != bitmap.count_ones() as usize {
         return Err(CodeLexicalArtifactErrorV1::Contract(
             "lexical artifact row carries a field length outside the encodable field set"
                 .to_owned(),
         ));
     }
-    out.push(bitmap);
-    for field in &FIELD_LENGTH_ORDER {
+    if include_vocabulary_fields {
+        out.extend_from_slice(&bitmap.to_le_bytes());
+    } else {
+        out.push(bitmap as u8);
+    }
+    for field in field_order {
         if let Some(length) = row.field_lengths.get(field) {
             put_varint(&mut out, length_u64(*length)?);
         }
@@ -469,15 +586,18 @@ fn encode_binary_v14(
     Ok(out)
 }
 
-fn decode_binary_v14(
+fn decode_binary(
     generation: &CodeGenerationId,
     chunk_id: &str,
     bytes: &[u8],
     dictionary: &dyn RowDictionaryV1,
+    magic: &[u8],
+    field_order: &[LexicalFieldV1],
+    wide_bitmap: bool,
 ) -> Result<ArtifactRowV1, CodeLexicalArtifactErrorV1> {
-    let payload = bytes.strip_prefix(ROW_CODEC_V14_MAGIC).ok_or_else(|| {
+    let payload = bytes.strip_prefix(magic).ok_or_else(|| {
         CodeLexicalArtifactErrorV1::Corrupt(
-            "lexical artifact row is missing the binary v14 codec tag".to_owned(),
+            "lexical artifact row is missing its binary codec tag".to_owned(),
         )
     })?;
     let mut cursor = RowCursorV1 { bytes: payload };
@@ -496,23 +616,31 @@ fn decode_binary_v14(
     let logical_path = logical_path.clone();
     let language_descriptor_revision =
         LanguageDescriptorRevision::new(language_descriptor_revision.clone()).map_err(corrupt)?;
-    let (symbol_occurrence_id, symbol_simple_name, symbol_qualified_name, symbol_kind) =
-        match cursor.take_optional_reference()? {
-            None => (None, None, None, None),
-            Some(entry_id) => {
-                let (symbol_occurrence_id, simple_name, qualified_name, kind) =
-                    symbol_entry_fields(dictionary.entry(entry_id)?.as_ref())?;
-                (
-                    symbol_occurrence_id
-                        .map(SymbolOccurrenceId::new)
-                        .transpose()
-                        .map_err(corrupt)?,
-                    simple_name,
-                    qualified_name,
-                    kind,
-                )
-            }
-        };
+    let (
+        symbol_occurrence_id,
+        symbol_simple_name,
+        symbol_qualified_name,
+        symbol_kind,
+        symbol_signature,
+        symbol_documentation,
+    ) = match cursor.take_optional_reference()? {
+        None => (None, None, None, None, None, None),
+        Some(entry_id) => {
+            let (symbol_occurrence_id, simple_name, qualified_name, kind, signature, documentation) =
+                symbol_entry_fields(dictionary.entry(entry_id)?.as_ref())?;
+            (
+                symbol_occurrence_id
+                    .map(SymbolOccurrenceId::new)
+                    .transpose()
+                    .map_err(corrupt)?,
+                simple_name,
+                qualified_name,
+                kind,
+                signature,
+                documentation,
+            )
+        }
+    };
     let parent_chunk_id = match cursor.take_u8()? {
         PARENT_NONE => None,
         PARENT_CANONICAL_DIGEST => {
@@ -561,7 +689,7 @@ fn decode_binary_v14(
                 )
             })?),
             TERM_SYMBOL_REFERENCE => {
-                let (symbol_occurrence_id, _, _, _) =
+                let (symbol_occurrence_id, _, _, _, _, _) =
                     symbol_entry_fields(dictionary.entry(cursor.take_reference()?)?.as_ref())?;
                 let symbol_occurrence_id = symbol_occurrence_id.ok_or_else(|| {
                     CodeLexicalArtifactErrorV1::Corrupt(
@@ -583,14 +711,18 @@ fn decode_binary_v14(
         );
     }
     let sanitized_text = BoundedSanitizedText::new(&cursor.take_string()?).map_err(corrupt)?;
-    let bitmap = cursor.take_u8()?;
-    if bitmap >> FIELD_LENGTH_ORDER.len() != 0 {
+    let bitmap = if wide_bitmap {
+        cursor.take_u16()?
+    } else {
+        u16::from(cursor.take_u8()?)
+    };
+    if bitmap >> field_order.len() != 0 {
         return Err(CodeLexicalArtifactErrorV1::Corrupt(
             "lexical artifact row field bitmap names an unknown field".to_owned(),
         ));
     }
     let mut field_lengths = BTreeMap::new();
-    for (bit, field) in FIELD_LENGTH_ORDER.iter().enumerate() {
+    for (bit, field) in field_order.iter().enumerate() {
         if bitmap & (1 << bit) != 0 {
             let length = usize::try_from(cursor.take_varint()?).map_err(corrupt)?;
             field_lengths.insert(*field, length);
@@ -621,12 +753,16 @@ fn decode_binary_v14(
         symbol_simple_name,
         symbol_qualified_name,
         symbol_kind,
+        symbol_signature,
+        symbol_documentation,
         field_lengths,
         normalized_text,
     })
 }
 
 type SymbolEntryFieldsV1 = (
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -642,11 +778,15 @@ fn symbol_entry_fields(
             simple_name,
             qualified_name,
             kind,
+            signature,
+            documentation,
         } => Ok((
             symbol_occurrence_id.clone(),
             simple_name.clone(),
             qualified_name.clone(),
             kind.clone(),
+            signature.clone(),
+            documentation.clone(),
         )),
         RowDictionaryEntryV1::File { .. } => Err(CodeLexicalArtifactErrorV1::Corrupt(
             "lexical artifact row symbol reference resolved to a file entry".to_owned(),
@@ -666,8 +806,9 @@ fn put_reference(
     out: &mut Vec<u8>,
     dictionary: &mut RowDictionaryTableV1,
     entry: &RowDictionaryEntryV1,
+    include_vocabulary_fields: bool,
 ) -> Result<(), CodeLexicalArtifactErrorV1> {
-    let encoded = entry.encode()?;
+    let encoded = entry.encode(include_vocabulary_fields)?;
     let entry_id = stable_row_dictionary_id(&encoded);
     match dictionary.get(&entry_id) {
         Some(existing) if *existing != encoded => {
@@ -752,6 +893,11 @@ impl<'a> RowCursorV1<'a> {
 
     fn take_u8(&mut self) -> Result<u8, CodeLexicalArtifactErrorV1> {
         Ok(self.take_exact(1)?[0])
+    }
+
+    fn take_u16(&mut self) -> Result<u16, CodeLexicalArtifactErrorV1> {
+        let bytes: [u8; 2] = self.take_exact(2)?.try_into().map_err(corrupt)?;
+        Ok(u16::from_le_bytes(bytes))
     }
 
     fn take_reference(&mut self) -> Result<i64, CodeLexicalArtifactErrorV1> {
@@ -848,6 +994,7 @@ mod tests {
     fn sample_row() -> ArtifactRowV1 {
         let sanitized =
             BoundedSanitizedText::new("fn RenderWidget() { return; }").expect("bounded text");
+        let normalized_text = sanitized.as_str().to_ascii_lowercase();
         ArtifactRowV1 {
             id: CodeSearchChunkId::new("chunk.sample").expect("chunk"),
             anchor: CodeSearchChunkAnchorV1 {
@@ -870,8 +1017,10 @@ mod tests {
             symbol_simple_name: Some("RenderWidget".to_owned()),
             symbol_qualified_name: Some("sample::RenderWidget".to_owned()),
             symbol_kind: Some("function".to_owned()),
+            symbol_signature: None,
+            symbol_documentation: None,
             field_lengths: BTreeMap::from([(LexicalFieldV1::BodyText, 4)]),
-            normalized_text: sanitized.as_str().to_ascii_lowercase(),
+            normalized_text,
         }
     }
 
@@ -917,6 +1066,9 @@ mod tests {
             },
         )
         .expect("configuration term");
+        let normalized_text = sanitized.as_str().to_ascii_lowercase();
+        let signature = "pub fn cancellation_probe_0001_003(input: u32) -> u32";
+        let documentation = "Cancels one probe after its bounded input.";
         ArtifactRowV1 {
             id: CodeSearchChunkId::new(format!("chunk.v1.sha256:{}", "0a".repeat(32)))
                 .expect("chunk"),
@@ -949,16 +1101,29 @@ mod tests {
                 "src/cancelled_batch/file_0001.rs::cancellation_probe_0001_003".to_owned(),
             ),
             symbol_kind: Some("function".to_owned()),
+            symbol_signature: Some(signature.to_owned()),
+            symbol_documentation: Some(documentation.to_owned()),
             field_lengths: BTreeMap::from([
                 (LexicalFieldV1::SymbolName, 1),
                 (LexicalFieldV1::QualifiedName, 1),
                 (LexicalFieldV1::Path, 1),
+                (LexicalFieldV1::Signature, 6),
+                (LexicalFieldV1::Documentation, 7),
                 (LexicalFieldV1::BodyText, 9),
                 (LexicalFieldV1::ExactTerm, 1),
                 (LexicalFieldV1::Subtoken, 10),
             ]),
-            normalized_text: sanitized.as_str().to_ascii_lowercase(),
+            normalized_text,
         }
+    }
+
+    fn legacy_symbol_row() -> ArtifactRowV1 {
+        let mut row = symbol_row();
+        row.symbol_signature = None;
+        row.symbol_documentation = None;
+        row.field_lengths.remove(&LexicalFieldV1::Signature);
+        row.field_lengths.remove(&LexicalFieldV1::Documentation);
+        row
     }
 
     fn round_trip(
@@ -1010,17 +1175,82 @@ mod tests {
     }
 
     #[test]
-    fn binary_v14_round_trips_symbol_window_and_display_only_rows() {
-        for row in [sample_row(), window_row(), symbol_row()] {
-            let (encoded, _, decoded) = round_trip(LexicalArtifactLayoutV1::V14, &row);
-            assert!(encoded.starts_with(b"TDLR14\0"));
-            assert_eq!(decoded, row);
+    fn binary_v14_and_v15_emit_current_row_codec() {
+        for layout in [LexicalArtifactLayoutV1::V14, LexicalArtifactLayoutV1::V15] {
+            for row in [
+                sample_row(),
+                window_row(),
+                legacy_symbol_row(),
+                symbol_row(),
+            ] {
+                let (encoded, _, decoded) = round_trip(layout, &row);
+                assert!(
+                    encoded.starts_with(b"TDLR16\0"),
+                    "admission bases must emit the current row codec"
+                );
+                assert_eq!(decoded, row);
+            }
         }
     }
 
     #[test]
-    fn binary_v14_references_one_file_and_one_symbol_entry_per_row() {
+    fn binary_layouts_restore_legacy_one_byte_bitmap_rows() {
+        for layout in [
+            LexicalArtifactLayoutV1::V14,
+            LexicalArtifactLayoutV1::V15,
+            LexicalArtifactLayoutV1::V16,
+        ] {
+            for row in [sample_row(), window_row(), legacy_symbol_row()] {
+                let mut dictionary = RowDictionaryTableV1::new();
+                let encoded = super::encode_binary(
+                    &row,
+                    &mut dictionary,
+                    super::ROW_CODEC_V14_MAGIC,
+                    &super::LEGACY_FIELD_LENGTH_ORDER,
+                    false,
+                )
+                .expect("encode legacy");
+                assert!(encoded.starts_with(b"TDLR14\0"));
+                let decoded = decode_artifact_row(
+                    layout,
+                    &row.anchor.generation_id,
+                    row.id.as_str(),
+                    &encoded,
+                    &dictionary,
+                )
+                .expect("decode legacy under current layout");
+                assert_eq!(decoded, row);
+            }
+        }
+    }
+
+    #[test]
+    fn binary_v16_round_trips_signature_and_documentation_fields() {
         let row = symbol_row();
+        let (encoded, _, decoded) = round_trip(LexicalArtifactLayoutV1::V16, &row);
+        assert!(encoded.starts_with(b"TDLR16\0"));
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn binary_v16_layout_reads_v14_admission_rows_after_successor_label() {
+        let row = symbol_row();
+        let (encoded, dictionary, _) = round_trip(LexicalArtifactLayoutV1::V14, &row);
+        assert!(encoded.starts_with(b"TDLR16\0"));
+        let decoded = decode_artifact_row(
+            LexicalArtifactLayoutV1::V16,
+            &row.anchor.generation_id,
+            row.id.as_str(),
+            &encoded,
+            &dictionary,
+        )
+        .expect("V16 layout must read current-codec admission rows");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn binary_v14_references_one_file_and_one_symbol_entry_per_row() {
+        let row = legacy_symbol_row();
         let (encoded, dictionary, _) = round_trip(LexicalArtifactLayoutV1::V14, &row);
         let (compact, _, _) = round_trip(LexicalArtifactLayoutV1::V13, &row);
         assert!(
@@ -1049,6 +1279,8 @@ mod tests {
                 simple_name: row.symbol_simple_name.clone(),
                 qualified_name: row.symbol_qualified_name.clone(),
                 kind: row.symbol_kind.clone(),
+                signature: row.symbol_signature.clone(),
+                documentation: row.symbol_documentation.clone(),
             })
         );
         let parent_hex = "c0".repeat(32);
@@ -1068,7 +1300,7 @@ mod tests {
 
     #[test]
     fn binary_v14_keeps_non_canonical_parents_and_foreign_term_symbols_verbatim() {
-        let mut row = symbol_row();
+        let mut row = legacy_symbol_row();
         row.anchor.parent_chunk_id =
             Some(CodeSearchChunkId::new("chunk.v1.sha256:NOTHEX").expect("literal parent"));
         let foreign = SymbolOccurrenceId::new("symbol.elsewhere").expect("foreign symbol");
@@ -1096,7 +1328,7 @@ mod tests {
 
     #[test]
     fn binary_v14_decoder_fails_closed_on_truncation_trailing_bytes_and_missing_entries() {
-        let row = symbol_row();
+        let row = legacy_symbol_row();
         let (encoded, dictionary, _) = round_trip(LexicalArtifactLayoutV1::V14, &row);
         let decode = |bytes: &[u8], dictionary: &RowDictionaryTableV1| {
             decode_artifact_row(

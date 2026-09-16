@@ -330,7 +330,7 @@ async fn project_context_surfaces_registry_read_failure_as_tool_error() {
         .execute_batch("DROP TABLE project_aliases")
         .unwrap();
     let server = tracedecay::mcp::McpServer::new_with_host_admission_test_runtime_for_test(
-        tracedecay::tracedecay::TraceDecay::open(cg.project_root())
+        tracedecay::project::TraceDecay::open(cg.project_root())
             .await
             .unwrap(),
         None,
@@ -387,7 +387,7 @@ async fn project_search_surfaces_registry_read_failure_as_tool_error() {
         .execute_batch("DROP TABLE project_aliases")
         .unwrap();
     let server = tracedecay::mcp::McpServer::new_with_host_admission_test_runtime_for_test(
-        tracedecay::tracedecay::TraceDecay::open(cg.project_root())
+        tracedecay::project::TraceDecay::open(cg.project_root())
             .await
             .unwrap(),
         None,
@@ -468,7 +468,7 @@ async fn project_registry_tools_prefer_injected_registry_over_process_default() 
         .await
         .unwrap();
     let server = tracedecay::mcp::McpServer::new_with_host_admission_test_runtime_for_test(
-        tracedecay::tracedecay::TraceDecay::open(cg.project_root())
+        tracedecay::project::TraceDecay::open(cg.project_root())
             .await
             .unwrap(),
         None,
@@ -631,6 +631,16 @@ async fn active_project_tool_reports_resolved_store_metadata() {
     .unwrap();
 
     let payload: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+    assert_eq!(
+        payload["project_id"].as_str(),
+        cg.store_layout().identity.project_id.as_deref()
+    );
+    assert!(
+        payload["repository_id"]
+            .as_str()
+            .is_some_and(|identity| identity.starts_with("repository.daemon.")),
+        "active project must expose its admitted repository identity: {payload}"
+    );
     assert_eq!(
         payload["project_root"].as_str(),
         Some(project_root.as_str())

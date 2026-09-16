@@ -3,11 +3,21 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use axum::http::HeaderMap;
-use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use tracedecay_api::HttpApplicationControls;
+use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_contracts::{
-    APPLICATION_REQUEST_ID_HEADER, ApplicationRequestControlV1, CancellationSignal, RequestId,
+    APPLICATION_REQUEST_ID_HEADER, ApplicationRequestControlV1, CancellationSignal, Deadline,
+    RequestId,
 };
+use tracedecay_domain::UtcMicros;
+
+use super::problems::current_micros;
+use super::{DEFAULT_DEADLINE_MICROS, HTTP_DEADLINE_HEADER, retained};
 
 pub(super) type HttpCancellationRegistry = Arc<Mutex<BTreeMap<RequestId, CancellationSignal>>>;
 
@@ -39,15 +49,10 @@ pub(super) fn supplied_request_id(
     ))
 }
 
-pub(super) fn supplied_request_id_operation(path: &str) -> Option<RetainedSurfaceOperation> {
-    let operation = path
-        .strip_prefix("/retained/")
-        .and_then(RetainedSurfaceOperation::from_operation_name)?;
-    matches!(
-        operation.sdk_operation_contract().request_id,
-        SdkRequestIdControlV1::Required
+pub(super) fn accepts_supplied_request_id(path: &str) -> bool {
+    path == tracedecay_api::retained_route_path(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::FactStoreCurate,
     )
-    .then_some(operation)
 }
 
 pub(super) struct ActiveHttpRequest {
@@ -97,6 +102,90 @@ impl Drop for ActiveHttpRequest {
     }
 }
 
+#[hotpath::measure(label = "application_surface.http_context")]
+pub(super) async fn application_http_context(
+    State(cancellations): State<HttpCancellationRegistry>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let supplied_request_id = match supplied_request_id(request.headers()) {
+        Ok(request_id) => request_id,
+        Err(RequestControlError::DuplicateHeader | RequestControlError::InvalidHeader) => {
+            return invalid_http_request_control_response();
+        }
+        Err(RequestControlError::ActiveCollision | RequestControlError::RegistryUnavailable) => {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if supplied_request_id.is_some() && !accepts_supplied_request_id(request.uri().path()) {
+        return invalid_http_request_control_response();
+    }
+    let request_id = match supplied_request_id {
+        Some(request_id) => request_id,
+        None => {
+            let Ok(request_id) = mint_global_request_id(GlobalRequestSurface::Http) else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            request_id
+        }
+    };
+    let Ok(cancellation) =
+        CancellationSignal::active(format!("cancellation.http.{}", request_id.as_str()))
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(observed_at) = current_micros() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let default_expires_at = observed_at.0.saturating_add(DEFAULT_DEADLINE_MICROS);
+    let caller_expires_at = match request.headers().get(HTTP_DEADLINE_HEADER) {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+        {
+            Some(expires_at) => expires_at,
+            None => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => default_expires_at,
+    };
+    let effective_expires_at = caller_expires_at.min(default_expires_at);
+    let Ok(deadline) = Deadline::new(UtcMicros(effective_expires_at)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let active = match ActiveHttpRequest::register(
+        Arc::clone(&cancellations),
+        request_id.clone(),
+        cancellation.clone(),
+    ) {
+        Ok(active) => active,
+        Err(RequestControlError::ActiveCollision) => {
+            return retained::active_request_conflict_response(request_id);
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    request.extensions_mut().insert(request_id.clone());
+    request.extensions_mut().insert(cancellation.clone());
+    request.extensions_mut().insert(HttpApplicationControls {
+        deadline,
+        cancellation: cancellation.clone(),
+    });
+    let response = hotpath::future!(
+        next.run(request),
+        label = "application_surface.http.dispatch"
+    )
+    .await;
+    active.finish();
+    response
+}
+
+pub(super) fn invalid_http_request_control_response() -> Response {
+    match mint_global_request_id(GlobalRequestSurface::Http) {
+        Ok(request_id) => tracedecay_api::retained_invalid_request_response(request_id),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
@@ -123,14 +212,8 @@ mod tests {
             supplied_request_id(&headers),
             Err(RequestControlError::DuplicateHeader)
         );
-        assert_eq!(
-            supplied_request_id_operation("/retained/fact_store_curate"),
-            Some(RetainedSurfaceOperation::FactStoreCurate)
-        );
-        assert_eq!(
-            supplied_request_id_operation("/retained/fact_store_add"),
-            None
-        );
+        assert!(accepts_supplied_request_id("/retained/fact_store_curate"));
+        assert!(!accepts_supplied_request_id("/retained/fact_store_add"));
     }
 
     #[test]

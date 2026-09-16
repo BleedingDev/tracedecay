@@ -250,13 +250,10 @@ impl HookSpoolV1 {
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.bytes);
         let mut checkpoint_records = 0u32;
-        let mut checkpoint_highest_sequence = None;
         let (mut scan, reusable_checkpoint) = match cached_checkpoint {
             Some(checkpoint) if checkpoint.records_revision == current_revision => {
                 checkpoint_records = u32::try_from(checkpoint.records.len())
                     .map_err(|_| HookSpoolError::MetadataCorrupted)?;
-                checkpoint_highest_sequence =
-                    checkpoint.records.last().map(|record| record.sequence);
                 let validated_end = checkpoint
                     .records_revision
                     .as_ref()
@@ -285,8 +282,6 @@ impl HookSpoolV1 {
                 if transition_matches {
                     checkpoint_records = u32::try_from(checkpoint.records.len())
                         .map_err(|_| HookSpoolError::MetadataCorrupted)?;
-                    checkpoint_highest_sequence =
-                        checkpoint.records.last().map(|record| record.sequence);
                     let anchor = CheckpointAnchorV1 {
                         records_revision: checkpoint.records_revision.clone(),
                         checksum: checkpoint.checksum,
@@ -338,25 +333,16 @@ impl HookSpoolV1 {
             || checkpoint_suffix_bytes >= CHECKPOINT_REWRITE_BYTE_THRESHOLD;
         let mut checkpoint_rewritten = false;
         let checkpoint = if matches!(meta.integrity, SpoolIntegrityV1::Healthy) {
-            let unreconciled_meta = meta.clone();
-            if meta.append_intent.as_ref().is_some_and(|intent| {
-                checkpoint_highest_sequence.is_some_and(|highest| intent.sequence <= highest)
-            }) {
-                return Err(HookSpoolError::MetadataCorrupted);
-            }
-            let suffix_at = usize::try_from(checkpoint_records)
-                .map_err(|_| HookSpoolError::MetadataCorrupted)?;
-            let suffix_records = scan
-                .records
-                .get(suffix_at..)
-                .ok_or(HookSpoolError::MetadataCorrupted)?;
-            reconcile_append_intent(&mut meta, suffix_records, config.host)?;
+            // A completed append deliberately leaves its durable intent in
+            // place. The referenced frame can already be inside a rewritten
+            // checkpoint, so reconcile against the whole bounded index.
+            reconcile_append_intent(&mut meta, &scan.records, config.host)?;
             validate_meta_against_records(
                 &meta,
                 scan.records.iter().map(|record| record.sequence),
                 config.limits,
             )?;
-            if meta_was_missing || meta != unreconciled_meta {
+            if meta_was_missing {
                 write_meta(&root, &meta)?;
             }
             Some(match (reusable_checkpoint, rewrite_checkpoint) {
@@ -536,16 +522,15 @@ impl HookSpoolV1 {
             return Err(error);
         }
         let record = decode_complete_frame(&frame, self.physical_len, self.config.host)?;
-        let mut committed_meta = self.meta.clone();
-        committed_meta.next_sequence = sequence
+        // The durable intent names the exact frame bytes, and the frame itself
+        // was flushed before append returned. Reopen reconciles that pair, so
+        // persisting the derived next sequence here would be a redundant third
+        // barrier in every contended hook append. The next mutation persists
+        // the reconciled state as part of its own write.
+        self.meta.next_sequence = sequence
             .checked_add(1)
             .ok_or(HookSpoolError::MetadataCorrupted)?;
-        committed_meta.append_intent = None;
-        if let Err(error) = write_meta(&self.root, &committed_meta) {
-            self.recovery_required = true;
-            return Err(error);
-        }
-        self.meta = committed_meta;
+        self.meta.append_intent = None;
         self.physical_len = self.physical_len.saturating_add(frame_len);
         self.note_pending(&record, self.physical_len.saturating_sub(frame_len))?;
         let Some(checkpoint) = self.checkpoint.as_ref() else {
@@ -822,6 +807,7 @@ impl HookSpoolV1 {
                 .get_mut(index)
                 .ok_or(HookSpoolError::MetadataCorrupted)?;
             pending.envelope = Some(record.envelope.clone());
+            pending.native_lifecycle = record.native_lifecycle.clone();
             records.push(record);
         }
         Ok(records)
@@ -1062,19 +1048,11 @@ fn ensure_root(root: &Path) -> Result<(), HookSpoolError> {
             return Err(HookSpoolError::UnsafePath);
         }
         Ok(_) => {
-            // An existing root must already be private to the current owner:
-            // a group/world-writable or foreign-owned directory lets another
-            // local account replace spool members despite their per-file
-            // modes. Transient metadata failures stay Io rather than
-            // condemning the path.
-            return tracedecay_private_fs::validate_private_directory(root).map_err(|error| {
-                match error.kind() {
-                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
-                        HookSpoolError::UnsafePath
-                    }
-                    _ => HookSpoolError::Io,
-                }
-            });
+            // An existing root must end private to the current owner. Foreign
+            // ownership stays UnsafePath; an owned but permissive directory
+            // (template copies under a group umask, legacy layouts) is healed
+            // through the same authority Hook configuration publication uses.
+            return ensure_existing_private_root(root);
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Err(HookSpoolError::Io),
@@ -1085,22 +1063,35 @@ fn ensure_root(root: &Path) -> Result<(), HookSpoolError> {
     match tracedecay_private_fs::create_private_directory(root) {
         Ok(()) => {}
         // A concurrent opener may win the creation race; the directory is
-        // acceptable only if it is private.
+        // acceptable only if it is (or can be healed to) private.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            tracedecay_private_fs::validate_private_directory(root).map_err(|error| match error
-                .kind()
-            {
-                io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
-                    HookSpoolError::UnsafePath
-                }
-                _ => HookSpoolError::Io,
-            })?;
+            ensure_existing_private_root(root)?;
         }
         Err(_) => return Err(HookSpoolError::Io),
     }
     hotpath::measure_block!("hooks.spool.fsync.directory", {
         shared_sync_directory(root, DIRECTORY_POLICY).map_err(|_| HookSpoolError::Io)
     })
+}
+
+fn ensure_existing_private_root(root: &Path) -> Result<(), HookSpoolError> {
+    match tracedecay_private_fs::validate_private_directory(root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            tracedecay_private_fs::make_private_directory(root)
+                .map(|_| ())
+                .map_err(|heal_error| match heal_error.kind() {
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
+                        HookSpoolError::UnsafePath
+                    }
+                    _ => HookSpoolError::Io,
+                })
+        }
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            Err(HookSpoolError::UnsafePath)
+        }
+        Err(_) => Err(HookSpoolError::Io),
+    }
 }
 
 fn validate_regular_or_missing(path: &Path) -> Result<bool, HookSpoolError> {

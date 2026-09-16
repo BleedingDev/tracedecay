@@ -1,3 +1,7 @@
+mod family_report;
+
+pub use family_report::{CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1};
+
 #[cfg(test)]
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -5,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 
 use roaring::RoaringBitmap;
@@ -14,16 +18,27 @@ use rusqlite::StatementStatus;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter, types::Value};
 use sha2::{Digest, Sha256};
 use tracedecay_code_index::chunks::CodeIndexImportEvidenceV1;
+use tracedecay_code_index::clones::{
+    CloneBodyOccurrenceV1, CloneBodyPayloadV1, CloneExactKeyV1, CloneSelectedBlockV1,
+    CodeIndexCloneBodyV1,
+};
 use tracedecay_code_index::production::CodeIndexExecutionControlV1;
 use tracedecay_domain::{
     CodeGenerationId, CodeSearchChunkGrainV1, CodeSearchChunkId, CompactCandidate,
     ComponentRevision, EvidenceRole, ExactAdmissionProof, ExactFieldV1, ExactTechnicalTermKindV1,
     FixedPointScore, LogicalEvidenceId, ManifestDigest, RetrieverBatch, RetrieverCoverage,
-    RetrieverKind, RetrieverOutcome, ScoreDomainId, SourceOccurrenceId,
+    RetrieverKind, RetrieverOutcome, ScoreDomainId, SourceOccurrenceId, SourceSpan,
+    SymbolOccurrenceId, canonical_sha256,
 };
 use tracedecay_private_fs::open_private_file;
 
 use super::builder::compute_section_digests;
+use super::clone_census::{CodeLexicalCloneIndexCensusV1, read_clone_index_census};
+use super::fingerprints::{
+    CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1, CloneFingerprintArtifactReadV1,
+    CloneFingerprintReadRequestV1, CloneSelectedBlockArtifactCandidateV1,
+    CloneSelectedBlockArtifactReadV1, read_clone_fingerprint_page,
+};
 use super::format::{
     ArtifactRowV1, CodeLexicalArtifactOccurrenceV1, CodeLexicalImportMembershipWitnessV1,
     VerifiedCodeLexicalArtifactV1, artifact_digest, decode_ngram_bitmap, decode_padded_receipt,
@@ -49,28 +64,136 @@ use crate::retrieval::ports::{
 
 use super::super::{
     ECHO_SCORE_MILLIS, ExactMatchRowViewV1, FUZZY_SCORE_MILLIS, FuzzyExpansionsV1,
-    FuzzyQueryGroupV1, LexicalRowScoreV1, LiteralProofCacheV1, PHRASE_SCORE_MILLIS,
-    PreparedLexicalQueryV1, add_score, bm25_score_micros, collect_term_kinds, exact_matches,
-    field_weight_millis, fuzzy_distance_bound, normalize_lexical, retrieval_anchor,
-    substring_count,
+    FuzzyQueryGroupV1, LexicalFieldTextV1, LexicalRowScoreV1, LiteralProofCacheV1,
+    PHRASE_SCORE_MILLIS, PreparedLexicalQueryV1, add_score, bm25_score_micros, collect_term_kinds,
+    exact_matches, field_weight_millis, fuzzy_distance_bound, matches_phrase, normalize_lexical,
+    normalized_field_text, proximity_count, retrieval_anchor, substring_count,
 };
 use crate::retrieval::lexical::{
     LexicalFieldFilterV1, LexicalFieldV1, LexicalLaneEvidence, LexicalLaneRequest,
-    MAX_FUZZY_TERM_EXPANSIONS_V1, MAX_LEXICAL_QUERY_TERM_BYTES_V1, admit_candidate_sources,
-    candidate_admission_outcome, field_admitted, lexical_checkpoint,
+    LexicalSpellingVariantV1, MAX_FUZZY_TERM_EXPANSIONS_V1, MAX_LEXICAL_QUERY_TERM_BYTES_V1,
+    admit_candidate_sources, candidate_admission_outcome, field_admitted, lexical_checkpoint,
 };
+
+impl LexicalFieldTextV1 for ArtifactRowV1 {
+    fn grain(&self) -> CodeSearchChunkGrainV1 {
+        self.anchor.grain
+    }
+
+    fn normalized_text(&self) -> &str {
+        &self.normalized_text
+    }
+
+    fn logical_path(&self) -> &str {
+        &self.logical_path
+    }
+
+    fn field_lengths(&self) -> &BTreeMap<LexicalFieldV1, usize> {
+        &self.field_lengths
+    }
+
+    fn symbol_simple_name(&self) -> Option<&str> {
+        self.symbol_simple_name.as_deref()
+    }
+
+    fn symbol_qualified_name(&self) -> Option<&str> {
+        self.symbol_qualified_name.as_deref()
+    }
+
+    fn symbol_signature(&self) -> Option<&str> {
+        self.symbol_signature.as_deref()
+    }
+
+    fn symbol_documentation(&self) -> Option<&str> {
+        self.symbol_documentation.as_deref()
+    }
+}
 
 #[derive(Clone)]
 pub struct CodeLexicalArtifactReaderV1 {
     connection: Arc<ArtifactConnectionMutex<Connection>>,
+    path: Arc<PathBuf>,
     metadata: super::super::CodeLexicalProjectionMetadataV1,
     receipt: VerifiedCodeLexicalArtifactV1,
     layout: LexicalArtifactLayoutV1,
+    clone_index_census: Arc<OnceLock<Result<Arc<CodeLexicalCloneIndexCensusV1>, String>>>,
     retained_owned_bytes: usize,
     /// Fuzzy expansion walks every in-fuzzy term. Hash-ordered `term_id`
     /// rows make a fresh `ORDER BY term` scan random I/O; share one load
     /// across clones and later queries on this reader.
     fuzzy_vocabulary: Arc<OnceLock<Arc<Vec<String>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloneExactArtifactMemberV1 {
+    pub payload: CloneBodyPayloadV1,
+    pub occurrence: CloneBodyOccurrenceV1,
+}
+
+pub const MAX_CLONE_EXACT_PAGE_MEMBERS_V1: usize = 1_000;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CloneArtifactCursorV1 {
+    pub(super) artifact_digest: ManifestDigest,
+    pub(super) generation: CodeGenerationId,
+    pub(super) request_digest: ManifestDigest,
+    pub(super) after: CloneArtifactCursorPositionV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(super) enum CloneArtifactCursorPositionV1 {
+    Exact(SymbolOccurrenceId),
+    Fingerprint {
+        body_digest: ManifestDigest,
+        payload_digest: ManifestDigest,
+    },
+}
+
+impl CloneArtifactCursorV1 {
+    /// Digests identifying the last completed fingerprint candidate when this
+    /// cursor continues a near-clone page; `None` for exact-posting cursors.
+    pub fn fingerprint_continuation_digests(&self) -> Option<(&ManifestDigest, &ManifestDigest)> {
+        match &self.after {
+            CloneArtifactCursorPositionV1::Fingerprint {
+                body_digest,
+                payload_digest,
+            } => Some((body_digest, payload_digest)),
+            CloneArtifactCursorPositionV1::Exact(_) => None,
+        }
+    }
+
+    pub fn encode(&self) -> Result<String, CodeLexicalArtifactErrorV1> {
+        serde_json::to_vec(self)
+            .map(hex::encode)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))
+    }
+
+    pub fn decode(encoded: &str) -> Result<Self, CodeLexicalArtifactErrorV1> {
+        let bytes = hex::decode(encoded)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloneArtifactPageV1<T> {
+    pub members: Vec<T>,
+    pub next_cursor: Option<CloneArtifactCursorV1>,
+}
+
+fn clone_authority_digest(
+    authority: &CloneBodyOccurrenceV1,
+) -> Result<ManifestDigest, CodeLexicalArtifactErrorV1> {
+    canonical_sha256(&(
+        "tracedecay.clone-exact-authority.v1",
+        &authority.project_id,
+        &authority.repository_id,
+        &authority.worktree_id,
+        &authority.source_generation,
+        &authority.snapshot_digest,
+    ))
+    .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
 }
 
 type ArtifactConnectionMutex<T> = StdMutex<T>;
@@ -118,6 +241,14 @@ impl std::fmt::Debug for CodeLexicalArtifactReaderV1 {
 }
 
 impl CodeLexicalArtifactReaderV1 {
+    pub fn has_clone_index(&self) -> bool {
+        self.layout.has_clone_index()
+    }
+
+    pub fn has_clone_fingerprints(&self) -> bool {
+        self.layout.has_clone_fingerprints()
+    }
+
     /// Open a published artifact whose trust anchor is its content address:
     /// the durable head names the artifact file's size and SHA-256 digest,
     /// the embedded receipt is decoded only after the whole file matches
@@ -198,6 +329,7 @@ impl CodeLexicalArtifactReaderV1 {
         let reader = hotpath::measure_block!(
             "query.artifact.open.reader_restore",
             Self::open_connection_with_control(
+                path,
                 connection,
                 &receipt,
                 cache_budget_bytes,
@@ -247,6 +379,7 @@ impl CodeLexicalArtifactReaderV1 {
         let reader = hotpath::measure_block!(
             "query.artifact.open.reader_restore",
             Self::open_connection_with_control(
+                path,
                 connection,
                 expected,
                 cache_budget_bytes,
@@ -262,6 +395,7 @@ impl CodeLexicalArtifactReaderV1 {
     }
 
     fn open_connection_with_control(
+        path: &Path,
         connection: Connection,
         expected: &VerifiedCodeLexicalArtifactV1,
         cache_budget_bytes: usize,
@@ -420,9 +554,11 @@ impl CodeLexicalArtifactReaderV1 {
             // identity for the process lifetime, so this per-reader lock must
             // remain plain. Static query spans retain operation visibility.
             connection: Arc::new(StdMutex::new(connection)),
+            path: Arc::new(path.to_path_buf()),
             metadata,
             receipt: stored,
             layout,
+            clone_index_census: Arc::new(OnceLock::new()),
             retained_owned_bytes,
             fuzzy_vocabulary: Arc::new(OnceLock::new()),
         })
@@ -436,6 +572,53 @@ impl CodeLexicalArtifactReaderV1 {
     #[hotpath::skip]
     pub fn verified_artifact(&self) -> &VerifiedCodeLexicalArtifactV1 {
         &self.receipt
+    }
+
+    #[hotpath::skip]
+    pub fn artifact_format_revision(&self) -> u32 {
+        self.layout.revision()
+    }
+
+    #[hotpath::skip]
+    pub fn clone_index_census(
+        &self,
+    ) -> Result<Option<Arc<CodeLexicalCloneIndexCensusV1>>, CodeLexicalArtifactErrorV1> {
+        if !self.layout.has_clone_index() {
+            return Ok(None);
+        }
+        let census = self.clone_index_census.get_or_init(|| {
+            let file = open_private_file(self.path.as_ref())
+                .map_err(map_private_artifact_file_error)
+                .map_err(|error| error.to_string())?;
+            verify_named_path_identity(self.path.as_ref(), &file)
+                .map_err(|error| error.to_string())?;
+            let connection = Connection::open_with_flags(
+                self.path.as_ref(),
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|error| map_reader_open_error(self.path.as_ref(), error))
+            .map_err(|error| error.to_string())?;
+            connection
+                .pragma_update(None, "query_only", true)
+                .map_err(sqlite_error)
+                .map_err(|error| error.to_string())?;
+            verify_named_path_identity(self.path.as_ref(), &file)
+                .map_err(|error| error.to_string())?;
+            let census = read_clone_index_census(
+                &connection,
+                self.layout.has_clone_fingerprints(),
+                CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
+            )
+            .map(Arc::new)
+            .map_err(|error| error.to_string())?;
+            verify_named_path_identity(self.path.as_ref(), &file)
+                .map_err(|error| error.to_string())?;
+            Ok(census)
+        });
+        census
+            .as_ref()
+            .map(|census| Some(Arc::clone(census)))
+            .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.clone()))
     }
 
     #[hotpath::skip]
@@ -535,6 +718,394 @@ impl CodeLexicalArtifactReaderV1 {
             reader: self.clone(),
             authority,
         }
+    }
+
+    pub fn clone_exact_page(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        cursor: Option<&CloneArtifactCursorV1>,
+        limit: usize,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneArtifactPageV1<CloneExactArtifactMemberV1>, CodeLexicalArtifactErrorV1> {
+        checkpoint(control)?;
+        self.validate_clone_lookup_authority(authority)?;
+        if !self.layout.has_clone_index() {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "clone lookup requires lexical artifact revision 15".to_owned(),
+            ));
+        }
+        if limit == 0 || limit > MAX_CLONE_EXACT_PAGE_MEMBERS_V1 {
+            return Err(CodeLexicalArtifactErrorV1::Contract(format!(
+                "clone exact page limit must be within 1..={MAX_CLONE_EXACT_PAGE_MEMBERS_V1}"
+            )));
+        }
+        let authority_digest = clone_authority_digest(authority)?;
+        let request_digest = canonical_sha256(&(
+            "tracedecay.clone-exact-request.v1",
+            self.receipt.artifact_digest(),
+            &authority_digest,
+            key,
+        ))
+        .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
+        let after = self.clone_exact_after(cursor, &request_digest)?;
+        let fetch = limit.checked_add(1).ok_or_else(|| {
+            CodeLexicalArtifactErrorV1::Contract("clone exact page limit overflowed".to_owned())
+        })?;
+        let connection = self.lock_connection()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT posting.symbol_occurrence_id, posting.payload_digest, occurrence.occurrence, payload.payload \
+                 FROM clone_exact_postings AS posting \
+                 LEFT JOIN clone_occurrences AS occurrence ON occurrence.symbol_occurrence_id = posting.symbol_occurrence_id \
+                 LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = posting.payload_digest \
+                 WHERE posting.class = ?1 AND posting.normalization_revision = ?2 AND posting.digest = ?3 \
+                 AND posting.symbol_occurrence_id != ?4 AND posting.symbol_occurrence_id > ?5 \
+                 ORDER BY posting.symbol_occurrence_id LIMIT ?6",
+            )
+            .map_err(sqlite_error)?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                i64::from(key.class as u8),
+                i64::from(key.normalization_revision),
+                key.digest.as_str(),
+                authority.symbol_occurrence_id.as_str(),
+                after,
+                i64::try_from(fetch)
+                    .map_err(|error| { CodeLexicalArtifactErrorV1::Contract(error.to_string()) })?,
+            ])
+            .map_err(sqlite_error)?;
+        let mut members = Vec::with_capacity(fetch);
+        while let Some(row) = rows.next().map_err(sqlite_error)? {
+            checkpoint(control)?;
+            members.push(self.verified_clone_member(authority, key, row)?);
+        }
+        let next_cursor = (members.len() > limit)
+            .then(|| {
+                members.get(limit - 1).map(|member| CloneArtifactCursorV1 {
+                    artifact_digest: self.receipt.artifact_digest().clone(),
+                    generation: self.metadata.generation.clone(),
+                    request_digest,
+                    after: CloneArtifactCursorPositionV1::Exact(
+                        member.occurrence.symbol_occurrence_id.clone(),
+                    ),
+                })
+            })
+            .flatten();
+        members.truncate(limit);
+        Ok(CloneArtifactPageV1 {
+            members,
+            next_cursor,
+        })
+    }
+
+    pub fn clone_fingerprint_page(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        cursor: Option<&CloneArtifactCursorV1>,
+        limit: usize,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneFingerprintArtifactReadV1, CodeLexicalArtifactErrorV1> {
+        self.validate_clone_lookup_authority(authority)?;
+        let authority_digest = clone_authority_digest(authority)?;
+        let connection = self.lock_connection()?;
+        read_clone_fingerprint_page(
+            &connection,
+            CloneFingerprintReadRequestV1 {
+                layout: self.layout,
+                receipt: &self.receipt,
+                authority_digest: &authority_digest,
+                authority,
+                source,
+                selected_block: None,
+                cursor,
+                limit,
+                control,
+            },
+        )
+    }
+
+    pub fn clone_body(
+        &self,
+        symbol: &SymbolOccurrenceId,
+    ) -> Result<Option<CodeIndexCloneBodyV1>, CodeLexicalArtifactErrorV1> {
+        if !self.layout.has_clone_index() {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "clone lookup requires lexical artifact revision 15".to_owned(),
+            ));
+        }
+        let connection = self.lock_connection()?;
+        let row = connection
+            .query_row(
+                "SELECT occurrence.occurrence, payload.payload \
+                 FROM clone_occurrences AS occurrence \
+                 LEFT JOIN clone_body_payloads AS payload \
+                 ON payload.payload_digest = occurrence.payload_digest \
+                 WHERE occurrence.symbol_occurrence_id = ?1",
+                [symbol.as_str()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some((occurrence, payload)) = row else {
+            return Ok(None);
+        };
+        let payload = payload.ok_or_else(|| {
+            CodeLexicalArtifactErrorV1::Corrupt(
+                "clone occurrence is missing its payload".to_owned(),
+            )
+        })?;
+        let occurrence: CloneBodyOccurrenceV1 =
+            serde_json::from_slice(&occurrence).map_err(|error| {
+                CodeLexicalArtifactErrorV1::Corrupt(format!(
+                    "clone occurrence is not canonical JSON: {error}"
+                ))
+            })?;
+        let payload: CloneBodyPayloadV1 = serde_json::from_slice(&payload).map_err(|error| {
+            CodeLexicalArtifactErrorV1::Corrupt(format!(
+                "clone body payload is not canonical JSON: {error}"
+            ))
+        })?;
+        self.validate_clone_lookup_authority(&occurrence)?;
+        if occurrence.symbol_occurrence_id != *symbol
+            || occurrence.payload_digest != payload.payload_digest
+            || payload.validate().is_err()
+        {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "clone body lookup failed canonical validation".to_owned(),
+            ));
+        }
+        Ok(Some(CodeIndexCloneBodyV1 {
+            payload: Arc::new(payload),
+            occurrence,
+        }))
+    }
+
+    pub fn clone_body_by_source_range(
+        &self,
+        path: &str,
+        span: SourceSpan,
+    ) -> Result<Option<CodeIndexCloneBodyV1>, CodeLexicalArtifactErrorV1> {
+        if !self.layout.has_clone_index() {
+            return Err(CodeLexicalArtifactErrorV1::Incompatible(
+                "clone lookup requires lexical artifact revision 15".to_owned(),
+            ));
+        }
+        span.validate()
+            .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
+        let connection = self.lock_connection()?;
+        let row = connection
+            .query_row(
+                "SELECT occurrence.occurrence, payload.payload \
+                 FROM clone_occurrences AS occurrence \
+                 LEFT JOIN clone_body_payloads AS payload \
+                 ON payload.payload_digest = occurrence.payload_digest \
+                 WHERE occurrence.path = ?1 AND occurrence.body_start <= ?2 \
+                 AND occurrence.body_end >= ?3 \
+                 ORDER BY occurrence.body_end - occurrence.body_start, \
+                 occurrence.symbol_occurrence_id \
+                 LIMIT 1",
+                rusqlite::params![
+                    path,
+                    i64::try_from(span.start_byte).map_err(|error| {
+                        CodeLexicalArtifactErrorV1::Contract(error.to_string())
+                    })?,
+                    i64::try_from(span.end_byte).map_err(|error| {
+                        CodeLexicalArtifactErrorV1::Contract(error.to_string())
+                    })?,
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        let Some((occurrence, payload)) = row else {
+            return Ok(None);
+        };
+        let payload = payload.ok_or_else(|| {
+            CodeLexicalArtifactErrorV1::Corrupt(
+                "clone occurrence is missing its payload".to_owned(),
+            )
+        })?;
+        let occurrence: CloneBodyOccurrenceV1 =
+            serde_json::from_slice(&occurrence).map_err(|error| {
+                CodeLexicalArtifactErrorV1::Corrupt(format!(
+                    "clone occurrence is not canonical JSON: {error}"
+                ))
+            })?;
+        let payload: CloneBodyPayloadV1 = serde_json::from_slice(&payload).map_err(|error| {
+            CodeLexicalArtifactErrorV1::Corrupt(format!(
+                "clone body payload is not canonical JSON: {error}"
+            ))
+        })?;
+        self.validate_clone_lookup_authority(&occurrence)?;
+        if occurrence.path != path
+            || occurrence.body_span.start_byte > span.start_byte
+            || occurrence.body_span.end_byte < span.end_byte
+            || occurrence.payload_digest != payload.payload_digest
+            || payload.validate().is_err()
+        {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "source range lookup disagrees with its clone occurrence".to_owned(),
+            ));
+        }
+        Ok(Some(CodeIndexCloneBodyV1 {
+            payload: Arc::new(payload),
+            occurrence,
+        }))
+    }
+
+    fn validate_clone_lookup_authority(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+    ) -> Result<(), CodeLexicalArtifactErrorV1> {
+        if self.metadata.repository_id.as_ref() != Some(&authority.repository_id) {
+            return Err(CodeLexicalArtifactErrorV1::Missing(
+                "clone lookup repository authority is unavailable".to_owned(),
+            ));
+        }
+        if self.metadata.generation != authority.source_generation {
+            return Err(CodeLexicalArtifactErrorV1::Missing(format!(
+                "clone lookup generation {} is stale; the artifact serves {}",
+                authority.source_generation.as_str(),
+                self.metadata.generation.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clone_selected_block_page(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        selected_block: &CloneSelectedBlockV1,
+        cursor: Option<&CloneArtifactCursorV1>,
+        limit: usize,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneSelectedBlockArtifactReadV1, CodeLexicalArtifactErrorV1> {
+        self.validate_clone_lookup_authority(authority)?;
+        let authority_digest = clone_authority_digest(authority)?;
+        let connection = self.lock_connection()?;
+        let read = read_clone_fingerprint_page(
+            &connection,
+            CloneFingerprintReadRequestV1 {
+                layout: self.layout,
+                receipt: &self.receipt,
+                authority_digest: &authority_digest,
+                authority,
+                source,
+                selected_block: Some(selected_block),
+                cursor,
+                limit,
+                control,
+            },
+        )?;
+        let stream = read.stream.ok_or_else(|| {
+            CodeLexicalArtifactErrorV1::Corrupt(
+                "selected clone block has no fingerprint stream".to_owned(),
+            )
+        })?;
+        let members = read
+            .page
+            .members
+            .into_iter()
+            .map(|candidate| {
+                let containment = candidate.selected_block_containment.ok_or_else(|| {
+                    CodeLexicalArtifactErrorV1::Corrupt(
+                        "selected clone block candidate has no containment class".to_owned(),
+                    )
+                })?;
+                Ok(CloneSelectedBlockArtifactCandidateV1 {
+                    payload: candidate.payload,
+                    occurrences: candidate.occurrences,
+                    anchors: candidate.ordered_anchors,
+                    containment,
+                })
+            })
+            .collect::<Result<Vec<_>, CodeLexicalArtifactErrorV1>>()?;
+        Ok(CloneSelectedBlockArtifactReadV1 {
+            page: CloneArtifactPageV1 {
+                members,
+                next_cursor: read.page.next_cursor,
+            },
+            stream,
+            coverage: read.coverage,
+            partial_reasons: read.partial_reasons,
+            accounting: read.accounting,
+        })
+    }
+
+    fn clone_exact_after<'a>(
+        &self,
+        cursor: Option<&'a CloneArtifactCursorV1>,
+        request_digest: &ManifestDigest,
+    ) -> Result<&'a str, CodeLexicalArtifactErrorV1> {
+        match cursor {
+            Some(cursor)
+                if cursor.artifact_digest == *self.receipt.artifact_digest()
+                    && cursor.generation == self.metadata.generation
+                    && cursor.request_digest == *request_digest =>
+            {
+                match &cursor.after {
+                    CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id) => {
+                        Ok(symbol_occurrence_id.as_str())
+                    }
+                    CloneArtifactCursorPositionV1::Fingerprint { .. } => {
+                        Err(CodeLexicalArtifactErrorV1::Contract(
+                            "clone cursor position does not match an exact read".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Some(_) => Err(CodeLexicalArtifactErrorV1::Contract(
+                "clone exact cursor does not match its artifact, key, or authority".to_owned(),
+            )),
+            None => Ok(""),
+        }
+    }
+
+    fn verified_clone_member(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        row: &rusqlite::Row<'_>,
+    ) -> Result<CloneExactArtifactMemberV1, CodeLexicalArtifactErrorV1> {
+        let posting_occurrence: String = row.get(0).map_err(sqlite_error)?;
+        let posting_payload: String = row.get(1).map_err(sqlite_error)?;
+        let occurrence_bytes: Option<Vec<u8>> = row.get(2).map_err(sqlite_error)?;
+        let payload_bytes: Option<Vec<u8>> = row.get(3).map_err(sqlite_error)?;
+        let (Some(occurrence_bytes), Some(payload_bytes)) = (occurrence_bytes, payload_bytes)
+        else {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "clone exact posting is missing its occurrence or payload".to_owned(),
+            ));
+        };
+        let occurrence: CloneBodyOccurrenceV1 = serde_json::from_slice(&occurrence_bytes)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
+        let payload: CloneBodyPayloadV1 = serde_json::from_slice(&payload_bytes)
+            .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
+        if occurrence.symbol_occurrence_id.as_str() != posting_occurrence
+            || occurrence.project_id != authority.project_id
+            || occurrence.repository_id != authority.repository_id
+            || occurrence.worktree_id != authority.worktree_id
+            || occurrence.source_generation != self.metadata.generation
+            || occurrence.snapshot_digest != authority.snapshot_digest
+            || occurrence.payload_digest.as_str() != posting_payload
+            || occurrence.payload_digest != payload.payload_digest
+            || payload.validate().is_err()
+            || !payload
+                .exact_keys(occurrence.eligibility)
+                .iter()
+                .any(|candidate| candidate == key)
+        {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "clone exact posting does not match its payload and occurrence".to_owned(),
+            ));
+        }
+        Ok(CloneExactArtifactMemberV1 {
+            payload,
+            occurrence,
+        })
     }
 
     /// Reader queries serialize on this one connection; the wait span makes
@@ -962,7 +1533,9 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => {
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => {
                 lookup_term_ids(connection, terms).map_err(map_query_artifact_error)?
             }
         };
@@ -972,7 +1545,9 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => v11_ids.len(),
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => v11_ids.len(),
         };
         ensure_sqlite_bind_capacity(documents.parameters.len(), dynamic_binds)?;
         ensure_sqlite_bound_value_bytes(
@@ -988,6 +1563,8 @@ fn visit_lexical_rows(
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
             | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16
                 if v11_ids.is_empty() =>
             {
                 "'[]'".to_owned()
@@ -1007,7 +1584,9 @@ fn visit_lexical_rows(
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => {
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => {
                 let placeholders = std::iter::repeat_n("?", v11_ids.len())
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -1068,7 +1647,9 @@ fn visit_lexical_rows(
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14 => {
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16 => {
                     let encoded: Vec<(i64, String, i64)> =
                         serde_json::from_str(&encoded_frequencies).map_err(contract_error)?;
                     entries.reserve(encoded.len());
@@ -1173,7 +1754,7 @@ fn ensure_sqlite_bound_value_bytes<'a>(
     Ok(())
 }
 
-/// The first fixed number of distinct n-grams forms a selective, bounded
+/// The rarest fixed number of distinct n-grams forms a selective, bounded
 /// prefilter. It may admit a superset for a very long phrase; the row-level
 /// substring check remains the correctness authority before scoring.
 fn ngram_document_query(
@@ -1184,10 +1765,7 @@ fn ngram_document_query(
     metrics: &ArtifactQueryMetricsV1,
 ) -> Result<DocumentQueryV1, RetrievalPortError> {
     hotpath::measure_block!("query.artifact.ngram.bitmap_query", {
-        let ngrams = query_ngrams(bytes)
-            .into_iter()
-            .take(ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1)
-            .collect::<Vec<_>>();
+        let ngrams = query_ngrams(bytes).into_iter().collect::<Vec<_>>();
         if ngrams.is_empty() {
             return Ok(DocumentQueryV1::empty());
         }
@@ -1289,6 +1867,7 @@ fn ngram_bitmap_candidates(
     }
     drop(selectivity_statement);
     selectivities.sort_unstable_by_key(|selectivity| (selectivity.cardinality, selectivity.ngram));
+    selectivities.truncate(ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1);
     if let Some(selectivity) = selectivities.first() {
         ensure_ngram_candidate_cardinality(selectivity.cardinality)?;
     }
@@ -1542,7 +2121,7 @@ impl<'a> ArtifactQueryV1<'a> {
                     .decode_row(&chunk_id, &bytes)
                     .map_err(map_query_artifact_error)?;
                 for (phrase, frequency) in &mut phrase_frequencies {
-                    if substring_count(&row.normalized_text, phrase) > 0 {
+                    if matches_phrase(&row, phrase) {
                         *frequency += 1;
                     }
                 }
@@ -1620,6 +2199,8 @@ impl<'a> ArtifactQueryV1<'a> {
                 matched_whole_terms: score.matched_whole_terms,
                 matched_subtokens: score.matched_subtokens,
                 matched_phrases: score.matched_phrases,
+                matched_proximities: score.matched_proximities,
+                spelling_variants: score.spelling_variants,
                 typo_recovery_applied: score.typo_recovery_applied,
                 echo_penalty_applied: score.echo_penalty_applied,
             };
@@ -1777,6 +2358,13 @@ impl<'a> ArtifactQueryV1<'a> {
                 whole_terms.extend(expansions.iter().cloned());
             }
         }
+        whole_terms.extend(
+            request
+                .proximities
+                .iter()
+                .flat_map(|proximity| &proximity.terms)
+                .map(|term| normalize_lexical(term)),
+        );
         let subtokens = request
             .subtokens
             .iter()
@@ -1811,7 +2399,9 @@ impl<'a> ArtifactQueryV1<'a> {
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => {
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => {
                 let subtoken_field = field_code(LexicalFieldV1::Subtoken);
                 for term in whole_terms {
                     if let Some(term_id) =
@@ -1887,7 +2477,9 @@ impl<'a> ArtifactQueryV1<'a> {
                 }
                 LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14 => {
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16 => {
                     sources.push(DocumentQueryV1::exact_id(
                         literal.field,
                         &literal.canonical_bytes,
@@ -2003,7 +2595,9 @@ impl<'a> ArtifactQueryV1<'a> {
             LexicalArtifactLayoutV1::V11
             | LexicalArtifactLayoutV1::V12
             | LexicalArtifactLayoutV1::V13
-            | LexicalArtifactLayoutV1::V14 => "SELECT term FROM vocabulary WHERE in_fuzzy = 1",
+            | LexicalArtifactLayoutV1::V14
+            | LexicalArtifactLayoutV1::V15
+            | LexicalArtifactLayoutV1::V16 => "SELECT term FROM vocabulary WHERE in_fuzzy = 1",
         }
     }
 
@@ -2058,7 +2652,9 @@ impl<'a> ArtifactQueryV1<'a> {
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14 => {
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16 => {
                     field_from_code(row.get::<_, i64>(0).map_err(map_query_sql_error)?)
                         .map_err(map_query_artifact_error)?
                 }
@@ -2106,7 +2702,9 @@ impl<'a> ArtifactQueryV1<'a> {
                 LexicalArtifactLayoutV1::V11
                 | LexicalArtifactLayoutV1::V12
                 | LexicalArtifactLayoutV1::V13
-                | LexicalArtifactLayoutV1::V14 => {
+                | LexicalArtifactLayoutV1::V14
+                | LexicalArtifactLayoutV1::V15
+                | LexicalArtifactLayoutV1::V16 => {
                     let assigned = lookup_term_ids(self.connection, terms)
                         .map_err(map_query_artifact_error)?;
                     let term_ids = assigned.values().copied().collect::<Vec<_>>();
@@ -2185,6 +2783,8 @@ impl<'a> ArtifactQueryV1<'a> {
         let mut matched_whole_terms = BTreeSet::new();
         let mut matched_subtokens = BTreeSet::new();
         let mut matched_phrases = BTreeSet::new();
+        let mut matched_proximities = BTreeSet::new();
+        let mut spelling_variants = BTreeSet::new();
         let mut matched_kinds = BTreeSet::new();
         let mut typo_recovery_applied = false;
         for field in row.field_lengths.keys() {
@@ -2212,6 +2812,10 @@ impl<'a> ArtifactQueryV1<'a> {
                                 / 1_000;
                             add_score(&mut field_scores, *field, score);
                             matched_whole_terms.insert((*query_term).to_owned());
+                            spelling_variants.insert(LexicalSpellingVariantV1 {
+                                query: (*query_term).to_owned(),
+                                alternative: expansion.clone(),
+                            });
                             typo_recovery_applied = true;
                             collect_term_kinds(&row.exact_terms, expansion, &mut matched_kinds);
                         }
@@ -2232,30 +2836,47 @@ impl<'a> ArtifactQueryV1<'a> {
             }
         }
         for (phrase, normalized) in &prepared.phrases {
-            let tf = substring_count(&row.normalized_text, normalized);
-            if tf == 0 {
-                continue;
+            for field in row.field_lengths.keys() {
+                let Some(text) = normalized_field_text(row, *field) else {
+                    continue;
+                };
+                let tf = substring_count(&text, normalized);
+                if tf == 0 {
+                    continue;
+                }
+                let score = self
+                    .term_score_with_df(
+                        *field,
+                        tf,
+                        row,
+                        phrase_frequencies
+                            .get(normalized)
+                            .copied()
+                            .unwrap_or_default(),
+                        stats,
+                    )
+                    .saturating_mul(PHRASE_SCORE_MILLIS)
+                    / 1_000;
+                add_score(&mut field_scores, *field, score);
+                matched_phrases.insert((*phrase).to_owned());
             }
-            let field = if row.anchor.grain == CodeSearchChunkGrainV1::FilePreamble {
-                LexicalFieldV1::PreambleText
-            } else {
-                LexicalFieldV1::BodyText
-            };
-            let score = self
-                .term_score_with_df(
-                    field,
-                    tf,
-                    row,
-                    phrase_frequencies
-                        .get(normalized)
-                        .copied()
-                        .unwrap_or_default(),
-                    stats,
-                )
-                .saturating_mul(PHRASE_SCORE_MILLIS)
-                / 1_000;
-            add_score(&mut field_scores, field, score);
-            matched_phrases.insert((*phrase).to_owned());
+        }
+        for proximity in &prepared.proximities {
+            for field in row.field_lengths.keys() {
+                let Some(text) = normalized_field_text(row, *field) else {
+                    continue;
+                };
+                let tf = proximity_count(&text, &proximity.terms, proximity.original.maximum_gap);
+                if tf == 0 {
+                    continue;
+                }
+                let score = self
+                    .term_score_with_df(*field, tf, row, 1, stats)
+                    .saturating_mul(PHRASE_SCORE_MILLIS)
+                    / 1_000;
+                add_score(&mut field_scores, *field, score);
+                matched_proximities.insert(proximity.original.clone());
+            }
         }
         let echo_penalty_applied =
             !prepared.echo_query.is_empty() && prepared.echo_query == row.normalized_text.trim();
@@ -2269,6 +2890,8 @@ impl<'a> ArtifactQueryV1<'a> {
             matched_whole_terms: matched_whole_terms.into_iter().collect(),
             matched_subtokens: matched_subtokens.into_iter().collect(),
             matched_phrases: matched_phrases.into_iter().collect(),
+            matched_proximities: matched_proximities.into_iter().collect(),
+            spelling_variants: spelling_variants.into_iter().collect(),
             matched_kinds: matched_kinds.into_iter().collect(),
             typo_recovery_applied,
             echo_penalty_applied,
@@ -2339,6 +2962,9 @@ fn lexical_terms(
     }
     for (_, normalized) in &prepared.subtokens {
         terms.insert(normalized.clone());
+    }
+    for proximity in &prepared.proximities {
+        terms.extend(proximity.terms.iter().cloned());
     }
     terms
 }
@@ -3430,7 +4056,7 @@ mod tests {
     }
 
     #[test]
-    fn phrase_ngram_stream_intersects_a_fixed_number_of_predicates() {
+    fn phrase_ngram_stream_selects_the_rarest_fixed_predicates_from_the_whole_phrase() {
         let connection = Connection::open_in_memory().expect("in-memory SQLite");
         connection
             .execute_batch(
@@ -3452,15 +4078,14 @@ mod tests {
             )
             .expect("ngram fixture schema");
         let phrase = b"abcdefghijklmnopqrstuvw";
-        let ngrams = query_ngrams(phrase)
-            .into_iter()
-            .take(ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1)
-            .collect::<Vec<_>>();
-        assert_eq!(ngrams.len(), ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1);
+        let ngrams = query_ngrams(phrase).into_iter().collect::<Vec<_>>();
+        assert!(ngrams.len() > ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1);
         for (ordinal, ngram) in ngrams.iter().enumerate() {
             let documents = if ordinal + 1 < ngrams.len() {
                 RoaringBitmap::from_iter([1, 2])
             } else {
+                // The only selective predicate sorts beyond the fixed
+                // intersection count in packed-ngram order.
                 RoaringBitmap::from_iter([1])
             };
             let encoded = encode_ngram_bitmap(LexicalArtifactLayoutV1::V11, &documents)
@@ -3491,6 +4116,11 @@ mod tests {
 
         assert_eq!(query.parameters.len(), 1);
         assert_eq!(streamed_documents(&connection, &query), vec![1]);
+        assert_eq!(
+            metrics.ngram_decoded_shards.get(),
+            ARTIFACT_NGRAM_INTERSECTION_SCRATCH_V1 as u64,
+            "selectivity must not increase the fixed shard-work bound"
+        );
     }
 
     #[test]

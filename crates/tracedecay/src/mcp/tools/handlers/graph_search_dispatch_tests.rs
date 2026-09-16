@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use serde_json::{Value, json};
-use tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader;
+use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader;
 use tracedecay_domain::ExactClass;
 use tracedecay_mcp::ToolResult;
 use tracedecay_query::retrieval::lexical::LexicalRoutingV1;
 
-use crate::tracedecay::TraceDecay;
+use crate::project::TraceDecay;
 
 fn completed_sparse_search() -> tracedecay_query::code_search::CodeIndexSearchOutcomeV1 {
     completed_sparse_search_for_generation("generation.mcp-verified-graph-fixture.1")
@@ -51,9 +51,6 @@ fn completed_sparse_search_for_generation(
     )
     .expect("canonical sparse lexical fallback payload");
     let anchor = candidate.candidate.anchor_id.clone();
-    let semantic = tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-        reason: "semantic_generation_warming",
-    };
     tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(
         tracedecay_query::code_search::CodeIndexSearchCompletedV1 {
             code_generation: generation.to_owned(),
@@ -68,8 +65,7 @@ fn completed_sparse_search_for_generation(
                     path: "src/lib.rs".to_owned(),
                 },
             )]),
-            coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::fused(&semantic),
-            semantic,
+            coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::warm(),
             next_cursor: None,
             lexical_routes: tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1 {
                 routes: vec![tracedecay_query::retrieval::lexical::LexicalRouteKindV1::Query],
@@ -85,9 +81,6 @@ fn unavailable_search() -> tracedecay_query::code_search::CodeIndexSearchOutcome
             code_generation: Some("generation.mcp-verified-graph-fixture.1".to_owned()),
             reason:
                 tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-            semantic: tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-                reason: "search_attempt_repeated",
-            },
             coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::unavailable(
                 "search_attempt_repeated",
             ),
@@ -197,109 +190,6 @@ async fn completed_primary_search_is_not_retried_after_graph_admission_case() {
     cg.close();
 }
 
-/// A strict-semantic request the runtime cannot honour is refused: the
-/// payload stays typed (`status: "unavailable"`, the reason, the semantic
-/// lane's own status) and the call is flagged as a tool-level error — not
-/// a JSON-RPC failure, and not an empty page passed off as success. The
-/// same outcome under `fallback_allowed` is a degraded answer, not a
-/// refusal.
-#[test]
-fn strict_semantic_unavailability_is_a_typed_refusal() {
-    run_with_locked_user_data_dir(strict_semantic_unavailability_is_a_typed_refusal_case());
-}
-
-async fn strict_semantic_unavailability_is_a_typed_refusal_case() {
-    let dir = tempfile::TempDir::new().expect("strict refusal isolation");
-    let _env = crate::mcp::tools::handlers::dispatch_test_support::SelectorEnv::new(dir.path());
-    let project = dir.path().join("strict-semantic-refusal");
-    std::fs::create_dir_all(project.join("src")).expect("create strict refusal sources");
-    std::fs::write(
-        project.join("src/lib.rs"),
-        "pub fn SparseLexicalWidget() {}\n",
-    )
-    .expect("write strict refusal fixture");
-    let (cg, _runtime) = TraceDecay::init_test_fixture_with_registered_runtime(
-        &project,
-        "project.strict-semantic-refusal",
-    )
-    .await
-    .expect("registered strict refusal fixture");
-
-    let executor: tracedecay_query::code_search::CodeIndexSearchExecutor = std::sync::Arc::new(
-        move |_| {
-            Box::pin(async {
-                tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(
-                    tracedecay_query::code_search::CodeIndexSearchUnavailableV1 {
-                        code_generation: Some(
-                            "generation.mcp-verified-graph-fixture.1".to_owned(),
-                        ),
-                        reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::SemanticUnavailable,
-                        semantic: tracedecay_query::code_search::CodeIndexSemanticStatusV1::Unavailable {
-                            reason: "calibration_unavailable",
-                        },
-                        coverage: tracedecay_query::code_search::CodeIndexSearchCoverageV1::unavailable(
-                            "calibration_unavailable",
-                        ),
-                    },
-                )
-            })
-        },
-    );
-
-    for (semantic_mode, refused) in [("strict_semantic", true), ("fallback_allowed", false)] {
-        let result = crate::mcp::tools::handlers::handle_tool_call_with_registry_options(
-            &cg,
-            "tracedecay_search",
-            json!({
-                "query": "SparseLexicalWidget",
-                "limit": 5,
-                "format": "json",
-                "semantic_mode": semantic_mode,
-            }),
-            None,
-            None,
-            search_test_options(&cg, std::sync::Arc::clone(&executor)),
-        )
-        .await
-        .expect("an unavailable search answers with a typed result, not a hard error");
-        let payload: Value = serde_json::from_str(
-            result.value["content"][0]["text"]
-                .as_str()
-                .expect("unavailable search JSON text"),
-        )
-        .expect("unavailable search JSON payload");
-
-        assert_eq!(
-            result.semantic_error() == Some(true),
-            refused,
-            "{semantic_mode}: refusal flag mismatch for {payload}"
-        );
-        assert_eq!(payload["status"], "unavailable", "{semantic_mode}");
-        assert_eq!(payload["reason"], "semantic_unavailable", "{semantic_mode}");
-        assert_eq!(payload["semantic"]["mode"], semantic_mode);
-        assert_eq!(
-            payload["semantic"]["status"], "unavailable",
-            "{semantic_mode}"
-        );
-        assert_eq!(
-            payload["semantic"]["reason"], "calibration_unavailable",
-            "{semantic_mode}"
-        );
-        assert_eq!(payload["results"], json!([]), "{semantic_mode}");
-        assert_eq!(
-            payload["query_fallback_digest"],
-            Value::Null,
-            "{semantic_mode}"
-        );
-        assert_eq!(
-            result.failure_message(),
-            Some("code-index search unavailable: semantic_unavailable"),
-            "{semantic_mode}"
-        );
-    }
-    cg.close();
-}
-
 #[test]
 fn generation_mismatch_retry_cannot_erase_a_complete_sparse_search() {
     run_with_locked_user_data_dir(
@@ -381,16 +271,15 @@ fn freshness_reader(
     let latest_generation_id = latest_generation_id.map(str::to_owned);
     let staleness_state = staleness_state.to_owned();
     std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
-        let freshness =
-            tracedecay_dashboard_api::code_index_freshness_api::CodeIndexWorktreeFreshnessV1 {
-                worktree_root: worktree_root.display().to_string(),
-                latest_generation_id: latest_generation_id.clone(),
-                staleness_state: Some(staleness_state.clone()),
-                rebuild_in_flight,
-                hook_hint_count: Some(0),
-                coverage: "complete".to_owned(),
-                ..Default::default()
-            };
+        let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
+            worktree_root: worktree_root.display().to_string(),
+            latest_generation_id: latest_generation_id.clone(),
+            staleness_state: Some(staleness_state.clone()),
+            rebuild_in_flight,
+            hook_hint_count: Some(0),
+            coverage: "complete".to_owned(),
+            ..Default::default()
+        };
         Box::pin(async move { Some(freshness) })
     })
 }
@@ -421,6 +310,7 @@ fn completed_sparse_search_with_anchor_route(
                 route,
                 score_micros: 900_000,
                 matched_terms: vec![anchor.to_owned()],
+                spelling_variants: Vec::new(),
             }],
         )]),
     };

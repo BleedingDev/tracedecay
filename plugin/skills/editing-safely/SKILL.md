@@ -1,6 +1,6 @@
 ---
 name: editing-safely
-description: Perform structural renames, signature or field changes, symbol moves, or consolidation with TraceDecay mutation operations.
+description: Make structural code edits with TraceDecay preview and mutation operations.
 ---
 
 # Editing safely
@@ -31,8 +31,8 @@ committed effects, reconcile its state (`tracedecay_source_edit_reconcile`)
 before retrying. Preserve peers' changes when the expected state no longer
 matches.
 
-For consolidation, body similarity is evidence; a similar name is not. Verify
-likely or vector-only duplicate matches before replacing an implementation.
+For consolidation, compare candidate bodies and behavior directly; a similar
+name does not justify replacing an implementation.
 Structural rewrite (`tracedecay_ast_grep_rewrite`) uses external ast-grep where
 advertised; its availability is separate from in-process structural search.
 Verify the actual changed behavior and use `assessing-impact` for structural

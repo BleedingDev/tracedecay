@@ -10,8 +10,8 @@ use std::sync::Arc;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CustomNotification, ErrorCode,
     ErrorData, Implementation, InitializeRequestParams, InitializeResult, ListResourcesResult,
-    ListToolsResult, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult,
-    ServerCapabilities, ServerInfo,
+    ListToolsResult, MetaObject, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{RoleServer, ServerHandler};
@@ -396,18 +396,27 @@ where
         connection: &mut C::Connection,
     ) -> Result<JsonRpcResponse, ErrorData> {
         let pre_cancelled = request_cancellation.is_cancelled();
+        let dispatch_cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        if pre_cancelled {
+            dispatch_cancellation.cancel();
+        }
         // The legacy MCP route already erases this shared dispatch authority
         // before awaiting it. Keep the typed RMCP route at the same ownership
         // boundary: the cancellation combinator otherwise stores the complete
         // catalog-dispatch future inline in rmcp's generated request future.
-        let handling =
-            self.context
-                .dispatch(request, self.timings_enabled, connection, pre_cancelled);
+        let handling = self.context.dispatch(
+            request,
+            self.timings_enabled,
+            connection,
+            dispatch_cancellation.clone(),
+        );
         let response = if pre_cancelled {
             Some(handling.await)
         } else {
             await_dispatch_with_cancellation(handling, request_cancellation.cancelled(), || {
-                self.context.cancel_request(&id, &self.memory_request_scope)
+                dispatch_cancellation.cancel();
+                let _ = self.context.cancel_request(&id, &self.memory_request_scope);
+                true
             })
             .await
         }
@@ -459,7 +468,7 @@ where
                 McpDispatchRequest::from_legacy(&request),
                 self.timings_enabled,
                 &mut connection,
-                false,
+                tracedecay_session_memory::context::CancellationToken::new(),
             )
             .await;
     }
@@ -699,11 +708,21 @@ where
         if !request_meta.is_empty() {
             request.meta = Some(request_meta);
         }
-        rmcp_response_result::<CallToolResult>(
+        let started =
+            (self.timings_enabled || self.context.timings_enabled()).then(std::time::Instant::now);
+        let mut result = rmcp_response_result::<CallToolResult>(
             self.dispatch(context, "tools/call", McpDispatchParams::ToolsCall(request))
                 .await?,
-        )
-        .map(Into::into)
+        )?;
+        if let Some(started) = started {
+            result
+                .meta
+                .get_or_insert_with(MetaObject::new)
+                .0
+                .entry("duration_us".to_owned())
+                .or_insert_with(|| json!(started.elapsed().as_micros() as u64));
+        }
+        Ok(result.into())
     }
 
     #[hotpath::skip]

@@ -125,6 +125,99 @@ struct ProjectionOutputAlias {
     message_id: String,
 }
 
+const LIVE_PROJECTION_AUTHORITY_SQL: &str = "SELECT disposition.reason,
+            alias.output_provider, alias.output_message_id
+         FROM (SELECT ?1 AS projector_version, ?2 AS observation_id) AS target
+         LEFT JOIN observation_projection_dispositions AS disposition
+           ON disposition.projector_version = target.projector_version
+          AND disposition.observation_id = target.observation_id
+         LEFT JOIN observation_projection_aliases AS alias
+           ON alias.projector_version = target.projector_version
+          AND alias.observation_id = target.observation_id";
+
+const REBUILD_PROJECTION_AUTHORITY_SQL: &str = "SELECT disposition.reason,
+            alias.output_provider, alias.output_message_id
+         FROM (
+            SELECT ?1 AS projector_version, ?2 AS generation, ?3 AS observation_id
+         ) AS target
+         LEFT JOIN observation_projection_dispositions AS disposition
+           ON disposition.projector_version = target.projector_version
+          AND disposition.observation_id = target.observation_id
+         LEFT JOIN observation_projection_rebuild_aliases AS alias
+           ON alias.projector_version = target.projector_version
+          AND alias.generation = target.generation
+          AND alias.observation_id = target.observation_id";
+
+struct ProjectionAuthority {
+    disposition: Option<ProjectionSkipReason>,
+    alias: Option<ProjectionOutputAlias>,
+}
+
+async fn read_projection_authority(
+    conn: &impl QueryExecutor,
+    observation_id: &CanonicalObservationIdV1,
+    rebuild_generation: Option<&str>,
+) -> ProjectionStoreResult<ProjectionAuthority> {
+    let mut rows = if let Some(generation) = rebuild_generation {
+        conn.query(
+            REBUILD_PROJECTION_AUTHORITY_SQL,
+            (
+                SESSION_MESSAGE_PROJECTOR_VERSION,
+                generation,
+                observation_id.as_str(),
+            ),
+        )
+        .await
+    } else {
+        conn.query(
+            LIVE_PROJECTION_AUTHORITY_SQL,
+            (SESSION_MESSAGE_PROJECTOR_VERSION, observation_id.as_str()),
+        )
+        .await
+    }
+    .map_err(|error| storage("read projection authority", error))?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| storage("read projection authority", error))?
+        .ok_or_else(|| storage_message("read projection authority", "authority row is missing"))?;
+    let reason = row
+        .get::<Option<String>>(0)
+        .map_err(|error| storage("read projection authority", error))?
+        .map(|reason| {
+            ProjectionSkipReason::from_durable_str(&reason).ok_or_else(|| {
+                storage_message(
+                    "read projection authority",
+                    "projection disposition has an unknown reason",
+                )
+            })
+        })
+        .transpose()?;
+    let provider = row
+        .get::<Option<String>>(1)
+        .map_err(|error| storage("read projection authority", error))?;
+    let message_id = row
+        .get::<Option<String>>(2)
+        .map_err(|error| storage("read projection authority", error))?;
+    let alias = match (provider, message_id) {
+        (Some(provider), Some(message_id)) => Some(ProjectionOutputAlias {
+            provider,
+            message_id,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(storage_message(
+                "read projection authority",
+                "projection alias identity is incomplete",
+            ));
+        }
+    };
+    Ok(ProjectionAuthority {
+        disposition: reason,
+        alias,
+    })
+}
+
 async fn read_projection_alias(
     conn: &impl QueryExecutor,
     observation_id: &CanonicalObservationIdV1,
@@ -190,9 +283,9 @@ async fn derive_projection_with_alias_from_generation(
     observation: &DurableObservationV1,
     rebuild_generation: Option<&str>,
 ) -> ProjectionStoreResult<ObservationProjection> {
-    if durable_projection_disposition(conn, observation.observation_id().as_str()).await?
-        == Some(ProjectionSkipReason::NativeSourceSuperseded)
-    {
+    let authority =
+        read_projection_authority(conn, observation.observation_id(), rebuild_generation).await?;
+    if authority.disposition == Some(ProjectionSkipReason::NativeSourceSuperseded) {
         Box::pin(super::source_transition::verify_native_source_supersession(
             conn,
             observation,
@@ -202,8 +295,7 @@ async fn derive_projection_with_alias_from_generation(
             ProjectionSkipReason::NativeSourceSuperseded,
         ));
     }
-    if let Some(reason) =
-        durable_projection_disposition(conn, observation.observation_id().as_str()).await?
+    if let Some(reason) = authority.disposition
         && matches!(
             reason,
             ProjectionSkipReason::OutputCollision
@@ -219,8 +311,7 @@ async fn derive_projection_with_alias_from_generation(
     // established (thread, objective, status) transition semantics.
     let projection =
         collapse_consecutive_goal_ticks(conn, observation, projection, rebuild_generation).await?;
-    let mut alias =
-        read_projection_alias(conn, observation.observation_id(), rebuild_generation).await?;
+    let mut alias = authority.alias;
     if alias.is_none()
         && let Some(predecessor) =
             super::source_transition::read_native_source_predecessor(conn, observation).await?
@@ -555,9 +646,13 @@ async fn upsert_projected_raw_message(
     tracedecay_lcm::raw::upsert_projection_raw_message(conn, message)
         .await
         .map_err(|error| match error {
-            LcmError::SanitizationRefused { reason } => {
-                ProjectionStoreError::SanitizationRefused { reason }
-            }
+            LcmError::SanitizationRefused {
+                reason,
+                quarantined,
+            } => ProjectionStoreError::SanitizationRefused {
+                reason,
+                quarantined,
+            },
             environmental => storage("upsert projected LCM raw message", environmental),
         })
 }
@@ -599,18 +694,12 @@ async fn reconcile_projected_codex_goal_response(
         ));
     }
     drop(provenance_rows);
-    conn.execute(
-        "DELETE FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
-        params![current.provider.as_str(), response_message_id.as_str()],
+    delete_projected_output(
+        conn,
+        current.provider.as_str(),
+        response_message_id.as_str(),
     )
-    .await
-    .map_err(|error| storage("remove paired Codex goal raw message", error))?;
-    conn.execute(
-        "DELETE FROM session_messages WHERE provider = ?1 AND message_id = ?2",
-        params![current.provider.as_str(), response_message_id.as_str()],
-    )
-    .await
-    .map_err(|error| storage("remove paired Codex goal projection", error))?;
+    .await?;
     conn.execute(
         "DELETE FROM observation_projection_provenance
          WHERE projector_version = ?1 AND output_provider = ?2 AND output_message_id = ?3",
@@ -650,6 +739,203 @@ async fn reconcile_projected_codex_goal_response(
     .await
     .map(|_| ())
     .map_err(|error| storage("remove paired Codex goal output state", error))
+}
+
+/// Replaces the stored output row with the one this binary derives.
+///
+/// The projected message row is derived state, so every field but its identity
+/// is rewritten from the record. Shared with released-rendering convergence,
+/// which reaches the same row through a different admission path and must not
+/// write it a second way.
+pub(super) async fn supersede_projected_message(
+    conn: &impl Executor,
+    message: &SessionMessageRecord,
+) -> ProjectionStoreResult<()> {
+    conn.execute(
+        "UPDATE session_messages
+         SET session_id = ?3, role = ?4, timestamp = ?5, ordinal = ?6,
+             text = ?7, kind = ?8, model = ?9, tool_names = ?10,
+             source_path = ?11, source_offset = ?12, metadata_json = ?13
+         WHERE provider = ?1 AND message_id = ?2",
+        params![
+            message.provider.as_str(),
+            message.message_id.as_str(),
+            message.session_id.as_str(),
+            message.role.as_str(),
+            message.timestamp,
+            message.ordinal,
+            message.text.as_str(),
+            message.kind.as_deref(),
+            message.model.as_deref(),
+            message.tool_names.as_deref(),
+            message.source_path.as_deref(),
+            message.source_offset,
+            message.metadata_json.as_deref(),
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| storage("supersede projected message", error))
+}
+
+/// Removes one projected output row together with its LCM raw twin.
+///
+/// The pair is the unit: a raw row without its message is unreachable and a
+/// message without its raw twin is unhydratable, so every retirement path drops
+/// both here rather than spelling the two deletes itself.
+async fn delete_projected_output(
+    conn: &impl Executor,
+    provider: &str,
+    message_id: &str,
+) -> ProjectionStoreResult<()> {
+    conn.execute(
+        "DELETE FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
+        params![provider, message_id],
+    )
+    .await
+    .map_err(|error| storage("remove retired projection raw message", error))?;
+    conn.execute(
+        "DELETE FROM session_messages WHERE provider = ?1 AND message_id = ?2",
+        params![provider, message_id],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| storage("remove retired projection message", error))
+}
+
+/// Whether the released rendering converged to a servable output or to the
+/// sanitizer's current quarantine verdict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in super::super) enum ConvergedRendering {
+    /// The output rows and provenance digest now hold this binary's rendering.
+    Output,
+    /// This binary's rendering is withheld by the LCM privacy sanitizer, so the
+    /// observation now holds the durable sanitization-refusal disposition a
+    /// fresh capture writes instead of an output.
+    Quarantined,
+}
+
+/// Rewrites one output's rows and provenance digest to this binary's
+/// deterministic rendering, keeping the historical `message_created` flag the
+/// releases wrote.
+///
+/// Reached only from the authority audit, which has already proven the stored
+/// provenance row is the digest of the output row this store holds — the
+/// rendering a release wrote — rather than a row disagreeing with its own
+/// output. The message row and its LCM raw twin are pure derivations of the
+/// durable observation, so rewriting them loses nothing; the digest is
+/// re-stamped last so an interrupted transaction leaves the released pairing
+/// intact.
+///
+/// When the LCM privacy sanitizer withholds this binary's rendering, that
+/// verdict *is* the current rendering: the output is retired to the disposition
+/// a fresh capture writes ([`retire_quarantined_projection`]). A sanitizer
+/// fault still fails the transaction so the store stays refused, named.
+pub(in super::super) async fn converge_released_output_rendering(
+    conn: &impl Executor,
+    projection: &SessionMessageProjection,
+) -> ProjectionStoreResult<ConvergedRendering> {
+    let message = projection.message();
+    supersede_projected_message(conn, message).await?;
+    if message.provider != "hermes" {
+        match upsert_projected_raw_message(conn, message).await {
+            Ok(()) => {}
+            Err(ProjectionStoreError::SanitizationRefused {
+                quarantined: true, ..
+            }) => {
+                retire_quarantined_projection(conn, projection).await?;
+                return Ok(ConvergedRendering::Quarantined);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let provenance = projection.provenance();
+    conn.execute(
+        "UPDATE observation_projection_provenance
+         SET output_digest = ?4
+         WHERE projector_version = ?1 AND observation_id = ?2 AND output_ordinal = ?3",
+        params![
+            provenance.projector_version(),
+            provenance.observation_id().as_str(),
+            projection.output_ordinal(),
+            projection.output_digest()?.as_str(),
+        ],
+    )
+    .await
+    .map_err(|error| storage("re-stamp released projection provenance", error))?;
+    Ok(ConvergedRendering::Output)
+}
+
+/// Converges one observation whose current rendering the LCM privacy sanitizer
+/// withholds to the durable disposition a fresh capture of the same envelope
+/// writes today.
+///
+/// A capture running now derives the same rendering, fails the same
+/// deterministic sanitization, rolls its rows back, and records
+/// `sanitization_refused` against the observation
+/// (`persist_projection_rejection_on_database`). So the released store reaches
+/// byte-identical state by removing the outputs this observation created with
+/// their LCM raw twins, dropping its provenance and workflow rows, and writing
+/// that disposition in their place. An output row a *different* observation
+/// created keeps its own provenance and is not this retirement's to remove —
+/// a fresh capture would not have created it either.
+///
+/// Only the projection is retired. The durable observation, its payload, and
+/// its receipt stay untouched, so a binary whose sanitizer admits the content
+/// re-projects it from the same authority.
+async fn retire_quarantined_projection(
+    conn: &impl Executor,
+    projection: &SessionMessageProjection,
+) -> ProjectionStoreResult<()> {
+    let provenance = projection.provenance();
+    let observation_id = provenance.observation_id().as_str();
+    let mut rows = conn
+        .query(
+            "SELECT output_provider, output_message_id
+             FROM observation_projection_provenance
+             WHERE projector_version = ?1 AND observation_id = ?2 AND message_created = 1",
+            params![provenance.projector_version(), observation_id],
+        )
+        .await
+        .map_err(|error| storage("read quarantined projection outputs", error))?;
+    let mut outputs = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| storage("read quarantined projection outputs", error))?
+    {
+        outputs.push((
+            row.get::<String>(0)
+                .map_err(|error| storage("read quarantined projection outputs", error))?,
+            row.get::<String>(1)
+                .map_err(|error| storage("read quarantined projection outputs", error))?,
+        ));
+    }
+    drop(rows);
+    for (output_provider, output_message_id) in &outputs {
+        delete_projected_output(conn, output_provider, output_message_id).await?;
+    }
+    conn.execute(
+        "DELETE FROM observation_projection_provenance
+         WHERE projector_version = ?1 AND observation_id = ?2",
+        params![provenance.projector_version(), observation_id],
+    )
+    .await
+    .map_err(|error| storage("remove quarantined projection provenance", error))?;
+    conn.execute(
+        "DELETE FROM observation_workflow_facts
+         WHERE projector_version = ?1 AND observation_id = ?2",
+        params![provenance.projector_version(), observation_id],
+    )
+    .await
+    .map_err(|error| storage("remove quarantined projection workflow facts", error))?;
+    apply_skip_disposition_for_receipt(
+        conn,
+        observation_id,
+        provenance.receipt_id(),
+        ProjectionSkipReason::SanitizationRefused,
+    )
+    .await
 }
 
 #[hotpath::measure(future = true, label = "global_db.observation_apply.persist.rows")]
@@ -714,30 +1000,7 @@ async fn apply_rows(
             .map_err(|error| storage("insert projected message", error))?;
         }
         MessageTransition::Supersede => {
-            conn.execute(
-                "UPDATE session_messages
-                 SET session_id = ?3, role = ?4, timestamp = ?5, ordinal = ?6,
-                     text = ?7, kind = ?8, model = ?9, tool_names = ?10,
-                     source_path = ?11, source_offset = ?12, metadata_json = ?13
-                 WHERE provider = ?1 AND message_id = ?2",
-                params![
-                    message.provider.as_str(),
-                    message.message_id.as_str(),
-                    message.session_id.as_str(),
-                    message.role.as_str(),
-                    message.timestamp,
-                    message.ordinal,
-                    message.text.as_str(),
-                    message.kind.as_deref(),
-                    message.model.as_deref(),
-                    message.tool_names.as_deref(),
-                    message.source_path.as_deref(),
-                    message.source_offset,
-                    message.metadata_json.as_deref(),
-                ],
-            )
-            .await
-            .map_err(|error| storage("supersede projected message", error))?;
+            supersede_projected_message(conn, message).await?;
         }
         MessageTransition::Retain => {}
     }
@@ -1147,54 +1410,31 @@ async fn apply_provenance(
     Ok(())
 }
 
-/// Durable deterministic dispositions are projection input on every replay and
-/// rebuild. Consulting them before derivation prevents an unchanged invalid
-/// observation from repeating expensive hashing or parsing work.
-#[hotpath::measure(future = true, label = "global_db.observation_apply.query.disposition")]
-pub async fn durable_projection_disposition(
-    conn: &impl QueryExecutor,
-    observation_id: &str,
-) -> ProjectionStoreResult<Option<ProjectionSkipReason>> {
-    let mut rows = conn
-        .query(
-            "SELECT reason FROM observation_projection_dispositions
-             WHERE projector_version = ?1 AND observation_id = ?2",
-            (SESSION_MESSAGE_PROJECTOR_VERSION, observation_id),
-        )
-        .await
-        .map_err(|error| storage("read projection disposition", error))?;
-    let reason = rows
-        .next()
-        .await
-        .map_err(|error| storage("read projection disposition", error))?
-        .map(|row| row.get::<String>(0))
-        .transpose()
-        .map_err(|error| storage("read projection disposition", error))?;
-    reason
-        .map(|reason| {
-            ProjectionSkipReason::from_durable_str(&reason).ok_or_else(|| {
-                storage_message(
-                    "read projection disposition",
-                    "projection disposition has an unknown reason",
-                )
-            })
-        })
-        .transpose()
-}
-
 async fn verify_skip_disposition(
     conn: &impl QueryExecutor,
     observation: &DurableObservationV1,
+    reason: ProjectionSkipReason,
+) -> ProjectionStoreResult<()> {
+    verify_skip_disposition_for_receipt(
+        conn,
+        observation.observation_id().as_str(),
+        observation.receipt().receipt().receipt_id().as_str(),
+        reason,
+    )
+    .await
+}
+
+async fn verify_skip_disposition_for_receipt(
+    conn: &impl QueryExecutor,
+    observation_id: &str,
+    expected_receipt_id: &str,
     reason: ProjectionSkipReason,
 ) -> ProjectionStoreResult<()> {
     let mut rows = conn
         .query(
             "SELECT receipt_id, reason FROM observation_projection_dispositions
              WHERE projector_version = ?1 AND observation_id = ?2",
-            params![
-                SESSION_MESSAGE_PROJECTOR_VERSION,
-                observation.observation_id().as_str()
-            ],
+            params![SESSION_MESSAGE_PROJECTOR_VERSION, observation_id],
         )
         .await
         .map_err(|error| storage("verify projection disposition", error))?;
@@ -1211,7 +1451,6 @@ async fn verify_skip_disposition(
     let actual_reason = row
         .get::<String>(1)
         .map_err(|error| storage("verify projection disposition", error))?;
-    let expected_receipt_id = observation.receipt().receipt().receipt_id().as_str();
     if receipt_id == expected_receipt_id && actual_reason == reason.as_str() {
         Ok(())
     } else {
@@ -1219,10 +1458,25 @@ async fn verify_skip_disposition(
     }
 }
 
-#[hotpath::measure(future = true, label = "global_db.observation_apply.persist.skip")]
 pub(super) async fn apply_skip_disposition(
     conn: &impl Executor,
     observation: &DurableObservationV1,
+    reason: ProjectionSkipReason,
+) -> ProjectionStoreResult<()> {
+    apply_skip_disposition_for_receipt(
+        conn,
+        observation.observation_id().as_str(),
+        observation.receipt().receipt().receipt_id().as_str(),
+        reason,
+    )
+    .await
+}
+
+#[hotpath::measure(future = true, label = "global_db.observation_apply.persist.skip")]
+async fn apply_skip_disposition_for_receipt(
+    conn: &impl Executor,
+    observation_id: &str,
+    receipt_id: &str,
     reason: ProjectionSkipReason,
 ) -> ProjectionStoreResult<()> {
     conn.execute(
@@ -1232,14 +1486,14 @@ pub(super) async fn apply_skip_disposition(
          ON CONFLICT DO NOTHING",
         params![
             SESSION_MESSAGE_PROJECTOR_VERSION,
-            observation.observation_id().as_str(),
-            observation.receipt().receipt().receipt_id().as_str(),
+            observation_id,
+            receipt_id,
             reason.as_str(),
         ],
     )
     .await
     .map_err(|error| storage("insert projection disposition", error))?;
-    verify_skip_disposition(conn, observation, reason).await
+    verify_skip_disposition_for_receipt(conn, observation_id, receipt_id, reason).await
 }
 
 async fn verify_message_effect(
@@ -1759,6 +2013,9 @@ pub(super) async fn apply_effect(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod authority_tests;
 
 #[cfg(test)]
 mod tests {

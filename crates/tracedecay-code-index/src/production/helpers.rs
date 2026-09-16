@@ -13,6 +13,9 @@ pub(crate) struct StagedGenerationV1 {
     pub(crate) chunks: GenerationChunkManifestV1,
     pub(crate) symbols: GenerationSymbolIndexV1,
     pub(crate) lineage: Vec<SymbolLineageCandidateV1>,
+    pub(crate) clone_payloads_reused: u64,
+    pub(crate) clone_payloads_computed: u64,
+    pub(crate) clone_stale_invalidations: u64,
 }
 
 pub(crate) fn staged_generation(
@@ -54,6 +57,9 @@ pub(crate) fn staged_generation(
         chunks,
         symbols,
         lineage,
+        clone_payloads_reused: 0,
+        clone_payloads_computed: 0,
+        clone_stale_invalidations: 0,
     })
 }
 
@@ -270,8 +276,8 @@ where
     }
     let (by_simple_name, rust_files) =
         hotpath::measure_block!("code_index.seal.reference_index", {
-            let mut by_simple_name: BTreeMap<&str, Vec<(usize, &LineageSymbolRecordV1)>> =
-                BTreeMap::new();
+            let mut by_simple_name: HashMap<&str, Vec<(usize, &LineageSymbolRecordV1)>> =
+                HashMap::new();
             for (index, file) in files.iter().enumerate() {
                 for symbol in &file.as_ref().artifacts.symbols {
                     by_simple_name
@@ -346,7 +352,7 @@ where
 /// therefore decides exactly what the whole-repository serial loop decided.
 fn resolve_one_file_cross_file_references<T>(
     files: &[T],
-    by_simple_name: &BTreeMap<&str, Vec<(usize, &LineageSymbolRecordV1)>>,
+    by_simple_name: &HashMap<&str, Vec<(usize, &LineageSymbolRecordV1)>>,
     rust_files: &RustFileIndexV1,
     index: usize,
 ) -> Vec<CanonicalRelationEdgeV1>
@@ -403,11 +409,11 @@ pub(super) fn take_seal_reference_resolutions() -> usize {
 }
 
 type ResolvedReferenceCacheV1<'a> =
-    BTreeMap<(usize, &'a str, RelationEdgeKindV1), Option<(usize, SymbolOccurrenceId)>>;
+    HashMap<(usize, &'a str, RelationEdgeKindV1), Option<(usize, SymbolOccurrenceId)>>;
 
 fn resolve_cross_file_reference<T>(
     files: &[T],
-    by_simple_name: &BTreeMap<&str, Vec<(usize, &LineageSymbolRecordV1)>>,
+    by_simple_name: &HashMap<&str, Vec<(usize, &LineageSymbolRecordV1)>>,
     rust_files: &RustFileIndexV1,
     reexport_cache: &mut RustReexportCacheV1,
     index: usize,
@@ -540,7 +546,7 @@ fn unique_import<'a>(
     matches.next().is_none().then_some(binding)
 }
 
-type RustReexportCacheV1 = BTreeMap<(usize, usize, String, usize, String), bool>;
+type RustReexportCacheV1 = HashMap<(usize, usize, String, usize, String), bool>;
 
 struct RustResolutionContextV1<'a> {
     files: &'a RustFileIndexV1,
@@ -589,12 +595,9 @@ impl RustFileIndexV1 {
                 );
             }
             if relative == "lib.rs"
-                && let Some(crate_name) = Path::new(source_root)
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|name| name.to_str())
+                && let Some(crate_name) = rust_crate_name(files, source_root)
             {
-                insert_unique_index(&mut crate_roots, crate_name.replace('-', "_"), index);
+                insert_unique_index(&mut crate_roots, crate_name, index);
             }
         }
         Self {
@@ -614,6 +617,40 @@ impl RustFileIndexV1 {
     fn crate_root(&self, crate_name: &str) -> Option<usize> {
         self.crate_roots.get(crate_name).copied().flatten()
     }
+}
+
+fn rust_crate_name<T>(files: &[T], source_root: &str) -> Option<String>
+where
+    T: AsRef<FileGenerationArtifactsV1>,
+{
+    let manifest = Path::new(source_root)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("Cargo.toml");
+    let manifest = manifest.to_str()?;
+    files
+        .iter()
+        .find(|file| file.as_ref().authority.logical_path == manifest)
+        .and_then(|file| {
+            file.as_ref().artifacts.symbols.iter().find(|symbol| {
+                symbol.simple_name == "name" && symbol.qualified_name.ends_with("::package::name")
+            })
+        })
+        .and_then(|symbol| symbol.signature.as_deref())
+        .and_then(|signature| toml::from_str::<toml::Value>(signature).ok())
+        .and_then(|pair| {
+            pair.get("name")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            Path::new(source_root)
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .map(|name| name.replace('-', "_"))
 }
 
 fn insert_unique_index<K: Ord>(index: &mut BTreeMap<K, Option<usize>>, key: K, value: usize) {

@@ -64,8 +64,12 @@ impl KimiDiscoveryReport {
 
 #[derive(Deserialize)]
 pub(super) struct KimiSessionState {
-    pub(super) id: String,
-    pub(super) cwd: PathBuf,
+    #[serde(default)]
+    pub(super) id: Option<String>,
+    #[serde(default)]
+    pub(super) cwd: Option<PathBuf>,
+    #[serde(default, rename = "workDir")]
+    pub(super) work_dir: Option<PathBuf>,
     #[serde(default)]
     pub(super) agents: BTreeMap<String, KimiAgentState>,
 }
@@ -74,6 +78,36 @@ pub(super) struct KimiSessionState {
 pub(super) struct KimiAgentState {
     #[serde(rename = "type")]
     pub(super) kind: String,
+    #[serde(default)]
+    pub(super) homedir: Option<PathBuf>,
+}
+
+impl KimiSessionState {
+    pub(super) fn working_directory(&self) -> Option<&Path> {
+        match (&self.cwd, &self.work_dir) {
+            (Some(cwd), Some(work_dir)) if cwd == work_dir => Some(cwd),
+            (Some(cwd), None) => Some(cwd),
+            (None, Some(work_dir)) => Some(work_dir),
+            (Some(_), Some(_)) | (None, None) => None,
+        }
+    }
+
+    pub(super) fn session_id(&self, session_dir: &Path) -> Option<String> {
+        let directory_id = session_dir.file_name()?.to_str()?;
+        match self.id.as_deref() {
+            Some(id) if id == directory_id => Some(id.to_owned()),
+            Some(_) => None,
+            None if !self.agents.is_empty()
+                && self.agents.iter().all(|(agent_id, agent)| {
+                    agent.homedir.as_deref()
+                        == Some(session_dir.join("agents").join(agent_id).as_path())
+                }) =>
+            {
+                Some(directory_id.to_owned())
+            }
+            None => None,
+        }
+    }
 }
 
 pub(super) fn charge_discovered_path(

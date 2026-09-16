@@ -187,6 +187,70 @@ fn fresh_generation_resolves_seal_references_once() {
     assert_eq!(super::helpers::take_seal_reference_resolutions(), 1);
 }
 
+/// Restoring a sealed generation resolves its cross-file references once.
+///
+/// Edges are derived, never persisted, so the restore already owns the only
+/// edge vector these files can produce: a second resolution inside validation
+/// re-runs the corpus-scale reference walk to compare a deterministic
+/// derivation against itself.
+#[test]
+fn restored_generation_resolves_seal_references_once() {
+    let mut owner = CodeIndexProductionOwnerV1::new(
+        worker_config(),
+        WorkerPublicationStore::default(),
+        WorkerProjectionSink,
+    )
+    .expect("production owner");
+    let published = owner
+        .build_and_publish(
+            worker_request_with_source(
+                "file.worker.restore-resolve-once",
+                1_100_000,
+                b"pub fn caller() { target(); }\npub fn target() {}\n",
+            ),
+            &UninterruptibleCodeIndexControlV1,
+        )
+        .expect("fresh generation");
+    let sealed = published.encode_sealed().expect("sealed generation bytes");
+    super::helpers::take_seal_reference_resolutions();
+
+    let restored =
+        CodeIndexPublishedGenerationV1::decode_sealed(&sealed).expect("restored generation");
+
+    assert_eq!(super::helpers::take_seal_reference_resolutions(), 1);
+    assert_eq!(restored.edges, published.edges);
+}
+
+#[test]
+fn unchanged_increment_shares_symbol_records_with_parent_generation() {
+    let store = WorkerPublicationStore::default();
+    let mut owner = CodeIndexProductionOwnerV1::new(worker_config(), store, WorkerProjectionSink)
+        .expect("production owner");
+    let source = b"pub fn unchanged() -> u32 { 1 }\n";
+    let first = owner
+        .build_and_publish(
+            worker_request_with_source("file.worker.shared-symbol", 1_100_000, source),
+            &UninterruptibleCodeIndexControlV1,
+        )
+        .expect("first generation");
+    let next = owner
+        .build_and_publish(
+            worker_request_with_source("file.worker.shared-symbol", 1_200_000, source),
+            &UninterruptibleCodeIndexControlV1,
+        )
+        .expect("unchanged increment");
+
+    assert_eq!(first.symbols.symbols.len(), 1);
+    assert!(Arc::ptr_eq(
+        &first.symbols.symbols[0],
+        &next.symbols.symbols[0]
+    ));
+    assert!(Arc::ptr_eq(
+        &first.files[0].artifacts.clone_bodies[0].payload,
+        &next.files[0].artifacts.clone_bodies[0].payload
+    ));
+}
+
 #[test]
 fn extractor_revision_change_reextracts_before_validating_retained_import_rows() {
     let store = WorkerPublicationStore::default();

@@ -1,6 +1,8 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use super::*;
 use crate::{
     HookCapabilityV1, HookEventFamily, HookEventSupportV1, HookEventV2, HookHostV1, HookOrderingV1,
@@ -181,20 +183,21 @@ fn checksum_is_real_sha256() {
     );
 }
 
-/// A pre-existing spool root that another local account could write into
-/// must be refused outright: per-file modes cannot protect members inside a
-/// writable directory.
+/// An owned but group-writable spool root is healed to owner-private on open.
+/// Foreign-owned permissive directories still fail closed inside
+/// `make_private_directory`; per-file modes cannot protect members while the
+/// directory itself stays group-writable.
 #[cfg(unix)]
 #[test]
-fn open_refuses_a_group_writable_existing_root() {
+fn open_heals_an_owned_group_writable_existing_root() {
     use std::os::unix::fs::PermissionsExt;
     let root = TestDir::new("permissive-root");
     fs::set_permissions(&root.0, fs::Permissions::from_mode(0o770)).unwrap();
 
-    assert!(matches!(
-        HookSpoolV1::open(&root.0, config(), UtcMicros(10)),
-        Err(HookSpoolError::UnsafePath)
-    ));
+    let (spool, _) = HookSpoolV1::open(&root.0, config(), UtcMicros(10)).expect("heal and open");
+    drop(spool);
+    let mode = fs::metadata(&root.0).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "owned permissive roots must be tightened");
 }
 
 #[test]
@@ -418,6 +421,26 @@ fn reused_event_id_with_different_envelope_is_rejected_after_reopen() {
     );
     assert_eq!(spool.pending.len(), 1);
     assert_eq!(spool.meta.next_sequence, 2);
+}
+
+#[test]
+fn a_durable_frame_reconciles_its_retained_append_intent_on_reopen() {
+    let root = TestDir::new("durable-frame-intent");
+    let (mut spool, _) = HookSpoolV1::open(&root.0, config(), UtcMicros(10)).unwrap();
+    spool
+        .append(envelope(1, 9), &binding(), UtcMicros(10))
+        .unwrap();
+    drop(spool);
+
+    let durable_meta = read_meta(&root.0).unwrap().unwrap();
+    assert_eq!(durable_meta.next_sequence, 1);
+    assert_eq!(durable_meta.append_intent.unwrap().sequence, 1);
+
+    let (spool, report) = HookSpoolV1::open(&root.0, config(), UtcMicros(11)).unwrap();
+    assert_eq!(report.next_sequence, 2);
+    assert_eq!(spool.pending.len(), 1);
+    assert_eq!(spool.meta.next_sequence, 2);
+    assert!(spool.meta.append_intent.is_none());
 }
 
 #[test]
@@ -798,6 +821,46 @@ fn replay_hydrates_only_checkpointed_records_in_the_batch() {
             .count(),
         batches[0].records.len()
     );
+}
+
+#[test]
+fn checkpointed_replay_hydrates_native_lifecycle() {
+    let root = TestDir::new("checkpoint-native-lifecycle");
+    let config = HookSpoolConfigV1::stock(HookHostV1::OpenCode);
+    let mut envelope = numbered_envelope(1, 9);
+    envelope.producer = HookHostV1::OpenCode;
+    envelope.protected_session_id = Sha256::digest(b"session.native.checkpoint").into();
+    envelope.event = HookEventV2::ToolLifecycle {
+        tool_id: [8; 16],
+        phase: crate::HookLifecyclePhaseV1::Completed,
+        effect_receipt_id: None,
+    };
+    let lifecycle = NativeContextScoutLifecycleV1::new(
+        "session.native.checkpoint",
+        "call.native.checkpoint",
+        envelope.event_id,
+    )
+    .unwrap();
+    let binding = binding_for_envelopes(config.host, std::slice::from_ref(&envelope));
+    let (mut spool, _) = HookSpoolV1::open(&root.0, config, UtcMicros(10)).unwrap();
+    spool
+        .append_with_native_lifecycle(
+            envelope.clone(),
+            Some(lifecycle.clone()),
+            &binding,
+            UtcMicros(10),
+        )
+        .unwrap();
+    drop(spool);
+    fs::remove_file(checkpoint_path(&root.0)).unwrap();
+    drop(HookSpoolV1::open(&root.0, config, UtcMicros(11)).unwrap().0);
+
+    let (mut spool, report) = HookSpoolV1::open(&root.0, config, UtcMicros(12)).unwrap();
+    assert_eq!(report.checkpoint_records, 1);
+    assert!(spool.pending[0].envelope.is_none());
+    let batches = spool.claim_replay_batches(UtcMicros(12), 1).unwrap();
+    assert_eq!(batches[0].records[0].envelope, envelope);
+    assert_eq!(batches[0].records[0].native_lifecycle, Some(lifecycle));
 }
 
 #[test]

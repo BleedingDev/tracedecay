@@ -18,7 +18,7 @@ async fn retrieve_tool_returns_full_stored_response() {
     let stored = tracedecay_mcp::response_handles::store_response_handle(
         cg.project_root(),
         original,
-        tracedecay::tracedecay::current_timestamp(),
+        tracedecay::project::current_timestamp(),
     )
     .unwrap();
 
@@ -97,7 +97,7 @@ async fn retrieve_pages_reconstruct_large_and_multibyte_handles_with_bounded_fra
         let stored = tracedecay_mcp::response_handles::store_response_handle(
             cg.project_root(),
             &original,
-            tracedecay::tracedecay::current_timestamp(),
+            tracedecay::project::current_timestamp(),
         )
         .unwrap();
         let mut offset = 0usize;
@@ -154,7 +154,7 @@ async fn retrieve_offset_beyond_content_returns_typed_reason() {
     let stored = tracedecay_mcp::response_handles::store_response_handle(
         cg.project_root(),
         "short",
-        tracedecay::tracedecay::current_timestamp(),
+        tracedecay::project::current_timestamp(),
     )
     .unwrap();
 
@@ -211,7 +211,7 @@ async fn retrieve_tool_reports_missing_and_expired_handles_actionably() {
     let expired = tracedecay_mcp::response_handles::store_response_handle(
         cg.project_root(),
         "{\"items\":[42]}",
-        tracedecay::tracedecay::current_timestamp()
+        tracedecay::project::current_timestamp()
             - tracedecay_mcp::response_handles::RESPONSE_HANDLE_TTL_SECS
             - 5,
     )
@@ -304,12 +304,12 @@ async fn fact_store_large_json_list_response_uses_retrieve_handle() {
     .await;
     let markdown_text = extract_text(&markdown_list.value);
     assert!(
-        markdown_text.starts_with("## fact\\_store\\_list"),
-        "default fact-store output should remain the canonical compact human view: {markdown_text}"
+        markdown_text.starts_with("## fact\\_store\\_list\n\n### Payload\n\n"),
+        "default fact-store output should lead with the bounded evidence payload: {markdown_text}"
     );
-    assert!(markdown_text.contains("complete: --json"));
+    assert!(markdown_text.contains("use --json for the complete typed result"));
     assert!(!markdown_text.contains("# Truncated Response"));
-    assert!(!markdown_text.contains("LONG_FACT_MARKER_00"));
+    assert!(markdown_text.contains("\"content\": \"LONG_FACT_MARKER_"));
 
     let listed = call_production_tool(
         &fixture,

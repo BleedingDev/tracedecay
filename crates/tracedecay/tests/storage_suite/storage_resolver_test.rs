@@ -10,8 +10,8 @@ use std::os::unix::fs::symlink;
 use tempfile::TempDir;
 use tracedecay::config::USER_DATA_DIR_ENV;
 use tracedecay::config::discover_project_root;
+use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay::tracedecay::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_configuration::{TraceDecayConfig, get_config_path, load_config};
 use tracedecay_global_db::{ProjectObservationStoreError, StoreInstanceUpsert};
 use tracedecay_mcp::response_handles::{
@@ -45,6 +45,7 @@ struct HomeGuard {
 
 impl HomeGuard {
     fn set(home: &Path) -> Self {
+        crate::common::register_process_runtime_ports();
         let previous_home = std::env::var_os("HOME");
         let previous_userprofile = std::env::var_os("USERPROFILE");
         let previous_data_dir = std::env::var_os(USER_DATA_DIR_ENV);

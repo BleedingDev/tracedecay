@@ -1,9 +1,7 @@
 //! Transport-neutral ports and contracts for TraceDecay.
 //!
 //! This bottom layer defines request and result types, service contracts, and
-//! the traits implemented by storage and runtime crates, including
-//! [`WorkStoragePort`], [`WorkflowDefinitionAuthorityPort`],
-//! [`StoreSizeTelemetryPort`], and [`SemanticActivationCoordinationPort`].
+//! the traits implemented by storage and runtime crates.
 //! `tracedecay-application` depends on these contracts to orchestrate product
 //! workflows; this crate never depends on that orchestration layer.
 //!
@@ -24,6 +22,7 @@ pub mod branch_snapshots;
 mod capability_manifest;
 pub mod catalog_composition;
 pub mod clock;
+pub mod code_index_freshness;
 pub mod configuration;
 pub mod context;
 pub mod context_scout;
@@ -49,6 +48,7 @@ pub mod observability;
 pub mod observatory_surface;
 pub mod policy;
 mod profile_identity;
+pub mod project_open;
 pub mod project_registry;
 pub mod remote;
 pub mod request_identity;
@@ -57,7 +57,6 @@ pub mod retained_receipts;
 pub mod retained_surfaces;
 pub mod retrieval;
 pub mod sdk_catalog;
-pub mod semantic_activation;
 pub mod session_sync;
 mod session_temporal_refresh;
 pub mod settings_preview;
@@ -78,7 +77,6 @@ pub mod work_leak_adjudication;
 pub mod work_owner_observation;
 pub mod work_placement;
 pub mod work_product;
-pub mod work_read;
 pub mod work_retry;
 pub mod work_run_control;
 pub mod work_synthesis;
@@ -398,9 +396,6 @@ pub use sdk_catalog::{
     application_http_executable_binding_registry, application_http_route_path,
     sdk_executable_binding_registry,
 };
-pub use semantic_activation::{
-    SemanticActivationCoordinationErrorV1, SemanticActivationCoordinationPort,
-};
 pub use session_temporal_refresh::{
     SessionTemporalRefreshWakeFuture, SessionTemporalRefreshWakePort,
     UnavailableSessionTemporalRefreshWake,
@@ -427,11 +422,10 @@ pub use storage::{
     CompactionDecisionV1, CompactionPlacementV1, CompactionTriggerPolicyV1, FreePageRatioV1,
     IncidentDebrisArtifactV1, IncidentDebrisKindV1, IncidentDebrisScanV1, OrphanStoreRecordV1,
     QuarantineContractV1, QuarantineLocationV1, QuarantinedArtifactV1, RelativeArtifactPathV1,
-    RetentionBacklogRecordV1, SemanticVectorRetentionRecordV1, StorageByteSizeV1,
-    StorageTelemetryFuture, StorageTelemetryReadV1, StoreBudgetEvaluationV1, StoreKeyV1,
-    StoreSizeBudgetV1, StoreSizeSampleV1, StoreSizeTelemetryPort, TableGrowthSampleV1, TableNameV1,
-    incident_debris_finding, orphan_store_finding, over_budget_finding, retention_backlog_finding,
-    semantic_vector_retention_finding,
+    RetentionBacklogRecordV1, StorageByteSizeV1, StorageTelemetryFuture, StorageTelemetryReadV1,
+    StoreBudgetEvaluationV1, StoreKeyV1, StoreSizeBudgetV1, StoreSizeSampleV1,
+    StoreSizeTelemetryPort, TableGrowthSampleV1, TableNameV1, incident_debris_finding,
+    orphan_store_finding, over_budget_finding, retention_backlog_finding,
 };
 pub use surface_contracts::{
     CallableCodeSurfaceMeta, CallableCodeSurfaceRequest, CodeCalleesSurfaceRequest,
@@ -442,11 +436,8 @@ pub use surface_contracts::{
     NativeIntegrationSurfaceRequest, PrimitiveCodeSurfaceRequest, primitive_code_into_primitive,
 };
 pub use work::{
-    AcceptProposalCommand, AcceptTaskCommand, AdmitExecutionCommand, CreateWorkCommand,
-    ReplanDependenciesCommand, ReviewProposalCommand, ReviewProposalDispositionV1,
-    ReviewProposalRequestV1, WorkAppendOutcome, WorkAppendRequest, WorkReadiness,
-    WorkRoutingSnapshotErrorV1, WorkRoutingSnapshotPortV1, WorkRoutingSnapshotV1, WorkService,
-    WorkStorageError, WorkStoragePort,
+    ReviewProposalDispositionV1, WorkRoutingSnapshotErrorV1, WorkRoutingSnapshotPortV1,
+    WorkRoutingSnapshotV1,
 };
 pub use work_artifact_hydration::{
     WorkArtifactHydrationRequestV1, WorkArtifactHydrationService, WorkArtifactHydrationV1,
@@ -534,11 +525,13 @@ pub use work_placement::{
     WorkPlacementStorageError, WorkPlacementStoragePort,
 };
 pub use work_product::{
-    AcceptWorkTaskRequestV1, AddWorkTaskRequestV1, AdmitWorkExecutionRequestV1,
+    AcceptWorkProposalDispositionV1, AcceptWorkProposalRequestV1, AcceptWorkTaskRequestV1,
+    AddWorkTaskRequestV1, AdmitWorkExecutionRequestV1, AdmittedWorkExecutionV1,
     AuthorizedWorkProductScopeV1, CreateWorkProductRequestV1, CreateWorkTaskRequestV1,
     DecideWorkProposalRequestV1, MAX_WORK_EVIDENCE_SELECTION_V1,
     MAX_WORK_GRAPH_TEMPORAL_ENTRIES_V1, MAX_WORK_HISTORY_EVENTS_V1,
-    PrepareWorkProductMutationRequestV1, SelectedWorkEvidenceV1, VerifiedWorkEvidenceExpansionV1,
+    PrepareWorkProductMutationRequestV1, ReviewWorkProposalDispositionV1,
+    ReviewWorkProposalRequestV1, SelectedWorkEvidenceV1, VerifiedWorkEvidenceExpansionV1,
     VerifiedWorkGraphVersionV1, WorkEvidenceExpandRequestV1, WorkEvidenceExpansionV1,
     WorkEvidenceReadPortErrorV1, WorkEvidenceReadPortV1, WorkEvidenceSelectRequestV1,
     WorkGraphReadModeV1, WorkGraphReadPortErrorV1, WorkGraphReadPortV1, WorkGraphReadRequestV1,
@@ -555,10 +548,6 @@ pub use work_product::{
     WorkProductPortContextV1, WorkProductReadServiceV1, WorkProductRetryAdmissionV1,
     WorkProductRevisionPinsV1, WorkProductSelectionScopeV1, WorkProductSynthesisAdmissionV1,
     WorkRelationScopeV1, work_product_projection_generation,
-};
-pub use work_read::{
-    MAX_WORK_PROJECTION_PAGE_SIZE, WorkProjectionApplicationError, WorkProjectionPortError,
-    WorkProjectionReadPort, WorkProjectionReadService,
 };
 pub use work_retry::{
     RetryWorkAttemptCommandV1, RuntimeWorkRetryEvidenceV1, VerifiedWorkRetryFailureV1,

@@ -4,10 +4,9 @@
 //! the active code pointer or a readable vector inventory names it. Collection
 //! therefore uses conservative mark-and-sweep rather than refcounts: a missed
 //! mark costs disk space, while a miscount could silently remove readable code
-//! evidence. The mark set is every generation addressable through the durable
-//! publication pointer and every vector-readable source. Callers may request a
-//! rollback floor explicitly, but the production default adds no unbounded
-//! evidence beyond the pointer's byte-, time-, and count-bounded history.
+//! evidence. The mark set is the active generation named by the durable
+//! publication pointer and every vector-readable source; nothing else is
+//! retained beyond the pointer's byte-, time-, and count-bounded history.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -23,9 +22,7 @@ use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write};
 // that number here let the writer be versioned to 3 while retention still
 // demanded 1: every real sealed file was refused as "incompatible" and the store
 // became uncollectable.
-use tracedecay_code_index::production::{
-    SEALED_GENERATION_FORMAT_REVISION_V1, sealed_generation_format_revision_is_compatible,
-};
+use tracedecay_code_index::production::SEALED_GENERATION_FORMAT_REVISION_V1;
 use tracedecay_domain::canonical_text::encode_lowercase_hex;
 /// Only the generation fixtures build tagged digests; production here works in
 /// untagged hex, so importing this unconditionally is an unused-import error.
@@ -65,7 +62,8 @@ pub use scope_roots::{
     resolve_live_code_index_roots,
 };
 pub use text_artifacts::{
-    attach_verified_text_artifact_under_lock, withdraw_verified_text_artifact_under_lock,
+    attach_verified_text_artifact_under_lock, replace_verified_text_artifact_under_lock,
+    withdraw_verified_text_artifact_under_lock,
 };
 
 use generation_transactions::{
@@ -104,8 +102,10 @@ use generation_scan::{read_generation_format_revision, read_generation_metadata}
 #[cfg(test)]
 use scope_quarantine::ScopeQuarantineAuthority;
 
-pub const DEFAULT_SUPERSEDED_GENERATION_FLOOR: usize = 0;
 pub const MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1: usize = 32;
+/// Persisted-receipt value of the retired superseded-generation rollback
+/// reserve; see `CodeGenerationRetentionReceiptV1::rollback_floor`.
+const RECEIPT_ROLLBACK_FLOOR: usize = 0;
 pub const MAX_DURABLE_GENERATION_INDEX_BYTES_V1: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_DURABLE_GENERATION_INDEX_TTL_MICROS_V1: i64 = 7 * 24 * 60 * 60 * 1_000_000;
 pub const MAX_DURABLE_PUBLICATION_POINTER_BYTES_V1: u64 = 512 * 1024;
@@ -525,7 +525,6 @@ pub struct CodeGenerationRetentionPlanV1 {
     /// mid-flight seal.
     pub active_generation_id: Option<CodeGenerationId>,
     pub vector_readable_sources: BTreeSet<CodeGenerationId>,
-    pub rollback_floor: usize,
     pub superseded_generations: Vec<CodeGenerationRetentionGenerationV1>,
     pub collectable_generations: Vec<CodeGenerationRetentionGenerationV1>,
     /// Derived text-artifact debris selected from one bounded canonical
@@ -596,6 +595,10 @@ pub struct CodeGenerationRetentionReceiptV1 {
     /// optional keep their exact digests.
     pub active_generation_id: Option<CodeGenerationId>,
     pub vector_readable_sources: BTreeSet<CodeGenerationId>,
+    /// Always zero. The superseded-generation rollback reserve was never
+    /// configurable in production; the field stays in the persisted receipt
+    /// and its digest material so durable receipts written before the
+    /// parameter was removed still verify.
     pub rollback_floor: usize,
     pub deleted_generations: Vec<CodeGenerationRetentionGenerationV1>,
     pub reclaimed_bytes: u64,
@@ -709,6 +712,7 @@ pub struct CodeGenerationRetentionReportV1 {
     pub receipt: Option<CodeGenerationRetentionReceiptV1>,
     pub deleted_text_artifacts: Vec<CodeTextArtifactRetentionCandidateV1>,
     pub text_artifact_receipt: Option<CodeTextArtifactRetentionReceiptV1>,
+    pub generation_segment_batch_exhausted: bool,
 }
 
 #[must_use]
@@ -745,12 +749,10 @@ pub fn code_index_scope_hash(canonical_project_root: &Path) -> String {
 pub fn plan_code_generation_retention(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
 ) -> Result<CodeGenerationRetentionPlanV1, CodeGenerationRetentionErrorV1> {
     plan_code_generation_retention_with_verification(
         store_root,
         vector_readable_sources,
-        rollback_floor,
         GenerationDigestVerificationV1::Full,
     )
 }
@@ -763,13 +765,11 @@ pub fn plan_code_generation_retention(
 pub fn plan_code_generation_retention_with_verification(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
     verification: GenerationDigestVerificationV1,
 ) -> Result<CodeGenerationRetentionPlanV1, CodeGenerationRetentionErrorV1> {
     plan_code_generation_retention_with_verification_cancellable(
         store_root,
         vector_readable_sources,
-        rollback_floor,
         verification,
         None,
         &|| false,
@@ -787,7 +787,6 @@ pub fn plan_code_generation_retention_with_verification(
 pub fn prepare_next_code_generation_retention_cancellable(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
     is_cancelled: &dyn Fn() -> bool,
     graph_replay_pool_root: Option<&Path>,
 ) -> Result<CodeGenerationRetentionPlanV1, CodeGenerationRetentionErrorV1> {
@@ -808,7 +807,6 @@ pub fn prepare_next_code_generation_retention_cancellable(
     let mut census = plan_code_generation_retention_with_verification_cancellable(
         store_root,
         vector_readable_sources,
-        rollback_floor,
         GenerationDigestVerificationV1::MetadataOnly,
         graph_replay_pool_root,
         is_cancelled,
@@ -838,7 +836,6 @@ pub fn prepare_next_code_generation_retention_cancellable(
     let mut plan = plan_code_generation_retention_with_verification_cancellable(
         store_root,
         vector_readable_sources,
-        rollback_floor,
         GenerationDigestVerificationV1::Full,
         graph_replay_pool_root,
         is_cancelled,
@@ -851,7 +848,6 @@ pub fn prepare_next_code_generation_retention_cancellable(
 fn plan_code_generation_retention_with_verification_cancellable(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
     verification: GenerationDigestVerificationV1,
     graph_replay_pool_root: Option<&Path>,
     is_cancelled: &dyn Fn() -> bool,
@@ -913,9 +909,16 @@ fn plan_code_generation_retention_with_verification_cancellable(
                 path.display()
             )));
         }
-        if !sealed_generation_format_revision_is_compatible(format_revision) {
+        // Retention plans a file's lifetime from its identity and size, not
+        // from a decoded graph, so a revision the readers have retired is
+        // ordinary collectable history — the daemon rebuilds past it, and
+        // refusing the whole plan here would leave a store that holds one
+        // permanently uncollectable. Only a revision from a newer build is
+        // unsafe: those bytes were written by a writer this one cannot
+        // reason about, so it must not plan their removal.
+        if format_revision > SEALED_GENERATION_FORMAT_REVISION_V1 {
             return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                "generation file '{}' has an incompatible format revision",
+                "generation file '{}' has a newer format revision",
                 path.display()
             )));
         }
@@ -1017,30 +1020,23 @@ fn plan_code_generation_retention_with_verification_cancellable(
     // Mark before sweeping. An omitted mark retains a derived file and costs
     // space; unlike refcounting, no accounting drift can silently delete a live
     // generation. The active generation and the vector-readable sources are
-    // exact liveness, while the newest superseded floor is the bounded
-    // rollback reserve.
+    // exact liveness; no superseded generation is reserved for rollback.
     //
     // Membership of the durable `generation_index` is deliberately *not* a
     // mark. That index is the pointer's own bounded history
     // (`MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1` entries / the TTL), so
-    // marking every entry made `rollback_floor` dead and moved the real floor
-    // onto those bounds: an instrumented run observed `collectable=[]` with
-    // four superseded generations all held live purely by the index. The
-    // index is a reference the executor *rewrites* -- it drops every collected
-    // id from the active pointer durably before a single file is unlinked --
-    // rather than a liveness claim retention must obey.
+    // marking every entry moved the real retention floor onto those bounds:
+    // an instrumented run observed `collectable=[]` with four superseded
+    // generations all held live purely by the index. The index is a reference
+    // the executor *rewrites* -- it drops every collected id from the active
+    // pointer durably before a single file is unlinked -- rather than a
+    // liveness claim retention must obey.
     let mut marked = BTreeSet::new();
     marked.extend(vector_readable_sources.iter().cloned());
     marked.extend(active_generation_id.clone());
-    marked.extend(
-        superseded_generations
-            .iter()
-            .take(rollback_floor)
-            .map(|generation| generation.generation_id.clone()),
-    );
-    // Sweep from the oldest end. `superseded_generations` is newest-first
-    // because the rollback reserve is the *newest* superseded window, but the
-    // collection batch is the opposite question: which bytes may go first.
+    // Sweep from the oldest end. `superseded_generations` is newest-first so
+    // reports read most-recent-first, but the collection batch is the
+    // opposite question: which bytes may go first.
     // Reading the batch in the newest-first order made every bounded unit -
     // `MAX_CODE_GENERATION_RETENTION_BATCH_V1` here, one generation after
     // `plan_next`/`prepare_next` truncate it - name the newest collectable
@@ -1106,7 +1102,6 @@ fn plan_code_generation_retention_with_verification_cancellable(
     Ok(CodeGenerationRetentionPlanV1 {
         active_generation_id,
         vector_readable_sources: vector_readable_sources.clone(),
-        rollback_floor,
         superseded_generations,
         collectable_generations,
         collectable_text_artifacts: text_artifact_inventory.candidates,
@@ -1160,11 +1155,13 @@ fn sweep_unreferenced_generation_segments(
     graph_replay_pool_root: Option<&Path>,
     apply: bool,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(bool, u64), CodeGenerationRetentionErrorV1> {
+) -> Result<(bool, u64, bool), CodeGenerationRetentionErrorV1> {
     let segments_root = store_root.join(GENERATION_SEGMENTS_DIRECTORY);
     let entries = match std::fs::read_dir(&segments_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((false, 0)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((false, 0, false));
+        }
         Err(error) => return Err(storage(error)),
     };
     let mut live_segments = BTreeSet::new();
@@ -1262,6 +1259,7 @@ fn sweep_unreferenced_generation_segments(
 
     let mut found = false;
     let mut reclaimed = 0_u64;
+    let mut reclaimed_segments = 0_usize;
     for entry in entries {
         if observe_cancel(is_cancelled) {
             return Err(CodeGenerationRetentionErrorV1::Cancelled);
@@ -1290,15 +1288,23 @@ fn sweep_unreferenced_generation_segments(
         }
         found = true;
         if !apply {
-            return Ok((true, 0));
+            return Ok((true, 0, false));
         }
         std::fs::remove_file(&path).map_err(storage)?;
         reclaimed = reclaimed.saturating_add(metadata.len());
+        reclaimed_segments += 1;
+        if reclaimed_segments == MAX_CODE_GENERATION_RETENTION_BATCH_V1 {
+            break;
+        }
     }
     if reclaimed > 0 {
         sync_directory(&segments_root)?;
     }
-    Ok((found, reclaimed))
+    Ok((
+        found,
+        reclaimed,
+        reclaimed_segments == MAX_CODE_GENERATION_RETENTION_BATCH_V1,
+    ))
 }
 
 fn replay_generation_file_digest(file_name: &str) -> Option<&str> {
@@ -1343,16 +1349,16 @@ fn has_unreferenced_generation_segments(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<bool, CodeGenerationRetentionErrorV1> {
     sweep_unreferenced_generation_segments(store_root, graph_replay_pool_root, false, is_cancelled)
-        .map(|(found, _)| found)
+        .map(|(found, _, _)| found)
 }
 
 fn collect_unreferenced_generation_segments(
     store_root: &Path,
     graph_replay_pool_root: Option<&Path>,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<u64, CodeGenerationRetentionErrorV1> {
+) -> Result<(u64, bool), CodeGenerationRetentionErrorV1> {
     sweep_unreferenced_generation_segments(store_root, graph_replay_pool_root, true, is_cancelled)
-        .map(|(_, reclaimed)| reclaimed)
+        .map(|(_, reclaimed, batch_exhausted)| (reclaimed, batch_exhausted))
 }
 
 /// `graph_replay_pool_root` is the project graph's replay pool. When present,
@@ -1404,6 +1410,7 @@ pub fn execute_code_generation_retention_cancellable(
             receipt: None,
             deleted_text_artifacts: Vec::new(),
             text_artifact_receipt: None,
+            generation_segment_batch_exhausted: false,
         });
     }
     // A metadata-only census trusts file names for content digests. That is
@@ -1431,27 +1438,28 @@ pub fn execute_code_generation_retention_cancellable(
             "active generation changed after the retention mark phase".to_owned(),
         ));
     }
-    let mut reclaimed_segment_bytes = if plan.collectable_generations.is_empty()
-        && plan.collectable_generation_segments == GenerationSegmentCensusV1::Present
-    {
-        let graph_replay_pool_lock = match graph_replay_pool_root {
-            Some(pool_root) => Some(acquire_graph_replay_pool_lock_checked(
-                pool_root,
-                Instant::now() + GRAPH_REPLAY_POOL_ACQUIRE_BUDGET,
+    let (mut reclaimed_segment_bytes, mut generation_segment_batch_exhausted) =
+        if plan.collectable_generations.is_empty()
+            && plan.collectable_generation_segments == GenerationSegmentCensusV1::Present
+        {
+            let graph_replay_pool_lock = match graph_replay_pool_root {
+                Some(pool_root) => Some(acquire_graph_replay_pool_lock_checked(
+                    pool_root,
+                    Instant::now() + GRAPH_REPLAY_POOL_ACQUIRE_BUDGET,
+                    is_cancelled,
+                )?),
+                None => None,
+            };
+            let reclaimed = collect_unreferenced_generation_segments(
+                store_root,
+                graph_replay_pool_root,
                 is_cancelled,
-            )?),
-            None => None,
+            )?;
+            drop(graph_replay_pool_lock);
+            reclaimed
+        } else {
+            (0, false)
         };
-        let reclaimed = collect_unreferenced_generation_segments(
-            store_root,
-            graph_replay_pool_root,
-            is_cancelled,
-        )?;
-        drop(graph_replay_pool_lock);
-        reclaimed
-    } else {
-        0
-    };
     let (deleted_generations, receipt) = if plan.collectable_generations.is_empty() {
         (Vec::new(), None)
     } else {
@@ -1529,11 +1537,12 @@ pub fn execute_code_generation_retention_cancellable(
                 &vector_readable_sources,
                 graph_replay_pool_lock.as_ref(),
             )?;
-            reclaimed_segment_bytes = collect_unreferenced_generation_segments(
-                store_root,
-                graph_replay_pool_root,
-                is_cancelled,
-            )?;
+            (reclaimed_segment_bytes, generation_segment_batch_exhausted) =
+                collect_unreferenced_generation_segments(
+                    store_root,
+                    graph_replay_pool_root,
+                    is_cancelled,
+                )?;
             clear_transaction(store_root)
         })();
         if let Err(error) = result {
@@ -1584,6 +1593,7 @@ pub fn execute_code_generation_retention_cancellable(
         receipt,
         deleted_text_artifacts,
         text_artifact_receipt,
+        generation_segment_batch_exhausted,
     })
 }
 
@@ -1637,7 +1647,6 @@ fn recover_code_generation_retention_cancellable(
 pub fn run_code_generation_retention(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
     mode: CodeGenerationRetentionModeV1,
     completed_at: UtcMicros,
     graph_replay_pool_root: Option<&Path>,
@@ -1645,7 +1654,6 @@ pub fn run_code_generation_retention(
     run_code_generation_retention_cancellable(
         store_root,
         vector_readable_sources,
-        rollback_floor,
         mode,
         completed_at,
         graph_replay_pool_root,
@@ -1660,7 +1668,6 @@ pub fn run_code_generation_retention(
 fn run_code_generation_retention_cancellable(
     store_root: &Path,
     vector_readable_sources: &BTreeSet<CodeGenerationId>,
-    rollback_floor: usize,
     mode: CodeGenerationRetentionModeV1,
     completed_at: UtcMicros,
     graph_replay_pool_root: Option<&Path>,
@@ -1681,7 +1688,6 @@ fn run_code_generation_retention_cancellable(
             plan_code_generation_retention_with_verification_cancellable(
                 store_root,
                 vector_readable_sources,
-                rollback_floor,
                 GenerationDigestVerificationV1::Full,
                 graph_replay_pool_root,
                 is_cancelled,
@@ -1691,7 +1697,6 @@ fn run_code_generation_retention_cancellable(
             plan_code_generation_retention_with_verification_cancellable(
                 store_root,
                 vector_readable_sources,
-                rollback_floor,
                 GenerationDigestVerificationV1::Full,
                 graph_replay_pool_root,
                 is_cancelled,
@@ -1989,7 +1994,7 @@ fn build_receipt(
         schema: RECEIPT_SCHEMA,
         active_generation_id: plan.active_generation_id.as_ref(),
         vector_readable_sources: &plan.vector_readable_sources,
-        rollback_floor: plan.rollback_floor,
+        rollback_floor: RECEIPT_ROLLBACK_FLOOR,
         deleted_generations: &deleted_generations,
         reclaimed_bytes,
         completed_at_micros: completed_at.0,
@@ -2002,7 +2007,7 @@ fn build_receipt(
         receipt_digest,
         active_generation_id: plan.active_generation_id.clone(),
         vector_readable_sources: plan.vector_readable_sources.clone(),
-        rollback_floor: plan.rollback_floor,
+        rollback_floor: RECEIPT_ROLLBACK_FLOOR,
         deleted_generations,
         reclaimed_bytes,
         completed_at_micros: completed_at.0,

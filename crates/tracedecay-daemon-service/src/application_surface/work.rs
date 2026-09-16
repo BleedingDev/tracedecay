@@ -9,16 +9,16 @@ use std::sync::Arc;
 use axum::response::Response;
 use tracedecay_api::{WorkHttpRequest, WorkOperation};
 use tracedecay_contracts::{
-    AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1, AdmitWorkPlacementCommand,
-    AdmitWorkSynthesisCommand, CancelWorkAttemptCommand, CreateWorkTaskRequestV1,
-    DecideWorkProposalRequestV1, ExecutionTopologyMetricsRequestV1, ExecutionTopologyMetricsV1,
-    ExecutionTopologyViewV1, GenerateProposalRequest, GeneratedWorkProposal, PauseWorkRunCommand,
-    PrepareWorkDuplicateAdjudicationRequestV1, PrepareWorkProductMutationRequestV1,
-    ReleaseWorkPlacementCommand, ResumeWorkAttemptsCommand, ResumeWorkRunCommand,
-    RetryWorkAttemptCommandV1, StartWorkAttemptCommand, WorkArtifactHydrationRequestV1,
-    WorkArtifactHydrationV1, WorkAttemptListRequestV1, WorkAttemptListV1,
-    WorkAttemptRecoveryReportV1, WorkAttemptStatusRequestV1,
-    WorkDuplicateAdjudicationAppendOutcomeV1, WorkEvidenceRetrievalV1,
+    AcceptWorkProposalRequestV1, AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1,
+    AdmitWorkPlacementCommand, AdmitWorkSynthesisCommand, AdmittedWorkExecutionV1,
+    CancelWorkAttemptCommand, CreateWorkTaskRequestV1, ExecutionTopologyMetricsRequestV1,
+    ExecutionTopologyMetricsV1, ExecutionTopologyViewV1, GenerateProposalRequest,
+    GeneratedWorkProposal, PauseWorkRunCommand, PrepareWorkDuplicateAdjudicationRequestV1,
+    PrepareWorkProductMutationRequestV1, ReleaseWorkPlacementCommand, ResumeWorkAttemptsCommand,
+    ResumeWorkRunCommand, RetryWorkAttemptCommandV1, ReviewWorkProposalRequestV1,
+    StartWorkAttemptCommand, WorkArtifactHydrationRequestV1, WorkArtifactHydrationV1,
+    WorkAttemptListRequestV1, WorkAttemptListV1, WorkAttemptRecoveryReportV1,
+    WorkAttemptStatusRequestV1, WorkDuplicateAdjudicationAppendOutcomeV1, WorkEvidenceRetrievalV1,
     WorkEvidenceRetrieveRequestV1, WorkExecutionHistoryV1, WorkExperienceRequestV1,
     WorkExperienceV1, WorkGraphReadRequestV1, WorkGraphReadV1, WorkLeakAdjudicationOutcomeV1,
     WorkPlacementPreflightRequestV1, WorkPlacementReadingV1, WorkPlacementStatusRequestV1,
@@ -32,7 +32,7 @@ use tracedecay_domain::{
 };
 use tracedecay_tool_catalog::RouteExposureV1;
 
-use super::invoke_registered_http;
+use super::registered_http::invoke_registered_http;
 use tracedecay_daemon_protocol::ApplicationSurfaceAdapterError;
 use tracedecay_daemon_protocol::DaemonInvocationExecutor;
 use tracedecay_daemon_protocol::{WorkApplicationInvocationV1, WorkApplicationOutcomeV1};
@@ -185,14 +185,14 @@ pub(crate) async fn invoke_work_operation(
         ),
         WorkOperation::ReviewProposal => {
             core!(
-                DecideWorkProposalRequestV1,
+                ReviewWorkProposalRequestV1,
                 ReviewProposal,
                 WorkProductMutationReceiptV1
             )
         }
         WorkOperation::AcceptProposal => {
             core!(
-                DecideWorkProposalRequestV1,
+                AcceptWorkProposalRequestV1,
                 AcceptProposal,
                 WorkProductMutationReceiptV1
             )
@@ -201,7 +201,7 @@ pub(crate) async fn invoke_work_operation(
             core!(
                 AdmitWorkExecutionRequestV1,
                 AdmitExecution,
-                WorkProductMutationReceiptV1
+                AdmittedWorkExecutionV1
             )
         }
         WorkOperation::StartAttempt => {

@@ -580,6 +580,7 @@ async fn wait_for_preserved_discovery(
     let mut last_status = json!(null);
     let mut last_sessions = json!(null);
     let mut last_grep = json!(null);
+    let mut last_search = json!(null);
     tokio::time::timeout(CONVERGENCE_WAIT, async {
         loop {
             let status = answered(
@@ -614,15 +615,30 @@ async fn wait_for_preserved_discovery(
                 }),
             )
             .await;
+            let search = answered(
+                harness,
+                project,
+                "tracedecay_message_search",
+                json!({
+                    "query": DIRECT_USER_QUERY,
+                    "message_type": "direct_user",
+                    "since": since,
+                    "limit": 5,
+                    "format": "json",
+                }),
+            )
+            .await;
             last_status = status.clone();
             last_sessions = sessions.clone();
             last_grep = grep.clone();
+            last_search = search.clone();
             if summary_generation_nonzero(&status)
                 && git_generation_nonzero(&sessions)
                 && session_ids(&sessions)
                     .iter()
                     .any(|id| id.starts_with("lcm-preserved-codex-"))
                 && !grep_hits(&grep).is_empty()
+                && !message_hit_session_ids(&search).is_empty()
             {
                 return;
             }
@@ -633,7 +649,8 @@ async fn wait_for_preserved_discovery(
     .unwrap_or_else(|_| {
         panic!(
             "ordinary background convergence never published summary, git-correlation, and 12-hour hits; \
-             status={last_status}; sessions_for={last_sessions}; lcm_grep={last_grep}"
+             status={last_status}; sessions_for={last_sessions}; lcm_grep={last_grep}; \
+             message_search={last_search}"
         )
     });
     (last_status, last_sessions, started.elapsed())
@@ -691,11 +708,13 @@ async fn preserved_profile_lcm_discovery_converges_without_blocking_retrieval() 
                     "tracedecay_body",
                     json!({"symbol": PROBE_SYMBOL, "format": "json"}),
                 ),
+                // This round proves admission, so one evidence result keeps
+                // response-handle storage outside the concurrency assertion.
                 timed_call(
                     &harness,
                     &project,
                     "tracedecay_message_search",
-                    json!({"query": "billing pipeline", "limit": 5, "format": "json"}),
+                    json!({"query": "billing pipeline", "limit": 1, "format": "json"}),
                 ),
             );
             let (session_elapsed, session_envelope) = &round.2;
@@ -849,34 +868,6 @@ async fn preserved_profile_lcm_discovery_converges_without_blocking_retrieval() 
     assert!(
         lcm_status_body(&status)["redaction"].is_object(),
         "LCM status must preserve the redaction authority block: {status}"
-    );
-
-    let (strict_elapsed, strict_response) = timed_raw(
-        &harness,
-        &project,
-        "tracedecay_search",
-        json!({
-            "query": PROBE_SYMBOL,
-            "semantic_mode": "strict_semantic",
-            "limit": 5,
-            "format": "json",
-        }),
-    )
-    .await;
-    assert_under_budget(
-        "typed unavailable semantic search",
-        strict_elapsed,
-        ADMISSION_BUDGET,
-    );
-    let (refused, strict) = tool_answer(&strict_response);
-    assert!(
-        refused,
-        "strict semantic search must refuse as a typed unavailable payload: {strict}"
-    );
-    assert_eq!(
-        strict["semantic"]["reason"],
-        json!("calibration_unavailable"),
-        "strict semantic search must abstain with calibration_unavailable: {strict}"
     );
 
     harness.shutdown().await;

@@ -300,7 +300,13 @@ impl SessionMessageProjection {
     }
 }
 
-fn message_output_digest(
+/// The digest a projected message output carries, over records a caller
+/// already holds.
+///
+/// The same function [`SessionMessageProjection::output_digest`] memoizes, so
+/// an authority that reads the output rows a store persisted can name their
+/// digest without re-deriving the projection that wrote them.
+pub fn message_output_digest(
     session: &SessionRecord,
     message: &SessionMessageRecord,
     output_ordinal: u32,
@@ -605,7 +611,14 @@ pub enum ProjectionStoreError {
     // succeed on retry: callers record a durable skip disposition and keep
     // draining instead of scheduling an environmental retry.
     #[error("projected content failed deterministic sanitization: {reason}")]
-    SanitizationRefused { reason: String },
+    SanitizationRefused {
+        reason: String,
+        /// Set when the sanitizer withheld content it proved it cannot serve,
+        /// rather than failing to run. Both converge to the same durable skip
+        /// on capture; only re-rendering an already-captured output treats the
+        /// verdict as the current rendering instead of a fault.
+        quarantined: bool,
+    },
     #[error(
         "projection retry is deferred after attempt {attempt_count} until {next_retry_at_micros}"
     )]

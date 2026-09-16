@@ -71,7 +71,7 @@ mod task_session;
 
 use daemon_fixture::{
     sdk_client, spawn_project_daemon, wait_for_application_mount, wait_for_work_mount,
-    workflow_tempdir,
+    wait_for_workflow_mount, workflow_tempdir,
 };
 
 const DAEMON_ACTOR: &str = "actor.tracedecay-daemon.project-open";
@@ -180,6 +180,7 @@ fn fan_out_input(identity: &str, graph_version: u64) -> WorkflowFanOutInput {
         WorkRouteDecisionV1::abstain("workflow provider is pinned by admission")
             .expect("fan-out proposal route"),
         format!("Execute fan-out child {identity}"),
+        input_digest.clone(),
         input_digest.clone(),
     )
     .expect("fan-out proposal");
@@ -393,7 +394,7 @@ pub(super) fn advance_provider_transcript_participant_generation(
 fn initialize_project(home: &Path, project: &Path) -> (String, CommitId) {
     std::fs::create_dir_all(home).expect("home directory");
     std::fs::create_dir_all(project).expect("project directory");
-    task_session::seed_semantic_source(project);
+    task_session::seed_probe_source(project);
     std::fs::write(project.join("README.md"), "advanced workflow journey\n")
         .expect("fixture source");
     run(
@@ -443,21 +444,57 @@ fn initialize_project(home: &Path, project: &Path) -> (String, CommitId) {
 }
 
 #[test]
+fn feedback_proximity_http_is_mounted_in_an_isolated_project() {
+    let scratch = workflow_tempdir();
+    let home = scratch.path().join("home");
+    let project = scratch.path().join("project");
+    initialize_project(&home, &project);
+    let project = project.canonicalize().expect("canonical project root");
+    let _daemon = spawn_project_daemon(&home, &project);
+    run(
+        common::tracedecay_command_with_home(&home)
+            .arg("init")
+            .current_dir(&project),
+        "tracedecay init",
+    );
+    let context: Value = serde_json::from_slice(&run(
+        common::tracedecay_command_with_home(&home)
+            .args(["projects", "context"])
+            .arg(&project)
+            .arg("--json")
+            .current_dir(&project),
+        "tracedecay projects context",
+    ))
+    .expect("project context JSON");
+    let project_id: ProjectId = id(context["project"]["project_id"]
+        .as_str()
+        .expect("project id"));
+    let client = sdk_client(&home, project_id.as_str());
+    let _ = wait_for_application_mount(&client);
+    wait_for_work_mount(&client);
+    let dashboard = task_session::DashboardProcess::start(&home, &project);
+
+    let (status, body) = dashboard.read_proximity(now());
+
+    assert_eq!(status, 200, "POST /api/feedback/proximity failed: {body}");
+    assert!(
+        body.pointer("/value/outcome/value/payload/state")
+            .and_then(Value::as_str)
+            .is_some_and(|state| matches!(
+                state,
+                "complete" | "complete_zero" | "partial" | "stale" | "unavailable"
+            )),
+        "the route must return a generated typed state: {body}"
+    );
+}
+
+#[test]
 fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     let scratch = workflow_tempdir();
     let home = scratch.path().join("home");
     let project = scratch.path().join("project");
     let (_commit_text, commit) = initialize_project(&home, &project);
     let project = project.canonicalize().expect("canonical project root");
-    let Some(semantic_fixture) = task_session::install_semantic_fixture(&home) else {
-        eprintln!(
-            "skipping the mounted fan-out Work journey; prepare the \
-             distribution-acceptance package and set \
-             TRACEDECAY_DISTRIBUTION_FASTEMBED_FIXTURE"
-        );
-        return;
-    };
-
     let mut daemon = spawn_project_daemon(&home, &project);
     run(
         common::tracedecay_command_with_home(&home)
@@ -706,6 +743,75 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
         "catalog pin denial must report expected and observed digests: {stale_catalog_denial}"
     );
 
+    // Run admission compares the pinned policy and configuration digests
+    // against the registered daemon environment, so validation and activation
+    // admit the same pins: an Active definition whose environment pin drifted
+    // could never start a run, and the live digest is only discoverable
+    // through this typed denial.
+    let drifted_policy_digest: ManifestDigest =
+        id("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let stale_policy_definition_id: WorkflowDefinitionId =
+        id("workflow.advanced-production-journey.stale-policy");
+    let stale_policy_definition = WorkflowDefinition::new(
+        stale_policy_definition_id.clone(),
+        1,
+        project_id.clone(),
+        vec![WorkflowStep {
+            step_id: id("prepare"),
+            operation: id("operation.work.start_attempt"),
+            predecessors: BTreeSet::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            fan_out: None,
+        }],
+        drifted_policy_digest.clone(),
+        definition.pinned_configuration_digest().clone(),
+        definition.pinned_catalog_digest().clone(),
+    )
+    .expect("stale-policy workflow definition");
+    let stale_policy_denial = client
+        .execute::<WorkflowValidateDefinition>(&WorkflowDefinitionValidateRequest {
+            definition: stale_policy_definition.clone(),
+        })
+        .expect_err("validation must name the stale policy pin");
+    assert!(
+        matches!(
+            stale_policy_denial,
+            ClientError::Problem(ref problem)
+                if problem.kind == "invalid_request"
+                    && problem.code == "workflow.policy.pin_mismatch"
+                    && problem.message.contains(&format!(
+                        "pinned_policy_digest expected {}",
+                        definition.pinned_policy_digest().as_str()
+                    ))
+                    && problem
+                        .message
+                        .contains(&format!("observed {}", drifted_policy_digest.as_str()))
+        ),
+        "policy pin denial must report expected and observed digests: {stale_policy_denial}"
+    );
+    client
+        .execute::<WorkflowRegisterDefinition>(&WorkflowDefinitionRegisterRequest {
+            definition: stale_policy_definition,
+        })
+        .expect("candidate registration stays lenient before activation");
+    let stale_policy_activation = client
+        .execute::<WorkflowActivateDefinition>(&WorkflowDefinitionActivateRequest {
+            definition_id: stale_policy_definition_id,
+            definition_version: 1,
+            expected_revision: 1,
+        })
+        .expect_err("activation must refuse a definition no run could ever start");
+    assert!(
+        matches!(
+            stale_policy_activation,
+            ClientError::Problem(ref problem)
+                if problem.kind == "invalid_request"
+                    && problem.code == "workflow.policy.pin_mismatch"
+        ),
+        "activation pin denial must stay typed: {stale_policy_activation}"
+    );
+
     let activated = client
         .execute::<WorkflowActivateDefinition>(&WorkflowDefinitionActivateRequest {
             definition_id: definition_id.clone(),
@@ -906,6 +1012,7 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     let client = sdk_client(&home, project_id.as_str());
     let _ = wait_for_application_mount(&client);
     wait_for_work_mount(&client);
+    wait_for_workflow_mount(&client, &run_id);
     let recovered_identity = fan_out_identities[1].clone();
     let recovered = wait_until("fenced recovery-required workflow child", || {
         attempt_status(&client, &recovered_identity)
@@ -982,12 +1089,15 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     wait_until("post-recovery cancellation child", || {
         cancellation_started.exists().then_some(())
     });
-    let running = client
-        .execute::<WorkflowGetRun>(&WorkflowRunGetRequest {
+    let running = wait_until("durably recovered workflow run", || {
+        match client.execute::<WorkflowGetRun>(&WorkflowRunGetRequest {
             run_id: run_id.clone(),
-        })
-        .expect("durably recovered workflow run")
-        .result;
+        }) {
+            Ok(response) => Some(response.result),
+            Err(ClientError::Problem(problem)) if problem.kind == "unavailable" => None,
+            Err(error) => panic!("durably recovered workflow run: {error}"),
+        }
+    });
     assert_eq!(running.status(), WorkflowRunStatus::Running);
     let paused_workflow = client
         .execute::<WorkflowPauseRun>(&WorkflowRunPauseRequest {
@@ -1232,7 +1342,7 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     restarted
         .kill_and_wait()
         .expect("physically restart daemon after accepted synthesis settlement");
-    let mut restored_daemon = spawn_project_daemon(&home, &project);
+    let restored_daemon = spawn_project_daemon(&home, &project);
     let client = sdk_client(&home, project_id.as_str());
     let _ = wait_for_application_mount(&client);
     wait_for_work_mount(&client);
@@ -1259,39 +1369,44 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
             .contains(completed_synthesis.identity()),
         "the accepted-attempt relation must survive physical daemon restart"
     );
-    restored_daemon = task_session::configure_restart_and_activate_semantic_profile(
+    let evidence_scope = task_session::TaskSessionEvidenceScope {
+        selection: &product_selection,
+        task_id: &synthesis_task,
+        verified_version: restored_entry.verified_version(),
+        identity: completed_synthesis.identity(),
+    };
+    let (_restarted_daemon, client) = task_session::restart_and_wait_for_task_session(
         &home,
         &project,
         &client,
         &project_id,
         restored_daemon,
-        &product_selection,
-        &synthesis_task,
-        restored_entry.verified_version(),
-        completed_synthesis.identity(),
+        &evidence_scope,
         &sealed_receipt,
-        &semantic_fixture,
     );
-    restored_daemon
-        .kill_and_wait()
-        .expect("physically restart daemon after evaluated semantic activation");
-    let _activated_daemon = spawn_project_daemon(&home, &project);
-    let client = sdk_client(&home, project_id.as_str());
-    let _ = wait_for_application_mount(&client);
-    wait_for_work_mount(&client);
-    task_session::wait_for_evaluated_semantic_profile_current(&home, &project, &client);
     let dashboard = task_session::DashboardProcess::start(&home, &project);
     let _task_session = task_session::assert_available_over_sdk_mcp_and_dashboard(
         &home,
         &project,
         &client,
         &dashboard,
-        task_session::TaskSessionEvidenceScope {
-            selection: &product_selection,
-            task_id: &synthesis_task,
-            verified_version: restored_entry.verified_version(),
-            identity: completed_synthesis.identity(),
-        },
+        evidence_scope,
+    );
+    let (proximity_status, proximity) = dashboard.read_proximity(now());
+    assert_eq!(
+        proximity_status, 200,
+        "the canonical proximity route must be mounted beside the Work evidence read: {proximity}"
+    );
+    let proximity_state = proximity
+        .pointer("/value/outcome/value/payload/state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("proximity response omitted its typed state: {proximity}"));
+    assert!(
+        matches!(
+            proximity_state,
+            "complete" | "complete_zero" | "partial" | "stale"
+        ),
+        "the admitted journey must return a typed proximity read: {proximity}"
     );
 
     let handoff_scope = TaskHandoffScope::new(

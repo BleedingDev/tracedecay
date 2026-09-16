@@ -15,7 +15,7 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
     MemoryProviderRecallRoutingV1, PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY,
-    RestartRequirementV1, SEMANTIC_RUNTIME_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
+    RestartRequirementV1, SOURCE_BINDINGS_SETTING_KEY,
     SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
     SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
@@ -32,11 +32,6 @@ use tracedecay_domain::configuration::{
     safe_work_topology_policy_v1,
 };
 use tracedecay_domain::feedback::PROXIMITY_RISK_THRESHOLD_SETTING_KEY_V1;
-use tracedecay_semantic_contracts::SemanticConfig;
-#[cfg(test)]
-use tracedecay_semantic_contracts::{
-    DEFAULT_FASTEMBED_MODEL_ID, SemanticProfileSelection, SemanticResourceCeilings,
-};
 
 /// Canonical default for configured-tier proximity warnings.
 pub const DEFAULT_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 7_000;
@@ -44,7 +39,7 @@ pub const MAX_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 10_000;
 
 /// Registry schema revision. Increment only when setting-definition semantics
 /// change, not when a setting value changes.
-pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 6;
+pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 7;
 
 #[derive(Debug, Error)]
 pub enum ConfigurationRegistryError {
@@ -67,31 +62,11 @@ pub enum ConfigurationRegistryError {
         maximum: u64,
         actual: u64,
     },
-    #[error("setting {key} payload is invalid: {reason}")]
-    InvalidSettingPayload {
-        key: SettingKey,
-        reason: InvalidSettingPayloadReason,
-    },
     #[error("setting {key} cannot be written in layer {layer:?}")]
     InvalidLayer {
         key: SettingKey,
         layer: tracedecay_domain::configuration::ConfigurationLayerIdV1,
     },
-}
-
-/// Static, field-level reason a typed setting payload was refused.
-///
-/// Variants never carry caller-supplied text, paths, or model ids.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum InvalidSettingPayloadReason {
-    #[error("malformed json")]
-    MalformedJson,
-    #[error("unknown field")]
-    UnknownField,
-    #[error("invalid artifact_digest")]
-    InvalidArtifactDigest,
-    #[error("invalid payload")]
-    InvalidPayload,
 }
 
 /// Immutable mapping of every supported setting to its typed definition.
@@ -207,27 +182,6 @@ impl ConfigurationRegistry {
             restart_requirement: RestartRequirementV1::None,
             deprecation: DeprecationStateV1::Active,
         })?;
-        let semantic_default = SemanticConfig::default();
-        semantic_default.validate().map_err(|_| {
-            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
-                field: "semantic runtime default",
-            })
-        })?;
-        let semantic_default = serde_json::to_string(&semantic_default).map_err(|_| {
-            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
-                field: "semantic runtime default encoding",
-            })
-        })?;
-        registry.register(SettingDefinitionV1 {
-            key: setting_key(SEMANTIC_RUNTIME_SETTING_KEY)?,
-            schema_revision: CONFIGURATION_REGISTRY_SCHEMA_REVISION,
-            value_kind: ConfigurationValueKindV1::Text,
-            default_value: ConfigurationValueV1::Text(semantic_default),
-            sensitivity: SettingSensitivityV1::Sensitive,
-            scope: SettingScopeV1::Project,
-            restart_requirement: RestartRequirementV1::AnalyzerRestart,
-            deprecation: DeprecationStateV1::Active,
-        })?;
         register_project_settings(&mut registry)?;
         let expected = CONFIGURATION_SETTING_KEYS_V1
             .iter()
@@ -336,9 +290,6 @@ impl ConfigurationRegistry {
                     actual: *actual,
                 });
             }
-        }
-        if key.as_str() == SEMANTIC_RUNTIME_SETTING_KEY {
-            validate_semantic_runtime_payload(key, value)?;
         }
         Ok(())
     }
@@ -747,62 +698,6 @@ fn setting_key(value: &str) -> Result<SettingKey, ConfigurationRegistryError> {
     Ok(SettingKey::new(value)?)
 }
 
-fn validate_semantic_runtime_payload(
-    key: &SettingKey,
-    value: &ConfigurationValueV1,
-) -> Result<(), ConfigurationRegistryError> {
-    let ConfigurationValueV1::Text(payload) = value else {
-        return Err(ConfigurationRegistryError::ValueKindMismatch {
-            key: key.clone(),
-            expected: ConfigurationValueKindV1::Text,
-            actual: value.kind(),
-        });
-    };
-    let parsed = serde_json::from_str::<SemanticConfig>(payload).map_err(|error| {
-        ConfigurationRegistryError::InvalidSettingPayload {
-            key: key.clone(),
-            reason: classify_semantic_json_error(&error),
-        }
-    })?;
-    if semantic_config_has_invalid_artifact_digest(&parsed) {
-        return Err(ConfigurationRegistryError::InvalidSettingPayload {
-            key: key.clone(),
-            reason: InvalidSettingPayloadReason::InvalidArtifactDigest,
-        });
-    }
-    parsed
-        .validate()
-        .map_err(|_| ConfigurationRegistryError::InvalidSettingPayload {
-            key: key.clone(),
-            reason: InvalidSettingPayloadReason::InvalidPayload,
-        })
-}
-
-fn classify_semantic_json_error(error: &serde_json::Error) -> InvalidSettingPayloadReason {
-    if error.is_syntax() || error.is_eof() {
-        return InvalidSettingPayloadReason::MalformedJson;
-    }
-    if error.is_data() && error.to_string().starts_with("unknown field") {
-        return InvalidSettingPayloadReason::UnknownField;
-    }
-    if error.is_data() {
-        InvalidSettingPayloadReason::InvalidPayload
-    } else {
-        InvalidSettingPayloadReason::MalformedJson
-    }
-}
-
-fn semantic_config_has_invalid_artifact_digest(config: &SemanticConfig) -> bool {
-    config
-        .active_profile
-        .as_ref()
-        .into_iter()
-        .chain(config.rollback_profile.as_ref())
-        .any(|profile| {
-            !tracedecay_domain::canonical_text::is_lowercase_hex(&profile.artifact_digest, 64)
-        })
-}
-
 #[cfg(test)]
 mod proximity_threshold_tests {
     use super::*;
@@ -887,7 +782,7 @@ mod user_profile_settings_tests {
 
     #[test]
     fn code_index_workers_default_is_automatic_and_zero_exact_is_denied() {
-        assert_eq!(CONFIGURATION_REGISTRY_SCHEMA_REVISION, 6);
+        assert_eq!(CONFIGURATION_REGISTRY_SCHEMA_REVISION, 7);
         let key = SettingKey::new(USER_CODE_INDEX_WORKERS_SETTING_KEY).expect("key");
         let project_registry = ConfigurationRegistry::core().expect("project registry");
         assert!(matches!(
@@ -927,157 +822,6 @@ mod user_profile_settings_tests {
         );
     }
 }
-
-#[cfg(test)]
-mod semantic_runtime_payload_tests {
-    use std::path::PathBuf;
-
-    use super::*;
-    use tracedecay_domain::ManifestDigest;
-    use tracedecay_domain::canonical_text::CANONICAL_TEXT_MAX_BYTES;
-
-    fn semantic_runtime_key() -> SettingKey {
-        SettingKey::new(SEMANTIC_RUNTIME_SETTING_KEY).expect("semantic runtime key")
-    }
-
-    /// Host-absolute fixture path: `artifact_path` validation requires
-    /// `Path::is_absolute`, which a bare `/...` literal fails on Windows.
-    fn absolute_fixture_path(posix: &str) -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(format!("C:{}", posix.replace('/', "\\")))
-        } else {
-            PathBuf::from(posix)
-        }
-    }
-
-    fn realistic_activation_config() -> SemanticConfig {
-        let artifact_digest = "ab".repeat(32);
-        SemanticConfig {
-            selected_model: Some(DEFAULT_FASTEMBED_MODEL_ID.to_owned()),
-            auto_download: true,
-            active_profile: Some(SemanticProfileSelection {
-                profile_id: "jina-embeddings-v2-base-code".to_owned(),
-                accepted_profile_digest: ManifestDigest::new(format!("sha256:{artifact_digest}"))
-                    .expect("accepted profile digest"),
-                artifact_digest,
-                artifact_path: absolute_fixture_path(concat!(
-                    "/var/lib/tracedecay/semantic-models/",
-                    "jina-embeddings-v2-base-code/",
-                    "revision-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/",
-                    "onnx/model.onnx"
-                )),
-            }),
-            rollback_profile: None,
-            resources: SemanticResourceCeilings {
-                max_model_bytes: 700 * 1024 * 1024,
-                max_tokenizer_bytes: 64 * 1024 * 1024,
-                max_resident_bytes: Some(2 * 1024 * 1024 * 1024),
-                max_threads: 8,
-                max_concurrent_sessions: 4,
-                max_batch_size: 32,
-                max_sequence_length: 4096,
-                load_deadline_ms: 30_000,
-            },
-            document_composition: tracedecay_domain::EmbeddingDocumentCompositionV1::SanitizedText,
-        }
-    }
-
-    fn encoded_activation_payload() -> String {
-        let encoded =
-            serde_json::to_string(&realistic_activation_config()).expect("semantic runtime JSON");
-        assert!(
-            encoded.len() > CANONICAL_TEXT_MAX_BYTES,
-            "activation payload must exceed the 512-byte label bound, got {}",
-            encoded.len()
-        );
-        encoded
-    }
-
-    #[test]
-    fn semantic_runtime_accepts_a_realistic_activation_payload() {
-        let registry = ConfigurationRegistry::core().expect("registry");
-        let payload = encoded_activation_payload();
-        registry
-            .validate_value(
-                &semantic_runtime_key(),
-                &ConfigurationValueV1::Text(payload),
-            )
-            .expect("realistic semantic.runtime.v1 payload");
-    }
-
-    #[test]
-    fn semantic_runtime_rejects_malformed_json() {
-        let registry = ConfigurationRegistry::core().expect("registry");
-        assert!(matches!(
-            registry.validate_value(
-                &semantic_runtime_key(),
-                &ConfigurationValueV1::Text("{".to_owned()),
-            ),
-            Err(ConfigurationRegistryError::InvalidSettingPayload {
-                reason: InvalidSettingPayloadReason::MalformedJson,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn semantic_runtime_rejects_an_unknown_field() {
-        let registry = ConfigurationRegistry::core().expect("registry");
-        let mut document = serde_json::to_value(realistic_activation_config()).expect("json value");
-        document
-            .as_object_mut()
-            .expect("object")
-            .insert("unexpected_field".to_owned(), serde_json::json!(true));
-        let payload = serde_json::to_string(&document).expect("unknown-field JSON");
-        assert!(matches!(
-            registry.validate_value(
-                &semantic_runtime_key(),
-                &ConfigurationValueV1::Text(payload),
-            ),
-            Err(ConfigurationRegistryError::InvalidSettingPayload {
-                reason: InvalidSettingPayloadReason::UnknownField,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn semantic_runtime_accepts_an_explicitly_disabled_selected_model() {
-        let registry = ConfigurationRegistry::core().expect("registry");
-        let config = SemanticConfig {
-            selected_model: None,
-            ..SemanticConfig::default()
-        };
-        let payload = serde_json::to_string(&config).expect("disabled semantic runtime JSON");
-        registry
-            .validate_value(
-                &semantic_runtime_key(),
-                &ConfigurationValueV1::Text(payload),
-            )
-            .expect("selected_model null disables the semantic lane");
-    }
-
-    #[test]
-    fn semantic_runtime_rejects_an_invalid_artifact_digest() {
-        let registry = ConfigurationRegistry::core().expect("registry");
-        let mut config = realistic_activation_config();
-        if let Some(profile) = config.active_profile.as_mut() {
-            profile.artifact_digest = "0".repeat(63);
-        }
-        let payload = serde_json::to_string(&config).expect("invalid digest JSON");
-        assert!(matches!(
-            registry.validate_value(
-                &semantic_runtime_key(),
-                &ConfigurationValueV1::Text(payload),
-            ),
-            Err(ConfigurationRegistryError::InvalidSettingPayload {
-                reason: InvalidSettingPayloadReason::InvalidArtifactDigest,
-                ..
-            })
-        ));
-    }
-}
-
 #[cfg(test)]
 mod memory_provider_registration_tests {
     use super::*;

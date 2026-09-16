@@ -17,6 +17,7 @@ use tracedecay_domain::{
 use crate::chunks::{
     CodeFileChunksV1, CodeIndexUnresolvedReferenceV1, CodeSearchDocumentV1, CodeSearchEligibilityV1,
 };
+use crate::clones::CodeIndexCloneBodyV1;
 use crate::extract::ExtractionBatchV1;
 use crate::lineage::LineageSymbolRecordV1;
 use crate::parallelism;
@@ -27,14 +28,23 @@ use super::*;
 /// The monolithic sealed-generation envelope revision. Every reader that
 /// gates on the monolithic format — the publication store, the worker probe,
 /// and code-generation retention — must gate on this one value.
-pub(super) const MONOLITHIC_SEALED_GENERATION_FORMAT_REVISION: u32 = 6;
+pub(super) const MONOLITHIC_SEALED_GENERATION_FORMAT_REVISION: u32 = 9;
 /// The partitioned generation manifest revision, which the daemon publishes.
-pub const SEALED_GENERATION_FORMAT_REVISION_V1: u32 = 7;
+///
+/// Revisions through eight predate required clone-body source rows and are
+/// rebuilt rather than interpreted as successful empty clone evidence.
+/// Revision 10 stored generation-bound `symbol_occurrences` on each file
+/// segment descriptor; revision 11 stores generation-independent
+/// `symbol_identities` and rebinds occurrences at restore so one-file seal
+/// reuse no longer SHA-256-rebounds every unchanged file's symbols.
+pub const SEALED_GENERATION_FORMAT_REVISION_V1: u32 = 11;
 
-/// The oldest sealed envelope revision this build decodes. Anything below it
-/// is refused by [`superseded_sealed_generation_revision`] instead of being
-/// migrated — a generation is re-derivable from its source tree, so the
-/// daemon rebuilds rather than carrying a decoder per retired shape.
+/// The oldest sealed envelope revision this build decodes. Anything below it,
+/// and any retired revision between it and
+/// [`SEALED_GENERATION_FORMAT_REVISION_V1`], is refused by
+/// [`superseded_sealed_generation_revision`] instead of being migrated — a
+/// generation is re-derivable from its source tree, so the daemon rebuilds
+/// rather than carrying a decoder per retired shape.
 pub const MINIMUM_SEALED_GENERATION_FORMAT_REVISION: u32 =
     MONOLITHIC_SEALED_GENERATION_FORMAT_REVISION;
 
@@ -135,6 +145,7 @@ struct PersistedFileIndexArtifactsRefV2<'a> {
     edges: &'a [CanonicalRelationEdgeV1],
     edge_abstentions: &'a [CodeIndexEdgeAbstentionV1],
     imports: &'a [CodeIndexImportEvidenceV1],
+    clone_bodies: &'a [CodeIndexCloneBodyV1],
     #[serde(skip_serializing_if = "Option::is_none")]
     schema_evidence: Option<&'a ExtractedSchemaEvidenceV1>,
     unresolved_references: &'a [CodeIndexUnresolvedReferenceV1],
@@ -148,6 +159,7 @@ struct PersistedFileIndexArtifactsV2 {
     edges: Vec<CanonicalRelationEdgeV1>,
     edge_abstentions: Vec<CodeIndexEdgeAbstentionV1>,
     imports: Vec<CodeIndexImportEvidenceV1>,
+    clone_bodies: Vec<CodeIndexCloneBodyV1>,
     schema_evidence: Option<ExtractedSchemaEvidenceV1>,
     #[serde(default)]
     unresolved_references: Vec<CodeIndexUnresolvedReferenceV1>,
@@ -330,6 +342,7 @@ impl<'a> PersistedFileGenerationArtifactsRefV2<'a> {
                 edges: &artifacts.edges,
                 edge_abstentions: &artifacts.edge_abstentions,
                 imports: &artifacts.imports,
+                clone_bodies: &artifacts.clone_bodies,
                 schema_evidence: artifacts.schema_evidence.as_ref(),
                 unresolved_references: &artifacts.unresolved_references,
             },
@@ -444,6 +457,7 @@ impl PersistedFileGenerationArtifactsV2 {
                 edges: artifacts.edges,
                 edge_abstentions: artifacts.edge_abstentions,
                 imports: artifacts.imports,
+                clone_bodies: artifacts.clone_bodies,
                 schema_evidence: artifacts.schema_evidence,
                 unresolved_references: artifacts.unresolved_references,
             },
@@ -471,7 +485,11 @@ impl<'de> Deserialize<'de> for CompatibleSealedFormatRevisionV1 {
         let revision = u32::deserialize(deserializer)?;
         if !sealed_generation_format_revision_is_compatible(revision) {
             return Err(serde::de::Error::custom(
-                if revision < MINIMUM_SEALED_GENERATION_FORMAT_REVISION {
+                // Retirement runs from below the decode floor up to the
+                // revision the writer emits, so a revision this build once
+                // wrote and has since retired is refused for rebuild rather
+                // than reported as a shape only a newer build produces.
+                if revision < SEALED_GENERATION_FORMAT_REVISION_V1 {
                     superseded_sealed_generation_revision(revision).to_string()
                 } else {
                     "sealed generation format revision is incompatible".to_owned()
@@ -658,10 +676,13 @@ pub(super) fn assemble_published_generation(
             ))
         })?;
     let published = CodeIndexPublishedGenerationV1 {
-        statistics: CodeIndexGenerationStatisticsV1::from_generation_parts(
-            &files,
-            symbols.symbols.len(),
-            edges.len(),
+        statistics: hotpath::measure_block!(
+            "code_index.sealed_decode.statistics",
+            CodeIndexGenerationStatisticsV1::from_generation_parts(
+                &files,
+                symbols.symbols.len(),
+                edges.len(),
+            )
         )?,
         manifest,
         snapshot,
@@ -674,6 +695,9 @@ pub(super) fn assemble_published_generation(
         imports,
         edges,
         edge_abstentions,
+        clone_payloads_reused: 0,
+        clone_payloads_computed: 0,
+        clone_stale_invalidations: 0,
         coverage,
         capability,
         projection,
@@ -1259,12 +1283,16 @@ mod tests {
 
     #[test]
     fn format_gate_accepts_only_the_monolithic_and_partitioned_revisions() {
-        assert_eq!(SEALED_GENERATION_FORMAT_REVISION_V1, 7);
-        assert_eq!(MINIMUM_SEALED_GENERATION_FORMAT_REVISION, 6);
-        assert!(sealed_generation_format_revision_is_compatible(6));
-        assert!(sealed_generation_format_revision_is_compatible(7));
-        assert!(!sealed_generation_format_revision_is_compatible(5));
+        assert_eq!(SEALED_GENERATION_FORMAT_REVISION_V1, 11);
+        assert_eq!(MINIMUM_SEALED_GENERATION_FORMAT_REVISION, 9);
+        assert!(sealed_generation_format_revision_is_compatible(9));
+        assert!(sealed_generation_format_revision_is_compatible(11));
         assert!(!sealed_generation_format_revision_is_compatible(8));
+        // Revision 10 stored generation-bound symbol occurrence lists on each
+        // file-segment descriptor; revision 11 stores generation-independent
+        // symbol identities and rebinds occurrences at restore.
+        assert!(!sealed_generation_format_revision_is_compatible(10));
+        assert!(!sealed_generation_format_revision_is_compatible(12));
     }
 
     struct LargestAllocationRecorderV1;
@@ -1483,12 +1511,15 @@ mod tests {
     /// not (the digest gate fails first).
     #[test]
     fn incompatible_revision_stays_none_with_and_without_a_matching_payload_digest() {
-        let generation = "{\"format_revision\":9}";
+        let generation = format!(
+            "{{\"format_revision\":{}}}",
+            SEALED_GENERATION_FORMAT_REVISION_V1 + 1
+        );
         let matching = json_generation_digest(generation.as_bytes()).expect("fixture digest");
         let mismatched = ManifestDigest::from_sha256_bytes(&[0; 32]).expect("fixture digest");
 
         for state_digest in [matching, mismatched] {
-            let sealed = sealed_fixture(&state_digest, generation);
+            let sealed = sealed_fixture(&state_digest, &generation);
             assert!(matches!(
                 CodeIndexPublishedGenerationV1::decode_sealed_if_compatible(&sealed),
                 Ok(None)
@@ -1548,7 +1579,7 @@ mod tests {
         );
     }
 
-    /// A revision-six envelope whose digest verifies but whose payload does
+    /// A current monolithic envelope whose digest verifies but whose payload does
     /// not materialize must keep the payload-decoding rejection, never the
     /// probe or digest one.
     #[test]
@@ -1559,11 +1590,11 @@ mod tests {
         let sealed = sealed_fixture(&state_digest, &generation);
 
         let error = CodeIndexPublishedGenerationV1::decode_sealed(&sealed)
-            .expect_err("an incomplete revision-six payload must not decode");
+            .expect_err("an incomplete current payload must not decode");
 
         assert!(
             error.to_string().contains("payload decoding failed"),
-            "incomplete revision-six payload reached the wrong rejection: {error}"
+            "incomplete current payload reached the wrong rejection: {error}"
         );
     }
 

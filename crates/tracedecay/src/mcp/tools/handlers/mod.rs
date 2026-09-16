@@ -4,31 +4,7 @@
 //! the JSON arguments, calls the appropriate `TraceDecay` method, and
 //! formats the result.
 
-mod admin_cli;
-pub(crate) use admin_cli::handle_projectless_admin_cli;
-pub(crate) use hook_runtime::{
-    HookV2AdmissionOutcomeV1, admit_hook_v2_envelope,
-    admit_hook_v2_replayed_envelope_with_lifecycle, handle_projectless_hook_runtime,
-    hook_v2_pending_work_envelopes, replay_projectless_hermes_host_admission,
-};
-mod admin_project;
-mod analytics;
 mod application_surface;
-mod automation_runs;
-pub mod dashboard;
-mod dashboard_delivery;
-mod dashboard_git_correlation;
-// Only reached by the test-transport dashboard git-correlation fixture
-// (`dashboard::dashboard_git_correlation_read_authority_for_test`); gate it
-// so the default production build does not carry it as an unused re-export.
-#[cfg(feature = "test-transport")]
-pub(crate) use dashboard_git_correlation::DashboardGitCorrelationReadAdapter;
-mod dashboard_lcm;
-// Only reached by the test-transport dashboard LCM fixture
-// (`dashboard::dashboard_lcm_read_authority_for_test`); gate it so the
-// default production build does not carry it as an unused re-export.
-#[cfg(feature = "test-transport")]
-pub(crate) use dashboard_lcm::DashboardLcmReadAdapter;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -47,6 +23,7 @@ mod configuration_dispatch_tests;
     clippy::uninlined_format_args
 )]
 mod context_scout_control_dispatch_tests;
+pub mod dashboard;
 mod dispatch_controls;
 mod dispatch_groups;
 #[cfg(test)]
@@ -67,7 +44,6 @@ mod dispatch_test_support;
     clippy::uninlined_format_args
 )]
 mod dispatch_tests;
-pub mod edit;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -77,7 +53,6 @@ pub mod edit;
     clippy::uninlined_format_args
 )]
 mod graph_search_dispatch_tests;
-pub mod hook_runtime;
 pub mod info;
 pub(crate) mod retained_catalog;
 #[cfg(test)]
@@ -107,8 +82,6 @@ mod runtime_generation_census_dispatch_tests;
     clippy::uninlined_format_args
 )]
 mod search_graph_independence_tests;
-mod session_authorities;
-pub mod skills;
 mod support;
 mod tool_call_support;
 #[cfg(test)]
@@ -138,7 +111,6 @@ mod verified_graph_query_authority_tests;
     clippy::uninlined_format_args
 )]
 mod work_dispatch_tests;
-pub mod workflow;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -149,11 +121,10 @@ pub mod workflow;
 )]
 mod workflow_dispatch_tests;
 
-pub use session_authorities::SessionAuthorities;
 use std::path::Path;
 use std::sync::Arc;
 pub(crate) use tool_call_support::resolve_registered_project_route_for_tool;
-pub(super) use tool_call_support::{json_result, text_tool_result};
+pub(super) use tool_call_support::text_tool_result;
 
 use serde_json::{Value, json};
 use tracedecay_contracts::RetainedSurfaceOperation;
@@ -166,22 +137,18 @@ use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 use tracedecay_tool_catalog::{ProfileId, SurfaceOperationName};
 
 use super::LegacyToolCompatibilityOwner;
-use super::binding::{
-    McpToolDispatchGroup, dispatch_group_for_tool, tool_accepts_registered_project_selector,
-    tool_dispatches_registered_project_reader,
-};
-use crate::tracedecay::TraceDecay;
-pub(crate) use dispatch_groups::tool_dispatch_ceiling;
+use crate::project::TraceDecay;
 use dispatch_groups::{
     dispatch_admin_tools, dispatch_analysis_tools, dispatch_application_surface_tools,
     dispatch_edit_tools, dispatch_git_tools, dispatch_graph_tools, dispatch_health_tools,
     dispatch_info_tools, dispatch_memory_tools, dispatch_retained_application_tools,
     dispatch_session_workflow_tools,
 };
-use retained_catalog::dispatch_profile_retained_application_tool;
 #[cfg(test)]
 use retained_catalog::retained_mcp_composition;
-pub(crate) use tool_call_support::INTERNAL_DAEMON_TOOL_NAMES;
+use retained_catalog::{
+    dispatch_profile_retained_application_tool, session_refresh_profile_scope_requested,
+};
 use tool_call_support::{boxed_send, rejected_tool_project_selector_present};
 use tracedecay_api::{WorkHttpRequest, WorkflowHttpRequest};
 use tracedecay_contracts::ProjectRegistryReadPort;
@@ -190,6 +157,13 @@ use tracedecay_daemon_service::application_surface::resolve_catalog_tool_binding
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::handlers::{SessionAuthorities, unknown_tool_error};
+use tracedecay_mcp::tools::binding::{
+    INTERNAL_DAEMON_TOOL_NAMES, McpToolDispatchGroup, dispatch_group_for_tool,
+    mcp_dispatch_contract, tool_accepts_registered_project_selector,
+    tool_dispatches_registered_project_reader, tool_requires_canonical_effect_settlement,
+};
+use tracedecay_mcp::tools::dispatch_ceiling::{tool_dispatch_budget, tool_dispatch_deadline_error};
 use tracedecay_mcp::{handle_multi_root, handle_work, handle_workflow};
 use tracedecay_runtime_core::storage::registered_project_id;
 
@@ -202,10 +176,9 @@ fn ensure_mcp_dispatch_available(tool_name: &str) -> Result<()> {
     if INTERNAL_DAEMON_TOOL_NAMES.contains(&tool_name) {
         return Ok(());
     }
-    let contract =
-        super::mcp_dispatch_contract(tool_name).map_err(|error| TraceDecayError::Config {
-            message: error.to_string(),
-        })?;
+    let contract = mcp_dispatch_contract(tool_name).map_err(|error| TraceDecayError::Config {
+        message: error.to_string(),
+    })?;
     if let tracedecay_tool_catalog::McpDispatchAvailability::Unavailable { reason, retryable } =
         contract.availability()
     {
@@ -305,8 +278,7 @@ pub struct ToolCallRegistryOptions<'a> {
     pub(crate) remote_operational_status:
         Option<tracedecay_contracts::RemoteOperationalStatusReaderV1>,
     pub(crate) code_index_freshness_reader:
-        Option<tracedecay_dashboard_api::code_index_freshness_api::CodeIndexFreshnessReader>,
-    pub(crate) explorer_semantic_reader: Option<tracedecay_dashboard_api::ExplorerSemanticReader>,
+        Option<tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader>,
     pub feedback_status_reader:
         Option<tracedecay_dashboard_api::feedback_api::FeedbackStatusReader>,
     pub(crate) pr_autotrack_reader:
@@ -330,6 +302,9 @@ pub struct ToolCallRegistryOptions<'a> {
         Option<crate::mcp::server::CodeIndexPublicationIdentityResolver>,
     pub(crate) code_index_reconcile_sink: Option<crate::mcp::server::CodeIndexReconcileSink>,
     pub(crate) code_index_search_executor: Option<crate::mcp::server::CodeIndexSearchExecutor>,
+    pub(crate) code_index_similar_executor: Option<crate::mcp::server::CodeIndexSimilarExecutor>,
+    pub(crate) code_index_redundancy_executor:
+        Option<crate::mcp::server::CodeIndexRedundancyExecutor>,
     pub(crate) code_index_branch_diff_executor:
         Option<crate::mcp::server::CodeIndexBranchDiffExecutor>,
     pub(crate) code_index_search_authority: Option<crate::mcp::server::CodeIndexSearchAuthorityV1>,
@@ -347,7 +322,7 @@ pub struct ToolCallRegistryOptions<'a> {
         Option<crate::mcp::server::CodeIndexIgnoredDependencyAdmissionPort>,
     /// Exact-scope sealed-generation census authority for runtime telemetry.
     pub(crate) generation_census_reader:
-        Option<tracedecay_session_memory::runtime_telemetry::GenerationCensusReader>,
+        Option<tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader>,
     /// Retained server authority consumed by the dashboard boundary. Project
     /// selection itself is completed before handler dispatch.
     pub(crate) retained_project_server_resolver:
@@ -386,7 +361,6 @@ impl Default for ToolCallRegistryOptions<'_> {
             doctor_report_reader: None,
             remote_operational_status: None,
             code_index_freshness_reader: None,
-            explorer_semantic_reader: None,
             feedback_status_reader: None,
             pr_autotrack_reader: None,
             diagnostics_lsp: None,
@@ -401,6 +375,8 @@ impl Default for ToolCallRegistryOptions<'_> {
             code_index_publication_identity: None,
             code_index_reconcile_sink: None,
             code_index_search_executor: None,
+            code_index_similar_executor: None,
+            code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
             code_index_search_authority: None,
             admitted_project_scope: None,
@@ -502,7 +478,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
         // A profile-scoped session refresh names its owner in the canonical
         // request; like `memory_scope=user`, that selects the profile session
         // authority and never the active project's session store.
-        if crate::mcp::tools::session_refresh_profile_scope_requested(tool_name, &args) {
+        if session_refresh_profile_scope_requested(tool_name, &args) {
             if args.get("storage_scope").is_some() {
                 return Err(TraceDecayError::Config {
                     message: format!("unknown parameter `storage_scope` for `{tool_name}`"),
@@ -672,11 +648,11 @@ pub fn handle_tool_call_with_registry_options<'a>(
         // they report a nicer domain-shaped result and a shorter bound, and this
         // is only the backstop beneath them.
         let dispatch_budget =
-            dispatch_groups::tool_dispatch_budget(tool_name, options.application_deadline.as_ref());
+            tool_dispatch_budget(tool_name, options.application_deadline.as_ref());
         let Some(dispatch_budget) = dispatch_budget else {
             // `deadline_remaining` yields `None` only for an already-elapsed
             // carried deadline, which must be rejected rather than dispatched.
-            return Err(dispatch_groups::tool_dispatch_deadline_error(
+            return Err(tool_dispatch_deadline_error(
                 tool_name,
                 std::time::Duration::ZERO,
             ));
@@ -775,7 +751,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
         let result = if matches!(
             dispatch_group,
             Some(McpToolDispatchGroup::RetainedApplication)
-        ) || super::binding::tool_requires_canonical_effect_settlement(tool_name)
+        ) || tool_requires_canonical_effect_settlement(tool_name)
         {
             // Canonically settled effects complete their own deadline and
             // cancellation protocol before this adapter receives a terminal.
@@ -785,10 +761,7 @@ pub fn handle_tool_call_with_registry_options<'a>(
         } else {
             match tokio::time::timeout(dispatch_budget, dispatched).await {
                 Ok(result) => result,
-                Err(_elapsed) => Err(dispatch_groups::tool_dispatch_deadline_error(
-                    tool_name,
-                    dispatch_budget,
-                )),
+                Err(_elapsed) => Err(tool_dispatch_deadline_error(tool_name, dispatch_budget)),
             }
         };
         match result {
@@ -903,13 +876,6 @@ async fn invoke_admitted_workflow_operation(
             format!("The Workflow application response was not valid JSON: {error}"),
         )
     })
-}
-
-/// The single rejection every dispatch group returns for a name it does not own.
-fn unknown_tool_error(tool_name: &str) -> TraceDecayError {
-    TraceDecayError::Config {
-        message: format!("unknown tool: {tool_name}"),
-    }
 }
 
 #[cfg(any(feature = "hotpath", test))]

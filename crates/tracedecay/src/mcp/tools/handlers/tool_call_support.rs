@@ -2,31 +2,27 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::tracedecay::TraceDecay;
-use crate::tracedecay::current_timestamp;
+use crate::project::TraceDecay;
+use crate::project::current_timestamp;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_mcp::response_handles::{
     ResponseHandleLookup, public_retrieve_error, retrieve_response_handle,
 };
 
-use super::super::binding::{
+use super::support::{registered_project_context, validate_registered_project_selector_aliases};
+use tracedecay_mcp::ToolResult;
+use tracedecay_mcp::handlers::{text_tool_result as text_result, tool_json};
+use tracedecay_mcp::tools::binding::{
     tool_accepts_registered_project_selector, tool_dispatches_registered_project_reader,
 };
-use super::support;
-use super::support::registered_project_context;
-use tracedecay_mcp::ToolResult;
 use tracedecay_mcp::tools::render;
 
 const RETRIEVE_PAGE_HEADER_ALLOWANCE: usize = 2_048;
 const RETRIEVE_FRAME_RESERVED_BYTES: usize = 256;
 
 pub(in crate::mcp::tools) fn text_tool_result(text: &str) -> ToolResult {
-    support::text_tool_result(text, Vec::new())
-}
-
-pub(in crate::mcp::tools) fn json_result(value: &Value) -> ToolResult {
-    text_tool_result(&value.to_string())
+    text_result(text, Vec::new())
 }
 
 pub(super) fn boxed_send<'a, T, F>(
@@ -37,14 +33,6 @@ where
 {
     Box::pin(future)
 }
-
-pub(crate) const INTERNAL_DAEMON_TOOL_NAMES: &[&str] = &[
-    "tracedecay_admin_branch_add",
-    "tracedecay_admin_cli",
-    "tracedecay_admin_project",
-    "tracedecay_admin_sync",
-    "tracedecay_hook_runtime",
-];
 
 pub(super) fn rejected_tool_project_selector_present(_tool_name: &str, args: &Value) -> bool {
     args.get("project_selector").is_some()
@@ -60,7 +48,7 @@ pub(crate) async fn resolve_registered_project_route_for_tool(
     let semantic_top_level_fields =
         crate::mcp::project_route::semantic_route_argument_fields(&tool_name);
     if tool_accepts_registered_project_selector(&tool_name) {
-        support::validate_registered_project_selector_aliases(&args, semantic_top_level_fields)?;
+        validate_registered_project_selector_aliases(&args, semantic_top_level_fields)?;
     }
     if !tool_dispatches_registered_project_reader(&tool_name) {
         return Ok(None);
@@ -236,7 +224,7 @@ pub(super) async fn handle_retrieve(cg: &TraceDecay, args: &Value) -> Result<Too
             "expires_at": expires_at,
         }),
     };
-    Ok(support::tool_json(Some(cg.project_root()), args, &payload))
+    Ok(tool_json(Some(cg.project_root()), args, &payload))
 }
 
 fn optional_usize_argument(args: &Value, field: &str) -> Result<Option<usize>> {

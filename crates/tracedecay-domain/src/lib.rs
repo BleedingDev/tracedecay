@@ -33,7 +33,6 @@ pub mod work_placement;
 pub mod work_product;
 pub mod work_product_event;
 pub mod work_product_projection;
-pub mod work_read;
 pub mod work_routing;
 pub mod work_run_control;
 pub mod work_runtime;
@@ -45,37 +44,30 @@ pub mod workflow_run;
 pub use automation::{SESSION_EVIDENCE_BUDGET_EXHAUSTED, SESSION_EVIDENCE_BUDGET_SUPPRESSED};
 pub use canonical_text::{encode_lowercase_hex, sha256_hex_suffix};
 pub use code_intelligence::{
-    AdaptiveRecallDepthPolicyV1, AdaptiveRecallStepV1, AdaptiveRecallStopV1,
-    AdmittedEmbeddingProjectionKeyV1, BoundedSanitizedText, CanonicalRelationEdgeV1,
-    ChangedCodeChunkSetV1, ChangedCodeChunkV1, ChunkLogicalIdentityV1, ChunkerRevision,
-    CodeChunkProjectionReceiptV1, CodeGenerationId, CodeGenerationManifestV1,
-    CodeGenerationSourceCommitmentsV1, CodeIndexCapabilityManifestV1, CodeSearchChunkAnchorV1,
-    CodeSearchChunkGrainV1, CodeSearchChunkId, CodeSearchChunkV1, ComplexityAnalysisV1,
-    ContentDigest, CoverageSummaryV1, EMBEDDING_PROJECTION_SCHEMA_V1, Edge, EdgeAuthorityV1,
-    EdgeKind, EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1, EmbeddingExecutionProviderV1,
-    EmbeddingMetricV1, EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1,
-    EmbeddingProjectionKeyV1, EmbeddingTruncationSideV1, EphemeralSanitizedQueryViewV1,
-    ExactTechnicalTermKindV1, ExactTechnicalTermV1, ExpandoBehaviorV1, ExtractionAdmittedChunkV1,
-    ExtractionResult, ExtractorRevision, FileIdentityDigest, FileOccurrenceId,
-    GenerationDiagnosticAttachmentV1, GenerationPlannerIdV1, GenerationSealV1,
-    GenerationTestAttributionV1, GrammarRevision, GraphStats, LanguageCapabilitySetV1,
-    LanguageDescriptorRevision, LanguageDescriptorV1, LanguageId, LanguageRegistryRevision,
-    MAX_CHUNK_TEXT_BYTES, MAX_EPHEMERAL_QUERY_VIEW_BYTES, Node, NodeKind,
+    BoundedSanitizedText, CanonicalRelationEdgeV1, ChangedCodeChunkSetV1, ChangedCodeChunkV1,
+    ChunkLogicalIdentityV1, ChunkerRevision, CodeChunkProjectionReceiptV1, CodeGenerationId,
+    CodeGenerationManifestV1, CodeGenerationSourceCommitmentsV1, CodeIndexCapabilityManifestV1,
+    CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId, CodeSearchChunkV1,
+    ComplexityAnalysisV1, ContentDigest, CoverageSummaryV1, Edge, EdgeAuthorityV1, EdgeKind,
+    EphemeralSanitizedQueryViewV1, ExactTechnicalTermKindV1, ExactTechnicalTermV1,
+    ExpandoBehaviorV1, ExtractionAdmittedChunkV1, ExtractionResult, ExtractorRevision,
+    FileIdentityDigest, FileOccurrenceId, GenerationDiagnosticAttachmentV1, GenerationPlannerIdV1,
+    GenerationSealV1, GenerationTestAttributionV1, GrammarRevision, GraphStats,
+    LanguageCapabilitySetV1, LanguageDescriptorRevision, LanguageDescriptorV1, LanguageId,
+    LanguageRegistryRevision, MAX_CHUNK_TEXT_BYTES, MAX_EPHEMERAL_QUERY_VIEW_BYTES, Node, NodeKind,
     PROJECTION_PUBLICATION_SEPARATOR, PolicyRevisionId, ProjectionBatchReceiptV1,
     ProjectionBatchRequestV1, ProjectionKeyV1, ProjectionKindV1, ProjectionOperationV1,
     ProjectionOutcomeV1, ProjectionReplayReasonV1, QueryNormalizationRevision, RelationEdgeKindV1,
-    SEMANTIC_ANN_RECALL_POLICY_V1, SEMANTIC_SEARCH_INDEX_SCHEMA_V1, SanitizedCodeFileV1,
-    SanitizedCodeSnapshotV1, SanitizerRevision, SemanticSearchIndexKeyV1,
-    SemanticSearchIndexKindV1, SemanticSearchIndexProfileV1, SensitivityDecision,
+    SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision, SensitivityDecision,
     SensitivityLevelV1, SnapshotFileDispositionV1, SourceSpan, SymbolIdentityDigest,
     SymbolOccurrenceId, TestAttributionEvidenceClassV1, UnresolvedRef, ValidatedCodeFileV1,
-    VectorGenerationIdV1, Visibility, classify_technical_token, code_source_full_replay_digest,
-    exact_search_canonical, generate_node_id, generate_node_id_at, is_cli_flag_token,
-    is_commit_hash, is_commit_identifier_token, is_compiler_error_code_token,
-    is_configuration_key_token, is_identifier_token, is_path_shape, is_path_token,
-    is_qualified_name_token, is_runtime_error_code_token, is_technical_token_char,
-    is_tool_name_token, projection_batch_publication_digest, repository_path_matches_scope,
-    semantic_vector_output_digest, split_subtokens, technical_tokens, validate_code_logical_path,
+    Visibility, classify_technical_token, code_source_full_replay_digest, exact_search_canonical,
+    generate_node_id, generate_node_id_at, is_cli_flag_token, is_commit_hash,
+    is_commit_identifier_token, is_compiler_error_code_token, is_configuration_key_token,
+    is_identifier_token, is_path_shape, is_path_token, is_qualified_name_token,
+    is_runtime_error_code_token, is_technical_token_char, is_tool_name_token,
+    projection_batch_publication_digest, repository_path_matches_scope, split_subtokens,
+    technical_tokens, validate_code_logical_path,
 };
 pub use configuration::{
     ACCESS_RULES_SETTING_KEY, ANALYZER_SETTINGS_SETTING_KEY, AUTOMATION_SETTINGS_SETTING_KEY,
@@ -109,7 +101,7 @@ pub use configuration::{
     RedactedConfigurationChangeV1, RepositoryPlacementScopeV1, RequiredCheckExpectationV1,
     RequiredCheckV1, RestartRequirementV1, RestrictiveCapabilityResolutionV1, ReviewRequirementV1,
     ReviewTopologyKindV1, ReviewTopologyPolicyV1, RollbackModeV1, RuleEffect,
-    SEMANTIC_RUNTIME_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
     SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
@@ -346,22 +338,20 @@ pub use research::{
 };
 pub use resource_policy::host_cpu_target;
 pub use retrieval::{
-    AuthorizationRevision, AuthorizedRerankView, CalibrationProfileId, CandidateContribution,
-    CandidateSetDigest, CodeSourceCursorBindingV1, CompactCandidate, ComponentRevision,
-    CursorPayloadDigest, DiversityPolicy, DiversityPolicyId, EvaluationDecisionId, EvidenceRole,
-    ExactAdmissionProof, ExactAdmissionRuleRevision, ExactAdmissionValidator, ExactClass,
-    ExactFieldV1, FallbackSubpayloadDigest, FixedPointScore, FreshnessCompatibilityV1,
-    FreshnessVectorDigest, FusedCandidate, FusionProfile, FusionProfileId, HydrationReceipt,
-    HydrationRevision, LogicalCopyClusterId, LogicalEvidenceId, OccurrenceProvenance,
-    OptionalStagePublicStatus, PrincipalId, PublicRetrieverStatus,
-    QUERY_FALLBACK_SUBPAYLOAD_DIGEST_DOMAIN, QueryDigest, QueryFallbackSubpayload, QueryMac,
-    RankedCandidate, RankingDecision, RankingDecisionKind, RankingRevision, RerankPolicy,
-    RerankPolicyId, RetrievalBudget, RetrievalBudgetUsage, RetrievalContractError, RetrievalCursor,
-    RetrievalCursorKeyId, RetrievalError, RetrievalFailure, RetrievalRequest, RetrievalScope,
-    RetrievalSnapshot, RetrieverBatch, RetrieverContinuation, RetrieverCoverage, RetrieverKind,
-    RetrieverOutcome, SanitizedBudgetUsage, SanitizedStageFailure, ScoreDomainCalibrationV1,
-    ScoreDomainId, SemanticRetrievalContinuationV1, SessionOrThreadId, SingleRootScopeV1,
-    SourceFreshness, SourceInstanceKey, SourceNamespace, SourceOccurrenceId,
+    AuthorizationRevision, CalibrationProfileId, CandidateContribution, CandidateSetDigest,
+    CodeSourceCursorBindingV1, CompactCandidate, ComponentRevision, CursorPayloadDigest,
+    DiversityPolicy, DiversityPolicyId, EvaluationDecisionId, EvidenceRole, ExactAdmissionProof,
+    ExactAdmissionRuleRevision, ExactAdmissionValidator, ExactClass, ExactFieldV1,
+    FallbackSubpayloadDigest, FixedPointScore, FreshnessCompatibilityV1, FreshnessVectorDigest,
+    FusedCandidate, FusionProfile, FusionProfileId, HydrationReceipt, HydrationRevision,
+    LogicalCopyClusterId, LogicalEvidenceId, OccurrenceProvenance, PrincipalId,
+    PublicRetrieverStatus, QUERY_FALLBACK_SUBPAYLOAD_DIGEST_DOMAIN, QueryDigest,
+    QueryFallbackSubpayload, QueryMac, RankedCandidate, RankingDecision, RankingDecisionKind,
+    RankingRevision, RetrievalBudget, RetrievalBudgetUsage, RetrievalContractError,
+    RetrievalCursor, RetrievalCursorKeyId, RetrievalError, RetrievalFailure, RetrievalRequest,
+    RetrievalScope, RetrievalSnapshot, RetrieverBatch, RetrieverContinuation, RetrieverCoverage,
+    RetrieverKind, RetrieverOutcome, ScoreDomainCalibrationV1, ScoreDomainId, SessionOrThreadId,
+    SingleRootScopeV1, SourceFreshness, SourceInstanceKey, SourceNamespace, SourceOccurrenceId,
     TemporalCandidateChannelV1, TemporalCandidateContributionV1, TemporalLaneEvidenceV1,
 };
 pub use session::{
@@ -390,11 +380,7 @@ pub use session_derived::{
     SessionDerivedEvidenceRecordV1, derive_session_evidence_from_occurrences,
 };
 pub use source_path_policy::{GENERATED_DIR_SEGMENTS, is_generated_dir_segment};
-pub use work::{
-    MAX_WORK_DEPENDENCIES, MAX_WORK_TITLE_BYTES, RuntimeEvidenceRef,
-    WORK_PROJECTION_STATE_VERSION_V1, WorkAuthority, WorkContractError, WorkEvent, WorkEventKind,
-    WorkProjection, WorkProjectionStateV1, WorkVersion,
-};
+pub use work::{RuntimeEvidenceRef, WorkAuthority, WorkContractError, WorkVersion};
 pub use work_duplicate_adjudication::{
     MAX_WORK_DUPLICATE_REASON_BYTES_V1, WorkDuplicateAdjudicationCommandV1,
     WorkDuplicateAdjudicationContractErrorV1, WorkDuplicateAdjudicationEvidenceV1,
@@ -432,16 +418,13 @@ pub use work_product_event::{
 pub use work_product_projection::{
     WorkCausalProjectionV1, WorkCriticalPathProjectionV1, WorkDagEdgeV1, WorkDagProjectionV1,
     WorkKanbanCardV1, WorkKanbanProjectionV1, WorkLegalActionV1, WorkProductProjectionBundleV1,
-    WorkRuntimeAttemptProjectionV1, WorkRuntimeProjectionCoverageV1, WorkRuntimeProjectionV1,
-    WorkTimelineEntryV1, WorkTimelineLaneV1, WorkTimelineProjectionV1, WorkWorkloadProjectionV1,
-};
-pub use work_read::{
-    MAX_WORK_PROJECTION_CURSOR_BYTES, MAX_WORK_PROJECTION_READ_ITEMS, WorkProjectionCoverageV1,
-    WorkProjectionDeltaV1, WorkProjectionReadError, WorkProjectionResumeCursorV1,
-    WorkProjectionSequenceRangeV1, WorkProjectionSequenceV1, WorkProjectionSnapshotV1,
+    WorkProjectionSequenceV1, WorkRuntimeAttemptProjectionV1, WorkRuntimeProjectionCoverageV1,
+    WorkRuntimeProjectionV1, WorkTimelineEntryV1, WorkTimelineLaneV1, WorkTimelineProjectionV1,
+    WorkWorkloadProjectionV1,
 };
 pub use work_routing::{
     WorkContentLocationClassV1, WorkEffortClassV1, WorkOrdinalBandV1, WorkRouteCandidateV1,
+    WorkRouteExecutionProfileV1,
 };
 pub use work_run_control::{
     MAX_FENCED_WORK_ATTEMPTS, WorkBlockedIntervalCauseV1, WorkBlockedIntervalClosureV1,

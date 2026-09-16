@@ -13,6 +13,7 @@ mod bash;
 #[cfg(feature = "lang-batch")]
 mod batch;
 mod c;
+mod clone_body_tokens;
 #[cfg(feature = "lang-cobol")]
 mod cobol;
 mod complexity_budget;
@@ -67,6 +68,7 @@ mod qbasic;
 mod quickbasic;
 #[cfg(feature = "lang-quint")]
 mod quint;
+mod rename_clone_tokens;
 #[cfg(feature = "lang-ruby")]
 mod ruby;
 mod rust;

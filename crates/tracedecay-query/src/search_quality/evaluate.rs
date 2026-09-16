@@ -8,39 +8,21 @@ use thiserror::Error;
 
 use super::candidate_output;
 use super::candidate_output::{
-    CandidateOutputError, CandidateWorkloadV1, DirectEvaluatedProfileMaterialV1,
-    GenerateCandidateOutputsResultV1, OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
+    CandidateOutputError, CandidateWorkloadV1, GenerateCandidateOutputsResultV1,
     ProductionCandidateOutputV1, ResourceMeasurementStatusV1, ResourceSampleV1, WorkloadQueryV1,
     compute_corpus_digest, compute_profile_material_digest, compute_workload_digest,
-    direct_evaluated_profile_material, validate_workload_for_tuning,
+    validate_workload_for_tuning,
 };
-use super::packaged;
 use super::report;
 use super::report::{
     DirectEvaluationReportV1, DirectProfileEvaluationV1, DirectQualityMetricsV1,
     DirectQueryEvaluationV1, DirectQueryQualityV1, DirectRatioMetricV1, DirectStratumQualityV1,
     DirectWorstStratumV1,
 };
-use super::semantic_native;
 
-/// Returns the nearest-rank percentile from an ascending sample.
-///
-/// The caller owns sorting so repeated percentile reads can share one sort.
-/// Empty samples and percentiles outside `1..=100` return `None`.
-pub fn nearest_rank(sorted: &[u64], percentile: usize) -> Option<u64> {
-    if sorted.is_empty() || !(1..=100).contains(&percentile) {
-        return None;
-    }
-    let rank = percentile.saturating_mul(sorted.len()).div_ceil(100);
-    sorted.get(rank.saturating_sub(1)).copied()
-}
-
+/// The checked-in exact/lexical/graph profile every packaged evaluation runs.
 pub const QUERY_BASELINE_PROFILE: &str = "query-fallback";
-pub const SEMANTIC_PROFILE: &str = "hybrid-conservative";
-pub const RERANK_PROFILE: &str = "hybrid-reranked";
 const METRIC_SCALE_PPM: u64 = 1_000_000;
-pub(super) const REQUIRED_NATURAL_LANGUAGE_NDCG_GAIN_PPM: u32 = 1;
-const MAX_PROTECTED_QUALITY_REGRESSION_PPM: u32 = 0;
 const PROTECTED_STRATA: &[&str] = &[
     "config_key",
     "exact_error",
@@ -69,109 +51,6 @@ pub enum DirectEvaluationStatusV1 {
     Pending,
 }
 
-/// Genuine activation-eligible output coupling one immutable evaluator report
-/// to the exact checked-in domain material it exercised.
-#[derive(Clone, Debug)]
-pub struct DirectActivationEvaluationV1 {
-    report: DirectEvaluationReportV1,
-    evaluated_material: DirectEvaluatedProfileMaterialV1,
-}
-
-impl DirectActivationEvaluationV1 {
-    /// Read the genuine evaluator report without granting construction or
-    /// serialization authority for an activation candidate.
-    pub fn report(&self) -> &DirectEvaluationReportV1 {
-        &self.report
-    }
-
-    pub fn into_parts(self) -> (DirectEvaluationReportV1, DirectEvaluatedProfileMaterialV1) {
-        (self.report, self.evaluated_material)
-    }
-
-    pub fn from_parts(
-        report: DirectEvaluationReportV1,
-        evaluated_material: DirectEvaluatedProfileMaterialV1,
-    ) -> Self {
-        Self {
-            report,
-            evaluated_material,
-        }
-    }
-}
-
-pub fn load_authoritative_default_workload_metadata() -> Result<CandidateWorkloadV1, SearchEvalError>
-{
-    let workload = packaged::load_workload()?;
-    validate_activation_profile_matrix(&workload)?;
-    Ok(workload)
-}
-
-pub fn validate_activation_profile_matrix(
-    workload: &CandidateWorkloadV1,
-) -> Result<(), SearchEvalError> {
-    let profile = |profile_id: &str| {
-        workload
-            .profile_matrix
-            .iter()
-            .find(|profile| profile.profile_id == profile_id)
-            .ok_or_else(|| {
-                SearchEvalError::Contract(format!(
-                    "authoritative direct workload is missing required profile {profile_id}"
-                ))
-            })
-    };
-    let baseline = profile(QUERY_BASELINE_PROFILE)?;
-    let semantic = profile(SEMANTIC_PROFILE)?;
-    let rerank = profile(RERANK_PROFILE)?;
-    if baseline.semantic_weight_ppm != 0 || baseline.rerank_weight_ppm != 0 {
-        return Err(SearchEvalError::Contract(
-            "query baseline must disable semantic and rerank lanes".to_owned(),
-        ));
-    }
-    if semantic.semantic_weight_ppm == 0 || semantic.rerank_weight_ppm != 0 {
-        return Err(SearchEvalError::Contract(
-            "semantic comparison profile must enable semantic and disable rerank".to_owned(),
-        ));
-    }
-    if rerank.semantic_weight_ppm != semantic.semantic_weight_ppm
-        || rerank.rerank_weight_ppm == 0
-        || rerank.lexical_weight_ppm != semantic.lexical_weight_ppm
-        || rerank.graph_weight_ppm != semantic.graph_weight_ppm
-        || rerank.calibration_threshold_ppm != semantic.calibration_threshold_ppm
-    {
-        return Err(SearchEvalError::Contract(
-            "rerank comparison must differ from the semantic profile only by rerank material"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn activation_profile_chain(
-    workload: &CandidateWorkloadV1,
-    evaluated_profile_id: &str,
-) -> Result<Vec<String>, SearchEvalError> {
-    validate_activation_profile_matrix(workload)?;
-    let profile_ids = match evaluated_profile_id {
-        QUERY_BASELINE_PROFILE => vec![QUERY_BASELINE_PROFILE],
-        SEMANTIC_PROFILE => vec![QUERY_BASELINE_PROFILE, SEMANTIC_PROFILE],
-        RERANK_PROFILE => vec![QUERY_BASELINE_PROFILE, SEMANTIC_PROFILE, RERANK_PROFILE],
-        _ => {
-            return Err(SearchEvalError::Contract(format!(
-                "{evaluated_profile_id} is not an activation-eligible checked-in profile"
-            )));
-        }
-    };
-    Ok(profile_ids.into_iter().map(str::to_owned).collect())
-}
-
-pub fn load_default_evaluated_profile_material(
-    profile_id: &str,
-) -> Result<DirectEvaluatedProfileMaterialV1, SearchEvalError> {
-    let workload = load_authoritative_default_workload_metadata()?;
-    Ok(direct_evaluated_profile_material(&workload, profile_id)?)
-}
-
 pub fn evaluate_generated_outputs(
     repo_root: &Path,
     workload: &CandidateWorkloadV1,
@@ -182,9 +61,8 @@ pub fn evaluate_generated_outputs(
 }
 
 /// Rebuild a report from retained outputs against an already-authoritative
-/// corpus digest. Package qualification uses this to validate embedded bytes
-/// without materializing the packaged fixture into a temporary directory.
-pub fn evaluate_generated_outputs_against_corpus(
+/// corpus digest.
+pub(super) fn evaluate_generated_outputs_against_corpus(
     workload: &CandidateWorkloadV1,
     generated: &GenerateCandidateOutputsResultV1,
     corpus_digest: &str,
@@ -291,7 +169,6 @@ fn evaluate_profile(
             output.profile_id, output.partition
         )));
     }
-    validate_optional_stage_evidence(profile, output)?;
     let mut results = Vec::new();
     let mut seen_queries = BTreeMap::new();
     for row in &output.queries {
@@ -374,9 +251,7 @@ fn evaluate_profile(
         && resource_status != DirectEvaluationStatusV1::Fail;
     let status = if !hard_invariants_pass {
         DirectEvaluationStatusV1::Fail
-    } else if optional_stages_pending(output.optional_stages)
-        || resource_status == DirectEvaluationStatusV1::Pending
-    {
+    } else if resource_status == DirectEvaluationStatusV1::Pending {
         DirectEvaluationStatusV1::Pending
     } else {
         DirectEvaluationStatusV1::Pass
@@ -391,149 +266,10 @@ fn evaluate_profile(
         cancellation_bounded,
         offline,
         resource_status,
-        optional_stages: output.optional_stages,
         quality,
         status,
         queries: results,
     })
-}
-
-fn validate_optional_stage_evidence(
-    profile: &candidate_output::ProfileSpecV1,
-    output: &ProductionCandidateOutputV1,
-) -> Result<(), SearchEvalError> {
-    validate_stage_request(
-        profile.semantic_weight_ppm != 0,
-        output.optional_stages.semantic,
-        "semantic",
-        &output
-            .queries
-            .iter()
-            .filter_map(|row| row.native.as_ref())
-            .map(|native| &native.exact_flat_oracle)
-            .collect::<Vec<_>>(),
-        output.queries.len(),
-    )?;
-    let rerank_results = output
-        .queries
-        .iter()
-        .filter_map(|row| row.native.as_ref())
-        .map(|native| (&native.rerank.on, &native.rerank.execution))
-        .collect::<Vec<_>>();
-    validate_rerank_stage_request(
-        profile.rerank_weight_ppm != 0,
-        output.optional_stages.rerank,
-        &rerank_results,
-        output.queries.len(),
-    )?;
-    for row in &output.queries {
-        let Some(native) = &row.native else {
-            continue;
-        };
-        if native.profile_id != output.profile_id || !native.fallback_bytes_unchanged {
-            return Err(SearchEvalError::Contract(format!(
-                "{}:{} query {} has invalid native profile/fallback binding",
-                output.profile_id, output.partition, row.query_id
-            )));
-        }
-    }
-    if let Some(evidence) = &output.native_resources {
-        evidence
-            .validate()
-            .map_err(|error| SearchEvalError::Contract(error.to_string()))?;
-    }
-    Ok(())
-}
-
-fn validate_stage_request<T>(
-    requested: bool,
-    status: OptionalStageMeasurementV1,
-    stage: &str,
-    results: &[&semantic_native::SemanticNativeStageResultV1<T>],
-    query_count: usize,
-) -> Result<(), SearchEvalError> {
-    use semantic_native::SemanticNativeStageResultV1;
-
-    match (requested, status) {
-        (false, OptionalStageMeasurementV1::NotRequested) => {
-            if results
-                .iter()
-                .any(|result| !matches!(result, SemanticNativeStageResultV1::NotRequested))
-            {
-                return Err(SearchEvalError::Contract(format!(
-                    "unrequested {stage} stage reported native execution"
-                )));
-            }
-        }
-        (false, _) | (true, OptionalStageMeasurementV1::NotRequested) => {
-            return Err(SearchEvalError::Contract(format!(
-                "{stage} optional stage status disagrees with its checked-in profile"
-            )));
-        }
-        (true, OptionalStageMeasurementV1::Complete) => {
-            if results.len() != query_count
-                || results
-                    .iter()
-                    .any(|result| !matches!(result, SemanticNativeStageResultV1::Complete(_)))
-            {
-                return Err(SearchEvalError::Contract(format!(
-                    "complete {stage} status lacks complete native evidence for every query"
-                )));
-            }
-        }
-        (true, OptionalStageMeasurementV1::Pending) => {
-            if results.len() == query_count
-                && results
-                    .iter()
-                    .all(|result| matches!(result, SemanticNativeStageResultV1::Complete(_)))
-            {
-                return Err(SearchEvalError::Contract(format!(
-                    "{stage} status is pending despite complete native evidence"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_rerank_stage_request<On, Execution>(
-    requested: bool,
-    status: OptionalStageMeasurementV1,
-    results: &[(
-        &semantic_native::SemanticNativeStageResultV1<On>,
-        &semantic_native::SemanticNativeStageResultV1<Execution>,
-    )],
-    query_count: usize,
-) -> Result<(), SearchEvalError> {
-    use semantic_native::SemanticNativeStageResultV1;
-
-    for (on, execution) in results {
-        let matching_state = matches!(
-            (on, execution),
-            (
-                SemanticNativeStageResultV1::NotRequested,
-                SemanticNativeStageResultV1::NotRequested
-            ) | (
-                SemanticNativeStageResultV1::Complete(_),
-                SemanticNativeStageResultV1::Complete(_)
-            ) | (
-                SemanticNativeStageResultV1::Pending { .. },
-                SemanticNativeStageResultV1::Pending { .. }
-            )
-        );
-        if !matching_state {
-            return Err(SearchEvalError::Contract(
-                "rerank output and execution evidence disagree".to_owned(),
-            ));
-        }
-    }
-    validate_stage_request(
-        requested,
-        status,
-        "rerank",
-        &results.iter().map(|(on, _)| *on).collect::<Vec<_>>(),
-        query_count,
-    )
 }
 
 fn validate_output_matrix(
@@ -1010,11 +746,6 @@ const fn pass_if(condition: bool) -> DirectEvaluationStatusV1 {
     }
 }
 
-const fn optional_stages_pending(stages: OptionalStageMeasurementsV1) -> bool {
-    matches!(stages.semantic, OptionalStageMeasurementV1::Pending)
-        || matches!(stages.rerank, OptionalStageMeasurementV1::Pending)
-}
-
 fn aggregate_profile_status(profiles: &[DirectProfileEvaluationV1]) -> DirectEvaluationStatusV1 {
     if profiles
         .iter()
@@ -1027,187 +758,16 @@ fn aggregate_profile_status(profiles: &[DirectProfileEvaluationV1]) -> DirectEva
     {
         DirectEvaluationStatusV1::Pending
     } else {
-        pairwise_candidate_status(profiles)
+        DirectEvaluationStatusV1::Pass
     }
-}
-
-fn pairwise_candidate_status(profiles: &[DirectProfileEvaluationV1]) -> DirectEvaluationStatusV1 {
-    pairwise_candidate_evaluation(profiles).0
-}
-
-pub(super) fn pairwise_candidate_failure_diagnostic(
-    profiles: &[DirectProfileEvaluationV1],
-) -> Option<String> {
-    pairwise_candidate_evaluation(profiles).1
-}
-
-fn pairwise_candidate_evaluation(
-    profiles: &[DirectProfileEvaluationV1],
-) -> (DirectEvaluationStatusV1, Option<String>) {
-    let mut unavailable = false;
-    for candidate in profiles.iter().filter(|profile| {
-        profile.profile_id == SEMANTIC_PROFILE || profile.profile_id == RERANK_PROFILE
-    }) {
-        let Some(baseline) = profiles.iter().find(|profile| {
-            profile.profile_id == QUERY_BASELINE_PROFILE && profile.partition == candidate.partition
-        }) else {
-            unavailable = true;
-            continue;
-        };
-        let (Some(baseline_natural), Some(candidate_natural)) = (
-            baseline
-                .quality
-                .strata
-                .iter()
-                .find(|stratum| stratum.stratum == "natural_language"),
-            candidate
-                .quality
-                .strata
-                .iter()
-                .find(|stratum| stratum.stratum == "natural_language"),
-        ) else {
-            unavailable = true;
-            continue;
-        };
-        // The compared stratum is not protected, so `MAX_PROTECTED_QUALITY_
-        // REGRESSION_PPM` never guards it and the only other requirement is a
-        // gain in its *mean*. A mean hides a per-query loss: the last packaged
-        // qualification raised the stratum mean while dropping one of
-        // `validation-006`'s labelled targets out of the ranking entirely
-        // (recall 2/3 to 1/3), because fusion admits a bounded number of
-        // approximate candidates per file and a semantic candidate displaced
-        // the labelled one. Losing labelled evidence the baseline already
-        // retrieved is a regression whatever the mean does.
-        if let Some(diagnostic) = dropped_relevant_label(candidate, baseline) {
-            return (DirectEvaluationStatusV1::Fail, Some(diagnostic));
-        }
-        if candidate_natural
-            .ndcg_at_10_ppm
-            .saturating_sub(baseline_natural.ndcg_at_10_ppm)
-            < REQUIRED_NATURAL_LANGUAGE_NDCG_GAIN_PPM
-        {
-            // A lexical baseline already at the metric ceiling leaves no
-            // room to demonstrate gain; name that so a small corpus is not
-            // mistaken for a semantic quality regression.
-            let saturated = if u64::from(baseline_natural.ndcg_at_10_ppm) >= METRIC_SCALE_PPM {
-                " (lexical baseline is saturated on this corpus; semantic gain cannot be demonstrated here)"
-            } else {
-                ""
-            };
-            return (
-                DirectEvaluationStatusV1::Fail,
-                Some(format!(
-                    "pairwise candidate quality failed: profile={} partition={} stratum=natural_language metric=ndcg_at_10_ppm baseline={} candidate={} required_gain={}{saturated}",
-                    candidate.profile_id,
-                    candidate.partition,
-                    baseline_natural.ndcg_at_10_ppm,
-                    candidate_natural.ndcg_at_10_ppm,
-                    REQUIRED_NATURAL_LANGUAGE_NDCG_GAIN_PPM,
-                )),
-            );
-        }
-        for baseline_stratum in baseline
-            .quality
-            .strata
-            .iter()
-            .filter(|stratum| stratum.protected)
-        {
-            let Some(candidate_stratum) = candidate
-                .quality
-                .strata
-                .iter()
-                .find(|stratum| stratum.stratum == baseline_stratum.stratum)
-            else {
-                unavailable = true;
-                continue;
-            };
-            let comparisons = [
-                (
-                    "recall_at_10_ppm",
-                    baseline_stratum.recall_at_10.ppm,
-                    candidate_stratum.recall_at_10.ppm,
-                ),
-                (
-                    "mean_reciprocal_rank_ppm",
-                    baseline_stratum.mean_reciprocal_rank_ppm,
-                    candidate_stratum.mean_reciprocal_rank_ppm,
-                ),
-                (
-                    "ndcg_at_10_ppm",
-                    baseline_stratum.ndcg_at_10_ppm,
-                    candidate_stratum.ndcg_at_10_ppm,
-                ),
-            ];
-            for (metric, baseline_value, candidate_value) in comparisons {
-                if baseline_value.saturating_sub(candidate_value)
-                    > MAX_PROTECTED_QUALITY_REGRESSION_PPM
-                {
-                    return (
-                        DirectEvaluationStatusV1::Fail,
-                        Some(format!(
-                            "pairwise candidate quality failed: profile={} partition={} stratum={} metric={} baseline={} candidate={} maximum_regression={}",
-                            candidate.profile_id,
-                            candidate.partition,
-                            baseline_stratum.stratum,
-                            metric,
-                            baseline_value,
-                            candidate_value,
-                            MAX_PROTECTED_QUALITY_REGRESSION_PPM,
-                        )),
-                    );
-                }
-            }
-        }
-    }
-    if unavailable {
-        (DirectEvaluationStatusV1::Pending, None)
-    } else {
-        (DirectEvaluationStatusV1::Pass, None)
-    }
-}
-
-/// The first compared query whose candidate retrieves fewer labelled targets
-/// than the baseline. Both sides score the same checked-in label set, so the
-/// recall numerators compare directly.
-fn dropped_relevant_label(
-    candidate: &DirectProfileEvaluationV1,
-    baseline: &DirectProfileEvaluationV1,
-) -> Option<String> {
-    report::pairwise_query_pairs(&candidate.queries, &baseline.queries)
-        .into_iter()
-        .find(|(candidate_query, baseline_query)| {
-            candidate_query.quality.recall_at_10.numerator
-                < baseline_query.quality.recall_at_10.numerator
-        })
-        .map(|(candidate_query, baseline_query)| {
-            format!(
-                "pairwise candidate quality failed: profile={} partition={} stratum=natural_language query={} metric=recall_at_10 baseline={}/{} candidate={}/{} (the candidate dropped a labelled target the baseline retrieved)",
-                candidate.profile_id,
-                candidate.partition,
-                candidate_query.query_id,
-                baseline_query.quality.recall_at_10.numerator,
-                baseline_query.quality.recall_at_10.denominator,
-                candidate_query.quality.recall_at_10.numerator,
-                candidate_query.quality.recall_at_10.denominator,
-            )
-        })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        QUERY_BASELINE_PROFILE, RERANK_PROFILE, SEMANTIC_PROFILE, activation_profile_chain,
-        aggregate_profile_status, aggregate_quality, evaluate_query,
-        load_authoritative_default_workload_metadata, ratio_metric,
-    };
+    use super::{aggregate_quality, evaluate_query};
     use crate::search_quality::candidate_output::{
-        HistoricalQueryExecutionV1, OptionalStageMeasurementV1, OptionalStageMeasurementsV1,
-        QueryCandidateRowV1, RankedCandidateRowV1, ResourceMeasurementStatusV1, ResourceSampleV1,
-        WorkloadQueryV1,
-    };
-    use crate::search_quality::report::{
-        DirectProfileEvaluationV1, DirectQualityMetricsV1, DirectQueryEvaluationV1,
-        DirectStratumQualityV1,
+        HistoricalQueryExecutionV1, QueryCandidateRowV1, RankedCandidateRowV1,
+        ResourceMeasurementStatusV1, ResourceSampleV1, WorkloadQueryV1,
     };
 
     fn ranked(anchor: &str) -> RankedCandidateRowV1 {
@@ -1227,8 +787,10 @@ mod tests {
             strata: vec![stratum.to_owned()],
             query: id.to_owned(),
             allowed_scopes: vec!["research".to_owned()],
+            lexical_aliases: Vec::new(),
             historical_commit: None,
             label: Some(serde_json::json!({ "anchors": anchors })),
+            need_provenance: None,
         }
     }
 
@@ -1238,95 +800,7 @@ mod tests {
             abstained: ranked.is_empty(),
             ranked,
             historical: HistoricalQueryExecutionV1::NotRequested,
-            native: None,
         }
-    }
-
-    fn passing_profile(
-        profile_id: &str,
-        natural_language_ndcg_at_10_ppm: u32,
-        protected_mrr_ppm: u32,
-    ) -> DirectProfileEvaluationV1 {
-        let perfect = ratio_metric(1, 1);
-        let empty = ratio_metric(0, 0);
-        DirectProfileEvaluationV1 {
-            profile_id: profile_id.to_owned(),
-            partition: "validation".to_owned(),
-            query_count: 2,
-            failed_queries: 0,
-            fallback_stable: true,
-            fallback_matches_expected: true,
-            cancellation_bounded: true,
-            offline: true,
-            resource_status: super::DirectEvaluationStatusV1::Pass,
-            optional_stages: OptionalStageMeasurementsV1 {
-                semantic: OptionalStageMeasurementV1::NotRequested,
-                rerank: OptionalStageMeasurementV1::NotRequested,
-            },
-            quality: DirectQualityMetricsV1 {
-                relevant_query_count: 2,
-                recall_at_10: perfect.clone(),
-                precision_at_10: perfect.clone(),
-                mean_reciprocal_rank_ppm: protected_mrr_ppm,
-                ndcg_at_10_ppm: natural_language_ndcg_at_10_ppm,
-                duplicate_rate: empty,
-                protected_recall_at_10: perfect.clone(),
-                strata: vec![
-                    DirectStratumQualityV1 {
-                        stratum: "exact_symbol".to_owned(),
-                        protected: true,
-                        query_count: 1,
-                        relevant_query_count: 1,
-                        recall_at_10: perfect.clone(),
-                        precision_at_10: perfect.clone(),
-                        mean_reciprocal_rank_ppm: protected_mrr_ppm,
-                        ndcg_at_10_ppm: protected_mrr_ppm,
-                        duplicate_rate: ratio_metric(0, 1),
-                    },
-                    DirectStratumQualityV1 {
-                        stratum: "natural_language".to_owned(),
-                        protected: false,
-                        query_count: 1,
-                        relevant_query_count: 1,
-                        recall_at_10: perfect.clone(),
-                        precision_at_10: perfect,
-                        mean_reciprocal_rank_ppm: natural_language_ndcg_at_10_ppm,
-                        ndcg_at_10_ppm: natural_language_ndcg_at_10_ppm,
-                        duplicate_rate: ratio_metric(0, 1),
-                    },
-                ],
-                worst_stratum: None,
-            },
-            status: super::DirectEvaluationStatusV1::Pass,
-            queries: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn activation_profile_chain_is_closed_and_ordered() {
-        let workload =
-            load_authoritative_default_workload_metadata().expect("authoritative workload");
-
-        assert_eq!(
-            activation_profile_chain(&workload, QUERY_BASELINE_PROFILE).expect("query chain"),
-            vec![QUERY_BASELINE_PROFILE.to_owned()]
-        );
-        assert_eq!(
-            activation_profile_chain(&workload, SEMANTIC_PROFILE).expect("semantic chain"),
-            vec![
-                QUERY_BASELINE_PROFILE.to_owned(),
-                SEMANTIC_PROFILE.to_owned()
-            ]
-        );
-        assert_eq!(
-            activation_profile_chain(&workload, RERANK_PROFILE).expect("rerank chain"),
-            vec![
-                QUERY_BASELINE_PROFILE.to_owned(),
-                SEMANTIC_PROFILE.to_owned(),
-                RERANK_PROFILE.to_owned()
-            ]
-        );
-        assert!(activation_profile_chain(&workload, "caller-authored").is_err());
     }
 
     #[test]
@@ -1454,131 +928,6 @@ mod tests {
         assert_eq!(multiple.quality.ndcg_at_10_ppm, 938_557);
     }
 
-    #[test]
-    fn candidate_without_pairwise_natural_language_gain_fails() {
-        for profile_id in [SEMANTIC_PROFILE, RERANK_PROFILE] {
-            let baseline = passing_profile(QUERY_BASELINE_PROFILE, 500_000, 1_000_000);
-            let candidate = passing_profile(profile_id, 500_000, 1_000_000);
-
-            assert_eq!(
-                aggregate_profile_status(&[baseline.clone(), candidate.clone()]),
-                super::DirectEvaluationStatusV1::Fail
-            );
-            let expected = format!(
-                "pairwise candidate quality failed: profile={profile_id} partition=validation stratum=natural_language metric=ndcg_at_10_ppm baseline=500000 candidate=500000 required_gain=1"
-            );
-            assert_eq!(
-                super::pairwise_candidate_failure_diagnostic(&[baseline, candidate]).as_deref(),
-                Some(expected.as_str())
-            );
-        }
-    }
-
-    #[test]
-    fn saturated_baseline_names_why_gain_cannot_be_demonstrated() {
-        let baseline = passing_profile(QUERY_BASELINE_PROFILE, 1_000_000, 1_000_000);
-        let candidate = passing_profile(SEMANTIC_PROFILE, 1_000_000, 1_000_000);
-
-        assert_eq!(
-            aggregate_profile_status(&[baseline.clone(), candidate.clone()]),
-            super::DirectEvaluationStatusV1::Fail
-        );
-        let diagnostic = super::pairwise_candidate_failure_diagnostic(&[baseline, candidate])
-            .expect("saturated baseline still refuses activation");
-        assert!(diagnostic.contains("baseline=1000000 candidate=1000000 required_gain=1"));
-        assert!(diagnostic.contains("lexical baseline is saturated"));
-    }
-
-    /// A stratum mean must not buy a candidate the right to lose labelled
-    /// evidence: this is the shape the last packaged qualification shipped,
-    /// where semantic gain on one natural-language query paid for a labelled
-    /// target dropped out of another query's ranking.
-    #[test]
-    fn candidate_that_drops_a_labelled_target_fails_despite_a_stratum_mean_gain() {
-        let labels = query("nl-lost", "natural_language", &["a", "b", "c"]);
-        let baseline_query = evaluate_query(
-            &labels,
-            &row("nl-lost", vec![ranked("a"), ranked("noise"), ranked("b")]),
-        )
-        .expect("baseline query");
-        let candidate_query = evaluate_query(
-            &labels,
-            &row(
-                "nl-lost",
-                vec![ranked("a"), ranked("displaced"), ranked("noise")],
-            ),
-        )
-        .expect("candidate query");
-        assert_eq!(baseline_query.quality.recall_at_10.numerator, 2);
-        assert_eq!(candidate_query.quality.recall_at_10.numerator, 1);
-
-        let profile_with = |profile_id: &str,
-                            natural_language_ndcg_at_10_ppm: u32,
-                            evaluated: DirectQueryEvaluationV1| {
-            let mut profile =
-                passing_profile(profile_id, natural_language_ndcg_at_10_ppm, 1_000_000);
-            profile.queries = vec![evaluated];
-            profile
-        };
-
-        let baseline = profile_with(QUERY_BASELINE_PROFILE, 500_000, baseline_query.clone());
-        let candidate = profile_with(SEMANTIC_PROFILE, 900_000, candidate_query);
-
-        assert_eq!(
-            aggregate_profile_status(&[baseline.clone(), candidate.clone()]),
-            super::DirectEvaluationStatusV1::Fail
-        );
-        let diagnostic = super::pairwise_candidate_failure_diagnostic(&[baseline, candidate])
-            .expect("a dropped labelled target refuses activation");
-        assert!(diagnostic.contains("query=nl-lost"), "{diagnostic}");
-        assert!(
-            diagnostic.contains("metric=recall_at_10 baseline=2/3 candidate=1/3"),
-            "{diagnostic}"
-        );
-
-        // Retaining the baseline's labelled evidence keeps the same gain
-        // admissible, so the floor refuses the loss and not the gain.
-        assert_eq!(
-            aggregate_profile_status(&[
-                profile_with(QUERY_BASELINE_PROFILE, 500_000, baseline_query.clone()),
-                profile_with(SEMANTIC_PROFILE, 900_000, baseline_query),
-            ]),
-            super::DirectEvaluationStatusV1::Pass
-        );
-    }
-
-    #[test]
-    fn candidate_with_protected_quality_regression_fails() {
-        let baseline = passing_profile(QUERY_BASELINE_PROFILE, 500_000, 1_000_000);
-        let candidate = passing_profile(SEMANTIC_PROFILE, 600_000, 900_000);
-
-        assert_eq!(
-            aggregate_profile_status(&[baseline, candidate]),
-            super::DirectEvaluationStatusV1::Fail
-        );
-    }
-
-    #[test]
-    fn candidate_without_pairwise_baseline_remains_pending() {
-        let candidate = passing_profile(SEMANTIC_PROFILE, 600_000, 1_000_000);
-
-        assert_eq!(
-            aggregate_profile_status(&[candidate]),
-            super::DirectEvaluationStatusV1::Pending
-        );
-    }
-
-    #[test]
-    fn candidate_with_pairwise_gain_and_no_regression_passes() {
-        let baseline = passing_profile(QUERY_BASELINE_PROFILE, 500_000, 1_000_000);
-        let candidate = passing_profile(SEMANTIC_PROFILE, 500_001, 1_000_000);
-
-        assert_eq!(
-            aggregate_profile_status(&[baseline, candidate]),
-            super::DirectEvaluationStatusV1::Pass
-        );
-    }
-
     fn resource_sample(
         status: ResourceMeasurementStatusV1,
         peak_rss_bytes: Option<u64>,
@@ -1613,7 +962,7 @@ mod tests {
             ResourceMeasurementStatusV1::Pending,
             None,
             Vec::new(),
-            Some("native semantic resource measurement pending"),
+            Some("resource measurement pending"),
         );
         assert_eq!(
             super::resource_sample_verdict(&not_run, 3),
