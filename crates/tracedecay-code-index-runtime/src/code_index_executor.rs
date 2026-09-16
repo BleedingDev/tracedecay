@@ -1450,12 +1450,45 @@ where
                     code_search::CodeIndexSimilarOutcomeV1::Complete(Box::new(result))
                 }
                 Ok(Ok(None)) => code_search::CodeIndexSimilarOutcomeV1::NotFound,
-                Ok(Err(_)) | Err(_) => {
-                    unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal)
-                }
+                Ok(Err(error)) => unavailable(map_similar_retrieval_error(error)),
+                Err(_) => unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal),
             }
         })
     })
+}
+
+/// Preserve the typed terminal state emitted by the verified similarity lane.
+///
+/// Similarity is a blocking read, so the executor owns the translation from
+/// the query port's domain to the MCP-facing unavailable reason. Every known
+/// port failure has a retry or caller-actionable meaning; `Internal` is kept
+/// for an unexpected task failure such as a `JoinError`.
+fn map_similar_retrieval_error(
+    error: RetrievalPortError,
+) -> code_search::CodeIndexSearchUnavailableReasonV1 {
+    match error {
+        RetrievalPortError::CapabilityManifestRejected => {
+            code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable
+        }
+        RetrievalPortError::AuthorityUnavailable(_) => {
+            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable
+        }
+        RetrievalPortError::GenerationMismatch | RetrievalPortError::StaleEvidence => {
+            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
+        }
+        RetrievalPortError::IncompatibleProjection => {
+            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified
+        }
+        RetrievalPortError::Cancelled => {
+            code_search::CodeIndexSearchUnavailableReasonV1::Cancelled
+        }
+        RetrievalPortError::BudgetExceeded => {
+            code_search::CodeIndexSearchUnavailableReasonV1::TimedOut
+        }
+        RetrievalPortError::Contract(_) => {
+            code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest
+        }
+    }
 }
 
 pub fn code_index_redundancy_executor<A, S>(
@@ -1714,6 +1747,55 @@ mod tests {
             output.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn similar_stale_generation_is_retryable_generation_unavailable() {
+        for error in [
+            RetrievalPortError::StaleEvidence,
+            RetrievalPortError::GenerationMismatch,
+        ] {
+            assert_eq!(
+                map_similar_retrieval_error(error),
+                CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
+            );
+        }
+    }
+
+    #[test]
+    fn similar_wrong_domain_preserves_authority_unavailable() {
+        assert_eq!(
+            map_similar_retrieval_error(RetrievalPortError::AuthorityUnavailable(
+                "similar source repository authority is unavailable".to_owned(),
+            )),
+            CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable
+        );
+    }
+
+    #[test]
+    fn similar_invalid_continuation_is_invalid_request() {
+        for detail in [
+            "clone cursor position does not match an exact read",
+            "clone exact cursor does not match its artifact, key, or authority",
+            "invalid clone cursor encoding",
+        ] {
+            assert_eq!(
+                map_similar_retrieval_error(RetrievalPortError::Contract(detail.to_owned())),
+                CodeIndexSearchUnavailableReasonV1::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn similar_bounded_interruptions_keep_their_public_reason() {
+        assert_eq!(
+            map_similar_retrieval_error(RetrievalPortError::Cancelled),
+            CodeIndexSearchUnavailableReasonV1::Cancelled
+        );
+        assert_eq!(
+            map_similar_retrieval_error(RetrievalPortError::BudgetExceeded),
+            CodeIndexSearchUnavailableReasonV1::TimedOut
         );
     }
 
