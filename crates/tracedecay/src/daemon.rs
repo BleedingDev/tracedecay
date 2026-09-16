@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use serde_json::{Value, json};
+use serde_json::json;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
@@ -51,7 +51,6 @@ use tracedecay_mcp::{
 };
 use tracedecay_mcp::{ToolRegistryMode, explore_call_budget, project_catalog_discovery_scope};
 use tracedecay_runtime_core::cancellation::CancellationToken;
-use zeroize::Zeroize;
 
 pub(crate) const PROJECT_WARMING_RETRY_HINT: &str =
     "is warming in the background; retry the same tool shortly";
@@ -107,29 +106,6 @@ impl AuthenticatedFirstRequest {
 
     pub(super) fn into_raw(self) -> String {
         self.raw
-    }
-
-    /// Erase the first initialize frame once its action proof has been parsed.
-    /// The connection keeps the non-secret request fields in its typed request
-    /// and never needs to replay this one-shot control frame after admission.
-    /// Clearing both the byte-exact raw line and the parsed JSON value avoids
-    /// retaining the ordinary `String` copy of `proof_key` while a cold project
-    /// open is in flight.
-    pub(super) fn redact_native_action_prepare(&mut self) {
-        if let Some(request) = self.parsed.as_mut()
-            && let Some(params) = request.params.as_mut()
-            && let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut)
-            && let Some(prepare) = meta
-                .get_mut(tracedecay_daemon_protocol::action_receipt::ACTION_PREPARE_META_KEY)
-                .and_then(Value::as_object_mut)
-            && let Some(proof_key) = prepare.get_mut("proof_key")
-        {
-            let secret = std::mem::replace(proof_key, Value::Null);
-            if let Value::String(mut secret) = secret {
-                secret.zeroize();
-            }
-        }
-        self.raw.zeroize();
     }
 }
 
