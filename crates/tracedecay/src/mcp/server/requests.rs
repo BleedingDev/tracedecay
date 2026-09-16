@@ -25,6 +25,11 @@ mod tool_dispatch;
 struct PreparedToolCall {
     tool_name: String,
     arguments: Value,
+    /// Runner action proof metadata parsed from the transport envelope.
+    action_call: Option<tracedecay_daemon_protocol::action_receipt::ActionCallMetadata>,
+    /// Exact business arguments used to validate the prepared action digest.
+    /// This is retained only for calls carrying action metadata.
+    action_arguments: Option<Value>,
     analytics_arguments: Value,
     analytics_session_id: Option<String>,
     /// The deadline the caller declared on the request, when it declared one.
@@ -462,6 +467,11 @@ impl McpServer {
         connection: &mut ConnectionRouteState,
         pre_cancelled: bool,
     ) -> Option<JsonRpcResponse> {
+        // Expired prepare reservations own zeroized proof keys; sweep them on
+        // every MCP request so an abandoned reservation does not remain until
+        // another prepare arrives.
+        self.action_receipt_authority
+            .cleanup_expired(mcp_now_micros().0);
         // A response lease belongs to exactly one request. Production
         // transports take it before writing; direct callers drop it with this
         // connection state after observing the returned response.
@@ -912,6 +922,354 @@ impl McpServer {
         Self::resource_contents(id, "tracedecay://branches", "application/json", &text)
     }
 
+    fn action_receipt_error(
+        error: tracedecay_daemon_protocol::action_receipt::ActionReceiptError,
+    ) -> TraceDecayError {
+        TraceDecayError::Config {
+            message: error.to_string(),
+        }
+    }
+
+    fn current_action_receipt_generation(
+        &self,
+    ) -> Result<tracedecay_daemon_protocol::action_receipt::DaemonGeneration> {
+        let profile_root = self
+            .profile_root
+            .as_deref()
+            .ok_or_else(|| TraceDecayError::Config {
+                message: "daemon action receipt authority is unavailable".to_owned(),
+            })?;
+        let record = tracedecay_daemon_identity::authority::current_record(profile_root)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("daemon action receipt authority could not be read: {error}"),
+            })?
+            .ok_or_else(|| TraceDecayError::Config {
+                message: "daemon action receipt authority record is unavailable".to_owned(),
+            })?;
+        tracedecay_daemon_protocol::action_receipt::DaemonGeneration::new(
+            record.epoch,
+            record.process_run_id,
+        )
+        .map_err(Self::action_receipt_error)
+    }
+
+    fn action_receipt_store_identity(
+        cg: &TraceDecay,
+    ) -> Result<tracedecay_daemon_protocol::action_receipt::LiveStoreIdentity> {
+        let layout = cg.store_layout();
+        let canonical = |path: &Path, field: &'static str| {
+            tracedecay_daemon_identity::authority::canonical_identity_path(path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!(
+                        "action receipt store identity {field} is unavailable: {error}"
+                    ),
+                })
+        };
+        tracedecay_daemon_protocol::action_receipt::LiveStoreIdentity::new(
+            layout.identity.project_id.clone(),
+            canonical(&layout.project_root, "project_root")?,
+            canonical(&layout.data_root, "data_root")?,
+            canonical(&layout.graph_db_path, "graph_db_path")?,
+            cg.serving_branch().map(str::to_owned),
+        )
+        .map_err(Self::action_receipt_error)
+    }
+
+    /// Retain a runner-prepared action against this server's live store and
+    /// daemon generation. The proof key remains in the protocol authority's
+    /// in-memory reservation and is never returned in this acknowledgement.
+    pub(crate) async fn prepare_action_receipt(
+        &self,
+        request: tracedecay_daemon_protocol::action_receipt::ActionPrepareRequest,
+    ) -> Result<tracedecay_daemon_protocol::action_receipt::ActionPrepareResponse> {
+        let (cg, live_branch) = self.reopen_if_branch_drifted_memoized().await;
+        if cg.branch_drifted_with(&live_branch) {
+            return Err(TraceDecayError::Config {
+                message: "action receipt store branch changed; retry action prepare".to_owned(),
+            });
+        }
+        let store_identity = Self::action_receipt_store_identity(&cg)?;
+        if request.scope != store_identity.project_root {
+            return Err(TraceDecayError::Config {
+                message: "action receipt scope does not match the live project store".to_owned(),
+            });
+        }
+        let generation = self.current_action_receipt_generation()?;
+        self.action_receipt_authority
+            .prepare(
+                request,
+                generation,
+                store_identity,
+                tracedecay_daemon_protocol::action_receipt::ACTION_ENTRYPOINT_MCP_STDIO,
+                mcp_now_micros().0,
+            )
+            .map_err(Self::action_receipt_error)
+    }
+
+    async fn begin_action_receipt(
+        &self,
+        call: &tracedecay_daemon_protocol::action_receipt::ActionCallMetadata,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Result<tracedecay_daemon_protocol::action_receipt::PendingAction> {
+        let (cg, live_branch) = self.reopen_if_branch_drifted_memoized().await;
+        if cg.branch_drifted_with(&live_branch) {
+            return Err(TraceDecayError::Config {
+                message: "action receipt store branch changed; retry action call".to_owned(),
+            });
+        }
+        let store_identity = Self::action_receipt_store_identity(&cg)?;
+        // The MCP adapter observes the concrete published tool and its exact
+        // business action before dispatch. Some host surfaces collapse the
+        // fact-store family into one `fact_store(action=...)` call, while the
+        // daemon publishes one tool per operation. Resolve that pair through
+        // the closed mapping below; a child-supplied route remains only a
+        // consistency assertion in the protocol authority.
+        let actual_route = Self::observed_action_route(tool_name, arguments)?;
+        let generation = self.current_action_receipt_generation()?;
+        self.action_receipt_authority
+            .begin(
+                call,
+                tool_name,
+                &actual_route,
+                tracedecay_daemon_protocol::action_receipt::ACTION_ENTRYPOINT_MCP_STDIO,
+                arguments,
+                &store_identity,
+                &generation,
+                mcp_now_micros().0,
+            )
+            .map_err(Self::action_receipt_error)
+    }
+
+    fn observed_action_route(tool_name: &str, arguments: &Value) -> Result<String> {
+        let (route, expected_action) = match tool_name {
+            "tracedecay_fact_store" => {
+                let action = arguments
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .filter(|action| !action.is_empty())
+                    .ok_or_else(|| TraceDecayError::Config {
+                        message: "fact_store action is required for receipt-backed dispatch"
+                            .to_owned(),
+                    })?;
+                let route = match action {
+                    "add" => "fact_store_add",
+                    "search" => "fact_store_search",
+                    "probe" => "fact_store_probe",
+                    "related" => "fact_store_related",
+                    "reason" => "fact_store_reason",
+                    "contradict" => "fact_store_contradict",
+                    "get" => "fact_store_get",
+                    "update" => "fact_store_update",
+                    "remove" => "fact_store_remove",
+                    "supersede" => "fact_store_supersede",
+                    "list" => "fact_store_list",
+                    "curate" => "fact_store_curate",
+                    _ => {
+                        return Err(TraceDecayError::Config {
+                            message: format!(
+                                "fact_store action {action:?} has no published receipt route"
+                            ),
+                        });
+                    }
+                };
+                (route, None)
+            }
+            "tracedecay_fact_store_add" => ("fact_store_add", Some("add")),
+            "tracedecay_fact_store_search" => ("fact_store_search", Some("search")),
+            "tracedecay_fact_store_probe" => ("fact_store_probe", Some("probe")),
+            "tracedecay_fact_store_related" => ("fact_store_related", Some("related")),
+            "tracedecay_fact_store_reason" => ("fact_store_reason", Some("reason")),
+            "tracedecay_fact_store_contradict" => ("fact_store_contradict", Some("contradict")),
+            "tracedecay_fact_store_get" => ("fact_store_get", Some("get")),
+            "tracedecay_fact_store_update" => ("fact_store_update", Some("update")),
+            "tracedecay_fact_store_remove" => ("fact_store_remove", Some("remove")),
+            "tracedecay_fact_store_supersede" => ("fact_store_supersede", Some("supersede")),
+            "tracedecay_fact_store_list" => ("fact_store_list", Some("list")),
+            "tracedecay_fact_store_curate" => ("fact_store_curate", Some("curate")),
+            "tracedecay_fact_feedback" => ("fact_feedback", Some("feedback")),
+            "tracedecay_status" => ("status", None),
+            "tracedecay_memory_status" => ("memory_status", None),
+            // These route ids are the bounded MCP surface published by the
+            // comparison contract. Keep the mapping explicit: a route is
+            // selected from the daemon-observed tool name, never inferred by
+            // stripping a prefix from a caller-provided label.
+            "tracedecay_configuration_get" => ("configuration_get", None),
+            "tracedecay_session_lookup" => ("session_lookup", None),
+            "tracedecay_message_search" => ("message_search", None),
+            "tracedecay_sessions_for" => ("sessions_for", None),
+            "tracedecay_session_refresh_begin" => ("session_refresh_begin", None),
+            "tracedecay_session_refresh_status" => ("session_refresh_status", None),
+            "tracedecay_session_refresh_cancel" => ("session_refresh_cancel", None),
+            "tracedecay_lcm_load_session" => ("lcm_load_session", None),
+            "tracedecay_lcm_grep" => ("lcm_grep", None),
+            "tracedecay_lcm_describe" => ("lcm_describe", None),
+            "tracedecay_lcm_expand" => ("lcm_expand", None),
+            "tracedecay_lcm_expand_query" => ("lcm_expand_query", None),
+            "tracedecay_lcm_status" => ("lcm_status", None),
+            "tracedecay_lcm_doctor" => ("lcm_doctor", None),
+            _ => {
+                return Err(TraceDecayError::Config {
+                    message: format!("tool {tool_name:?} has no published receipt route"),
+                });
+            }
+        };
+        if let Some(expected_action) = expected_action
+            && let Some(action) = arguments.get("action")
+        {
+            let Some(action) = action.as_str() else {
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "receipt-backed {tool_name} action must be the exact string {expected_action:?}"
+                    ),
+                });
+            };
+            if action != expected_action {
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "receipt-backed {tool_name} action {action:?} does not match published route {expected_action:?}"
+                    ),
+                });
+            }
+        }
+        Ok(route.to_owned())
+    }
+
+    fn terminal_result_value(response: &JsonRpcResponse) -> Value {
+        let mut value = if let Some(result) = response.result.as_ref() {
+            result.clone()
+        } else {
+            response.error.as_ref().map_or(Value::Null, |error| {
+                json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "data": error.data,
+                })
+            })
+        };
+        // The runner hashes the terminal payload after removing the receipt
+        // metadata. Strip the same key before hashing so a child cannot cause a
+        // Rust/Python digest split by pre-populating a lookalike receipt.
+        Self::strip_action_receipt_metadata(&mut value);
+        value
+    }
+
+    fn strip_action_receipt_metadata(value: &mut Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        // Receipt attachment replaces a malformed/non-object `_meta` with an
+        // object before inserting its own key. Normalize that same outcome
+        // before hashing so Python, which sees the post-attachment object and
+        // then removes the receipt key, computes the same digest.
+        let remove_meta = match object.get_mut("_meta") {
+            Some(meta) if meta.is_object() => {
+                let meta = meta.as_object_mut().expect("object checked above");
+                meta.remove(tracedecay_daemon_protocol::action_receipt::ACTION_RECEIPT_META_KEY);
+                meta.is_empty()
+            }
+            Some(meta) => {
+                *meta = json!({});
+                true
+            }
+            None => false,
+        };
+        if remove_meta {
+            object.remove("_meta");
+        }
+        let null_data = match object.get_mut("data") {
+            Some(data) if data.is_object() => {
+                let data = data.as_object_mut().expect("object checked above");
+                data.remove(tracedecay_daemon_protocol::action_receipt::ACTION_RECEIPT_META_KEY);
+                data.is_empty()
+            }
+            Some(data) => {
+                // Error receipt attachment also replaces malformed `data`
+                // with an object; an empty post-removal object is serialized
+                // as JSON null by the shared error normalizer.
+                *data = json!({});
+                true
+            }
+            None => false,
+        };
+        if null_data {
+            object.insert("data".to_owned(), Value::Null);
+        }
+    }
+
+    fn attach_action_receipt(
+        response: &mut JsonRpcResponse,
+        receipt: tracedecay_daemon_protocol::action_receipt::ActionReceipt,
+    ) {
+        let receipt = serde_json::to_value(receipt).unwrap_or_default();
+        if let Some(result) = response.result.as_mut()
+            && let Some(result) = result.as_object_mut()
+        {
+            let meta = result.entry("_meta").or_insert_with(|| json!({}));
+            if !meta.is_object() {
+                *meta = json!({});
+            }
+            meta.as_object_mut()
+                .expect("receipt metadata object")
+                .insert(
+                    tracedecay_daemon_protocol::action_receipt::ACTION_RECEIPT_META_KEY.to_owned(),
+                    receipt,
+                );
+            return;
+        }
+        if let Some(error) = response.error.as_mut() {
+            let data = error.data.get_or_insert_with(|| json!({}));
+            if !data.is_object() {
+                *data = json!({});
+            }
+            data.as_object_mut()
+                .expect("receipt error data object")
+                .insert(
+                    tracedecay_daemon_protocol::action_receipt::ACTION_RECEIPT_META_KEY.to_owned(),
+                    receipt,
+                );
+        }
+    }
+
+    async fn finish_action_receipt(
+        &self,
+        pending: tracedecay_daemon_protocol::action_receipt::PendingAction,
+        response: &mut JsonRpcResponse,
+    ) {
+        // Re-read the mounted graph at terminal time. The dispatch snapshot can
+        // be retired while a tool is running; issuing a receipt for that stale
+        // database would make branch/database drift invisible.
+        let (cg, live_branch) = self.reopen_if_branch_drifted_memoized().await;
+        if cg.branch_drifted_with(&live_branch) {
+            return;
+        }
+        let Ok(store_identity) = Self::action_receipt_store_identity(&cg) else {
+            return;
+        };
+        let Ok(generation) = self.current_action_receipt_generation() else {
+            return;
+        };
+        let result_digest = tracedecay_daemon_protocol::action_receipt::canonical_result_digest(
+            &Self::terminal_result_value(response),
+        );
+        match self.action_receipt_authority.finish(
+            pending,
+            store_identity,
+            result_digest,
+            &generation,
+            mcp_now_micros().0,
+        ) {
+            Ok(receipt) => Self::attach_action_receipt(response, receipt),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "action receipt terminal issuance was refused"
+                );
+            }
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     /// Normalizes either transport's `tools/call` params into one prepared
     /// call.
@@ -928,7 +1286,7 @@ impl McpServer {
         let invalid_params = |message: &str| {
             JsonRpcResponse::error(id.clone(), ErrorCode::InvalidParams, message.to_owned())
         };
-        let (tool_name, mut arguments, caller_deadline) = match params {
+        let (tool_name, mut arguments, caller_deadline, action_call) = match params {
             ToolCallParams::Raw(None) => {
                 return Err(invalid_params("missing params for tools/call"));
             }
@@ -936,10 +1294,15 @@ impl McpServer {
                 let Some(tool_name) = params.get("name").and_then(Value::as_str) else {
                     return Err(invalid_params("missing 'name' in tools/call params"));
                 };
+                let action_call = match tracedecay_daemon_protocol::action_receipt::parse_call_metadata_from_params(Some(params)) {
+                    Ok(action_call) => action_call,
+                    Err(error) => return Err(invalid_params(&error.to_string())),
+                };
                 (
                     tool_name.to_owned(),
                     params.get("arguments").cloned().unwrap_or(json!({})),
                     tracedecay_mcp::caller_tool_call_deadline(Some(params)),
+                    action_call,
                 )
             }
             ToolCallParams::Typed(::rmcp::model::CallToolRequestParams {
@@ -947,15 +1310,37 @@ impl McpServer {
                 name,
                 arguments,
                 ..
-            }) => (
-                name.into_owned(),
-                arguments.map_or_else(|| json!({}), Value::Object),
-                tracedecay_mcp::caller_tool_call_deadline_from_meta(
-                    meta.as_ref()
-                        .map(|meta| -> &serde_json::Map<String, Value> { meta }),
-                ),
-            ),
+            }) => {
+                let action_call =
+                    match tracedecay_daemon_protocol::action_receipt::parse_call_metadata_map(
+                        meta.as_ref()
+                            .map(|meta| -> &serde_json::Map<String, Value> { meta }),
+                    ) {
+                        Ok(action_call) => action_call,
+                        Err(error) => return Err(invalid_params(&error.to_string())),
+                    };
+                (
+                    name.into_owned(),
+                    arguments.map_or_else(|| json!({}), Value::Object),
+                    tracedecay_mcp::caller_tool_call_deadline_from_meta(
+                        meta.as_ref()
+                            .map(|meta| -> &serde_json::Map<String, Value> { meta }),
+                    ),
+                    action_call,
+                )
+            }
         };
+        // The action digest covers exactly the arguments present on the wire.
+        // Structural route protection below is an internal handler transform
+        // and must not silently change the proof input.
+        let action_arguments = action_call.as_ref().map(|_| arguments.clone());
+        if action_call.is_some()
+            && crate::mcp::project_route::arguments_have_structural_route_identity(&arguments)
+        {
+            return Err(invalid_params(
+                "receipt-backed calls cannot carry session or thread route aliases",
+            ));
+        }
         if crate::mcp::project_route::protect_tool_structural_ids(&mut arguments).is_err() {
             return Err(invalid_params("invalid structural identifier"));
         }
@@ -965,6 +1350,8 @@ impl McpServer {
             analytics_session_id: mcp_analytics_session_id(&arguments),
             tool_name,
             arguments,
+            action_call,
+            action_arguments,
             caller_deadline,
         })
     }
@@ -1554,6 +1941,8 @@ impl McpServer {
         let PreparedToolCall {
             tool_name,
             arguments,
+            action_call,
+            action_arguments,
             analytics_arguments,
             analytics_session_id,
             caller_deadline,
@@ -1667,6 +2056,33 @@ impl McpServer {
             ),
         );
 
+        // Consume the retained reservation immediately before terminal work
+        // is admitted. A missing or mismatched nonce never reaches a tool
+        // handler, and a worker that never settles drops the pending proof key
+        // without producing a receipt.
+        let pending_action = match action_call {
+            Some(action_call) => {
+                let Some(action_arguments) = action_arguments.as_ref() else {
+                    connection.clear_selected_response_lease();
+                    let error = TraceDecayError::Config {
+                        message: "action receipt call arguments are unavailable".to_owned(),
+                    };
+                    return tool_error_response(id, &tool_name, &error);
+                };
+                match dispatch_server
+                    .begin_action_receipt(&action_call, &tool_name, action_arguments)
+                    .await
+                {
+                    Ok(pending) => Some(pending),
+                    Err(error) => {
+                        connection.clear_selected_response_lease();
+                        return tool_error_response(id, &tool_name, &error);
+                    }
+                }
+            }
+            None => None,
+        };
+
         let fast_unavailable =
             dispatch_server.message_search_worker_is_unavailable(&tool_name, &routed.arguments);
         let target_request_id = application_request_id
@@ -1738,7 +2154,13 @@ impl McpServer {
             return response;
         }
         if fast_unavailable {
-            return Self::finish_unavailable_tool_call(id, &tool_name, dispatch);
+            let mut response = Self::finish_unavailable_tool_call(id, &tool_name, dispatch);
+            if let Some(pending_action) = pending_action {
+                dispatch_server
+                    .finish_action_receipt(pending_action, &mut response)
+                    .await;
+            }
+            return response;
         }
         let response = dispatch_server
             .complete_tool_call(
@@ -1750,6 +2172,12 @@ impl McpServer {
                 self,
             )
             .await;
+        let mut response = response;
+        if let Some(pending_action) = pending_action {
+            dispatch_server
+                .finish_action_receipt(pending_action, &mut response)
+                .await;
+        }
         if let Some(response) = dispatch_server.project_server_revoked_response(&id, &tool_name) {
             connection.clear_selected_response_lease();
             return response;
@@ -1774,6 +2202,101 @@ mod tool_call_preparation_tests {
             .as_object()
             .cloned()
             .expect("object arguments")
+    }
+
+    #[test]
+    fn observed_route_maps_each_fact_store_action_to_its_published_tool_route() {
+        for (action, expected_route) in [
+            ("add", "fact_store_add"),
+            ("search", "fact_store_search"),
+            ("probe", "fact_store_probe"),
+            ("related", "fact_store_related"),
+            ("reason", "fact_store_reason"),
+            ("contradict", "fact_store_contradict"),
+            ("get", "fact_store_get"),
+            ("update", "fact_store_update"),
+            ("remove", "fact_store_remove"),
+            ("supersede", "fact_store_supersede"),
+            ("list", "fact_store_list"),
+            ("curate", "fact_store_curate"),
+        ] {
+            assert_eq!(
+                McpServer::observed_action_route(
+                    "tracedecay_fact_store",
+                    &json!({"action": action})
+                )
+                .expect("collapsed fact-store action route"),
+                expected_route,
+                "fact_store action {action} must select its exact published route",
+            );
+        }
+    }
+
+    #[test]
+    fn observed_route_maps_status_to_its_published_tool_route() {
+        assert_eq!(
+            McpServer::observed_action_route("tracedecay_status", &json!({}))
+                .expect("status route"),
+            "status"
+        );
+    }
+
+    #[test]
+    fn observed_route_maps_each_contract_mcp_tool_explicitly() {
+        for (tool, expected_route) in [
+            ("tracedecay_fact_feedback", "fact_feedback"),
+            ("tracedecay_memory_status", "memory_status"),
+            ("tracedecay_configuration_get", "configuration_get"),
+            ("tracedecay_session_lookup", "session_lookup"),
+            ("tracedecay_message_search", "message_search"),
+            ("tracedecay_sessions_for", "sessions_for"),
+            ("tracedecay_session_refresh_begin", "session_refresh_begin"),
+            (
+                "tracedecay_session_refresh_status",
+                "session_refresh_status",
+            ),
+            (
+                "tracedecay_session_refresh_cancel",
+                "session_refresh_cancel",
+            ),
+            ("tracedecay_lcm_load_session", "lcm_load_session"),
+            ("tracedecay_lcm_grep", "lcm_grep"),
+            ("tracedecay_lcm_describe", "lcm_describe"),
+            ("tracedecay_lcm_expand", "lcm_expand"),
+            ("tracedecay_lcm_expand_query", "lcm_expand_query"),
+            ("tracedecay_lcm_status", "lcm_status"),
+            ("tracedecay_lcm_doctor", "lcm_doctor"),
+        ] {
+            assert_eq!(
+                McpServer::observed_action_route(tool, &json!({})).expect("published MCP route"),
+                expected_route,
+                "{tool} must select its exact contract route",
+            );
+        }
+    }
+
+    #[test]
+    fn observed_route_rejects_fact_store_route_and_action_mismatches() {
+        let error = McpServer::observed_action_route(
+            "tracedecay_fact_store_search",
+            &json!({"action": "add"}),
+        )
+        .expect_err("an exact tool cannot claim a different fact-store action");
+        assert!(error.to_string().contains("does not match published route"));
+
+        let error = McpServer::observed_action_route(
+            "tracedecay_fact_store",
+            &json!({"action": "unsupported"}),
+        )
+        .expect_err("an unsupported collapsed action cannot select a route");
+        assert!(error.to_string().contains("no published receipt route"));
+    }
+
+    #[test]
+    fn observed_route_fails_closed_for_unmapped_tools() {
+        let error = McpServer::observed_action_route("tracedecay_context", &json!({}))
+            .expect_err("unreviewed tools cannot mint action receipts");
+        assert!(error.to_string().contains("no published receipt route"));
     }
 
     /// The typed `rmcp` params and the equivalent raw JSON-RPC params must
@@ -1863,6 +2386,112 @@ mod tool_call_preparation_tests {
         assert_eq!(
             serde_json::to_string(&missing_name).expect("serialize refusal"),
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"missing 'name' in tools/call params"}}"#,
+        );
+    }
+
+    #[test]
+    fn receipt_backed_calls_reject_structural_project_route_aliases() {
+        let params = json!({
+            "name": "tracedecay_memory_status",
+            "arguments": {"session_id": "session.route-alias"},
+            "_meta": {
+                "nativeOriginalActionNonce": "aa".repeat(32),
+                "nativeOriginalActionDigest": "bb".repeat(32),
+            }
+        });
+        let Err(response) =
+            McpServer::prepare_tool_call(&json!(4), ToolCallParams::Raw(Some(&params)))
+        else {
+            panic!("receipt-backed structural route aliases must be refused");
+        };
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(-32602)
+        );
+        assert!(
+            response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("cannot carry session or thread"))
+        );
+    }
+
+    #[test]
+    fn terminal_result_digest_normalizes_success_is_error_without_receipt_metadata() {
+        let response = tracedecay_mcp::JsonRpcResponse::success(
+            json!(9),
+            json!({
+                "content": [{"type": "text", "text": "validation failed"}],
+                "isError": true,
+                "_meta": {
+                    "nativeOriginalActionReceipt": {"receipt_sha256": "aa".repeat(32)}
+                }
+            }),
+        );
+        let normalized = McpServer::terminal_result_value(&response);
+        assert_eq!(
+            normalized,
+            json!({
+                "content": [{"type": "text", "text": "validation failed"}],
+                "isError": true,
+            })
+        );
+        assert_eq!(
+            tracedecay_daemon_protocol::action_receipt::canonical_result_digest(&normalized),
+            tracedecay_daemon_protocol::action_receipt::canonical_result_digest(&json!({
+                "content": [{"type": "text", "text": "validation failed"}],
+                "isError": true,
+            })),
+        );
+    }
+
+    #[test]
+    fn terminal_result_digest_normalizes_jsonrpc_error_without_receipt_metadata() {
+        let response = tracedecay_mcp::JsonRpcResponse::error_with_data(
+            json!(10),
+            tracedecay_mcp::ErrorCode::InvalidParams,
+            "validation failed".to_owned(),
+            Some(json!({
+                "reason": "invalid input",
+                "nativeOriginalActionReceipt": {"receipt_sha256": "bb".repeat(32)},
+            })),
+        );
+        let normalized = McpServer::terminal_result_value(&response);
+        assert_eq!(
+            normalized,
+            json!({
+                "code": -32602,
+                "message": "validation failed",
+                "data": {"reason": "invalid input"},
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_result_digest_matches_receipt_attachment_container_replacement() {
+        let success = tracedecay_mcp::JsonRpcResponse::success(
+            json!(11),
+            json!({
+                "content": [],
+                "_meta": "caller supplied a malformed metadata value",
+            }),
+        );
+        assert_eq!(
+            McpServer::terminal_result_value(&success),
+            json!({"content": []}),
+            "success metadata replacement must be removed before hashing",
+        );
+
+        let error = tracedecay_mcp::JsonRpcResponse::error_with_data(
+            json!(12),
+            tracedecay_mcp::ErrorCode::InvalidParams,
+            "invalid input".to_owned(),
+            Some(json!("caller supplied malformed error data")),
+        );
+        assert_eq!(
+            McpServer::terminal_result_value(&error),
+            json!({"code": -32602, "message": "invalid input", "data": null}),
+            "error data replacement must be normalized before hashing",
         );
     }
 }

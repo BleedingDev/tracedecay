@@ -6,11 +6,12 @@ use rmcp::model::PaginatedRequestParams;
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Value, json};
-use tracedecay_mcp::JsonRpcResponse;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracedecay_mcp::server::{
     McpConnectionContext, McpConnectionState, McpDispatchRequest, McpResponseLease,
-    RmcpConnectionAdapter,
+    RmcpConnectionAdapter, rmcp_response_result,
 };
+use tracedecay_mcp::{JsonRpcError, JsonRpcResponse};
 
 struct TestLease {
     revoked: tracedecay_session_memory::context::CancellationToken,
@@ -195,4 +196,113 @@ async fn rmcp_duplex_handshake_and_typed_list_share_the_dispatch_context() {
 
     client.close().await.expect("close RMCP client");
     serving.await.expect("join RMCP server");
+}
+
+#[tokio::test]
+async fn rmcp_rejects_non_initialize_requests_before_handshake() {
+    let context = Arc::new(TestContext {
+        cancellation_registered: tokio::sync::Notify::new(),
+        cancellations: std::sync::Mutex::new(Vec::new()),
+    });
+    let adapter =
+        RmcpConnectionAdapter::new(Arc::clone(&context), false, None, None).expect("RMCP adapter");
+    let (server_io, client_io) = tokio::io::duplex(256 * 1024);
+    let serving = tokio::spawn(async move {
+        let running = adapter
+            .serve(IntoTransport::into_transport(server_io))
+            .await
+            .expect("serve RMCP");
+        running.waiting().await.expect("RMCP server task");
+    });
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let mut reader = tokio::io::BufReader::new(reader);
+
+    writer
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+        .await
+        .expect("write pre-initialize request");
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("pre-initialize refusal timeout")
+    .expect("read pre-initialize refusal");
+    let refusal: Value = serde_json::from_str(&line).expect("pre-initialize refusal JSON");
+    assert_eq!(refusal["id"], json!(1));
+    assert_eq!(refusal["error"]["code"], json!(-32600));
+
+    writer
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+        )
+        .await
+        .expect("write initialize request");
+    line.clear();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("initialize response timeout")
+    .expect("read initialize response");
+    let initialized: Value = serde_json::from_str(&line).expect("initialize response JSON");
+    assert_eq!(initialized["id"], json!(2));
+    assert_eq!(
+        initialized["result"]["protocolVersion"],
+        json!("2024-11-05")
+    );
+    assert!(initialized["result"]["serverInfo"].is_object());
+
+    drop(writer);
+    drop(reader);
+    serving.await.expect("join RMCP server");
+}
+
+#[test]
+fn rmcp_response_parser_rejects_invalid_envelopes_and_content_union_values() {
+    let mut wrong_version = JsonRpcResponse::success(
+        json!(1),
+        json!({"content": [{"type": "text", "text": "ok"}]}),
+    );
+    wrong_version.jsonrpc = "1.0".to_owned();
+    assert!(rmcp_response_result::<rmcp::model::CallToolResult>(wrong_version).is_err());
+
+    let mut both = JsonRpcResponse::success(
+        json!(1),
+        json!({"content": [{"type": "text", "text": "ok"}]}),
+    );
+    both.error = Some(JsonRpcError {
+        code: -32603,
+        message: "also failed".to_owned(),
+        data: None,
+    });
+    assert!(rmcp_response_result::<rmcp::model::CallToolResult>(both).is_err());
+
+    for error in [
+        json!({"code": "-32603", "message": "code must be an integer"}),
+        json!({"code": -32603, "message": 7}),
+    ] {
+        let response = serde_json::from_value::<JsonRpcResponse>(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": error,
+        }));
+        assert!(
+            response.is_err(),
+            "malformed JSON-RPC error shape was accepted",
+        );
+    }
+
+    for content in [
+        json!([{"type": "unknown", "value": "not a ContentBlock"}]),
+        json!([{"type": "text", "text": 7}]),
+    ] {
+        let response = JsonRpcResponse::success(json!(1), json!({"content": content}));
+        assert!(
+            rmcp_response_result::<rmcp::model::CallToolResult>(response).is_err(),
+            "invalid ContentBlock union member was accepted",
+        );
+    }
 }

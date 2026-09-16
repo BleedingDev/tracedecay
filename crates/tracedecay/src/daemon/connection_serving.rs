@@ -35,6 +35,17 @@ type ProjectOwnerAwaitFutureV1<'a, T> = std::pin::Pin<
 type BrokerConnectionPhaseFutureV1<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 
+fn action_prepare_success_result(value: serde_json::Value) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        tracedecay_daemon_protocol::action_receipt::ACTION_PREPARE_META_KEY.to_owned(),
+        value,
+    );
+    let mut result = serde_json::Map::new();
+    result.insert("_meta".to_owned(), serde_json::Value::Object(metadata));
+    serde_json::Value::Object(result)
+}
+
 #[inline(never)]
 fn boxed_broker_connection_phase<'a, T>(
     future: impl std::future::Future<Output = Result<T>> + Send + 'a,
@@ -196,6 +207,74 @@ fn serve_routed_rmcp_connection_inner(
 
 fn is_mcp_initialize_request(request: Option<&JsonRpcRequest>) -> bool {
     request.is_some_and(|request| request.method == "initialize")
+}
+
+/// Parse a one-shot action reservation before any project route/open work.
+/// The scope is applied to the authenticated handshake by the caller before
+/// `apply_daemon_initialize_route`, which is intentionally disabled for the
+/// runner's private prepare connection.
+fn parse_action_prepare_for_connection(
+    first_request: &mut AuthenticatedFirstRequest,
+) -> std::result::Result<
+    Option<tracedecay_daemon_protocol::action_receipt::ActionPrepareRequest>,
+    tracedecay_daemon_protocol::action_receipt::ActionReceiptError,
+> {
+    let Some(request) = first_request.parsed() else {
+        return Ok(None);
+    };
+    if request.method != "initialize" {
+        return Ok(None);
+    }
+    let Some(params) = request.params.as_ref() else {
+        return Ok(None);
+    };
+    let has_prepare_metadata = params
+        .get("_meta")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|meta| {
+            meta.contains_key(tracedecay_daemon_protocol::action_receipt::ACTION_PREPARE_META_KEY)
+        });
+    if !has_prepare_metadata {
+        return Ok(None);
+    }
+    // A notification has no response channel and must never allocate a
+    // reservation/key that cannot be acknowledged or consumed.
+    if request.id.as_ref().is_none_or(serde_json::Value::is_null) {
+        return Err(
+            tracedecay_daemon_protocol::action_receipt::ActionReceiptError::MissingField("id"),
+        );
+    }
+    let prepared =
+        tracedecay_daemon_protocol::action_receipt::parse_prepare_from_initialize(params);
+    // The typed reservation owns the only secret copy needed after this point.
+    // Erase both ordinary JSON/String copies from the first frame before
+    // routing can open a project or retain a long-lived future, including on a
+    // malformed proof frame that will be refused below.
+    first_request.redact_native_action_prepare();
+    prepared
+}
+
+fn bind_action_prepare_scope(
+    handshake: &mut DaemonHandshake,
+    prepared: &mut tracedecay_daemon_protocol::action_receipt::ActionPrepareRequest,
+) -> Result<()> {
+    let scope =
+        tracedecay_daemon_identity::authority::canonical_identity_path(Path::new(&prepared.scope))
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("action receipt scope cannot be resolved: {error}"),
+            })?;
+    if !scope.is_absolute() {
+        return Err(TraceDecayError::Config {
+            message: "action receipt scope must be an absolute project path".to_owned(),
+        });
+    }
+    // Keep one canonical scope string across the handshake, live-store
+    // identity, acknowledgement, and the later action-digest check. The
+    // runner is expected to prepare its digest from this canonical path too.
+    prepared.scope = scope.to_string_lossy().into_owned();
+    handshake.scope_prefix = None;
+    handshake.project_path = Some(scope);
+    Ok(())
 }
 
 /// Answer an unparseable handshake with one typed refusal frame and drain
@@ -656,10 +735,20 @@ fn settle_daemon_work_delivery(
         if let Err(error) =
             offer_daemon_work_delivery(recorder, Some(attempt.clone()), outcome, drop_reason)
         {
-            result = Err(error);
+            retain_first_error(&mut result, error);
         }
     }
     result
+}
+
+/// Retain the earliest error in a multi-stage settlement. A later fan-out
+/// attempt can fail while cleaning up after the original refusal, but replacing
+/// the original error would make the terminal stage appear to be the cause of
+/// the transport/setup failure.
+fn retain_first_error<E>(result: &mut std::result::Result<(), E>, error: E) {
+    if result.is_ok() {
+        *result = Err(error);
+    }
 }
 
 async fn write_daemon_delivery_ack_response(
@@ -1045,6 +1134,8 @@ fn serve_broker_socket_client_inner(
             first_request,
             setup_activity,
             _per_client_permit,
+            action_prepare,
+            action_prepare_id,
         )) = boxed_broker_connection_phase(async move {
             let mut transport = BrokerStreamTransport::new(stream);
         if let Some(expected_token) = auth_token.as_deref() {
@@ -1087,7 +1178,45 @@ fn serve_broker_socket_client_inner(
         let Some(first_request_line) = first_request_line else {
             return Ok(None);
         };
-        let first_request = AuthenticatedFirstRequest::new(first_request_line);
+        let mut first_request = AuthenticatedFirstRequest::new(first_request_line);
+        // Capture the JSON-RPC correlation value before redacting the one-shot
+        // proof frame. The preparation response must echo this exact id.
+        let action_prepare_id = first_request
+            .parsed()
+            .and_then(|request| request.id.clone())
+            .filter(|id| !id.is_null());
+        // Native action reservations must select their authoritative project
+        // before any route/open stage. Parse and redact the one-shot prepare
+        // frame while it is still a connection-local value.
+        let mut action_prepare = match parse_action_prepare_for_connection(&mut first_request) {
+            Ok(action_prepare) => action_prepare,
+            Err(error) => {
+                if let Some(id) = action_prepare_id.clone() {
+                    let response = JsonRpcResponse::error(
+                        id,
+                        ErrorCode::InvalidParams,
+                        error.to_string(),
+                    );
+                    write_json_rpc_response(&mut transport, &response).await?;
+                }
+                drop(setup_activity);
+                return Ok(None);
+            }
+        };
+        if let Some(action_prepare) = action_prepare.as_mut()
+            && let Err(error) = bind_action_prepare_scope(&mut handshake, action_prepare)
+        {
+            if let Some(id) = action_prepare_id.clone() {
+                let response = JsonRpcResponse::error(
+                    id,
+                    ErrorCode::InvalidParams,
+                    error.to_string(),
+                );
+                write_json_rpc_response(&mut transport, &response).await?;
+            }
+            drop(setup_activity);
+            return Ok(None);
+        }
         // Ordered after the first request, exactly as the portable broker does,
         // so a binding that misses its deadline is answered as a typed retry on
         // that request's id instead of closing the socket with no evidence.
@@ -1145,6 +1274,8 @@ fn serve_broker_socket_client_inner(
                 first_request,
                 setup_activity,
                 _per_client_permit,
+                action_prepare,
+                action_prepare_id,
             )))
         })
         .await?
@@ -1160,6 +1291,8 @@ fn serve_broker_socket_client_inner(
                 first_request,
                 setup_activity,
                 _per_client_permit,
+                action_prepare,
+                action_prepare_id,
                 initialize_route,
             )) = boxed_broker_connection_phase(async move {
                 if let Some(cancellation) =
@@ -1247,6 +1380,8 @@ fn serve_broker_socket_client_inner(
                     first_request,
                     setup_activity,
                     _per_client_permit,
+                    action_prepare,
+                    action_prepare_id,
                     initialize_route,
                 )))
             })
@@ -1256,6 +1391,63 @@ fn serve_broker_socket_client_inner(
             };
 
             boxed_broker_connection_phase(async move {
+                if let Some(request) = first_request.parsed()
+                    && request.method == "initialize"
+                {
+                    if let Some(action_prepare) = action_prepare {
+                        let server = match await_project_owner_or_disconnect(
+                            &mut transport,
+                            engine.project_server_for_request(
+                                &handshake,
+                                ProjectServerRequirement::Core,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Some((server, _pending_lines))) => server,
+                            Ok(None) => return Ok(()),
+                            Err(error) => {
+                                if let Some(id) = action_prepare_id.clone() {
+                                    let response = JsonRpcResponse::error(
+                                        id,
+                                        ErrorCode::InternalError,
+                                        error.to_string(),
+                                    );
+                                    write_json_rpc_response(&mut transport, &response).await?;
+                                }
+                                drop(setup_activity);
+                                return Ok(());
+                            }
+                        };
+                        let response = match server.prepare_action_receipt(action_prepare).await {
+                            Ok(response) => action_prepare_id.clone().map(|id| {
+                                match serde_json::to_value(response) {
+                                    Ok(value) => JsonRpcResponse::success(
+                                        id,
+                                        action_prepare_success_result(value),
+                                    ),
+                                    Err(error) => JsonRpcResponse::error(
+                                        id,
+                                        ErrorCode::InternalError,
+                                        format!("action receipt response encoding failed: {error}"),
+                                    ),
+                                }
+                            }),
+                            Err(error) => action_prepare_id.clone().map(|id| {
+                                JsonRpcResponse::error(
+                                    id,
+                                    ErrorCode::InvalidParams,
+                                    error.to_string(),
+                                )
+                            }),
+                        };
+                        drop(setup_activity);
+                        if let Some(response) = response {
+                            write_json_rpc_response(&mut transport, &response).await?;
+                        }
+                        return Ok(());
+                    }
+                }
                 if let Some(request) = parse_branch_admin_request(first_request.parsed()) {
                     return boxed_broker_connection_phase(async move {
                         let result = match request.action.clone() {
@@ -1640,10 +1832,41 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
     let Some(first_request_line) = read_line_handling_wire_oversized(&mut transport).await? else {
         return Ok(());
     };
-    let first_request = AuthenticatedFirstRequest::new(first_request_line);
+    let mut first_request = AuthenticatedFirstRequest::new(first_request_line);
+    // Capture the JSON-RPC correlation value before redacting the one-shot
+    // proof frame. The preparation response must echo this exact id.
+    let action_prepare_id = first_request
+        .parsed()
+        .and_then(|request| request.id.clone())
+        .filter(|id| !id.is_null());
     if let Some(response) = daemon_shutdown_response(&first_request) {
         lifecycle.begin_draining();
         write_json_rpc_response(&mut transport, &response).await?;
+        drop(setup_activity);
+        return Ok(());
+    }
+    // The prepare scope is authoritative for this one-shot connection and must
+    // be installed before profile/project routing. Parsing also lets us erase
+    // the raw proof key before any cold project work is admitted.
+    let mut action_prepare = match parse_action_prepare_for_connection(&mut first_request) {
+        Ok(action_prepare) => action_prepare,
+        Err(error) => {
+            if let Some(id) = action_prepare_id.clone() {
+                let response =
+                    JsonRpcResponse::error(id, ErrorCode::InvalidParams, error.to_string());
+                write_json_rpc_response(&mut transport, &response).await?;
+            }
+            drop(setup_activity);
+            return Ok(());
+        }
+    };
+    if let Some(action_prepare) = action_prepare.as_mut()
+        && let Err(error) = bind_action_prepare_scope(&mut handshake, action_prepare)
+    {
+        if let Some(id) = action_prepare_id.clone() {
+            let response = JsonRpcResponse::error(id, ErrorCode::InvalidParams, error.to_string());
+            write_json_rpc_response(&mut transport, &response).await?;
+        }
         drop(setup_activity);
         return Ok(());
     }
@@ -1753,6 +1976,63 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
             return Ok(());
         }
     };
+    if let Some(request) = first_request.parsed()
+        && request.method == "initialize"
+    {
+        if let Some(action_prepare) = action_prepare {
+            let server = match await_project_owner_or_disconnect(
+                &mut transport,
+                Box::pin(portable_project_server_for_request(
+                    lifecycle.clone(),
+                    store_administration.clone(),
+                    Arc::clone(&project_open_gates),
+                    invocation.clone(),
+                    http_application_registry.clone(),
+                    &handshake,
+                    ProjectServerRequirement::Core,
+                    #[cfg(test)]
+                    project_open_attempts.clone(),
+                )),
+            )
+            .await
+            {
+                Ok(Some((server, _pending_lines))) => server,
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    if let Some(id) = action_prepare_id.clone() {
+                        let response =
+                            JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string());
+                        write_json_rpc_response(&mut transport, &response).await?;
+                    }
+                    drop(setup_activity);
+                    return Ok(());
+                }
+            };
+            let response =
+                match server.prepare_action_receipt(action_prepare).await {
+                    Ok(response) => action_prepare_id
+                        .clone()
+                        .map(|id| match serde_json::to_value(response) {
+                            Ok(value) => {
+                                JsonRpcResponse::success(id, action_prepare_success_result(value))
+                            }
+                            Err(error) => JsonRpcResponse::error(
+                                id,
+                                ErrorCode::InternalError,
+                                format!("action receipt response encoding failed: {error}"),
+                            ),
+                        }),
+                    Err(error) => action_prepare_id.clone().map(|id| {
+                        JsonRpcResponse::error(id, ErrorCode::InvalidParams, error.to_string())
+                    }),
+                };
+            drop(setup_activity);
+            if let Some(response) = response {
+                write_json_rpc_response(&mut transport, &response).await?;
+            }
+            return Ok(());
+        }
+    }
     if let Some(request) = parse_branch_admin_request(first_request.parsed()) {
         let result = match request.action.clone() {
             Ok(action) => {
@@ -2225,5 +2505,17 @@ mod delivery_ack_tests {
             classify_daemon_delivery_ack_wait(DaemonDeliveryAckWait::Cancelled),
             Err(tracedecay_domain::DeliveryDropReasonV1::Cancelled)
         );
+    }
+
+    #[test]
+    fn settlement_preserves_the_first_causal_error() {
+        let mut result = Err("setup");
+        super::retain_first_error(&mut result, "cleanup");
+        assert_eq!(result, Err("setup"));
+
+        let mut result = Ok(());
+        super::retain_first_error(&mut result, "first");
+        super::retain_first_error(&mut result, "later");
+        assert_eq!(result, Err("first"));
     }
 }

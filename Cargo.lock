@@ -5848,6 +5848,7 @@ dependencies = [
  "gix",
  "glob",
  "hex",
+ "hmac 0.13.0",
  "hotpath",
  "ignore",
  "jsonschema",
@@ -6391,10 +6392,12 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
+ "hmac 0.13.0",
  "hotpath",
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -6403,6 +6406,7 @@ dependencies = [
  "tracedecay-framing",
  "tracedecay-private-fs",
  "tracedecay-tool-catalog",
+ "zeroize",
 ]
 
 [[package]]
@@ -8791,6 +8795,9 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"

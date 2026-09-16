@@ -504,11 +504,21 @@ where
 pub fn rmcp_response_result<T: DeserializeOwned>(
     response: JsonRpcResponse,
 ) -> Result<T, ErrorData> {
+    if response.jsonrpc != "2.0" {
+        return Err(ErrorData::internal_error(
+            "TraceDecay MCP handler returned a non-JSON-RPC 2.0 response",
+            None,
+        ));
+    }
     match (response.result, response.error) {
         (Some(result), None) => serde_json::from_value(result)
             .map_err(|error| ErrorData::internal_error(error.to_string(), None)),
-        (_, Some(error)) => Err(rmcp_error(error)),
-        _ => Err(ErrorData::internal_error(
+        (None, Some(error)) => Err(rmcp_error(error)),
+        (Some(_), Some(_)) => Err(ErrorData::internal_error(
+            "TraceDecay MCP handler returned both result and error",
+            None,
+        )),
+        (None, None) => Err(ErrorData::internal_error(
             "TraceDecay MCP handler returned neither result nor error",
             None,
         )),
@@ -518,6 +528,13 @@ pub fn rmcp_response_result<T: DeserializeOwned>(
 /// The typed refusal for an `initialize` whose params `rmcp` could not decode.
 const MALFORMED_INITIALIZE_MESSAGE: &str = "initialize params are missing or malformed: \
      protocolVersion, capabilities and clientInfo are required";
+/// A request other than `ping` cannot enter the RMCP service before a valid
+/// `initialize`. Without this guard rmcp's compatibility branch forwards a
+/// pre-initialize custom request directly to the handler, which would let a
+/// client observe tools/resources before the server identity and negotiated
+/// capabilities had been established.
+const PRE_INITIALIZE_REQUEST_MESSAGE: &str =
+    "initialize must complete before this request is handled";
 
 /// Answers a malformed `initialize` with a typed JSON-RPC error frame and
 /// leaves the connection able to accept a corrected handshake.
@@ -564,7 +581,11 @@ where
                     return Some(message);
                 }
                 let rmcp::model::ClientJsonRpcMessage::Request(request) = &message else {
-                    return Some(message);
+                    // Notifications, responses, and error envelopes cannot
+                    // establish the server identity. Drop them until a valid
+                    // initialize request arrives; forwarding one would let
+                    // rmcp run a custom notification before initialization.
+                    continue;
                 };
                 let malformed_initialize = request.request.method() == "initialize"
                     && !matches!(
@@ -572,11 +593,29 @@ where
                         rmcp::model::ClientRequest::InitializeRequest(_)
                     );
                 if !malformed_initialize {
-                    // `rmcp` answers a pre-initialize ping in place and keeps
-                    // waiting; any other request ends its handshake loop.
-                    self.handshake_settled =
-                        !matches!(request.request, rmcp::model::ClientRequest::PingRequest(_));
-                    return Some(message);
+                    if matches!(request.request, rmcp::model::ClientRequest::PingRequest(_)) {
+                        // `rmcp` answers a pre-init ping in place and keeps
+                        // waiting for the required initialize request.
+                        return Some(message);
+                    }
+                    if matches!(
+                        request.request,
+                        rmcp::model::ClientRequest::InitializeRequest(_)
+                    ) {
+                        self.handshake_settled = true;
+                        return Some(message);
+                    }
+                    // `rmcp` otherwise has a compatibility branch that can
+                    // dispatch a custom request before initialize. Refuse it
+                    // here and keep the connection in the pre-init state.
+                    let refusal = rmcp::model::ServerJsonRpcMessage::error(
+                        ErrorData::invalid_request(PRE_INITIALIZE_REQUEST_MESSAGE, None),
+                        Some(request.id.clone()),
+                    );
+                    if self.inner.send(refusal).await.is_err() {
+                        return None;
+                    }
+                    continue;
                 }
                 let refusal = rmcp::model::ServerJsonRpcMessage::error(
                     ErrorData::invalid_params(MALFORMED_INITIALIZE_MESSAGE, None),
@@ -644,9 +683,22 @@ where
     #[hotpath::skip]
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        mut request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // rmcp's wire deserializer stores the params `_meta` map in the
+        // request context before invoking this handler; the typed
+        // `CallToolRequestParams` consequently has `meta=None` for ordinary
+        // wire traffic. Merge both representations before the shared dispatch
+        // envelope reads action-receipt metadata. A hand-built typed request's
+        // fields are applied after the context map so its explicit values win.
+        let mut request_meta = std::mem::take(&mut context.meta);
+        if let Some(params_meta) = request.meta.take() {
+            request_meta.extend(params_meta);
+        }
+        if !request_meta.is_empty() {
+            request.meta = Some(request_meta);
+        }
         rmcp_response_result::<CallToolResult>(
             self.dispatch(context, "tools/call", McpDispatchParams::ToolsCall(request))
                 .await?,
