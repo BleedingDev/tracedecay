@@ -264,7 +264,7 @@ pub(super) fn read_clone_fingerprint_page(
         selected_block.map(CloneSelectedBlockV1::tokens),
     ))
     .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-    let (after, discovery_after) = match cursor {
+    let (after, discovery_after, discovery_complete_resume) = match cursor {
         Some(cursor)
             if cursor.artifact_digest == *receipt.artifact_digest()
                 && cursor.generation == *receipt.generation()
@@ -274,7 +274,11 @@ pub(super) fn read_clone_fingerprint_page(
                 CloneArtifactCursorPositionV1::Fingerprint {
                     body_digest,
                     payload_digest,
-                } => (Some((body_digest.clone(), payload_digest.clone())), None),
+                } => (
+                    Some((body_digest.clone(), payload_digest.clone())),
+                    None,
+                    false,
+                ),
                 CloneArtifactCursorPositionV1::FingerprintDiscovery {
                     discovery,
                     comparison_body_digest,
@@ -290,7 +294,8 @@ pub(super) fn read_clone_fingerprint_page(
                         comparison_body_digest
                             .clone()
                             .zip(comparison_payload_digest.clone()),
-                        Some(discovery.clone()),
+                        (!discovery.complete).then(|| discovery.clone()),
+                        discovery.complete,
                     )
                 }
                 CloneArtifactCursorPositionV1::Exact(_) => {
@@ -306,7 +311,7 @@ pub(super) fn read_clone_fingerprint_page(
                     .to_owned(),
             ));
         }
-        None => (None, None),
+        None => (None, None, false),
     };
 
     if source_positions.is_empty() {
@@ -398,7 +403,11 @@ pub(super) fn read_clone_fingerprint_page(
             partial_reasons.insert(CloneFingerprintPartialReasonV1::HotPostings);
             continue;
         }
-        let remaining = CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1 - accounting.posting_rows_examined;
+        let remaining = if discovery_complete_resume {
+            posting_count
+        } else {
+            CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1.saturating_sub(accounting.posting_rows_examined)
+        };
         if remaining == 0 {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
@@ -462,7 +471,6 @@ pub(super) fn read_clone_fingerprint_page(
         };
         while let Some(row) = rows.next().map_err(sqlite_error)? {
             accounting.posting_rows_examined = accounting.posting_rows_examined.saturating_add(1);
-            let previous_discovered = last_discovered.clone();
             if interrupt(
                 control,
                 CloneFingerprintCancellationPointV1::PostingRead,
@@ -523,6 +531,7 @@ pub(super) fn read_clone_fingerprint_page(
                     })?,
                 ),
                 token_position: Some(candidate_position),
+                complete: false,
             });
             if occurrence.symbol_occurrence_id == authority.symbol_occurrence_id
                 || payload.language != source.language
@@ -544,9 +553,10 @@ pub(super) fn read_clone_fingerprint_page(
             }
             let key = (payload.body_digest.clone(), payload.payload_digest.clone());
             if !candidates.contains_key(&key) {
-                if candidates.len() == CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1 {
+                if !discovery_complete_resume
+                    && candidates.len() == CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1
+                {
                     partial_reasons.insert(CloneFingerprintPartialReasonV1::CandidateBodyBudget);
-                    last_discovered = previous_discovered;
                     stop = true;
                     break;
                 }
@@ -586,7 +596,6 @@ pub(super) fn read_clone_fingerprint_page(
                 &mut accounting,
                 &mut partial_reasons,
             ) {
-                last_discovered = previous_discovered;
                 stop = true;
                 break;
             }
@@ -612,7 +621,6 @@ pub(super) fn read_clone_fingerprint_page(
                     > CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1
                 {
                     partial_reasons.insert(CloneFingerprintPartialReasonV1::VerificationWorkBudget);
-                    last_discovered = previous_discovered;
                     stop = true;
                     break;
                 }
@@ -643,17 +651,33 @@ pub(super) fn read_clone_fingerprint_page(
                     .insert(occurrence.symbol_occurrence_id.clone(), occurrence);
             }
         }
-        if read_limit < posting_count {
+        if !discovery_complete_resume && read_limit < posting_count {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
         }
     }
 
-    let candidates = candidates
-        .into_iter()
-        .filter(|(_, candidate)| !candidate.anchors.is_empty())
-        .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
-        .collect::<Vec<_>>();
+    // A bounded discovery page never emits comparisons. Its candidate map is
+    // only a local probe and cannot represent postings already consumed on an
+    // earlier page. Defer the comparison pass until a completed-discovery
+    // cursor asks us to replay the immutable stream from its beginning.
+    let discovery_partial = stop
+        || partial_reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                CloneFingerprintPartialReasonV1::PostingRowBudget
+                    | CloneFingerprintPartialReasonV1::CandidateBodyBudget
+            )
+        });
+    let candidates = if discovery_partial {
+        Vec::new()
+    } else {
+        candidates
+            .into_iter()
+            .filter(|(_, candidate)| !candidate.anchors.is_empty())
+            .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
+            .collect::<Vec<_>>()
+    };
     let candidate_count = candidates.len();
     let mut members = Vec::new();
     let mut last_compared = after;
@@ -760,39 +784,43 @@ pub(super) fn read_clone_fingerprint_page(
             break;
         }
     }
-    let discovery_partial = partial_reasons.iter().any(|reason| {
-        matches!(
-            reason,
-            CloneFingerprintPartialReasonV1::PostingRowBudget
-                | CloneFingerprintPartialReasonV1::CandidateBodyBudget
-        )
-    });
     // A verification budget can fire before the first candidate comparison.
     // In that case `last_compared` is still the incoming comparison position,
     // so retain the discovery frontier as the resumable source of progress.
     let discovery_frontier = last_discovered.or_else(|| discovery_after.clone());
-    let next_cursor = if discovery_partial
-        || (has_more && last_compared.is_none() && discovery_frontier.is_some())
-    {
-        discovery_frontier.map(|discovery| CloneArtifactCursorV1 {
-            artifact_digest: receipt.artifact_digest().clone(),
-            generation: receipt.generation().clone(),
-            request_digest: request_digest.clone(),
-            after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
-                discovery,
-                comparison_body_digest: last_compared
-                    .as_ref()
-                    .map(|(body_digest, _)| body_digest.clone()),
-                comparison_payload_digest: last_compared
-                    .as_ref()
-                    .map(|(_, payload_digest)| payload_digest.clone()),
-            },
+    let next_cursor = if discovery_partial {
+        discovery_frontier.map(|mut discovery| {
+            discovery.complete = false;
+            CloneArtifactCursorV1 {
+                artifact_digest: receipt.artifact_digest().clone(),
+                generation: receipt.generation().clone(),
+                request_digest: request_digest.clone(),
+                after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
+                    discovery,
+                    comparison_body_digest: None,
+                    comparison_payload_digest: None,
+                },
+            }
+        })
+    } else if has_more && last_compared.is_none() && discovery_frontier.is_some() {
+        discovery_frontier.map(|mut discovery| {
+            discovery.complete = true;
+            CloneArtifactCursorV1 {
+                artifact_digest: receipt.artifact_digest().clone(),
+                generation: receipt.generation().clone(),
+                request_digest: request_digest.clone(),
+                after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
+                    discovery,
+                    comparison_body_digest: None,
+                    comparison_payload_digest: None,
+                },
+            }
         })
     } else if has_more {
         last_compared.map(|(body_digest, payload_digest)| CloneArtifactCursorV1 {
             artifact_digest: receipt.artifact_digest().clone(),
             generation: receipt.generation().clone(),
-            request_digest,
+            request_digest: request_digest.clone(),
             after: CloneArtifactCursorPositionV1::Fingerprint {
                 body_digest,
                 payload_digest,

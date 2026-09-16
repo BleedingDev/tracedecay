@@ -105,11 +105,21 @@ pub struct CloneFingerprintDiscoveryPositionV2 {
     pub symbol_occurrence_id: Option<SymbolOccurrenceId>,
     #[serde(default)]
     pub token_position: Option<u32>,
+    /// Marks the boundary between bounded posting discovery and the later
+    /// comparison pass. A completed discovery cursor deliberately carries no
+    /// row position; the next read replays the immutable posting stream from
+    /// its beginning so candidates collected on earlier bounded pages cannot
+    /// be lost.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 impl CloneFingerprintDiscoveryPositionV2 {
     fn validate(&self) -> Result<(), CloneCursorErrorV1> {
         if self.symbol_occurrence_id.is_some() != self.token_position.is_some() {
+            return Err(CloneCursorErrorV1::Invalid);
+        }
+        if self.complete && self.symbol_occurrence_id.is_some() {
             return Err(CloneCursorErrorV1::Invalid);
         }
         Ok(())
@@ -601,8 +611,7 @@ fn validate_common(
     if encoded_artifact_digest != expected_artifact_digest
         || encoded_generation != expected_generation
         || encoded_snapshot_digest != expected_snapshot_digest
-        || expected_query_descriptor
-            .is_some_and(|expected| encoded_query_descriptor != expected)
+        || expected_query_descriptor.is_some_and(|expected| encoded_query_descriptor != expected)
     {
         return Err(CloneCursorErrorV1::Stale);
     }
@@ -870,6 +879,7 @@ mod tests {
             fingerprint: 7,
             symbol_occurrence_id: Some(id("occurrence.discovery")),
             token_position: Some(4),
+            complete: false,
         };
         let encoded = codec
             .issue_artifact(

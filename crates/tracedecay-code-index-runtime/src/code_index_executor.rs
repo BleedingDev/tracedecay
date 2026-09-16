@@ -3,6 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tracedecay_domain::{
+    FreshnessVectorDigest, RetrievalRequest, RetrievalScope, RetrievalSnapshot, SingleRootScopeV1,
+    TemporalModeV1, VectorWatermark,
+};
 use tracedecay_query::code_search;
 use tracedecay_query::retrieval::RetrievalPortError;
 
@@ -1514,6 +1518,57 @@ where
                 }
                 Err(error) => return unavailable(map_similar_retrieval_error(error)),
             }
+            let query_authority = match schedulers.query_authority_for_scope(&scope).await {
+                Some(authority) => authority,
+                None => {
+                    return unavailable(
+                        code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+                    );
+                }
+            };
+            let metadata = generation.metadata();
+            let manifest = metadata.manifest();
+            let snapshot = metadata.snapshot();
+            if snapshot.repository != scope.repository_id
+                || snapshot.worktree.as_ref() != Some(&scope.worktree_id)
+            {
+                return unavailable(
+                    code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+                );
+            }
+            let freshness_digest =
+                match FreshnessVectorDigest::new(manifest.snapshot_digest.as_str()) {
+                    Ok(digest) => digest,
+                    Err(_) => {
+                        return unavailable(
+                            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
+                        );
+                    }
+                };
+            let retrieval_request = RetrievalRequest {
+                principal: terminal_expected_authority.principal.clone(),
+                scope: RetrievalScope {
+                    privacy_domain: manifest.privacy_domain.clone(),
+                    root: SingleRootScopeV1 {
+                        repository: snapshot.repository.clone(),
+                        worktree: snapshot.worktree.clone(),
+                        reference: snapshot.reference.clone(),
+                    },
+                },
+                temporal_mode: TemporalModeV1::Current,
+                snapshot: RetrievalSnapshot {
+                    watermarks: VectorWatermark::default(),
+                    freshness_digest,
+                    authorization_revision: terminal_expected_authority
+                        .authorization_revision
+                        .clone(),
+                    captured_at: manifest.seal.sealed_at,
+                },
+                profile_id: query_authority.profile().profile_id.clone(),
+                budget: query_authority.profile().retrieval_budget,
+            };
+            let snapshot_digest = manifest.snapshot_digest.clone();
+            let now = tracedecay_contracts::clock::now_micros();
             let owners = match generation.production_query_owners_with_budget(
                 &code_index_scheduler::queries::maximum_retrieval_budget(),
             ) {
@@ -1523,10 +1578,20 @@ where
             let runtime = tokio::runtime::Handle::current();
             let execution_control = Arc::clone(&control);
             let settlement_control = Arc::clone(&control);
+            let query_authority_for_read = Arc::clone(&query_authority);
             let execution = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 runtime.block_on(async move {
-                    let work = async move { owners.similar(&request, execution_control.as_ref()) };
+                    let work = async move {
+                        owners.similar(
+                            &request,
+                            query_authority_for_read.as_ref(),
+                            &retrieval_request,
+                            &snapshot_digest,
+                            now,
+                            execution_control.as_ref(),
+                        )
+                    };
                     tokio::pin!(work);
                     tokio::select! {
                         biased;

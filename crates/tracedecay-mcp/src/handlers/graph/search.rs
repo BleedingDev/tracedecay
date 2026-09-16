@@ -1071,6 +1071,15 @@ pub async fn handle_find_exact_symbol(
 #[hotpath::measure(label = "mcp.graph.similar.total")]
 pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
     let request: SimilarSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_similar")?;
+    if request.project_id != ctx.admitted_scope().project_id
+        || request.repository_id != ctx.admitted_scope().repository_id
+    {
+        return Err(TraceDecayError::ProjectRoute {
+            reason_code: "similar-repository-not-authorized".to_owned(),
+            retryable: false,
+            detail: "the selected repository is outside the authorized repository scope".to_owned(),
+        });
+    }
     let source_extent =
         request
             .validated_source_extent()
@@ -1101,14 +1110,6 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
             }
         })
         .collect();
-    let cursor = request
-        .cursor
-        .as_deref()
-        .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::decode)
-        .transpose()
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("invalid tracedecay_similar cursor: {error}"),
-        })?;
     let executor =
         ctx.code_index_similar_executor()
             .ok_or_else(|| TraceDecayError::ProjectRoute {
@@ -1123,7 +1124,7 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
         match_classes,
         result_limit: request.result_limit as usize,
         work_limit: request.work_limit as usize,
-        cursor,
+        cursor: request.cursor,
         authority: ctx.code_index_search_authority().cloned(),
         deadline: ctx.deadline().cloned(),
         cancellation: ctx.cancellation().cloned(),
@@ -1151,17 +1152,11 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
             detail: "the selected source is outside the authorized repository scope".to_owned(),
         });
     }
-    let (near, near_touched_files) = similar_near_result(
-        &similar.source,
-        source_extent,
-        similar.near,
-        project_id.clone(),
-        repository_id.clone(),
-    )?;
     let source = similar_occurrence(&similar.source.occurrence);
     let mut touched_files = vec![source.path.clone()];
-    touched_files.extend(near_touched_files);
     let mut complete = true;
+    let mut remaining_wire_occurrences = request.result_limit as usize;
+    let mut wire_limit_reached = false;
     let families = similar
         .exact_groups
         .into_iter()
@@ -1175,27 +1170,27 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
                     SimilarMatchClassV1::RenameNormalizedExact
                 }
             };
-            let members = group
-                .members
-                .into_iter()
-                .filter(|member| {
-                    member.occurrence.project_id == project_id
-                        && member.occurrence.repository_id == repository_id
-                })
-                .map(|member| {
-                    let occurrence = similar_occurrence(&member.occurrence);
-                    touched_files.push(occurrence.path.clone());
-                    occurrence
-                })
-                .collect::<Vec<_>>();
-            let next_cursor = group
-                .next_cursor
-                .as_ref()
-                .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::encode)
-                .transpose()
-                .map_err(|error| TraceDecayError::Config {
-                    message: format!("failed to encode tracedecay_similar cursor: {error}"),
-                })?;
+            let mut members = Vec::new();
+            let mut group_members_omitted = false;
+            for member in group.members {
+                if member.occurrence.project_id != project_id
+                    || member.occurrence.repository_id != repository_id
+                {
+                    continue;
+                }
+                if remaining_wire_occurrences == 0 {
+                    group_members_omitted = true;
+                    wire_limit_reached = true;
+                    continue;
+                }
+                let occurrence = similar_occurrence(&member.occurrence);
+                touched_files.push(occurrence.path.clone());
+                members.push(occurrence);
+                remaining_wire_occurrences = remaining_wire_occurrences.saturating_sub(1);
+            }
+            if group_members_omitted {
+                complete = false;
+            }
             Ok(SimilarFamilyV1 {
                 match_class,
                 normalization_revision: group.key.normalization_revision,
@@ -1203,15 +1198,28 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
                 representative_payload_digest: similar.source.payload.payload_digest.clone(),
                 member_count: members.len(),
                 members,
-                complete: group.complete,
-                next_cursor,
+                complete: group.complete && !group_members_omitted,
+                next_cursor: group.next_cursor,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let (near, near_touched_files, near_wire_limit_reached) = similar_near_result(
+        &similar.source,
+        source_extent,
+        similar.near,
+        project_id.clone(),
+        repository_id.clone(),
+        &mut remaining_wire_occurrences,
+    )?;
+    wire_limit_reached |= near_wire_limit_reached;
+    complete &= matches!(near.coverage, SimilarNearCoverageV1::Complete);
+    touched_files.extend(near_touched_files);
     touched_files.sort();
     touched_files.dedup();
     let coverage = match similar.source.occurrence.eligibility {
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible if complete => {
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
+            if complete && !wire_limit_reached =>
+        {
             SimilarCoverageV1::Complete
         }
         tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
@@ -1264,9 +1272,11 @@ fn similar_near_result(
     near: tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
     project_id: tracedecay_domain::ProjectId,
     repository_id: tracedecay_domain::RepositoryId,
-) -> Result<(SimilarNearResultV1, Vec<String>)> {
+    remaining_wire_occurrences: &mut usize,
+) -> Result<(SimilarNearResultV1, Vec<String>, bool)> {
     let mut touched_files = Vec::new();
     let mut matches = Vec::new();
+    let mut wire_limit_reached = false;
     let coverage;
     let next_cursor;
     match near {
@@ -1282,7 +1292,7 @@ fn similar_near_result(
                 &read.partial_reasons,
                 read.coverage.unknown > 0 || read.coverage.capped > 0,
             );
-            next_cursor = encode_similar_cursor(read.page.next_cursor)?;
+            next_cursor = read.page.next_cursor;
             for pair in read.page.members {
                 let match_class = similar_match_class(pair.class);
                 let alignment = SimilarAlignmentV1 {
@@ -1304,6 +1314,10 @@ fn similar_near_result(
                     {
                         continue;
                     }
+                    if *remaining_wire_occurrences == 0 {
+                        wire_limit_reached = true;
+                        continue;
+                    }
                     touched_files.push(occurrence.path.clone());
                     matches.push(SimilarNearMatchV1 {
                         candidate: similar_occurrence(&occurrence),
@@ -1315,6 +1329,7 @@ fn similar_near_result(
                         differences: differences.clone(),
                         containment: None,
                     });
+                    *remaining_wire_occurrences = (*remaining_wire_occurrences).saturating_sub(1);
                 }
             }
         }
@@ -1324,7 +1339,7 @@ fn similar_near_result(
                 &read.partial_reasons,
                 read.coverage.unknown > 0 || read.coverage.capped > 0,
             );
-            next_cursor = encode_similar_cursor(read.page.next_cursor)?;
+            next_cursor = read.page.next_cursor;
             let (source_offset, selected_token_count) = match &extent {
                 SimilarSourceExtentV1::WholeBody => {
                     return Err(TraceDecayError::Config {
@@ -1364,6 +1379,10 @@ fn similar_near_result(
                     {
                         continue;
                     }
+                    if *remaining_wire_occurrences == 0 {
+                        wire_limit_reached = true;
+                        continue;
+                    }
                     touched_files.push(occurrence.path.clone());
                     matches.push(SimilarNearMatchV1 {
                         candidate: similar_occurrence(&occurrence),
@@ -1381,6 +1400,7 @@ fn similar_near_result(
                         differences: Vec::new(),
                         containment: Some(containment),
                     });
+                    *remaining_wire_occurrences = (*remaining_wire_occurrences).saturating_sub(1);
                 }
             }
         }
@@ -1401,6 +1421,7 @@ fn similar_near_result(
             next_cursor,
         },
         touched_files,
+        wire_limit_reached,
     ))
 }
 
@@ -1560,18 +1581,6 @@ fn similar_unavailable_reason(
             SimilarNearUnavailableReasonV1::Internal
         }
     }
-}
-
-fn encode_similar_cursor(
-    cursor: Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
-) -> Result<Option<String>> {
-    cursor
-        .as_ref()
-        .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::encode)
-        .transpose()
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("failed to encode tracedecay_similar cursor: {error}"),
-        })
 }
 
 fn directional_coverage(shared: u64, total: u64) -> u32 {

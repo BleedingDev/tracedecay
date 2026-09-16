@@ -419,7 +419,12 @@ pub struct CodeIndexSimilarRequestV1 {
     pub match_classes: Vec<tracedecay_code_index::clones::CloneNormalizationClassV1>,
     pub result_limit: usize,
     pub work_limit: usize,
-    pub cursor: Option<crate::retrieval::lexical::CloneArtifactCursorV1>,
+    /// Authenticated clone continuation received from the wire. The serving
+    /// owner verifies this against its mounted
+    /// [`crate::retrieval::QueryAuthorityV1`] before it
+    /// opens an artifact reader; the MCP layer never decodes a cursor into the
+    /// legacy hex JSON representation.
+    pub cursor: Option<String>,
     pub authority: Option<CodeIndexSearchAuthorityV1>,
     pub deadline: Option<tracedecay_contracts::Deadline>,
     pub cancellation: Option<tracedecay_contracts::CancellationSignal>,
@@ -430,7 +435,9 @@ pub struct CodeIndexSimilarExactGroupV1 {
     pub key: tracedecay_code_index::clones::CloneExactKeyV1,
     pub members: Vec<crate::retrieval::lexical::CloneExactArtifactMemberV1>,
     pub complete: bool,
-    pub next_cursor: Option<crate::retrieval::lexical::CloneArtifactCursorV1>,
+    /// Authenticated clone continuation ready for the wire. A typed cursor
+    /// must never cross this query boundary because it is not an authority.
+    pub next_cursor: Option<String>,
 }
 
 /// The verified fingerprint read selected by [`CodeIndexSimilarRequestV1`].
@@ -442,8 +449,8 @@ pub struct CodeIndexSimilarExactGroupV1 {
 /// unavailable terminal state for this lane.
 #[derive(Clone, Debug)]
 pub enum CodeIndexSimilarNearReadV1 {
-    WholeBody(crate::retrieval::lexical::CloneFingerprintArtifactReadV1),
-    SelectedTokenRange(crate::retrieval::lexical::CloneSelectedBlockArtifactReadV1),
+    WholeBody(crate::retrieval::lexical::AuthenticatedCloneFingerprintArtifactReadV1),
+    SelectedTokenRange(crate::retrieval::lexical::AuthenticatedCloneSelectedBlockArtifactReadV1),
     Unavailable(CodeIndexSearchUnavailableReasonV1),
 }
 

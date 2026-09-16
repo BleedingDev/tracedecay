@@ -72,13 +72,14 @@ use crate::{
         },
         graph::{GraphLane, production_code_index_freshness},
         lexical::{
+            AuthenticatedCloneFingerprintArtifactReadV1,
+            AuthenticatedCloneSelectedBlockArtifactReadV1,
             CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
             CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
             CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
             CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintArtifactReadV1,
-            CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
-            CloneFingerprintStreamDescriptorV1, CloneSelectedBlockArtifactReadV1,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintPartialReasonV1,
+            CloneFingerprintReadAccountingV1, CloneFingerprintStreamDescriptorV1,
             CloneSelectedBlockV1, CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBuilderV1,
             CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationPhaseV1,
             CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactOccurrenceV1,
@@ -586,6 +587,10 @@ impl ProductionCodeIndexQueryOwnersV1 {
     pub(crate) fn similar(
         &self,
         request: &tracedecay_query::code_search::CodeIndexSimilarRequestV1,
+        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
+        retrieval_request: &tracedecay_domain::RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<
         Option<tracedecay_query::code_search::CodeIndexSimilarCompletedV1>,
@@ -607,15 +612,43 @@ impl ProductionCodeIndexQueryOwnersV1 {
         check_similar_control(control)?;
         self.validate_similar_source(&source)?;
 
+        let cursor_position = request
+            .cursor
+            .as_deref()
+            .map(|encoded| {
+                let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
+                    query_authority,
+                    retrieval_request,
+                )
+                .map_err(map_clone_cursor_error)?;
+                codec
+                    .decode_artifact_unbound(
+                        encoded,
+                        self.hydration.verified_artifact().artifact_digest(),
+                        &self.hydration.metadata().generation,
+                        snapshot_digest,
+                        now,
+                    )
+                    .map(|cursor| cursor.after)
+                    .map_err(map_clone_cursor_error)
+            })
+            .transpose()?;
         // A fingerprint cursor continues the near lane. Replaying it through
         // the exact reader would fail its request-digest check, so the exact
         // lane is deliberately omitted on that continuation. An exact cursor
         // continues exact families while the additive near lane starts a new
         // page; the two readers have intentionally distinct cursor domains.
-        let near_cursor = request
-            .cursor
-            .as_ref()
-            .filter(|cursor| cursor.fingerprint_continuation_digests().is_some());
+        let continue_near = cursor_position.as_ref().is_some_and(|position| {
+            matches!(
+                position,
+                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
+                    ..
+                } | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                    ..
+                }
+            )
+        });
+        let near_cursor = continue_near.then(|| request.cursor.as_deref()).flatten();
         let continue_near = near_cursor.is_some();
         // Request-wide budgets: share result_limit and work_limit across match
         // classes instead of resetting a per-family page size on each key.
@@ -645,8 +678,12 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 let page = self.verified_exact_clone_page(
                     &source,
                     &key,
-                    request.cursor.as_ref(),
+                    request.cursor.as_deref(),
                     page_limit,
+                    query_authority,
+                    retrieval_request,
+                    snapshot_digest,
+                    now,
                     control,
                 )?;
                 remaining_results = remaining_results.saturating_sub(page.members.len());
@@ -675,6 +712,10 @@ impl ProductionCodeIndexQueryOwnersV1 {
             remaining_results,
             remaining_work,
             near_cursor,
+            query_authority,
+            retrieval_request,
+            snapshot_digest,
+            now,
             control,
         )?;
         Ok(Some(
@@ -718,7 +759,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
         requested_classes: &[tracedecay_code_index::clones::CloneNormalizationClassV1],
         result_limit: usize,
         work_limit: usize,
-        cursor: Option<&tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+        cursor: Option<&str>,
+        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
+        retrieval_request: &tracedecay_domain::RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<tracedecay_query::code_search::CodeIndexSimilarNearReadV1, RetrievalPortError> {
         let source_class = source
@@ -741,18 +786,22 @@ impl ProductionCodeIndexQueryOwnersV1 {
         match extent {
             tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
                 if page_limit == 0 {
-                    return Ok(similar_near_budget_exhausted_whole_body(source));
+                    return Ok(similar_near_budget_exhausted_whole_body(source, cursor));
                 }
                 self.hydration
-                    .clone_fingerprint_page(
+                    .clone_fingerprint_page_authenticated(
                         &source.occurrence,
                         &source.payload,
                         cursor,
                         page_limit,
+                        query_authority,
+                        retrieval_request,
+                        snapshot_digest,
+                        now,
                         control,
                     )
                     .map(tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody)
-                    .map_err(map_text_artifact_error)
+                    .map_err(map_clone_cursor_read_error)
             }
             tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
                 start,
@@ -761,7 +810,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 if source.occurrence.eligibility
                     != tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
                 {
-                    return Ok(similar_near_budget_exhausted_selected_range(source));
+                    return Ok(similar_near_budget_exhausted_selected_range(source, cursor));
                 }
                 let selected = tracedecay_code_index::clones::CloneSelectedBlockV1::from_payload(
                     &source.payload,
@@ -770,21 +819,27 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 )
                 .map_err(RetrievalPortError::Contract)?;
                 if page_limit == 0 {
-                    return Ok(similar_near_budget_exhausted_selected_block(&selected));
+                    return Ok(similar_near_budget_exhausted_selected_block(
+                        &selected, cursor,
+                    ));
                 }
                 self.hydration
-                    .clone_selected_block_page(
+                    .clone_selected_block_page_authenticated(
                         &source.occurrence,
                         &source.payload,
                         &selected,
                         cursor,
                         page_limit,
+                        query_authority,
+                        retrieval_request,
+                        snapshot_digest,
+                        now,
                         control,
                     )
                     .map(
                         tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange,
                     )
-                    .map_err(map_text_artifact_error)
+                    .map_err(map_clone_cursor_read_error)
             }
         }
     }
@@ -794,19 +849,33 @@ impl ProductionCodeIndexQueryOwnersV1 {
         &self,
         source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
         key: &tracedecay_code_index::clones::CloneExactKeyV1,
-        start_cursor: Option<&tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+        start_cursor: Option<&str>,
         limit: usize,
+        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
+        retrieval_request: &tracedecay_domain::RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<VerifiedExactClonePageV1, RetrievalPortError> {
         let mut members = Vec::new();
-        let mut cursor = start_cursor.cloned();
+        let mut cursor = start_cursor.map(str::to_owned);
         let mut complete = false;
         let mut work_spent = 0usize;
         while members.len() < limit {
             let page = self
                 .hydration
-                .clone_exact_page(&source.occurrence, key, cursor.as_ref(), limit, control)
-                .map_err(|error| RetrievalPortError::AuthorityUnavailable(error.to_string()))?;
+                .clone_exact_page_authenticated(
+                    &source.occurrence,
+                    key,
+                    cursor.as_deref(),
+                    limit,
+                    query_authority,
+                    retrieval_request,
+                    snapshot_digest,
+                    now,
+                    control,
+                )
+                .map_err(map_clone_cursor_read_error)?;
             // `clone_exact_page` fetches one lookahead row when a continuation
             // exists. Count the whole decoded page, including members later
             // rejected by the source/payload verification below.
@@ -864,7 +933,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
 struct VerifiedExactClonePageV1 {
     members: Vec<tracedecay_query::retrieval::lexical::CloneExactArtifactMemberV1>,
     complete: bool,
-    next_cursor: Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+    next_cursor: Option<String>,
     work_spent: usize,
 }
 
@@ -894,6 +963,36 @@ fn check_similar_control(
         Err(RetrievalPortError::BudgetExceeded)
     } else {
         Ok(())
+    }
+}
+
+fn map_clone_cursor_error(
+    error: tracedecay_query::retrieval::lexical::CloneCursorErrorV1,
+) -> RetrievalPortError {
+    use tracedecay_query::retrieval::lexical::CloneCursorErrorV1;
+
+    match error {
+        CloneCursorErrorV1::Invalid => {
+            RetrievalPortError::Contract("clone cursor is invalid".to_owned())
+        }
+        CloneCursorErrorV1::Tampered => {
+            RetrievalPortError::Contract("clone cursor authentication failed".to_owned())
+        }
+        CloneCursorErrorV1::Stale => RetrievalPortError::StaleEvidence,
+        CloneCursorErrorV1::Unavailable(detail) => RetrievalPortError::AuthorityUnavailable(detail),
+    }
+}
+
+fn map_clone_cursor_read_error(
+    error: tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1,
+) -> RetrievalPortError {
+    match error {
+        tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1::Cursor(error) => {
+            map_clone_cursor_error(error)
+        }
+        tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1::Artifact(error) => {
+            RetrievalPortError::AuthorityUnavailable(error.to_string())
+        }
     }
 }
 
@@ -935,12 +1034,13 @@ fn similar_near_budget_reason() -> Vec<CloneFingerprintPartialReasonV1> {
 
 fn similar_near_budget_exhausted_whole_body(
     source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    cursor: Option<&str>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(
-        CloneFingerprintArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+        AuthenticatedCloneFingerprintArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor: None,
+                next_cursor: cursor.map(str::to_owned),
             },
             stream: similar_stream_descriptor(source),
             source_eligibility: source.occurrence.eligibility,
@@ -955,14 +1055,15 @@ fn similar_near_budget_exhausted_whole_body(
 
 fn similar_near_budget_exhausted_selected_range(
     source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    cursor: Option<&str>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     let stream = similar_stream_descriptor(source)
         .unwrap_or_else(|| fallback_similar_stream_descriptor(source));
     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-        CloneSelectedBlockArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+        AuthenticatedCloneSelectedBlockArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor: None,
+                next_cursor: cursor.map(str::to_owned),
             },
             stream,
             coverage: similar_near_partial_coverage(),
@@ -974,12 +1075,13 @@ fn similar_near_budget_exhausted_selected_range(
 
 fn similar_near_budget_exhausted_selected_block(
     selected: &CloneSelectedBlockV1,
+    cursor: Option<&str>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-        CloneSelectedBlockArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::CloneArtifactPageV1 {
+        AuthenticatedCloneSelectedBlockArtifactReadV1 {
+            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor: None,
+                next_cursor: cursor.map(str::to_owned),
             },
             stream: CloneFingerprintStreamDescriptorV1 {
                 language: selected.language().to_owned(),
