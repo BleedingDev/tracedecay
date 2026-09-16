@@ -6079,6 +6079,7 @@ dependencies = [
  "tracedecay-lsp",
  "tracedecay-maintenance",
  "tracedecay-mcp",
+ "tracedecay-memory-ncm-runtime",
  "tracedecay-memory-observation",
  "tracedecay-privacy",
  "tracedecay-private-fs",

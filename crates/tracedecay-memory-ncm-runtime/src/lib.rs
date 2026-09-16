@@ -9,12 +9,13 @@ pub mod client;
 pub mod embedding;
 pub mod engine;
 pub mod maintenance;
-pub mod ports;
 pub mod platform;
+pub mod ports;
 pub mod privacy;
 pub mod snapshot;
 mod source_binding;
 pub mod store;
 pub mod wire;
 pub mod worker;
-pub(crate) mod worker_artifact;
+/// Offline verification and private staging for the shipped NCM worker.
+pub mod worker_artifact;

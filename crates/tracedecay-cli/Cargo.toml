@@ -194,6 +194,7 @@ tracedecay-host-integration = { path = "../tracedecay-host-integration", version
 tracedecay-lsp = { path = "../tracedecay-lsp", version = "0.1.0" }
 tracedecay-maintenance = { path = "../tracedecay-maintenance", version = "0.1.0" }
 tracedecay-mcp = { path = "../tracedecay-mcp", version = "0.1.0" }
+tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", version = "0.1.0-beta.37", default-features = false }
 tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
 tracedecay-sdk = { path = "../tracedecay-sdk", version = "0.1.0" }

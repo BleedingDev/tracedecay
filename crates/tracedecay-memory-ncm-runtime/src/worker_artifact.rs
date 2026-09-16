@@ -33,8 +33,13 @@ pub enum WorkerIntegrityError {
     /// The configured file could not be read.
     Read(String),
     /// The configured file length differs from the pinned artifact.
+    ///
+    /// The fields contain the expected and observed byte counts, respectively.
     SizeMismatch { expected: u64, actual: u64 },
     /// The configured file digest differs from the pinned artifact.
+    ///
+    /// The fields contain the expected and observed hexadecimal digests,
+    /// respectively.
     DigestMismatch { expected: String, actual: String },
     /// The verified bytes could not be sealed into a private launch artifact.
     Staging(String),

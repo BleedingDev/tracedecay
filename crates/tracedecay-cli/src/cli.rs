@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, builder::PossibleValuesParser};
 
+pub use crate::ncm_cmd::NcmAction;
+
 mod automation;
 pub mod dispatch;
 mod help;
@@ -710,6 +712,11 @@ pub enum Commands {
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
+    },
+    /// Install, update, inspect, recover, or uninstall the opt-in NCM worker.
+    Ncm {
+        #[command(subcommand)]
+        action: NcmAction,
     },
     /// Self-improvement automation configuration and run inspection
     #[command(long_about = AUTOMATION_LONG_ABOUT, after_help = AUTOMATION_AFTER_HELP)]
