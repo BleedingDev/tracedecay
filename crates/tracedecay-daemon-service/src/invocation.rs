@@ -591,11 +591,19 @@ impl DaemonInvocationService {
     pub async fn mount_session_holder_databases(
         &self,
         databases: impl IntoIterator<Item = tracedecay_global_db::RegisteredGlobalDbLeaseV1>,
-    ) {
+    ) -> Vec<PathBuf> {
         let mut mounted = self.session_holder_databases.lock().await;
+        let mut inserted = Vec::new();
         for database in databases {
-            mounted.insert(database.db_path().to_path_buf(), database);
+            let database_path = database.db_path().to_path_buf();
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                mounted.entry(database_path.clone())
+            {
+                entry.insert(database);
+                inserted.push(database_path);
+            }
         }
+        inserted
     }
 
     /// Remove session-holder leases that belonged to an aborted project-open

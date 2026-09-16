@@ -558,7 +558,7 @@ async fn production_project_server_inner(
             }
         };
         let upgrade = match Box::pin(inputs.construct_full_server(&opened, &core)).await {
-            Ok(full) => {
+            Ok(mut full) => {
                 let phase_failure = inputs
                     .phase_checkpoint(ProjectOpenFailurePhase::ProviderMount)
                     .and_then(|()| {
@@ -571,7 +571,7 @@ async fn production_project_server_inner(
                             &core,
                             &activation,
                             &resolved,
-                            &full,
+                            &mut full,
                         ))
                         .await
                         {
@@ -835,6 +835,7 @@ struct AdmittedSessionDatabases {
 struct PublishedFullServer {
     server: Arc<crate::mcp::McpServer>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    session_holder_database_paths: Vec<PathBuf>,
     #[cfg(feature = "memory-provider-host")]
     provider_full_mount:
         Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1>,
@@ -1495,13 +1496,6 @@ impl ProjectOpenInputs<'_> {
             )
             .await
             .map_err(|error| TraceDecayError::Config { message: error })?;
-        self.invocation
-            .service
-            .mount_session_holder_databases([
-                core.registered_profile_db.clone(),
-                user_session_db.clone(),
-            ])
-            .await;
         let delivery_access = daemon_owned_project_source_access_at(
             &code_index.scope,
             self.canonical_project_path,
@@ -1723,6 +1717,7 @@ impl ProjectOpenInputs<'_> {
         Ok(PublishedFullServer {
             server: full_candidate,
             session_db,
+            session_holder_database_paths: Vec::new(),
             #[cfg(feature = "memory-provider-host")]
             provider_full_mount,
         })
@@ -1820,7 +1815,7 @@ impl ProjectOpenInputs<'_> {
         core: &ComposedCoreServer,
         activation: &CoreRouteActivation,
         resolved: &Arc<crate::mcp::McpServer>,
-        full: &PublishedFullServer,
+        full: &mut PublishedFullServer,
     ) -> Result<()> {
         // Keep the core in the registry while this whole block runs. A full
         // candidate is only dispatchable after every owner mount, deferred
@@ -1828,6 +1823,14 @@ impl ProjectOpenInputs<'_> {
         let mut registry_published = false;
         let result = async {
             self.log_phase("session_capabilities_prepared", None, self.started);
+            full.session_holder_database_paths = self
+                .invocation
+                .service
+                .mount_session_holder_databases([
+                    core.registered_profile_db.clone(),
+                    full.session_db.clone(),
+                ])
+                .await;
             Box::pin(self.mount_full_server_owners(
                 opened,
                 core,
@@ -2264,6 +2267,10 @@ async fn retire_failed_project_open_owner(
     let full_server = published_full_server
         .as_ref()
         .map(|full| Arc::clone(&full.server));
+    let session_holder_database_paths = published_full_server
+        .as_ref()
+        .map(|full| full.session_holder_database_paths.clone())
+        .unwrap_or_default();
     let removed = store_administration
         .project_servers()
         .lock()
@@ -2419,6 +2426,6 @@ async fn retire_failed_project_open_owner(
     }
     invocation
         .service
-        .unmount_session_holder_databases([project_sessions_path])
+        .unmount_session_holder_databases(session_holder_database_paths)
         .await;
 }
