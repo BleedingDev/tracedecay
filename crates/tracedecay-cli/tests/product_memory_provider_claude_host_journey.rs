@@ -687,14 +687,18 @@ impl ClaudeHostJourney {
                 .capture_observation(request)
                 .await
                 .expect("persist canonical revision fixture");
-            assert!(
-                matches!(
-                    outcome,
-                    CaptureObservationOutcome::Persisted { .. }
-                        | CaptureObservationOutcome::AcceptedForReplay { .. }
+            match &outcome {
+                CaptureObservationOutcome::Persisted { outcome, .. }
+                | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => assert_eq!(
+                    outcome.receipt().observation().observation_id(),
+                    &observation_id,
+                    "canonical producer receipt must retain its derived observation identity"
                 ),
-                "canonical revision fixture must cross the durable admission boundary: {outcome:?}"
-            );
+                CaptureObservationOutcome::Rejected { .. }
+                | CaptureObservationOutcome::Quarantined { .. } => panic!(
+                    "canonical revision fixture must cross the durable admission boundary: {outcome:?}"
+                ),
+            }
             drop(application);
             drop(host_runtime);
         });
