@@ -300,6 +300,14 @@ impl IsolatedCli {
             "tracedecay"
         });
         fs::write(&v1, b"stable V1 placeholder").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&v1).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&v1, permissions).unwrap();
+        }
         v1
     }
 
