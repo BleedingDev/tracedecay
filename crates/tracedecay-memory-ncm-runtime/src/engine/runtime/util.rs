@@ -52,6 +52,8 @@ pub(super) fn lookup_replay(
         .capsules_in_commit_order(true)
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let durable = validate_recovery_event(&event, seq, handle.commit_seq)?;
+    validate_durable_receipt(&durable, event.seq)
+        .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
     validate_event_payload_digest(&event, &durable, &capsules)?;
     let mut replay = durable.reply;
     attach_observation_delivery(handle, &mut replay)?;
@@ -151,6 +153,45 @@ pub(crate) fn durable_integrity_digest(
         operation,
         state_digest,
     })
+}
+
+/// Verifies the self-contained integrity and generation fields of a durable
+/// receipt before a replay or inspection path exposes its reply.
+///
+/// The journal row supplies the event sequence; the receipt must independently
+/// attest to that same sequence. Keeping this check beside the receipt digest
+/// constructor prevents consumers that do not run the full recovery prefix
+/// validator from accepting a receipt whose fields were changed together with
+/// an otherwise valid journal row.
+pub(super) fn validate_durable_receipt(
+    receipt: &DurableReceipt,
+    expected_sequence: u64,
+) -> Result<(), String> {
+    if expected_sequence == 0 || receipt.reply.state_generation != expected_sequence {
+        return Err("durable receipt generation mismatch".to_owned());
+    }
+    if !is_sha256_hex(&receipt.state_digest) {
+        return Err("durable receipt state digest is invalid".to_owned());
+    }
+    if !is_sha256_hex(&receipt.integrity_digest) {
+        return Err("durable receipt integrity digest is invalid".to_owned());
+    }
+    let expected =
+        durable_integrity_digest(&receipt.reply, &receipt.operation, &receipt.state_digest)?;
+    if expected != receipt.integrity_digest {
+        return Err("durable receipt integrity digest mismatch".to_owned());
+    }
+    if receipt.reply.outcome != Outcome::Success {
+        return Err("durable receipt outcome is not success".to_owned());
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn put_checkpoint(

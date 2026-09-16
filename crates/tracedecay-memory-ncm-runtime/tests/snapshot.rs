@@ -581,6 +581,93 @@ fn identity_mismatch_is_incompatible_and_restore_is_idempotent() {
 }
 
 #[test]
+fn restore_replay_rejects_a_tampered_journal_envelope() {
+    let source_dir = TempDir::new().expect("source tempdir creates");
+    let source = engine(&source_dir);
+    observe(
+        &source,
+        &namespace(),
+        "source-a",
+        "alpha",
+        "value",
+        "source-a",
+    );
+    let bytes = export(&source, &namespace());
+
+    for tamper in ["kind", "sequence", "integrity"] {
+        let target_dir = TempDir::new().expect("target tempdir creates");
+        let target = engine(&target_dir);
+        let first = snapshot::restore(
+            &target,
+            &namespace(),
+            RestoreRequest {
+                idempotency_key: "tampered-restore".to_owned(),
+                bytes: bytes.clone(),
+            },
+            DEADLINE,
+        );
+        assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+
+        let path = namespace_dir(&target_dir, &namespace()).join("ncm.sqlite");
+        let connection = rusqlite::Connection::open(path).expect("open restored sqlite");
+        let key = "tampered-restore";
+        match tamper {
+            "kind" => {
+                connection
+                    .execute(
+                        "UPDATE events SET kind = 'maintenance' WHERE idempotency_key = ?1",
+                        [key],
+                    )
+                    .expect("tamper restore event kind");
+            }
+            "sequence" => {
+                connection
+                    .execute(
+                        "UPDATE events SET seq = seq + 1 WHERE idempotency_key = ?1",
+                        [key],
+                    )
+                    .expect("tamper restore event sequence");
+            }
+            "integrity" => {
+                let receipt: String = connection
+                    .query_row(
+                        "SELECT receipt FROM events WHERE idempotency_key = ?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .expect("read restore receipt");
+                let mut receipt: Value =
+                    serde_json::from_str(&receipt).expect("decode restore receipt");
+                receipt["integrity_digest"] = json!("0".repeat(64));
+                connection
+                    .execute(
+                        "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
+                        [serde_json::to_string(&receipt).unwrap(), key.to_owned()],
+                    )
+                    .expect("tamper restore integrity");
+            }
+            _ => unreachable!("test tamper case"),
+        }
+        drop(connection);
+
+        let replay = snapshot::restore(
+            &target,
+            &namespace(),
+            RestoreRequest {
+                idempotency_key: key.to_owned(),
+                bytes: bytes.clone(),
+            },
+            DEADLINE,
+        );
+        assert_eq!(
+            replay.outcome,
+            Outcome::Corrupt,
+            "tamper={tamper}: {replay:?}"
+        );
+    }
+}
+
+#[test]
 fn engine_export_delegates_and_envelope_omits_revocation_authority() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();

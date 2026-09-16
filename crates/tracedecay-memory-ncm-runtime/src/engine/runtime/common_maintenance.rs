@@ -5,7 +5,8 @@ use super::super::{
     NamespaceHandle, NcmEngine, Outcome, RejectReason,
 };
 use super::util::{
-    canonical_digest, sha256_hex, store_reply, unavailable_recovery, validate_idempotency_key,
+    canonical_digest, sha256_hex, store_reply, unavailable_recovery, validate_durable_receipt,
+    validate_idempotency_key,
 };
 use crate::ports::Deadline;
 use crate::store::Event;
@@ -596,6 +597,7 @@ fn checked_event(
     }
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|error| format!("invalid durable maintenance receipt: {error}"))?;
+    validate_durable_receipt(&durable, event.seq)?;
     let Some(value) = durable.reply.payload.get("common_maintenance") else {
         return Ok(None);
     };

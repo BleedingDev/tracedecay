@@ -807,6 +807,56 @@ fn maintenance_event_key_mismatch_is_rejected_as_corrupt() {
 }
 
 #[test]
+fn common_maintenance_receipt_integrity_is_verified_on_all_replay_surfaces() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "integrity").state_generation;
+    let original = request("integrity-receipt", "repair", generation);
+    let first = invoke(&live, original.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let key = digest(b"integrity-receipt");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    receipt["integrity_digest"] = json!("0".repeat(64));
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
+            [serde_json::to_string(&receipt).unwrap(), key],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = engine(&directory);
+    assert_eq!(
+        inspect_receipt(&reopened, "integrity-receipt").outcome,
+        Outcome::Corrupt
+    );
+    let mut retry = original;
+    retry["expected_generation"] = json!(first.state_generation);
+    assert_eq!(invoke(&reopened, retry).outcome, Outcome::Corrupt);
+    assert_eq!(
+        snapshot::export(&reopened, &namespace(), DEADLINE)
+            .unwrap_err()
+            .outcome,
+        Outcome::Corrupt
+    );
+}
+
+#[test]
 fn empty_and_dry_run_maintenance_do_not_invent_retained_effects() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

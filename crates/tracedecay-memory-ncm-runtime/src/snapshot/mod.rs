@@ -7,7 +7,7 @@
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, MaintenanceKind,
     NamespaceHandle, NcmEngine, Outcome, RejectReason, durable_integrity_digest,
-    portable_common_maintenance_event,
+    portable_common_maintenance_event, validate_event_payload_digest,
 };
 use crate::ports::{Deadline, StateRoot};
 use crate::store::{
@@ -992,6 +992,13 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         }
         let receipt: DurableReceipt = serde_json::from_str(&event.receipt)
             .map_err(|error| rejected(&format!("decode snapshot event receipt: {error}")))?;
+        validate_snapshot_event_envelope(event, &receipt)?;
+        validate_event_payload_digest(event, &receipt, &content.capsules).map_err(|reply| {
+            rejected(&format!(
+                "snapshot event payload is invalid: {:?}",
+                reply.payload
+            ))
+        })?;
         let portable_maintenance = portable_common_maintenance_event(&content.namespace, event)
             .map_err(|reason| rejected(&reason))?;
         let portable_control = match &receipt.operation {
@@ -1030,6 +1037,65 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         {
             return Err(rejected("snapshot contains a non-portable event"));
         }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_event_envelope(
+    event: &Event,
+    receipt: &DurableReceipt,
+) -> Result<(), EngineReply> {
+    if event.seq == 0 || receipt.reply.state_generation != event.seq {
+        return Err(rejected(
+            "snapshot event sequence does not match its receipt",
+        ));
+    }
+    if !is_sha256_hex(&event.payload_sha256) {
+        return Err(rejected("snapshot event payload digest is invalid"));
+    }
+    if !is_sha256_hex(&receipt.state_digest) {
+        return Err(rejected("snapshot event state digest is invalid"));
+    }
+    if !is_sha256_hex(&receipt.integrity_digest) {
+        return Err(rejected("snapshot event integrity digest is invalid"));
+    }
+    let expected_integrity =
+        durable_integrity_digest(&receipt.reply, &receipt.operation, &receipt.state_digest)
+            .map_err(|reason| rejected(&format!("snapshot event receipt integrity: {reason}")))?;
+    if expected_integrity != receipt.integrity_digest {
+        return Err(rejected("snapshot event receipt integrity mismatch"));
+    }
+    if receipt.reply.outcome != Outcome::Success {
+        return Err(rejected("snapshot event receipt outcome is not success"));
+    }
+    let key_required = !matches!(&receipt.operation, DurableOperation::DeletionFence { .. });
+    if key_required
+        && event
+            .idempotency_key
+            .as_deref()
+            .is_none_or(|key| key.is_empty() || key.len() > 256)
+    {
+        return Err(rejected("snapshot event idempotency key is invalid"));
+    }
+    if !key_required && event.idempotency_key.is_some() {
+        return Err(rejected(
+            "snapshot deletion fence unexpectedly has an idempotency key",
+        ));
+    }
+    let kind_matches = match &receipt.operation {
+        DurableOperation::CommonControl { .. } => event.kind == "common_control",
+        DurableOperation::Observe { .. } => event.kind == "observe",
+        DurableOperation::Feedback { .. } => event.kind == "feedback",
+        DurableOperation::Correction { .. } => event.kind == "correction",
+        DurableOperation::Maintenance { kind } => {
+            event.kind == "maintenance"
+                || (matches!(kind, MaintenanceKind::Checkpoint) && event.kind == "snapshot_restore")
+        }
+        DurableOperation::DeletionFence { .. } => event.kind == "deletion_fence",
+        DurableOperation::DeleteBySource { .. } => event.kind == "delete_by_source",
+    };
+    if !kind_matches {
+        return Err(rejected("snapshot event operation kind mismatch"));
     }
     Ok(())
 }
@@ -1486,8 +1552,43 @@ fn lookup_restore_replay(
             handle.commit_seq,
         )));
     }
+    let event = handle
+        .store
+        .event(seq)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+        .ok_or_else(|| corrupt_reply(handle.commit_seq, "restore idempotency event is missing"))?;
+    if event.seq != seq
+        || event.kind != "snapshot_restore"
+        || event.idempotency_key.as_deref() != Some(key)
+        || event.payload_sha256 != stored_digest
+        || event.receipt != receipt
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "restore idempotency envelope does not match its journal row",
+        ));
+    }
     let durable: DurableReceipt = serde_json::from_str(&receipt)
         .map_err(|error| corrupt_reply(seq, &format!("decode restore receipt: {error}")))?;
+    validate_snapshot_event_envelope(&event, &durable).map_err(|reply| {
+        corrupt_reply(
+            handle.commit_seq,
+            reply.payload["reason"]
+                .as_str()
+                .unwrap_or("restore event envelope is invalid"),
+        )
+    })?;
+    if !matches!(
+        durable.operation,
+        DurableOperation::Maintenance {
+            kind: MaintenanceKind::Checkpoint
+        }
+    ) {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "restore receipt operation is not a checkpoint",
+        ));
+    }
     let mut reply = durable.reply;
     if let Some(object) = reply.payload.as_object_mut() {
         object.insert("replayed".to_owned(), Value::Bool(true));
