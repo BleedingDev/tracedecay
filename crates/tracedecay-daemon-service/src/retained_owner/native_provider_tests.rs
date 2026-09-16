@@ -18,9 +18,9 @@ use tracedecay_domain::{
 use tracedecay_memory_provider_registry::{
     CancellationToken, CanonicalPayload, CommittedEffectState, HandshakeRequest,
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation, OBSERVATION_CONTRACT_ID,
-    OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
-    ProviderCallParts, ProviderOperation, ProviderReply, TerminalCode,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation, NativeObservationEnvelope,
+    OBSERVATION_CONTRACT_ID, OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+    ProviderCall, ProviderCallParts, ProviderOperation, ProviderReply, TerminalCode,
 };
 use tracedecay_session_memory::memory::{
     ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
@@ -32,6 +32,9 @@ use tracedecay_store::{
 
 use super::*;
 use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
+
+const SCOPE_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 fn project_parts(label: &str) -> (ProjectId, FactOwnerV1, FactCommitOwnerV1) {
     let project_id =
@@ -150,7 +153,7 @@ fn call_for(project_id: &str) -> ProviderCall {
             "worktree.native-bridge-test",
             "branch.native-bridge-test",
             "agent.native-bridge-test",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-test".to_owned(),
@@ -188,7 +191,7 @@ fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> Provid
             "worktree.native-bridge-store",
             "branch.native-bridge-store",
             "agent.native-bridge-store",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-store".to_owned(),
@@ -245,7 +248,7 @@ fn ready_request() -> HandshakeRequest {
             "worktree.native-bridge-ready",
             "branch.native-bridge-ready",
             "agent.native-bridge-ready",
-            2,
+            SCOPE_DIGEST,
         )
         .expect("valid exact scope"),
         request_id: "request.native-bridge-ready".to_owned(),
@@ -316,12 +319,12 @@ async fn read_store_snapshot(
 }
 
 fn observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
-    NativeObservation {
+    NativeObservation::FactPromotion(NativeObservationEnvelope {
         call,
         observation_kind: NATIVE_FACT_PROMOTION_OBSERVATION_KIND.to_owned(),
         payload_contract: NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID.to_owned(),
         canonical_payload,
-    }
+    })
 }
 
 async fn real_project_fixture() -> (
@@ -466,7 +469,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
             "worktree.native-bridge-recall",
             "branch.native-bridge-recall",
             "agent.native-bridge-recall",
-            1,
+            SCOPE_DIGEST,
         )
         .expect("valid recall exact scope"),
         request_id: "request.native-bridge-recall".to_owned(),

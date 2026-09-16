@@ -32,10 +32,11 @@ use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_memory_provider_registry::{
     ApiError, CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
     HandshakeResponse, NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
-    NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID, NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
-    NativeObservation, OBSERVATION_CONTRACT_ID, OperationControl, OwnedProviderId,
-    OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits, ProviderOperation,
-    ProviderReply, TerminalCode, TerminalRecord,
+    NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID, NATIVE_PROVIDER_ID,
+    NATIVE_STAGED_SESSION_OBSERVATION_KIND, NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
+    NativeMemoryApplicationPort, NativeObservation, OBSERVATION_CONTRACT_ID, OperationControl,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
+    ProviderOperation, ProviderReply, TerminalCode, TerminalRecord,
 };
 use tracedecay_store::{
     FactReadControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
@@ -336,16 +337,29 @@ impl NativeMemoryApplicationPort for ProjectNativeMemoryApplicationPort {
         if call.validate().is_err() || !observation_matches_call(&observation) {
             return self.observe_invalid(call);
         }
-        let payload = match parse_settled_native_fact(&observation) {
-            Ok(payload) => payload,
-            Err(failure) => return self.observe_failure(call, failure),
-        };
-        let outcome = self
-            .actor
-            .dispatch(call.clone(), payload.fact, payload.commit);
-        match outcome {
-            NativeReadOutcome::Verified => self.success_reply(call),
-            NativeReadOutcome::Failed(failure) => self.observe_failure(call, failure),
+        match observation {
+            // Fact promotion remains a separate, explicitly authorized
+            // consequence. It is the only observation kind that enters the
+            // Native fact verification actor.
+            NativeObservation::FactPromotion(_) => {
+                let payload = match parse_settled_native_fact(&observation) {
+                    Ok(payload) => payload,
+                    Err(failure) => return self.observe_failure(call, failure),
+                };
+                let outcome = self
+                    .actor
+                    .dispatch(call.clone(), payload.fact, payload.commit);
+                match outcome {
+                    NativeReadOutcome::Verified => self.success_reply(call),
+                    NativeReadOutcome::Failed(failure) => self.observe_failure(call, failure),
+                }
+            }
+            // Session messages are already admitted and sanitized by the host
+            // observation journey. Native acknowledges that canonical
+            // delivery statelessly; it owns no staging table, journal, or
+            // receipt. The host records the resulting acknowledgement in its
+            // own delivery journal.
+            NativeObservation::StagedSession(_) => self.success_reply(call),
         }
     }
 
@@ -522,8 +536,19 @@ fn observation_matches_call(observation: &NativeObservation<'_>) -> bool {
     if call.operation != ProviderOperation::Observe
         || call.provider_id.as_str() != NATIVE_PROVIDER_ID
         || call.payload.contract_id.as_str() != OBSERVATION_CONTRACT_ID
-        || observation.observation_kind() != NATIVE_FACT_PROMOTION_OBSERVATION_KIND
-        || observation.payload_contract() != NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
+        || !matches!(
+            (
+                observation.observation_kind(),
+                observation.payload_contract()
+            ),
+            (
+                NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
+                NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
+            ) | (
+                NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+                NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID
+            )
+        )
     {
         return false;
     }
