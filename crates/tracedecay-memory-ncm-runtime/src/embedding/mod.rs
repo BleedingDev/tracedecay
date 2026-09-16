@@ -1041,7 +1041,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         cache_snapshot, digest_bytes, read_snapshot_file, read_verified_artifact, EncoderFile,
-        CACHE_REPOSITORY_DIR, MODEL_REVISION,
+        CACHE_REPOSITORY_DIR, MODEL_NAME, MODEL_REVISION,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
