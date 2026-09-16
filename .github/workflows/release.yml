@@ -62,6 +62,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           source_sha="$(git rev-parse HEAD)"
@@ -72,15 +73,15 @@ jobs:
           [[ "$version" != *-* ]]
           tag="v${version}"
           test "$RELEASE_TAG" = "$tag"
-          test "$GITHUB_REF" = "refs/tags/${tag}"
-          test "$GITHUB_SHA" = "$source_sha"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
-            tag_sha="$(git rev-list -n 1 "$tag")"
-            if [[ "$tag_sha" != "$source_sha" ]]; then
-              echo "::error::${tag} targets ${tag_sha}, not release source ${source_sha}"
-              exit 1
-            fi
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [[ "$tag_sha" != "$source_sha" ]]; then
+            echo "::error::${RELEASE_TAG} targets ${tag_sha}, not release source ${source_sha}"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            test "$GITHUB_REF" = "refs/tags/${tag}"
+            test "$GITHUB_SHA" = "$source_sha"
           fi
           {
             echo "source_sha=${source_sha}"
@@ -106,6 +107,11 @@ jobs:
             --source-digest "$source_sha" \
             --asset-names retained-asset-names \
             --download-dir retained-assets
+          python3 scripts/plan-release-recovery.py \
+            --manifest .github/release-targets.json \
+            --tag "$tag" \
+            --profile stable \
+            --asset-directory retained-assets
 
   dashboard-assets:
     name: Build dashboard artifact
@@ -439,17 +445,27 @@ jobs:
               )
           PY
           shasum -a 256 "$archive" > "$archive.sha256"
+          binary="target/${{ matrix.target }}/release/tracedecay"
+          binary_sha256="$(shasum -a 256 "$binary" | awk '{print $1}')"
+          archive_sha256="$(shasum -a 256 "tracedecay-${{ steps.version.outputs.tag }}-${{ matrix.name }}.${{ matrix.archive }}" | awk '{print $1}')"
           python3 .release-automation/scripts/product/ncm/verify-installed.py \
             --binary-archive "tracedecay-${{ steps.version.outputs.tag }}-${{ matrix.name }}.${{ matrix.archive }}" \
             --worker-archive "$archive" \
+            --binary "$binary" \
             --target "${{ matrix.target }}" \
-            --release-name "${{ matrix.name }}"
-          python3 .release-automation/scripts/product/ncm/check-backend.py \
-            --repo .release-automation \
+            --release-name "${{ matrix.name }}" \
+            --profile stable \
+            --expected-version "${{ needs.validate-release.outputs.version }}" \
+            --expected-source-sha "${{ needs.validate-release.outputs.source_sha }}" \
+            --expected-archive-sha256 "$archive_sha256" \
+            --expected-binary-sha256 "$binary_sha256" \
+            --manifest .release-automation/product/ncm/release/model-acquisition-manifest.json \
+            --embedding-manifest .release-automation/product/ncm/reference/embedding-manifest.json \
+            --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json \
+            --revision-receipt .release-automation/product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json \
             --model-root "${RUNNER_TEMP}/ncm-release-model-root" \
-            --state-root "${RUNNER_TEMP}/ncm-release-state" \
-            --install-model \
-            --receipt-dir "${RUNNER_TEMP}/ncm-release-receipts"
+            --operation install \
+            --installed-e2e
 
       - name: Verify binary archive (unix)
         if: matrix.archive == 'tar.gz'
@@ -457,24 +473,30 @@ jobs:
         run: |
           set -euo pipefail
           archive="tracedecay-${{ steps.version.outputs.tag }}-${{ matrix.name }}.tar.gz"
-          rm -rf verify-binary
-          mkdir verify-binary
-          tar xzf "$archive" -C verify-binary
-          test -x verify-binary/tracedecay
-          verify-binary/tracedecay --version
-          verify-binary/tracedecay --help >/dev/null
+          archive_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          python3 .release-automation/scripts/product/ncm/verify-installed.py \
+            --binary-archive "$archive" \
+            --target "${{ matrix.target }}" \
+            --release-name "${{ matrix.name }}" \
+            --profile stable \
+            --expected-version "${{ needs.validate-release.outputs.version }}" \
+            --expected-source-sha "${{ needs.validate-release.outputs.source_sha }}" \
+            --expected-archive-sha256 "$archive_sha256"
 
       - name: Verify binary archive (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
           $archive = "tracedecay-${{ steps.version.outputs.tag }}-${{ matrix.name }}.zip"
-          Remove-Item verify-binary -Recurse -Force -ErrorAction SilentlyContinue
-          Expand-Archive -Path $archive -DestinationPath verify-binary
-          & "./verify-binary/tracedecay.exe" --version
-          if ($LASTEXITCODE -ne 0) { throw "Packaged binary failed --version" }
-          & "./verify-binary/tracedecay.exe" --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "Packaged binary failed --help" }
+          $archiveSha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          python3 .release-automation/scripts/product/ncm/verify-installed.py `
+            --binary-archive $archive `
+            --target "${{ matrix.target }}" `
+            --release-name "${{ matrix.name }}" `
+            --profile stable `
+            --expected-version "${{ needs.validate-release.outputs.version }}" `
+            --expected-source-sha "${{ needs.validate-release.outputs.source_sha }}" `
+            --expected-archive-sha256 $archiveSha
 
       - name: Upload binary archive artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -627,6 +649,11 @@ jobs:
             --source-digest "$SOURCE_SHA" \
             --asset-names retained-asset-names \
             --download-dir retained-assets
+          python3 .release-automation/scripts/plan-release-recovery.py \
+            --manifest .release-automation/.github/release-targets.json \
+            --tag "$TAG" \
+            --profile stable \
+            --asset-directory retained-assets
           while IFS= read -r asset; do
             [[ -z "$asset" ]] && continue
             if [[ "$asset" == tracedecay-ncm-worker-*.tar.gz* ]]; then
@@ -659,7 +686,8 @@ jobs:
             --mcpbs mcpbs \
             --sidecars ncm-workers \
             --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json \
-            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json
+            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json \
+            --model-revision-receipt .release-automation/product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json
           for bundle in mcpbs/*.mcpb; do
             platform="${bundle#mcpbs/tracedecay-"${TAG}"-}"
             platform="${platform%.mcpb}"
@@ -715,6 +743,7 @@ jobs:
           SOURCE_SHA="${{ needs.validate-release.outputs.source_sha }}"
           git -C .release-automation fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
           test "$(git -C .release-automation rev-list -n 1 "$TAG")" = "$SOURCE_SHA"
+          test "$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft,isPrerelease --jq '[.isPrerelease, .isDraft] | @tsv')" = $'false\tfalse'
 
           gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
             --jq '.assets[].name' > remote-asset-names
@@ -732,6 +761,7 @@ jobs:
               exit 1
             fi
           done < remote-asset-names
+          test "$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft,isPrerelease --jq '[.isPrerelease, .isDraft] | @tsv')" = $'false\tfalse'
           for asset in "${assets[@]}"; do
             name="$(basename "$asset")"
             if grep -Fxq "$name" remote-asset-names; then
@@ -767,7 +797,8 @@ jobs:
             --mcpbs remote-assets/mcpbs \
             --sidecars remote-assets/ncm-workers \
             --worker-manifest .release-automation/product/ncm/reference/worker-manifest.json \
-            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json
+            --model-acquisition-manifest .release-automation/product/ncm/release/model-acquisition-manifest.json \
+            --model-revision-receipt .release-automation/product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json
           .release-automation/scripts/verify-retained-release-assets.sh \
             --tag "$TAG" \
             --repo "${{ github.repository }}" \
@@ -779,10 +810,11 @@ jobs:
         if: needs.validate-release.outputs.prerelease == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >-
-          gh release edit "${{ needs.validate-release.outputs.tag }}"
-          --repo "${{ github.repository }}"
-          --latest
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.validate-release.outputs.tag }}"
+          test "$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft,isPrerelease --jq '[.isPrerelease, .isDraft] | @tsv')" = $'false\tfalse'
+          gh release edit "$TAG" --repo "${{ github.repository }}" --latest
 
   # Rewrites the MCP registry manifest (server.json) from the actual nonempty
   # platform MCPBs so version, URLs, and fileSha256 values describe uploaded

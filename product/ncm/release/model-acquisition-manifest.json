@@ -13,6 +13,7 @@
   "repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
   "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
   "revision_provenance": "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json#/identities/model/revision",
+  "revision_provenance_sha256": "d621ca48f66affa76e53143931f8f3ae4d7c68ed2dd6baaef646b48a510f0866",
   "max_length": 128,
   "pooling": "mean",
   "normalize": true,
@@ -53,7 +54,7 @@
   "transaction": {
     "version": 1,
     "publication": "atomic-directory-swap",
-    "journal": "ncm-model-acquisition-v1.json",
+    "journal": "ncm-model-lifecycle-v1.json",
     "staging_prefix": ".ncm-model-staging-",
     "backup_prefix": ".ncm-model-backup-"
   },
@@ -70,6 +71,7 @@
       "repository",
       "revision",
       "manifest_sha256",
+      "revision_provenance_sha256",
       "files",
       "created_at_unix"
     ]

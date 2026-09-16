@@ -34,15 +34,20 @@ jobs:
     name: Core, runtime, and adapter without native model
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/tracedecay-cargo-target
-      TRACEDECAY_DATA_DIR: ${{ runner.temp }}/tracedecay-test-profile/.tracedecay
-      RUSTC_WRAPPER: ""
     steps:
       - name: Checkout complete history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure runner-local test paths
+        shell: bash
+        run: |
+          {
+            echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/tracedecay-cargo-target"
+            echo "TRACEDECAY_DATA_DIR=${RUNNER_TEMP}/tracedecay-test-profile/.tracedecay"
+            echo "RUSTC_WRAPPER="
+          } >> "$GITHUB_ENV"
 
       - name: Show pinned Rust toolchain
         run: rustc --version --verbose
@@ -82,18 +87,27 @@ jobs:
 
   backend-real-encoder:
     name: Pinned MiniLM artifact and isolated text journey
-    runs-on: ubuntu-latest
+    # The checked-in worker manifest pins only the arm64 macOS production
+    # artifact. Keep this acceptance lane on the matching hosted runner so the
+    # backend gate verifies the artifact it is authorized to launch instead of
+    # failing with an implicit x86_64-linux target.
+    runs-on: macos-14
     timeout-minutes: 120
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/tracedecay-cargo-target
-      TRACEDECAY_DATA_DIR: ${{ runner.temp }}/tracedecay-test-profile/.tracedecay
-      TRACEDECAY_NCM_REAL_MODEL_ROOT: ${{ runner.temp }}/ncm-real-model-root
-      RUSTC_WRAPPER: ""
     steps:
       - name: Checkout complete history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Configure runner-local test paths
+        shell: bash
+        run: |
+          {
+            echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/tracedecay-cargo-target"
+            echo "TRACEDECAY_DATA_DIR=${RUNNER_TEMP}/tracedecay-test-profile/.tracedecay"
+            echo "TRACEDECAY_NCM_REAL_MODEL_ROOT=${RUNNER_TEMP}/ncm-real-model-root"
+            echo "RUSTC_WRAPPER="
+          } >> "$GITHUB_ENV"
 
       - name: Configure Python
         uses: actions/setup-python@v5

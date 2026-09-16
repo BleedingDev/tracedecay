@@ -408,7 +408,7 @@
           "sha256": "3f5961b9ac86288cccdb97f32fb848d6187c78e1603958c53f3ea1f296b7d8a2"
         }
       ],
-      "manifest_sha256": "8177baea44e400c431cd4c179c917ef917487ce40401f026e7abd6d2faaa9346",
+      "manifest_sha256": "40084ced45c8bc429e525f65ffbfec6dd4e9ded4267f1be8d092c499f2dcb328",
       "model": "paraphrase-multilingual-MiniLM-L12-v2",
       "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
       "root": "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/ncm-backend-model-root"

@@ -58,6 +58,11 @@ def main() -> int:
         "status": "unsupported",
         "fallback": "native-only",
     }
+    assert module.worker_platform_capability(policy, "x86_64-apple-darwin") == {
+        "target": "x86_64-apple-darwin",
+        "status": "unsupported",
+        "fallback": "native-only",
+    }
 
     output = run_checker(
         "--policy",
@@ -115,6 +120,23 @@ def main() -> int:
         worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
         policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
         release_path.write_text(json.dumps(release_value), encoding="utf-8")
+        run_checker(
+            "--policy",
+            str(policy_path),
+            "--worker-manifest",
+            str(worker_path),
+            "--release-targets",
+            str(release_path),
+            expect=2,
+        )
+
+        policy_value = json.loads(POLICY.read_text(encoding="utf-8"))
+        policy_value["unsupported_targets"] = [
+            entry
+            for entry in policy_value["unsupported_targets"]
+            if entry["target"] != "x86_64-apple-darwin"
+        ]
+        policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
         run_checker(
             "--policy",
             str(policy_path),

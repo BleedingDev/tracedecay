@@ -27,6 +27,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -57,6 +58,9 @@ MODEL_REVISION_PROVENANCE = (
     "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
     "#/identities/model/revision"
 )
+MODEL_REVISION_RECEIPT_PATH = (
+    "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+)
 MODEL_REQUIRED_FILES = (
     "onnx/model.onnx",
     "tokenizer.json",
@@ -64,7 +68,10 @@ MODEL_REQUIRED_FILES = (
     "special_tokens_map.json",
     "tokenizer_config.json",
 )
-JOURNAL_FILENAME = "ncm-model-acquisition-v1.json"
+# Keep the lifecycle journal name identical to the Rust model_lifecycle owner.
+# The release verifier's acquisition receipt remains a separate Python-owned
+# evidence file because the Rust owner intentionally emits no release receipt.
+JOURNAL_FILENAME = "ncm-model-lifecycle-v1.json"
 RECEIPT_FILENAME = "ncm-model-acquisition-v1.json"
 STAGING_PREFIX = ".ncm-model-staging-"
 BACKUP_PREFIX = ".ncm-model-backup-"
@@ -106,6 +113,25 @@ def _require_digest(value: Any, label: str) -> str:
         f"{label} must be lowercase hexadecimal SHA-256",
     )
     return digest
+
+
+def _require_source_sha(value: Any, label: str) -> str:
+    source_sha = _require_string(value, label)
+    _require(
+        re.fullmatch(r"[0-9a-f]{40}", source_sha) is not None,
+        f"{label} must be a lowercase 40-character git commit SHA",
+    )
+    return source_sha
+
+
+def _require_release_version(value: Any, label: str) -> str:
+    version = _require_string(value, label)
+    _require(
+        re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version)
+        is not None,
+        f"{label} must be a release SemVer without build metadata",
+    )
+    return version
 
 
 def _require_positive_int(value: Any, label: str) -> int:
@@ -180,6 +206,26 @@ def _read_regular(path: Path, label: str, maximum: int = MAX_MANIFEST_BYTES) -> 
             total += len(chunk)
             _require(total <= maximum, f"{label} exceeds its byte bound: {path}")
             chunks.append(chunk)
+    except OSError as error:
+        raise VerificationFailure(f"read {label} {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks)
+
+
+def _read_prefix(path: Path, label: str, maximum: int) -> bytes:
+    """Read at most ``maximum`` bytes without imposing a full-file limit."""
+    _require(maximum > 0, "prefix byte bound must be positive")
+    descriptor = _open_regular(path, label)
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total < maximum:
+            chunk = os.read(descriptor, min(CHUNK_BYTES, maximum - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
     except OSError as error:
         raise VerificationFailure(f"read {label} {path}: {error}") from error
     finally:
@@ -324,6 +370,7 @@ def validate_acquisition_manifest(
     target: str = SUPPORTED_TARGET,
     release_name: str = SUPPORTED_RELEASE_NAME,
     embedding_manifest: Path | None = None,
+    revision_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Validate the release descriptor and its target-bound model identity."""
     _require(manifest.get("schema_version") == 1, "model acquisition schema_version must be 1")
@@ -340,6 +387,10 @@ def validate_acquisition_manifest(
     _require(manifest.get("repository") == MODEL_REPOSITORY, "model acquisition repository is not pinned")
     _require(manifest.get("revision") == MODEL_REVISION, "model acquisition revision is not pinned")
     _require(manifest.get("revision_provenance") == MODEL_REVISION_PROVENANCE, "model acquisition revision provenance drifted")
+    revision_receipt_digest = _require_digest(
+        manifest.get("revision_provenance_sha256"),
+        "model acquisition revision_provenance_sha256",
+    )
     _require(manifest.get("transport") == "https", "production model acquisition transport must be HTTPS")
     _require_string(manifest.get("base_url"), "model acquisition base_url")
     _require(manifest.get("max_length") == 128, "model acquisition max_length must be 128")
@@ -376,7 +427,24 @@ def validate_acquisition_manifest(
     required_fields = receipt.get("required_fields")
     _require(isinstance(required_fields, list) and all(isinstance(item, str) for item in required_fields), "model acquisition receipt.required_fields must be strings")
     required = set(required_fields)
-    _require({"schema_version", "operation_id", "operation", "outcome", "target", "model", "repository", "revision", "manifest_sha256", "files", "created_at_unix"} <= required, "model acquisition receipt omits identity fields")
+    _require(
+        {
+            "schema_version",
+            "operation_id",
+            "operation",
+            "outcome",
+            "target",
+            "model",
+            "repository",
+            "revision",
+            "manifest_sha256",
+            "revision_provenance_sha256",
+            "files",
+            "created_at_unix",
+        }
+        <= required,
+        "model acquisition receipt omits identity fields",
+    )
 
     if embedding_manifest is not None:
         trusted, trusted_bytes = _load_json(embedding_manifest, "trusted embedding manifest")
@@ -391,7 +459,97 @@ def validate_acquisition_manifest(
             trusted_entry = trusted_files.get(path)
             _require(trusted_entry is not None, f"trusted embedding manifest omits {path}")
             _require(entry["bytes"] == trusted_entry["bytes"] and entry["sha256"] == trusted_entry["sha256"], f"release model digest differs from trusted embedding manifest for {path}")
+    if revision_receipt is not None:
+        _validate_revision_receipt(
+            revision_receipt,
+            manifest=manifest,
+            files=files,
+            expected_digest=revision_receipt_digest,
+        )
     return files
+
+
+def _validate_revision_receipt(
+    path: Path,
+    *,
+    manifest: dict[str, Any],
+    files: dict[str, dict[str, Any]],
+    expected_digest: str,
+) -> dict[str, Any]:
+    """Validate the tracked backend receipt used as model revision evidence."""
+    _require(
+        path.name == Path(MODEL_REVISION_RECEIPT_PATH).name,
+        "trusted model revision receipt path is not the canonical receipt",
+    )
+    raw = _read_regular(path, "trusted model revision receipt", MAX_RECEIPT_BYTES)
+    _require(
+        sha256_bytes(raw) == expected_digest,
+        "model acquisition revision receipt digest differs from its manifest pin",
+    )
+    receipt, _ = _load_json(path, "trusted model revision receipt", MAX_RECEIPT_BYTES)
+    identities = receipt.get("identities")
+    model_identity = identities.get("model") if isinstance(identities, dict) else None
+    _require(isinstance(model_identity, dict), "trusted model revision receipt has no model identity")
+    _require(
+        model_identity.get("model") == manifest["model"],
+        "trusted model revision receipt model identity drifted",
+    )
+    _require(
+        model_identity.get("revision") == manifest["revision"],
+        "trusted model revision receipt revision identity drifted",
+    )
+    artifact_digest = _require_digest(
+        model_identity.get("artifact_sha256"),
+        "trusted model revision receipt artifact_sha256",
+    )
+    _require(
+        artifact_digest == files["onnx/model.onnx"]["sha256"],
+        "trusted model revision receipt artifact digest drifted",
+    )
+    _require(
+        model_identity.get("manifest_sha256") == manifest["embedding_manifest_sha256"],
+        "trusted model revision receipt manifest digest differs from the canonical model manifest",
+    )
+    receipt_files = model_identity.get("files")
+    _require(
+        isinstance(receipt_files, list),
+        "trusted model revision receipt files must be a list",
+    )
+    receipt_by_path: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(receipt_files):
+        _require(
+            isinstance(entry, dict),
+            f"trusted model revision receipt files[{index}] must be an object",
+        )
+        relative = _safe_relative_path(
+            entry.get("path"),
+            f"trusted model revision receipt files[{index}].path",
+        )
+        _require(
+            relative not in receipt_by_path,
+            f"trusted model revision receipt repeats {relative}",
+        )
+        _require_positive_int(
+            entry.get("bytes"),
+            f"trusted model revision receipt files[{index}].bytes",
+        )
+        _require_digest(
+            entry.get("sha256"),
+            f"trusted model revision receipt files[{index}].sha256",
+        )
+        receipt_by_path[relative] = entry
+    _require(
+        set(receipt_by_path) == set(files),
+        "trusted model revision receipt file set differs from the release pin",
+    )
+    for relative, entry in files.items():
+        receipt_entry = receipt_by_path[relative]
+        _require(
+            receipt_entry["bytes"] == entry["bytes"]
+            and receipt_entry["sha256"] == entry["sha256"],
+            f"trusted model revision receipt file identity differs for {relative}",
+        )
+    return receipt
 
 
 def _model_file_entries_without_url(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -480,9 +638,745 @@ def _extract_zip(path: Path, destination: Path) -> list[str]:
     return names
 
 
-def verify_binary_archive(path: Path, *, target: str, profile: str = "stable") -> dict[str, Any]:
-    """Extract a CLI archive, launch it, and return the binary identity."""
+def _probe_cli_identity(
+    binary: Path,
+    *,
+    expected_version: str,
+    expected_source_sha: str,
+) -> None:
+    """Require the CLI to report the release identity stamped by its build."""
+    _require_release_version(expected_version, "expected release version")
+    _require_source_sha(expected_source_sha, "expected source SHA")
+    expected_line = f"tracedecay {expected_version}+{expected_source_sha}"
+    for arguments in (("--version",), ("--help",)):
+        completed = subprocess.run(
+            [str(binary), *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        _require(
+            completed.returncode == 0,
+            f"installed CLI {arguments[0]} failed: {completed.stderr.strip()}",
+        )
+        if arguments == ("--version",):
+            _require(
+                completed.stdout.splitlines() == [expected_line],
+                "installed CLI --version did not report the trusted release/source identity",
+            )
+
+
+def _verify_executable_format(path: Path, *, target: str) -> None:
+    """Reject text scripts and binaries for a different release platform."""
+    prefix = _read_prefix(path, "CLI executable", 4096)
+    if target.endswith("-apple-darwin"):
+        _require(
+            len(prefix) >= 8
+            and prefix[:4] in {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"},
+            "CLI executable is not a 64-bit Mach-O binary",
+        )
+        if prefix[:4] == b"\xcf\xfa\xed\xfe":
+            cpu_type = int.from_bytes(prefix[4:8], "little", signed=False)
+        else:
+            cpu_type = int.from_bytes(prefix[4:8], "big", signed=False)
+        expected_cpu = 0x0100000C if target == SUPPORTED_TARGET else 0x01000007
+        _require(
+            cpu_type == expected_cpu,
+            f"CLI executable CPU type {cpu_type:#x} is not pinned for {target}",
+        )
+        return
+    if target.endswith("-windows-msvc"):
+        _require(len(prefix) >= 0x40 and prefix[:2] == b"MZ", "CLI executable is not a PE binary")
+        pe_offset = int.from_bytes(prefix[0x3C:0x40], "little", signed=False)
+        _require(
+            pe_offset + 6 <= len(prefix) and prefix[pe_offset : pe_offset + 4] == b"PE\0\0",
+            "CLI executable has no valid PE header",
+        )
+        machine = int.from_bytes(prefix[pe_offset + 4 : pe_offset + 6], "little", signed=False)
+        architecture = target.split("-", 1)[0]
+        expected_machine = {
+            "x86_64": 0x8664,
+            "aarch64": 0xAA64,
+            "i686": 0x014C,
+        }.get(architecture)
+        _require(
+            expected_machine is not None,
+            f"CLI executable target architecture is unsupported: {target}",
+        )
+        _require(
+            machine == expected_machine,
+            f"CLI executable COFF machine {machine:#x} is not pinned for {target}",
+        )
+        return
+    _require(len(prefix) >= 20 and prefix[:4] == b"\x7fELF", "CLI executable is not an ELF binary")
+    architecture = target.split("-", 1)[0]
+    expected = {
+        "x86_64": (2, 0x003E),
+        "aarch64": (2, 0x00B7),
+        "i686": (1, 0x0003),
+        "armv7": (1, 0x0028),
+    }.get(architecture)
+    _require(
+        expected is not None,
+        f"CLI executable target architecture is unsupported: {target}",
+    )
+    elf_class, expected_machine = expected
+    _require(
+        prefix[4] == elf_class,
+        f"CLI executable ELF class {prefix[4]} is not pinned for {target}",
+    )
+    _require(
+        prefix[5] == 1,
+        "CLI executable ELF header has unsupported byte order",
+    )
+    machine = int.from_bytes(prefix[18:20], "little", signed=False)
+    _require(
+        machine == expected_machine,
+        f"CLI executable ELF machine {machine:#x} is not pinned for {target}",
+    )
+
+
+def _run_cli_raw(
+    binary: Path,
+    arguments: Iterable[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one release CLI command with bounded captured output."""
+    try:
+        return subprocess.run(
+            [str(binary), *arguments],
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except OSError as error:
+        raise VerificationFailure(f"run installed CLI {binary}: {error}") from error
+    except subprocess.TimeoutExpired as error:
+        raise VerificationFailure(
+            f"installed CLI timed out after {timeout}s: {' '.join(arguments)}"
+        ) from error
+
+
+def _run_cli(
+    binary: Path,
+    arguments: Iterable[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    label: str,
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one CLI command and turn any non-zero exit into a gate failure."""
+    completed = _run_cli_raw(
+        binary,
+        arguments,
+        cwd=cwd,
+        environment=environment,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+        stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+        details = stderr or stdout or f"exit status {completed.returncode}"
+        raise VerificationFailure(f"{label} failed: {details[-4000:]}")
+    return completed
+
+
+def _run_cli_json(
+    binary: Path,
+    arguments: Iterable[str],
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    label: str,
+    timeout: int = 180,
+) -> dict[str, Any]:
+    """Run a JSON-producing CLI command and require one object result."""
+    completed = _run_cli(
+        binary,
+        arguments,
+        cwd=cwd,
+        environment=environment,
+        label=label,
+        timeout=timeout,
+    )
+    try:
+        value = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VerificationFailure(f"{label} did not return valid JSON: {error}") from error
+    _require(isinstance(value, dict), f"{label} must return one JSON object")
+    return value
+
+
+def _initialize_e2e_project(project: Path, *, environment: dict[str, str]) -> None:
+    """Create the smallest committed project accepted by the installed CLI."""
+    project.mkdir(parents=True, exist_ok=False)
+    (project / "src").mkdir()
+    (project / "Cargo.toml").write_text(
+        "[package]\nname = \"ncm-installed-e2e\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+        encoding="utf-8",
+    )
+    (project / "src/lib.rs").write_text(
+        "pub fn ncm_installed_e2e_fixture() -> u8 { 7 }\n",
+        encoding="utf-8",
+    )
+    for arguments in (
+        ("git", "init", "--quiet", "-b", "main"),
+        ("git", "config", "user.email", "ncm-release@example.com"),
+        ("git", "config", "user.name", "NCM Release"),
+        ("git", "add", "."),
+        ("git", "commit", "--quiet", "-m", "initial"),
+    ):
+        try:
+            completed = subprocess.run(
+                list(arguments),
+                cwd=project,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise VerificationFailure(f"initialize installed CLI project: {error}") from error
+        if completed.returncode != 0:
+            details = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise VerificationFailure(
+                f"initialize installed CLI project command {' '.join(arguments)} failed: {details[-2000:]}"
+            )
+
+
+def _authority_paths(profile_root: Path) -> tuple[Path, ...]:
+    """Return the platform-specific daemon authority record candidates."""
+    return (
+        profile_root / "daemon-authority.json",
+        profile_root / "daemon-authority" / "daemon-authority.json",
+    )
+
+
+def _read_authority_record(
+    paths: tuple[Path, ...],
+    *,
+    expected_profile_root: Path,
+) -> dict[str, Any] | None:
+    """Read one valid authority record without accepting a stale malformed file."""
+    for path in paths:
+        if not path.exists():
+            continue
+        record, _ = _load_json(path, "daemon authority record", MAX_RECEIPT_BYTES)
+        _require(
+            isinstance(record.get("pid"), int)
+            and not isinstance(record.get("pid"), bool)
+            and record["pid"] > 0,
+            "daemon authority record pid is invalid",
+        )
+        _require(
+            isinstance(record.get("process_run_id"), str)
+            and bool(record["process_run_id"]),
+            "daemon authority record process_run_id is invalid",
+        )
+        _require(
+            isinstance(record.get("epoch"), int)
+            and not isinstance(record.get("epoch"), bool)
+            and record["epoch"] > 0,
+            "daemon authority record epoch is invalid",
+        )
+        _require(
+            isinstance(record.get("version"), str) and bool(record["version"]),
+            "daemon authority record version is invalid",
+        )
+        try:
+            observed_root = Path(record["profile_root"]).resolve()
+        except (OSError, RuntimeError) as error:
+            raise VerificationFailure("daemon authority record profile root is invalid") from error
+        _require(
+            observed_root == expected_profile_root.resolve(),
+            "daemon authority record belongs to a different profile",
+        )
+        return record
+    return None
+
+
+def _wait_for_authority(
+    paths: tuple[Path, ...],
+    *,
+    expected_profile_root: Path,
+    previous: dict[str, Any] | None = None,
+    timeout: int = 180,
+) -> dict[str, Any]:
+    """Wait for a fresh daemon authority record after install or restart."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        record = _read_authority_record(paths, expected_profile_root=expected_profile_root)
+        if record is not None and (
+            previous is None
+            or any(
+                record.get(key) != previous.get(key)
+                for key in ("pid", "process_run_id", "epoch")
+            )
+        ):
+            return record
+        time.sleep(0.25)
+    raise VerificationFailure(
+        "timed out waiting for the installed daemon authority after "
+        f"{timeout}s ({', '.join(str(path) for path in paths)})"
+    )
+
+
+def _worker_handshake(
+    worker: Path,
+    state_root: Path,
+    *,
+    expected_artifact_sha256: str,
+) -> dict[str, Any]:
+    """Launch the production worker and require its real encoder identity."""
+    _lstat_regular(worker, "installed NCM worker")
+    if os.name != "nt":
+        _require(worker.stat().st_mode & 0o111, "installed NCM worker is not executable")
+    request = canonical_json(
+        {
+            "protocol_version": 1,
+            "id": 1,
+            "deadline_ms": 30_000,
+            "op": "handshake",
+            "namespace": "0" * 64,
+            "payload": {
+                "protocol_version": 1,
+                "algorithm_profile": "ncm-biomem-rs.v1",
+            },
+        }
+    )
+    frame = struct.pack(">I", len(request)) + request
+    environment = os.environ.copy()
+    # A production worker must not resolve a Python or test-double substitute
+    # from PATH. The executable and the pinned model tree are its only inputs.
+    environment["PATH"] = ""
+    try:
+        completed = subprocess.run(
+            [str(worker), "--state-root", str(state_root)],
+            input=frame,
+            capture_output=True,
+            check=False,
+            timeout=120,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise VerificationFailure(f"launch production NCM worker handshake: {error}") from error
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+    _require(
+        completed.returncode == 0,
+        f"production NCM worker handshake process failed: {stderr[-2000:]}",
+    )
+    _require(len(completed.stdout) >= 4, "production NCM worker returned no framed handshake")
+    length = struct.unpack(">I", completed.stdout[:4])[0]
+    _require(
+        length > 0 and len(completed.stdout) == length + 4,
+        "production NCM worker handshake frame is truncated or has trailing bytes",
+    )
+    try:
+        reply = json.loads(completed.stdout[4:].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise VerificationFailure(f"production NCM worker handshake is invalid JSON: {error}") from error
+    _require(isinstance(reply, dict), "production NCM worker handshake must be an object")
+    _require(
+        str(reply.get("outcome", "")).lower() == "success",
+        f"production NCM worker handshake failed: {reply}",
+    )
+    payload = reply.get("payload")
+    _require(isinstance(payload, dict), "production NCM worker handshake has no payload")
+    encoder = payload.get("encoder")
+    _require(isinstance(encoder, dict), "production NCM worker handshake has no encoder identity")
+    _require(
+        encoder.get("model") == MODEL_NAME,
+        "production NCM worker handshake did not expose the pinned MiniLM model",
+    )
+    _require(
+        encoder.get("artifact_sha256") == expected_artifact_sha256,
+        "production NCM worker handshake artifact digest differs from the pinned model",
+    )
+    return {
+        "outcome": "success",
+        "model": encoder.get("model"),
+        "artifact_sha256": encoder.get("artifact_sha256"),
+        "algorithm": payload.get("algorithm"),
+        "state_generation": reply.get("state_generation"),
+    }
+
+
+def _status_with_identity(
+    binary: Path,
+    project: Path,
+    *,
+    environment: dict[str, str],
+    profile_root: Path,
+    model_root: Path,
+) -> dict[str, Any]:
+    """Require status to expose the complete installed sidecar/model binding."""
+    status = _run_cli_json(
+        binary,
+        ("ncm", "status", "--path", str(project), "--json"),
+        cwd=project,
+        environment=environment,
+        label="installed NCM status",
+    )
+    for key in (
+        "enabled",
+        "platform_supported",
+        "worker_present",
+        "manifest_present",
+        "model_acquisition_manifest_present",
+        "model_manifest_present",
+        "encoder_ready",
+    ):
+        _require(status.get(key) is True, f"installed NCM status does not prove {key}")
+    _require(
+        Path(_require_string(status.get("profile_root"), "NCM status profile_root")).resolve()
+        == profile_root.resolve(),
+        "installed NCM status profile root differs from the isolated service profile",
+    )
+    _require(
+        Path(_require_string(status.get("state_root"), "NCM status state_root")).resolve()
+        == model_root.resolve(),
+        "installed NCM status state root differs from the pinned model root",
+    )
+    for key in ("worker_path", "worker_manifest_path", "model_acquisition_manifest_path"):
+        _require_string(status.get(key), f"NCM status {key}")
+    return status
+
+
+def verify_installed_e2e(
+    binary: Path,
+    worker_archive: Path,
+    model_root: Path,
+    manifest: dict[str, Any],
+    *,
+    acquisition_manifest_bytes: bytes,
+    embedding_manifest_path: Path,
+    worker_manifest_path: Path,
+    revision_receipt: Path,
+    target: str,
+    release_name: str,
+    profile: str,
+    expected_version: str | None,
+    expected_source_sha: str | None,
+    expected_binary_sha256: str | None,
+) -> dict[str, Any]:
+    """Exercise CLI install, service restart, and a production worker handshake."""
+    _require(target == SUPPORTED_TARGET, "installed NCM E2E requires the supported arm64 macOS target")
+    _require(release_name == SUPPORTED_RELEASE_NAME, "installed NCM E2E release name is unsupported")
+    _require(profile in {"stable", "beta"}, "installed NCM E2E release profile is invalid")
+    binary = binary.absolute()
+    model_root = model_root.absolute()
+    _require_release_version(expected_version, "expected release version")
+    _require_source_sha(expected_source_sha, "expected source SHA")
+    expected_binary_sha256 = _require_digest(
+        expected_binary_sha256,
+        "expected installed CLI SHA-256",
+    )
+    _lstat_regular(binary, "installed CLI binary")
+    if os.name != "nt":
+        _require(binary.stat().st_mode & 0o111, "installed CLI binary is not executable")
+    _verify_executable_format(binary, target=target)
+    _probe_cli_identity(
+        binary,
+        expected_version=expected_version,
+        expected_source_sha=expected_source_sha,
+    )
+    _require(
+        _digest_regular(binary, "installed CLI binary")[1] == expected_binary_sha256,
+        "installed CLI digest differs from the trusted release identity",
+    )
+    _lstat_directory(model_root, "installed NCM model root")
+    embedding_bytes = _read_regular(embedding_manifest_path, "trusted embedding manifest")
+    verified_before = verify_model_tree(
+        model_root,
+        manifest,
+        manifest_bytes=embedding_bytes,
+        receipt_required=True,
+        revision_receipt=revision_receipt,
+    )
+    _require(
+        not _journal_path(model_root).exists(),
+        "installed NCM model root has a pending lifecycle journal before the CLI E2E gate",
+    )
+    expected_artifact_sha256 = next(
+        entry["sha256"] for entry in manifest["files"] if entry["path"] == "onnx/model.onnx"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ncm-installed-e2e-") as directory:
+        e2e_root = Path(directory)
+        home = e2e_root / "home"
+        profile_root = e2e_root / "profile"
+        config_root = home / ".config"
+        project = e2e_root / "project"
+        worker_root = e2e_root / "worker"
+        for path in (home, profile_root, config_root, worker_root):
+            path.mkdir(parents=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(home),
+                "USERPROFILE": str(home),
+                "XDG_CONFIG_HOME": str(config_root),
+                "TRACEDECAY_DATA_DIR": str(profile_root),
+                "TRACEDECAY_GLOBAL_DB": str(profile_root / "global.db"),
+                "TRACEDECAY_SERVICE_NAMESPACE": (
+                    f"ncm-e2e-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                ),
+                "TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN": "1",
+            }
+        )
+        for key in ("HF_HOME", "HF_ENDPOINT", "FASTEMBED_CACHE_DIR", "TRACEDECAY_NCM_WORKER"):
+            environment.pop(key, None)
+        _initialize_e2e_project(project, environment=environment)
+        names = _extract_tar(worker_archive, worker_root)
+        expected_names = [WORKER_NAME, WORKER_MANIFEST_NAME, MODEL_ACQUISITION_MANIFEST_NAME]
+        _require(names == expected_names, f"installed NCM E2E sidecar entries differ: {names}")
+        worker = worker_root / WORKER_NAME
+        worker_manifest = worker_root / WORKER_MANIFEST_NAME
+        model_manifest = worker_root / MODEL_ACQUISITION_MANIFEST_NAME
+        sidecar_worker_data, _ = _load_json(worker_manifest, "E2E sidecar worker manifest")
+        sidecar_worker_pin = _worker_manifest(sidecar_worker_data, target=target)
+        _verify_executable_format(worker, target=target)
+        sidecar_worker_size, sidecar_worker_digest = _digest_regular(
+            worker, "E2E sidecar worker"
+        )
+        _require(
+            sidecar_worker_size == sidecar_worker_pin["bytes"]
+            and sidecar_worker_digest == sidecar_worker_pin["sha256"],
+            "E2E sidecar worker differs from the trusted target pin",
+        )
+        _lstat_regular(worker_manifest, "E2E sidecar worker manifest")
+        _lstat_regular(model_manifest, "E2E sidecar model acquisition manifest")
+        _require(
+            _read_regular(worker_manifest, "E2E sidecar worker manifest")
+            == _read_regular(worker_manifest_path, "trusted worker manifest"),
+            "E2E sidecar worker manifest differs from the canonical worker manifest",
+        )
+        _require(
+            _read_regular(model_manifest, "E2E sidecar model acquisition manifest")
+            == acquisition_manifest_bytes,
+            "E2E sidecar model acquisition manifest differs from the canonical release descriptor",
+        )
+
+        authority_paths = _authority_paths(profile_root)
+        service_installed = False
+        cleanup_error: str | None = None
+        failure: Exception | None = None
+        before_status: dict[str, Any] | None = None
+        after_status: dict[str, Any] | None = None
+        handshake: dict[str, Any] | None = None
+        evidence: dict[str, Any] | None = None
+        try:
+            _run_cli(
+                binary,
+                ("daemon", "install-service"),
+                cwd=project,
+                environment=environment,
+                label="installed daemon service install",
+            )
+            service_installed = True
+            first_authority = _wait_for_authority(
+                authority_paths,
+                expected_profile_root=profile_root,
+            )
+            # `init` can race the daemon's code-index scheduler during a cold
+            # service start; retry only that typed warming outcome.
+            init_deadline = time.monotonic() + 180
+            while True:
+                init = _run_cli_raw(
+                    binary,
+                    ("init",),
+                    cwd=project,
+                    environment=environment,
+                    timeout=180,
+                )
+                if init.returncode == 0:
+                    break
+                init_stderr = init.stderr.decode("utf-8", errors="replace")
+                if "code_index_scheduler_unavailable" not in init_stderr or time.monotonic() >= init_deadline:
+                    _require(
+                        False,
+                        f"installed CLI init failed: {init_stderr.strip()[-4000:]}",
+                    )
+                time.sleep(0.25)
+            _run_cli(
+                binary,
+                (
+                    "--yes",
+                    "ncm",
+                    "install",
+                    "--path",
+                    str(project),
+                    "--worker",
+                    str(worker),
+                    "--state-root",
+                    str(model_root),
+                    "--json",
+                ),
+                cwd=project,
+                environment=environment,
+                label="installed NCM CLI install",
+            )
+            before_status = _status_with_identity(
+                binary,
+                project,
+                environment=environment,
+                profile_root=profile_root,
+                model_root=model_root,
+            )
+            _require(
+                Path(before_status["worker_path"]).resolve().is_file(),
+                "installed NCM status worker path is missing",
+            )
+            _run_cli(
+                binary,
+                ("daemon", "restart"),
+                cwd=project,
+                environment=environment,
+                label="installed daemon service restart",
+            )
+            _wait_for_authority(
+                authority_paths,
+                expected_profile_root=profile_root,
+                previous=first_authority,
+            )
+            after_status = _status_with_identity(
+                binary,
+                project,
+                environment=environment,
+                profile_root=profile_root,
+                model_root=model_root,
+            )
+            _require(
+                after_status["worker_path"] == before_status["worker_path"],
+                "daemon restart changed the installed NCM worker binding",
+            )
+            verified_after = verify_model_tree(
+                model_root,
+                manifest,
+                manifest_bytes=embedding_bytes,
+                receipt_required=True,
+                revision_receipt=revision_receipt,
+            )
+            _require(
+                not _journal_path(model_root).exists(),
+                "installed daemon restart left a pending model lifecycle journal",
+            )
+            installed_worker = Path(after_status["worker_path"])
+            _lstat_regular(installed_worker, "installed staged NCM worker")
+            _verify_executable_format(installed_worker, target=target)
+            installed_worker_size, installed_worker_digest = _digest_regular(
+                installed_worker, "installed staged NCM worker"
+            )
+            _require(
+                installed_worker_size == sidecar_worker_pin["bytes"]
+                and installed_worker_digest == sidecar_worker_pin["sha256"],
+                "installed staged NCM worker differs from the trusted target pin",
+            )
+            installed_worker_root = installed_worker.resolve()
+            expected_worker_root = (profile_root / "ncm" / "worker").resolve()
+            _require(
+                installed_worker_root.is_relative_to(expected_worker_root),
+                "installed NCM worker escaped the isolated profile worker root",
+            )
+            installed_manifest = Path(after_status["worker_manifest_path"])
+            installed_model_manifest = Path(after_status["model_acquisition_manifest_path"])
+            _require(
+                _read_regular(installed_manifest, "installed worker manifest")
+                == _read_regular(worker_manifest_path, "trusted worker manifest"),
+                "installed worker manifest differs from the canonical worker manifest",
+            )
+            _require(
+                _read_regular(installed_model_manifest, "installed model acquisition manifest")
+                == acquisition_manifest_bytes,
+                "installed model acquisition manifest differs from the canonical release descriptor",
+            )
+            handshake = _worker_handshake(
+                installed_worker,
+                model_root,
+                expected_artifact_sha256=expected_artifact_sha256,
+            )
+            evidence = {
+                "mode": "installed-cli-service-restart",
+                "profile": profile,
+                "target": target,
+                "version": expected_version,
+                "source_sha": expected_source_sha,
+                "binary_sha256": expected_binary_sha256,
+                "model_tree_before": verified_before,
+                "model_tree_after": verified_after,
+                "before_status": before_status,
+                "after_status": after_status,
+                "worker_handshake": handshake,
+            }
+        except Exception as error:
+            failure = error
+        finally:
+            if service_installed:
+                try:
+                    cleanup = _run_cli_raw(
+                        binary,
+                        ("daemon", "uninstall-service"),
+                        cwd=project,
+                        environment=environment,
+                        timeout=120,
+                    )
+                    if cleanup.returncode != 0:
+                        detail = cleanup.stderr.decode("utf-8", errors="replace").strip()
+                        cleanup_error = detail[-2000:] or f"exit status {cleanup.returncode}"
+                except VerificationFailure as error:
+                    cleanup_error = str(error)
+        if failure is not None:
+            raise failure
+        _require(cleanup_error is None, f"installed daemon service cleanup failed: {cleanup_error}")
+        _require(
+            evidence is not None
+            and before_status is not None
+            and after_status is not None
+            and handshake is not None,
+            "installed NCM E2E produced incomplete evidence",
+        )
+        return evidence
+
+
+def verify_binary_archive(
+    path: Path,
+    *,
+    target: str,
+    profile: str = "stable",
+    expected_version: str | None = None,
+    expected_source_sha: str | None = None,
+    expected_archive_sha256: str | None = None,
+    expected_binary_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Extract a CLI archive and prove its trusted release/source identity."""
     _lstat_regular(path, "CLI release archive")
+    expected_version = _require_release_version(expected_version, "expected release version")
+    expected_source_sha = _require_source_sha(expected_source_sha, "expected source SHA")
+    expected_archive_sha256 = _require_digest(
+        expected_archive_sha256,
+        "expected CLI archive SHA-256",
+    )
+    if expected_binary_sha256 is not None:
+        expected_binary_sha256 = _require_digest(
+            expected_binary_sha256,
+            "expected installed CLI SHA-256",
+        )
+    archive_size, archive_digest = _digest_regular(path, "CLI release archive")
+    _require(
+        archive_digest == expected_archive_sha256,
+        "CLI release archive digest differs from the trusted release identity",
+    )
     expected_name = "tracedecay.exe" if path.suffix == ".zip" or target.endswith("windows-msvc") else "tracedecay"
     with tempfile.TemporaryDirectory(prefix="ncm-release-cli-") as directory:
         root = Path(directory)
@@ -492,23 +1386,68 @@ def verify_binary_archive(path: Path, *, target: str, profile: str = "stable") -
         _lstat_regular(binary, "installed CLI binary")
         if os.name != "nt":
             _require(binary.stat().st_mode & 0o111, f"installed CLI binary is not executable: {binary}")
-        for arguments in (("--version",), ("--help",)):
-            completed = subprocess.run([str(binary), *arguments], capture_output=True, text=True, check=False, timeout=30)
-            _require(completed.returncode == 0, f"installed CLI {arguments[0]} failed: {completed.stderr.strip()}")
+        _verify_executable_format(binary, target=target)
+        _probe_cli_identity(
+            binary,
+            expected_version=expected_version,
+            expected_source_sha=expected_source_sha,
+        )
         bytes_count, digest = _digest_regular(binary, "installed CLI binary")
-        return {"path": str(path), "entry": expected_name, "bytes": bytes_count, "sha256": digest, "profile": profile, "target": target}
+        if expected_binary_sha256 is not None:
+            _require(
+                digest == expected_binary_sha256,
+                "extracted CLI binary digest differs from the separately verified installed binary",
+            )
+        return {
+            "path": str(path),
+            "entry": expected_name,
+            "bytes": bytes_count,
+            "sha256": digest,
+            "archive_bytes": archive_size,
+            "archive_sha256": archive_digest,
+            "profile": profile,
+            "target": target,
+            "version": expected_version,
+            "source_sha": expected_source_sha,
+        }
 
 
-def verify_installed_binary(path: Path) -> dict[str, Any]:
-    """Run the already installed binary without changing its configuration."""
+def verify_installed_binary(
+    path: Path,
+    *,
+    target: str,
+    expected_version: str | None = None,
+    expected_source_sha: str | None = None,
+    expected_binary_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Run an installed binary and prove its trusted release/source identity."""
     _lstat_regular(path, "installed CLI binary")
     if os.name != "nt":
         _require(path.stat().st_mode & 0o111, f"installed CLI binary is not executable: {path}")
-    for arguments in (("--version",), ("--help",)):
-        completed = subprocess.run([str(path), *arguments], capture_output=True, text=True, check=False, timeout=30)
-        _require(completed.returncode == 0, f"installed CLI {arguments[0]} failed: {completed.stderr.strip()}")
+    expected_version = _require_release_version(expected_version, "expected release version")
+    expected_source_sha = _require_source_sha(expected_source_sha, "expected source SHA")
+    expected_binary_sha256 = _require_digest(
+        expected_binary_sha256,
+        "expected installed CLI SHA-256",
+    )
+    _verify_executable_format(path, target=target)
+    _probe_cli_identity(
+        path,
+        expected_version=expected_version,
+        expected_source_sha=expected_source_sha,
+    )
     size, digest = _digest_regular(path, "installed CLI binary")
-    return {"path": str(path), "bytes": size, "sha256": digest}
+    _require(
+        digest == expected_binary_sha256,
+        "installed CLI digest differs from the trusted release identity",
+    )
+    return {
+        "path": str(path),
+        "bytes": size,
+        "sha256": digest,
+        "version": expected_version,
+        "source_sha": expected_source_sha,
+    }
 
 
 def verify_worker_archive(
@@ -517,6 +1456,7 @@ def verify_worker_archive(
     target: str = SUPPORTED_TARGET,
     worker_manifest_path: Path | None = None,
     model_manifest_path: Path | None = None,
+    revision_receipt_path: Path | None = None,
     checksum_path: Path | None = None,
 ) -> dict[str, Any]:
     """Verify a target-specific worker sidecar and both trusted manifests."""
@@ -557,12 +1497,19 @@ def verify_worker_archive(
             stat.S_IMODE(model_manifest_metadata.st_mode) == 0o644,
             "sidecar model acquisition manifest must have mode 0644",
         )
+        _verify_executable_format(worker, target=target)
         worker_data, _ = _load_json(worker_manifest, "sidecar worker manifest")
         pin = _worker_manifest(worker_data, target=target)
         worker_size, worker_digest = _digest_regular(worker, "sidecar worker")
         _require(worker_size == pin["bytes"] and worker_digest == pin["sha256"], "sidecar worker bytes or digest differs from target pin")
         acquisition, acquisition_bytes = _load_json(model_manifest, "sidecar model acquisition manifest")
-        validate_acquisition_manifest(acquisition, target=target, release_name=SUPPORTED_RELEASE_NAME, embedding_manifest=None)
+        validate_acquisition_manifest(
+            acquisition,
+            target=target,
+            release_name=SUPPORTED_RELEASE_NAME,
+            embedding_manifest=None,
+            revision_receipt=revision_receipt_path,
+        )
         trusted_bytes = _read_regular(worker_manifest_path, "trusted worker manifest")
         _require(trusted_bytes == _read_regular(worker_manifest, "sidecar worker manifest"), "sidecar worker manifest differs from trusted target manifest")
         trusted_bytes = _read_regular(model_manifest_path, "trusted model acquisition manifest")
@@ -709,9 +1656,16 @@ def _require_exact_entries(
     )
 
 
-def verify_model_tree(root: Path, manifest: dict[str, Any], *, manifest_bytes: bytes | None = None) -> dict[str, Any]:
+def verify_model_tree(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    manifest_bytes: bytes | None = None,
+    receipt_required: bool = False,
+    revision_receipt: Path | None = None,
+) -> dict[str, Any]:
     """Verify the exact cache layout and every pinned artifact byte."""
-    validate_acquisition_manifest(manifest)
+    validate_acquisition_manifest(manifest, revision_receipt=revision_receipt)
     models, snapshot = _model_tree_paths(root, manifest)
     _require_exact_entries(
         models,
@@ -747,13 +1701,26 @@ def verify_model_tree(root: Path, manifest: dict[str, Any], *, manifest_bytes: b
     runtime_bytes = _read_regular(runtime_manifest, "installed runtime model manifest")
     expected_runtime = manifest_bytes if manifest_bytes is not None else _manifest_runtime_bytes(manifest)
     _require(runtime_bytes == expected_runtime, "installed runtime model manifest differs from the release pin")
-    return {
+    result = {
         "root": str(root),
         "revision": MODEL_REVISION,
         "manifest_sha256": sha256_bytes(runtime_bytes),
         "files": [{"path": path, "bytes": entry["bytes"], "sha256": entry["sha256"]} for path, entry in expected_files.items()],
         "tree_sha256": _tree_digest(models),
     }
+    if receipt_required:
+        _require(
+            revision_receipt is not None,
+            "installed model verification requires the canonical model revision receipt",
+        )
+        _validate_installed_receipt(
+            root,
+            manifest,
+            result,
+            expected_operation_id=None,
+            revision_receipt=revision_receipt,
+        )
+    return result
 
 
 def _operation_id(operation: str) -> str:
@@ -816,7 +1783,12 @@ def _read_journal(root: Path) -> dict[str, Any] | None:
     return value
 
 
-def recover_model(root: Path) -> dict[str, Any]:
+def recover_model(
+    root: Path,
+    manifest: dict[str, Any] | None = None,
+    *,
+    revision_receipt: Path | None = None,
+) -> dict[str, Any]:
     """Recover one interrupted publication using the journal's digest guards."""
     _ensure_private_directory(root)
     journal = _read_journal(root)
@@ -855,13 +1827,46 @@ def recover_model(root: Path) -> dict[str, Any]:
     if models.exists() or models.is_symlink():
         _require(not models.is_symlink(), "live model directory must not be a symlink during recovery")
         published_digest = _tree_digest(models)
-        if phase == "published" and published_digest == journal.get("after_digest"):
-            if backup is not None and backup.exists():
-                shutil.rmtree(backup)
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging)
-            _journal_path(root).unlink(missing_ok=True)
-            return {"outcome": "committed", "root": str(root), "recovered": "published"}
+    if phase == "published":
+        # Publication is not committed until the release acquisition receipt is
+        # durable. A process crash between the directory rename and receipt
+        # write must leave the journal in place and fail closed; deleting that
+        # journal would turn an unrecorded model tree into accepted state.
+        _require(
+            published_digest is not None
+            and published_digest == journal.get("after_digest"),
+            "published model tree differs from the transaction candidate",
+        )
+        _require(
+            manifest is not None,
+            "published model lifecycle recovery requires the pinned acquisition manifest",
+        )
+        _require(
+            revision_receipt is not None,
+            "published model lifecycle recovery requires the canonical model revision receipt",
+        )
+        verified = verify_model_tree(
+            root,
+            manifest,
+            revision_receipt=revision_receipt,
+        )
+        _validate_installed_receipt(
+            root,
+            manifest,
+            verified,
+            expected_operation_id=journal["operation_id"],
+            revision_receipt=revision_receipt,
+        )
+        if backup is not None and backup.exists():
+            _require(not backup.is_symlink(), "model rollback backup must not be a symlink")
+            shutil.rmtree(backup)
+        if staging is not None and staging.exists():
+            _require(not staging.is_symlink(), "model staging directory must not be a symlink")
+            shutil.rmtree(staging)
+        _journal_path(root).unlink(missing_ok=True)
+        _sync_directory(root)
+        return {"outcome": "committed", "root": str(root), "recovered": "published"}
+    if published_digest is not None:
         _require(
             published_digest == journal.get("after_digest"),
             "live model tree changed outside the model transaction",
@@ -910,6 +1915,7 @@ def acquire_model(
     operation: str = "install",
     source_dir: Path | None = None,
     embedding_manifest_path: Path | None = None,
+    revision_receipt_path: Path | None = None,
     receipt_path: Path | None = None,
     failure_after: str | None = None,
 ) -> dict[str, Any]:
@@ -925,13 +1931,22 @@ def acquire_model(
         trusted_embedding, trusted_runtime_bytes = _load_json(embedding_manifest_path, "trusted embedding manifest")
         # The release descriptor compares the source manifest's raw identity,
         # while the runtime stores the same object under its state root.
-    files = validate_acquisition_manifest(manifest, embedding_manifest=embedding_manifest_path)
+    files = validate_acquisition_manifest(
+        manifest,
+        embedding_manifest=embedding_manifest_path,
+        revision_receipt=revision_receipt_path,
+    )
     pending = _read_journal(root)
     _require(pending is None, f"model lifecycle has a pending journal at {_journal_path(root)}; recover first")
     models = root / "models"
     if operation == "install" and models.exists():
         try:
-            existing = verify_model_tree(root, manifest, manifest_bytes=trusted_runtime_bytes)
+            existing = verify_model_tree(
+                root,
+                manifest,
+                manifest_bytes=trusted_runtime_bytes,
+                revision_receipt=revision_receipt_path,
+            )
         except VerificationFailure as error:
             raise VerificationFailure(f"existing model tree is present but not the exact pin: {error}") from error
         receipt = _receipt(manifest, operation, "already_present", root, existing, _operation_id(operation))
@@ -990,7 +2005,12 @@ def acquire_model(
         candidate.rename(models)
         journal["phase"] = "published"
         _write_atomic(_journal_path(root), json.dumps(journal, indent=2).encode("utf-8") + b"\n")
-        verified = verify_model_tree(root, manifest, manifest_bytes=runtime_bytes)
+        verified = verify_model_tree(
+            root,
+            manifest,
+            manifest_bytes=runtime_bytes,
+            revision_receipt=revision_receipt_path,
+        )
         _require(verified["tree_sha256"] == candidate_digest, "published model tree changed during verification")
         receipt = _receipt(manifest, operation, "committed", root, verified, operation_id)
         try:
@@ -1012,7 +2032,11 @@ def acquire_model(
         # Keep a journal long enough for an external recover, but perform the
         # same rollback immediately so an ordinary failed command is safe.
         try:
-            recover_model(root)
+            recover_model(
+                root,
+                manifest,
+                revision_receipt=revision_receipt_path,
+            )
         except Exception as recovery_error:
             raise VerificationFailure(f"model acquisition failed ({error}); recovery failed: {recovery_error}") from recovery_error
         if isinstance(error, VerificationFailure):
@@ -1032,12 +2056,104 @@ def _receipt(manifest: dict[str, Any], operation: str, outcome: str, root: Path,
         "repository": manifest["repository"],
         "revision": manifest["revision"],
         "manifest_sha256": manifest["embedding_manifest_sha256"],
+        "revision_provenance_sha256": manifest["revision_provenance_sha256"],
         "acquisition_manifest_sha256": sha256_bytes(canonical_json(manifest)),
         "root": str(root),
         "tree_sha256": verified["tree_sha256"],
         "files": verified["files"],
         "created_at_unix": int(time.time()),
     }
+
+
+def _validate_installed_receipt(
+    root: Path,
+    manifest: dict[str, Any],
+    verified: dict[str, Any],
+    *,
+    expected_operation_id: str | None = None,
+    revision_receipt: Path | None = None,
+) -> None:
+    """Require the installed state receipt to identify the canonical model pin."""
+    if revision_receipt is not None:
+        validate_acquisition_manifest(manifest, revision_receipt=revision_receipt)
+    receipt_path = root / manifest["receipt"]["relative_path"]
+    receipt, _ = _load_json(receipt_path, "installed model acquisition receipt", MAX_RECEIPT_BYTES)
+    required = set(manifest["receipt"]["required_fields"])
+    _require(
+        required <= set(receipt),
+        "installed model acquisition receipt omits required identity fields",
+    )
+    _require(receipt.get("schema_version") == 1, "installed model acquisition receipt schema_version is invalid")
+    operation_id = receipt.get("operation_id")
+    _require(
+        isinstance(operation_id, str) and bool(operation_id),
+        "installed model acquisition receipt operation_id is invalid",
+    )
+    if expected_operation_id is not None:
+        _require(
+            operation_id == expected_operation_id,
+            "installed model acquisition receipt operation identity differs from the pending transaction",
+        )
+    _require(receipt.get("operation") in {"install", "update"}, "installed model acquisition receipt operation is invalid")
+    _require(receipt.get("outcome") in {"committed", "already_present"}, "installed model acquisition receipt outcome is invalid")
+    for key in ("target", "model", "repository", "revision"):
+        _require(receipt.get(key) == manifest[key], f"installed model acquisition receipt {key} differs from the release pin")
+    _require(
+        receipt.get("manifest_sha256") == manifest["embedding_manifest_sha256"],
+        "installed model acquisition receipt manifest digest differs from the canonical model manifest",
+    )
+    _require(
+        receipt.get("revision_provenance_sha256") == manifest["revision_provenance_sha256"],
+        "installed model acquisition receipt revision receipt digest differs from the canonical receipt",
+    )
+    _require(
+        receipt.get("acquisition_manifest_sha256") == sha256_bytes(canonical_json(manifest)),
+        "installed model acquisition receipt descriptor digest differs from the release pin",
+    )
+    receipt_files = receipt.get("files")
+    _require(isinstance(receipt_files, list), "installed model acquisition receipt files must be a list")
+    expected_files = {
+        entry["path"]: {"path": entry["path"], "bytes": entry["bytes"], "sha256": entry["sha256"]}
+        for entry in manifest["files"]
+    }
+    seen_files: set[str] = set()
+    validated_files: list[tuple[str, dict[str, Any]]] = []
+    for index, entry in enumerate(receipt_files):
+        _require(
+            isinstance(entry, dict),
+            f"installed model acquisition receipt files[{index}] must be an object",
+        )
+        relative = _safe_relative_path(
+            entry.get("path"),
+            f"installed model acquisition receipt files[{index}].path",
+        )
+        _require(
+            relative not in seen_files,
+            f"installed model acquisition receipt repeats {relative}",
+        )
+        _require_positive_int(
+            entry.get("bytes"),
+            f"installed model acquisition receipt files[{index}].bytes",
+        )
+        _require_digest(
+            entry.get("sha256"),
+            f"installed model acquisition receipt files[{index}].sha256",
+        )
+        seen_files.add(relative)
+        validated_files.append((relative, entry))
+    _require(
+        seen_files == set(expected_files),
+        "installed model acquisition receipt file set differs from the canonical model manifest",
+    )
+    for relative, entry in validated_files:
+        _require(
+            entry == expected_files[relative],
+            "installed model acquisition receipt files differ from the canonical model manifest",
+        )
+    _require(
+        receipt.get("tree_sha256") == verified["tree_sha256"],
+        "installed model acquisition receipt tree digest differs from the installed model",
+    )
 
 
 def verify_release_contract(repo: Path) -> dict[str, Any]:
@@ -1047,8 +2163,13 @@ def verify_release_contract(repo: Path) -> dict[str, Any]:
     worker_path = repo / "product/ncm/reference/worker-manifest.json"
     release_targets_path = repo / ".github/release-targets.json"
     worker_platforms_path = repo / "product/ncm/reference/worker-platforms.json"
+    revision_receipt_path = repo / MODEL_REVISION_RECEIPT_PATH
     manifest, raw = _load_json(manifest_path, "release model acquisition manifest")
-    validate_acquisition_manifest(manifest, embedding_manifest=embedding_path)
+    validate_acquisition_manifest(
+        manifest,
+        embedding_manifest=embedding_path,
+        revision_receipt=revision_receipt_path,
+    )
     worker, worker_raw = _load_json(worker_path, "trusted worker manifest")
     _worker_manifest(worker, target=SUPPORTED_TARGET)
     checker_path = repo / "scripts/check-release-artifacts.py"
@@ -1077,6 +2198,9 @@ def verify_release_contract(repo: Path) -> dict[str, Any]:
         "manifest": str(manifest_path),
         "manifest_sha256": sha256_bytes(raw),
         "embedding_manifest_sha256": sha256_bytes(_read_regular(embedding_path, "trusted embedding manifest")),
+        "revision_provenance_sha256": sha256_bytes(
+            _read_regular(revision_receipt_path, "trusted model revision receipt")
+        ),
         "worker_manifest_sha256": sha256_bytes(worker_raw),
         "target": SUPPORTED_TARGET,
         "release_targets": [target["name"] for target in targets],
@@ -1090,15 +2214,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, default=repo_default / "product/ncm/release/model-acquisition-manifest.json")
     parser.add_argument("--embedding-manifest", type=Path, default=repo_default / "product/ncm/reference/embedding-manifest.json")
     parser.add_argument("--worker-manifest", type=Path, default=repo_default / "product/ncm/reference/worker-manifest.json")
+    parser.add_argument("--revision-receipt", type=Path, default=repo_default / MODEL_REVISION_RECEIPT_PATH)
     parser.add_argument("--target", default=SUPPORTED_TARGET)
     parser.add_argument("--release-name", default=SUPPORTED_RELEASE_NAME)
+    parser.add_argument("--profile", choices=("stable", "beta"), default="stable")
     parser.add_argument("--binary-archive", type=Path)
     parser.add_argument("--worker-archive", type=Path)
     parser.add_argument("--binary", type=Path, help="already installed CLI binary to smoke")
+    parser.add_argument("--expected-version", help="trusted release SemVer stamped in --version")
+    parser.add_argument("--expected-source-sha", help="trusted release source commit SHA")
+    parser.add_argument("--expected-archive-sha256", help="trusted CLI archive SHA-256")
+    parser.add_argument("--expected-binary-sha256", help="trusted installed CLI binary SHA-256")
     parser.add_argument("--model-root", "--state-root", dest="model_root", type=Path)
     parser.add_argument("--source-dir", type=Path, help="offline fixture source tree; never used implicitly")
     parser.add_argument("--receipt", type=Path, help="combined verification receipt path")
     parser.add_argument("--operation", choices=("install", "update", "recover", "verify"), default="verify")
+    parser.add_argument(
+        "--installed-e2e",
+        action="store_true",
+        help="exercise installed CLI NCM install, daemon restart, and production worker handshake",
+    )
     parser.add_argument("--failure-after", choices=(*MODEL_REQUIRED_FILES, "staged", "backed_up"))
     arguments = parser.parse_args(argv)
 
@@ -1111,28 +2246,120 @@ def main(argv: list[str] | None = None) -> int:
             arguments.source_dir is None or arguments.model_root is not None,
             "--source-dir requires --model-root",
         )
+        if arguments.installed_e2e:
+            _require(arguments.binary is not None, "--installed-e2e requires --binary")
+            _require(arguments.worker_archive is not None, "--installed-e2e requires --worker-archive")
+            _require(arguments.model_root is not None, "--installed-e2e requires --model-root")
+            _require(
+                arguments.operation in {"install", "verify"},
+                "--installed-e2e requires --operation install or verify",
+            )
         if arguments.binary_archive is None and arguments.worker_archive is None and arguments.binary is None and arguments.model_root is None and arguments.operation == "verify":
             result = verify_release_contract(arguments.repo.resolve())
             print(json.dumps(result, indent=2))
             return 0
-        model_manifest, model_raw = _load_json(arguments.manifest, "model acquisition manifest")
-        validate_acquisition_manifest(model_manifest, target=arguments.target, release_name=arguments.release_name, embedding_manifest=arguments.embedding_manifest)
-        result: dict[str, Any] = {"schema_version": 1, "target": arguments.target, "manifest_sha256": sha256_bytes(model_raw)}
+        needs_model_contract = arguments.worker_archive is not None or arguments.model_root is not None
+        model_manifest: dict[str, Any] | None = None
+        model_raw: bytes | None = None
+        if needs_model_contract:
+            model_manifest, model_raw = _load_json(arguments.manifest, "model acquisition manifest")
+            validate_acquisition_manifest(
+                model_manifest,
+                target=arguments.target,
+                release_name=arguments.release_name,
+                embedding_manifest=arguments.embedding_manifest,
+                revision_receipt=arguments.revision_receipt,
+            )
+        result: dict[str, Any] = {"schema_version": 1, "target": arguments.target}
+        if model_raw is not None:
+            result["manifest_sha256"] = sha256_bytes(model_raw)
+        installed_binary_result: dict[str, Any] | None = None
+        if arguments.binary is not None:
+            installed_binary_result = verify_installed_binary(
+                arguments.binary,
+                target=arguments.target,
+                expected_version=arguments.expected_version,
+                expected_source_sha=arguments.expected_source_sha,
+                expected_binary_sha256=arguments.expected_binary_sha256,
+            )
+            result["installed_binary"] = installed_binary_result
         if arguments.binary_archive is not None:
-            result["binary_archive"] = verify_binary_archive(arguments.binary_archive, target=arguments.target)
+            result["binary_archive"] = verify_binary_archive(
+                arguments.binary_archive,
+                target=arguments.target,
+                profile=arguments.profile,
+                expected_version=arguments.expected_version,
+                expected_source_sha=arguments.expected_source_sha,
+                expected_archive_sha256=arguments.expected_archive_sha256,
+                expected_binary_sha256=(
+                    installed_binary_result["sha256"]
+                    if installed_binary_result is not None
+                    else None
+                ),
+            )
         if arguments.worker_archive is not None:
             checksum = arguments.worker_archive.with_name(arguments.worker_archive.name + ".sha256")
-            result["worker_archive"] = verify_worker_archive(arguments.worker_archive, target=arguments.target, worker_manifest_path=arguments.worker_manifest, model_manifest_path=arguments.manifest, checksum_path=checksum)
-        if arguments.binary is not None:
-            result["installed_binary"] = verify_installed_binary(arguments.binary)
+            result["worker_archive"] = verify_worker_archive(
+                arguments.worker_archive,
+                target=arguments.target,
+                worker_manifest_path=arguments.worker_manifest,
+                model_manifest_path=arguments.manifest,
+                revision_receipt_path=arguments.revision_receipt,
+                checksum_path=checksum,
+            )
         if arguments.model_root is not None:
             root = arguments.model_root.absolute()
             if arguments.operation == "recover":
-                result["model"] = recover_model(root)
+                result["model"] = recover_model(
+                    root,
+                    model_manifest,
+                    revision_receipt=arguments.revision_receipt,
+                )
             elif arguments.operation in {"install", "update"}:
-                result["model"] = acquire_model(root, model_manifest, operation=arguments.operation, source_dir=arguments.source_dir, embedding_manifest_path=arguments.embedding_manifest, receipt_path=None, failure_after=arguments.failure_after)
+                _require(model_manifest is not None, "model acquisition manifest is required")
+                result["model"] = acquire_model(
+                    root,
+                    model_manifest,
+                    operation=arguments.operation,
+                    source_dir=arguments.source_dir,
+                    embedding_manifest_path=arguments.embedding_manifest,
+                    revision_receipt_path=arguments.revision_receipt,
+                    receipt_path=None,
+                    failure_after=arguments.failure_after,
+                )
             else:
-                result["model"] = verify_model_tree(root, model_manifest, manifest_bytes=_read_regular(arguments.embedding_manifest, "trusted embedding manifest"))
+                _require(model_manifest is not None, "model acquisition manifest is required")
+                result["model"] = verify_model_tree(
+                    root,
+                    model_manifest,
+                    manifest_bytes=_read_regular(
+                        arguments.embedding_manifest,
+                        "trusted embedding manifest",
+                    ),
+                    receipt_required=True,
+                    revision_receipt=arguments.revision_receipt,
+                )
+        if arguments.installed_e2e:
+            _require(model_manifest is not None and model_raw is not None, "--installed-e2e requires the model acquisition manifest")
+            _require(arguments.binary is not None, "--installed-e2e requires --binary")
+            _require(arguments.worker_archive is not None, "--installed-e2e requires --worker-archive")
+            _require(arguments.model_root is not None, "--installed-e2e requires --model-root")
+            result["installed_e2e"] = verify_installed_e2e(
+                arguments.binary,
+                arguments.worker_archive,
+                arguments.model_root,
+                model_manifest,
+                acquisition_manifest_bytes=model_raw,
+                embedding_manifest_path=arguments.embedding_manifest,
+                worker_manifest_path=arguments.worker_manifest,
+                revision_receipt=arguments.revision_receipt,
+                target=arguments.target,
+                release_name=arguments.release_name,
+                profile=arguments.profile,
+                expected_version=arguments.expected_version,
+                expected_source_sha=arguments.expected_source_sha,
+                expected_binary_sha256=arguments.expected_binary_sha256,
+            )
         if arguments.receipt is not None:
             _write_atomic(arguments.receipt.resolve(), json.dumps(result, indent=2, ensure_ascii=False).encode("utf-8") + b"\n")
         print(json.dumps(result, indent=2))

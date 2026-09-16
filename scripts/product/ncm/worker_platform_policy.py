@@ -11,6 +11,13 @@ class WorkerPlatformPolicyError(ValueError):
     """The NCM worker platform policy is malformed or inconsistent."""
 
 
+WORKER_MANIFEST_PATH = "product/ncm/reference/worker-manifest.json"
+MODEL_ACQUISITION_MANIFEST_PATH = "product/ncm/release/model-acquisition-manifest.json"
+WORKER_MANIFEST_NAME = "worker-manifest.json"
+MODEL_ACQUISITION_MANIFEST_NAME = "model-acquisition-manifest.json"
+EXPLICIT_INTEL_MAC_TARGET = "x86_64-apple-darwin"
+
+
 def _load_object(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -89,6 +96,31 @@ def validate_worker_platform_policy(
         raise WorkerPlatformPolicyError(
             "worker platform policy.fallback must be 'native-only'"
         )
+    if policy.get("worker_manifest") != WORKER_MANIFEST_PATH:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.worker_manifest must name the trusted worker manifest"
+        )
+    if policy.get("model_acquisition_manifest") != MODEL_ACQUISITION_MANIFEST_PATH:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.model_acquisition_manifest must name the pinned model acquisition manifest"
+        )
+    runtime_policy = policy.get("runtime_policy")
+    if not isinstance(runtime_policy, dict):
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.runtime_policy must be an object"
+        )
+    if runtime_policy.get("worker_manifest") != WORKER_MANIFEST_PATH:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.runtime_policy.worker_manifest must name the trusted worker manifest"
+        )
+    if runtime_policy.get("model_manifest") != "product/ncm/reference/embedding-manifest.json":
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.runtime_policy.model_manifest must name the canonical model manifest"
+        )
+    if runtime_policy.get("model_acquisition_manifest") != MODEL_ACQUISITION_MANIFEST_PATH:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.runtime_policy.model_acquisition_manifest must name the pinned model acquisition manifest"
+        )
     packaging = policy.get("packaging")
     if not isinstance(packaging, dict):
         raise WorkerPlatformPolicyError("worker platform policy.packaging must be an object")
@@ -103,6 +135,10 @@ def validate_worker_platform_policy(
     if packaging.get("manifest_sidecar_required") is not True:
         raise WorkerPlatformPolicyError(
             "worker platform policy.packaging.manifest_sidecar_required must be true"
+        )
+    if packaging.get("model_acquisition_manifest_sidecar_required") is not True:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.packaging.model_acquisition_manifest_sidecar_required must be true"
         )
 
     supported = _entries(policy.get("supported_targets"), "supported_targets")
@@ -125,6 +161,10 @@ def validate_worker_platform_policy(
             )
     for index, entry in enumerate(unsupported):
         _required_string(entry.get("reason"), f"unsupported_targets[{index}].reason")
+    if EXPLICIT_INTEL_MAC_TARGET not in unsupported_targets:
+        raise WorkerPlatformPolicyError(
+            "Intel macOS must have an explicit unsupported NCM policy row"
+        )
 
     worker_manifest = _load_object(
         worker_manifest_path
@@ -211,6 +251,33 @@ def validate_worker_platform_policy(
         if policy_entry["target"] != target:
             raise WorkerPlatformPolicyError(
                 f"release target {name} target differs between manifests"
+            )
+        release_status = entry.get("ncm")
+        if release_status != policy_entry.get("ncm"):
+            raise WorkerPlatformPolicyError(
+                f"release target {name} NCM status differs between manifests"
+            )
+        sidecar = entry.get("sidecar")
+        if policy_entry["ncm"] == "supported":
+            if not isinstance(sidecar, dict):
+                raise WorkerPlatformPolicyError(
+                    f"supported release target {name} must carry sidecar metadata"
+                )
+            if sidecar.get("worker") != worker_name:
+                raise WorkerPlatformPolicyError(
+                    f"supported release target {name} sidecar worker differs from policy"
+                )
+            if sidecar.get("manifest") != WORKER_MANIFEST_NAME:
+                raise WorkerPlatformPolicyError(
+                    f"supported release target {name} sidecar must carry {WORKER_MANIFEST_NAME}"
+                )
+            if sidecar.get("model_manifest") != MODEL_ACQUISITION_MANIFEST_NAME:
+                raise WorkerPlatformPolicyError(
+                    f"supported release target {name} sidecar must carry {MODEL_ACQUISITION_MANIFEST_NAME}"
+                )
+        elif sidecar is not None:
+            raise WorkerPlatformPolicyError(
+                f"native-only release target {name} must not carry NCM sidecar metadata"
             )
     if expected_release_names != release_names:
         extra = sorted(release_names - expected_release_names)
