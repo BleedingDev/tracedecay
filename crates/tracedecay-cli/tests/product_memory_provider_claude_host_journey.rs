@@ -2279,6 +2279,7 @@ fn assert_host_memory_journey_with_provider(
             &mut journey,
             next_session,
             &recalled.1,
+            &original.1,
         );
     }
     record_demo_output(&journey, next_session, &original.1, &recalled.1);

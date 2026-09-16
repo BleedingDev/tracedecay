@@ -44,8 +44,11 @@ pub(super) fn assert_provider_control_journeys(
     journey: &mut ClaudeHostJourney,
     session_id: &str,
     recalled_stdout: &[u8],
+    cross_scope_stdout: &[u8],
 ) {
     let (source, state) = source_and_state(journey, recalled_stdout, session_id);
+    let (cross_scope_source, _) =
+        source_and_state(journey, cross_scope_stdout, journey.session_id());
 
     assert_health(journey, &state, "health.before-controls");
     assert_feedback_idempotency(journey, &source.selector);
@@ -59,7 +62,12 @@ pub(super) fn assert_provider_control_journeys(
     assert_lane_contains_source(&after_maintenance, &source.selector);
 
     assert_correction_revision_refusal(journey, &source);
-    assert_wrong_selector_is_hidden_as_missing_grant(journey, &source.selector, &state);
+    assert_wrong_selector_is_hidden_as_missing_grant(
+        journey,
+        &source.selector,
+        &cross_scope_source.selector,
+        &state,
+    );
 
     // Exercise the typed unavailable advisory lane through the real Native
     // mount fault seam, then restore the same journal and prove recovery.
@@ -539,19 +547,22 @@ fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &Reca
 fn assert_wrong_selector_is_hidden_as_missing_grant(
     journey: &ClaudeHostJourney,
     selector: &ProviderControlSourceSelectorV1,
+    cross_scope_selector: &ProviderControlSourceSelectorV1,
     state: &ProviderControlStateSelectorV1,
 ) {
-    let mut wrong = selector.clone();
-    // Keep the trace and item references from the real recall, but use a
-    // source member that is validly shaped and belongs to no authorized
-    // canonical history. This exercises source-grant lookup rather than a
-    // malformed request path.
-    wrong.observation_id = format!("{}-cross-scope", wrong.observation_id);
+    assert_ne!(
+        selector.trace_ref, cross_scope_selector.trace_ref,
+        "cross-scope selector must come from the distinct origin recall trace"
+    );
+    // This selector is a real source from the originating session's recall,
+    // with a valid item and observation identity. The active route is the
+    // destination session, so source authorization must deny the cross-scope
+    // grant rather than taking a malformed or nonexistent-item path.
     let response = invoke(
         journey,
         "host-provider-control.feedback.wrong-selector",
         ProviderControlRequestV1::Feedback(ProviderFeedbackRequestV1 {
-            source: wrong,
+            source: cross_scope_selector.clone(),
             signal: ProviderControlFeedbackSignalV1::Ignored,
             weight: "0".to_owned(),
             evidence_refs: Vec::new(),
