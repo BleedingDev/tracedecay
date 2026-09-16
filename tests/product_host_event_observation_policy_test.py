@@ -167,25 +167,39 @@ class HostEventObservationPolicyTest(unittest.TestCase):
                 "source_identity.required_fields",
             )
 
-    def test_dispatch_settlement_uses_current_mcp_authority(self) -> None:
+    def test_settlement_points_use_current_authorities(self) -> None:
         events = {
             row["event_id"]: row
             for row in self.policy["event_classes"]
             if row["event_id"]
             in {
                 "application.tool_execution_settled.v1",
-                "application.source_edit_settled.v1",
+                "application.test_execution_settled.v1",
             }
         }
-        current_authority = "crates/tracedecay-mcp/src/server/settlement.rs"
-        stale_authority = "crates/tracedecay/src/mcp/server/dispatch_settlement.rs"
-        for event_id in (
-            "application.tool_execution_settled.v1",
-            "application.source_edit_settled.v1",
-        ):
+        expected_authorities = {
+            "application.tool_execution_settled.v1": {
+                "crates/tracedecay-mcp/src/server/settlement.rs",
+                "crates/tracedecay-application/src/observability/delivery_settlement.rs",
+            },
+            "application.test_execution_settled.v1": {
+                "crates/tracedecay-application/src/observability/delivery_settlement.rs",
+            },
+        }
+        stale_authorities = {
+            "crates/tracedecay/src/mcp/server/dispatch_settlement.rs",
+            "crates/tracedecay-usecases/src/observability/delivery_settlement.rs",
+        }
+        for event_id, authorities in expected_authorities.items():
             commit_point = events[event_id]["canonical_commit_point"]
-            self.assertIn(current_authority, commit_point["source_paths"])
-            self.assertNotIn(stale_authority, commit_point["source_paths"])
+            for authority in authorities:
+                self.assertIn(authority, commit_point["source_paths"])
+        for row in self.policy["event_classes"]:
+            if row["disposition"] != "admit":
+                continue
+            source_paths = row["canonical_commit_point"]["source_paths"]
+            for stale_authority in stale_authorities:
+                self.assertNotIn(stale_authority, source_paths)
 
     # -- filesystem grounding for canonical_commit_point -------------------------
 

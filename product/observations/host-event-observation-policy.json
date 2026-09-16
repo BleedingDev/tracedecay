@@ -458,7 +458,7 @@
         "settled_state": "DispatchExecutionSettlement joined with a typed terminal outcome and committed-effect state",
         "source_paths": [
           "crates/tracedecay-mcp/src/server/settlement.rs",
-          "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"
+          "crates/tracedecay-application/src/observability/delivery_settlement.rs"
         ],
         "receipt_fields": ["operation_id", "terminal_outcome", "committed_effect", "effect_digest", "resolved_scope_digest"],
         "ordering_authority": "The operation settlement receipt and its source sequence, not request-start or response-arrival time.",
@@ -570,7 +570,7 @@
         "point_id": "test_execution_authority.settled",
         "authority": "TraceDecay test execution and result authority",
         "settled_state": "Test process reached a typed terminal result and result receipt was durably recorded",
-        "source_paths": ["crates/tracedecay/src/daemon", "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"],
+        "source_paths": ["crates/tracedecay/src/daemon", "crates/tracedecay-application/src/observability/delivery_settlement.rs"],
         "receipt_fields": ["execution_id", "source_generation", "terminal_status", "result_digest", "resolved_scope_digest"],
         "ordering_authority": "Execution receipt and source generation, not process-start or log-line order.",
         "provider_fanout": "Only after the test result is terminal and durably recorded."
