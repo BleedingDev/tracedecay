@@ -18,7 +18,7 @@
     "event_policy": "product/observations/host-event-observation-policy.json"
   },
   "detector_authority": {
-    "credential_corpus": "tracedecay_runtime_core::memory::hygiene::detect_secret_like",
+    "credential_corpus": "tracedecay_session_memory::memory::hygiene::detect_secret_like",
     "canonical_redaction": "tracedecay_runtime_core::privacy::sanitize_memory_fact_payload",
     "transient_corpus": "tracedecay_memory_hygiene::transient",
     "reason": "The vendored credential catalogue has exactly one owner. This policy binds class identities to that owner's public detectors instead of restating its patterns; only the transient corpus, which needs byte spans the upstream surface does not expose, is implemented here."

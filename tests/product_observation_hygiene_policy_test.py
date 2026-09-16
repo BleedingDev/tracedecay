@@ -489,7 +489,7 @@ class ObservationHygienePolicyTest(unittest.TestCase):
         authority = self.policy["detector_authority"]
         self.assertEqual(
             authority["credential_corpus"],
-            "tracedecay_runtime_core::memory::hygiene::detect_secret_like",
+            "tracedecay_session_memory::memory::hygiene::detect_secret_like",
         )
         self.assertEqual(
             authority["canonical_redaction"],
@@ -502,7 +502,7 @@ class ObservationHygienePolicyTest(unittest.TestCase):
         # second catalogue: no rule table may be declared in this crate beyond
         # the two direct signals the document names.
         self.assertIn(
-            "use tracedecay_runtime_core::memory::hygiene::detect_secret_like",
+            "use tracedecay_session_memory::memory::hygiene::detect_secret_like",
             self.credentials_rs,
         )
 
