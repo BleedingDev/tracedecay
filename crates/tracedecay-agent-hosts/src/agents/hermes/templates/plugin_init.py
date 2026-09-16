@@ -2253,6 +2253,9 @@ class TraceDecayContextEngine(ContextEngine):
             "session_id": self.active_session_id,
             "messages": list(messages or []),
         })
+        # The typed preflight request has no message-pattern field; that
+        # filter is applied by the compression request after preflight.
+        args.pop("ignore_message_patterns", None)
         if current_tokens is not None:
             args["current_tokens"] = current_tokens
         _apply_lcm_option_overrides(args, kwargs, (
@@ -2269,7 +2272,6 @@ class TraceDecayContextEngine(ContextEngine):
             "reserve_tokens_floor",
             "ignore_session_patterns",
             "stateless_session_patterns",
-            "ignore_message_patterns",
         ))
         args = _lcm_store_args(args, project_root)
         return call_tracedecay_json(
@@ -2455,6 +2457,9 @@ class TraceDecayContextEngine(ContextEngine):
             "session_id": self.active_session_id,
             "messages": list(messages),
         })
+        # The typed preflight request has no message-pattern field; that
+        # filter is applied by the compression request after preflight.
+        args.pop("ignore_message_patterns", None)
         _apply_lcm_option_overrides(args, kwargs, (
             "current_tokens",
             "threshold_tokens",
@@ -2470,7 +2475,6 @@ class TraceDecayContextEngine(ContextEngine):
             "reserve_tokens_floor",
             "ignore_session_patterns",
             "stateless_session_patterns",
-            "ignore_message_patterns",
         ))
         args = _lcm_store_args(args, project_root)
         try:

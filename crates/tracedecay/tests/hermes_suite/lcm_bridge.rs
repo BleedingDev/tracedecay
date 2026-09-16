@@ -963,7 +963,7 @@ assert preflight_args["summary_fan_in"] == 3
 assert preflight_args["incremental_max_depth"] == 2
 assert preflight_args["ignore_session_patterns"] == ["cron-*"]
 assert preflight_args["stateless_session_patterns"] == ["probe-*", "dry-run"]
-assert preflight_args["ignore_message_patterns"] == ["heartbeat"]
+assert "ignore_message_patterns" not in preflight_args
 assert "storage_scope" not in preflight_args
 
 result = engine.compress(
