@@ -7,4 +7,5 @@
 //! it mutates process environment variables in-process.
 
 mod host_lifecycle_cli_acceptance;
+mod ncm_lifecycle_cli_acceptance;
 mod opencode_one_analyzer_journey;
