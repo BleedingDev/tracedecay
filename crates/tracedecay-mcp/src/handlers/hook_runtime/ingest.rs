@@ -77,12 +77,6 @@ fn host_admission_facade<'a>(
                             cg.project_root(), &project_id, &marker,
                         )
                     });
-                    #[cfg(feature = "memory-provider-host")]
-                let provenance = provenance.map(|context| context.with_original_provenance_resolver(std::sync::Arc::new(
-                    crate::daemon::retained_owner::provider_history::HookOriginReaderV1::new(
-                        cg.hook_store_layout().data_root.clone(), identity.brain_id().clone(), identity.profile_id().clone(),
-                    ),
-                )));
                     let authority = HostAdmissionAuthorities::for_project(
                         identity.brain_id().clone(),
                         identity.profile_id().clone(),
