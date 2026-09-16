@@ -161,6 +161,76 @@ fn search_terminated<A: CodeIndexMcpReadAdmissionV1>(
     })
 }
 
+fn similar_outcome_from_search_termination(
+    outcome: code_search::CodeIndexSearchOutcomeV1,
+) -> code_search::CodeIndexSimilarOutcomeV1 {
+    match outcome {
+        code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => {
+            code_search::CodeIndexSimilarOutcomeV1::Unavailable(unavailable.reason)
+        }
+        // `search_terminated` only emits `Unavailable`; keep this arm explicit so a
+        // future change cannot accidentally publish a search result as similarity.
+        code_search::CodeIndexSearchOutcomeV1::Complete(_) => {
+            code_search::CodeIndexSimilarOutcomeV1::Unavailable(
+                code_search::CodeIndexSearchUnavailableReasonV1::Internal,
+            )
+        }
+    }
+}
+
+fn similar_search_terminated<A: CodeIndexMcpReadAdmissionV1>(
+    control: &McpRetrievalExecutionControlV1<A>,
+    admission_provider: &A,
+) -> Option<code_search::CodeIndexSimilarOutcomeV1> {
+    search_terminated(control, admission_provider, None)
+        .map(similar_outcome_from_search_termination)
+}
+
+fn similar_publication_is_authorized<A, S>(
+    control: &McpRetrievalExecutionControlV1<A>,
+    admission_provider: &A,
+    scope_resolver: &S,
+    project_root: &std::path::Path,
+    project_id: &tracedecay_domain::ProjectId,
+    initial_scope: &tracedecay_contracts::ResolvedScope,
+    expected_authority: &code_search::CodeIndexSearchAuthorityV1,
+) -> Option<code_search::CodeIndexSimilarOutcomeV1>
+where
+    A: CodeIndexMcpReadAdmissionV1,
+    S: CodeIndexScopeResolverV1,
+{
+    if let Some(outcome) = similar_search_terminated(control, admission_provider) {
+        return Some(outcome);
+    }
+    let terminal_scope = match scope_resolver.resolved_scope_for_project(project_root, project_id) {
+        Ok(scope) if scope == *initial_scope => scope,
+        _ => {
+            return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
+                code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+            ));
+        }
+    };
+    let terminal_admission = match admission_provider.admit_current(&terminal_scope) {
+        Ok(admission) => admission,
+        Err(_) => {
+            return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
+                code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+            ));
+        }
+    };
+    let terminal_authority = terminal_admission.search_authority();
+    if terminal_authority != *expected_authority
+        || terminal_admission
+            .authorize(&terminal_scope, Some(&terminal_authority))
+            .is_err()
+    {
+        return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
+            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+        ));
+    }
+    None
+}
+
 struct CodeIndexSearchHydrationSourceV1<A, P, H> {
     authorize: A,
     preflight: P,
@@ -1375,22 +1445,30 @@ where
                     );
                 }
             };
-            if admission
-                .authorize(&scope, request.authority.as_ref())
-                .is_err()
-            {
-                return unavailable(
-                    code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                );
-            }
+            let terminal_expected_authority =
+                match admission.authorize(&scope, request.authority.as_ref()) {
+                    Ok(authority) => authority,
+                    // The scope is resolved from live daemon state. If the route's
+                    // open-time authority is stale after a checkout, bind this read
+                    // to the authority just admitted, matching the search lane.
+                    Err(CodeIndexMcpAdmissionUnavailableV1::AuthorizationStale) => {
+                        admission.search_authority()
+                    }
+                    Err(_) => {
+                        return unavailable(
+                            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+                        );
+                    }
+                };
+            let project_root = request.project_root.clone();
             let control = Arc::new(McpRetrievalExecutionControlV1 {
                 started: std::time::Instant::now(),
-                admission_provider,
+                admission_provider: admission_provider.clone(),
                 deadline: request.deadline.clone(),
                 cancellation: request.cancellation.clone(),
             });
-            if let Some(reason) = control.request_termination() {
-                return unavailable(reason);
+            if let Some(outcome) = similar_search_terminated(&control, &admission_provider) {
+                return outcome;
             }
             let permit = match execution_admission.try_acquire_owned() {
                 Ok(permit) => permit,
@@ -1400,14 +1478,24 @@ where
                     );
                 }
             };
-            let Some((generation, _)) = schedulers
-                .latest_text_serving_freshness_for_scope(&scope)
-                .await
-            else {
-                return unavailable(
-                    code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
-                );
+            let generation = match bounded_by_settlement(
+                request.deadline.as_ref(),
+                request.cancellation.as_ref(),
+                schedulers.latest_text_serving_freshness_for_scope(&scope),
+            )
+            .await
+            {
+                Ok(Some((generation, _))) => generation,
+                Ok(None) => {
+                    return unavailable(
+                        code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+                    );
+                }
+                Err(outcome) => return similar_outcome_from_search_termination(outcome),
             };
+            if let Some(outcome) = similar_search_terminated(&control, &admission_provider) {
+                return outcome;
+            }
             match generation.finish_query_owner_warmup_for_request(control.as_ref()) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1415,9 +1503,7 @@ where
                         code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
                     );
                 }
-                Err(_) => {
-                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
-                }
+                Err(error) => return unavailable(map_similar_retrieval_error(error)),
             }
             match generation.finish_clone_similarity_warmup_for_request(control.as_ref()) {
                 Ok(true) => {}
@@ -1426,32 +1512,66 @@ where
                         code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
                     );
                 }
-                Err(_) => {
-                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
-                }
+                Err(error) => return unavailable(map_similar_retrieval_error(error)),
             }
             let owners = match generation.production_query_owners_with_budget(
                 &code_index_scheduler::queries::maximum_retrieval_budget(),
             ) {
                 Ok(owners) => owners,
-                Err(_) => {
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
-                    );
-                }
+                Err(error) => return unavailable(map_similar_retrieval_error(error)),
             };
-            let read = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Handle::current();
+            let execution_control = Arc::clone(&control);
+            let settlement_control = Arc::clone(&control);
+            let execution = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                owners.similar(&request, control.as_ref())
-            })
-            .await;
+                runtime.block_on(async move {
+                    let work = async move { owners.similar(&request, execution_control.as_ref()) };
+                    tokio::pin!(work);
+                    tokio::select! {
+                        biased;
+                        output = &mut work => output,
+                        settlement_reason = settlement_control.settled() => {
+                            Err(match settlement_reason {
+                                code_search::CodeIndexSearchUnavailableReasonV1::TimedOut => {
+                                    RetrievalPortError::BudgetExceeded
+                                }
+                                _ => RetrievalPortError::Cancelled,
+                            })
+                        }
+                    }
+                })
+            });
+            let read = match code_index_task_support::settle_owned_blocking_task(
+                execution,
+                std::time::Duration::from_millis(10),
+                || search_terminated(&control, &admission_provider, None),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
+                }
+                Err(outcome) => return similar_outcome_from_search_termination(outcome),
+            };
+            if let Some(outcome) = similar_publication_is_authorized(
+                &control,
+                &admission_provider,
+                &scope_resolver,
+                &project_root,
+                &project_id,
+                &scope,
+                &terminal_expected_authority,
+            ) {
+                return outcome;
+            }
             match read {
-                Ok(Ok(Some(result))) => {
+                Ok(Some(result)) => {
                     code_search::CodeIndexSimilarOutcomeV1::Complete(Box::new(result))
                 }
-                Ok(Ok(None)) => code_search::CodeIndexSimilarOutcomeV1::NotFound,
-                Ok(Err(error)) => unavailable(map_similar_retrieval_error(error)),
-                Err(_) => unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal),
+                Ok(None) => code_search::CodeIndexSimilarOutcomeV1::NotFound,
+                Err(error) => unavailable(map_similar_retrieval_error(error)),
             }
         })
     })
@@ -1479,9 +1599,7 @@ fn map_similar_retrieval_error(
         RetrievalPortError::IncompatibleProjection => {
             code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified
         }
-        RetrievalPortError::Cancelled => {
-            code_search::CodeIndexSearchUnavailableReasonV1::Cancelled
-        }
+        RetrievalPortError::Cancelled => code_search::CodeIndexSearchUnavailableReasonV1::Cancelled,
         RetrievalPortError::BudgetExceeded => {
             code_search::CodeIndexSearchUnavailableReasonV1::TimedOut
         }
@@ -1797,6 +1915,25 @@ mod tests {
             map_similar_retrieval_error(RetrievalPortError::BudgetExceeded),
             CodeIndexSearchUnavailableReasonV1::TimedOut
         );
+    }
+
+    #[test]
+    fn similar_termination_reuses_search_lifecycle_reason() {
+        for reason in [
+            CodeIndexSearchUnavailableReasonV1::Cancelled,
+            CodeIndexSearchUnavailableReasonV1::TimedOut,
+            CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+            CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+        ] {
+            let outcome = similar_outcome_from_search_termination(code_index_search_unavailable(
+                reason,
+                "similar_terminated",
+            ));
+            assert!(matches!(
+                outcome,
+                code_search::CodeIndexSimilarOutcomeV1::Unavailable(observed) if observed == reason
+            ));
+        }
     }
 
     #[tokio::test]
