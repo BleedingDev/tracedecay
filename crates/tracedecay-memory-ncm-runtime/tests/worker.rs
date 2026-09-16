@@ -89,7 +89,45 @@ fn direct_observe(
     assert_eq!(engine.observe(namespace, request).outcome, Outcome::Success);
 }
 
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
+    observe_payload_with_provenance(
+        idempotency_key,
+        key,
+        value,
+        json!({"origin": "worker-test"}),
+    )
+}
+
+fn common_observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
+    let capsule = serde_json::to_vec(&json!({"origin": "common-maintenance-worker-test"}))
+        .expect("common capsule serializes");
+    observe_payload_with_provenance(
+        idempotency_key,
+        key,
+        value,
+        json!({
+            "common_capsule": {
+                "version": 1,
+                "sha256": digest(&capsule),
+                "bytes": capsule,
+            }
+        }),
+    )
+}
+
+fn observe_payload_with_provenance(
+    idempotency_key: &str,
+    key: &str,
+    value: &str,
+    provenance: Value,
+) -> Value {
     let mut request = ObserveRequest {
         idempotency_key: idempotency_key.to_owned(),
         payload_sha256: String::new(),
@@ -99,7 +137,7 @@ fn observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
         affect: None,
         surprise: 0.4,
         intensity: 1.0,
-        provenance: json!({"origin": "worker-test"}),
+        provenance,
         deadline: Deadline {
             remaining_ms: u64::MAX,
         },
@@ -118,6 +156,53 @@ fn observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
         "intensity": request.intensity,
         "provenance": request.provenance
     })
+}
+
+fn common_maintenance_control(
+    namespace: &str,
+    idempotency_key: &str,
+    operation_id: &str,
+    expected_generation: u64,
+) -> Value {
+    let mut control = json!({
+        "action": "maintenance",
+        "idempotency_key": idempotency_key,
+        "expected_generation": expected_generation,
+        "task": "repair",
+        "maximum_items": 100,
+        "maximum_bytes": 1_048_576,
+        "maximum_duration_millis": 60_000,
+        "dry_run": false,
+        "resume_cursor": null,
+        "policy_revision": 1,
+        "extensions": [],
+    });
+    let semantics = json!({
+        "action": "maintenance",
+        "task": control["task"],
+        "dry_run": control["dry_run"],
+        "maximum_items": control["maximum_items"],
+        "maximum_bytes": control["maximum_bytes"],
+        "maximum_duration_millis": control["maximum_duration_millis"],
+        "resume_cursor": control["resume_cursor"],
+        "policy_revision": control["policy_revision"],
+        "extensions": control["extensions"],
+    });
+    let admission = serde_json::to_vec(&json!({
+        "namespace": namespace,
+        "operation_id": operation_id,
+        "idempotency_key": idempotency_key,
+        "request_semantic_sha256": digest(
+            &serde_json::to_vec(&semantics).expect("maintenance semantics serialize")
+        ),
+    }))
+    .expect("maintenance admission serializes");
+    control["maintenance_capsule"] = json!({
+        "version": 1,
+        "sha256": digest(&admission),
+        "bytes": admission,
+    });
+    control
 }
 
 fn raw_worker(root: &Path) -> (Child, ChildStdin, ChildStdout) {
@@ -531,6 +616,69 @@ fn observe_killed_after_commit_reconciles_without_second_record() {
     assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["tick"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(18);
+    let observe = client
+        .call(
+            Request::new(
+                200,
+                0,
+                Operation::Observe,
+                &ns,
+                common_observe_payload(
+                    "common-maintenance-seed",
+                    "common maintenance key",
+                    "common maintenance value",
+                ),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("common maintenance seed succeeds");
+    assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
+    assert_eq!(observe.state_generation, 1);
+
+    let key = "common-maintenance-after-commit";
+    let control = common_maintenance_control(&ns, key, "01993262-4d00-0000-8000-000000000018", 1);
+    let request = Request::new(
+        201,
+        0,
+        Operation::Maintenance,
+        &ns,
+        json!({
+            "common_control": control,
+            "test_sleep_after_commit_ms": 1000,
+        }),
+    );
+    let result = client.call(request, Duration::from_millis(50));
+    assert_eq!(result, Err(ClientError::EffectUnknown { op_id: 201 }));
+    assert_eq!(client.pid(), None, "deadline must reap the worker");
+
+    let replay = client
+        .reconcile_unknown(key)
+        .expect("common maintenance receipt replays after restart");
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.state_generation, 2);
+    assert_eq!(replay.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = client
+        .call(
+            Request::new(202, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after maintenance reconciliation");
+    assert_eq!(inspection.outcome, Outcome::Success, "{inspection:?}");
+    assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 2);
+    assert_eq!(
+        client.reconcile_unknown(key),
+        Err(ClientError::UnknownIdempotencyKey)
+    );
 }
 
 #[cfg(unix)]
