@@ -214,6 +214,10 @@ jobs:
       - name: Build release binary for packaging
         run: cargo build ${{ steps.release-profile.outputs.binary_args }} --release --target ${{ matrix.target }} ${{ steps.release-profile.outputs.cargo_args }} --locked
 
+      - name: Build NCM worker sidecar
+        if: matrix.name == 'aarch64-macos'
+        run: cargo build -p tracedecay-memory-ncm-runtime --bin tracedecay-ncm-worker --release --target ${{ matrix.target }} --locked
+
       - name: Install modern Bash for distribution acceptance
         if: runner.os == 'macOS'
         run: brew install bash
@@ -309,6 +313,55 @@ jobs:
             --entry-name "$entry_name" \
             --epoch "${{ needs.validate.outputs.source_epoch }}"
 
+      - name: Package NCM worker sidecar
+        if: matrix.name == 'aarch64-macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker="target/${{ matrix.target }}/release/tracedecay-ncm-worker"
+          manifest="product/ncm/reference/worker-manifest.json"
+          archive="tracedecay-ncm-worker-beta-${RELEASE_TAG}-${{ matrix.name }}.tar.gz"
+          test -x "$worker"
+          test -s "$manifest"
+          python3 .release-automation/scripts/package-release-archive.py \
+            --binary "$worker" \
+            --output "$archive" \
+            --format tar.gz \
+            --entry-name tracedecay-ncm-worker \
+            --epoch "${{ needs.validate.outputs.source_epoch }}" \
+            --companion "$manifest=worker-manifest.json"
+          rm -rf verify-ncm-worker
+          mkdir verify-ncm-worker
+          tar xzf "$archive" -C verify-ncm-worker
+          test -x verify-ncm-worker/tracedecay-ncm-worker
+          cmp "$manifest" verify-ncm-worker/worker-manifest.json
+          python3 - "$manifest" "$worker" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          manifest_path = pathlib.Path(sys.argv[1])
+          worker_path = pathlib.Path(sys.argv[2])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          target = next(
+              item
+              for item in manifest["targets"]
+              if item["triple"] == "aarch64-apple-darwin"
+          )
+          payload = worker_path.read_bytes()
+          if len(payload) != target["bytes"]:
+              raise SystemExit(
+                  f"worker byte count mismatch: {len(payload)} != {target['bytes']}"
+              )
+          digest = hashlib.sha256(payload).hexdigest()
+          if digest != target["sha256"]:
+              raise SystemExit(
+                  f"worker SHA-256 mismatch: {digest} != {target['sha256']}"
+              )
+          PY
+          shasum -a 256 "$archive" > "$archive.sha256"
+
       - name: Verify binary archive (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -336,6 +389,15 @@ jobs:
         with:
           name: beta-${{ matrix.name }}
           path: tracedecay-beta-*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.name == 'aarch64-macos'
+        with:
+          name: ncm-worker-beta-${{ matrix.name }}
+          path: |
+            tracedecay-ncm-worker-beta-${RELEASE_TAG}-${{ matrix.name }}.tar.gz
+            tracedecay-ncm-worker-beta-${RELEASE_TAG}-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
 
   publish:
