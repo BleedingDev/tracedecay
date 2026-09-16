@@ -16,13 +16,13 @@ use tracedecay_memory_ncm_core::types::AlgorithmIdentity;
 use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
-    EngineReply, NcmEngine, ObserveRequest, Outcome, RecallRequest, RejectReason,
+    EngineReply, NcmEngine, ObserveAffect, ObserveRequest, Outcome, RecallRequest, RejectReason,
 };
 use tracedecay_memory_ncm_runtime::ports::{
     Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder,
 };
 use tracedecay_memory_ncm_runtime::snapshot::{self, RestoreRequest};
-use tracedecay_memory_ncm_runtime::store::{Event, StoredCapsule};
+use tracedecay_memory_ncm_runtime::store::{CapsuleStatus, Event, StoredCapsule};
 
 const DEADLINE: Deadline = Deadline {
     remaining_ms: u64::MAX,
@@ -286,13 +286,110 @@ where
     F: FnOnce(&mut Value),
 {
     let mut envelope: Value = serde_json::from_slice(&export(engine)).unwrap();
+    let mut original_content = envelope.clone();
+    original_content
+        .as_object_mut()
+        .unwrap()
+        .remove("content_sha256");
+    let original_content: SnapshotContentForTampering =
+        serde_json::from_value(original_content).unwrap();
     mutate(&mut envelope);
 
     let mut content = envelope.clone();
     content.as_object_mut().unwrap().remove("content_sha256");
-    let content: SnapshotContentForTampering = serde_json::from_value(content).unwrap();
-    envelope["content_sha256"] = json!(digest(&serde_json::to_vec(&content).unwrap()));
+    let mut content: SnapshotContentForTampering = serde_json::from_value(content).unwrap();
+    reconcile_observe_event_payloads(&original_content, &mut content);
+    content.lengths = SnapshotLengthsForTampering {
+        kernel_state_bytes: content.kernel_state.len() as u64,
+        capsules_bytes: serde_json::to_vec(&content.capsules).unwrap().len() as u64,
+        events_bytes: serde_json::to_vec(&content.events).unwrap().len() as u64,
+        capsule_count: content.capsules.len() as u64,
+        event_count: content.events.len() as u64,
+    };
+    let content_bytes = serde_json::to_vec(&content).unwrap();
+    let mut envelope = serde_json::to_value(content).unwrap();
+    envelope["content_sha256"] = json!(digest(&content_bytes));
     serde_json::to_vec(&envelope).unwrap()
+}
+
+fn reconcile_observe_event_payloads(
+    original: &SnapshotContentForTampering,
+    content: &mut SnapshotContentForTampering,
+) {
+    for event in &mut content.events {
+        if event.kind != "observe" {
+            continue;
+        }
+        let Some(capsule) = content
+            .capsules
+            .iter()
+            .find(|capsule| capsule.commit_seq == event.seq)
+        else {
+            continue;
+        };
+        if capsule.status == CapsuleStatus::Revoked {
+            continue;
+        }
+        let original_capsule = original
+            .capsules
+            .iter()
+            .find(|capsule| capsule.commit_seq == event.seq);
+        let affect = original_capsule
+            .and_then(|capsule| infer_observe_affect(capsule, &event.payload_sha256))
+            .unwrap_or(None);
+        event.payload_sha256 = observe_payload_sha256(capsule, &affect);
+    }
+}
+
+fn infer_observe_affect(capsule: &StoredCapsule, expected: &str) -> Option<Option<ObserveAffect>> {
+    let mut candidates = vec![None, Some(ObserveAffect::Values(capsule.affect.0))];
+    for name in [
+        "positive",
+        "curious",
+        "negative",
+        "stressed",
+        "social",
+        "dopamin",
+        "serotonin",
+        "kortizol",
+        "oxytocin",
+    ] {
+        candidates.push(Some(ObserveAffect::Preset(name.to_owned())));
+    }
+    candidates
+        .into_iter()
+        .find(|affect| observe_payload_sha256(capsule, affect) == expected)
+}
+
+fn observe_payload_sha256(capsule: &StoredCapsule, affect: &Option<ObserveAffect>) -> String {
+    #[derive(serde::Serialize)]
+    struct Payload<'a> {
+        source: &'a tracedecay_memory_ncm_core::types::SourceId,
+        key_text: &'a str,
+        value_text: &'a str,
+        affect: &'a Option<ObserveAffect>,
+        surprise: f32,
+        intensity: f32,
+        provenance: &'a Value,
+    }
+
+    let mut provenance: Value = serde_json::from_str(&capsule.provenance).unwrap();
+    provenance
+        .as_object_mut()
+        .unwrap()
+        .remove("delivery_capsule");
+    digest(
+        &serde_json::to_vec(&Payload {
+            source: &capsule.source_id,
+            key_text: &capsule.key_text,
+            value_text: &capsule.value_text,
+            affect,
+            surprise: capsule.surprise,
+            intensity: capsule.intensity,
+            provenance: &provenance,
+        })
+        .unwrap(),
+    )
 }
 
 fn tamper_snapshot_selections(engine: &NcmEngine, rows: &[(usize, &[(&str, &str)])]) -> Vec<u8> {
