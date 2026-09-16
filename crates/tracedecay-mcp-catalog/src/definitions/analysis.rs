@@ -37,6 +37,32 @@ pub(super) fn def_dead_code() -> ToolDefinition {
     )
 }
 
+pub(super) fn def_unused_imports() -> ToolDefinition {
+    def(
+        "tracedecay_unused_imports",
+        "Unused Imports",
+        "Find private Rust import bindings with no reference in the owning source file. The scan is pinned to the admitted V2 graph generation, bounded by file and result limits, and exposes explicit partial evidence when source changes or a continuation is required.",
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "number",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "description": "Maximum unused imports to return (default: 50, max: 500)."
+                },
+                "cursor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Continuation token from next_cursor. File-budget tokens are project-relative paths; result-limit tokens may resume inside the named file."
+                }
+            },
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub(super) fn def_circular() -> ToolDefinition {
     def(
         "tracedecay_circular",

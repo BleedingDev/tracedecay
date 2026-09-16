@@ -31,6 +31,7 @@ mod lcm;
 mod memory;
 mod multi_root;
 mod session;
+mod simplify;
 mod skills;
 mod testing;
 mod work;
@@ -49,6 +50,7 @@ pub use graph::{SEARCH_MAX_LEXICAL_ANCHOR_BYTES, SEARCH_MAX_LEXICAL_ANCHORS};
 use lcm::*;
 use memory::*;
 use multi_root::*;
+use simplify::*;
 use skills::*;
 use testing::*;
 
@@ -409,6 +411,7 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_remote_status_read(),
         def_affected(),
         def_dead_code(),
+        def_unused_imports(),
         def_diff_context(),
         def_circular(),
         def_hotspots(),
@@ -422,6 +425,7 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_inheritance_depth(),
         def_distribution(),
         def_recursion(),
+        def_simplify_scan(),
         def_complexity(),
         def_doc_coverage(),
         def_god_class(),
@@ -666,6 +670,7 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_remote_status",
     // analysis
     "tracedecay_dead_code",
+    "tracedecay_unused_imports",
     "tracedecay_circular",
     "tracedecay_hotspots",
     "tracedecay_unmounted_files",
@@ -675,6 +680,7 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_inheritance_depth",
     "tracedecay_distribution",
     "tracedecay_recursion",
+    "tracedecay_simplify_scan",
     "tracedecay_complexity",
     "tracedecay_doc_coverage",
     "tracedecay_god_class",

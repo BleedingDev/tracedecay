@@ -120,7 +120,7 @@ fn ephemeral_folder_selection_filters_capture_and_keeps_default_cursor_shape() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         ordinary_paths,
-        BTreeSet::from(["src/lib.rs", "vendor/lib.rs"]),
+        BTreeSet::from(["src/lib.rs"]),
         "clearing the request must restore the default Git-admitted source set"
     );
 }

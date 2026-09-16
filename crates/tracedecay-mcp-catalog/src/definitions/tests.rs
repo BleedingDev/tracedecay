@@ -16,14 +16,25 @@ fn internal_host_ingest_is_cli_resolvable_but_not_advertised() {
 }
 
 #[test]
-fn retired_unused_import_scan_is_absent_while_diagnostic_reads_remain() {
+fn unused_import_scan_is_advertised_while_diagnostic_reads_remain() {
     let definitions = get_maximal_tool_definitions().expect("tool definitions");
     eprintln!("maximal source catalog count: {}", definitions.len());
 
-    assert!(
-        definitions
-            .iter()
-            .all(|definition| definition.name != "tracedecay_unused_imports")
+    let definition = definitions
+        .iter()
+        .find(|definition| definition.name == "tracedecay_unused_imports")
+        .expect("V2 unused import analysis must be advertised");
+    assert_eq!(
+        definition.input_schema["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        definition.input_schema["properties"]["limit"]["maximum"],
+        json!(500)
+    );
+    assert_eq!(
+        definition.input_schema["properties"]["cursor"]["maxLength"],
+        json!(4096)
     );
     for name in ["tracedecay_diagnose", "tracedecay_diagnostics"] {
         assert!(

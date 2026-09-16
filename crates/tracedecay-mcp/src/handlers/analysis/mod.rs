@@ -7,8 +7,10 @@ mod dead_code;
 mod dispatch;
 mod field_sites;
 mod hotspots;
+mod imports;
 mod metrics;
 mod recursion;
+mod simplify;
 #[cfg(feature = "source-analysis")]
 mod unmounted_files;
 mod unsafe_patterns;
@@ -20,10 +22,12 @@ pub use dead_code::handle_dead_code;
 pub use dispatch::dispatch_tool;
 pub use field_sites::handle_field_sites;
 pub use hotspots::handle_hotspots;
+pub use imports::handle_unused_imports;
 pub use metrics::{
     handle_coupling, handle_distribution, handle_inheritance_depth, handle_largest, handle_rank,
 };
 pub use recursion::handle_recursion;
+pub use simplify::handle_simplify_scan;
 #[cfg(feature = "source-analysis")]
 pub use unmounted_files::handle_unmounted_files;
 pub use unsafe_patterns::handle_unsafe_patterns;

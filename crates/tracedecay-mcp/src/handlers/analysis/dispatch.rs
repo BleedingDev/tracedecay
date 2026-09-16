@@ -11,7 +11,7 @@ use super::{
     handle_circular, handle_complexity, handle_constructors, handle_coupling, handle_dead_code,
     handle_distribution, handle_doc_coverage, handle_field_sites, handle_god_class,
     handle_hotspots, handle_inheritance_depth, handle_largest, handle_rank, handle_recursion,
-    handle_unsafe_patterns,
+    handle_simplify_scan, handle_unsafe_patterns, handle_unused_imports,
 };
 use crate::ToolResult;
 use crate::handlers::support::unknown_tool_error;
@@ -34,6 +34,9 @@ pub async fn dispatch_tool(
         "tracedecay_circular" => handle_circular(&open(read("health_read")?).await?, args).await,
         "tracedecay_hotspots" => {
             handle_hotspots(&open(read("health_read")?).await?, args, scope_prefix).await
+        }
+        "tracedecay_unused_imports" => {
+            handle_unused_imports(&open(read("health_read")?).await?, args, scope_prefix).await
         }
         // The one analysis tool that opens no graph query: its whole finding is
         // that the graph and the compiler disagree, so taking the graph's file
@@ -60,6 +63,9 @@ pub async fn dispatch_tool(
         }
         "tracedecay_recursion" => {
             handle_recursion(&open(read("health_read")?).await?, args, scope_prefix).await
+        }
+        "tracedecay_simplify_scan" => {
+            handle_simplify_scan(&open(read("health_read")?).await?, args, scope_prefix).await
         }
         "tracedecay_complexity" => {
             handle_complexity(&open(read("health_read")?).await?, args, scope_prefix).await
