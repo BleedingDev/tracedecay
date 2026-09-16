@@ -244,6 +244,15 @@ impl InProcessDaemonInvocationExecutor {
     #[hotpath::skip]
     async fn invoke_once(&self, request: DaemonInvocationRequest) -> DaemonInvocationResponse {
         if let Some(project_admission) = self.project_admission.as_ref() {
+            let profile_id = match self.store_administration.profile_identity() {
+                Ok(identity) => identity.profile_id().clone(),
+                Err(_) => {
+                    return DaemonInvocationResponse::problem(
+                        request.request_id,
+                        DaemonInvocationProblem::Unavailable,
+                    );
+                }
+            };
             let git_service = if invocation_is_git_operation(request.operation()) {
                 git_service_for_project_path(&self.store_administration, Some(&self.project_path))
                     .await
@@ -262,8 +271,9 @@ impl InProcessDaemonInvocationExecutor {
                 };
             self.invocation
                 .service
-                .invoke_with_project_admission(
+                .invoke_with_project_admission_for_profile(
                     &self.invocation.lsp_session_registry,
+                    &profile_id,
                     &self.project_path,
                     git_service,
                     native_integration_service,

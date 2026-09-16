@@ -431,6 +431,338 @@ fn retained_grant(
     .expect("retained grant")
 }
 
+fn retained_grant_for_operations(
+    scope: &ResolvedScope,
+    actor: &ActorId,
+    operations: &[&tracedecay_contracts::ApplicationOperation],
+    revision: u64,
+) -> CapabilityGrantSnapshot {
+    CapabilityGrantSnapshot::new(
+        CapabilityGrantId::new(format!("grant.retained.profile.{revision}")).expect("grant id"),
+        revision,
+        ManifestDigest::new(format!("sha256:{revision:064}")).expect("grant digest"),
+        actor.clone(),
+        UtcMicros(1),
+        UtcMicros(i64::MAX),
+        scope.clone(),
+        operations
+            .iter()
+            .map(|operation| operation.capability_id().clone())
+            .collect(),
+        operations
+            .iter()
+            .map(|operation| operation.use_case_id().clone())
+            .collect(),
+        DisclosureClass::Sensitive,
+    )
+    .expect("retained grant")
+}
+
+struct CountingProviderControlPort(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracedecay_contracts::retained_surfaces::RetainedProviderControlExecutionPortV1
+    for CountingProviderControlPort
+{
+    fn execute_provider_control<'a>(
+        &'a self,
+        _context: tracedecay_contracts::RetainedSurfaceExecutionContextV1<'a>,
+        _request: &'a tracedecay_contracts::retained_surfaces::ProviderControlRequestV1,
+    ) -> tracedecay_contracts::retained_surfaces::RetainedSurfaceExecutionFutureV1<'a> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Err(tracedecay_contracts::RetainedSurfaceExecutionErrorV1::Unsupported) })
+    }
+}
+
+fn retained_provider_request(
+    request_id: &str,
+    request: tracedecay_contracts::retained_surfaces::ProviderControlRequestV1,
+) -> DaemonInvocationRequest {
+    let now = current_micros();
+    DaemonInvocationRequest::retained_application(
+        request_id,
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1::ProviderControl(request),
+        now,
+        Deadline::new(UtcMicros(now.0.saturating_add(30_000_000))).expect("deadline"),
+        CancellationContext::active(format!("cancel.{request_id}")).expect("cancellation"),
+    )
+}
+
+fn provider_state() -> tracedecay_contracts::retained_surfaces::ProviderControlStateSelectorV1 {
+    tracedecay_contracts::retained_surfaces::ProviderControlStateSelectorV1::CanonicalSession {
+        provider_id: "native".to_owned(),
+        registration_revision: 1,
+        canonical_provider_id: "claude".to_owned(),
+        session_id: "session.retained.profile".to_owned(),
+    }
+}
+
+fn provider_inspection_request(request_id: &str) -> DaemonInvocationRequest {
+    retained_provider_request(
+        request_id,
+        tracedecay_contracts::retained_surfaces::ProviderControlRequestV1::Inspection(
+            tracedecay_contracts::retained_surfaces::ProviderInspectionRequestV1 {
+                state: provider_state(),
+                selection: tracedecay_contracts::retained_surfaces::
+                    ProviderControlInspectionSelectorV1::StateSummary,
+                maximum_items: 1,
+                maximum_bytes: 1024,
+                cursor: None,
+            },
+        ),
+    )
+}
+
+fn provider_feedback_request(request_id: &str) -> DaemonInvocationRequest {
+    retained_provider_request(
+        request_id,
+        tracedecay_contracts::retained_surfaces::ProviderControlRequestV1::Feedback(
+            tracedecay_contracts::retained_surfaces::ProviderFeedbackRequestV1 {
+                source: tracedecay_contracts::retained_surfaces::ProviderControlSourceSelectorV1 {
+                    trace_ref: "trace.retained.profile".to_owned(),
+                    item_ref: "item.retained.profile".to_owned(),
+                    observation_id: "observation.retained.profile".to_owned(),
+                },
+                signal: tracedecay_contracts::retained_surfaces::
+                    ProviderControlFeedbackSignalV1::Helpful,
+                weight: "1".to_owned(),
+                evidence_refs: Vec::new(),
+                occurred_at: UtcMicros(1),
+            },
+        ),
+    )
+}
+
+async fn invoke_retained_for_profile(
+    service: &DaemonInvocationService,
+    registry: &Arc<Mutex<LspSessionRegistry>>,
+    profile_id: &UserProfileId,
+    project_root: &Path,
+    request: DaemonInvocationRequest,
+) -> DaemonInvocationResponse {
+    service
+        .invoke_with_cancellation_for_profile(
+            registry,
+            profile_id,
+            Some(project_root),
+            None,
+            None,
+            None,
+            request,
+            None,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn cross_profile_retained_dispatch_never_reuses_incumbent_provider_control() {
+    let service = DaemonInvocationService::default();
+    let registrar = DaemonRetainedRuntimeRegistrar::new(&service);
+    let checkout = tempfile::tempdir().expect("same physical checkout");
+    let project_root = checkout.path().to_path_buf();
+    let profile_a = UserProfileId::new("profile.retained.a").expect("profile A");
+    let profile_b = UserProfileId::new("profile.retained.b").expect("profile B");
+    let scope = retained_scope("project.retained.cross-profile");
+    // Keep the actor equal across profiles: agent/session identity is not part
+    // of same-profile route reconciliation, while the profile is.
+    let actor = ActorId::new("actor.retained.shared").expect("retained actor");
+    let inspection_operation = tracedecay_contracts::retained_surface_application_operation(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::ProviderInspection,
+    )
+    .expect("inspection operation");
+    let mutation_operation = tracedecay_contracts::retained_surface_application_operation(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::ProviderFeedback,
+    )
+    .expect("mutation operation");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ports = std::sync::Arc::new(
+        tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1::default()
+            .with_provider_control(std::sync::Arc::new(CountingProviderControlPort(
+                std::sync::Arc::clone(&calls),
+            ))),
+    );
+
+    registrar
+        .register(
+            profile_a.clone(),
+            project_root.clone(),
+            scope.clone(),
+            actor.clone(),
+            retained_grant_for_operations(
+                &scope,
+                &actor,
+                &[&inspection_operation, &mutation_operation],
+                1,
+            ),
+            std::sync::Arc::clone(&ports),
+        )
+        .await
+        .expect("profile A retained owner registration");
+
+    let foreign_registration = registrar
+        .register(
+            profile_b.clone(),
+            project_root.clone(),
+            scope.clone(),
+            actor.clone(),
+            retained_grant_for_operations(
+                &scope,
+                &actor,
+                &[&inspection_operation, &mutation_operation],
+                2,
+            ),
+            std::sync::Arc::new(
+                tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1::default(),
+            ),
+        )
+        .await;
+    assert!(
+        matches!(foreign_registration, Err(TraceDecayError::Config { ref message })
+            if message == "a different retained runtime is already registered for this project"),
+        "a second authenticated profile must not reconcile A's retained owner: {foreign_registration:?}"
+    );
+
+    let registry = std::sync::Arc::new(Mutex::new(LspSessionRegistry::default()));
+    let a_inspection = invoke_retained_for_profile(
+        &service,
+        &registry,
+        &profile_a,
+        &project_root,
+        provider_inspection_request("request.retained.profile.inspection"),
+    )
+    .await;
+    assert!(matches!(
+        a_inspection.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let b_inspection = invoke_retained_for_profile(
+        &service,
+        &registry,
+        &profile_b,
+        &project_root,
+        provider_inspection_request("request.retained.profile.foreign-inspection"),
+    )
+    .await;
+    assert!(matches!(
+        b_inspection.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let a_mutation = invoke_retained_for_profile(
+        &service,
+        &registry,
+        &profile_a,
+        &project_root,
+        provider_feedback_request("request.retained.profile.mutation"),
+    )
+    .await;
+    assert!(matches!(
+        a_mutation.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let b_mutation = invoke_retained_for_profile(
+        &service,
+        &registry,
+        &profile_b,
+        &project_root,
+        provider_feedback_request("request.retained.profile.foreign-mutation"),
+    )
+    .await;
+    assert!(matches!(
+        b_mutation.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn unscoped_retained_dispatch_rejects_provider_controls_without_contact() {
+    let service = DaemonInvocationService::default();
+    let registrar = DaemonRetainedRuntimeRegistrar::new(&service);
+    let checkout = tempfile::tempdir().expect("same physical checkout");
+    let project_root = checkout.path().to_path_buf();
+    let profile_id = UserProfileId::new("profile.retained.missing").expect("profile");
+    let scope = retained_scope("project.retained.missing-profile");
+    let actor = ActorId::new("actor.retained.missing-profile").expect("retained actor");
+    let inspection_operation = tracedecay_contracts::retained_surface_application_operation(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::ProviderInspection,
+    )
+    .expect("inspection operation");
+    let mutation_operation = tracedecay_contracts::retained_surface_application_operation(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::ProviderFeedback,
+    )
+    .expect("mutation operation");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ports = std::sync::Arc::new(
+        tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1::default()
+            .with_provider_control(std::sync::Arc::new(CountingProviderControlPort(
+                std::sync::Arc::clone(&calls),
+            ))),
+    );
+
+    registrar
+        .register(
+            profile_id,
+            project_root.clone(),
+            scope.clone(),
+            actor.clone(),
+            retained_grant_for_operations(
+                &scope,
+                &actor,
+                &[&inspection_operation, &mutation_operation],
+                1,
+            ),
+            ports,
+        )
+        .await
+        .expect("retained owner registration");
+
+    let registry = std::sync::Arc::new(Mutex::new(LspSessionRegistry::default()));
+    let inspection = service
+        .invoke(
+            &registry,
+            Some(&project_root),
+            None,
+            None,
+            None,
+            provider_inspection_request("request.retained.missing-profile.inspection"),
+        )
+        .await;
+    assert!(matches!(
+        inspection.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "profile-less inspection must not contact the retained provider-control port"
+    );
+
+    let mutation = service
+        .invoke(
+            &registry,
+            Some(&project_root),
+            None,
+            None,
+            None,
+            provider_feedback_request("request.retained.missing-profile.mutation"),
+        )
+        .await;
+    assert!(matches!(
+        mutation.outcome,
+        DaemonInvocationOutcome::ApplicationProblem { .. }
+    ));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "profile-less mutation must not contact the retained provider-control port"
+    );
+}
+
 /// Two routes of one project — a linked worktree, or a reopen of a route whose
 /// ports were rebuilt — must alias one retained runtime. Keying the
 /// registration on the ports object instead refused every second route.
@@ -439,12 +771,14 @@ async fn same_authority_routes_alias_one_retained_runtime() {
     let service = DaemonInvocationService::default();
     let registrar = DaemonRetainedRuntimeRegistrar::new(&service);
     let project_root = PathBuf::from("/project-retained-alias");
+    let profile_id = UserProfileId::new("profile.retained.alias").expect("retained profile");
     let scope = retained_scope("project.retained.alias");
     let actor = ActorId::new("actor.retained.alias").expect("retained actor");
     let incumbent_ports =
         Arc::new(tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1::default());
     let (first, second) = tokio::join!(
         registrar.register(
+            profile_id.clone(),
             project_root.clone(),
             scope.clone(),
             actor.clone(),
@@ -452,6 +786,7 @@ async fn same_authority_routes_alias_one_retained_runtime() {
             Arc::clone(&incumbent_ports),
         ),
         registrar.register(
+            profile_id.clone(),
             project_root.clone(),
             scope.clone(),
             actor.clone(),
@@ -473,6 +808,7 @@ async fn same_authority_routes_alias_one_retained_runtime() {
 
     let foreign = registrar
         .register(
+            profile_id,
             project_root.clone(),
             retained_scope("project.retained.foreign"),
             actor.clone(),

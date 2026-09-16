@@ -1194,19 +1194,22 @@ impl DaemonRetainedRuntimeRegistrar {
 
     /// Registers this project's one retained runtime, or joins the incumbent.
     ///
-    /// Identity is the registered store authority — the exact authorized scope
-    /// and the actor whose grant issued it — never the identity of the ports
-    /// object. Every route builds its own `RetainedSurfacePortsV1`, so
+    /// Identity is the registered store authority — the authenticated profile,
+    /// exact authorized scope, and actor whose grant issued it — never the
+    /// identity of the ports object. Every route builds its own
+    /// `RetainedSurfacePortsV1`, so
     /// comparing that object (or the grant digest it folds the current
     /// configuration into) refused the second same-identity worktree route and
     /// every reopen of a route whose ports had been rebuilt: project open then
-    /// degraded, for the life of the daemon. A matching route aliases the
-    /// incumbent and stamps its own grant on it. Later publication may add
-    /// missing families (session/LCM after the memory core), but never replaces
-    /// an incumbent family. A foreign scope or actor is still refused.
+    /// degraded, for the life of the daemon. A matching same-profile route
+    /// aliases the incumbent and stamps its own grant on it. Later publication
+    /// may add missing families (session/LCM after the memory core), but never
+    /// replaces an incumbent family. A foreign profile, scope, or actor is
+    /// refused.
     #[hotpath::skip]
     pub async fn register(
         &self,
+        profile_id: UserProfileId,
         project_root: PathBuf,
         scope: ResolvedScope,
         actor: ActorId,
@@ -1223,7 +1226,10 @@ impl DaemonRetainedRuntimeRegistrar {
             .register_or_reconcile(
                 project_root,
                 |registered: &mut RegisteredRetainedRuntime| {
-                    if registered.scope == scope && registered.actor == actor {
+                    if registered.profile_id == profile_id
+                        && registered.scope == scope
+                        && registered.actor == actor
+                    {
                         let mut completed = registered.ports.as_ref().clone();
                         if completed.mount_missing_from(ports.as_ref()) {
                             registered.ports = Arc::new(completed);
@@ -1239,6 +1245,7 @@ impl DaemonRetainedRuntimeRegistrar {
                 },
                 || async {
                     Ok(RegisteredRetainedRuntime {
+                        profile_id: profile_id.clone(),
                         scope: scope.clone(),
                         actor: actor.clone(),
                         grant: grant.clone(),

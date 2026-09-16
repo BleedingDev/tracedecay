@@ -1269,6 +1269,12 @@ for line in sys.stdin:
         let grant =
             crate::daemon::project_open_owners::project_open_retained_grant(&access, observed_at)
                 .expect("dashboard user-job retained grant");
+        let profile_id = graph
+            .profile_database()
+            .binding()
+            .shard_id
+            .profile_id
+            .clone();
         let invocation_service = tracedecay_daemon_service::DaemonInvocationService::default();
         let project_sessions = graph
             .store_runtime_registry()
@@ -1312,6 +1318,7 @@ for line in sys.stdin:
         );
         tracedecay_daemon_service::DaemonRetainedRuntimeRegistrar::new(&invocation_service)
             .register(
+                profile_id,
                 project_root.clone(),
                 scope,
                 access.requester.clone(),

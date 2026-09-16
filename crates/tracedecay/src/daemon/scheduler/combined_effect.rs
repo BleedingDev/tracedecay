@@ -900,6 +900,12 @@ mod tests {
                 observed_at,
             )
             .expect("combined admission retained grant");
+            let profile_id = memory
+                .profile_database()
+                .binding()
+                .shard_id
+                .profile_id
+                .clone();
             let engine = DaemonEngine::default();
             let invocation_service = engine.invocation.invocation_service();
             let retained_ports = tracedecay_daemon_service::retained_owner::retained_surface_ports(
@@ -925,6 +931,7 @@ mod tests {
                 .invocation
                 .retained_runtime_registrar()
                 .register(
+                    profile_id,
                     project_root.clone(),
                     scope,
                     access.requester,

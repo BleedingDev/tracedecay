@@ -50,9 +50,11 @@ pub async fn prepare(
     let operation =
         retained_surface_application_operation(RetainedSurfaceOperation::FactStoreCurate)
             .map_err(contract_error)?;
+    let profile_id = &memory.profile_database().binding().shard_id.profile_id;
     let context = match invocation
         .registered_retained_request_context(
             project_root,
+            profile_id,
             request_id.clone(),
             deadline,
             cancellation.context(),

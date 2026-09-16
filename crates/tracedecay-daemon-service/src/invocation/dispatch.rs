@@ -97,9 +97,23 @@ impl DaemonInvocationService {
             .admit_request(project_root, canonical_root)
     }
 
-    /// Executes a closed request after daemon socket authentication.
-    /// `lsp_workspace` is supplied only after the daemon has resolved every
-    /// requested root through registered project ownership.
+    /// Returns the retained runtime's profile for the in-process retained
+    /// owner test harness. This keeps that harness on the same profile-aware
+    /// dispatch path as production while leaving unscoped test helpers unable
+    /// to select a retained owner.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn retained_profile_id_for_test(&self, project_root: &Path) -> Option<UserProfileId> {
+        self.project_runtimes
+            .get::<RegisteredRetainedRuntime>(project_root)
+            .await
+            .map(|registered| registered.profile_id().clone())
+    }
+
+    /// Test-only unscoped request dispatch.
+    ///
+    /// Since this helper has no authenticated profile identity, retained
+    /// application requests are intentionally unavailable. Production callers
+    /// must use [`Self::invoke_with_cancellation_for_profile`].
     #[cfg(any(test, feature = "test-helpers"))]
     #[hotpath::skip]
     pub async fn invoke(
@@ -123,9 +137,13 @@ impl DaemonInvocationService {
         .await
     }
 
-    /// Executes a request with a cancellation lease that was admitted before a
-    /// route-local project-open wait. The ordinary `invoke` entry point keeps
-    /// owning registration for callers that do not need a pre-admission wait.
+    /// Test-only unscoped dispatch with a cancellation lease that was admitted
+    /// before a route-local project-open wait.
+    ///
+    /// Retained application requests are intentionally unavailable because
+    /// this helper has no authenticated profile identity. Production callers
+    /// must use [`Self::invoke_with_cancellation_for_profile`].
+    #[cfg(any(test, feature = "test-helpers"))]
     #[hotpath::skip]
     pub async fn invoke_with_cancellation(
         &self,
@@ -138,6 +156,7 @@ impl DaemonInvocationService {
         admitted_cancellation: Option<CancellationToken>,
     ) -> DaemonInvocationResponse {
         self.invoke_with_admission(
+            None,
             lsp_registry,
             project_root,
             lsp_workspace,
@@ -150,6 +169,41 @@ impl DaemonInvocationService {
         .await
     }
 
+    /// Executes a request for an authenticated profile. The project runtime
+    /// registry is shared by daemon connections, so retained owners must be
+    /// checked against this profile before any provider-control port is
+    /// dispatched.
+    #[hotpath::skip]
+    pub async fn invoke_with_cancellation_for_profile(
+        &self,
+        lsp_registry: &Arc<Mutex<LspSessionRegistry>>,
+        profile_id: &UserProfileId,
+        project_root: Option<&Path>,
+        lsp_workspace: Option<AuthorizedLspWorkspace>,
+        git_service: Option<DaemonGitInvocationOwner>,
+        native_integration_service: Option<DaemonNativeIntegrationOwner>,
+        request: DaemonInvocationRequest,
+        admitted_cancellation: Option<CancellationToken>,
+    ) -> DaemonInvocationResponse {
+        self.invoke_with_admission(
+            profile_id,
+            lsp_registry,
+            project_root,
+            lsp_workspace,
+            git_service,
+            native_integration_service,
+            request,
+            admitted_cancellation,
+            None,
+        )
+        .await
+    }
+
+    /// Test-only project-admitted dispatch without a profile identity.
+    ///
+    /// Retained application requests are intentionally unavailable. Production
+    /// callers must use [`Self::invoke_with_project_admission_for_profile`].
+    #[cfg(any(test, feature = "test-helpers"))]
     #[hotpath::skip]
     pub async fn invoke_with_project_admission(
         &self,
@@ -162,6 +216,35 @@ impl DaemonInvocationService {
         project_admission: &crate::project_runtime::ProjectRuntimeRequestLeaseV1,
     ) -> DaemonInvocationResponse {
         self.invoke_with_admission(
+            None,
+            lsp_registry,
+            Some(project_root),
+            None,
+            git_service,
+            native_integration_service,
+            request,
+            admitted_cancellation,
+            Some(project_admission),
+        )
+        .await
+    }
+
+    /// Executes a request with an already-admitted project lease and the
+    /// authenticated profile that owns the route.
+    #[hotpath::skip]
+    pub async fn invoke_with_project_admission_for_profile(
+        &self,
+        lsp_registry: &Arc<Mutex<LspSessionRegistry>>,
+        profile_id: &UserProfileId,
+        project_root: &Path,
+        git_service: Option<DaemonGitInvocationOwner>,
+        native_integration_service: Option<DaemonNativeIntegrationOwner>,
+        request: DaemonInvocationRequest,
+        admitted_cancellation: Option<CancellationToken>,
+        project_admission: &crate::project_runtime::ProjectRuntimeRequestLeaseV1,
+    ) -> DaemonInvocationResponse {
+        self.invoke_with_admission(
+            profile_id,
             lsp_registry,
             Some(project_root),
             None,
@@ -178,6 +261,7 @@ impl DaemonInvocationService {
     #[hotpath::measure(label = "daemon.service.invocation.dispatch", future = true)]
     async fn invoke_with_admission(
         &self,
+        profile_id: Option<&UserProfileId>,
         lsp_registry: &Arc<Mutex<LspSessionRegistry>>,
         project_root: Option<&Path>,
         lsp_workspace: Option<AuthorizedLspWorkspace>,
@@ -318,7 +402,13 @@ impl DaemonInvocationService {
         let advisory_cycle = runtimes.advisory_cycle;
         let configuration_runtime = runtimes.configuration;
         let work_runtime = runtimes.work;
-        let retained_runtime = runtimes.retained;
+        // A missing profile identity is an explicit unscoped test mode. It
+        // must never widen retained dispatch to the process-wide owner.
+        let retained_runtime = profile_id.and_then(|profile_id| {
+            runtimes
+                .retained
+                .filter(|registered| registered.profile_id() == profile_id)
+        });
         let lsp_owner = runtimes.lsp_owner;
         let source_edit_owner = runtimes.source_edit;
 

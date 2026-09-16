@@ -171,6 +171,13 @@ pub(super) async fn register_project_open_retained_owner(
                 message: format!("project-open retained grant is invalid: {error}"),
             }
         })?;
+    let profile_id = server
+        .profile_identity()
+        .ok_or_else(|| TraceDecayError::Config {
+            message: "project-open retained runtime requires exact profile authority".to_owned(),
+        })?
+        .profile_id()
+        .clone();
     let retained_ports = server.retained_surface_ports(
         project_root,
         access.scope.project_id.clone(),
@@ -178,6 +185,7 @@ pub(super) async fn register_project_open_retained_owner(
     );
     hotpath::future!(
         invocation.retained_runtime_registrar().register(
+            profile_id,
             project_root.to_path_buf(),
             access.scope.clone(),
             access.requester.clone(),

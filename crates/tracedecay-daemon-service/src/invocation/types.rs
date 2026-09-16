@@ -733,18 +733,25 @@ impl RegisteredWorkRuntime {
     }
 }
 
-/// One project's retained application runtime, shared by every route that
-/// answers to the same store authority.
+/// One profile's retained application runtime, shared by every route that
+/// answers to the same profile-scoped store authority.
 ///
 /// A linked worktree of the same project, and a reopen of a route whose ports
 /// were rebuilt, join this runtime instead of registering a second one. It is
 /// released with the whole root (`retire_roots`), never per route.
 #[derive(Clone)]
 pub struct RegisteredRetainedRuntime {
+    pub(super) profile_id: UserProfileId,
     pub(super) scope: ResolvedScope,
     pub(super) actor: ActorId,
     pub(super) grant: CapabilityGrantSnapshot,
     pub(super) ports: Arc<tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1<'static>>,
+}
+
+impl RegisteredRetainedRuntime {
+    pub(super) fn profile_id(&self) -> &UserProfileId {
+        &self.profile_id
+    }
 }
 
 pub struct RegisteredFeedbackRuntime {

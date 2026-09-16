@@ -488,12 +488,12 @@ impl DaemonInvocationService {
 
     /// Registers this project's one source-edit owner, or joins the incumbent.
     ///
-    /// Identity is the authorized scope, exactly as
+    /// Identity is the authenticated profile and authorized scope, exactly as
     /// [`DaemonRetainedRuntimeRegistrar::register`] keys the retained runtime.
     /// A linked worktree or a reopen of the same canonical root builds its own
-    /// owner object; that route aliases the incumbent instead of being refused,
-    /// while a foreign scope is refused with a typed error rather than
-    /// replacing the incumbent.
+    /// owner object; that same-profile route aliases the incumbent instead of
+    /// being refused, while a foreign profile or scope is refused with a typed
+    /// error rather than replacing the incumbent.
     #[hotpath::skip]
     pub async fn register_source_edit_owner(
         &self,
@@ -522,6 +522,30 @@ impl DaemonInvocationService {
     pub async fn registered_retained_request_context(
         &self,
         project_root: &Path,
+        profile_id: &UserProfileId,
+        request_id: RequestId,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+        observed_at: UtcMicros,
+        operation: &ApplicationOperation,
+    ) -> Result<RequestContext, RegisteredRetainedRequestContextError> {
+        self.registered_retained_request_context_inner(
+            project_root,
+            profile_id,
+            request_id,
+            deadline,
+            cancellation,
+            observed_at,
+            operation,
+        )
+        .await
+    }
+
+    #[hotpath::skip]
+    async fn registered_retained_request_context_inner(
+        &self,
+        project_root: &Path,
+        expected_profile_id: &UserProfileId,
         request_id: RequestId,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -537,6 +561,13 @@ impl DaemonInvocationService {
                     message: "automation retained application authority is unavailable".to_owned(),
                 })
             })?;
+        if registered.profile_id() != expected_profile_id {
+            return Err(RegisteredRetainedRequestContextError::Runtime(
+                TraceDecayError::Config {
+                    message: "automation retained application authority is unavailable".to_owned(),
+                },
+            ));
+        }
         let effective_deadline = Deadline {
             expires_at: UtcMicros(deadline.expires_at.0.min(registered.grant.expires_at.0)),
         };

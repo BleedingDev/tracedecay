@@ -23,6 +23,15 @@ impl DaemonInvocationState {
         if let Some(response) = invalid_multi_root_invocation_response(&request) {
             return response;
         }
+        let profile_id = match store_administration.profile_identity() {
+            Ok(identity) => identity.profile_id().clone(),
+            Err(_) => {
+                return DaemonInvocationResponse::problem(
+                    request.request_id,
+                    DaemonInvocationProblem::Unavailable,
+                );
+            }
+        };
         let direct_request_cancellation_lease = if matches!(
             &request.payload,
             DaemonInvocationPayload::MultiRootScopeSetRead { .. }
@@ -357,8 +366,9 @@ impl DaemonInvocationState {
             DaemonInvocationPayload::LspFrame { session, .. } => Some(session.clone()),
             _ => None,
         };
-        let response = Box::pin(self.service.invoke_with_cancellation(
+        let response = Box::pin(self.service.invoke_with_cancellation_for_profile(
             &self.lsp_session_registry,
+            &profile_id,
             request_project_path,
             lsp_workspace,
             git_service,
