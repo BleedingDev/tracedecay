@@ -728,7 +728,7 @@ fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
         CALL_DEADLINE,
     );
     assert!(
-        matches!(result, Err(ClientError::Unavailable(detail)) if detail.contains("mismatch")),
+        matches!(result, Err(ClientError::Unavailable(ref detail)) if detail.contains("mismatch")),
         "unexpected result: {result:?}"
     );
     assert_eq!(client.pid(), None);
