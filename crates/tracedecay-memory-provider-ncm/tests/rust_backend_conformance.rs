@@ -12,7 +12,7 @@ mod enabled {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -36,7 +36,8 @@ mod enabled {
         observation_extensions_digest,
     };
     use tracedecay_memory_provider_ncm::{
-        NCM_PROVIDER_ID, NcmNamespace, NcmProviderAdapter, RustNcmConfig, RustNcmSurface,
+        NCM_PROVIDER_ID, NcmCognitiveSurface, NcmNamespace, NcmProviderAdapter, NcmSurfaceCall,
+        NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse, RustNcmConfig, RustNcmSurface,
         StateRoot, WorkerOptions,
     };
 
@@ -137,6 +138,47 @@ mod enabled {
 
     fn adapter(root: &TestRoot) -> Arc<NcmProviderAdapter> {
         Arc::new(NcmProviderAdapter::new(surface(root)).expect("construct NCM adapter"))
+    }
+
+    struct CancelAfterCommitSurface {
+        inner: Arc<RustNcmSurface>,
+        cancel_next_observe: AtomicBool,
+    }
+
+    impl NcmCognitiveSurface for CancelAfterCommitSurface {
+        fn descriptor(&self) -> tracedecay_memory_provider_api::ProviderDescriptor {
+            self.inner.descriptor()
+        }
+
+        fn handshake(
+            &self,
+            request: &NcmSurfaceHandshakeRequest,
+        ) -> NcmSurfaceHandshakeResponse {
+            self.inner.handshake(request)
+        }
+
+        fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
+            let reply = self.inner.invoke(call);
+            if call.operation == ProviderOperation::Observe
+                && self.cancel_next_observe.swap(false, Ordering::SeqCst)
+            {
+                assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+                assert_eq!(
+                    reply.terminal.committed_effect().state(),
+                    CommittedEffectState::Committed
+                );
+                call.control.cancellation().cancel();
+            }
+            reply
+        }
+    }
+
+    fn cancel_after_commit_adapter(root: &TestRoot) -> Arc<NcmProviderAdapter> {
+        let surface = Arc::new(CancelAfterCommitSurface {
+            inner: surface(root),
+            cancel_next_observe: AtomicBool::new(true),
+        });
+        Arc::new(NcmProviderAdapter::new(surface).expect("construct NCM adapter"))
     }
 
     fn scope_parts(
@@ -691,7 +733,7 @@ mod enabled {
     #[test]
     fn cancelled_calls_never_return_success_and_committed_observe_reconciles_once() {
         let root = TestRoot::new("cancel");
-        let provider = adapter(&root);
+        let provider = cancel_after_commit_adapter(&root);
         let exact_scope = scope("project-cancel");
         let (receipt, generation) = ready_parts(provider.as_ref(), &exact_scope);
         for operation in supported_operations() {
@@ -714,13 +756,9 @@ mod enabled {
         }
 
         let token = CancellationToken::new();
-        let mut value = observe_value("source-cancel", "cancel key", "cancel value");
-        value
-            .as_object_mut()
-            .expect("observe object")
-            .insert("test_sleep_after_commit_ms".to_owned(), json!(250));
+        let value = observe_value("source-cancel", "cancel key", "cancel value");
         let (receipt, generation) = ready_parts(provider.as_ref(), &exact_scope);
-        let observe = call_with(
+        let unknown = provider.invoke(&call_with(
             ProviderOperation::Observe,
             &exact_scope,
             &receipt,
@@ -728,14 +766,9 @@ mod enabled {
             Some("cancel-after-commit"),
             value.clone(),
             operation_contract(ProviderOperation::Observe),
-            token.clone(),
+            token,
             10_000,
-        );
-        let threaded = Arc::clone(&provider);
-        let handle = thread::spawn(move || threaded.invoke(&observe));
-        thread::sleep(Duration::from_millis(40));
-        token.cancel();
-        let unknown = handle.join().expect("cancelled observe joins");
+        ));
         assert_eq!(
             unknown.terminal.terminal_code(),
             TerminalCode::EffectUnknown
