@@ -2315,7 +2315,7 @@ mod tests {
         let target = locator_target(&delivery, &observation, locator);
         let request = feedback_request_for(target.clone());
 
-        let mut first_call = lifecycle_call(
+        let first_call = lifecycle_call(
             &delivery,
             1,
             ProviderOperation::Feedback,
@@ -2323,7 +2323,6 @@ mod tests {
             staged.generation().expect("first generation"),
             &request,
         );
-        first_call.ready_receipt_sha256 = "b".repeat(64);
         let first_admission = admission_for(&first_call, std::slice::from_ref(&source));
         let first = staged
             .control(&first_call, Some(&first_admission))
@@ -2332,6 +2331,25 @@ mod tests {
             first.response["applied_effect"]["retained_source_locator"],
             locator
         );
+
+        // The same registration cannot silently swap its ready receipt. A
+        // restart is represented by a new registration revision, which the
+        // later call below exercises explicitly.
+        let mut same_registration_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.re-handshake-ready-swap",
+            staged.generation().expect("ready swap generation"),
+            &request,
+        );
+        same_registration_call.ready_receipt_sha256 = "b".repeat(64);
+        let same_registration_admission =
+            admission_for(&same_registration_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&same_registration_call, Some(&same_registration_admission)),
+            Err(StagedStoreError::LifecycleConflict(_))
+        ));
 
         drop(staged);
         let reopened = store(&root, 8);
@@ -2475,7 +2493,7 @@ mod tests {
         assert!(matches!(
             staged.control(&delete_call, None),
             Err(StagedStoreError::LifecycleConflict(
-                "stored source attribution"
+                "deletion authority unavailable"
             ))
         ));
         assert_eq!(
