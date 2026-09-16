@@ -1475,27 +1475,6 @@ impl ProjectOpenInputs<'_> {
             )
             .await?;
         self.phase_checkpoint(ProjectOpenFailurePhase::SessionDatabases)?;
-        #[cfg(feature = "memory-provider-host")]
-        let provider_full_mount =
-            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
-                &core.memory_provider_host,
-                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountInputsV1 {
-                    graph: Arc::clone(cg),
-                    canonical_project_path: self.canonical_project_path.to_path_buf(),
-                    profile_id: core.profile_identity.profile_id().clone(),
-                    brain_id: core.profile_identity.brain_id().clone(),
-                    scope: code_index.scope.clone(),
-                    authoritative_project_id: code_index.project_id.clone(),
-                    session_db: session_db.clone(),
-                    configuration_digest: runtime_configuration
-                        .snapshot()
-                        .effective_behavior_digest
-                        .clone(),
-                },
-                self.cancellation,
-            )
-            .await
-            .map_err(|error| TraceDecayError::Config { message: error })?;
         let delivery_access = daemon_owned_project_source_access_at(
             &code_index.scope,
             self.canonical_project_path,
@@ -1652,6 +1631,27 @@ impl ProjectOpenInputs<'_> {
             .store_administration
             .profile_session_refresh_service(&user_session_db)
             .await;
+        #[cfg(feature = "memory-provider-host")]
+        let provider_full_mount =
+            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
+                &core.memory_provider_host,
+                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountInputsV1 {
+                    graph: Arc::clone(cg),
+                    canonical_project_path: self.canonical_project_path.to_path_buf(),
+                    profile_id: core.profile_identity.profile_id().clone(),
+                    brain_id: core.profile_identity.brain_id().clone(),
+                    scope: code_index.scope.clone(),
+                    authoritative_project_id: code_index.project_id.clone(),
+                    session_db: session_db.clone(),
+                    configuration_digest: runtime_configuration
+                        .snapshot()
+                        .effective_behavior_digest
+                        .clone(),
+                },
+                self.cancellation,
+            )
+            .await
+            .map_err(|error| TraceDecayError::Config { message: error })?;
         let full_context = core
             .publish_route_ports(
                 crate::mcp::server::McpServerConstructionContext::daemon_owned(
@@ -1699,16 +1699,31 @@ impl ProjectOpenInputs<'_> {
                 context.with_observation_journey_mount(journey)
             })
             .with_provider_control_mount(provider_full_mount.provider_control_mount());
-        project_open_cancellation_checkpoint(self.cancellation)?;
+        if let Err(error) = project_open_cancellation_checkpoint(self.cancellation) {
+            #[cfg(feature = "memory-provider-host")]
+            shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
+                .await;
+            return Err(error);
+        }
         let full_construction_started = Instant::now();
         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
-        full_candidate
+        if full_candidate
             .install_generation_census_reader(Arc::clone(&code_index.generation_census_reader))
-            .map_err(|_| TraceDecayError::Config {
+            .is_err()
+        {
+            #[cfg(feature = "memory-provider-host")]
+            shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
+                .await;
+            full_candidate.shutdown().await;
+            return Err(TraceDecayError::Config {
                 message: "full MCP generation census authority was already installed".to_owned(),
-            })?;
+            });
+        }
         self.log_phase("mcp_full_constructed", None, full_construction_started);
         if *core.current_key.lock().await != *key {
+            #[cfg(feature = "memory-provider-host")]
+            shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
+                .await;
             full_candidate.shutdown().await;
             return Err(TraceDecayError::Config {
                 message: "project changed branch during full capability admission".to_owned(),
@@ -2248,6 +2263,25 @@ async fn project_delivery_settlement_ports(
     Ok((authority, recorder))
 }
 
+#[cfg(feature = "memory-provider-host")]
+async fn shutdown_failed_provider_full_mount(
+    mount: &Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1>,
+    project: &Path,
+) {
+    for journey in mount.observation_journeys() {
+        let failures = journey
+            .shutdown(tokio::time::Instant::now() + tracedecay_daemon_service::TASK_ABORT_DEADLINE)
+            .await;
+        for failure in failures {
+            tracing::warn!(
+                project = %project.display(),
+                failure = %failure,
+                "failed project-open provider journey did not stop cleanly"
+            );
+        }
+    }
+}
+
 /// Retire every resource this failed open attempt published. The owner
 /// registry, HTTP cache, invocation runtime, refresh schedulers, provider
 /// workers, and database leases all have independent retention, so rollback
@@ -2312,20 +2346,8 @@ async fn retire_failed_project_open_owner(
     // server task graph before the last Arc drops.
     if let Some(full) = published_full_server {
         #[cfg(feature = "memory-provider-host")]
-        for journey in full.provider_full_mount.observation_journeys() {
-            let failures = journey
-                .shutdown(
-                    tokio::time::Instant::now() + tracedecay_daemon_service::TASK_ABORT_DEADLINE,
-                )
-                .await;
-            for failure in failures {
-                tracing::warn!(
-                    project = %canonical_project_path.display(),
-                    failure = %failure,
-                    "failed project-open provider journey did not stop cleanly"
-                );
-            }
-        }
+        shutdown_failed_provider_full_mount(&full.provider_full_mount, canonical_project_path)
+            .await;
         if !full_is_removed {
             full.server.revoke_project_server_responses();
             full.server.shutdown().await;
