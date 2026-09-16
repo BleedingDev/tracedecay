@@ -22,7 +22,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tracedecay_memory_provider_api::contract::{CAPABILITIES, FallbackEligibility, TerminalCode};
+use tracedecay_memory_provider_api::contract::{
+    CAPABILITIES, CommittedEffectState, FallbackEligibility, TerminalCode,
+};
 use tracedecay_memory_provider_api::{
     ApiError, FallbackDirective, HandshakeRequest, HandshakeResponse, MemoryProvider,
     OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor,
@@ -1361,6 +1363,15 @@ impl MemoryFabric {
             terminal.exact_scope_sha256(),
             terminal.diagnostic_id().map(str::to_owned),
         )?;
+        // Unknown effects intentionally carry no generation claim. The
+        // provider may have committed before the response became uncertain,
+        // so rejecting the terminal merely because the effect omits its
+        // before/after generations would discard the reconciliation witness.
+        // Every known effect state retains the strict generation checks below.
+        if terminal.committed_effect().state() == CommittedEffectState::Unknown {
+            return Ok(());
+        }
+
         if let Some(expected) = expected_state_generation {
             match terminal.committed_effect().state_generation_before() {
                 Some(evidence) if evidence != expected => {

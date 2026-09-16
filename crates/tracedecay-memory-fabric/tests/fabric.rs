@@ -1760,46 +1760,145 @@ fn boundary_rejects_operation_provider_scope_and_generation_mismatches()
         })
     );
 
-    let missing_generation_before_call = call(
-        "provider.missing-generation-before",
+    let unknown_effect_call = call(
+        "provider.unknown-effect",
         ProviderOperation::Observe,
         Some(DIGEST),
         &["observation.accept.v1"],
         OperationControl::new(i64::MAX, 100, CancellationToken::new()),
     )?;
-    let missing_generation_before_reply = ProviderReply {
+    let unknown_effect_reply = ProviderReply {
         terminal: terminal(
             ProviderOperation::Observe,
-            "provider.missing-generation-before",
+            "provider.unknown-effect",
             TerminalCode::EffectUnknown,
             CommittedEffectEvidence::unknown(DIGEST, "inspect-provider-journal")?,
             FallbackDirective::forbidden(),
-            &missing_generation_before_call.operation_id,
-            &missing_generation_before_call
-                .exact_scope
-                .exact_scope_sha256(),
+            &unknown_effect_call.operation_id,
+            &unknown_effect_call.exact_scope.exact_scope_sha256(),
             Some("diagnostic.effect-unknown"),
         )?,
         payload: None,
         warnings: Vec::new(),
         extensions: Vec::new(),
-        state_generation: 0,
+        // The provider may still report its observed current generation even
+        // though the committed-effect boundary is unknown. The fabric must
+        // preserve the unknown terminal instead of requiring that value to be
+        // duplicated in the effect evidence.
+        state_generation: 1,
     };
+    let unknown_effect_provider = Arc::new(TestProvider::scripted(
+        "provider.unknown-effect",
+        unknown_effect_reply,
+    )?);
     fabric.register(
-        provider_id("provider.missing-generation-before")?,
+        provider_id("provider.unknown-effect")?,
         1,
         ProviderMode::Observer,
-        Arc::new(TestProvider::scripted(
-            "provider.missing-generation-before",
-            missing_generation_before_reply,
-        )?),
+        unknown_effect_provider.clone(),
     )?;
-    fabric.handshake(&handshake_request("provider.missing-generation-before")?)?;
+    fabric.handshake(&handshake_request("provider.unknown-effect")?)?;
+    let receipt = fabric.deliver_observation(&unknown_effect_call)?;
     assert_eq!(
-        fabric.deliver_observation(&missing_generation_before_call),
-        Err(FabricError::ResponseStateGenerationBeforeMissing { expected: 0 })
+        receipt.terminal.terminal_code(),
+        TerminalCode::EffectUnknown
     );
+    assert_eq!(
+        receipt.terminal.committed_effect().state(),
+        CommittedEffectState::Unknown
+    );
+    assert_eq!(
+        receipt
+            .terminal
+            .committed_effect()
+            .provider_receipt_sha256(),
+        Some(DIGEST)
+    );
+    assert_eq!(
+        receipt.terminal.committed_effect().reconciliation_action(),
+        Some("inspect-provider-journal")
+    );
+    assert_eq!(
+        receipt
+            .terminal
+            .committed_effect()
+            .state_generation_before(),
+        None
+    );
+    assert_eq!(
+        receipt.terminal.committed_effect().state_generation_after(),
+        None
+    );
+    assert_eq!(unknown_effect_provider.invocation_count(), 1);
 
+    Ok(())
+}
+
+#[test]
+fn mutating_unknown_effect_reply_is_preserved_without_generation_evidence()
+-> Result<(), Box<dyn Error>> {
+    let provider_name = "provider.active-effect-unknown";
+    let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
+    let feedback_call = call(
+        provider_name,
+        ProviderOperation::Feedback,
+        Some(DIGEST),
+        &["feedback.record.v1"],
+        OperationControl::new(i64::MAX, 100, CancellationToken::new()),
+    )?;
+    let feedback_reply = ProviderReply {
+        terminal: terminal(
+            ProviderOperation::Feedback,
+            provider_name,
+            TerminalCode::EffectUnknown,
+            CommittedEffectEvidence::unknown(DIGEST, "reconcile-feedback-effect")?,
+            FallbackDirective::forbidden(),
+            &feedback_call.operation_id,
+            &feedback_call.exact_scope.exact_scope_sha256(),
+            Some("diagnostic.feedback-effect-unknown"),
+        )?,
+        payload: None,
+        warnings: Vec::new(),
+        extensions: Vec::new(),
+        state_generation: 1,
+    };
+    let provider = Arc::new(TestProvider::build(
+        provider_name,
+        &["feedback.record.v1"],
+        Some(feedback_reply),
+    )?);
+    fabric.register(
+        provider_id(provider_name)?,
+        1,
+        ProviderMode::Active,
+        provider.clone(),
+    )?;
+    fabric.handshake(&handshake_request(provider_name)?)?;
+
+    let reply = fabric.invoke_active(&feedback_call)?;
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::EffectUnknown);
+    assert_eq!(
+        reply.terminal.committed_effect().state(),
+        CommittedEffectState::Unknown
+    );
+    assert_eq!(
+        reply.terminal.committed_effect().state_generation_before(),
+        None
+    );
+    assert_eq!(
+        reply.terminal.committed_effect().state_generation_after(),
+        None
+    );
+    assert_eq!(reply.state_generation, 1);
+    assert_eq!(provider.invocation_count(), 1);
+
+    // Unknown effect evidence invalidates readiness until reconciliation, so
+    // the same mutation cannot be retried blindly.
+    assert_eq!(
+        fabric.invoke_active(&feedback_call),
+        Err(FabricError::ProviderNotReady(provider_name.to_owned()))
+    );
+    assert_eq!(provider.invocation_count(), 1);
     Ok(())
 }
 
