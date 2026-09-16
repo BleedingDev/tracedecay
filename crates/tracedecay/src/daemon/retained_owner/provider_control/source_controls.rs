@@ -200,9 +200,13 @@ impl PreparedCorrectionV1<'_> {
         };
         port.require_same_state(state, target)?;
         port.require_same_state(state, replacement)?;
-        let mut originals = vec![target.authorized.retained.original_source.clone()];
-        if replacement.authorized.retained.original_source != originals[0] {
-            originals.push(replacement.authorized.retained.original_source.clone());
+        // Retained source attributions are opaque locator projections. The
+        // canonical source identities for this transient inventory must come
+        // from the fresh grants returned by host re-resolution.
+        let mut originals = vec![target.granted_source()?.attribution.source.clone()];
+        let replacement_source = replacement.granted_source()?.attribution.source.clone();
+        if replacement_source != originals[0] {
+            originals.push(replacement_source);
         }
         // Reuse the existing canonical inventory authority to derive one actual
         // relation and checkpoint for both originals. The installed provider
@@ -210,7 +214,7 @@ impl PreparedCorrectionV1<'_> {
         // claim and revalidates every full source immediately before use.
         let inventory = port
             .authority()?
-            .authorize_retained_source_inventory(&state.retained, &originals, &invocation.control)
+            .authorize_source_inventory(&state.retained, &originals, &invocation.control)
             .await?;
         let grant = inventory
             .grant

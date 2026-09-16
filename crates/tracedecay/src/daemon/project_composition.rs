@@ -1011,6 +1011,9 @@ struct ComposedCoreServer {
     observation_provider_mounts: Vec<ProjectObservationMountWithHistoryV1>,
     #[cfg(feature = "memory-provider-host")]
     cognitive_recall_mount: Option<crate::mcp::server::CognitiveRecallMount>,
+    #[cfg(feature = "memory-provider-host")]
+    recall_locator_key:
+        crate::daemon::retained_owner::cognitive_recall::control_attribution::RecallLocatorKeyV1,
     ports: ProjectRoutePorts,
 }
 
@@ -1389,6 +1392,26 @@ impl ProjectOpenInputs<'_> {
         // provider has a route: disabled and observer-only compositions mount
         // none, so an observer can never be selected for product output.
         #[cfg(feature = "memory-provider-host")]
+        let recall_locator_key = {
+            let configuration_database = cg.configuration_runtime().registered_database();
+            let locator_key_material =
+                tracedecay_global_db::configuration::GlobalDbConfigurationControlStore::new_registered(
+                    configuration_database.as_ref(),
+                )
+                .load_recall_locator_key()
+                .await
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!("could not load durable recall locator key: {error}"),
+                })?;
+            super::retained_owner::cognitive_recall::control_attribution::RecallLocatorKeyV1::from_material(
+                locator_key_material,
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("could not validate durable recall locator key: {error}"),
+            })?
+        };
+
+        #[cfg(feature = "memory-provider-host")]
         let cognitive_recall_mount = match (
             memory_provider_host_mount.registry(),
             project_recall_routing_policy(
@@ -1438,6 +1461,7 @@ impl ProjectOpenInputs<'_> {
                         super::retained_owner::cognitive_recall::host_provider_invocation_boundary(
                             PROJECT_MEMORY_PROVIDER_MAX_IN_FLIGHT,
                         ),
+                    locator_key: recall_locator_key.clone(),
                 },
             )
             .map_err(|error| TraceDecayError::Config {
@@ -1544,6 +1568,8 @@ impl ProjectOpenInputs<'_> {
             observation_provider_mounts,
             #[cfg(feature = "memory-provider-host")]
             cognitive_recall_mount,
+            #[cfg(feature = "memory-provider-host")]
+            recall_locator_key,
             ports: ProjectRoutePorts {
                 code_index,
                 dashboard_code_index_freshness_reader: project_dashboard_freshness_reader(
@@ -2017,6 +2043,7 @@ impl ProjectOpenInputs<'_> {
                     .cognitive_recall_mount
                     .as_ref()
                     .map(|mount| mount.control_ledger()),
+                locator_key: core.recall_locator_key.clone(),
                 live_journals: control_journals,
                 runtime: tokio::runtime::Handle::current(),
             };
@@ -3281,7 +3308,6 @@ mod memory_provider_routing_tests {
             resolve_memory_provider_activation(&self::config(true, Some("provider.ncm-local")))
                 .expect_err("unknown active provider");
         assert!(error.to_string().contains("is unknown"));
-
     }
 }
 

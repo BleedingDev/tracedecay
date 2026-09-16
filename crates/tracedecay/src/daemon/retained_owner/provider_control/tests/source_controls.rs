@@ -28,10 +28,10 @@ use tracedecay_memory_observation::{RecoveryTimeBudgetV1, SqliteObservationJourn
 use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
 use tracedecay_memory_provider_registry::{
     AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CancellationToken,
-    CurrentAdvisoryAdmission, OperationControl, OwnedProviderId, OwnedVersionedId,
-    ProjectMemoryProviderComposition, ProviderCall, ProviderCallParts, ProviderOperation,
-    RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainProviderExplanationV1,
-    RecallExplainTraceV1,
+    CurrentAdvisoryAdmission, LifecycleTargetReference, OperationControl, OwnedProviderId,
+    OwnedVersionedId, ProjectMemoryProviderComposition, ProviderCall, ProviderCallParts,
+    ProviderOperation, RecallExplainHostDecisionV1, RecallExplainItemV1,
+    RecallExplainProviderExplanationV1, RecallExplainTraceV1,
 };
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::ObservationCancellation;
@@ -41,7 +41,10 @@ use tracedecay_sessions::runtime::claude_observation::ingest_source_with_observa
 
 use crate::daemon::retained_owner::cognitive_recall::{
     RecallAdmissionLedgerV1,
-    control_attribution::{PreparedRecallControlMetadataV1, RetainedRecallControlBindingV1},
+    control_attribution::{
+        PreparedRecallControlMetadataV1, RecallLocatorKeyV1, RetainedRecallControlBindingV1,
+        retained_trace_id_with_key,
+    },
 };
 use crate::daemon::retained_owner::observation_journey::ObservationJourneyPolicyV1;
 use crate::daemon::retained_owner::provider_control::ProviderControlMountInputsV1;
@@ -53,8 +56,8 @@ use crate::daemon::retained_owner::provider_history::{
     ProviderHistoryAuthorityV1, ProviderHistoryReaderV1, history_grant_json,
     source_attribution_json,
 };
-use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use crate::mcp::tools::handlers::hook_runtime::capture_live_origin_for_control_test;
+use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
 
 const SESSION: &str = "offline-source-control-session";
 const ORIGINAL_CONTENT: &str =
@@ -70,6 +73,7 @@ struct OfflineSourceFixture {
     selector: ProviderControlSourceSelectorV1,
     attribution: SourceAttribution,
     scope: ResolvedScope,
+    provider_id: OwnedProviderId,
 }
 
 fn operation_control() -> OperationControl {
@@ -133,10 +137,14 @@ fn hook_envelope(event: u8, now: UtcMicros) -> HookEventEnvelopeV2 {
 
 impl OfflineSourceFixture {
     async fn new() -> Self {
-        Self::for_delivery_session(SESSION).await
+        Self::for_provider(SESSION, "tracedecay.native").await
     }
 
     async fn for_delivery_session(delivery_session: &str) -> Self {
+        Self::for_provider(delivery_session, "tracedecay.native").await
+    }
+
+    async fn for_provider(delivery_session: &str, provider_name: &str) -> Self {
         let temporary = TempDir::new().unwrap();
         let project_root = temporary.path().join("repository");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -169,6 +177,7 @@ impl OfflineSourceFixture {
                 .unwrap();
         let data_root = temporary.path().join("provider-data");
         std::fs::create_dir_all(&data_root).unwrap();
+        let provider = OwnedProviderId::new(provider_name).unwrap();
         let hook_root = data_root
             .join("hook-v2-admissions")
             .join(HookHostV1::ClaudeCode.hook_key());
@@ -338,12 +347,15 @@ impl OfflineSourceFixture {
             .unwrap();
         let journal = Arc::new(
             SqliteObservationJournal::open(
-                data_root.join("memory-observation-journal-v1.sqlite3"),
+                data_root.join(match provider.as_str() {
+                    "tracedecay.native" => "memory-observation-journal-v1.sqlite3",
+                    "ncm" => "memory-observation-ncm-journal-v1.sqlite3",
+                    _ => panic!("unsupported provider fixture"),
+                }),
                 ObservationJourneyPolicyV1::project_default().retention,
             )
             .unwrap(),
         );
-        let provider = OwnedProviderId::new("tracedecay.native").unwrap();
         let bridge = Arc::new(
             HistoryIdentityBridgeV1::admit(
                 &project_root,
@@ -386,8 +398,23 @@ impl OfflineSourceFixture {
         );
         let wire: RecallSourceAttributionV1 =
             serde_json::from_value(source_attribution_json(&attribution).unwrap()).unwrap();
+        let raw_candidate_id = "candidate.original-source";
+        let retained_candidate_id = crate::daemon::retained_owner::cognitive_recall::control_attribution::retained_candidate_identity_alias_for_context(
+            &RecallLocatorKeyV1::for_test(),
+            &delivery.exact_scope_sha256(),
+            "request.retained-source",
+            provider.as_str(),
+            1,
+            raw_candidate_id,
+        );
         let trace = RecallExplainTraceV1 {
-            trace_id: "a".repeat(64),
+            trace_id: retained_trace_id_with_key(
+                &RecallLocatorKeyV1::for_test(),
+                &delivery.exact_scope_sha256(),
+                "request.retained-source",
+                provider.as_str(),
+                1,
+            ),
             request_id: "request.retained-source".to_owned(),
             provider_id: provider.as_str().to_owned(),
             registration_revision: 1,
@@ -395,11 +422,11 @@ impl OfflineSourceFixture {
             degraded: false,
             token_summary: None,
             items: vec![RecallExplainItemV1 {
-                candidate_id: "candidate.original-source".to_owned(),
+                candidate_id: retained_candidate_id.clone(),
                 provider_rank: 0,
                 stage: RecallExplainHostDecisionV1::Selected.stage(),
                 host_decision: RecallExplainHostDecisionV1::Selected,
-                host_reason_code: "selected".to_owned(),
+                host_reason_code: RecallExplainHostDecisionV1::Selected.code().to_owned(),
                 host_reason_detail: None,
                 provider_explanation: RecallExplainProviderExplanationV1::NotProvided,
                 section: None,
@@ -410,7 +437,7 @@ impl OfflineSourceFixture {
             &trace,
             &delivery,
             &BTreeMap::from([(
-                "candidate.original-source".to_owned(),
+                retained_candidate_id,
                 RetainedRecallControlBindingV1 {
                     stable_memory_ref: format!("observation:{}", attribution.source.observation_id),
                     original_sources: vec![wire],
@@ -455,7 +482,8 @@ impl OfflineSourceFixture {
                     hook_origin_reader: origin_reader,
                     store_data_root: data_root,
                     live_ledger: Some(ledger.clone()),
-                    live_journals: vec![(provider, journal.clone())],
+                    locator_key: RecallLocatorKeyV1::for_test(),
+                    live_journals: vec![(provider.clone(), journal.clone())],
                     runtime: tokio::runtime::Handle::current(),
                 },
                 &operation_control(),
@@ -484,6 +512,7 @@ impl OfflineSourceFixture {
             ledger,
             journal,
             history_authority,
+            provider_id: provider,
             selector,
             attribution,
             scope,
@@ -542,20 +571,74 @@ impl OfflineSourceFixture {
         request_context: &RequestContext,
         cancellation_signal: &CancellationSignal,
     ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
+        self.execute_on(&self.port, request, request_context, cancellation_signal)
+            .await
+    }
+
+    async fn execute_on(
+        &self,
+        port: &ProjectProviderControlPortV1,
+        request: &ProviderControlRequestV1,
+        request_context: &RequestContext,
+        cancellation_signal: &CancellationSignal,
+    ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
         let operation =
             tracedecay_contracts::retained_surface_application_operation(request.operation())
                 .unwrap();
-        self.port
-            .execute_provider_control(
-                RetainedSurfaceExecutionContextV1 {
-                    request_context,
-                    cancellation_signal,
-                    operation: &operation,
-                    observed_at: tracedecay_contracts::now_micros(),
-                },
-                request,
-            )
-            .await
+        port.execute_provider_control(
+            RetainedSurfaceExecutionContextV1 {
+                request_context,
+                cancellation_signal,
+                operation: &operation,
+                observed_at: tracedecay_contracts::now_micros(),
+            },
+            request,
+        )
+        .await
+    }
+
+    fn reopened_port(&self) -> ProjectProviderControlPortV1 {
+        let data_root = self._temporary.path().join("provider-data");
+        let profile = self.port.inputs.profile_id.clone();
+        let profile_id = profile.clone();
+        let session_db = self.port.inputs.canonical_session_db.clone();
+        let authority = ProviderControlAuthorityV1::from_mounted_data(
+            ProviderControlAuthorityInputsV1 {
+                canonical_project_path: self.port.inputs.project_root.clone(),
+                profile_id: profile.clone(),
+                mounted_scope: self.port.inputs.mounted_scope.clone(),
+                session_db: session_db.clone(),
+                dispositions: self.port.inputs.canonical_dispositions.clone(),
+                hook_origin_reader: Arc::new(HookOriginReaderV1::new(
+                    data_root.clone(),
+                    session_db.binding().shard_id.brain_id.clone(),
+                    profile.clone(),
+                )),
+                store_data_root: data_root.clone(),
+                live_ledger: Some(Arc::new(
+                    RecallAdmissionLedgerV1::open_for_control_test(&data_root).unwrap(),
+                )),
+                locator_key: RecallLocatorKeyV1::for_test(),
+                live_journals: Vec::new(),
+                runtime: tokio::runtime::Handle::current(),
+            },
+            &operation_control(),
+        )
+        .unwrap();
+        ProjectProviderControlPortV1 {
+            inputs: ProviderControlMountInputsV1 {
+                authority: Some(Arc::new(authority)),
+                composition: Arc::new(ProjectMemoryProviderComposition::Disabled),
+                journeys: Vec::new(),
+                profile_id,
+                mounted_scope: self.port.inputs.mounted_scope.clone(),
+                authoritative_project_id: self.port.inputs.authoritative_project_id.clone(),
+                project_root: self.port.inputs.project_root.clone(),
+                configuration_digest: self.port.inputs.configuration_digest.clone(),
+                canonical_session_db: session_db,
+                canonical_dispositions: self.port.inputs.canonical_dispositions.clone(),
+            },
+        }
     }
 
     async fn admit_source_call(
@@ -588,7 +671,7 @@ impl OfflineSourceFixture {
         let readiness_claim = "a".repeat(64);
         let mut payload = deletion_body(request, &self.attribution);
         payload["common_request"] = json!({
-            "provider_id": "tracedecay.native",
+            "provider_id": self.provider_id.as_str(),
             "registration_revision": 1,
             "ready_receipt_digest": readiness_claim,
             "exact_scope_identity": projection::scope(&grant.destination_scope),
@@ -602,7 +685,7 @@ impl OfflineSourceFixture {
         });
         ProviderCall::new(ProviderCallParts {
             operation: ProviderOperation::DeleteBySource,
-            provider_id: OwnedProviderId::new("tracedecay.native").unwrap(),
+            provider_id: self.provider_id.clone(),
             registration_revision: 1,
             ready_receipt_sha256: readiness_claim,
             exact_scope: grant.destination_scope.clone(),
@@ -630,7 +713,7 @@ impl OfflineSourceFixture {
             .read_provider_source_deletion_intent_receipt_bounded(
                 &ProviderSourceDeletionIntentV1 {
                     operation_id: accepted.operation_id(),
-                    provider_id: "tracedecay.native",
+                    provider_id: self.provider_id.as_str(),
                     original_source_sha256: &digest,
                     expected_fence_revision: 0,
                     mode: DeletionMode::RemoveInfluence,
@@ -646,6 +729,206 @@ impl OfflineSourceFixture {
             .unwrap()
             .unwrap()
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_control_port_authorizes_opaque_locator_and_builds_target_from_fresh_grant() {
+    let fixture = OfflineSourceFixture::new().await;
+    let reopened = fixture.reopened_port();
+    let selected = reopened
+        .resolve_source(&fixture.selector, true, &operation_control())
+        .await
+        .unwrap();
+    let granted = selected.granted_source().unwrap();
+    assert_eq!(granted.attribution, fixture.attribution);
+    assert_eq!(selected.target.source, granted.attribution.source);
+    assert_eq!(
+        selected.target.original_scope,
+        granted.attribution.origin_scope
+    );
+    let LifecycleTargetReference::RetainedSourceLocator(reference) = &selected.target.reference
+    else {
+        panic!("retained source target reference")
+    };
+    assert!(reference.starts_with("recall-memory-ref-v1:"));
+    assert_ne!(
+        reference,
+        &format!("observation:{}", fixture.attribution.source.observation_id)
+    );
+
+    // The reopened port can complete the host authorization and durable intent
+    // path with the provider mount unavailable. The provider never receives a
+    // raw source object from the retained SQLite row.
+    let request = fixture.request();
+    let (context, cancellation) = fixture.context(&request, "request.reopened-control");
+    let operation =
+        tracedecay_contracts::retained_surface_application_operation(request.operation()).unwrap();
+    let outcome = reopened
+        .execute_provider_control(
+            RetainedSurfaceExecutionContextV1 {
+                request_context: &context,
+                cancellation_signal: &cancellation,
+                operation: &operation,
+                observed_at: tracedecay_contracts::now_micros(),
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let ApplicationOutcome::Effect(effect) = outcome else {
+        panic!("reopened control retains an effect outcome")
+    };
+    let Some(RetainedSurfaceResultV1::ProviderControl(result)) = effect.payload else {
+        panic!("reopened control returns a provider result")
+    };
+    assert_eq!(
+        result.terminal,
+        ProviderControlTerminalV1::ProviderUnavailable
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_ncm_control_port_uses_retained_source_locator_before_dispatch() {
+    let fixture = OfflineSourceFixture::for_provider(SESSION, "ncm").await;
+    let reopened = fixture.reopened_port();
+    let selected = reopened
+        .resolve_source(&fixture.selector, true, &operation_control())
+        .await
+        .unwrap();
+    let granted = selected.granted_source().unwrap();
+    assert_eq!(granted.attribution, fixture.attribution);
+    assert_eq!(selected.target.source, granted.attribution.source);
+    assert_eq!(selected.target.provider_id.as_str(), "ncm");
+    let LifecycleTargetReference::RetainedSourceLocator(reference) = &selected.target.reference
+    else {
+        panic!("reopened NCM source target must carry a retained locator")
+    };
+    assert!(reference.starts_with("recall-memory-ref-v1:"));
+    assert_ne!(
+        reference,
+        &format!("observation:{}", fixture.attribution.source.observation_id)
+    );
+
+    let request = fixture.request();
+    let (context, cancellation) = fixture.context(&request, "request.reopened-ncm-control");
+    let operation =
+        tracedecay_contracts::retained_surface_application_operation(request.operation()).unwrap();
+    let outcome = reopened
+        .execute_provider_control(
+            RetainedSurfaceExecutionContextV1 {
+                request_context: &context,
+                cancellation_signal: &cancellation,
+                operation: &operation,
+                observed_at: tracedecay_contracts::now_micros(),
+            },
+            &request,
+        )
+        .await
+        .unwrap();
+    let ApplicationOutcome::Effect(effect) = outcome else {
+        panic!("reopened NCM control retains an effect outcome")
+    };
+    let Some(RetainedSurfaceResultV1::ProviderControl(result)) = effect.payload else {
+        panic!("reopened NCM control returns a provider result")
+    };
+    assert_eq!(
+        result.terminal,
+        ProviderControlTerminalV1::ProviderUnavailable
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_feedback_control_resolves_opaque_locator_before_provider_dispatch() {
+    let fixture = OfflineSourceFixture::new().await;
+    let reopened = fixture.reopened_port();
+    let request = ProviderControlRequestV1::Feedback(ProviderFeedbackRequestV1 {
+        source: fixture.selector.clone(),
+        signal: ProviderControlFeedbackSignalV1::Helpful,
+        weight: "1".to_owned(),
+        evidence_refs: Vec::new(),
+        occurred_at: tracedecay_contracts::now_micros(),
+    });
+    let (context, cancellation) = fixture.context(&request, "request.reopened-feedback");
+    let ApplicationOutcome::Effect(effect) = fixture
+        .execute_on(&reopened, &request, &context, &cancellation)
+        .await
+        .unwrap()
+    else {
+        panic!("reopened feedback retains an effect outcome");
+    };
+    let Some(RetainedSurfaceResultV1::ProviderControl(result)) = effect.payload else {
+        panic!("reopened feedback returns a provider result");
+    };
+    assert_eq!(
+        result.terminal,
+        ProviderControlTerminalV1::ProviderUnavailable
+    );
+    assert!(matches!(
+        result.result,
+        ProviderControlOperationResultV1::Feedback(None)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_correction_control_resolves_opaque_locator_before_revision_refusal() {
+    let fixture = OfflineSourceFixture::new().await;
+    let reopened = fixture.reopened_port();
+    // Claude's canonical source has no provider revision. The host still has
+    // to resolve the retained locator and then refuse the correction as a
+    // stale/unknown revision before any provider contact.
+    let request = ProviderControlRequestV1::Correction(ProviderCorrectionRequestV1 {
+        source: fixture.selector.clone(),
+        expected_source_revision: "revision.unavailable".to_owned(),
+        correction: ProviderControlCorrectionV1::ChangeValidity {
+            valid_from: tracedecay_contracts::now_micros(),
+            valid_until: None,
+        },
+        reason: "post-reopen correction must bind a canonical revision".to_owned(),
+        evidence_refs: Vec::new(),
+    });
+    let (context, cancellation) = fixture.context(&request, "request.reopened-correction");
+    assert!(matches!(
+        fixture
+            .execute_on(&reopened, &request, &context, &cancellation)
+            .await,
+        Err(RetainedSurfaceExecutionErrorV1::Conflict)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopened_source_inspection_resolves_opaque_locator_before_provider_dispatch() {
+    let fixture = OfflineSourceFixture::new().await;
+    let reopened = fixture.reopened_port();
+    let request = ProviderControlRequestV1::Inspection(ProviderInspectionRequestV1 {
+        state: ProviderControlStateSelectorV1::RecallScope {
+            trace_ref: fixture.selector.trace_ref.clone(),
+        },
+        selection: ProviderControlInspectionSelectorV1::SourceInfluence {
+            source: fixture.selector.clone(),
+        },
+        maximum_items: 1,
+        maximum_bytes: 16_384,
+        cursor: None,
+    });
+    let (context, cancellation) = fixture.context(&request, "request.reopened-inspection");
+    let ApplicationOutcome::Evidence(evidence) = fixture
+        .execute_on(&reopened, &request, &context, &cancellation)
+        .await
+        .unwrap()
+    else {
+        panic!("reopened inspection retains an evidence outcome");
+    };
+    let Some(RetainedSurfaceResultV1::ProviderControl(result)) = evidence.payload else {
+        panic!("reopened inspection returns a provider result");
+    };
+    assert_eq!(
+        result.terminal,
+        ProviderControlTerminalV1::ProviderUnavailable
+    );
+    assert!(matches!(
+        result.result,
+        ProviderControlOperationResultV1::Inspection(None)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -796,7 +1079,7 @@ fn snapshot_carrier(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn offline_snapshot_cleanup_keeps_actual_removal_proof_when_an_unrelated_file_is_corrupt() {
+async fn reopened_snapshot_cleanup_uses_fresh_grant_when_an_unrelated_file_is_corrupt() {
     use crate::daemon::retained_owner::provider_control::portability::{
         read_snapshot_artifact, seed_snapshot_artifact_for_test,
     };
@@ -852,8 +1135,9 @@ async fn offline_snapshot_cleanup_keeps_actual_removal_proof_when_an_unrelated_f
     };
     body.include_snapshots = true;
     let (context, cancellation) = fixture.context(&request, "request.offline-snapshot-delete");
+    let reopened = fixture.reopened_port();
     let ApplicationOutcome::Effect(output) = fixture
-        .execute(&request, &context, &cancellation)
+        .execute_on(&reopened, &request, &context, &cancellation)
         .await
         .unwrap()
     else {

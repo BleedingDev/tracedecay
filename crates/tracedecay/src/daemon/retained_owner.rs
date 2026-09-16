@@ -27,14 +27,14 @@ use crate::tracedecay::TraceDecay;
 pub(crate) mod cognitive_recall;
 #[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
 pub use cognitive_recall::test_context_evidence;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_common_factory_tests.rs"]
+mod native_common_factory_tests;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
-#[cfg(all(test, feature = "memory-provider-host"))]
-#[path = "retained_owner/native_common_factory_tests.rs"]
-mod native_common_factory_tests;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_staged_observations;
 #[cfg(feature = "memory-provider-host")]

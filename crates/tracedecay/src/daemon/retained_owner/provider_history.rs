@@ -28,6 +28,11 @@ use tracedecay_store::{
     StoreShardIdV1, StoreShardScopeV1, StoredObservation,
 };
 
+use super::cognitive_recall::control_attribution::{
+    RecallControlTraceRefV1, RecallLocatorKeyV1, redact_retained_source_attribution_with_key,
+    validate_opaque_retained_source, validate_retained_candidate_identity,
+    validate_retained_provider_rank,
+};
 use super::observation_journey::exact_scope_for_session;
 use tracedecay_memory_provider_registry::recall_admission::{
     RecallOutcomeScopeV1, source_attribution::RecallSourceAttributionV1,
@@ -1327,6 +1332,114 @@ where
                 "current source disposition",
             ));
         }
+        self.bridge.authorize_control_scope(destination, control)?;
+        self.grant(destination, vec![actual])
+    }
+
+    /// Re-resolves one opaque control locator through the canonical sequence
+    /// authority. The persisted attribution is only a privacy-safe locator;
+    /// it never supplies a canonical observation key or source identity.
+    ///
+    /// The single-row replay is deliberately addressed by `source_sequence`:
+    /// after reopen the host has no reverse map from an opaque source locator
+    /// to provider data. The replayed row is projected afresh, then redacted
+    /// with the exact trace/revision/rank/alias context that produced the
+    /// persisted bytes. Only a byte-for-byte match can proceed to the usual
+    /// scope, disposition, policy and bridge checks.
+    pub(crate) async fn authorize_retained_source_locator(
+        &self,
+        destination: &OwnedExactScope,
+        trace: &RecallControlTraceRefV1,
+        registration_revision: u64,
+        provider_rank: usize,
+        candidate_id: &str,
+        expected: &RecallSourceAttributionV1,
+        control: &tracedecay_memory_provider_registry::OperationControl,
+        include_unavailable: bool,
+        locator_key: &RecallLocatorKeyV1,
+    ) -> HistoryResult<HistoryGrant> {
+        self.check_control(control)?;
+        if self.policy_revision == 0 || registration_revision == 0 {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator policy revision",
+            ));
+        }
+        if !trace.is_bound_to_scope(destination) {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator destination scope",
+            ));
+        }
+        validate_retained_provider_rank(provider_rank)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator provider rank"))?;
+        validate_retained_candidate_identity(candidate_id)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator candidate"))?;
+        validate_opaque_retained_source(expected).map_err(|_| {
+            ProviderHistoryErrorV1::ClaimMismatch("retained locator source projection")
+        })?;
+        let source_sequence = expected.source_sequence;
+        let after_sequence =
+            source_sequence
+                .checked_sub(1)
+                .ok_or(ProviderHistoryErrorV1::ClaimMismatch(
+                    "retained locator source sequence",
+                ))?;
+        self.bridge.authorize_control_scope(destination, control)?;
+        let request = ObservationReplayRequest::new(after_sequence, 1)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator replay bound"))?;
+        let mut records = bounded_read(
+            control,
+            self.observations.replay_admitted_observations(request),
+            "retained locator canonical replay",
+        )
+        .await?;
+        if records.len() != 1 {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator canonical row count",
+            ));
+        }
+        let stored = records.pop().ok_or(ProviderHistoryErrorV1::ClaimMismatch(
+            "retained locator canonical row",
+        ))?;
+        if stored.sequence() != source_sequence {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator canonical row sequence",
+            ));
+        }
+        let actual = self.project_source(&stored, destination, control).await?;
+        if actual.attribution.source_sequence != source_sequence {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator projected sequence",
+            ));
+        }
+        let fresh_wire: RecallSourceAttributionV1 = serde_json::from_value(
+            source_attribution_json(&actual.attribution)?,
+        )
+        .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator source wire"))?;
+        let redacted = redact_retained_source_attribution_with_key(
+            locator_key,
+            self.provider_id.as_str(),
+            trace,
+            registration_revision,
+            provider_rank,
+            candidate_id,
+            &fresh_wire,
+        )
+        .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator redaction"))?;
+        let expected_bytes = serde_json::to_vec(expected)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator bytes"))?;
+        let redacted_bytes = serde_json::to_vec(&redacted)
+            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained locator bytes"))?;
+        if redacted_bytes != expected_bytes {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "retained locator source changed",
+            ));
+        }
+        if !include_unavailable && !retained_history_source(actual.current_disposition.state) {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "current source disposition",
+            ));
+        }
+        self.check_control(control)?;
         self.bridge.authorize_control_scope(destination, control)?;
         self.grant(destination, vec![actual])
     }

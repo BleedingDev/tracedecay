@@ -50,7 +50,13 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use tracedecay_domain::canonical_text::{canonical_framed_sha256, sha256_hex};
-use tracedecay_memory_provider_registry::{ApiError, OwnedExactScope};
+use tracedecay_memory_provider_registry::{
+    ApiError, OwnedExactScope, PayloadSanitizationReceipt, PayloadSanitizationReceiptParts,
+};
+
+use tracedecay_memory_observation::{
+    AdmittedObservationV1, ObservationIdempotencyKeyV1, SqliteObservationJournal,
+};
 
 /// Directory the Native provider owns inside the host-granted provider-state
 /// root. Placement only: scope identity is never derived from a path.
@@ -59,8 +65,14 @@ const NATIVE_PROVIDER_STATE_DIR_NAME: &str = "native";
 /// File name of the staged-observation store.
 const STAGED_STORE_FILE_NAME: &str = "staged-observations-v1.sqlite3";
 
+/// The host journal is the authority for the bytes Native receives. Its
+/// envelope digest covers the source settlement, transformed provider view,
+/// extensions, and sanitization binding. Native keeps the journal outside its
+/// private database and re-reads it when a provider-local row is used.
+const HOST_OBSERVATION_JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
+
 /// Schema version this build writes and understands.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// How long a writer waits on a busy database before reporting failure.
 const BUSY_TIMEOUT_MILLIS: u64 = 250;
@@ -243,6 +255,20 @@ pub(crate) struct StagedEffectEvidence {
     pub(crate) idempotency_key: String,
     /// Operation that actually committed the row.
     pub(crate) operation_id: String,
+}
+
+/// The hygiene/projection evidence that authenticated one provider view.
+///
+/// `source_payload_sha256` inside the receipt names the bytes the host's
+/// provider projection handed to hygiene. It is a different trust domain from
+/// `OriginalSourceIdentity.content_sha256`, which names the complete canonical
+/// source observation. Keeping the receipt verbatim lets a reopened Native
+/// store revalidate the exact transformed bytes without pretending that a
+/// narrowed or redacted provider payload is the original source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderViewSanitization {
+    receipt_json: String,
+    extensions_digest: String,
 }
 
 /// Why a staging attempt was refused rather than staged or deduplicated.
@@ -619,22 +645,39 @@ impl StagedObservationStore {
         &self,
         record: StagedObservationRecord,
     ) -> Result<StagedOutcome, StagedStoreError> {
-        self.stage_with_control(record, None)
+        self.stage_with_control(record, None, None)
     }
 
     pub(crate) fn stage_controlled(
         &self,
         record: StagedObservationRecord,
         call: &tracedecay_memory_provider_registry::ProviderCall,
+        admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
     ) -> Result<StagedOutcome, StagedStoreError> {
-        self.stage_with_control(record, Some(call))
+        self.stage_with_control(record, Some(call), admission)
     }
 
     fn stage_with_control(
         &self,
         record: StagedObservationRecord,
         call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+        admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
     ) -> Result<StagedOutcome, StagedStoreError> {
+        let provider_view = match call {
+            Some(call) => provider_view_sanitization_for_call(&record, call)?,
+            None => direct_provider_view_sanitization(&record.sanitized_payload)?,
+        };
+        if let Some(call) = call {
+            if let Some(host_projection) =
+                host_projection_for_record(&self.path, &record, Some(call))?
+            {
+                if host_projection != provider_view {
+                    return Err(StagedStoreError::LifecycleConflict(
+                        "host projection lineage",
+                    ));
+                }
+            }
+        }
         let mut guard = self.connection()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let common_source = serde_json::from_slice::<Value>(&record.sanitized_payload)
@@ -644,7 +687,14 @@ impl StagedObservationStore {
                     .pointer("/source_identity/original_source")
                     .is_some()
             });
-        let outcome = stage_in_transaction(&transaction, record, self.retention)?;
+        let outcome = stage_in_transaction(
+            &transaction,
+            record,
+            self.retention,
+            &provider_view,
+            call,
+            admission,
+        )?;
         #[cfg(test)]
         if matches!(outcome, StagedOutcome::Committed(_))
             && self
@@ -719,7 +769,32 @@ impl StagedObservationStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<StagedRow>, StagedStoreError> {
-        self.recall_filtered(scope, query, limit, None, None, None, "")
+        self.recall_filtered(scope, query, limit, None, None, None, None, None, "")
+    }
+
+    /// Recalls rows for a live Native provider call. The call is retained all
+    /// the way down to row validation so a controlled recall cannot use the
+    /// direct/legacy journal fallback when host projection lineage is absent.
+    pub(crate) fn recall_controlled(
+        &self,
+        scope: &ExactScopeFields,
+        query: &str,
+        limit: usize,
+        history_grant: Option<&Value>,
+        admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+        call: &tracedecay_memory_provider_registry::ProviderCall,
+    ) -> Result<Vec<StagedRow>, StagedStoreError> {
+        self.recall_filtered(
+            scope,
+            query,
+            limit,
+            None,
+            history_grant,
+            admission,
+            None,
+            Some(call),
+            &call.request_id,
+        )
     }
 
     pub(crate) fn recall_temporal(
@@ -731,13 +806,38 @@ impl StagedObservationStore {
         exclusions: &tracedecay_memory_provider_registry::OwnedRecallExclusions,
         request_id: &str,
     ) -> Result<Vec<StagedRow>, StagedStoreError> {
+        self.recall_temporal_with_admission(
+            scope,
+            query,
+            temporal,
+            history_grant,
+            None,
+            exclusions,
+            request_id,
+            None,
+        )
+    }
+
+    pub(crate) fn recall_temporal_with_admission(
+        &self,
+        scope: &ExactScopeFields,
+        query: &str,
+        temporal: &tracedecay_memory_provider_registry::OwnedTemporalQuery,
+        history_grant: Option<&Value>,
+        admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+        exclusions: &tracedecay_memory_provider_registry::OwnedRecallExclusions,
+        request_id: &str,
+        call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    ) -> Result<Vec<StagedRow>, StagedStoreError> {
         self.recall_filtered(
             scope,
             query,
             self.retention.maximum_content_rows_per_scope,
             Some(temporal),
             history_grant,
+            admission,
             Some(exclusions),
+            call,
             request_id,
         )
     }
@@ -749,7 +849,9 @@ impl StagedObservationStore {
         limit: usize,
         temporal: Option<&tracedecay_memory_provider_registry::OwnedTemporalQuery>,
         history_grant: Option<&Value>,
+        admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
         exclusions: Option<&tracedecay_memory_provider_registry::OwnedRecallExclusions>,
+        call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
         request_id: &str,
     ) -> Result<Vec<StagedRow>, StagedStoreError> {
         #[cfg(test)]
@@ -787,25 +889,49 @@ impl StagedObservationStore {
         let superseded = temporal.is_none_or(|query| query.include_superseded);
         let revoked = temporal.is_none_or(|query| query.include_revoked);
 
-        let allowed: Vec<String> = history_grant
-            .and_then(|grant| grant.get("sources"))
-            .and_then(Value::as_array)
-            .map(|sources| {
-                sources
-                    .iter()
-                    .filter(|source| {
-                        matches!(
-                            source
-                                .pointer("/current_disposition/state")
-                                .and_then(Value::as_str),
-                            Some("available" | "superseded" | "revoked")
-                        )
-                    })
-                    .filter_map(|source| source.get("attribution"))
-                    .map(Value::to_string)
-                    .collect()
+        // A request grant is only a claim. When the actor has a fresh host
+        // admission, rebuild the source list from that admission and use it
+        // for both the SQLite allowlist and the final candidate check. This
+        // keeps a previously accepted grant from surviving a disposition
+        // change between recalls.
+        let fresh_sources: Vec<Value> = if let Some(admission) = admission {
+            admission
+                .history_sources
+                .iter()
+                .map(|trusted| {
+                    let attribution =
+                        super::provider_history::source_attribution_json(&trusted.attribution)
+                            .map_err(|_| {
+                                StagedStoreError::LifecycleConflict("history source attribution")
+                            })?;
+                    Ok(serde_json::json!({
+                        "attribution": attribution,
+                        "current_disposition": {
+                            "state": trusted.current_disposition.state.as_wire()
+                        }
+                    }))
+                })
+                .collect::<Result<_, StagedStoreError>>()?
+        } else {
+            history_grant
+                .and_then(|grant| grant.get("sources"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let allowed: Vec<String> = fresh_sources
+            .iter()
+            .filter(|source| {
+                matches!(
+                    source
+                        .pointer("/current_disposition/state")
+                        .and_then(Value::as_str),
+                    Some("available" | "superseded" | "revoked")
+                )
             })
-            .unwrap_or_default();
+            .filter_map(|source| source.get("attribution"))
+            .map(Value::to_string)
+            .collect();
         let allowed = serde_json::to_string(&allowed)
             .map_err(|_| StagedStoreError::InvalidAdvisory("history sources"))?;
         let exclusions = exclusions.cloned().unwrap_or_default();
@@ -818,7 +944,8 @@ impl StagedObservationStore {
                     source_authority, source_event_id, source_revision, observation_kind, \
                     payload_contract, sanitized_payload, payload_sha256, operation_id, \
                     request_identity, provider_reference, receipt, effect_digest, \
-                    admitted_sequence, admitted_at_unix_ms, exact_scope_sha256, actual_revision, original_source, feedback, validity_override \
+                    admitted_sequence, admitted_at_unix_ms, exact_scope_sha256, actual_revision, original_source, feedback, validity_override, \
+                    sanitization_receipt_json, sanitization_extensions_digest \
              FROM tdmem_native_staged_observation_v1 \
              WHERE profile_id = ?1 AND project_id = ?2 AND repository_identity = ?3 \
                AND worktree_identity = ?4 AND branch_identity = ?5 AND tombstone = 0 \
@@ -867,11 +994,7 @@ impl StagedObservationStore {
             allowed,
             exclusions,
             request_id,
-            history_grant
-                .and_then(|grant| grant.get("sources"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]))
-                .to_string(),
+            Value::Array(fresh_sources).to_string(),
             checkout_digest(scope),
         ])?;
         while let Some(row) = rows.next()? {
@@ -914,6 +1037,79 @@ impl StagedObservationStore {
                     Ok::<_, StagedStoreError>(value)
                 })
                 .transpose()?;
+            validate_payload_source_identity(
+                &payload,
+                original_source.as_ref(),
+                &row.get::<_, String>(9)?,
+                source_revision.as_deref(),
+            )?;
+            if let Some(admission) = admission {
+                let Some(original_source) = original_source.as_ref() else {
+                    // A controlled recall cannot authenticate a source-less
+                    // resident row against the fresh host source inventory.
+                    continue;
+                };
+                let mut matching = admission.history_sources.iter().filter(|trusted| {
+                    super::native_provider::attribution_matches(
+                        original_source,
+                        &trusted.attribution,
+                    )
+                });
+                let Some(trusted) = matching.next() else {
+                    // Apply the same fresh source allowlist to rows from the
+                    // current checkout. Scope equality is not a substitute
+                    // for current host attribution.
+                    continue;
+                };
+                if matching.next().is_some() {
+                    return Err(StagedStoreError::LifecycleConflict(
+                        "history source ambiguity",
+                    ));
+                }
+                if !matches!(
+                    trusted.current_disposition.state,
+                    tracedecay_memory_provider_registry::SourceDisposition::Available
+                        | tracedecay_memory_provider_registry::SourceDisposition::Superseded
+                        | tracedecay_memory_provider_registry::SourceDisposition::Revoked
+                ) {
+                    continue;
+                }
+            }
+            let sanitization_receipt_json: Option<String> = row.get(27)?;
+            let sanitization_extensions_digest: Option<String> = row.get(28)?;
+            match (
+                sanitization_receipt_json.as_deref(),
+                sanitization_extensions_digest.as_deref(),
+            ) {
+                (Some(receipt_json), Some(extensions_digest)) => {
+                    validate_host_projection_for_row(
+                        &self.path,
+                        &stored_scope,
+                        &idempotency_key,
+                        &row.get::<_, String>(8)?,
+                        &row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?.as_deref(),
+                        &row.get::<_, String>(11)?,
+                        &row.get::<_, String>(12)?,
+                        &payload,
+                        &payload_sha256,
+                        receipt_json,
+                        extensions_digest,
+                        call,
+                    )?;
+                }
+                (None, None) if call.is_none() && !has_host_projection_journal(&self.path) => {}
+                (None, None) => {
+                    return Err(StagedStoreError::LifecycleConflict(
+                        "host projection lineage unavailable",
+                    ));
+                }
+                _ => {
+                    return Err(StagedStoreError::LifecycleConflict(
+                        "host projection lineage",
+                    ));
+                }
+            }
             let admitted_sequence = u64::try_from(row.get::<_, i64>(20)?).map_err(|_| {
                 StagedStoreError::ValueOutOfRange {
                     field: "admitted_sequence",
@@ -1083,6 +1279,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StagedStoreError
             transaction.execute("UPDATE tdmem_native_staged_observation_v1 SET semantic_sha256=?1,projected_content_sha256=?2 WHERE provider_reference=?3",params![semantic,content,reference])?;
         }
     }
+    if version < 3 {
+        transaction.execute_batch(
+            "ALTER TABLE tdmem_native_staged_observation_v1 ADD COLUMN sanitization_receipt_json TEXT;
+             ALTER TABLE tdmem_native_staged_observation_v1 ADD COLUMN sanitization_extensions_digest TEXT;",
+        )?;
+    }
     transaction.execute_batch(ADVISORY_DDL)?;
     transaction.execute("UPDATE tdmem_native_state_v2 SET generation = MAX(generation,
         (SELECT COALESCE(MAX(admitted_sequence), 0) FROM tdmem_native_staged_observation_v1)) WHERE singleton = 1", [])?;
@@ -1102,7 +1304,8 @@ fn evict_scope_overflow(
     let keep = i64::try_from(keep.max(1)).unwrap_or(i64::MAX);
     transaction.execute(
         "UPDATE tdmem_native_staged_observation_v1 \
-         SET sanitized_payload = NULL, tombstone = 1 \
+         SET sanitized_payload = NULL, tombstone = 1, sanitization_receipt_json = NULL, \
+             sanitization_extensions_digest = NULL \
          WHERE exact_scope_sha256 = ?1 AND tombstone = 0 \
            AND admitted_sequence NOT IN ( \
                SELECT admitted_sequence FROM tdmem_native_staged_observation_v1 \
@@ -1471,6 +1674,819 @@ mod tests {
             extensions: Vec::new(),
         })
         .expect("lifecycle call")
+    }
+
+    fn attributed_source(
+        observation: &Value,
+    ) -> tracedecay_memory_provider_registry::SourceAttribution {
+        use tracedecay_memory_provider_registry::{
+            OriginScopeEvidence, OriginalSourceIdentity, SourceAttribution,
+        };
+        let original = &observation["source_identity"]["original_source"];
+        let source = &original["source"];
+        SourceAttribution {
+            source: OriginalSourceIdentity {
+                canonical_provider_id: tracedecay_memory_provider_registry::OwnedProviderId::new(
+                    source["canonical_provider_id"].as_str().expect("provider"),
+                )
+                .expect("provider id"),
+                canonical_session_id: source["canonical_session_id"]
+                    .as_str()
+                    .expect("session")
+                    .to_owned(),
+                source_key: source["source_key"]
+                    .as_str()
+                    .expect("source key")
+                    .to_owned(),
+                stable_record_id: source["stable_record_id"].as_str().map(str::to_owned),
+                observation_id: source["observation_id"]
+                    .as_str()
+                    .expect("observation")
+                    .to_owned(),
+                source_revision: source["source_revision"].as_str().map(str::to_owned),
+                content_sha256: source["content_sha256"]
+                    .as_str()
+                    .expect("content digest")
+                    .to_owned(),
+            },
+            origin_scope: OriginScopeEvidence::Recorded {
+                scope: exact_scope_from_value(&original["origin_scope"]["exact_scope_identity"])
+                    .expect("origin scope"),
+                authority_ref: original["origin_scope"]["authority_ref"]
+                    .as_str()
+                    .expect("origin authority")
+                    .to_owned(),
+            },
+            source_sequence: original["source_sequence"].as_u64().expect("sequence"),
+            occurred_at_utc_nanos: original["occurred_at"]
+                .as_str()
+                .and_then(super::super::native_provider::parse_rfc3339_nanos),
+            ingested_at_utc_nanos: super::super::native_provider::parse_rfc3339_nanos(
+                original["ingested_at"].as_str().expect("ingested at"),
+            )
+            .expect("ingested timestamp"),
+            validity: recorded_validity(Some(original)).expect("validity"),
+        }
+    }
+
+    fn locator_target(
+        delivery_scope: &ExactScopeFields,
+        observation: &Value,
+        locator: &str,
+    ) -> Value {
+        let original = &observation["source_identity"]["original_source"];
+        json!({
+            "provider_id":"tracedecay.native",
+            "registration_revision":1,
+            "original_scope":original["origin_scope"],
+            "delivery_scope":scope_json(delivery_scope),
+            "source":original["source"],
+            "reference":{"kind":"retained_source_locator","reference":locator}
+        })
+    }
+
+    fn admission_for(
+        call: &tracedecay_memory_provider_registry::ProviderCall,
+        sources: &[tracedecay_memory_provider_registry::SourceAttribution],
+    ) -> tracedecay_memory_provider_registry::CurrentAdvisoryAdmission {
+        use tracedecay_memory_provider_registry::{
+            CurrentAdvisoryAdmission, CurrentSourceDisposition, GrantedHistorySource,
+            SourceDisposition,
+        };
+        let disposition = CurrentSourceDisposition {
+            state: SourceDisposition::Available,
+            authority_ref: "fixture.current-source".to_owned(),
+            authority_revision: Some(7),
+            checked_at_utc_nanos: 1_750_000_000_000_000_000,
+        };
+        CurrentAdvisoryAdmission::new(
+            call,
+            sources
+                .iter()
+                .cloned()
+                .map(|attribution| GrantedHistorySource {
+                    attribution,
+                    current_disposition: disposition.clone(),
+                })
+                .collect(),
+            None,
+        )
+        .expect("fixture admission")
+    }
+
+    fn attributed_record(
+        delivery_scope: &ExactScopeFields,
+        observation: &Value,
+        key: &str,
+    ) -> StagedObservationRecord {
+        let source = &observation["source_identity"]["original_source"]["source"];
+        let mut record = record(
+            delivery_scope,
+            key,
+            source["observation_id"].as_str().expect("observation id"),
+            1,
+            "ignored fixture text",
+        );
+        record.source_revision = source["source_revision"].as_str().map(str::to_owned);
+        record.sanitized_payload = serde_json::to_vec(observation).expect("observation bytes");
+        record
+    }
+
+    /// Builds a source envelope whose canonical payload contains a message and
+    /// a second fact, then builds the provider view after eligibility narrows
+    /// it to the message fact. The source attribution keeps the digest of the
+    /// complete source canonical payload, while the delivered envelope carries
+    /// the independent provider-view digest.
+    fn mixed_fact_source_and_provider_view(origin: &ExactScopeFields) -> (Value, Value) {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+
+        let mut source = common_observation(
+            origin,
+            1,
+            Some("r1"),
+            "mixed-fact provider view",
+            Some(T1),
+            None,
+        );
+        let message = json!({
+            "kind":"message",
+            "role":"user",
+            "content":{"text":"eligible mixed-fact message"}
+        });
+        let source_canonical = json!({
+            "facts":[
+                message.clone(),
+                {"kind":"tool_result","tool":"private.lookup","content":{"secret":"source-only"}}
+            ]
+        });
+        let source_canonical_bytes =
+            tracedecay_memory_hygiene::canonical_payload_bytes(&source_canonical)
+                .expect("source canonical bytes");
+        let source_digest = sha256_hex(&source_canonical_bytes);
+        source["canonical_payload"] = source_canonical.into();
+        source["payload_sha256"] = source_digest.clone().into();
+        source["source_identity"]["original_source"]["source"]["content_sha256"] =
+            source_digest.into();
+
+        let mut provider_view = source.clone();
+        let provider_canonical = json!({"facts":[message]});
+        let provider_canonical_bytes =
+            tracedecay_memory_hygiene::canonical_payload_bytes(&provider_canonical)
+                .expect("provider canonical bytes");
+        provider_view["canonical_payload"] = provider_canonical.into();
+        provider_view["payload_sha256"] = sha256_hex(&provider_canonical_bytes).into();
+        (source, provider_view)
+    }
+
+    /// Rewrites a staged row's provider-view proof to an authenticated
+    /// redacted receipt. The receipt's source digest names the projected bytes
+    /// the sanitizer read; it is deliberately different from the source
+    /// attribution's complete canonical digest.
+    fn install_redacted_provider_view_receipt(
+        staged: &StagedObservationStore,
+        idempotency_key: &str,
+        projected_source: &Value,
+    ) -> tracedecay_memory_provider_registry::PayloadSanitizationReceipt {
+        use tracedecay_memory_provider_registry::{
+            PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, SanitizationDisposition,
+        };
+
+        let connection = staged.connection().expect("redaction receipt connection");
+        let (payload_sha256, extensions_digest): (String, String) = connection
+            .query_row(
+                "SELECT payload_sha256, sanitization_extensions_digest
+                 FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params![idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("staged provider-view evidence");
+        let source_bytes = tracedecay_memory_hygiene::canonical_payload_bytes(projected_source)
+            .expect("projected source bytes");
+        let receipt = PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts {
+            sanitizer_revision: "fixture.provider-view-redaction.v1".to_owned(),
+            source_payload_sha256: sha256_hex(&source_bytes),
+            sanitized_payload_sha256: payload_sha256,
+            extensions_digest,
+            disposition: SanitizationDisposition::Redacted,
+            finding_count: 1,
+            findings_digest: sha256_hex(b"fixture.provider-view-redaction.finding"),
+        })
+        .expect("redacted provider-view receipt");
+        connection
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1
+                 SET sanitization_receipt_json=?1, sanitization_extensions_digest=?2
+                 WHERE idempotency_key=?3",
+                params![
+                    receipt.to_json(),
+                    receipt.extensions_digest(),
+                    idempotency_key
+                ],
+            )
+            .expect("store redacted provider-view receipt");
+        receipt
+    }
+
+    /// Installs the immutable host journal envelope that authenticated a
+    /// direct fixture row. The provider-local row can copy this receipt, but
+    /// it cannot mint a second host envelope for rewritten payload bytes.
+    fn install_host_projection(root: &TempDir, record: &StagedObservationRecord) {
+        use tracedecay_memory_provider_registry::{
+            PayloadSanitizationReceipt, PayloadSanitizationReceiptParts,
+        };
+
+        let receipt =
+            PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+                "native-direct-stage.v1",
+                sha256_hex(&record.sanitized_payload),
+            ))
+            .expect("host fixture sanitization receipt");
+        install_host_projection_with_receipt(root, record, &receipt);
+    }
+
+    fn install_host_projection_with_receipt(
+        root: &TempDir,
+        record: &StagedObservationRecord,
+        receipt: &tracedecay_memory_provider_registry::PayloadSanitizationReceipt,
+    ) {
+        use tracedecay_memory_observation::{
+            AdmittedObservationV1, CanonicalSettlementReceiptV1, ForgetSourceKeyV1,
+            ObservationIdV1, ObservationPrivacyV1, PrivacyClassificationV1, ProvenanceOriginV1,
+            ProviderTargetV1, RetentionClassV1, SanitizationBindingV1, SourceAuthorityV1,
+            SourceSequenceV1, SourceStreamIdV1, extensions_digest,
+        };
+        use tracedecay_memory_provider_registry::{
+            CanonicalPayload, OwnedProviderId, OwnedVersionedId,
+        };
+
+        let payload_sha256 = sha256_hex(&record.sanitized_payload);
+        let payload = CanonicalPayload::new(
+            OwnedVersionedId::new(record.payload_contract.clone()).expect("payload contract"),
+            record.sanitized_payload.clone(),
+            payload_sha256,
+        )
+        .expect("host fixture payload");
+        let extensions = Vec::new();
+        let extensions_digest = extensions_digest(&extensions).expect("host fixture extensions");
+        let mut admitted = AdmittedObservationV1 {
+            observation_id: ObservationIdV1::from_v7_parts(1_750_000_000_000, [7; 10])
+                .expect("host fixture observation id"),
+            idempotency_key: ObservationIdempotencyKeyV1::parse(&"0".repeat(64))
+                .expect("temporary host fixture key"),
+            target: ProviderTargetV1 {
+                provider_id: OwnedProviderId::new("tracedecay.native")
+                    .expect("host fixture provider"),
+                provider_instance_id: "tracedecay.native.project".to_owned(),
+                registration_revision: 1,
+                ready_receipt_digest: "a".repeat(64),
+            },
+            exact_scope: record.scope.clone(),
+            source: CanonicalSettlementReceiptV1 {
+                source_authority: SourceAuthorityV1::HostSession,
+                commit_point_id: "fixture.host.commit".to_owned(),
+                source_event_id: record.source_event_id.clone(),
+                source_event_revision: 1,
+                source_event_sha256: sha256_hex(&record.sanitized_payload),
+                source_stream: SourceStreamIdV1::new("fixture.host.stream")
+                    .expect("host fixture stream"),
+                source_sequence: SourceSequenceV1(1),
+                settled_at_unix_micros: 1_750_000_000_000_000,
+                settlement_proof_sha256: "b".repeat(64),
+            },
+            observation_kind: OwnedVersionedId::new(record.observation_kind.clone())
+                .expect("observation kind"),
+            payload,
+            extensions,
+            extensions_digest: extensions_digest.clone(),
+            provenance_origin: ProvenanceOriginV1::Agent,
+            provenance_sha256: "c".repeat(64),
+            privacy: ObservationPrivacyV1 {
+                classification: PrivacyClassificationV1::Sensitive,
+                retention_class: RetentionClassV1::Session,
+                redaction_revision: 1,
+                content_policy_revision: 1,
+                forget_source_key: ForgetSourceKeyV1::new(format!(
+                    "fixture:{}",
+                    record.source_event_id
+                ))
+                .expect("host fixture forget key"),
+                expires_at_unix_micros: 1_750_000_002_000_000,
+            },
+            sanitization: SanitizationBindingV1 {
+                receipt_id: receipt.receipt_id().to_owned(),
+                sanitizer_revision: receipt.sanitizer_revision().to_owned(),
+                source_payload_sha256: receipt.source_payload_sha256().to_owned(),
+                receipt_json: receipt.to_json(),
+            },
+            occurred_at_unix_micros: 1_750_000_000_000_000,
+            admitted_at_unix_micros: 1_750_000_000_000_100,
+            deadline_unix_micros: 1_750_000_002_000_000,
+            request_id: "fixture.host.request".to_owned(),
+            envelope_sha256: String::new(),
+        };
+        admitted.idempotency_key = admitted.derive_idempotency_key();
+        admitted.envelope_sha256 = admitted.expected_envelope_sha256();
+        admitted.validate().expect("valid host fixture envelope");
+
+        let journal_path = root.path().join(HOST_OBSERVATION_JOURNAL_FILE_NAME);
+        let journal = SqliteObservationJournal::open(
+            &journal_path,
+            super::super::observation_journey::ObservationJourneyPolicyV1::project_default()
+                .retention,
+        )
+        .expect("host fixture journal");
+        journal
+            .append_admitted_at(&admitted, 1_750_000_000_000_200)
+            .expect("append host fixture envelope");
+    }
+
+    #[test]
+    fn retained_locator_rejects_fully_recomputed_provider_view_against_host_lineage() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::{
+            PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderOperation,
+        };
+
+        let root = TempDir::new().expect("host-lineage root");
+        let origin = scope("session.host-lineage-origin");
+        let delivery = scope("session.host-lineage-delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "host-authenticated provider view",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let record = attributed_record(&origin, &observation, "locator.host-lineage");
+        staged
+            .stage_or_duplicate(record.clone())
+            .expect("stage provider-local row");
+        install_host_projection(&root, &record);
+
+        // Rewrite the canonical provider view and recompute every digest a
+        // malicious provider-local writer can reach, including a fresh public
+        // sanitization receipt. The immutable host envelope still names the
+        // original bytes and must reject the retained locator resolution.
+        let connection = staged.connection().expect("tamper connection");
+        let original_payload: Vec<u8> = connection
+            .query_row(
+                "SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params!["locator.host-lineage"],
+                |row| row.get(0),
+            )
+            .expect("stored provider view");
+        let mut tampered: Value = serde_json::from_slice(&original_payload).expect("envelope");
+        tampered["canonical_payload"]["content"] = "forged provider-local content".into();
+        let canonical =
+            tracedecay_memory_hygiene::canonical_payload_bytes(&tampered["canonical_payload"])
+                .expect("forged canonical bytes");
+        tampered["payload_sha256"] = sha256_hex(&canonical).into();
+        let sanitized = serde_json::to_vec(&tampered).expect("forged envelope bytes");
+        let payload_sha256 = sha256_hex(&sanitized);
+        let semantic_sha256 = semantic_observation_digest(&sanitized).expect("semantic digest");
+        let projected_content_sha256 =
+            extract_message_text(&sanitized).map(|text| sha256_hex(text.as_bytes()));
+        let receipt =
+            PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+                "attacker-recomputed-receipt.v1",
+                payload_sha256.clone(),
+            ))
+            .expect("forged public receipt");
+        let (sequence, operation_id): (i64, String) = connection
+            .query_row(
+                "SELECT admitted_sequence, operation_id FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params!["locator.host-lineage"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row evidence");
+        let evidence = derive_effect_evidence(
+            &origin.exact_scope_sha256(),
+            "locator.host-lineage",
+            &payload_sha256,
+            u64::try_from(sequence).expect("sequence"),
+            &operation_id,
+        );
+        connection
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1
+                 SET sanitized_payload=?1, payload_sha256=?2, semantic_sha256=?3,
+                     projected_content_sha256=?4, provider_reference=?5,
+                     receipt=?6, effect_digest=?7, sanitization_receipt_json=?8,
+                     sanitization_extensions_digest=?9
+                 WHERE idempotency_key=?10",
+                params![
+                    sanitized,
+                    payload_sha256,
+                    semantic_sha256,
+                    projected_content_sha256,
+                    evidence.provider_reference,
+                    evidence.receipt,
+                    evidence.effect_digest,
+                    receipt.to_json(),
+                    receipt.extensions_digest(),
+                    "locator.host-lineage",
+                ],
+            )
+            .expect("recompute provider-local evidence");
+        drop(connection);
+
+        let target = locator_target(&delivery, &observation, "recall-memory-ref-v1:host-lineage");
+        let request = feedback_request_for(target);
+        let call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.host-lineage-feedback",
+            staged.generation().expect("generation"),
+            &request,
+        );
+        let admission = admission_for(&call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&call, Some(&admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage"
+            ))
+        ));
+        assert_eq!(
+            staged
+                .connection()
+                .expect("post-rejection connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.host-lineage"],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("unchanged feedback"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn retained_locator_rejects_fully_recomputed_provider_view_without_host_lineage() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::{
+            PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderOperation,
+        };
+
+        let root = TempDir::new().expect("host-lineage absence root");
+        let origin = scope("session.host-lineage-absence-origin");
+        let delivery = scope("session.host-lineage-absence-delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "host lineage must be present",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let record = attributed_record(&origin, &observation, "locator.host-lineage-absence");
+        staged
+            .stage_or_duplicate(record.clone())
+            .expect("stage provider-local row");
+
+        // Recompute every provider-local value after changing the transformed
+        // view. With no sibling host journal, even a self-consistent forged
+        // receipt has no authenticated source-to-projection edge.
+        let connection = staged.connection().expect("tamper connection");
+        let original_payload: Vec<u8> = connection
+            .query_row(
+                "SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params!["locator.host-lineage-absence"],
+                |row| row.get(0),
+            )
+            .expect("stored provider view");
+        let mut tampered: Value = serde_json::from_slice(&original_payload).expect("envelope");
+        tampered["canonical_payload"]["content"] = "forged without host lineage".into();
+        let canonical =
+            tracedecay_memory_hygiene::canonical_payload_bytes(&tampered["canonical_payload"])
+                .expect("forged canonical bytes");
+        tampered["payload_sha256"] = sha256_hex(&canonical).into();
+        let sanitized = serde_json::to_vec(&tampered).expect("forged envelope bytes");
+        let payload_sha256 = sha256_hex(&sanitized);
+        let semantic_sha256 = semantic_observation_digest(&sanitized).expect("semantic digest");
+        let projected_content_sha256 =
+            extract_message_text(&sanitized).map(|text| sha256_hex(text.as_bytes()));
+        let receipt =
+            PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+                "attacker-recomputed-receipt-without-host.v1",
+                payload_sha256.clone(),
+            ))
+            .expect("forged public receipt");
+        let (sequence, operation_id): (i64, String) = connection
+            .query_row(
+                "SELECT admitted_sequence, operation_id FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params!["locator.host-lineage-absence"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row evidence");
+        let evidence = derive_effect_evidence(
+            &origin.exact_scope_sha256(),
+            "locator.host-lineage-absence",
+            &payload_sha256,
+            u64::try_from(sequence).expect("sequence"),
+            &operation_id,
+        );
+        connection
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1
+                 SET sanitized_payload=?1, payload_sha256=?2, semantic_sha256=?3,
+                     projected_content_sha256=?4, provider_reference=?5,
+                     receipt=?6, effect_digest=?7, sanitization_receipt_json=?8,
+                     sanitization_extensions_digest=?9
+                 WHERE idempotency_key=?10",
+                params![
+                    sanitized,
+                    payload_sha256,
+                    semantic_sha256,
+                    projected_content_sha256,
+                    evidence.provider_reference,
+                    evidence.receipt,
+                    evidence.effect_digest,
+                    receipt.to_json(),
+                    receipt.extensions_digest(),
+                    "locator.host-lineage-absence",
+                ],
+            )
+            .expect("recompute provider-local evidence");
+        drop(connection);
+
+        let target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:host-lineage-absence",
+        );
+        let request = feedback_request_for(target);
+        let call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.host-lineage-absence-feedback",
+            staged.generation().expect("generation"),
+            &request,
+        );
+        let admission = admission_for(&call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&call, Some(&admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage unavailable"
+            ))
+        ));
+        assert_eq!(
+            staged
+                .connection()
+                .expect("post-rejection connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.host-lineage-absence"],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("unchanged feedback"),
+            0.0
+        );
+        assert!(!has_host_projection_journal(staged.path()));
+        assert_eq!(record.source_event_id, source.source.observation_id);
+    }
+
+    #[test]
+    fn retained_locator_survives_reopen_with_changed_ready_receipt_and_registration() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("re-handshake root");
+        let origin = scope("session.re-handshake-origin");
+        let delivery = scope("session.re-handshake-delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "retained locator survives re-handshake",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let record = attributed_record(&origin, &observation, "locator.re-handshake-source");
+        staged
+            .stage_or_duplicate(record.clone())
+            .expect("stage source");
+        install_host_projection(&root, &record);
+        let locator = "recall-memory-ref-v1:re-handshake";
+        let target = locator_target(&delivery, &observation, locator);
+        let request = feedback_request_for(target.clone());
+
+        let mut first_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.re-handshake-first",
+            staged.generation().expect("first generation"),
+            &request,
+        );
+        first_call.ready_receipt_sha256 = "b".repeat(64);
+        let first_admission = admission_for(&first_call, std::slice::from_ref(&source));
+        let first = staged
+            .control(&first_call, Some(&first_admission))
+            .expect("first re-handshake feedback");
+        assert_eq!(
+            first.response["applied_effect"]["retained_source_locator"],
+            locator
+        );
+
+        drop(staged);
+        let reopened = store(&root, 8);
+        let mut second_target = target;
+        // The opaque locator names the settled source; its old delivery
+        // registration remains in the request while the current call has
+        // already re-registered with a new revision.
+        second_target["registration_revision"] = 1.into();
+        let second_request = feedback_request_for(second_target);
+        let mut second_call = lifecycle_call(
+            &delivery,
+            2,
+            ProviderOperation::Feedback,
+            "locator.re-handshake-second",
+            reopened.generation().expect("reopened generation"),
+            &second_request,
+        );
+        second_call.ready_receipt_sha256 = "c".repeat(64);
+        let second_admission = admission_for(&second_call, std::slice::from_ref(&source));
+        let second = reopened
+            .control(&second_call, Some(&second_admission))
+            .expect("re-registered locator feedback");
+        assert_eq!(
+            second.response["applied_effect"]["retained_source_locator"],
+            locator
+        );
+        assert!(
+            !second
+                .response
+                .to_string()
+                .contains(&record.idempotency_key)
+        );
+        assert_eq!(
+            reopened
+                .connection()
+                .expect("feedback connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.re-handshake-source"],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("feedback persisted"),
+            1.0
+        );
+
+        let next_generation = reopened.generation().expect("post-feedback generation");
+        let rejected = |name: &str, request: Value| {
+            let call = lifecycle_call(
+                &delivery,
+                2,
+                ProviderOperation::Feedback,
+                name,
+                next_generation,
+                &request,
+            );
+            let admission = admission_for(&call, std::slice::from_ref(&source));
+            reopened.control(&call, Some(&admission))
+        };
+        let mut wrong_provider = second_request.clone();
+        wrong_provider["target"]["provider_id"] = "tracedecay.other".into();
+        assert!(matches!(
+            rejected("locator.re-handshake-wrong-provider", wrong_provider),
+            Err(StagedStoreError::LifecycleConflict("target attribution"))
+        ));
+        let mut wrong_scope = second_request.clone();
+        wrong_scope["target"]["delivery_scope"] = scope_json(&scope("session.wrong-scope"));
+        assert!(matches!(
+            rejected("locator.re-handshake-wrong-scope", wrong_scope),
+            Err(StagedStoreError::LifecycleConflict("target attribution"))
+        ));
+        let mut wrong_source = second_request;
+        wrong_source["target"]["source"]["observation_id"] = "observation.wrong".into();
+        assert!(matches!(
+            rejected("locator.re-handshake-wrong-source", wrong_source),
+            Err(StagedStoreError::LifecycleConflict("target source unknown"))
+        ));
+    }
+
+    #[test]
+    fn resident_source_tamper_blocks_deletion_and_recall() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("resident source tamper root");
+        let origin = scope("session.resident-source-tamper");
+        let observation_a = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "source A must remain attributable",
+            Some(T1),
+            None,
+        );
+        let observation_b = common_observation(
+            &origin,
+            2,
+            Some("r1"),
+            "source B must remain attributable",
+            Some(T1),
+            None,
+        );
+        let source_a = attributed_source(&observation_a);
+        let record_a = attributed_record(&origin, &observation_a, "resident.source-a");
+        let record_b = attributed_record(&origin, &observation_b, "resident.source-b");
+        let staged = store(&root, 8);
+        staged
+            .stage_or_duplicate(record_a.clone())
+            .expect("stage source A");
+        staged
+            .stage_or_duplicate(record_b.clone())
+            .expect("stage source B");
+        install_host_projection(&root, &record_a);
+        install_host_projection(&root, &record_b);
+
+        // Change only the provider-local attribution. The payload and its
+        // digest still describe A, while the row now claims B.
+        staged
+            .connection()
+            .expect("tamper connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1 SET original_source=?1 WHERE idempotency_key=?2",
+                params![observation_b["source_identity"]["original_source"].to_string(), "resident.source-a"],
+            )
+            .expect("tamper resident attribution");
+
+        let delete_request = json!({
+            "forget_source_keys":[source_a.source.source_key],
+            "mode":"hard_delete",
+            "include_snapshots":true,
+            "retention_lock_policy_revision":1,
+            "verification_query":"resident source tamper",
+        });
+        let delete_call = lifecycle_call(
+            &origin,
+            1,
+            ProviderOperation::DeleteBySource,
+            "resident.source-tamper-delete",
+            staged.generation().expect("delete generation"),
+            &delete_request,
+        );
+        assert!(matches!(
+            staged.control(&delete_call, None),
+            Err(StagedStoreError::LifecycleConflict(
+                "stored source attribution"
+            ))
+        ));
+        assert_eq!(
+            staged
+                .connection()
+                .expect("fence connection")
+                .query_row(
+                    "SELECT COUNT(*) FROM tdmem_native_deleted_source_v2",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("deletion fence count"),
+            0
+        );
+
+        // Recall performs the same payload-to-row attribution check before a
+        // candidate can be emitted, including when the row is in this exact
+        // checkout and no history grant is needed.
+        assert!(matches!(
+            staged.recall(&origin, "attributable", 8),
+            Err(StagedStoreError::LifecycleConflict(
+                "stored source attribution"
+            ))
+        ));
+    }
+
+    fn feedback_request_for(target: Value) -> Value {
+        json!({
+            "target":target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.provider-view.feedback",
+            "evidence_refs":[],
+            "occurred_at":"2025-01-01T00:00:01Z"
+        })
+    }
+
+    fn source_influence_request(target: Value, source_key: &str, locator: &str) -> Value {
+        json!({
+            "view":"source_influence",
+            "selector":{"source_key":source_key,"stable_memory_ref":locator},
+            "maximum_items":8,
+            "maximum_bytes":16384,
+            "redaction_policy_revision":1,
+            "cursor":null,
+            "target":target
+        })
     }
 
     #[test]
@@ -1935,6 +2951,1630 @@ mod tests {
     }
 
     #[test]
+    fn retained_locator_feedback_correction_and_inspection_survive_reopen() {
+        use tracedecay_memory_conformance::compatibility::{T1, T2, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("root");
+        let origin = scope("session.origin");
+        let delivery = scope("session.delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "retained locator beacon",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let source_record = attributed_record(&origin, &observation, "locator.source");
+        let StagedOutcome::Committed(private_effect) = staged
+            .stage_or_duplicate(source_record.clone())
+            .expect("stage source")
+        else {
+            panic!("expected source commit");
+        };
+        install_host_projection(&root, &source_record);
+        let locator = "recall-memory-ref-v1:opaque-locator-1";
+        let target = locator_target(&delivery, &observation, locator);
+        let feedback = json!({
+            "target":target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.feedback",
+            "evidence_refs":[],
+            "occurred_at":T1
+        });
+        let feedback_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.feedback",
+            staged.generation().expect("generation"),
+            &feedback,
+        );
+        let feedback_admission = admission_for(&feedback_call, std::slice::from_ref(&source));
+        let first = staged
+            .control(&feedback_call, Some(&feedback_admission))
+            .expect("locator feedback");
+        assert_eq!(
+            first.response["applied_effect"]["stable_memory_ref"],
+            locator
+        );
+        assert_eq!(
+            first.response["applied_effect"]["retained_source_locator"],
+            locator
+        );
+        assert!(
+            !first
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        drop(staged);
+        let reopened = store(&root, 8);
+        let mut correction = json!({
+            "target":target,
+            "correction_kind":"change_validity",
+            "replacement":{"valid_from":T1,"valid_until":T2},
+            "expected_target_revision":"r1",
+            "reason":"reopened correction",
+            "evidence_refs":[]
+        });
+        let correction_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Correction,
+            "locator.correction",
+            reopened.generation().expect("reopened generation"),
+            &correction,
+        );
+        let correction_admission = admission_for(&correction_call, std::slice::from_ref(&source));
+        let corrected = reopened
+            .control(&correction_call, Some(&correction_admission))
+            .expect("reopened locator correction");
+        assert_eq!(
+            corrected.response["affected_provider_effects"],
+            json!([locator])
+        );
+        assert!(
+            !corrected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        correction["correction_kind"] = "replace_content".into();
+        let replacement_observation = common_observation(
+            &origin,
+            1,
+            Some("r2"),
+            "retained locator correction",
+            Some(T2),
+            None,
+        );
+        let replacement_source = attributed_source(&replacement_observation);
+        let replacement_record =
+            attributed_record(&origin, &replacement_observation, "locator.replacement");
+        install_host_projection(&root, &replacement_record);
+        correction["replacement"] = replacement_observation;
+        let replacement_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Correction,
+            "locator.replacement",
+            reopened
+                .generation()
+                .expect("validity correction generation"),
+            &correction,
+        );
+        let replacement_admission =
+            admission_for(&replacement_call, &[source.clone(), replacement_source]);
+        let replaced = reopened
+            .control(&replacement_call, Some(&replacement_admission))
+            .expect("reopened locator replacement");
+        let replacement_reference: String = reopened
+            .connection()
+            .expect("replacement connection")
+            .query_row(
+                "SELECT provider_reference FROM tdmem_native_staged_observation_v1 WHERE actual_revision=?1",
+                params!["r2"],
+                |row| row.get(0),
+            )
+            .expect("replacement private reference");
+        assert_eq!(replaced.response["affected_provider_effects"], json!(2_u64));
+        assert!(
+            !replaced
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+        assert!(
+            !replaced
+                .response
+                .to_string()
+                .contains(&replacement_reference)
+        );
+
+        // Even if a private replacement reference is tampered into the
+        // provider-local validity overlay, retained inspection must rebuild a
+        // typed summary and redact that private value before it reaches the
+        // host response.
+        let tampered_replacement_reference =
+            format!("{PROVIDER_REFERENCE_PREFIX}{}", "d".repeat(64));
+        {
+            let connection = reopened.connection().expect("tampered overlay connection");
+            let overlay: String = connection
+                .query_row(
+                    "SELECT validity_override FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.source"],
+                    |row| row.get(0),
+                )
+                .expect("stored correction overlay");
+            let mut overlay: Value = serde_json::from_str(&overlay).expect("overlay json");
+            overlay["superseded_by"] = tampered_replacement_reference.clone().into();
+            connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET validity_override=?1 WHERE idempotency_key=?2",
+                    params![overlay.to_string(), "locator.source"],
+                )
+                .expect("tamper replacement reference");
+        }
+
+        let inspection = json!({
+            "view":"source_influence",
+            "selector":{"source_key":source.source.source_key,"stable_memory_ref":locator},
+            "maximum_items":8,
+            "maximum_bytes":16384,
+            "redaction_policy_revision":1,
+            "cursor":null,
+            "target":target
+        });
+        let inspection_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.inspection",
+            reopened.generation().expect("post-replacement generation"),
+            &inspection,
+        );
+        let inspection_admission = admission_for(&inspection_call, std::slice::from_ref(&source));
+        let inspected = reopened
+            .control(&inspection_call, Some(&inspection_admission))
+            .expect("reopened locator inspection");
+        let item = inspected.response["items"]
+            .as_array()
+            .expect("inspection items")
+            .first()
+            .expect("retained influence");
+        assert_eq!(
+            item["target"]["reference"],
+            json!({"kind":"retained_source_locator","reference":locator})
+        );
+        assert_eq!(item["settled_feedback"]["helpful"], 1);
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&replacement_reference)
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&tampered_replacement_reference)
+        );
+    }
+
+    #[test]
+    fn retained_locator_accepts_mixed_fact_provider_projection_for_lifecycle_reads_and_writes() {
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("mixed-fact root");
+        let origin = scope("session.mixed-origin");
+        let delivery = scope("session.mixed-delivery");
+        let (source_observation, provider_view) = mixed_fact_source_and_provider_view(&origin);
+        let source = attributed_source(&source_observation);
+        let staged = store(&root, 8);
+        let provider_view_record =
+            attributed_record(&origin, &provider_view, "locator.mixed-facts");
+        let StagedOutcome::Committed(private_effect) = staged
+            .stage_or_duplicate(provider_view_record.clone())
+            .expect("stage narrowed provider view")
+        else {
+            panic!("expected mixed-fact source commit");
+        };
+        install_host_projection(&root, &provider_view_record);
+        assert_ne!(
+            provider_view["payload_sha256"],
+            source_observation["source_identity"]["original_source"]["source"]["content_sha256"],
+            "the provider view must carry a digest independent of the full source"
+        );
+        let locator = "recall-memory-ref-v1:mixed-facts";
+        let target = locator_target(&delivery, &source_observation, locator);
+
+        let feedback_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.mixed-feedback",
+            staged.generation().expect("mixed generation"),
+            &feedback_request_for(target.clone()),
+        );
+        let feedback_admission = admission_for(&feedback_call, std::slice::from_ref(&source));
+        let feedback = staged
+            .control(&feedback_call, Some(&feedback_admission))
+            .expect("mixed-fact feedback");
+        assert_eq!(
+            feedback.response["applied_effect"]["retained_source_locator"],
+            locator
+        );
+        assert!(
+            !feedback
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        let correction = json!({
+            "target":target.clone(),
+            "correction_kind":"change_validity",
+            "replacement":{"valid_from":"2025-01-01T00:00:01Z","valid_until":"2025-01-01T00:00:02Z"},
+            "expected_target_revision":"r1",
+            "reason":"mixed-fact validity correction",
+            "evidence_refs":[]
+        });
+        let correction_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Correction,
+            "locator.mixed-correction",
+            staged.generation().expect("mixed feedback generation"),
+            &correction,
+        );
+        let correction_admission = admission_for(&correction_call, std::slice::from_ref(&source));
+        let corrected = staged
+            .control(&correction_call, Some(&correction_admission))
+            .expect("mixed-fact correction");
+        assert_eq!(
+            corrected.response["affected_provider_effects"],
+            json!([locator])
+        );
+        assert!(
+            !corrected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        let inspection =
+            source_influence_request(target, source.source.source_key.as_str(), locator);
+        let inspection_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.mixed-inspection",
+            staged.generation().expect("mixed correction generation"),
+            &inspection,
+        );
+        let inspection_admission = admission_for(&inspection_call, std::slice::from_ref(&source));
+        let inspected = staged
+            .control(&inspection_call, Some(&inspection_admission))
+            .expect("mixed-fact inspection");
+        let item = inspected.response["items"]
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("mixed-fact influence item");
+        assert_eq!(
+            item["target"]["reference"],
+            json!({"kind":"retained_source_locator","reference":locator})
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+    }
+
+    #[test]
+    fn retained_locator_accepts_redacted_provider_view_only_with_intact_receipt() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("redacted root");
+        let origin = scope("session.redacted-origin");
+        let delivery = scope("session.redacted-delivery");
+        let source_observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "credential-bearing source text",
+            Some(T1),
+            None,
+        );
+        let mut provider_view = source_observation.clone();
+        provider_view["canonical_payload"]["content"] = "[redacted by provider hygiene]".into();
+        let provider_canonical =
+            tracedecay_memory_hygiene::canonical_payload_bytes(&provider_view["canonical_payload"])
+                .expect("redacted provider canonical bytes");
+        provider_view["payload_sha256"] = sha256_hex(&provider_canonical).into();
+        let source = attributed_source(&source_observation);
+        let staged = store(&root, 8);
+        let provider_view_record =
+            attributed_record(&origin, &provider_view, "locator.redacted-view");
+        let StagedOutcome::Committed(private_effect) = staged
+            .stage_or_duplicate(provider_view_record.clone())
+            .expect("stage redacted provider view")
+        else {
+            panic!("expected redacted source commit");
+        };
+        let host_receipt = install_redacted_provider_view_receipt(
+            &staged,
+            "locator.redacted-view",
+            &source_observation,
+        );
+        install_host_projection_with_receipt(&root, &provider_view_record, &host_receipt);
+        assert_ne!(
+            provider_view["payload_sha256"],
+            source_observation["source_identity"]["original_source"]["source"]["content_sha256"],
+            "redaction must keep the transformed digest separate from source attribution"
+        );
+        let locator = "recall-memory-ref-v1:redacted-view";
+        let target = locator_target(&delivery, &source_observation, locator);
+
+        let feedback_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.redacted-feedback",
+            staged.generation().expect("redacted generation"),
+            &feedback_request_for(target.clone()),
+        );
+        let feedback_admission = admission_for(&feedback_call, std::slice::from_ref(&source));
+        let feedback = staged
+            .control(&feedback_call, Some(&feedback_admission))
+            .expect("redacted feedback");
+        assert_eq!(
+            feedback.response["applied_effect"]["retained_source_locator"],
+            locator
+        );
+        assert!(
+            !feedback
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        let correction = json!({
+            "target":target.clone(),
+            "correction_kind":"change_validity",
+            "replacement":{"valid_from":T1,"valid_until":"2025-01-01T00:00:02Z"},
+            "expected_target_revision":"r1",
+            "reason":"redacted provider-view correction",
+            "evidence_refs":[]
+        });
+        let correction_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Correction,
+            "locator.redacted-correction",
+            staged.generation().expect("redacted feedback generation"),
+            &correction,
+        );
+        let correction_admission = admission_for(&correction_call, std::slice::from_ref(&source));
+        let corrected = staged
+            .control(&correction_call, Some(&correction_admission))
+            .expect("redacted correction");
+        assert_eq!(
+            corrected.response["affected_provider_effects"],
+            json!([locator])
+        );
+        assert!(
+            !corrected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        let inspection =
+            source_influence_request(target.clone(), source.source.source_key.as_str(), locator);
+        let inspection_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.redacted-inspection",
+            staged.generation().expect("redacted correction generation"),
+            &inspection,
+        );
+        let inspection_admission = admission_for(&inspection_call, std::slice::from_ref(&source));
+        let inspected = staged
+            .control(&inspection_call, Some(&inspection_admission))
+            .expect("redacted inspection");
+        assert_eq!(
+            inspected.response["items"][0]["target"]["reference"],
+            json!({"kind":"retained_source_locator","reference":locator})
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+
+        let original_payload: Vec<u8> = staged
+            .connection()
+            .expect("redacted payload connection")
+            .query_row(
+                "SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                params!["locator.redacted-view"],
+                |row| row.get(0),
+            )
+            .expect("redacted payload");
+        let mut tampered_payload = original_payload.clone();
+        tampered_payload.push(b' ');
+        staged
+            .connection()
+            .expect("tampered payload connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=?1 WHERE idempotency_key=?2",
+                params![tampered_payload, "locator.redacted-view"],
+            )
+            .expect("tamper transformed bytes");
+        let tampered_bytes_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.redacted-tampered-bytes",
+            staged.generation().expect("tampered bytes generation"),
+            &feedback_request_for(target.clone()),
+        );
+        let tampered_bytes_admission =
+            admission_for(&tampered_bytes_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&tampered_bytes_call, Some(&tampered_bytes_admission)),
+            Err(StagedStoreError::PayloadDigestMismatch { .. })
+        ));
+
+        staged
+            .connection()
+            .expect("restore payload connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=?1 WHERE idempotency_key=?2",
+                params![original_payload, "locator.redacted-view"],
+            )
+            .expect("restore transformed bytes");
+        staged
+            .connection()
+            .expect("tampered receipt connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1
+                 SET sanitization_receipt_json=replace(
+                     sanitization_receipt_json,
+                     'fixture.provider-view-redaction.v1',
+                     'fixture.provider-view-redaction.v2'
+                 )
+                 WHERE idempotency_key=?1",
+                params!["locator.redacted-view"],
+            )
+            .expect("tamper transformed receipt");
+        let tampered_receipt_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.redacted-tampered-receipt",
+            staged.generation().expect("tampered receipt generation"),
+            &inspection,
+        );
+        let tampered_receipt_admission =
+            admission_for(&tampered_receipt_call, std::slice::from_ref(&source));
+        let tampered_receipt =
+            staged.control(&tampered_receipt_call, Some(&tampered_receipt_admission));
+        assert!(
+            matches!(
+                &tampered_receipt,
+                Err(StagedStoreError::LifecycleConflict(
+                    "target sanitization receipt"
+                ))
+            ),
+            "tampered receipt result: {tampered_receipt:?}"
+        );
+    }
+
+    #[test]
+    fn retained_locator_requires_fresh_admission_and_rejects_mismatch_unknown_and_ambiguity() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let root = TempDir::new().expect("root");
+        let origin = scope("session.origin");
+        let delivery = scope("session.delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "locator authority beacon",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let source_record = attributed_record(&origin, &observation, "locator.source");
+        staged
+            .stage_or_duplicate(source_record.clone())
+            .expect("stage source");
+        install_host_projection(&root, &source_record);
+        let locator = "recall-memory-ref-v1:opaque-locator-2";
+        let target = locator_target(&delivery, &observation, locator);
+        let request_for = |target: Value| {
+            json!({
+                "target":target,
+                "signal":"helpful",
+                "weight":"0.5",
+                "canonical_outcome_receipt":"fixture.feedback",
+                "evidence_refs":[],
+                "occurred_at":T1
+            })
+        };
+
+        let no_grant_request = request_for(target.clone());
+        let no_grant_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.no-grant",
+            staged.generation().expect("generation"),
+            &no_grant_request,
+        );
+        assert!(matches!(
+            staged.control(&no_grant_call, None),
+            Err(StagedStoreError::LifecycleConflict(
+                "target authority unavailable"
+            ))
+        ));
+
+        let mut mismatched_target = target.clone();
+        mismatched_target["source"]["content_sha256"] = "f".repeat(64).into();
+        let mismatch_request = request_for(mismatched_target);
+        let mismatch_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.mismatch",
+            staged.generation().expect("generation"),
+            &mismatch_request,
+        );
+        let mismatch_admission = admission_for(&mismatch_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&mismatch_call, Some(&mismatch_admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "target source mismatch"
+            ))
+        ));
+
+        let mut unknown_target = target.clone();
+        unknown_target["source"]["observation_id"] = "observation.unknown".into();
+        let unknown_request = request_for(unknown_target);
+        let unknown_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.unknown",
+            staged.generation().expect("generation"),
+            &unknown_request,
+        );
+        let unknown_admission = admission_for(&unknown_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&unknown_call, Some(&unknown_admission)),
+            Err(StagedStoreError::LifecycleConflict("target source unknown"))
+        ));
+
+        let mut malformed_target = target.clone();
+        malformed_target["reference"]["reference"] = " locator".into();
+        let malformed_request = request_for(malformed_target);
+        let malformed_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.malformed",
+            staged.generation().expect("generation"),
+            &malformed_request,
+        );
+        assert!(matches!(
+            staged.control(&malformed_call, None),
+            Err(StagedStoreError::InvalidAdvisory("target reference"))
+        ));
+
+        let mut ambiguous_source = source.clone();
+        ambiguous_source.source.source_key = "source.other".to_owned();
+        let ambiguity_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.ambiguous",
+            staged.generation().expect("generation"),
+            &request_for(target.clone()),
+        );
+        let ambiguity_admission =
+            admission_for(&ambiguity_call, &[source.clone(), ambiguous_source]);
+        assert!(matches!(
+            staged.control(&ambiguity_call, Some(&ambiguity_admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "target source ambiguous"
+            ))
+        ));
+
+        // Two delivery rows on the same checkout can carry the same admitted
+        // source identity after a restart/session change. A locator must not
+        // guess which private Native row to mutate.
+        staged
+            .stage_or_duplicate(attributed_record(
+                &scope("session.other"),
+                &observation,
+                "locator.source.other",
+            ))
+            .expect("stage second checkout row");
+        let row_ambiguity_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.row-ambiguous",
+            staged.generation().expect("generation after second row"),
+            &request_for(target.clone()),
+        );
+        let row_ambiguity_admission =
+            admission_for(&row_ambiguity_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&row_ambiguity_call, Some(&row_ambiguity_admission)),
+            Err(StagedStoreError::LifecycleConflict("target row ambiguous"))
+        ));
+        let connection = staged.connection().expect("connection");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("unchanged feedback"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn retained_locator_duplicate_replay_rejects_missing_or_revoked_grant() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::{ProviderOperation, SourceDisposition};
+
+        let root = TempDir::new().expect("root");
+        let origin = scope("session.origin");
+        let delivery = scope("session.delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "locator duplicate beacon",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let source_record = attributed_record(&origin, &observation, "locator.duplicate");
+        staged
+            .stage_or_duplicate(source_record.clone())
+            .expect("stage source");
+        install_host_projection(&root, &source_record);
+        let target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:opaque-locator-duplicate",
+        );
+        let request = json!({
+            "target":target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.feedback",
+            "evidence_refs":[],
+            "occurred_at":T1
+        });
+        let generation = staged.generation().expect("generation");
+        let first_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.duplicate-replay",
+            generation,
+            &request,
+        );
+        let first_admission = admission_for(&first_call, std::slice::from_ref(&source));
+        staged
+            .control(&first_call, Some(&first_admission))
+            .expect("initial feedback");
+
+        // The durable response journal is consulted only after a retained
+        // locator has passed a fresh authority check. A replay without any
+        // grant cannot use the old success as a capability.
+        let no_grant_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.duplicate-replay",
+            generation,
+            &request,
+        );
+        assert!(matches!(
+            staged.control(&no_grant_call, None),
+            Err(StagedStoreError::LifecycleConflict(
+                "target authority unavailable"
+            ))
+        ));
+
+        // A fresh admission whose current source grant has been revoked is
+        // equally unable to replay the prior operation. The old journal
+        // response remains behind the authority boundary.
+        let revoked_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.duplicate-replay",
+            generation,
+            &request,
+        );
+        let mut revoked_admission = admission_for(&revoked_call, std::slice::from_ref(&source));
+        revoked_admission.history_sources[0]
+            .current_disposition
+            .state = SourceDisposition::Deleted;
+        assert!(matches!(
+            staged.control(&revoked_call, Some(&revoked_admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "target source unavailable"
+            ))
+        ));
+        assert_eq!(
+            staged
+                .connection()
+                .expect("feedback connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("feedback remains committed"),
+            0.5
+        );
+    }
+
+    #[test]
+    fn general_replay_duplicate_rechecks_current_source_disposition() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::{ProviderOperation, SourceDisposition};
+
+        let root = TempDir::new().expect("root");
+        let origin = scope("session.replay-origin");
+        let delivery = scope("session.replay-delivery");
+        let mut observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "general replay duplicate beacon",
+            Some(T1),
+            None,
+        );
+        // The common conformance observation is the host envelope body. Replay
+        // additionally needs the admitted observation delivery identity.
+        observation["idempotency_key"] = "b".repeat(64).into();
+        observation["request_identity"] = "fixture.replay.request".into();
+        let source = attributed_source(&observation);
+        let staged = store(&root, 8);
+        let replay_record = attributed_record(
+            &delivery,
+            &observation,
+            observation["idempotency_key"].as_str().expect("replay key"),
+        );
+        install_host_projection(&root, &replay_record);
+        let attribution = observation["source_identity"]["original_source"].clone();
+        let grant = |state: &str| {
+            json!({
+                "authorization_ref":"fixture.replay",
+                "policy_revision":1,
+                "destination_scope":scope_json(&delivery),
+                "relation":"exact_scope",
+                "sources":[{"attribution":attribution.clone(),"current_disposition":{
+                    "state":state,"authority_ref":"fixture.current","authority_revision":1,
+                    "checked_at":T1
+                }}],
+                "disposition_checkpoint":{"exact_scope":scope_json(&delivery),
+                    "authority_ref":"fixture.checkpoint","authority_revision":1,"checked_at":T1}
+            })
+        };
+        let request = |state: &str| {
+            json!({
+                "observation_batch_refs":["fixture.replay.receipt.1"],
+                "resolved_observations":[{"receipt_ref":"fixture.replay.receipt.1",
+                    "observation":observation.clone()}],
+                "first_source_sequence":1,
+                "last_source_sequence":1,
+                "expected_previous_acknowledged_sequence":0,
+                "history_grant":grant(state)
+            })
+        };
+
+        let first_request = request("available");
+        let generation = staged.generation().expect("initial generation");
+        let first_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Replay,
+            "replay.general-duplicate",
+            generation,
+            &first_request,
+        );
+        let first_admission = admission_for(&first_call, std::slice::from_ref(&source));
+        let first = staged
+            .control(&first_call, Some(&first_admission))
+            .expect("initial replay");
+        assert_eq!(first.response["applied_observations"], 1);
+
+        // Keep the operation key and request body stable. The only change is
+        // the fresh host disposition, which must be checked before the old
+        // operation-journal success can be returned.
+        for state in ["revoked", "deleted", "redacted", "expired"] {
+            let retry_request = request(state);
+            let retry_call = lifecycle_call(
+                &delivery,
+                1,
+                ProviderOperation::Replay,
+                "replay.general-duplicate",
+                generation,
+                &retry_request,
+            );
+            let mut retry_admission = admission_for(&retry_call, std::slice::from_ref(&source));
+            retry_admission.history_sources[0].current_disposition.state =
+                SourceDisposition::from_wire(state).expect("fixture disposition");
+            assert!(
+                matches!(
+                    staged.control(&retry_call, Some(&retry_admission)),
+                    Err(StagedStoreError::LifecycleConflict(
+                        "replay source unavailable"
+                    ))
+                ),
+                "duplicate replay unexpectedly bypassed {state} disposition"
+            );
+        }
+        assert_eq!(
+            staged
+                .connection()
+                .expect("replay connection")
+                .query_row(
+                    "SELECT COUNT(*) FROM tdmem_native_staged_observation_v1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("replay row count"),
+            1
+        );
+    }
+
+    #[test]
+    fn retained_locator_validates_provenance_and_allows_tombstone_inspection_only() {
+        use tracedecay_memory_conformance::compatibility::{T1, T2, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let tamper_root = TempDir::new().expect("tamper root");
+        let origin = scope("session.origin");
+        let delivery = scope("session.delivery");
+        let observation = common_observation(
+            &origin,
+            1,
+            Some("r1"),
+            "locator provenance beacon",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let tampered = store(&tamper_root, 8);
+        let StagedOutcome::Committed(private_effect) = tampered
+            .stage_or_duplicate(attributed_record(&origin, &observation, "locator.source"))
+            .expect("stage source")
+        else {
+            panic!("expected source commit");
+        };
+        {
+            let connection = tampered.connection().expect("connection");
+            let original: String = connection
+                .query_row(
+                    "SELECT original_source FROM tdmem_native_staged_observation_v1",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("stored attribution");
+            let mut value: Value = serde_json::from_str(&original).expect("attribution json");
+            value["source"]["content_sha256"] = "e".repeat(64).into();
+            connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET original_source=?1",
+                    params![value.to_string()],
+                )
+                .expect("tamper attribution");
+        }
+        let target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:opaque-locator-3",
+        );
+        let request = json!({
+            "target":target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.feedback",
+            "evidence_refs":[],
+            "occurred_at":T1
+        });
+        let call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.tampered",
+            tampered.generation().expect("generation"),
+            &request,
+        );
+        let admission = admission_for(&call, std::slice::from_ref(&source));
+        assert!(tampered.control(&call, Some(&admission)).is_err());
+        assert_eq!(
+            private_effect.provider_reference.len(),
+            PROVIDER_REFERENCE_PREFIX.len() + 64
+        );
+
+        let malformed_root = TempDir::new().expect("malformed root");
+        let malformed = store(&malformed_root, 8);
+        let malformed_record = attributed_record(&origin, &observation, "locator.source");
+        malformed
+            .stage_or_duplicate(malformed_record.clone())
+            .expect("stage malformed source");
+        install_host_projection(&malformed_root, &malformed_record);
+        malformed
+            .connection()
+            .expect("malformed connection")
+            .execute(
+                "UPDATE tdmem_native_staged_observation_v1 SET original_source=?1",
+                params!["not-json"],
+            )
+            .expect("tamper malformed attribution");
+        let malformed_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:opaque-locator-3-malformed",
+        );
+        let malformed_request = json!({
+            "target":malformed_target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.feedback",
+            "evidence_refs":[],
+            "occurred_at":T1
+        });
+        let malformed_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.malformed-stored-source",
+            malformed.generation().expect("malformed generation"),
+            &malformed_request,
+        );
+        let malformed_admission = admission_for(&malformed_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            malformed.control(&malformed_call, Some(&malformed_admission)),
+            Err(StagedStoreError::InvalidAdvisory("target source"))
+        ));
+
+        let tombstone_root = TempDir::new().expect("tombstone root");
+        let staged = store(&tombstone_root, 1);
+        let source_record = attributed_record(&origin, &observation, "locator.source");
+        let StagedOutcome::Committed(private_effect) = staged
+            .stage_or_duplicate(source_record.clone())
+            .expect("stage source")
+        else {
+            panic!("expected tombstone source commit");
+        };
+        install_host_projection(&tombstone_root, &source_record);
+        let replacement_observation = common_observation(
+            &origin,
+            1,
+            Some("r2"),
+            "tombstone replacement",
+            Some(T2),
+            None,
+        );
+        let replacement_record =
+            attributed_record(&origin, &replacement_observation, "locator.replacement");
+        let StagedOutcome::Committed(replacement_effect) = staged
+            .stage_or_duplicate(replacement_record.clone())
+            .expect("stage replacement")
+        else {
+            panic!("expected tombstone replacement commit");
+        };
+        install_host_projection(&tombstone_root, &replacement_record);
+        staged
+            .stage_or_duplicate(record(
+                &origin,
+                "locator.evict",
+                "event.evict",
+                1,
+                "eviction beacon",
+            ))
+            .expect("stage eviction row");
+        let locator = "recall-memory-ref-v1:opaque-locator-4";
+        let target = locator_target(&delivery, &observation, locator);
+        let inspection = json!({
+            "view":"source_influence",
+            "selector":{"source_key":source.source.source_key,"stable_memory_ref":locator},
+            "maximum_items":8,
+            "maximum_bytes":16384,
+            "redaction_policy_revision":1,
+            "cursor":null,
+            "target":target
+        });
+        let inspection_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.tombstone-inspection",
+            staged.generation().expect("generation"),
+            &inspection,
+        );
+        let inspection_admission = admission_for(&inspection_call, std::slice::from_ref(&source));
+        let inspected = staged
+            .control(&inspection_call, Some(&inspection_admission))
+            .expect("tombstone inspection");
+        let item = inspected.response["items"]
+            .as_array()
+            .expect("inspection items")
+            .first()
+            .expect("tombstone item");
+        assert_eq!(item["disposition"], "deleted");
+        assert_eq!(
+            item["target"]["reference"],
+            json!({"kind":"retained_source_locator","reference":locator})
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&private_effect.provider_reference)
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&replacement_effect.provider_reference)
+        );
+
+        let feedback = json!({
+            "target":target,
+            "signal":"helpful",
+            "weight":"0.5",
+            "canonical_outcome_receipt":"fixture.feedback",
+            "evidence_refs":[],
+            "occurred_at":T1
+        });
+        let feedback_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.tombstone-feedback",
+            staged.generation().expect("generation"),
+            &feedback,
+        );
+        let feedback_admission = admission_for(&feedback_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&feedback_call, Some(&feedback_admission)),
+            Err(StagedStoreError::LifecycleConflict("target tombstone"))
+        ));
+
+        let correction = json!({
+            "target":target,
+            "correction_kind":"change_validity",
+            "replacement":{"valid_from":T1,"valid_until":T2},
+            "expected_target_revision":"r1",
+            "reason":"tombstone correction",
+            "evidence_refs":[]
+        });
+        let correction_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Correction,
+            "locator.tombstone-correction",
+            staged.generation().expect("generation"),
+            &correction,
+        );
+        let correction_admission = admission_for(&correction_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            staged.control(&correction_call, Some(&correction_admission)),
+            Err(StagedStoreError::LifecycleConflict("target tombstone"))
+        ));
+
+        // Privacy deletion scrubs the attribution itself. The retained
+        // locator may still inspect the tombstone through the preserved
+        // source event/revision, while the fresh admission supplies the
+        // caller-visible attribution and no provider-local handle escapes.
+        let scrubbed_root = TempDir::new().expect("scrubbed tombstone root");
+        let scrubbed = store(&scrubbed_root, 8);
+        let scrubbed_record = attributed_record(&origin, &observation, "locator.scrubbed");
+        let StagedOutcome::Committed(scrubbed_effect) = scrubbed
+            .stage_or_duplicate(scrubbed_record.clone())
+            .expect("stage scrubbed source")
+        else {
+            panic!("expected scrubbed source commit");
+        };
+        install_host_projection(&scrubbed_root, &scrubbed_record);
+        let scrubbed_generation = scrubbed.generation().expect("scrubbed generation");
+        {
+            let connection = scrubbed.connection().expect("scrubbed connection");
+            super::fence_and_scrub_source(
+                &connection,
+                &origin,
+                &source.source.source_key,
+                scrubbed_generation + 1,
+            )
+            .expect("scrub source");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT original_source FROM tdmem_native_staged_observation_v1",
+                        [],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .expect("scrubbed attribution"),
+                None
+            );
+        }
+        let scrubbed_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:opaque-locator-4-scrubbed",
+        );
+        let scrubbed_inspection = json!({
+            "view":"source_influence",
+            "selector":{"source_key":source.source.source_key,"stable_memory_ref":"ignored"},
+            "maximum_items":8,
+            "maximum_bytes":16384,
+            "redaction_policy_revision":1,
+            "cursor":null,
+            "target":scrubbed_target
+        });
+        let scrubbed_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Inspection,
+            "locator.scrubbed-inspection",
+            scrubbed_generation,
+            &scrubbed_inspection,
+        );
+        let scrubbed_admission = admission_for(&scrubbed_call, std::slice::from_ref(&source));
+        let inspected = scrubbed
+            .control(&scrubbed_call, Some(&scrubbed_admission))
+            .expect("scrubbed tombstone inspection");
+        let item = inspected.response["items"]
+            .as_array()
+            .expect("scrubbed inspection items")
+            .first()
+            .expect("scrubbed tombstone item");
+        assert_eq!(item["disposition"], "deleted");
+        assert_eq!(
+            item["target"]["reference"],
+            json!({
+                "kind":"retained_source_locator",
+                "reference":"recall-memory-ref-v1:opaque-locator-4-scrubbed"
+            })
+        );
+        assert!(
+            !inspected
+                .response
+                .to_string()
+                .contains(&scrubbed_effect.provider_reference)
+        );
+    }
+
+    #[test]
+    fn retained_locator_rejects_tampered_payload_identity_evidence_and_zero_row_update() {
+        use tracedecay_memory_conformance::compatibility::{T1, common_observation};
+        use tracedecay_memory_provider_registry::ProviderOperation;
+
+        let feedback_request = |target: Value| {
+            json!({
+                "target":target,
+                "signal":"helpful",
+                "weight":"0.5",
+                "canonical_outcome_receipt":"fixture.feedback",
+                "evidence_refs":[],
+                "occurred_at":T1
+            })
+        };
+
+        // A syntactically valid attribution from another source cannot be
+        // swapped into the matched row. The immutable source_event_id and
+        // payload source identity still have to agree with it.
+        let identity_root = TempDir::new().expect("identity root");
+        let origin = scope("session.origin");
+        let delivery = scope("session.delivery");
+        let observation =
+            common_observation(&origin, 1, Some("r1"), "identity target", Some(T1), None);
+        let swapped_observation = common_observation(
+            &scope("session.other"),
+            2,
+            Some("r1"),
+            "valid swapped attribution",
+            Some(T1),
+            None,
+        );
+        let source = attributed_source(&observation);
+        let identity_store = store(&identity_root, 8);
+        let identity_record = attributed_record(&origin, &observation, "locator.identity");
+        let StagedOutcome::Committed(identity_effect) = identity_store
+            .stage_or_duplicate(identity_record.clone())
+            .expect("stage identity row")
+        else {
+            panic!("expected identity commit");
+        };
+        install_host_projection(&identity_root, &identity_record);
+        let target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:tampered-identity",
+        );
+        {
+            let identity_connection = identity_store.connection().expect("identity connection");
+            identity_connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET original_source=?1",
+                    params![swapped_observation["source_identity"]["original_source"].to_string()],
+                )
+                .expect("swap valid attribution");
+        }
+        let identity_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.valid-attribution-swap",
+            identity_store.generation().expect("identity generation"),
+            &feedback_request(target.clone()),
+        );
+        let identity_admission = admission_for(&identity_call, std::slice::from_ref(&source));
+        assert!(
+            identity_store
+                .control(&identity_call, Some(&identity_admission))
+                .is_err()
+        );
+        assert_eq!(
+            identity_store
+                .connection()
+                .expect("identity connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",
+                    params![identity_effect.provider_reference],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("identity feedback"),
+            0.0
+        );
+
+        // A payload swap is rejected from its stored byte digest before the
+        // envelope can be used to derive text or source identity.
+        let payload_root = TempDir::new().expect("payload root");
+        let payload_store = store(&payload_root, 8);
+        let payload_record = attributed_record(&origin, &observation, "locator.payload");
+        let StagedOutcome::Committed(payload_effect) = payload_store
+            .stage_or_duplicate(payload_record.clone())
+            .expect("stage payload row")
+        else {
+            panic!("expected payload commit");
+        };
+        install_host_projection(&payload_root, &payload_record);
+        {
+            let payload_connection = payload_store.connection().expect("payload connection");
+            payload_connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=?1",
+                    params![serde_json::to_vec(&swapped_observation).expect("swapped payload")],
+                )
+                .expect("swap payload");
+        }
+        let payload_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:tampered-payload",
+        );
+        let payload_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.payload-swap",
+            payload_store.generation().expect("payload generation"),
+            &feedback_request(payload_target),
+        );
+        let payload_admission = admission_for(&payload_call, std::slice::from_ref(&source));
+        assert!(
+            payload_store
+                .control(&payload_call, Some(&payload_admission))
+                .is_err()
+        );
+        assert_eq!(
+            payload_store
+                .connection()
+                .expect("payload connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",
+                    params![payload_effect.provider_reference],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("payload feedback"),
+            0.0
+        );
+
+        // Recomputing every Native-local digest and effect field must not make
+        // a rewritten canonical payload authoritative. The source's canonical
+        // content digest comes from the fresh host attribution and remains the
+        // binding that the provider cannot rewrite locally.
+        let recomputed_root = TempDir::new().expect("recomputed root");
+        let recomputed = store(&recomputed_root, 8);
+        let recomputed_record = attributed_record(&origin, &observation, "locator.recomputed");
+        recomputed
+            .stage_or_duplicate(recomputed_record.clone())
+            .expect("stage recomputed row");
+        install_host_projection(&recomputed_root, &recomputed_record);
+        {
+            let connection = recomputed.connection().expect("recomputed connection");
+            let original_payload: Vec<u8> = connection
+                .query_row(
+                    "SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.recomputed"],
+                    |row| row.get(0),
+                )
+                .expect("stored recomputed payload");
+            let mut tampered: Value =
+                serde_json::from_slice(&original_payload).expect("stored recomputed envelope");
+            tampered["canonical_payload"]["content"] = "coherent local rewrite".into();
+            let canonical =
+                tracedecay_memory_hygiene::canonical_payload_bytes(&tampered["canonical_payload"])
+                    .expect("tampered canonical payload");
+            tampered["payload_sha256"] = sha256_hex(&canonical).into();
+            let sanitized = serde_json::to_vec(&tampered).expect("tampered envelope bytes");
+            let payload_sha256 = sha256_hex(&sanitized);
+            let semantic_sha256 =
+                semantic_observation_digest(&sanitized).expect("tampered semantic digest");
+            let projected_content_sha256 =
+                extract_message_text(&sanitized).map(|text| sha256_hex(text.as_bytes()));
+            let evidence = super::derive_effect_evidence(
+                &origin.exact_scope_sha256(),
+                "locator.recomputed",
+                &payload_sha256,
+                1,
+                "operation.locator.recomputed",
+            );
+            connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1
+                     SET sanitized_payload=?1, payload_sha256=?2, semantic_sha256=?3,
+                         projected_content_sha256=?4, provider_reference=?5,
+                         receipt=?6, effect_digest=?7
+                     WHERE idempotency_key=?8",
+                    params![
+                        sanitized,
+                        payload_sha256,
+                        semantic_sha256,
+                        projected_content_sha256,
+                        evidence.provider_reference,
+                        evidence.receipt,
+                        evidence.effect_digest,
+                        "locator.recomputed",
+                    ],
+                )
+                .expect("recompute Native-local evidence");
+        }
+        let recomputed_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:tampered-coherent-local-digests",
+        );
+        let recomputed_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.recomputed-feedback",
+            recomputed.generation().expect("recomputed generation"),
+            &feedback_request(recomputed_target),
+        );
+        let recomputed_admission = admission_for(&recomputed_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            recomputed.control(&recomputed_call, Some(&recomputed_admission)),
+            Err(StagedStoreError::LifecycleConflict(
+                "target sanitization receipt"
+            ))
+        ));
+
+        // A valid Native reference copied from another row still fails the
+        // deterministic evidence check; the locator never follows it.
+        let evidence_root = TempDir::new().expect("evidence root");
+        let evidence_store = store(&evidence_root, 8);
+        let first_evidence_record = attributed_record(&origin, &observation, "locator.evidence.1");
+        let StagedOutcome::Committed(_first_effect) = evidence_store
+            .stage_or_duplicate(first_evidence_record.clone())
+            .expect("stage first evidence row")
+        else {
+            panic!("expected first evidence commit");
+        };
+        install_host_projection(&evidence_root, &first_evidence_record);
+        let second_origin = scope("session.other");
+        let second_observation = common_observation(
+            &second_origin,
+            2,
+            Some("r1"),
+            "second evidence row",
+            Some(T1),
+            None,
+        );
+        let second_evidence_record =
+            attributed_record(&second_origin, &second_observation, "locator.evidence.2");
+        let StagedOutcome::Committed(second_effect) = evidence_store
+            .stage_or_duplicate(second_evidence_record.clone())
+            .expect("stage second evidence row")
+        else {
+            panic!("expected second evidence commit");
+        };
+        install_host_projection(&evidence_root, &second_evidence_record);
+        {
+            let evidence_connection = evidence_store.connection().expect("evidence connection");
+            evidence_connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET provider_reference=?1 WHERE idempotency_key=?2",
+                    params![second_effect.provider_reference, "locator.evidence.1"],
+                )
+                .expect("swap private reference");
+        }
+        let evidence_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:tampered-evidence",
+        );
+        let evidence_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.private-reference-swap",
+            evidence_store.generation().expect("evidence generation"),
+            &feedback_request(evidence_target),
+        );
+        let evidence_admission = admission_for(&evidence_call, std::slice::from_ref(&source));
+        assert!(
+            evidence_store
+                .control(&evidence_call, Some(&evidence_admission))
+                .is_err()
+        );
+        assert_eq!(
+            evidence_store
+                .connection()
+                .expect("evidence connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1 WHERE idempotency_key=?1",
+                    params!["locator.evidence.1"],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("evidence feedback"),
+            0.0
+        );
+
+        // validity_override is an untrusted JSON overlay and must remain
+        // structurally tied to the recorded validity projection.
+        let validity_root = TempDir::new().expect("validity root");
+        let validity_store = store(&validity_root, 8);
+        let validity_record = attributed_record(&origin, &observation, "locator.validity");
+        let StagedOutcome::Committed(validity_effect) = validity_store
+            .stage_or_duplicate(validity_record.clone())
+            .expect("stage validity row")
+        else {
+            panic!("expected validity commit");
+        };
+        install_host_projection(&validity_root, &validity_record);
+        {
+            let validity_connection = validity_store.connection().expect("validity connection");
+            let original: String = validity_connection
+                .query_row(
+                    "SELECT original_source FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",
+                    params![validity_effect.provider_reference],
+                    |row| row.get(0),
+                )
+                .expect("validity attribution");
+            let original: Value =
+                serde_json::from_str(&original).expect("validity attribution json");
+            let mut overlay = original["validity"].clone();
+            overlay["unexpected_private_field"] = "must be rejected".into();
+            validity_connection
+                .execute(
+                    "UPDATE tdmem_native_staged_observation_v1 SET validity_override=?1 WHERE provider_reference=?2",
+                    params![overlay.to_string(), validity_effect.provider_reference],
+                )
+                .expect("tamper validity overlay");
+        }
+        let validity_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:tampered-validity",
+        );
+        let validity_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.validity-swap",
+            validity_store.generation().expect("validity generation"),
+            &feedback_request(validity_target),
+        );
+        let validity_admission = admission_for(&validity_call, std::slice::from_ref(&source));
+        assert!(
+            validity_store
+                .control(&validity_call, Some(&validity_admission))
+                .is_err()
+        );
+
+        // A trigger that suppresses the write exercises the exactly-one
+        // affected-row postcondition. The operation must refuse rather than
+        // acknowledge a feedback effect that did not land.
+        let update_root = TempDir::new().expect("update root");
+        let update_store = store(&update_root, 8);
+        let update_record = attributed_record(&origin, &observation, "locator.update");
+        update_store
+            .stage_or_duplicate(update_record.clone())
+            .expect("stage update row");
+        install_host_projection(&update_root, &update_record);
+        {
+            let update_connection = update_store.connection().expect("update connection");
+            update_connection
+                .execute_batch(
+                    "CREATE TRIGGER ignore_native_feedback BEFORE UPDATE OF feedback
+                     ON tdmem_native_staged_observation_v1 BEGIN SELECT RAISE(IGNORE); END;",
+                )
+                .expect("install zero-row trigger");
+        }
+        let update_target = locator_target(
+            &delivery,
+            &observation,
+            "recall-memory-ref-v1:zero-row-update",
+        );
+        let update_call = lifecycle_call(
+            &delivery,
+            1,
+            ProviderOperation::Feedback,
+            "locator.zero-row-update",
+            update_store.generation().expect("update generation"),
+            &feedback_request(update_target),
+        );
+        let update_admission = admission_for(&update_call, std::slice::from_ref(&source));
+        assert!(matches!(
+            update_store.control(&update_call, Some(&update_admission)),
+            Err(StagedStoreError::LifecycleConflict("target row update"))
+        ));
+        assert_eq!(
+            update_store
+                .connection()
+                .expect("update connection")
+                .query_row(
+                    "SELECT feedback FROM tdmem_native_staged_observation_v1",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("unchanged feedback"),
+            0.0
+        );
+    }
+
+    #[test]
     fn deletion_hashes_query_string_bytes_and_rejects_non_strings_before_mutation() {
         use tracedecay_memory_conformance::compatibility::{T1, common_observation};
         use tracedecay_memory_provider_registry::ProviderOperation;
@@ -1985,7 +4625,14 @@ mod tests {
             {
                 let connection = staged.connection().expect("connection");
                 assert!(matches!(
-                    delete_advisory(&connection, &call, &invalid, generation + 1, None),
+                    delete_advisory(
+                        &connection,
+                        &call,
+                        &invalid,
+                        generation + 1,
+                        None,
+                        staged.path(),
+                    ),
                     Err(StagedStoreError::InvalidAdvisory("verification query"))
                 ));
                 assert_eq!(
@@ -3092,6 +5739,44 @@ pub(crate) fn recorded_validity(
     Ok(validity)
 }
 
+/// The validity overlay is provider-local state, but it is still interpreted
+/// as canonical lifecycle metadata when a retained locator is resolved. Keep
+/// its schema closed so an injected JSON key cannot become an unreviewed
+/// inspection field or alter a later validity decision.
+fn validate_validity_overlay(value: &Value) -> Result<(), StagedStoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StagedStoreError::LifecycleConflict(
+            "target validity overlay",
+        ))?;
+    const ALLOWED: &[&str] = &[
+        "valid_from",
+        "valid_until",
+        "superseded_at",
+        "superseded_by",
+        "revoked_at",
+    ];
+    if object
+        .keys()
+        .any(|field| !ALLOWED.iter().any(|allowed| *allowed == field))
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target validity overlay",
+        ));
+    }
+    Ok(())
+}
+
+fn validity_json(validity: &tracedecay_memory_provider_registry::RecordedValidity) -> Value {
+    serde_json::json!({
+        "valid_from": validity.valid_from_utc_nanos.and_then(super::native_provider::format_rfc3339_nanos),
+        "valid_until": validity.valid_until_utc_nanos.and_then(super::native_provider::format_rfc3339_nanos),
+        "superseded_at": validity.superseded_at_utc_nanos.and_then(super::native_provider::format_rfc3339_nanos),
+        "superseded_by": validity.superseded_by,
+        "revoked_at": validity.revoked_at_utc_nanos.and_then(super::native_provider::format_rfc3339_nanos),
+    })
+}
+
 fn validate_attribution(value: &Value) -> Result<(), StagedStoreError> {
     let source = value
         .get("source")
@@ -3218,6 +5903,13 @@ impl StagedObservationStore {
         let mut request: Value = serde_json::from_slice(&call.payload.bytes)
             .map_err(|_| StagedStoreError::InvalidAdvisory("lifecycle request"))?;
         let scope = call.exact_scope.exact_scope_sha256();
+        // The host admission is part of the current semantic request. Apply
+        // it before deriving the idempotency digest or consulting the journal
+        // so duplicate lifecycle calls cannot reuse an old success after a
+        // source disposition changes.
+        if let Some(admission) = admission {
+            super::native_provider::apply_current_admission(&mut request, admission);
+        }
         let mut guard = self.connection()?;
         let transaction = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let before = u64::try_from(generation_in(&transaction)?)
@@ -3252,6 +5944,28 @@ impl StagedObservationStore {
         } else {
             legacy_digest
         };
+        // A retained locator is an authority-bearing host claim even when the
+        // semantic operation is an idempotent redelivery. Resolve it against
+        // the fresh admission before consulting the durable response journal;
+        // otherwise a previously accepted response could be replayed after
+        // the source grant disappeared or its live control was revoked.
+        if matches!(
+            call.operation,
+            ProviderOperation::Feedback | ProviderOperation::Correction
+        ) && request
+            .pointer("/target/reference/kind")
+            .and_then(Value::as_str)
+            == Some("retained_source_locator")
+        {
+            let _ = resolve_target(&transaction, call, &request, admission, false, &self.path)?;
+        }
+        // Replay is also authority-bearing. Preflight the fresh source
+        // dispositions before consulting the general operation journal so a
+        // duplicate response cannot bypass a later revoke, privacy deletion,
+        // redaction, or expiry decision.
+        if call.operation == ProviderOperation::Replay {
+            preflight_replay(&transaction, call, &request, admission)?;
+        }
         if !read {
             if key.is_empty() {
                 return Err(StagedStoreError::InvalidAdvisory("idempotency key"));
@@ -3286,9 +6000,23 @@ impl StagedObservationStore {
                 return Err(StagedStoreError::LifecycleConflict("state generation"));
             }
         }
-        if let Some(admission) = admission {
-            super::native_provider::apply_current_admission(&mut request, admission);
-        }
+        let inspection_target = if call.operation == ProviderOperation::Inspection
+            && request
+                .pointer("/target/reference/kind")
+                .and_then(Value::as_str)
+                == Some("retained_source_locator")
+        {
+            Some(resolve_target(
+                &transaction,
+                call,
+                &request,
+                admission,
+                true,
+                &self.path,
+            )?)
+        } else {
+            None
+        };
         let (mut response, changed) = match call.operation {
             ProviderOperation::Health => {
                 let count: u64 = transaction.query_row("SELECT COUNT(*) FROM tdmem_native_staged_observation_v1 WHERE exact_scope_sha256 = ?1", params![scope], |row| sqlite_u64(row, 0))?;
@@ -3298,30 +6026,49 @@ impl StagedObservationStore {
                 )
             }
             ProviderOperation::Inspection => (
-                inspect_advisory(&transaction, call, &request, before)?,
+                inspect_advisory(
+                    &transaction,
+                    call,
+                    &request,
+                    before,
+                    inspection_target.as_ref(),
+                )?,
                 false,
             ),
-            ProviderOperation::Feedback => feedback_advisory(&transaction, call, &request)?,
-            ProviderOperation::Correction => {
-                correct_advisory(&transaction, call, &request, self.retention)?
+            ProviderOperation::Feedback => {
+                feedback_advisory(&transaction, call, &request, admission, &self.path)?
             }
+            ProviderOperation::Correction => correct_advisory(
+                &transaction,
+                call,
+                &request,
+                self.retention,
+                admission,
+                &self.path,
+            )?,
             ProviderOperation::DeleteBySource => delete_advisory(
                 &transaction,
                 call,
                 &request,
                 before.saturating_add(1),
                 deletion_targets.as_deref(),
+                &self.path,
             )?,
             ProviderOperation::Maintenance => maintain_advisory(&transaction, call, &request)?,
             ProviderOperation::SnapshotExport => {
                 (export_snapshot(&transaction, call, before)?, false)
             }
             ProviderOperation::SnapshotRestore => {
-                restore_snapshot(&transaction, call, &request, before, admission)?
+                restore_snapshot(&transaction, call, &request, before, admission, &self.path)?
             }
-            ProviderOperation::Replay => {
-                replay_advisory(&transaction, call, &request, self.retention)?
-            }
+            ProviderOperation::Replay => replay_advisory(
+                &transaction,
+                call,
+                &request,
+                self.retention,
+                admission,
+                &self.path,
+            )?,
             _ => return Err(StagedStoreError::InvalidAdvisory("lifecycle operation")),
         };
         let transaction_generation = if call.operation == ProviderOperation::Health {
@@ -3437,90 +6184,839 @@ fn bounded_integer(
         .ok_or(StagedStoreError::InvalidAdvisory(field))
 }
 
-/// Resolves only retained provider targets with independently matching source and delivery scope.
+/// The provider-local row resolved from one lifecycle target.
+///
+/// `provider_reference` never crosses the Native/provider boundary. It is the
+/// SQLite lookup key only. When the host supplied a retained source locator,
+/// `outward_reference` is that opaque locator and is the only reference this
+/// module may put in a response.
+#[derive(Clone, Debug)]
+struct ResolvedTarget {
+    /// SQLite's immutable row identity for the lifetime of this connection.
+    /// Lifecycle mutations must use this identity after resolution; a mutable
+    /// provider reference is only evidence that is checked against the row.
+    row_id: i64,
+    provider_reference: String,
+    outward_reference: String,
+    retained_source_locator: Option<String>,
+    attribution: Option<Value>,
+    feedback: f64,
+    tombstone: bool,
+    target_digest: String,
+}
+
+#[derive(Debug)]
+struct RetainedLocatorRow {
+    row_id: i64,
+    exact_scope_sha256: String,
+    idempotency_key: String,
+    profile_id: String,
+    project_id: String,
+    repository_identity: String,
+    worktree_identity: String,
+    branch_identity: String,
+    agent_session_id: String,
+    resolved_scope_digest: String,
+    source_authority: String,
+    source_event_id: String,
+    actual_revision: Option<String>,
+    observation_kind: String,
+    payload_contract: String,
+    sanitized_payload: Option<Vec<u8>>,
+    payload_sha256: String,
+    operation_id: String,
+    request_identity: String,
+    provider_reference: String,
+    receipt: String,
+    effect_digest: String,
+    admitted_sequence: i64,
+    admitted_at_unix_ms: i64,
+    tombstone: bool,
+    original_source: Option<Value>,
+    feedback: f64,
+    feedback_suppressed: bool,
+    validity_override: Option<Value>,
+    valid_from_nanos: Option<i64>,
+    valid_until_nanos: Option<i64>,
+    superseded_nanos: Option<i64>,
+    revoked_nanos: Option<i64>,
+    semantic_sha256: Option<String>,
+    projected_content_sha256: Option<String>,
+    deleted_source_key: Option<String>,
+    sanitization_receipt_json: Option<String>,
+    sanitization_extensions_digest: Option<String>,
+}
+
+fn lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn stored_text(value: &str, limit: usize) -> bool {
+    !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
+}
+
+fn expected_payload_contract(observation_kind: &str) -> Option<&'static str> {
+    match observation_kind {
+        STAGED_SESSION_OBSERVATION_KIND => Some(STAGED_SESSION_PAYLOAD_CONTRACT),
+        "source.edit_settled.v1" => Some("tracedecay.memory.observation.source-edit.v1"),
+        "test.execution_settled.v1" => Some("tracedecay.memory.observation.test-execution.v1"),
+        "feedback.outcome_settled.v1" => Some("tracedecay.memory.observation.feedback-outcome.v1"),
+        _ => None,
+    }
+}
+
+fn expected_source_identity_authority(observation_kind: &str) -> Option<&'static str> {
+    match observation_kind {
+        STAGED_SESSION_OBSERVATION_KIND => Some("host_session"),
+        "source.edit_settled.v1" => Some("source_edit"),
+        "test.execution_settled.v1" => Some("test_execution"),
+        "feedback.outcome_settled.v1" => Some("feedback_outcome"),
+        _ => None,
+    }
+}
+
+fn validate_source_revision_text(source_revision: Option<&str>) -> Result<(), StagedStoreError> {
+    match source_revision {
+        None => Ok(()),
+        Some(value)
+            if !value.is_empty()
+                && value.trim() == value
+                && value.len() <= 1024
+                && !value.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(StagedStoreError::InvalidAdvisory("target source revision")),
+    }
+}
+
+fn parse_stored_json(
+    text: Option<String>,
+    field: &'static str,
+) -> Result<Option<Value>, StagedStoreError> {
+    text.map(|text| {
+        serde_json::from_str(&text).map_err(|_| StagedStoreError::InvalidAdvisory(field))
+    })
+    .transpose()
+}
+
+fn read_retained_locator_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<RetainedLocatorRow, StagedStoreError> {
+    Ok(RetainedLocatorRow {
+        row_id: row.get(0)?,
+        exact_scope_sha256: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        profile_id: row.get(3)?,
+        project_id: row.get(4)?,
+        repository_identity: row.get(5)?,
+        worktree_identity: row.get(6)?,
+        branch_identity: row.get(7)?,
+        agent_session_id: row.get(8)?,
+        resolved_scope_digest: row.get(9)?,
+        source_authority: row.get(10)?,
+        source_event_id: row.get(11)?,
+        actual_revision: row.get(12)?,
+        observation_kind: row.get(13)?,
+        payload_contract: row.get(14)?,
+        sanitized_payload: row.get(15)?,
+        payload_sha256: row.get(16)?,
+        operation_id: row.get(17)?,
+        request_identity: row.get(18)?,
+        provider_reference: row.get(19)?,
+        receipt: row.get(20)?,
+        effect_digest: row.get(21)?,
+        admitted_sequence: row.get(22)?,
+        admitted_at_unix_ms: row.get(23)?,
+        tombstone: row.get(24)?,
+        original_source: parse_stored_json(row.get(25)?, "target source")?,
+        feedback: row.get(26)?,
+        feedback_suppressed: row.get(27)?,
+        validity_override: parse_stored_json(row.get(28)?, "target validity override")?,
+        valid_from_nanos: row.get(29)?,
+        valid_until_nanos: row.get(30)?,
+        superseded_nanos: row.get(31)?,
+        revoked_nanos: row.get(32)?,
+        semantic_sha256: row.get(33)?,
+        projected_content_sha256: row.get(34)?,
+        deleted_source_key: row.get(35)?,
+        sanitization_receipt_json: row.get(36)?,
+        sanitization_extensions_digest: row.get(37)?,
+    })
+}
+
+/// Verifies the provider-view bytes against the hygiene receipt that admitted
+/// them. The receipt's source digest names the already projected provider view
+/// before hygiene; it must never be compared with the complete canonical
+/// source digest carried by `original_source`.
+fn validate_provider_view_sanitization(row: &RetainedLocatorRow) -> Result<(), StagedStoreError> {
+    let Some(receipt_json) = row.sanitization_receipt_json.as_deref() else {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target sanitization receipt",
+        ));
+    };
+    let extensions_digest = row
+        .sanitization_extensions_digest
+        .as_deref()
+        .filter(|digest| lower_hex_digest(digest))
+        .ok_or(StagedStoreError::LifecycleConflict(
+            "target sanitization extensions",
+        ))?;
+    let receipt = PayloadSanitizationReceipt::from_json(receipt_json)
+        .map_err(|_| StagedStoreError::LifecycleConflict("target sanitization receipt"))?;
+    receipt
+        .verify_binding(&row.payload_sha256, extensions_digest)
+        .map_err(|_| StagedStoreError::LifecycleConflict("target sanitization receipt"))?;
+    Ok(())
+}
+
+/// Revalidates all mutable columns that can influence a retained-source
+/// locator before it is allowed to name a Native row. The provider database is
+/// private, but a locator is an authority-bearing host claim, so a matching
+/// checkout/revision alone is not enough: every stored identity, envelope,
+/// content digest, validity projection, and deterministic effect value must
+/// still agree.
+fn validate_retained_locator_row(
+    row: &RetainedLocatorRow,
+    delivery_scope: &ExactScopeFields,
+    requested_revision: Option<&str>,
+    trusted_attribution: &Value,
+    staged_path: Option<&Path>,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+) -> Result<Option<Value>, StagedStoreError> {
+    // The source digest is authoritative only as part of this freshly admitted
+    // attribution. Validate its shape here; compare the complete attribution
+    // with the fresh authority after row matching, below. The provider-view
+    // payload is a separate transformed byte domain.
+    validate_attribution(trusted_attribution)?;
+    if row.row_id <= 0
+        || !stored_text(&row.exact_scope_sha256, 64)
+        || !stored_text(&row.idempotency_key, 32768)
+        || !stored_text(&row.source_authority, 32768)
+        || !stored_text(&row.source_event_id, 32768)
+        || !stored_text(&row.observation_kind, 32768)
+        || !stored_text(&row.payload_contract, 32768)
+        || !stored_text(&row.operation_id, 32768)
+        || !stored_text(&row.request_identity, 32768)
+        || row.admitted_sequence <= 0
+        || row.admitted_at_unix_ms < 0
+        || !row.feedback.is_finite()
+        || !(-1.0..=1.0).contains(&row.feedback)
+        || !lower_hex_digest(&row.payload_sha256)
+        || !lower_hex_digest(&row.receipt)
+        || !lower_hex_digest(&row.effect_digest)
+    {
+        return Err(StagedStoreError::LifecycleConflict("target row integrity"));
+    }
+    validate_source_revision_text(row.actual_revision.as_deref())?;
+    if row.source_authority != "host_session" {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target source authority",
+        ));
+    }
+    if row.actual_revision.as_deref() != requested_revision {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target source revision",
+        ));
+    }
+    let stored_scope = ExactScopeFields {
+        profile_id: row.profile_id.clone(),
+        project_id: row.project_id.clone(),
+        repository_identity: row.repository_identity.clone(),
+        worktree_identity: row.worktree_identity.clone(),
+        branch_identity: row.branch_identity.clone(),
+        agent_session_id: row.agent_session_id.clone(),
+        resolved_scope_digest: row.resolved_scope_digest.clone(),
+    };
+    stored_scope
+        .validate()
+        .map_err(StagedStoreError::InvalidScope)?;
+    if stored_scope.exact_scope_sha256() != row.exact_scope_sha256
+        || stored_scope.profile_id != delivery_scope.profile_id
+        || stored_scope.project_id != delivery_scope.project_id
+        || stored_scope.repository_identity != delivery_scope.repository_identity
+        || stored_scope.worktree_identity != delivery_scope.worktree_identity
+        || stored_scope.branch_identity != delivery_scope.branch_identity
+    {
+        return Err(StagedStoreError::LifecycleConflict("target row scope"));
+    }
+    let expected_contract = expected_payload_contract(&row.observation_kind)
+        .ok_or(StagedStoreError::LifecycleConflict("target row kind"))?;
+    if row.payload_contract != expected_contract {
+        return Err(StagedStoreError::LifecycleConflict("target row contract"));
+    }
+    let admitted_sequence = u64::try_from(row.admitted_sequence)
+        .map_err(|_| StagedStoreError::LifecycleConflict("target row sequence"))?;
+    let expected = derive_effect_evidence(
+        &row.exact_scope_sha256,
+        &row.idempotency_key,
+        &row.payload_sha256,
+        admitted_sequence,
+        &row.operation_id,
+    );
+    if row.provider_reference != expected.provider_reference
+        || row.receipt != expected.receipt
+        || row.effect_digest != expected.effect_digest
+    {
+        return Err(StagedStoreError::LifecycleConflict("target row evidence"));
+    }
+    if (row.sanitized_payload.is_some()) == row.tombstone {
+        return Err(StagedStoreError::LifecycleConflict("target row tombstone"));
+    }
+    if row
+        .semantic_sha256
+        .as_deref()
+        .is_none_or(|digest| !lower_hex_digest(digest))
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target semantic digest",
+        ));
+    }
+    if row
+        .deleted_source_key
+        .as_deref()
+        .is_some_and(|key| !stored_text(key, 1024))
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target deletion marker",
+        ));
+    }
+
+    let attribution = row.original_source.as_ref();
+    if let Some(attribution) = attribution {
+        validate_attribution(attribution)?;
+        let source = attribution
+            .get("source")
+            .ok_or(StagedStoreError::InvalidAdvisory("target source"))?;
+        if source.get("observation_id").and_then(Value::as_str)
+            != Some(row.source_event_id.as_str())
+            || target_source_revision(source)? != row.actual_revision.as_deref()
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target source identity",
+            ));
+        }
+    }
+    if row.tombstone {
+        if row.original_source.is_some() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target tombstone source",
+            ));
+        }
+        if row.sanitization_receipt_json.is_some() || row.sanitization_extensions_digest.is_some() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target tombstone evidence",
+            ));
+        }
+    } else {
+        if row.sanitization_receipt_json.is_none() || row.sanitization_extensions_digest.is_none() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target sanitization receipt",
+            ));
+        }
+        validate_provider_view_sanitization(row)?;
+    }
+    if let Some(overlay) = &row.validity_override {
+        if attribution.is_none() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target validity overlay",
+            ));
+        }
+        validate_validity_overlay(overlay)?;
+        let effective = serde_json::json!({"validity": overlay});
+        let validity = recorded_validity(Some(&effective))?;
+        if row.valid_from_nanos != validity.valid_from_utc_nanos
+            || row.valid_until_nanos != validity.valid_until_utc_nanos
+            || row.superseded_nanos != validity.superseded_at_utc_nanos
+            || row.revoked_nanos != validity.revoked_at_utc_nanos
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target validity projection",
+            ));
+        }
+    } else if let Some(attribution) = attribution {
+        let validity = recorded_validity(Some(attribution))?;
+        if row.valid_from_nanos != validity.valid_from_utc_nanos
+            || row.valid_until_nanos != validity.valid_until_utc_nanos
+            || row.superseded_nanos != validity.superseded_at_utc_nanos
+            || row.revoked_nanos != validity.revoked_at_utc_nanos
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target validity projection",
+            ));
+        }
+    } else if row.valid_from_nanos.is_some()
+        || row.valid_until_nanos.is_some()
+        || row.superseded_nanos.is_some()
+        || row.revoked_nanos.is_some()
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target validity projection",
+        ));
+    }
+
+    if let Some(content_digest) = row.projected_content_sha256.as_deref() {
+        if !lower_hex_digest(content_digest) {
+            return Err(StagedStoreError::LifecycleConflict("target content digest"));
+        }
+    } else if attribution.is_some() {
+        return Err(StagedStoreError::LifecycleConflict("target content digest"));
+    }
+    let Some(payload) = row.sanitized_payload.as_deref() else {
+        return Ok(row.original_source.clone());
+    };
+    if sha256_hex(payload) != row.payload_sha256 {
+        return Err(StagedStoreError::PayloadDigestMismatch {
+            idempotency_key: row.idempotency_key.clone(),
+            stored_payload_sha256: row.payload_sha256.clone(),
+        });
+    }
+    if let Some(staged_path) = staged_path {
+        validate_host_projection_for_row(
+            staged_path,
+            &stored_scope,
+            &row.idempotency_key,
+            &row.source_authority,
+            &row.source_event_id,
+            row.actual_revision.as_deref(),
+            &row.observation_kind,
+            &row.payload_contract,
+            payload,
+            &row.payload_sha256,
+            row.sanitization_receipt_json
+                .as_deref()
+                .ok_or(StagedStoreError::LifecycleConflict(
+                    "target sanitization receipt",
+                ))?,
+            row.sanitization_extensions_digest.as_deref().ok_or(
+                StagedStoreError::LifecycleConflict("target sanitization extensions"),
+            )?,
+            call,
+        )?;
+    }
+    let envelope: Value = serde_json::from_slice(payload)
+        .map_err(|_| StagedStoreError::InvalidAdvisory("target observation envelope"))?;
+    if envelope.get("observation_kind").and_then(Value::as_str)
+        != Some(row.observation_kind.as_str())
+        || envelope.get("payload_contract").and_then(Value::as_str)
+            != Some(row.payload_contract.as_str())
+        || envelope.pointer("/source_identity/original_source") != attribution
+    {
+        return Err(StagedStoreError::LifecycleConflict("target payload source"));
+    }
+    if let Some(identity) = envelope.get("source_identity") {
+        if let Some(value) = identity.get("source_authority") {
+            if value.as_str() != expected_source_identity_authority(&row.observation_kind) {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "target payload identity",
+                ));
+            }
+        }
+        if let Some(value) = identity.get("source_event_id")
+            && value.as_str() != Some(row.source_event_id.as_str())
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target payload identity",
+            ));
+        }
+    }
+    let expected_payload_digest = envelope
+        .get("payload_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| lower_hex_digest(value))
+        .ok_or(StagedStoreError::InvalidAdvisory("target canonical digest"))?;
+    let canonical =
+        tracedecay_memory_hygiene::canonical_payload_bytes(&envelope["canonical_payload"])
+            .map_err(|_| StagedStoreError::InvalidAdvisory("target canonical payload"))?;
+    let canonical_digest = sha256_hex(&canonical);
+    if expected_payload_digest != canonical_digest {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target canonical digest",
+        ));
+    }
+    // `canonical_digest` is the transformed provider-view payload's own
+    // digest. The complete original canonical source digest belongs to the
+    // freshly trusted attribution above and is validated by exact attribution
+    // equality below; these two values are intentionally independent because
+    // eligibility narrowing and hygiene redaction can rewrite the provider
+    // view before Native sees it.
+    if extract_message_text(payload).is_none() {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target observation evidence",
+        ));
+    }
+    let semantic = semantic_observation_digest(payload)?;
+    if row.semantic_sha256.as_deref() != Some(semantic.as_str()) {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target semantic digest",
+        ));
+    }
+    let content_digest = extract_message_text(payload).map(|text| sha256_hex(text.as_bytes()));
+    if row.projected_content_sha256.as_deref() != content_digest.as_deref() {
+        return Err(StagedStoreError::LifecycleConflict("target content digest"));
+    }
+    Ok(row.original_source.clone())
+}
+
+fn target_source_revision(source: &Value) -> Result<Option<&str>, StagedStoreError> {
+    match source.get("source_revision") {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value))
+            if !value.is_empty()
+                && value.trim() == value
+                && value.len() <= 1024
+                && !value.chars().any(char::is_control) =>
+        {
+            Ok(Some(value.as_str()))
+        }
+        _ => Err(StagedStoreError::InvalidAdvisory("target source revision")),
+    }
+}
+
+fn validate_payload_original_source(
+    payload: &[u8],
+    stored_original_source: Option<&Value>,
+) -> Result<(), StagedStoreError> {
+    let envelope: Value = serde_json::from_slice(payload)
+        .map_err(|_| StagedStoreError::InvalidAdvisory("stored observation envelope"))?;
+    if envelope.pointer("/source_identity/original_source") != stored_original_source {
+        return Err(StagedStoreError::LifecycleConflict(
+            "stored source attribution",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_payload_source_identity(
+    payload: &[u8],
+    stored_original_source: Option<&Value>,
+    stored_source_event_id: &str,
+    stored_source_revision: Option<&str>,
+) -> Result<(), StagedStoreError> {
+    validate_payload_original_source(payload, stored_original_source)?;
+    let Some(original_source) = stored_original_source else {
+        return Ok(());
+    };
+    validate_attribution(original_source)?;
+    let source = original_source
+        .get("source")
+        .ok_or(StagedStoreError::InvalidAdvisory(
+            "stored source attribution",
+        ))?;
+    if source.get("observation_id").and_then(Value::as_str) != Some(stored_source_event_id)
+        || target_source_revision(source)? != stored_source_revision
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "stored source identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves a lifecycle target against Native's private row identity.
+///
+/// Stable references retain their historical provider-local lookup behavior.
+/// A retained source locator is different: it is accepted only with the fresh
+/// call-bound admission, where exactly one trusted source and exactly one
+/// Native row agree on observation identity, actual revision, and checkout.
+/// The row's full stored attribution is then checked against the trusted
+/// source before any lifecycle effect is allowed.
 fn resolve_target(
     connection: &Connection,
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
-) -> Result<(String, Option<Value>, f64, String), StagedStoreError> {
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    allow_tombstone: bool,
+    staged_path: &Path,
+) -> Result<ResolvedTarget, StagedStoreError> {
     let target = request
         .get("target")
         .ok_or(StagedStoreError::InvalidAdvisory("target"))?;
     if required_text(target, "provider_id")? != call.provider_id.as_str()
-        || target.get("registration_revision").and_then(Value::as_u64)
-            != Some(call.registration_revision)
         || exact_scope_from_value(&target["delivery_scope"])? != call.exact_scope
     {
         return Err(StagedStoreError::LifecycleConflict("target attribution"));
     }
-    if target.pointer("/reference/kind").and_then(Value::as_str) != Some("stable_memory_ref") {
-        return Err(StagedStoreError::LifecycleConflict("target unknown"));
-    }
-    let reference = required_text(&target["reference"], "reference")?;
-    let stored: Option<(Option<String>, String, String, f64)> = connection.query_row(
-        "SELECT original_source, source_event_id, exact_scope_sha256, feedback FROM tdmem_native_staged_observation_v1
-        WHERE provider_reference = ?1 AND profile_id = ?2 AND project_id = ?3 AND repository_identity = ?4
-        AND worktree_identity = ?5 AND branch_identity = ?6 AND tombstone = 0",
-        params![reference, call.exact_scope.profile_id, call.exact_scope.project_id, call.exact_scope.repository_identity,
-            call.exact_scope.worktree_identity, call.exact_scope.branch_identity],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).optional()?;
-    let Some((attribution, source_event, stored_scope, feedback)) = stored else {
-        return Err(StagedStoreError::LifecycleConflict("target unknown"));
-    };
-    let attribution = attribution
-        .map(|text| {
-            serde_json::from_str::<Value>(&text)
-                .map_err(|_| StagedStoreError::InvalidAdvisory("target source"))
-        })
-        .transpose()?;
-    if let Some(attribution) = &attribution {
-        if attribution.get("source") != target.get("source")
-            || attribution.get("origin_scope") != target.get("original_scope")
-        {
-            return Err(StagedStoreError::LifecycleConflict("target source"));
+    let target_registration_revision = target
+        .get("registration_revision")
+        .and_then(Value::as_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or(StagedStoreError::InvalidAdvisory(
+            "target registration revision",
+        ))?;
+    let reference = target
+        .get("reference")
+        .ok_or(StagedStoreError::InvalidAdvisory("target reference"))?;
+    let kind = required_text(reference, "kind")?;
+    let requested_reference = required_text(reference, "reference")?;
+
+    if kind == "stable_memory_ref" {
+        if target_registration_revision != call.registration_revision {
+            return Err(StagedStoreError::LifecycleConflict("target attribution"));
         }
-    } else if stored_scope != call.exact_scope.exact_scope_sha256()
-        || target
-            .pointer("/source/stable_record_id")
+        let stored: Option<(i64, Option<String>, String, String, f64)> = connection.query_row(
+            "SELECT rowid, original_source, source_event_id, exact_scope_sha256, feedback FROM tdmem_native_staged_observation_v1
+            WHERE provider_reference = ?1 AND profile_id = ?2 AND project_id = ?3 AND repository_identity = ?4
+            AND worktree_identity = ?5 AND branch_identity = ?6 AND tombstone = 0",
+            params![requested_reference, call.exact_scope.profile_id, call.exact_scope.project_id, call.exact_scope.repository_identity,
+                call.exact_scope.worktree_identity, call.exact_scope.branch_identity],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
+        let Some((row_id, attribution, source_event, stored_scope, feedback)) = stored else {
+            return Err(StagedStoreError::LifecycleConflict("target unknown"));
+        };
+        let attribution = attribution
+            .map(|text| {
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|_| StagedStoreError::InvalidAdvisory("target source"))
+            })
+            .transpose()?;
+        if let Some(attribution) = &attribution {
+            if attribution.get("source") != target.get("source")
+                || attribution.get("origin_scope") != target.get("original_scope")
+            {
+                return Err(StagedStoreError::LifecycleConflict("target source"));
+            }
+        } else if stored_scope != call.exact_scope.exact_scope_sha256()
+            || target
+                .pointer("/source/stable_record_id")
+                .and_then(Value::as_str)
+                != Some(source_event.as_str())
+            || target
+                .pointer("/original_scope/state")
+                .and_then(Value::as_str)
+                != Some("unavailable")
+        {
+            return Err(StagedStoreError::LifecycleConflict("legacy target source"));
+        }
+        let source_key = target
+            .pointer("/source/source_key")
             .and_then(Value::as_str)
-            != Some(source_event.as_str())
-        || target
-            .pointer("/original_scope/state")
-            .and_then(Value::as_str)
-            != Some("unavailable")
+            .ok_or(StagedStoreError::InvalidAdvisory("target source key"))?;
+        if source_deleted(
+            connection,
+            &call.exact_scope,
+            source_key,
+            attribution.as_ref(),
+        )? {
+            return Err(StagedStoreError::PrivacyDeleted);
+        }
+        // Match NCM's digest of the complete admitted target JSON, before any
+        // provider-local reference/source projection.
+        let target_bytes = serde_json::to_vec(target)
+            .map_err(|_| StagedStoreError::InvalidAdvisory("target serialization"))?;
+        return Ok(ResolvedTarget {
+            row_id,
+            provider_reference: requested_reference.to_owned(),
+            outward_reference: requested_reference.to_owned(),
+            retained_source_locator: None,
+            attribution,
+            feedback,
+            tombstone: false,
+            target_digest: sha256_hex(&target_bytes),
+        });
+    }
+
+    if kind != "retained_source_locator" {
+        return Err(StagedStoreError::LifecycleConflict("target unknown"));
+    }
+    if requested_reference.trim() != requested_reference
+        || requested_reference.len() > 1024
+        || requested_reference.chars().any(char::is_control)
     {
-        return Err(StagedStoreError::LifecycleConflict("legacy target source"));
+        return Err(StagedStoreError::InvalidAdvisory("target reference"));
     }
-    let source_key = target
-        .pointer("/source/source_key")
-        .and_then(Value::as_str)
-        .ok_or(StagedStoreError::InvalidAdvisory("target source key"))?;
-    if source_deleted(
-        connection,
-        &call.exact_scope,
-        source_key,
-        attribution.as_ref(),
-    )? {
-        return Err(StagedStoreError::PrivacyDeleted);
+    // Retained locators are host authority claims. Even a tombstone has to
+    // run while the sibling host journal is available; its scrubbed payload
+    // cannot carry the projection edge that a live row revalidates below.
+    require_host_projection_journal(staged_path)?;
+    let admission = admission.ok_or(StagedStoreError::LifecycleConflict(
+        "target authority unavailable",
+    ))?;
+    admission
+        .verify_for(call)
+        .map_err(|_| StagedStoreError::LifecycleConflict("target authority binding"))?;
+    let target_source = target
+        .get("source")
+        .ok_or(StagedStoreError::InvalidAdvisory("target source"))?;
+    let observation_id = required_text(target_source, "observation_id")?;
+    let source_revision = target_source_revision(target_source)?;
+    let trusted: Vec<_> = admission
+        .history_sources
+        .iter()
+        .filter(|source| {
+            source.attribution.source.observation_id == observation_id
+                && source.attribution.source.source_revision.as_deref() == source_revision
+        })
+        .collect();
+    let trusted = match trusted.as_slice() {
+        [] => {
+            return Err(StagedStoreError::LifecycleConflict("target source unknown"));
+        }
+        [trusted] => trusted,
+        _ => {
+            return Err(StagedStoreError::LifecycleConflict(
+                "target source ambiguous",
+            ));
+        }
+    };
+    let trusted_attribution =
+        super::provider_history::source_attribution_json(&trusted.attribution)
+            .map_err(|_| StagedStoreError::InvalidAdvisory("target authority source"))?;
+    if !allow_tombstone
+        && !super::provider_history::retained_history_source(trusted.current_disposition.state)
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target source unavailable",
+        ));
     }
-    // Match NCM's digest of the complete admitted target JSON, before any
-    // provider-local reference/source projection.
+    if target_source != trusted_attribution.get("source").unwrap_or(&Value::Null)
+        || target.get("original_scope") != trusted_attribution.get("origin_scope")
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target source mismatch",
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT rowid, exact_scope_sha256, idempotency_key, profile_id, project_id,
+                repository_identity, worktree_identity, branch_identity, agent_session_id,
+                resolved_scope_digest, source_authority, source_event_id, actual_revision,
+                observation_kind, payload_contract, sanitized_payload, payload_sha256,
+                operation_id, request_identity, provider_reference, receipt, effect_digest,
+                admitted_sequence, admitted_at_unix_ms, tombstone, original_source,
+                feedback, feedback_suppressed, validity_override, valid_from_nanos,
+                valid_until_nanos, superseded_nanos, revoked_nanos, semantic_sha256,
+                projected_content_sha256, deleted_source_key, sanitization_receipt_json,
+                sanitization_extensions_digest
+         FROM tdmem_native_staged_observation_v1
+         WHERE profile_id = ?1 AND project_id = ?2 AND repository_identity = ?3
+           AND worktree_identity = ?4 AND branch_identity = ?5
+           AND actual_revision IS ?6 AND source_event_id = ?7
+           ORDER BY admitted_sequence",
+    )?;
+    let mut rows = statement.query(params![
+        call.exact_scope.profile_id,
+        call.exact_scope.project_id,
+        call.exact_scope.repository_identity,
+        call.exact_scope.worktree_identity,
+        call.exact_scope.branch_identity,
+        source_revision,
+        observation_id,
+    ])?;
+    let mut matches = Vec::new();
+    while let Some(row) = rows.next()? {
+        let candidate = read_retained_locator_row(row)?;
+        let attribution = validate_retained_locator_row(
+            &candidate,
+            &call.exact_scope,
+            source_revision,
+            &trusted_attribution,
+            Some(staged_path),
+            Some(call),
+        )?;
+        let matches_source = if candidate.tombstone && attribution.is_none() {
+            // Privacy scrubbing deliberately removes original_source. The
+            // preserved source event/revision, already constrained by the
+            // trusted-admission query above, is sufficient to identify a
+            // tombstone for read-only inspection.
+            candidate.source_event_id == observation_id
+                && candidate.actual_revision.as_deref() == source_revision
+        } else {
+            attribution.as_ref().is_some_and(|attribution| {
+                let Some(source) = attribution.get("source") else {
+                    return false;
+                };
+                source.get("observation_id").and_then(Value::as_str) == Some(observation_id)
+                    && target_source_revision(source).ok().flatten() == source_revision
+            })
+        };
+        if !matches_source {
+            continue;
+        }
+        matches.push((
+            candidate.row_id,
+            candidate.provider_reference,
+            attribution,
+            candidate.feedback,
+            candidate.tombstone,
+            candidate.deleted_source_key,
+        ));
+        if matches.len() > 1 {
+            return Err(StagedStoreError::LifecycleConflict("target row ambiguous"));
+        }
+    }
+    let Some((
+        row_id,
+        provider_reference,
+        stored_attribution,
+        feedback,
+        tombstone,
+        deleted_source_key,
+    )) = matches.pop()
+    else {
+        return Err(StagedStoreError::LifecycleConflict("target row unknown"));
+    };
+    let attribution = match stored_attribution {
+        Some(attribution) => {
+            validate_attribution(&attribution)?;
+            if attribution != trusted_attribution {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "stored target source mismatch",
+                ));
+            }
+            if source_deleted(
+                connection,
+                &call.exact_scope,
+                trusted.attribution.source.source_key.as_str(),
+                Some(&attribution),
+            )? {
+                return Err(StagedStoreError::PrivacyDeleted);
+            }
+            attribution
+        }
+        None if tombstone => {
+            let target = NativeSourceTarget::from_source(&trusted_attribution["source"])?;
+            let digest = target.digest();
+            if deleted_source_key.as_deref() != Some(target.source_key.as_str())
+                && deleted_source_key.as_deref() != Some(digest.as_str())
+            {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "target deletion marker",
+                ));
+            }
+            trusted_attribution
+        }
+        None => return Err(StagedStoreError::InvalidAdvisory("target source")),
+    };
+    if tombstone && !allow_tombstone {
+        return Err(StagedStoreError::LifecycleConflict("target tombstone"));
+    }
     let target_bytes = serde_json::to_vec(target)
         .map_err(|_| StagedStoreError::InvalidAdvisory("target serialization"))?;
-    Ok((
-        reference.to_owned(),
-        attribution,
+    Ok(ResolvedTarget {
+        row_id,
+        provider_reference,
+        outward_reference: requested_reference.to_owned(),
+        retained_source_locator: Some(requested_reference.to_owned()),
+        attribution: Some(attribution),
         feedback,
-        sha256_hex(&target_bytes),
-    ))
+        tombstone,
+        target_digest: sha256_hex(&target_bytes),
+    })
 }
 
 fn feedback_advisory(
     connection: &Connection,
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
-    let (reference, _, previous, target_digest) = resolve_target(connection, call, request)?;
+    let resolved = resolve_target(connection, call, request, admission, false, staged_path)?;
+    let previous = resolved.feedback;
     let signal = required_text(request, "signal")?;
     let weight_text = required_text(request, "weight")?;
     if weight_text.len() > 20
@@ -3546,7 +7042,16 @@ fn feedback_advisory(
         "ignored" => 0.0,
         _ => return Err(StagedStoreError::InvalidAdvisory("feedback signal")),
     };
-    let was_suppressed:bool=connection.query_row("SELECT feedback_suppressed FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",params![reference],|row|row.get(0))?;
+    let was_suppressed: Option<bool> = connection
+        .query_row(
+            "SELECT feedback_suppressed FROM tdmem_native_staged_observation_v1 WHERE rowid=?1",
+            params![resolved.row_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(was_suppressed) = was_suppressed else {
+        return Err(StagedStoreError::LifecycleConflict("target row missing"));
+    };
     let suppressed = if delta == 0.0 {
         was_suppressed
     } else {
@@ -3559,15 +7064,31 @@ fn feedback_advisory(
     } else {
         -weight
     };
-    connection.execute(
-        "UPDATE tdmem_native_staged_observation_v1 SET feedback = ?1, feedback_suppressed = ?3 WHERE provider_reference = ?2",
-        params![next, reference, suppressed],
+    let changed = connection.execute(
+        "UPDATE tdmem_native_staged_observation_v1
+         SET feedback = ?1, feedback_suppressed = ?2 WHERE rowid = ?3",
+        params![next, suppressed, resolved.row_id],
     )?;
+    if changed != 1 {
+        return Err(StagedStoreError::LifecycleConflict("target row update"));
+    }
     // A settled event is a durable change even when its explicit neutral effect is zero.
+    let mut applied_effect = serde_json::json!({
+        "stable_memory_ref":resolved.outward_reference,
+        "ranking_bias_before":previous,
+        "ranking_bias_after":next,
+        "ranking_bias_delta":next-previous,
+        "recall_score_weight":"0.5",
+        "feedback_suppressed_before":was_suppressed,
+        "feedback_suppressed_after":suppressed,
+        "neutral":delta == 0.0
+    });
+    if let Some(locator) = &resolved.retained_source_locator {
+        applied_effect["retained_source_locator"] = locator.clone().into();
+    }
     Ok((
-        serde_json::json!({"target_digest":target_digest, "signal":signal,
-        "applied_effect":{"stable_memory_ref":reference,"ranking_bias_before":previous, "ranking_bias_after":next, "ranking_bias_delta":next-previous,
-            "recall_score_weight":"0.5", "feedback_suppressed_before":was_suppressed,"feedback_suppressed_after":suppressed,"neutral":delta == 0.0}, "warnings":[]}),
+        serde_json::json!({"target_digest":resolved.target_digest, "signal":signal,
+            "applied_effect":applied_effect, "warnings":[]}),
         true,
     ))
 }
@@ -3577,11 +7098,17 @@ fn correct_advisory(
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
     retention: StagedRetentionPolicyV1,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
-    let (reference, original, _, target_digest) = resolve_target(connection, call, request)?;
-    let mut original = original.ok_or(StagedStoreError::LifecycleConflict(
-        "unknown source revision",
-    ))?;
+    let resolved = resolve_target(connection, call, request, admission, false, staged_path)?;
+    let reference = &resolved.provider_reference;
+    let mut original = resolved
+        .attribution
+        .clone()
+        .ok_or(StagedStoreError::LifecycleConflict(
+            "unknown source revision",
+        ))?;
     let expected = required_text(request, "expected_target_revision")?;
     if original
         .pointer("/source/source_revision")
@@ -3608,8 +7135,13 @@ fn correct_advisory(
             "scope does not narrow exact source scope",
         ));
     }
-    if let Some(text)=connection.query_row("SELECT validity_override FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",params![reference],|row|row.get::<_,Option<String>>(0))? {
-        original["validity"]=serde_json::from_str(&text).map_err(|_|StagedStoreError::InvalidAdvisory("correction validity overlay"))?;
+    if let Some(text) = connection.query_row(
+        "SELECT validity_override FROM tdmem_native_staged_observation_v1 WHERE rowid=?1",
+        params![resolved.row_id],
+        |row| row.get::<_, Option<String>>(0),
+    )? {
+        original["validity"] = serde_json::from_str(&text)
+            .map_err(|_| StagedStoreError::InvalidAdvisory("correction validity overlay"))?;
     }
     if matches!(kind, "change_validity" | "mark_incorrect") {
         if kind == "mark_incorrect" {
@@ -3626,10 +7158,17 @@ fn correct_advisory(
             }
         }
         recorded_validity(Some(&original))?;
-        connection.execute("UPDATE tdmem_native_staged_observation_v1 SET validity_override=?1 WHERE provider_reference=?2",params![original["validity"].to_string(),reference])?;
-        sync_row_validity(connection, &reference, Some(&original))?;
+        let changed = connection.execute(
+            "UPDATE tdmem_native_staged_observation_v1 SET validity_override=?1 WHERE rowid=?2",
+            params![original["validity"].to_string(), resolved.row_id],
+        )?;
+        if changed != 1 {
+            return Err(StagedStoreError::LifecycleConflict("target row update"));
+        }
+        sync_row_validity_by_rowid(connection, resolved.row_id, Some(&original))?;
+        let affected = resolved.outward_reference.clone();
         return Ok((
-            serde_json::json!({"target_digest":target_digest,"correction_kind":kind,"affected_provider_effects":[reference],"warnings":[]}),
+            serde_json::json!({"target_digest":resolved.target_digest,"correction_kind":kind,"affected_provider_effects":[affected],"warnings":[]}),
             true,
         ));
     }
@@ -3637,11 +7176,46 @@ fn correct_advisory(
         .pointer("/source_identity/original_source")
         .ok_or(StagedStoreError::InvalidAdvisory("replacement attribution"))?;
     validate_attribution(replacement_source)?;
-    let revision = replacement_source
-        .pointer("/source/source_revision")
-        .and_then(Value::as_str)
+    let replacement_identity = replacement_source
+        .get("source")
+        .ok_or(StagedStoreError::InvalidAdvisory("replacement attribution"))?;
+    let replacement_id = required_text(replacement_identity, "observation_id")?;
+    let replacement_revision = target_source_revision(replacement_identity)?;
+    if let Some(admission) = admission {
+        let admitted_replacements: Vec<_> = admission
+            .history_sources
+            .iter()
+            .filter(|source| {
+                source.attribution.source.observation_id == replacement_id
+                    && source.attribution.source.source_revision.as_deref() == replacement_revision
+            })
+            .collect();
+        if !admitted_replacements.is_empty() {
+            let [trusted_replacement] = admitted_replacements.as_slice() else {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "replacement source ambiguous",
+                ));
+            };
+            let trusted_replacement =
+                super::provider_history::source_attribution_json(&trusted_replacement.attribution)
+                    .map_err(|_| {
+                        StagedStoreError::InvalidAdvisory("replacement authority source")
+                    })?;
+            if replacement_source != &trusted_replacement {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "replacement source mismatch",
+                ));
+            }
+        } else if resolved.retained_source_locator.is_some() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "replacement source unknown",
+            ));
+        }
+    }
+    let revision = replacement_revision
         .filter(|revision| *revision != expected)
         .ok_or(StagedStoreError::LifecycleConflict("replacement revision"))?;
+    validate_source_revision_text(Some(revision))?;
     for field in [
         "canonical_provider_id",
         "canonical_session_id",
@@ -3696,7 +7270,17 @@ fn correct_advisory(
         request_identity: call.request_id.clone(),
         admitted_at_unix_ms: super::native_provider::unix_millis_now(),
     };
-    let evidence = match stage_in_transaction(connection, record, retention)? {
+    let provider_view = host_projection_for_record(staged_path, &record, Some(call))?.unwrap_or(
+        direct_provider_view_sanitization(&record.sanitized_payload)?,
+    );
+    let evidence = match stage_in_transaction(
+        connection,
+        record,
+        retention,
+        &provider_view,
+        Some(call),
+        admission,
+    )? {
         StagedOutcome::Committed(evidence) => evidence,
         _ => {
             return Err(StagedStoreError::LifecycleConflict(
@@ -3707,17 +7291,39 @@ fn correct_advisory(
     original["validity"]["valid_until"] = at_wire.clone().into();
     original["validity"]["superseded_at"] = at_wire.into();
     original["validity"]["superseded_by"] = evidence.provider_reference.clone().into();
-    connection.execute("UPDATE tdmem_native_staged_observation_v1 SET validity_override = ?1 WHERE provider_reference = ?2",
-        params![original["validity"].to_string(), reference])?;
-    sync_row_validity(connection, &reference, Some(&original))?;
-    sync_row_validity(
-        connection,
-        &evidence.provider_reference,
-        Some(replacement_source),
+    let changed = connection.execute(
+        "UPDATE tdmem_native_staged_observation_v1 SET validity_override = ?1 WHERE rowid = ?2",
+        params![original["validity"].to_string(), resolved.row_id],
     )?;
+    if changed != 1 {
+        return Err(StagedStoreError::LifecycleConflict("target row update"));
+    }
+    sync_row_validity_by_rowid(connection, resolved.row_id, Some(&original))?;
+    let mut replacement_rows = connection.prepare(
+        "SELECT rowid FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",
+    )?;
+    let replacement_row_ids = replacement_rows
+        .query_map(params![evidence.provider_reference], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let [replacement_row_id] = replacement_row_ids.as_slice() else {
+        return Err(StagedStoreError::LifecycleConflict(
+            "replacement row identity",
+        ));
+    };
+    sync_row_validity_by_rowid(connection, *replacement_row_id, Some(replacement_source))?;
+    // The replacement row has a new private Native reference. Expose only the
+    // count on the retained-locator path; the original opaque locator remains
+    // the caller's stable public handle, while both raw refs stay in SQLite.
+    let affected = if resolved.retained_source_locator.is_some() {
+        serde_json::json!(2_u64)
+    } else {
+        serde_json::json!([reference, evidence.provider_reference])
+    };
     Ok((
-        serde_json::json!({"target_digest":target_digest,"correction_kind":kind,
-        "affected_provider_effects":[reference,evidence.provider_reference], "warnings":[]}),
+        serde_json::json!({"target_digest":resolved.target_digest,"correction_kind":kind,
+        "affected_provider_effects":affected, "warnings":[]}),
         true,
     ))
 }
@@ -3739,11 +7345,107 @@ fn fence_and_scrub_source(
         ],
     )?;
     Ok(connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,
-        deleted_source_key=?6,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL
+        deleted_source_key=?6,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL,sanitization_receipt_json=NULL,sanitization_extensions_digest=NULL
         WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
         AND (json_extract(original_source,'$.source.source_key')=?6 OR deleted_source_key=?6 OR (original_source IS NULL AND source_event_id=?6))
         AND (sanitized_payload IS NOT NULL OR original_source IS NOT NULL OR validity_override IS NOT NULL OR feedback!=0 OR feedback_suppressed!=0)",
         params![scope.profile_id,scope.project_id,scope.repository_identity,scope.worktree_identity,scope.branch_identity,source])? as u64)
+}
+
+/// Before a privacy mutation uses the row's source index, authenticate every
+/// resident payload/source pair against the immutable host journal. A mutable
+/// `original_source` column must never be able to move a row out of (or into)
+/// the deletion set. Tombstones have already scrubbed that pair and retain
+/// only their deletion marker, so there is no source attribution left to
+/// redirect.
+fn validate_resident_original_sources(
+    connection: &Connection,
+    scope: &ExactScopeFields,
+    staged_path: &Path,
+    call: &tracedecay_memory_provider_registry::ProviderCall,
+) -> Result<(), StagedStoreError> {
+    require_host_projection_journal(staged_path)?;
+    let mut statement = connection.prepare(
+        "SELECT source_authority, source_event_id, actual_revision, observation_kind,
+                payload_contract, sanitized_payload, payload_sha256, original_source,
+                sanitization_receipt_json, sanitization_extensions_digest, tombstone
+         FROM tdmem_native_staged_observation_v1
+         WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3
+           AND worktree_identity=?4 AND branch_identity=?5",
+    )?;
+    let mut rows = statement.query(params![
+        scope.profile_id,
+        scope.project_id,
+        scope.repository_identity,
+        scope.worktree_identity,
+        scope.branch_identity,
+    ])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, bool>(10)? {
+            if row.get::<_, Option<String>>(7)?.is_some()
+                || row.get::<_, Option<Vec<u8>>>(5)?.is_some()
+            {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "resident tombstone source",
+                ));
+            }
+            continue;
+        }
+        let source_authority: String = row.get(0)?;
+        let source_event_id: String = row.get(1)?;
+        let source_revision: Option<String> = row.get(2)?;
+        let observation_kind: String = row.get(3)?;
+        let payload_contract: String = row.get(4)?;
+        let payload: Vec<u8> =
+            row.get::<_, Option<Vec<u8>>>(5)?
+                .ok_or(StagedStoreError::LifecycleConflict(
+                    "resident payload unavailable",
+                ))?;
+        let payload_sha256: String = row.get(6)?;
+        let original_source: Value = row
+            .get::<_, Option<String>>(7)?
+            .ok_or(StagedStoreError::LifecycleConflict(
+                "resident source unavailable",
+            ))
+            .and_then(|text| {
+                serde_json::from_str(&text)
+                    .map_err(|_| StagedStoreError::LifecycleConflict("resident source unavailable"))
+            })?;
+        validate_payload_source_identity(
+            &payload,
+            Some(&original_source),
+            &source_event_id,
+            source_revision.as_deref(),
+        )?;
+        let receipt_json: String =
+            row.get::<_, Option<String>>(8)?
+                .ok_or(StagedStoreError::LifecycleConflict(
+                    "resident sanitization receipt",
+                ))?;
+        let extensions_digest: String =
+            row.get::<_, Option<String>>(9)?
+                .ok_or(StagedStoreError::LifecycleConflict(
+                    "resident sanitization extensions",
+                ))?;
+        validate_host_projection_for_row(
+            staged_path,
+            scope,
+            // The host lookup uses the source event and exact payload; the
+            // row idempotency key is not needed for this privacy preflight.
+            "privacy-lineage-validation",
+            &source_authority,
+            &source_event_id,
+            source_revision.as_deref(),
+            &observation_kind,
+            &payload_contract,
+            &payload,
+            &payload_sha256,
+            &receipt_json,
+            &extensions_digest,
+            Some(call),
+        )?;
+    }
+    Ok(())
 }
 
 fn preflight_targeted_deletion(
@@ -3807,7 +7509,7 @@ fn fence_and_scrub_target(
         ],
     )?;
     Ok(connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,
-        deleted_source_key=?6,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL
+        deleted_source_key=?6,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL,sanitization_receipt_json=NULL,sanitization_extensions_digest=NULL
         WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
         AND json_extract(original_source,'$.origin_scope.state')='recorded'
         AND json_extract(original_source,'$.origin_scope.exact_scope_identity.profile_id')=?1
@@ -3963,6 +7665,7 @@ fn delete_advisory(
     request: &Value,
     generation: u64,
     targets: Option<&[NativeSourceTarget]>,
+    staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
     let sources = request
         .get("forget_source_keys")
@@ -3982,6 +7685,7 @@ fn delete_advisory(
         .get("verification_query")
         .and_then(Value::as_str)
         .ok_or(StagedStoreError::InvalidAdvisory("verification query"))?;
+    validate_resident_original_sources(connection, &call.exact_scope, staged_path, call)?;
     if let Some(targets) = targets {
         preflight_targeted_deletion(connection, call, targets)?;
     }
@@ -4048,6 +7752,7 @@ fn inspect_advisory(
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
     generation: u64,
+    retained_target: Option<&ResolvedTarget>,
 ) -> Result<Value, StagedStoreError> {
     let scope = call.exact_scope.exact_scope_sha256();
     let view = required_text(request, "view")?;
@@ -4076,56 +7781,99 @@ fn inspect_advisory(
             .ok_or(StagedStoreError::InvalidAdvisory("inspection cursor"))?,
         _ => return Err(StagedStoreError::InvalidAdvisory("inspection cursor")),
     };
+    // A locator is resolved to the private Native reference before this query.
+    // The five checkout columns deliberately omit the delivery session so a
+    // retained source can be inspected after reopening from another session.
+    // Stable-reference inspection keeps the existing exact-scope query.
+    let retained_locator =
+        retained_target.and_then(|target| target.retained_source_locator.as_ref());
+    let selected_reference = if retained_target.is_some() {
+        None
+    } else if view == "trace" {
+        Some(required_text(&request["selector"], "stable_memory_ref")?)
+    } else if view == "source_influence" {
+        retained_target
+            .map(|target| target.provider_reference.as_str())
+            .or_else(|| {
+                request
+                    .pointer("/selector/stable_memory_ref")
+                    .and_then(Value::as_str)
+            })
+    } else if view == "delivery_receipt" {
+        retained_target.map(|target| target.provider_reference.as_str())
+    } else {
+        None
+    };
     let mut statement = connection.prepare("SELECT provider_reference, admitted_sequence, actual_revision, feedback, tombstone, original_source,
         receipt,feedback_suppressed,validity_override,operation_id,idempotency_key,sanitized_payload,payload_sha256
-        FROM tdmem_native_staged_observation_v1 WHERE exact_scope_sha256 = ?1 AND admitted_sequence > ?2
-        AND (?4 IS NULL OR json_extract(original_source,'$.source.source_key')=?4)
-        AND (?5 IS NULL OR idempotency_key=?5) AND (?6 IS NULL OR provider_reference=?6)
-        ORDER BY admitted_sequence LIMIT ?3")?;
+        FROM tdmem_native_staged_observation_v1 WHERE
+        ((?7 = 0 AND exact_scope_sha256 = ?1)
+         OR (?7 = 1 AND profile_id = ?2 AND project_id = ?3 AND repository_identity = ?4
+             AND worktree_identity = ?5 AND branch_identity = ?6
+             AND rowid = ?12))
+        AND admitted_sequence > ?8
+        AND (?7 = 1 OR ?10 IS NULL OR json_extract(original_source,'$.source.source_key')=?10)
+        AND (?7 = 1 OR ?11 IS NULL OR idempotency_key=?11)
+        AND (?13 IS NULL OR provider_reference=?13)
+        ORDER BY admitted_sequence LIMIT ?9")?;
     let mut rows = statement.query(params![
         scope,
+        call.exact_scope.profile_id,
+        call.exact_scope.project_id,
+        call.exact_scope.repository_identity,
+        call.exact_scope.worktree_identity,
+        call.exact_scope.branch_identity,
+        retained_locator.is_some(),
         sqlite_i64(after, "inspection cursor")?,
         sqlite_i64(maximum + 1, "inspection maximum_items")?,
-        request
-            .pointer("/selector/source_key")
-            .and_then(Value::as_str),
-        if view == "delivery_receipt" {
+        if retained_target.is_some() {
+            None
+        } else {
+            request
+                .pointer("/selector/source_key")
+                .and_then(Value::as_str)
+        },
+        if view == "delivery_receipt" && retained_target.is_none() {
             Some(required_text(&request["selector"], "idempotency_key")?)
         } else {
             None
         },
-        if view == "trace" {
-            Some(required_text(&request["selector"], "stable_memory_ref")?)
-        } else if view == "source_influence" {
-            request
-                .pointer("/selector/stable_memory_ref")
-                .and_then(Value::as_str)
-        } else {
-            None
-        },
+        retained_target.map(|target| target.row_id),
+        selected_reference,
     ])?;
     let mut items = Vec::new();
     let mut bytes = 2;
     let mut cursor = after;
     let mut partial = false;
     while let Some(row) = rows.next()? {
-        let attribution = row
+        let mut attribution = row
             .get::<_, Option<String>>(5)?
             .map(|text| {
                 serde_json::from_str::<Value>(&text)
                     .map_err(|_| StagedStoreError::InvalidAdvisory("inspection attribution"))
             })
             .transpose()?;
+        if attribution.is_none() && retained_target.is_some_and(|target| target.tombstone) {
+            attribution = retained_target.and_then(|target| target.attribution.clone());
+        }
         let mut item = if view == "state_summary" {
-            serde_json::json!({"stable_memory_ref":row.get::<_,String>(0)?,"sequence":sqlite_u64(row, 1)?,
+            let raw_reference: String = row.get(0)?;
+            let reference = retained_target
+                .map(|target| target.outward_reference.as_str())
+                .unwrap_or(raw_reference.as_str());
+            serde_json::json!({"stable_memory_ref":reference,"sequence":sqlite_u64(row, 1)?,
                 "source_revision":row.get::<_,Option<String>>(2)?,"ranking_bias":row.get::<_,f64>(3)?,"privacy_or_retention_tombstone":row.get::<_,bool>(4)?,
                 "validity":attribution.as_ref().and_then(|source|source.get("validity")),"receipt":row.get::<_,String>(6)?})
         } else {
             Value::Null
         };
         if view == "delivery_receipt" {
+            let raw_reference: String = row.get(0)?;
+            let reference = retained_target
+                .map(|target| target.outward_reference.as_str())
+                .unwrap_or(raw_reference.as_str());
             item = serde_json::json!({"operation_id":row.get::<_,String>(9)?,"idempotency_key":row.get::<_,String>(10)?,
-                "provider_receipt_digest":row.get::<_,String>(6)?,"stable_memory_ref":row.get::<_,String>(0)?});
+                "provider_receipt_digest":row.get::<_,String>(6)?,"stable_memory_ref":reference});
         } else if view == "trace" {
             let payload: Option<Vec<u8>> = row.get(11)?;
             let mut content = if let Some(payload) = payload {
@@ -4147,7 +7895,11 @@ fn inspect_advisory(
                 text.truncate(end);
             }
             let content_sha256 = content.as_ref().map(|text| sha256_hex(text.as_bytes()));
-            item = serde_json::json!({"stable_memory_ref":row.get::<_,String>(0)?,"content":content,
+            let raw_reference: String = row.get(0)?;
+            let reference = retained_target
+                .map(|target| target.outward_reference.as_str())
+                .unwrap_or(raw_reference.as_str());
+            item = serde_json::json!({"stable_memory_ref":reference,"content":content,
                 "content_sha256":content_sha256,"original_source":if content.is_some() {attribution.clone()} else {None}});
         } else if view == "source_influence" {
             let Some(attribution) = &attribution else {
@@ -4155,6 +7907,9 @@ fn inspect_advisory(
                 continue;
             };
             let reference: String = row.get(0)?;
+            let outward_reference = retained_target
+                .map(|target| target.outward_reference.as_str())
+                .unwrap_or(reference.as_str());
             // Original receipts predate the explicit association and retain
             // SHA(reference). Read them without rewriting their evidence.
             let original_reference_digest = sha256_hex(reference.as_bytes());
@@ -4162,15 +7917,16 @@ fn inspect_advisory(
             let mut counts = connection.prepare(
                 "SELECT json_extract(response,'$.signal'),COUNT(*) FROM tdmem_native_operation_v2 \
                  WHERE (json_extract(response,'$.applied_effect.stable_memory_ref')=?1 \
+                    OR json_extract(response,'$.applied_effect.retained_source_locator')=?1 \
                     OR (json_extract(response,'$.applied_effect.stable_memory_ref') IS NULL \
                         AND json_extract(response,'$.target_digest')=?2)) \
                    AND json_extract(response,'$.signal') IS NOT NULL \
                  GROUP BY json_extract(response,'$.signal')",
             )?;
-            let entries = counts
-                .query_map(params![reference, original_reference_digest], |row| {
-                    Ok((row.get::<_, String>(0)?, sqlite_u64(row, 1)?))
-                })?;
+            let entries = counts.query_map(
+                params![outward_reference, original_reference_digest],
+                |row| Ok((row.get::<_, String>(0)?, sqlite_u64(row, 1)?)),
+            )?;
             for entry in entries {
                 let (signal, count) = entry?;
                 feedback[signal] = count.into();
@@ -4179,20 +7935,26 @@ fn inspect_advisory(
                 .query_row(
                     "SELECT receipt FROM tdmem_native_operation_v2 \
                  WHERE (json_extract(response,'$.applied_effect.stable_memory_ref')=?1 \
+                    OR json_extract(response,'$.applied_effect.retained_source_locator')=?1 \
                     OR (json_extract(response,'$.applied_effect.stable_memory_ref') IS NULL \
                         AND json_extract(response,'$.target_digest')=?2)) \
-                   AND json_extract(response,'$.signal') IS NOT NULL \
+                 AND json_extract(response,'$.signal') IS NOT NULL \
                  ORDER BY generation_after DESC LIMIT 1",
-                    params![reference, original_reference_digest],
+                    params![outward_reference, original_reference_digest],
                     |row| row.get(0),
                 )
                 .optional()?;
             let tombstone: bool = row.get(4)?;
             let suppressed: bool = row.get(7)?;
             let validity = match row.get::<_, Option<String>>(8)? {
-                Some(text) => serde_json::from_str::<Value>(&text)
-                    .map_err(|_| StagedStoreError::InvalidAdvisory("inspection validity"))?,
-                None => attribution["validity"].clone(),
+                Some(text) => {
+                    let overlay: Value = serde_json::from_str(&text)
+                        .map_err(|_| StagedStoreError::InvalidAdvisory("inspection validity"))?;
+                    validate_validity_overlay(&overlay)?;
+                    let effective = serde_json::json!({"validity":overlay});
+                    validity_json(&recorded_validity(Some(&effective))?)
+                }
+                None => validity_json(&recorded_validity(Some(attribution))?),
             };
             let now = super::native_provider::unix_millis_now().saturating_mul(1_000_000);
             let passed = |field: &str| {
@@ -4216,7 +7978,22 @@ fn inspect_advisory(
             let effect_summary = serde_json::json!({
                 "ranking_bias": row.get::<_, f64>(3)?,
                 "feedback_suppressed": suppressed,
-                "validity": validity,
+                // A replacement correction stores its private Native row
+                // reference in the old row's validity overlay. Retained
+                // locators must never echo that provider-local handle.
+                "validity": if retained_target.is_some() {
+                    let mut validity = validity;
+                    if validity
+                        .get("superseded_by")
+                        .and_then(Value::as_str)
+                        .is_some()
+                    {
+                        validity["superseded_by"] = Value::Null;
+                    }
+                    validity
+                } else {
+                    validity
+                },
             })
             .to_string();
             if effect_summary.len() > 8192 {
@@ -4224,9 +8001,13 @@ fn inspect_advisory(
                     field: "provider_local_effect_summary",
                 });
             }
+            let reference_kind = retained_target
+                .and_then(|target| target.retained_source_locator.as_ref())
+                .map(|_| "retained_source_locator")
+                .unwrap_or("stable_memory_ref");
             item = serde_json::json!({"target":{"provider_id":call.provider_id.as_str(),"registration_revision":call.registration_revision,
                 "original_scope":attribution["origin_scope"],"delivery_scope":scope_json(&call.exact_scope),"source":attribution["source"],
-                "reference":{"kind":"stable_memory_ref","reference":reference}},"source":attribution["source"],
+                "reference":{"kind":reference_kind,"reference":outward_reference}},"source":attribution["source"],
                 "active":!tombstone&&!suppressed&&disposition=="available","disposition":disposition,"settled_feedback":feedback,"last_feedback_receipt":last,
                 "provider_local_effect_summary":effect_summary});
         }
@@ -4551,7 +8332,7 @@ fn maintain_advisory(
     if !dry_run {
         for (reference, remove, bias) in updates {
             if remove {
-                connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL WHERE provider_reference=?1",params![reference])?;
+                connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL,sanitization_receipt_json=NULL,sanitization_extensions_digest=NULL WHERE provider_reference=?1",params![reference])?;
             } else {
                 connection.execute("UPDATE tdmem_native_staged_observation_v1 SET feedback=?1 WHERE provider_reference=?2",params![bias,reference])?;
             }
@@ -4569,15 +8350,391 @@ fn sync_row_validity(
     reference: &str,
     attribution: Option<&Value>,
 ) -> Result<(), StagedStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT rowid FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",
+    )?;
+    let row_ids = statement
+        .query_map(params![reference], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let [row_id] = row_ids.as_slice() else {
+        return Err(StagedStoreError::LifecycleConflict("target row identity"));
+    };
+    sync_row_validity_by_rowid(connection, *row_id, attribution)
+}
+
+fn sync_row_validity_by_rowid(
+    connection: &Connection,
+    row_id: i64,
+    attribution: Option<&Value>,
+) -> Result<(), StagedStoreError> {
+    if row_id <= 0 {
+        return Err(StagedStoreError::LifecycleConflict("target row identity"));
+    }
     let validity = recorded_validity(attribution)?;
-    let payload:Option<Vec<u8>>=connection.query_row("SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1",params![reference],|row|row.get(0))?;
+    let payload: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT sanitized_payload FROM tdmem_native_staged_observation_v1 WHERE rowid=?1",
+            params![row_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(StagedStoreError::LifecycleConflict("target row missing"))?;
     let content_digest = payload
         .as_deref()
         .and_then(extract_message_text)
         .map(|text| sha256_hex(text.as_bytes()));
-    connection.execute("UPDATE tdmem_native_staged_observation_v1 SET projected_content_sha256=?1 WHERE provider_reference=?2",params![content_digest,reference])?;
-    connection.execute("UPDATE tdmem_native_staged_observation_v1 SET valid_from_nanos=?1,valid_until_nanos=?2,superseded_nanos=?3,revoked_nanos=?4 WHERE provider_reference=?5",
-        params![validity.valid_from_utc_nanos,validity.valid_until_utc_nanos,validity.superseded_at_utc_nanos,validity.revoked_at_utc_nanos,reference])?;
+    let changed = connection.execute(
+        "UPDATE tdmem_native_staged_observation_v1 SET projected_content_sha256=?1 WHERE rowid=?2",
+        params![content_digest, row_id],
+    )?;
+    if changed != 1 {
+        return Err(StagedStoreError::LifecycleConflict("target row update"));
+    }
+    let changed = connection.execute(
+        "UPDATE tdmem_native_staged_observation_v1
+         SET valid_from_nanos=?1,valid_until_nanos=?2,superseded_nanos=?3,revoked_nanos=?4
+         WHERE rowid=?5",
+        params![
+            validity.valid_from_utc_nanos,
+            validity.valid_until_utc_nanos,
+            validity.superseded_at_utc_nanos,
+            validity.revoked_at_utc_nanos,
+            row_id
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StagedStoreError::LifecycleConflict("target row update"));
+    }
+    Ok(())
+}
+
+/// Captures the host-authenticated hygiene receipt for the exact bytes being
+/// staged. The observation boundary has already checked this receipt against
+/// the journal, but Native repeats the binding against its own record before
+/// persisting it so a mismatched record cannot inherit another call's proof.
+fn provider_view_sanitization_for_call(
+    record: &StagedObservationRecord,
+    call: &tracedecay_memory_provider_registry::ProviderCall,
+) -> Result<ProviderViewSanitization, StagedStoreError> {
+    let payload_sha256 = sha256_hex(&record.sanitized_payload);
+    if call.payload.bytes != record.sanitized_payload || call.payload.sha256 != payload_sha256 {
+        return Err(StagedStoreError::LifecycleConflict(
+            "provider view payload binding",
+        ));
+    }
+    call.validate()
+        .map_err(|_| StagedStoreError::LifecycleConflict("sanitization receipt"))?;
+    let receipt = call
+        .sanitization()
+        .ok_or(StagedStoreError::InvalidAdvisory("sanitization receipt"))?;
+    let extensions_digest = receipt.extensions_digest().to_owned();
+    receipt
+        .verify_binding(&payload_sha256, &extensions_digest)
+        .map_err(|_| StagedStoreError::LifecycleConflict("sanitization receipt"))?;
+    Ok(ProviderViewSanitization {
+        receipt_json: receipt.to_json(),
+        extensions_digest,
+    })
+}
+
+/// Direct store/replay callers predate the observation-call seam and do not
+/// carry a host receipt. Give those provider-local paths an explicit,
+/// byte-bound accepted receipt so their rows remain structurally complete;
+/// production observation delivery always uses
+/// [`provider_view_sanitization_for_call`] above.
+fn direct_provider_view_sanitization(
+    payload: &[u8],
+) -> Result<ProviderViewSanitization, StagedStoreError> {
+    let payload_sha256 = sha256_hex(payload);
+    let receipt =
+        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
+            "native-direct-stage.v1",
+            payload_sha256,
+        ))
+        .map_err(|_| StagedStoreError::InvalidAdvisory("sanitization receipt"))?;
+    Ok(ProviderViewSanitization {
+        extensions_digest: receipt.extensions_digest().to_owned(),
+        receipt_json: receipt.to_json(),
+    })
+}
+
+/// Returns the host observation journal next to a Native staged store.
+///
+/// The Native database is provider-local and therefore cannot authenticate its
+/// own projection evidence. The sibling host journal is the durable authority
+/// that admitted the exact transformed bytes. A missing journal is tolerated
+/// only for the legacy/direct test surface, which has no host admission call;
+/// once a host journal is present, a controlled row must match one of its
+/// validated admitted envelopes.
+fn host_observation_journal_path(staged_path: &Path) -> Option<PathBuf> {
+    staged_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|provider_state_root| provider_state_root.join(HOST_OBSERVATION_JOURNAL_FILE_NAME))
+}
+
+fn has_host_projection_journal(staged_path: &Path) -> bool {
+    host_observation_journal_path(staged_path).is_some_and(|path| path.is_file())
+}
+
+fn require_host_projection_journal(staged_path: &Path) -> Result<(), StagedStoreError> {
+    if has_host_projection_journal(staged_path) {
+        Ok(())
+    } else {
+        Err(StagedStoreError::LifecycleConflict(
+            "host projection lineage unavailable",
+        ))
+    }
+}
+
+/// Reads the host-authenticated projection for one staged record.
+///
+/// `PayloadSanitizationReceipt` is intentionally not treated as an authority
+/// here: it is self-consistent but publicly reconstructible. The observation
+/// journal's `AdmittedObservationV1::envelope_sha256` is recomputed by the
+/// host decoder and covers the source settlement, exact provider-view bytes,
+/// extensions, and sanitization binding. Native accepts a record only when
+/// those host-owned bytes and identities agree with the record it is about to
+/// persist. The returned provider-view binding is copied from that validated
+/// host envelope for replay/correction staging.
+fn host_projection_for_record(
+    staged_path: &Path,
+    record: &StagedObservationRecord,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+) -> Result<Option<ProviderViewSanitization>, StagedStoreError> {
+    let Some(journal_path) = host_observation_journal_path(staged_path) else {
+        return if call.is_some() {
+            Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage unavailable",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    if !journal_path.is_file() {
+        return if call.is_some() {
+            Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage unavailable",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+
+    let journal = SqliteObservationJournal::open_existing(
+        &journal_path,
+        super::observation_journey::ObservationJourneyPolicyV1::project_default().retention,
+    )
+    .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal unavailable"))?;
+
+    // Normal Observe delivery carries the content-derived journal key. A
+    // correction uses a new lifecycle key, so fall back to the immutable
+    // `(target, scope, source_event_id)` identity for that path. Both sets are
+    // checked against the decoded envelope below; a key alone is never proof.
+    let mut candidate_keys = BTreeSet::new();
+    if let Ok(key) = ObservationIdempotencyKeyV1::parse(&record.idempotency_key) {
+        candidate_keys.insert(key.as_str().to_owned());
+    }
+    let host_connection = Connection::open_with_flags(
+        &journal_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal unavailable"))?;
+    let mut statement = host_connection
+        .prepare(
+            "SELECT idempotency_key FROM tdmem_observation_journal_v1
+             WHERE exact_scope_sha256=?1 AND source_event_id=?2
+               AND payload_bytes IS NOT NULL
+               AND (?3 IS NULL OR provider_id=?3)
+             ORDER BY idempotency_key LIMIT 16",
+        )
+        .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal unavailable"))?;
+    let provider_id = call.map(|call| call.provider_id.as_str());
+    let source_keys = statement
+        .query_map(
+            params![
+                record.scope.exact_scope_sha256(),
+                record.source_event_id,
+                provider_id,
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    candidate_keys.extend(source_keys);
+
+    // A restart/re-registration can append another journal envelope for the
+    // same source and provider view. Registration/ready receipt are delivery
+    // facts, so identical stable projection facts are one lineage. Distinct
+    // receipts or extensions remain ambiguous and fail closed below.
+    let mut matches = BTreeSet::new();
+    for key in candidate_keys {
+        let key = ObservationIdempotencyKeyV1::parse(&key)
+            .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal key"))?;
+        let Some(admitted) = journal
+            .read_admitted_observation_by_idempotency(&key)
+            .map_err(|_| {
+                StagedStoreError::LifecycleConflict("host projection journal unavailable")
+            })?
+        else {
+            continue;
+        };
+        if host_admission_matches_record(&admitted, record, call) {
+            matches.insert((
+                admitted.sanitization.receipt_json.clone(),
+                admitted.extensions_digest.clone(),
+            ));
+        }
+    }
+    let (receipt_json, extensions_digest) = match matches.into_iter().collect::<Vec<_>>().as_slice()
+    {
+        [(receipt_json, extensions_digest)] => (receipt_json.clone(), extensions_digest.clone()),
+        [] => {
+            return Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage",
+            ));
+        }
+        _ => {
+            return Err(StagedStoreError::LifecycleConflict(
+                "host projection lineage ambiguous",
+            ));
+        }
+    };
+    Ok(Some(ProviderViewSanitization {
+        receipt_json,
+        extensions_digest,
+    }))
+}
+
+fn host_admission_matches_record(
+    admitted: &AdmittedObservationV1,
+    record: &StagedObservationRecord,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+) -> bool {
+    let scope = &admitted.exact_scope;
+    let scope_matches = scope.exact_scope_sha256() == record.scope.exact_scope_sha256()
+        && scope.profile_id == record.scope.profile_id
+        && scope.project_id == record.scope.project_id
+        && scope.repository_identity == record.scope.repository_identity
+        && scope.worktree_identity == record.scope.worktree_identity
+        && scope.branch_identity == record.scope.branch_identity
+        && scope.agent_session_id == record.scope.agent_session_id
+        && scope.resolved_scope_digest == record.scope.resolved_scope_digest;
+    let target_matches = call.is_none_or(|call| {
+        admitted.target.provider_id == call.provider_id
+            && (call.operation != tracedecay_memory_provider_registry::ProviderOperation::Observe
+                || (call.sanitization().is_some_and(|receipt| {
+                    receipt.to_json() == admitted.sanitization.receipt_json
+                }) && call.extensions == admitted.extensions))
+    });
+    scope_matches
+        && admitted.source.source_authority.as_wire() == record.source_authority
+        && admitted.source.source_event_id == record.source_event_id
+        && admitted.observation_kind.as_str() == record.observation_kind
+        && admitted.payload.contract_id.as_str() == record.payload_contract
+        && admitted.payload.bytes == record.sanitized_payload
+        && admitted.payload.sha256 == sha256_hex(&record.sanitized_payload)
+        && target_matches
+}
+
+/// Binds a provider-view envelope's complete original-source attribution to
+/// the fresh host admission before a public sanitization receipt is accepted.
+///
+/// The receipt proves only the transformed bytes. The trusted source list is
+/// the host-owned lineage edge that prevents a provider-local payload from
+/// relabeling itself with an arbitrary source (or swapping to another source
+/// that happens to share a checkout and revision). Direct legacy staging has
+/// no host call and keeps its historical structural-only behavior.
+fn validate_stage_source_admission(
+    original_source: Option<&Value>,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+) -> Result<(), StagedStoreError> {
+    let Some(original_source) = original_source else {
+        return Ok(());
+    };
+    let Some(admission) = admission else {
+        if call.is_some() {
+            return Err(StagedStoreError::LifecycleConflict(
+                "source authority unavailable",
+            ));
+        }
+        return Ok(());
+    };
+    if let Some(call) = call {
+        admission
+            .verify_for(call)
+            .map_err(|_| StagedStoreError::LifecycleConflict("source authority binding"))?;
+    }
+    let matches: Vec<_> = admission
+        .history_sources
+        .iter()
+        .filter(|source| {
+            super::provider_history::source_attribution_json(&source.attribution)
+                .ok()
+                .is_some_and(|candidate| candidate == *original_source)
+        })
+        .collect();
+    match matches.as_slice() {
+        [_] => Ok(()),
+        [] => Err(StagedStoreError::LifecycleConflict(
+            "source projection lineage",
+        )),
+        _ => Err(StagedStoreError::LifecycleConflict(
+            "source projection lineage ambiguous",
+        )),
+    }
+}
+
+/// Checks a retained row against the host admission that produced its
+/// transformed provider view. Tombstones intentionally skip this check: their
+/// content and hygiene binding have been purged, and inspection remains
+/// possible from the durable identity/effect evidence alone.
+fn validate_host_projection_for_row(
+    staged_path: &Path,
+    scope: &ExactScopeFields,
+    idempotency_key: &str,
+    source_authority: &str,
+    source_event_id: &str,
+    source_revision: Option<&str>,
+    observation_kind: &str,
+    payload_contract: &str,
+    payload: &[u8],
+    payload_sha256: &str,
+    receipt_json: &str,
+    extensions_digest: &str,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+) -> Result<(), StagedStoreError> {
+    let record = StagedObservationRecord {
+        scope: scope.clone(),
+        idempotency_key: idempotency_key.to_owned(),
+        source_authority: source_authority.to_owned(),
+        source_event_id: source_event_id.to_owned(),
+        source_revision: source_revision.map(str::to_owned),
+        observation_kind: observation_kind.to_owned(),
+        payload_contract: payload_contract.to_owned(),
+        sanitized_payload: payload.to_vec(),
+        operation_id: "host-lineage-validation".to_owned(),
+        request_identity: "host-lineage-validation".to_owned(),
+        admitted_at_unix_ms: 0,
+    };
+    let Some(host_projection) = host_projection_for_record(staged_path, &record, call)? else {
+        return Ok(());
+    };
+    if host_projection.receipt_json != receipt_json
+        || host_projection.extensions_digest != extensions_digest
+    {
+        return Err(StagedStoreError::LifecycleConflict(
+            "host projection lineage",
+        ));
+    }
+    if payload_sha256 != sha256_hex(payload) {
+        return Err(StagedStoreError::PayloadDigestMismatch {
+            idempotency_key: idempotency_key.to_owned(),
+            stored_payload_sha256: payload_sha256.to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -4585,6 +8742,9 @@ fn stage_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     record: StagedObservationRecord,
     retention: StagedRetentionPolicyV1,
+    provider_view: &ProviderViewSanitization,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> Result<StagedOutcome, StagedStoreError> {
     record.validate()?;
     let exact_scope_sha256 = record.scope.exact_scope_sha256();
@@ -4596,6 +8756,7 @@ fn stage_in_transaction(
     let original_source = envelope
         .pointer("/source_identity/original_source")
         .cloned();
+    validate_stage_source_admission(original_source.as_ref(), call, admission)?;
     if let Some(attribution) = &original_source {
         validate_attribution(attribution)?;
         if extract_message_text(&record.sanitized_payload).is_none() {
@@ -4752,10 +8913,11 @@ fn stage_in_transaction(
                  resolved_scope_digest, source_authority, source_event_id, source_revision,
                  observation_kind, payload_contract, sanitized_payload, payload_sha256,
                  operation_id, request_identity, provider_reference, receipt, effect_digest,
-                 admitted_sequence, admitted_at_unix_ms, tombstone, actual_revision, original_source, semantic_sha256
+                 admitted_sequence, admitted_at_unix_ms, tombstone, actual_revision, original_source,
+                 semantic_sha256, sanitization_receipt_json, sanitization_extensions_digest
              ) VALUES (
                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0, ?24, ?25, ?26
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0, ?24, ?25, ?26, ?27, ?28
              )",
         params![
             exact_scope_sha256,
@@ -4784,6 +8946,8 @@ fn stage_in_transaction(
             source_revision,
             original_source.as_ref().map(Value::to_string),
             semantic_sha256,
+            provider_view.receipt_json.as_str(),
+            provider_view.extensions_digest.as_str(),
         ],
     )?;
 
@@ -4847,6 +9011,8 @@ const SNAPSHOT_COLUMNS: &[&str] = &[
     "semantic_sha256",
     "projected_content_sha256",
     "deleted_source_key",
+    "sanitization_receipt_json",
+    "sanitization_extensions_digest",
 ];
 
 fn export_snapshot(
@@ -4980,7 +9146,13 @@ fn restore_snapshot(
     request: &Value,
     before: u64,
     admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
+    // Restores can introduce provider-view rows in bulk. Require the durable
+    // host journal before reading any snapshot bytes so a provider-local
+    // snapshot cannot mint its own projection lineage.
+    require_host_projection_journal(staged_path)?;
+    validate_resident_original_sources(connection, &call.exact_scope, staged_path, call)?;
     let snapshot = request
         .get("snapshot")
         .ok_or(StagedStoreError::InvalidAdvisory("snapshot"))?;
@@ -5148,12 +9320,21 @@ fn restore_snapshot(
         call.control
             .snapshot()
             .map_err(StagedStoreError::ControlEnded)?;
-        if exact_scope_from_value(row)? != call.exact_scope
-            || row["exact_scope_sha256"] != scope
-            || row
-                .as_object()
-                .is_none_or(|object| object.len() != SNAPSHOT_COLUMNS.len())
-        {
+        if exact_scope_from_value(row)? != call.exact_scope || row["exact_scope_sha256"] != scope {
+            return Err(StagedStoreError::LifecycleConflict("snapshot row scope"));
+        }
+        let mut restored_row = row.clone();
+        let row_field_count = row.as_object().map_or(0, serde_json::Map::len);
+        let legacy_provider_view_evidence =
+            row_field_count == SNAPSHOT_COLUMNS.len().saturating_sub(2);
+        if legacy_provider_view_evidence {
+            // Older snapshots predate the provider-view hygiene evidence. They
+            // remain importable for ordinary state recovery, but their rows
+            // cannot later be named by a retained locator until a fresh,
+            // receipt-bearing observation is staged.
+            restored_row["sanitization_receipt_json"] = Value::Null;
+            restored_row["sanitization_extensions_digest"] = Value::Null;
+        } else if row_field_count != SNAPSHOT_COLUMNS.len() {
             return Err(StagedStoreError::LifecycleConflict("snapshot row scope"));
         }
         let reference = required_text(row, "provider_reference")?;
@@ -5181,7 +9362,6 @@ fn restore_snapshot(
                 "snapshot effect identity",
             ));
         }
-        let mut restored_row = row.clone();
         if let Some(source_key) = row["deleted_source_key"].as_str() {
             // Fence inventory was applied by explicit kind above. A scrubbed row
             // marker carries no origin proof and must never create a raw fence.
@@ -5264,6 +9444,8 @@ fn restore_snapshot(
                     "superseded_nanos",
                     "revoked_nanos",
                     "projected_content_sha256",
+                    "sanitization_receipt_json",
+                    "sanitization_extensions_digest",
                 ] {
                     restored_row[field] = Value::Null;
                 }
@@ -5345,6 +9527,46 @@ fn restore_snapshot(
                     ));
                 }
             }
+            if !legacy_provider_view_evidence {
+                let receipt_json = restored_row["sanitization_receipt_json"].as_str().ok_or(
+                    StagedStoreError::LifecycleConflict("snapshot sanitization receipt"),
+                )?;
+                let extensions_digest = restored_row["sanitization_extensions_digest"]
+                    .as_str()
+                    .filter(|digest| lower_hex_digest(digest))
+                    .ok_or(StagedStoreError::LifecycleConflict(
+                        "snapshot sanitization extensions",
+                    ))?;
+                let receipt =
+                    PayloadSanitizationReceipt::from_json(receipt_json).map_err(|_| {
+                        StagedStoreError::LifecycleConflict("snapshot sanitization receipt")
+                    })?;
+                receipt
+                    .verify_binding(
+                        restored_row["payload_sha256"]
+                            .as_str()
+                            .ok_or(StagedStoreError::InvalidAdvisory("snapshot payload digest"))?,
+                        extensions_digest,
+                    )
+                    .map_err(|_| {
+                        StagedStoreError::LifecycleConflict("snapshot sanitization receipt")
+                    })?;
+                validate_host_projection_for_row(
+                    staged_path,
+                    &call.exact_scope,
+                    required_text(&restored_row, "idempotency_key")?,
+                    required_text(&restored_row, "source_authority")?,
+                    required_text(&restored_row, "source_event_id")?,
+                    restored_row["actual_revision"].as_str(),
+                    required_text(&restored_row, "observation_kind")?,
+                    required_text(&restored_row, "payload_contract")?,
+                    &payload,
+                    required_text(&restored_row, "payload_sha256")?,
+                    receipt_json,
+                    extensions_digest,
+                    Some(call),
+                )?;
+            }
             let mut effective = attribution
                 .clone()
                 .unwrap_or_else(|| serde_json::json!({"validity":{}}));
@@ -5367,7 +9589,7 @@ fn restore_snapshot(
                 return Err(StagedStoreError::LifecycleConflict("snapshot target alias"));
             }
             if restored_row["tombstone"] == 1 {
-                connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL WHERE provider_reference=?1",params![reference])?;
+                connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL,sanitization_receipt_json=NULL,sanitization_extensions_digest=NULL WHERE provider_reference=?1",params![reference])?;
             }
             // Existing deletion/retention/correction fences and newer receipts survive rollback.
             continue;
@@ -5391,7 +9613,7 @@ fn restore_snapshot(
     }
     let keep_json = serde_json::to_string(&keep)
         .map_err(|_| StagedStoreError::InvalidAdvisory("snapshot targets"))?;
-    connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0 WHERE exact_scope_sha256=?1 AND provider_reference NOT IN(SELECT value FROM json_each(?2))",params![scope,keep_json])?;
+    connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,sanitization_receipt_json=NULL,sanitization_extensions_digest=NULL WHERE exact_scope_sha256=?1 AND provider_reference NOT IN(SELECT value FROM json_each(?2))",params![scope,keep_json])?;
     let operations = body["operations"]
         .as_array()
         .filter(|items| items.len() <= 1024)
@@ -5516,11 +9738,108 @@ fn snapshot_sql_value(value: &Value) -> Result<rusqlite::types::Value, StagedSto
     })
 }
 
+/// Revalidates every replay source before a duplicate operation journal lookup.
+///
+/// The operation journal is an idempotency record, not a capability cache. A
+/// successful replay may be retried with the same key, but the current host
+/// admission and privacy/deletion fence still have to authorize that retry.
+fn preflight_replay(
+    transaction: &rusqlite::Transaction<'_>,
+    call: &tracedecay_memory_provider_registry::ProviderCall,
+    request: &Value,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+) -> Result<(), StagedStoreError> {
+    use tracedecay_memory_provider_registry::SourceDisposition;
+
+    let admission = admission.ok_or(StagedStoreError::LifecycleConflict(
+        "replay authority unavailable",
+    ))?;
+    admission
+        .verify_for(call)
+        .map_err(|_| StagedStoreError::LifecycleConflict("replay authority binding"))?;
+    let grant = request
+        .get("history_grant")
+        .ok_or(StagedStoreError::InvalidAdvisory("replay history grant"))?;
+    let grant_sources = grant
+        .get("sources")
+        .and_then(Value::as_array)
+        .ok_or(StagedStoreError::InvalidAdvisory("replay grant sources"))?;
+    let items = request
+        .get("resolved_observations")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= 4096)
+        .ok_or(StagedStoreError::InvalidAdvisory("replay observations"))?;
+    if grant_sources.len() != items.len() {
+        return Err(StagedStoreError::LifecycleConflict(
+            "replay source coverage",
+        ));
+    }
+    for item in items {
+        let envelope = item
+            .get("observation")
+            .ok_or(StagedStoreError::InvalidAdvisory("replay observation"))?;
+        let attribution = envelope
+            .pointer("/source_identity/original_source")
+            .ok_or(StagedStoreError::InvalidAdvisory("replay attribution"))?;
+        validate_attribution(attribution)?;
+        if !grant_sources
+            .iter()
+            .any(|source| source.get("attribution") == Some(attribution))
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "ungranted replay source",
+            ));
+        }
+        let trusted: Vec<_> = admission
+            .history_sources
+            .iter()
+            .filter(|source| {
+                super::provider_history::source_attribution_json(&source.attribution)
+                    .ok()
+                    .is_some_and(|candidate| candidate == *attribution)
+            })
+            .collect();
+        let trusted = match trusted.as_slice() {
+            [trusted] => trusted,
+            [] => {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "ungranted replay source",
+                ));
+            }
+            _ => {
+                return Err(StagedStoreError::LifecycleConflict(
+                    "ambiguous replay source",
+                ));
+            }
+        };
+        if !matches!(
+            trusted.current_disposition.state,
+            SourceDisposition::Available | SourceDisposition::Superseded
+        ) {
+            return Err(StagedStoreError::LifecycleConflict(
+                "replay source unavailable",
+            ));
+        }
+        let source_key = required_text(&attribution["source"], "source_key")?;
+        if source_deleted(
+            transaction,
+            &call.exact_scope,
+            source_key,
+            Some(attribution),
+        )? {
+            return Err(StagedStoreError::PrivacyDeleted);
+        }
+    }
+    Ok(())
+}
+
 fn replay_advisory(
     transaction: &rusqlite::Transaction<'_>,
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
     retention: StagedRetentionPolicyV1,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
     let scope = call.exact_scope.exact_scope_sha256();
     let grant = &request["history_grant"];
@@ -5632,7 +9951,18 @@ fn replay_advisory(
             request_identity: required_text(envelope, "request_identity")?.to_owned(),
             admitted_at_unix_ms: super::native_provider::unix_millis_now(),
         };
-        match stage_in_transaction(transaction, record, retention)? {
+        let provider_view = host_projection_for_record(staged_path, &record, Some(call))?
+            .unwrap_or(direct_provider_view_sanitization(
+                &record.sanitized_payload,
+            )?);
+        match stage_in_transaction(
+            transaction,
+            record,
+            retention,
+            &provider_view,
+            Some(call),
+            admission,
+        )? {
             StagedOutcome::Committed(_) => applied += 1,
             StagedOutcome::Duplicate(_) => duplicates += 1,
             StagedOutcome::Conflict {

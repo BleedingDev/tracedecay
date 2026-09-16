@@ -22,7 +22,9 @@ use tracedecay_runtime_core::db::Database;
 
 use super::super::cognitive_recall::{
     LEDGER_FILE_NAME, RecallAdmissionLedgerV1,
-    control_attribution::{RetainedRecallControlScopeV1, RetainedRecallControlSourceV1},
+    control_attribution::{
+        RecallLocatorKeyV1, RetainedRecallControlScopeV1, RetainedRecallControlSourceV1,
+    },
 };
 use super::super::observation_journey::ObservationJourneyPolicyV1;
 use super::super::provider_history::{
@@ -42,6 +44,7 @@ pub(crate) struct ProviderControlAuthorityInputsV1 {
     pub(crate) hook_origin_reader: Arc<HookOriginReaderV1>,
     pub(crate) store_data_root: PathBuf,
     pub(crate) live_ledger: Option<Arc<RecallAdmissionLedgerV1>>,
+    pub(crate) locator_key: RecallLocatorKeyV1,
     pub(crate) live_journals: Vec<(OwnedProviderId, Arc<SqliteObservationJournal>)>,
     pub(crate) runtime: tokio::runtime::Handle,
 }
@@ -53,6 +56,7 @@ pub(crate) struct ProviderControlAuthorityV1 {
     dispositions: Arc<Database>,
     original_authority: Arc<MountedOriginalObservationAuthorityV1>,
     ledger: Option<Arc<RecallAdmissionLedgerV1>>,
+    locator_key: RecallLocatorKeyV1,
     journals: BTreeMap<OwnedProviderId, Arc<SqliteObservationJournal>>,
     runtime: tokio::runtime::Handle,
 }
@@ -455,6 +459,7 @@ impl ProviderControlAuthorityV1 {
             bridge: Arc::new(bridge),
         });
         let ledger_path = inputs.store_data_root.join(LEDGER_FILE_NAME);
+        let locator_key = inputs.locator_key.clone();
         let ledger = match inputs.live_ledger {
             Some(ledger) => {
                 if ledger.path() != ledger_path {
@@ -465,7 +470,8 @@ impl ProviderControlAuthorityV1 {
                 Some(ledger)
             }
             None if existing_regular_file(&ledger_path)? => Some(Arc::new(
-                RecallAdmissionLedgerV1::open_existing(ledger_path).map_err(|_| {
+                RecallAdmissionLedgerV1::open_existing_with_key(ledger_path, locator_key.clone())
+                    .map_err(|_| {
                     ProviderHistoryErrorV1::Unavailable("existing retained recall ledger")
                 })?,
             )),
@@ -512,6 +518,7 @@ impl ProviderControlAuthorityV1 {
             dispositions: inputs.dispositions,
             original_authority,
             ledger,
+            locator_key,
             journals,
             runtime: inputs.runtime,
         })
@@ -559,10 +566,6 @@ impl ProviderControlAuthorityV1 {
         let operation = control.clone();
         let work = tokio::task::spawn_blocking(move || {
             validate_retained_scope_identity(&retained.scope)?;
-            let expected = retained
-                .original_source
-                .to_owned_attribution()
-                .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained original source"))?;
             let journal = authority
                 .journals
                 .get(&retained.scope.provider_id)
@@ -581,11 +584,16 @@ impl ProviderControlAuthorityV1 {
             };
             let grant = authority
                 .runtime
-                .block_on(reader.authorize_retained_source(
+                .block_on(reader.authorize_retained_source_locator(
                     &retained.scope.delivery_scope,
-                    &expected,
+                    &retained.trace,
+                    retained.scope.registration_revision,
+                    retained.provider_rank,
+                    &retained.candidate_id,
+                    &retained.original_source,
                     &operation,
                     include_unavailable,
+                    &authority.locator_key,
                 ))?;
             check(&operation)?;
             Ok(AuthorizedRetainedControlSourceV1 {
@@ -651,15 +659,16 @@ impl AuthorizedRetainedControlSourceV1 {
                 ProviderHistoryErrorV1::ClaimMismatch("control history source count").into(),
             );
         };
-        let expected = self
-            .retained
-            .original_source
-            .to_owned_attribution()
-            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained original source"))?;
+        // `retained.original_source` is deliberately an opaque locator after
+        // the SQLite privacy boundary. The canonical attribution in this fresh
+        // grant has already been re-resolved and byte-compared against that
+        // locator by `authorize_retained_source_locator`; use it for the
+        // transient journal fence checks instead of trying to treat the
+        // redacted projection as canonical authority.
+        let expected = &source.attribution;
         if self.grant.destination_scope != self.retained.scope.delivery_scope
-            || source.attribution != expected
             || request.provider_id != self.retained.scope.provider_id.as_str()
-            || request.original_source_sha256 != original_source_fence_digest(&expected)?
+            || request.original_source_sha256 != original_source_fence_digest(expected)?
             || request.source_revision != expected.source.source_revision.as_deref()
         {
             return Err(ProviderHistoryErrorV1::ClaimMismatch("host intent source binding").into());

@@ -629,34 +629,28 @@ impl ProjectProviderControlPortV1 {
         let authorized = authority
             .authorize_source(&retained, include_unavailable, control)
             .await?;
-        let original = authorized
-            .retained
-            .original_source
-            .to_owned_attribution()
-            .map_err(|_| {
-                ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
-                    "retained source attribution",
-                ))
-            })?;
         let [granted] = authorized.grant.sources.as_slice() else {
             return Err(ControlFailureV1::new(
                 ControlFailureStageV1::InvalidBinding("one authorized original source"),
             ));
         };
-        if granted.attribution != original
-            || authorized.grant.destination_scope != authorized.retained.scope.delivery_scope
-        {
+        if authorized.grant.destination_scope != authorized.retained.scope.delivery_scope {
             return Err(ControlFailureV1::new(
                 ControlFailureStageV1::InvalidBinding("fresh retained source binding"),
             ));
         }
+        // The retained row carries only an opaque source locator. Build the
+        // provider target from the fresh canonical grant returned by the host
+        // authority; the opaque value remains a handle for the provider-local
+        // reference until that provider resolves its lifecycle target.
+        let original = &granted.attribution;
         let target = LifecycleTarget {
             provider_id: authorized.retained.scope.provider_id.clone(),
             registration_revision: authorized.retained.scope.registration_revision,
-            original_scope: original.origin_scope,
+            original_scope: original.origin_scope.clone(),
             delivery_scope: authorized.retained.scope.delivery_scope.clone(),
-            source: original.source,
-            reference: LifecycleTargetReference::StableMemoryRef(
+            source: original.source.clone(),
+            reference: LifecycleTargetReference::RetainedSourceLocator(
                 authorized.retained.stable_memory_ref.clone(),
             ),
         };

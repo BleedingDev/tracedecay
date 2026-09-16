@@ -180,9 +180,7 @@ pub(super) fn result_after_failure(
     } else {
         no_effect()
     };
-    if possible_effect
-        && let Some(received) = received_terminal
-    {
+    if possible_effect && let Some(received) = received_terminal {
         let evidence = received.committed_effect();
         effect.provider_receipt_digest = evidence.provider_receipt_sha256().map(str::to_owned);
         if let Some(action) = evidence.reconciliation_action() {
@@ -1109,9 +1107,7 @@ mod tests {
                 tracedecay_domain::canonical_text::sha256_hex(&bytes),
             )
             .unwrap(),
-            required_capabilities: vec![
-                OwnedVersionedId::new(operation.capability_id()).unwrap(),
-            ],
+            required_capabilities: vec![OwnedVersionedId::new(operation.capability_id()).unwrap()],
             extensions: Vec::new(),
         })
         .unwrap();
@@ -1221,7 +1217,10 @@ mod tests {
             panic!("host uncertainty retains the control identity and warning");
         };
         assert_eq!(retained.provider_id, state().provider_id.as_str());
-        assert_eq!(retained.registration_revision, state().registration_revision);
+        assert_eq!(
+            retained.registration_revision,
+            state().registration_revision
+        );
         assert_eq!(retained.scope, projection::scope(&state().delivery_scope));
         assert_eq!(retained.operation_id, identity().operation_id);
         assert_eq!(retained.idempotency_key, identity().idempotency_key);
@@ -1232,9 +1231,12 @@ mod tests {
             retained.effect.reconciliation_action.as_deref(),
             Some("reconcile_same_operation")
         );
-        assert!(retained.warnings.iter().any(|warning| {
-            warning.contains("durable receipt could not be confirmed")
-        }));
+        assert!(
+            retained
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("durable receipt could not be confirmed") })
+        );
 
         let mut committed = unchanged_result();
         let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut committed.result

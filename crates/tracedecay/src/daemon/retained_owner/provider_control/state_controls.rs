@@ -5,13 +5,13 @@ use tracedecay_contracts::retained_surfaces::{
     ProviderControlInspectionSelectorV1, ProviderControlSourceSelectorV1, ProviderHealthRequestV1,
     ProviderInspectionRequestV1, ProviderMaintenanceRequestV1,
 };
-use tracedecay_memory_provider_registry::LifecycleTargetReference;
+use tracedecay_memory_provider_registry::{LifecycleTarget, LifecycleTargetReference};
 
 use super::{
     AuthorizedControlSourceV1, CompletedProviderControlV1, ControlFailureStageV1, ControlFailureV1,
     ControlInvocationV1, ControlResult, PROVIDER_CONTROL_POLICY_REVISION_V1,
     ProjectProviderControlPortV1, ResolvedControlStateV1,
-    projection::{HostControlEvidence, InspectionEvidenceV1},
+    projection::{HostControlEvidence, InspectionEvidenceV1, lifecycle_target_wire},
 };
 
 pub(super) async fn health(
@@ -57,15 +57,34 @@ pub(super) async fn maintenance(
     port.project(invocation, dispatched, HostControlEvidence::Maintenance)
 }
 
-fn inspection_body(request: &ProviderInspectionRequestV1, selector: Value) -> Value {
-    json!({
+fn inspection_body(
+    request: &ProviderInspectionRequestV1,
+    selector: Value,
+    target: Option<Value>,
+) -> Value {
+    let mut body = json!({
         "view": request.selection.view(),
         "selector": selector,
         "maximum_items": request.maximum_items,
         "maximum_bytes": request.maximum_bytes,
         "redaction_policy_revision": PROVIDER_CONTROL_POLICY_REVISION_V1,
         "cursor": request.cursor,
-    })
+    });
+    if let Some(target) = target {
+        body["target"] = target;
+    }
+    body
+}
+
+fn source_reference(target: &LifecycleTarget) -> ControlResult<&str> {
+    match &target.reference {
+        LifecycleTargetReference::StableMemoryRef(value)
+        | LifecycleTargetReference::RetainedSourceLocator(value) => Ok(value),
+        LifecycleTargetReference::RecallTraceRef(_)
+        | LifecycleTargetReference::ContextPackItemRef(_) => Err(ControlFailureV1::new(
+            ControlFailureStageV1::InvalidBinding("retained source reference"),
+        )),
+    }
 }
 
 async fn source_for_inspection(
@@ -96,7 +115,7 @@ pub(super) async fn inspection(
                 .dispatch(
                     invocation,
                     &state,
-                    inspection_body(request, json!({})),
+                    inspection_body(request, json!({}), None),
                     &invocation.identity,
                     None,
                 )
@@ -139,50 +158,36 @@ pub(super) async fn inspection(
             };
             let selected = match &request.selection {
                 ProviderControlInspectionSelectorV1::SourceInfluence { .. } => {
-                    let LifecycleTargetReference::StableMemoryRef(stable) =
-                        &source.target.reference
-                    else {
-                        return Err(ControlFailureV1::new(
-                            ControlFailureStageV1::InvalidBinding(
-                                "retained stable memory reference",
-                            ),
-                        ));
-                    };
+                    let stable = source_reference(&source.target)?;
                     json!({"stable_memory_ref": stable, "source_key": source.target.source.source_key})
                 }
                 ProviderControlInspectionSelectorV1::Trace { .. } => {
-                    let LifecycleTargetReference::StableMemoryRef(stable) =
-                        &source.target.reference
-                    else {
-                        return Err(ControlFailureV1::new(
-                            ControlFailureStageV1::InvalidBinding(
-                                "retained stable memory reference",
-                            ),
-                        ));
-                    };
+                    let stable = source_reference(&source.target)?;
                     json!({"stable_memory_ref": stable})
                 }
                 ProviderControlInspectionSelectorV1::DeliveryReceipt { .. } => {
-                    let LifecycleTargetReference::StableMemoryRef(stable) =
-                        &source.target.reference
-                    else {
-                        return Err(ControlFailureV1::new(
-                            ControlFailureStageV1::InvalidBinding(
-                                "retained stable memory reference",
-                            ),
-                        ));
-                    };
+                    let stable = source_reference(&source.target)?;
                     json!({"idempotency_key": delivery_key.as_deref(), "stable_memory_ref": stable})
                 }
                 _ => unreachable!("source inspection selection"),
             };
+            let source_evidence = source.projection_evidence(selector)?;
+            let target = matches!(
+                &source.target.reference,
+                LifecycleTargetReference::RetainedSourceLocator(_)
+            )
+            .then(|| lifecycle_target_wire(source_evidence))
+            .transpose()
+            .map_err(|error| ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(error)))?;
+            let source_grant = target.as_ref().map(|_| source.authorized.grant.clone());
             let dispatched = port
-                .dispatch(
+                .dispatch_with_source_grant(
                     invocation,
                     &state,
-                    inspection_body(request, selected),
+                    inspection_body(request, selected, target),
                     &invocation.identity,
                     None,
+                    source_grant,
                 )
                 .await?;
             // Re-read current disposition after provider contact. If authority
@@ -234,6 +239,7 @@ pub(super) async fn inspection(
                     inspection_body(
                         request,
                         json!({"operation_id": operation_id, "idempotency_key": idempotency_key}),
+                        None,
                     ),
                     &invocation.identity,
                     None,

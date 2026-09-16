@@ -141,9 +141,12 @@ struct FeedbackAssertionBindingV1 {
     target: SourceCommandTargetV1,
 }
 
-/// Only a stable memory target is accepted. Its original scope and source are
-/// retained in full in `original_attribution`, after exact equality is checked
-/// against the resolved LifecycleTarget. The delivery scope remains separate.
+/// A source target's original scope and source are retained in full in
+/// `original_attribution`, after exact equality is checked against the resolved
+/// LifecycleTarget. The delivery scope remains separate. The historical
+/// `stable_memory_ref` field carries either a stable provider reference or an
+/// opaque retained locator; `reference_kind` is omitted for legacy/stable
+/// records so their durable bytes remain unchanged.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct SourceCommandTargetV1 {
@@ -151,7 +154,17 @@ struct SourceCommandTargetV1 {
     registration_revision: u64,
     delivery_scope: RecallOutcomeScopeV1,
     stable_memory_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_kind: Option<SourceCommandReferenceKindV1>,
     original_attribution: RecallSourceAttributionV1,
+}
+
+/// Additive marker for the one non-legacy target kind. An absent marker is the
+/// original stable-memory-reference encoding used by existing receipts.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SourceCommandReferenceKindV1 {
+    RetainedSourceLocator,
 }
 
 impl FeedbackAssertionBindingV1 {
@@ -369,7 +382,12 @@ impl SourceCommandTargetV1 {
             original_scope: original_attribution.origin_scope,
             delivery_scope: scope_owned(&self.delivery_scope)?,
             source: original_attribution.source,
-            reference: LifecycleTargetReference::StableMemoryRef(self.stable_memory_ref.clone()),
+            reference: match self.reference_kind {
+                Some(SourceCommandReferenceKindV1::RetainedSourceLocator) => {
+                    LifecycleTargetReference::RetainedSourceLocator(self.stable_memory_ref.clone())
+                }
+                None => LifecycleTargetReference::StableMemoryRef(self.stable_memory_ref.clone()),
+            },
         };
         target.validate().map_err(|_| invalid("lifecycle target"))?;
         if observation_id != target.source.observation_id {
@@ -400,14 +418,23 @@ fn prepare_target(
     {
         return Err(invalid("target and source attribution disagree"));
     }
-    let LifecycleTargetReference::StableMemoryRef(stable_memory_ref) = &target.reference else {
-        return Err(invalid("resolved stable memory reference is required"));
+    let (stable_memory_ref, reference_kind) = match &target.reference {
+        LifecycleTargetReference::StableMemoryRef(value) => (value.clone(), None),
+        LifecycleTargetReference::RetainedSourceLocator(value) => (
+            value.clone(),
+            Some(SourceCommandReferenceKindV1::RetainedSourceLocator),
+        ),
+        LifecycleTargetReference::RecallTraceRef(_)
+        | LifecycleTargetReference::ContextPackItemRef(_) => {
+            return Err(invalid("resolved source reference is required"));
+        }
     };
     Ok(SourceCommandTargetV1 {
         provider_id: target.provider_id.as_str().to_owned(),
         registration_revision: target.registration_revision,
         delivery_scope: scope_wire(&target.delivery_scope),
-        stable_memory_ref: stable_memory_ref.clone(),
+        stable_memory_ref,
+        reference_kind,
         original_attribution: attribution_wire(original_attribution),
     })
 }
@@ -1224,7 +1251,9 @@ mod tests {
             original_scope: attribution.origin_scope.clone(),
             delivery_scope: scope,
             source: attribution.source.clone(),
-            reference: LifecycleTargetReference::StableMemoryRef("memory.original.1".to_owned()),
+            reference: LifecycleTargetReference::RetainedSourceLocator(
+                "memory.original.1".to_owned(),
+            ),
         };
         let request = ProviderFeedbackRequestV1 {
             source: ProviderControlSourceSelectorV1 {
@@ -1242,6 +1271,44 @@ mod tests {
 
     fn binding() -> FeedbackAssertionBindingV1 {
         let (context, request, target, source) = inputs();
+        FeedbackAssertionBindingV1::prepare(&context, &request, &target, &source, now_micros())
+            .unwrap()
+    }
+
+    fn retained_inputs() -> (
+        RequestContext,
+        ProviderFeedbackRequestV1,
+        LifecycleTarget,
+        SourceAttribution,
+    ) {
+        let (context, request, mut target, source) = inputs();
+        target.reference = LifecycleTargetReference::RetainedSourceLocator(format!(
+            "recall-memory-ref-v1:{}",
+            "a".repeat(64)
+        ));
+        (context, request, target, source)
+    }
+
+    fn retained_binding() -> FeedbackAssertionBindingV1 {
+        let (context, request, target, source) = retained_inputs();
+        FeedbackAssertionBindingV1::prepare(&context, &request, &target, &source, now_micros())
+            .unwrap()
+    }
+
+    fn stable_inputs() -> (
+        RequestContext,
+        ProviderFeedbackRequestV1,
+        LifecycleTarget,
+        SourceAttribution,
+    ) {
+        let (context, request, mut target, source) = inputs();
+        target.reference =
+            LifecycleTargetReference::StableMemoryRef(format!("ncm-memory:{}", "c".repeat(64)));
+        (context, request, target, source)
+    }
+
+    fn stable_binding() -> FeedbackAssertionBindingV1 {
+        let (context, request, target, source) = stable_inputs();
         FeedbackAssertionBindingV1::prepare(&context, &request, &target, &source, now_micros())
             .unwrap()
     }
@@ -1273,6 +1340,68 @@ mod tests {
             ArtifactQuota::DEFAULT,
             publish_receipt,
         )
+    }
+
+    #[test]
+    fn retained_locator_acceptance_replays_and_preserves_reference_kind() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join(ROOT_NAME);
+        let original = retained_binding();
+        let (context, request, target, source) = retained_inputs();
+        let accepted = accept(&root, original.clone()).unwrap();
+        let path = receipt_path(&root, &original.lookup_key().unwrap());
+        let retained_bytes = std::fs::read(&path).unwrap();
+
+        let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
+        let replay = ledger
+            .retained_feedback_assertion(&context, &control())
+            .unwrap();
+        assert_eq!(replay, accepted);
+        assert!(
+            replay
+                .matches(&context, &request, &target, &source)
+                .unwrap()
+        );
+        let mut stable_target = target.clone();
+        stable_target.reference =
+            LifecycleTargetReference::StableMemoryRef(match &target.reference {
+                LifecycleTargetReference::RetainedSourceLocator(value) => value.clone(),
+                _ => unreachable!("retained fixture target"),
+            });
+        assert!(
+            !replay
+                .matches(&context, &request, &stable_target, &source)
+                .unwrap()
+        );
+
+        let encoded = serde_json::to_value(&accepted.0).unwrap();
+        assert_eq!(
+            encoded["binding"]["target"]["reference_kind"],
+            "retained_source_locator"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), retained_bytes);
+    }
+
+    #[test]
+    fn stable_reference_acceptance_keeps_legacy_receipt_shape_and_replays() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join(ROOT_NAME);
+        let original = stable_binding();
+        let (context, request, target, source) = stable_inputs();
+        let accepted = accept(&root, original).unwrap();
+        let encoded = serde_json::to_value(&accepted.0).unwrap();
+        assert!(encoded["binding"]["target"].get("reference_kind").is_none());
+
+        let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
+        let replay = ledger
+            .retained_feedback_assertion(&context, &control())
+            .unwrap();
+        assert_eq!(replay, accepted);
+        assert!(
+            replay
+                .matches(&context, &request, &target, &source)
+                .unwrap()
+        );
     }
 
     fn write_private(path: &Path, bytes: &[u8]) {
@@ -1470,7 +1599,7 @@ mod tests {
         );
         let mut changed_target = target.clone();
         changed_target.reference =
-            LifecycleTargetReference::StableMemoryRef("memory.different".to_owned());
+            LifecycleTargetReference::RetainedSourceLocator("memory.different".to_owned());
         assert!(
             !accepted
                 .matches(&context, &request, &changed_target, &attribution)
@@ -1871,6 +2000,20 @@ mod tests {
         (context, request, target, source)
     }
 
+    fn retained_deletion_inputs() -> (
+        RequestContext,
+        ProviderDeleteBySourceRequestV1,
+        LifecycleTarget,
+        SourceAttribution,
+    ) {
+        let (context, request, mut target, source) = deletion_inputs();
+        target.reference = LifecycleTargetReference::RetainedSourceLocator(format!(
+            "recall-memory-ref-v1:{}",
+            "b".repeat(64)
+        ));
+        (context, request, target, source)
+    }
+
     fn deletion_binding() -> DeletionCommandBindingV1 {
         let (context, request, target, source) = deletion_inputs();
         DeletionCommandBindingV1::prepare(&context, &request, &target, &source, now_micros())
@@ -1888,6 +2031,39 @@ mod tests {
             ArtifactQuota::DEFAULT,
             publish_receipt,
         )?)
+    }
+
+    #[test]
+    fn retained_locator_deletion_replays_and_rejects_stable_reconstruction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join(ROOT_NAME);
+        let (context, request, target, source) = retained_deletion_inputs();
+        let command =
+            DeletionCommandBindingV1::prepare(&context, &request, &target, &source, now_micros())
+                .unwrap();
+        let accepted = accept_deletion(&root, command.clone()).unwrap();
+        let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
+        let replay = ledger
+            .retained_deletion_command(&context, &control())
+            .unwrap();
+        assert_eq!(replay, accepted);
+        assert!(
+            replay
+                .matches(&context, &request, &target, &source)
+                .unwrap()
+        );
+
+        let mut stable_target = target.clone();
+        stable_target.reference =
+            LifecycleTargetReference::StableMemoryRef(match &target.reference {
+                LifecycleTargetReference::RetainedSourceLocator(value) => value.clone(),
+                _ => unreachable!("retained fixture target"),
+            });
+        assert!(
+            !replay
+                .matches(&context, &request, &stable_target, &source)
+                .unwrap()
+        );
     }
 
     #[test]

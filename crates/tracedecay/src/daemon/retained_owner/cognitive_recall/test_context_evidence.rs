@@ -24,7 +24,9 @@ pub use tracedecay_memory_provider_registry::{
 
 use super::control_attribution::{
     MAX_DECISION_BYTES, MAX_ID_BYTES, RecallControlAttributionErrorV1, RecallControlTraceRefV1,
-    optional_text, read_retained_control_scope_on_connection, required_text,
+    RecallLocatorKeyV1, is_lower_hex_sha256, optional_text,
+    read_retained_control_scope_on_connection, required_text, retained_item_bytes_mac,
+    retained_trace_bytes_mac,
 };
 use super::{ADVISORY_CONTEXT_PACK_JSON_KEY, LEDGER_FILE_NAME, PROJECT_RECALL_BUDGETS};
 
@@ -216,7 +218,9 @@ pub fn read_retained_context_trace_for_test(
     connection.busy_timeout(Duration::from_millis(remaining.remaining_millis.min(10)))?;
     check_control(control)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    let scope = read_retained_control_scope_on_connection(&transaction, &reference, control)?;
+    let locator_key = RecallLocatorKeyV1::for_test();
+    let scope =
+        read_retained_control_scope_on_connection(&transaction, &reference, control, &locator_key)?;
     if scope.provider_id.as_str() != expected_provider_id
         || scope.registration_revision != expected_registration_revision
         || &scope.delivery_scope != expected_delivery_scope
@@ -231,14 +235,15 @@ pub fn read_retained_context_trace_for_test(
         .query_row(
             "SELECT substr(CAST(request_id AS BLOB),1,1025), requested_count, degraded,
                 substr(CAST(token_summary_json AS BLOB),1,16385),
-                substr(CAST(trace_sha256 AS BLOB),1,65)
+                substr(CAST(trace_sha256 AS BLOB),1,65),
+                substr(CAST(trace_mac AS BLOB),1,65)
          FROM recall_explain_traces WHERE exact_scope_sha256=?1 AND trace_id=?2 LIMIT 1",
             params![scope_sha256, reference.trace_id()],
             |row| Ok(decode_header(row)),
         )
         .optional();
     check_control(control)?;
-    let (request_id, requested_count, degraded, token_summary_json, trace_sha256) =
+    let (request_id, requested_count, degraded, token_summary_json, trace_sha256, trace_mac) =
         header?.ok_or(ContextEvidenceReadErrorV1::Missing)??;
     if request_id != expected_request_id {
         return Err(ContextEvidenceReadErrorV1::Invalid(
@@ -261,7 +266,8 @@ pub fn read_retained_context_trace_for_test(
                 substr(CAST(host_reason_detail AS BLOB),1,16385),
                 substr(CAST(host_decision_json AS BLOB),1,16385),
                 substr(CAST(provider_explanation_json AS BLOB),1,16385),
-                substr(CAST(section AS BLOB),1,1025), tokens
+                substr(CAST(section AS BLOB),1,1025), tokens,
+                substr(CAST(item_mac AS BLOB),1,65)
          FROM recall_explain_trace_items WHERE exact_scope_sha256=?1 AND trace_id=?2
          ORDER BY provider_rank ASC LIMIT ?3",
     )?;
@@ -289,6 +295,24 @@ pub fn read_retained_context_trace_for_test(
                 "trace rank or candidate partition",
             ));
         }
+        let item_mac = required_text(row, 9, 64)?;
+        if !is_lower_hex_sha256(&item_mac) {
+            return Err(ContextEvidenceReadErrorV1::Invalid("retained item mac"));
+        }
+        let item_bytes = serde_json::to_vec(&item)?;
+        let expected_item_mac = retained_item_bytes_mac(
+            &locator_key,
+            scope_sha256,
+            reference.trace_id(),
+            scope.provider_id.as_str(),
+            scope.registration_revision,
+            item.provider_rank,
+            &item.candidate_id,
+            &item_bytes,
+        );
+        if item_mac != expected_item_mac {
+            return Err(ContextEvidenceReadErrorV1::Invalid("retained item mac"));
+        }
         items.push(item);
     }
     if items.len() != requested_count {
@@ -315,12 +339,25 @@ pub fn read_retained_context_trace_for_test(
             "retained trace digest mismatch",
         ));
     }
+    if !is_lower_hex_sha256(&trace_mac)
+        || trace_mac
+            != retained_trace_bytes_mac(
+                &locator_key,
+                scope_sha256,
+                reference.trace_id(),
+                scope.provider_id.as_str(),
+                scope.registration_revision,
+                &serde_json::to_vec(&trace)?,
+            )
+    {
+        return Err(ContextEvidenceReadErrorV1::Invalid("retained trace mac"));
+    }
     check_control(control)?;
     // Dropping the read transaction releases its snapshot; no commit/write path.
     Ok(trace)
 }
 
-type TraceHeader = (String, usize, bool, Option<String>, String);
+type TraceHeader = (String, usize, bool, Option<String>, String, String);
 
 fn decode_header(row: &Row<'_>) -> Result<TraceHeader> {
     let count: i64 = row.get(1)?;
@@ -337,6 +374,7 @@ fn decode_header(row: &Row<'_>) -> Result<TraceHeader> {
         degraded == 1,
         optional_text(row, 3, MAX_DECISION_BYTES)?,
         required_text(row, 4, 64)?,
+        required_text(row, 5, 64)?,
     ))
 }
 

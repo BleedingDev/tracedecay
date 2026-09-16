@@ -55,11 +55,12 @@ use tracedecay_memory_provider_registry::{
     ProviderInvocationLimitsV1, ProviderItemProvenanceV1, ProviderLimits, ProviderWorkV1,
     ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
     ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RecallAdmissionAuditError,
-    RecallAdmissionObserver, RecallAdmissionReport, RecallBudgetsV1, RecallExplainHostDecisionV1,
-    RecallExplainHostWithholdingV1, RecallExplainItemV1, RecallExplainProviderExplanationV1,
-    RecallExplainStageV1, RecallExplainTokenSummaryV1, RecallExplainTraceInputsV1,
-    RecallExplainTraceV1, RecallExplanationRedactorV1, RecallNormalizationV1, RecallSelectionV1,
-    build_recall_explain_trace, explanation_source_sha256,
+    RecallAdmissionObserver, RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason,
+    RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1, RecallExplainItemV1,
+    RecallExplainProviderExplanationV1, RecallExplainStageV1, RecallExplainTokenSummaryV1,
+    RecallExplainTraceInputsV1, RecallExplainTraceV1, RecallExplanationRedactorV1,
+    RecallNormalizationV1, RecallSelectionV1, build_recall_explain_trace,
+    explanation_source_sha256,
 };
 
 use super::observation_journey::{
@@ -183,6 +184,9 @@ impl CognitiveRecallMountError {
 /// Typed failure of retaining one admission report.
 #[derive(Debug, thiserror::Error)]
 pub enum RecallAdmissionLedgerError {
+    /// A retained trace lookup must carry its complete scope-bound reference.
+    #[error("retained recall explain trace reference is invalid or not scope-bound")]
+    InvalidTraceReference,
     /// Control data differs from the final trace, or the sink cannot retain it.
     #[error(
         "recall control metadata does not match the final trace or is unsupported by this sink"
@@ -294,6 +298,7 @@ pub struct RetainedRecallExplainTraceV1 {
 pub struct RecallAdmissionLedgerV1 {
     path: PathBuf,
     connection: Mutex<Connection>,
+    locator_key: control_attribution::RecallLocatorKeyV1,
 }
 
 impl std::fmt::Debug for RecallAdmissionLedgerV1 {
@@ -313,21 +318,40 @@ impl RecallAdmissionLedgerV1 {
         Self::open(store_data_root.join(LEDGER_FILE_NAME))
     }
 
+    #[cfg(test)]
     fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
-        Self::open_with_flags(path, rusqlite::OpenFlags::default())
+        Self::open_with_key(path, control_attribution::RecallLocatorKeyV1::for_test())
+    }
+
+    pub(crate) fn open_with_key(
+        path: PathBuf,
+        locator_key: control_attribution::RecallLocatorKeyV1,
+    ) -> Result<Self, CognitiveRecallMountError> {
+        Self::open_with_flags(path, rusqlite::OpenFlags::default(), locator_key)
     }
 
     /// Opens an existing host-owned ledger without creating a missing target.
+    #[cfg(test)]
     pub(crate) fn open_existing(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
+        Self::open_existing_with_key(path, control_attribution::RecallLocatorKeyV1::for_test())
+    }
+
+    /// Opens an existing host-owned ledger with the durable composition key.
+    pub(crate) fn open_existing_with_key(
+        path: PathBuf,
+        locator_key: control_attribution::RecallLocatorKeyV1,
+    ) -> Result<Self, CognitiveRecallMountError> {
         Self::open_with_flags(
             path,
             rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
+            locator_key,
         )
     }
 
     fn open_with_flags(
         path: PathBuf,
         flags: rusqlite::OpenFlags,
+        locator_key: control_attribution::RecallLocatorKeyV1,
     ) -> Result<Self, CognitiveRecallMountError> {
         let connection = Connection::open_with_flags(&path, flags).map_err(|source| {
             CognitiveRecallMountError::LedgerOpen {
@@ -426,6 +450,7 @@ impl RecallAdmissionLedgerV1 {
         Ok(Self {
             path,
             connection: Mutex::new(connection),
+            locator_key,
         })
     }
 
@@ -433,6 +458,12 @@ impl RecallAdmissionLedgerV1 {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Keyed projection context shared by explain, denial and control
+    /// retention. The key itself never leaves this host module.
+    pub(crate) fn locator_key(&self) -> &control_attribution::RecallLocatorKeyV1 {
+        &self.locator_key
     }
 
     fn connection(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -449,6 +480,18 @@ impl RecallAdmissionLedgerV1 {
         &self,
         report: &RecallAdmissionReport,
     ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
+        // The projection is deliberately bound to the routed provider and
+        // registration revision. A pure registry helper may leave these
+        // fields unset, but such a report is not safe to retain at the host
+        // boundary and must fail closed instead of using an "unknown"
+        // projection context.
+        if report.provider_id.as_deref().is_none_or(str::is_empty)
+            || report
+                .registration_revision
+                .is_none_or(|revision| revision == 0)
+        {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
         let recorded_at = try_now_micros().map_err(RecallAdmissionLedgerError::Clock)?;
         let report_bytes =
             serde_json::to_vec(report).map_err(RecallAdmissionLedgerError::Encode)?;
@@ -461,11 +504,43 @@ impl RecallAdmissionLedgerV1 {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| unknown_validity_policy.to_string());
+        let retained_aliases = control_attribution::retained_candidate_identity_aliases_for_report(
+            report,
+            &self.locator_key,
+        );
         let mut denial_rows = Vec::with_capacity(report.denied.len());
         for denied in &report.denied {
-            let reason_json = serde_json::to_string(&denied.reason)
+            let reason_json = sanitized_denial_reason_json(&denied.reason)
                 .map_err(RecallAdmissionLedgerError::Encode)?;
-            denial_rows.push((denied, reason_json));
+            let Some(retained_candidate_id) = retained_aliases.get(&denied.candidate_id).cloned()
+            else {
+                // A malformed report that denies an identity absent from its
+                // received partition cannot receive a collision-safe alias.
+                // Refuse it instead of falling back to an ambiguous projection.
+                return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+            };
+            // Denials are durable project state. Keep the report's raw id for
+            // the in-memory admission result and its replay digest, but make
+            // the retained denial row opaque so a provider cannot park source
+            // paths or secret-looking bytes in SQLite. The complete map is
+            // shared with explain/control retention, including any collision
+            // suffixes.
+            denial_rows.push((
+                denied,
+                reason_json,
+                retained_candidate_id.clone(),
+                denied
+                    .stable_memory_ref
+                    .as_deref()
+                    .map(|stable_memory_ref| {
+                        control_attribution::opaque_denial_stable_memory_ref(
+                            report,
+                            &self.locator_key,
+                            &retained_candidate_id,
+                            stable_memory_ref,
+                        )
+                    }),
+            ));
         }
 
         let mut connection = self.connection();
@@ -514,7 +589,9 @@ impl RecallAdmissionLedgerV1 {
                 ],
             )
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        for (position, (denied, reason_json)) in denial_rows.iter().enumerate() {
+        for (position, (denied, reason_json, retained_candidate_id, retained_stable_memory_ref)) in
+            denial_rows.iter().enumerate()
+        {
             transaction
                 .execute(
                     "INSERT INTO recall_admission_denials (
@@ -527,13 +604,13 @@ impl RecallAdmissionLedgerV1 {
                         report.exact_scope_sha256,
                         report.request_id,
                         i64::try_from(position).unwrap_or(i64::MAX),
-                        denied.candidate_id,
-                        denied.stable_memory_ref,
+                        retained_candidate_id,
+                        retained_stable_memory_ref,
                         denied.reason.label(),
                         reason_json,
                         denied.provider_claimed_scope_binding.as_wire(),
                         denied.provider_claimed_scope_sha256,
-                        denied.provider_claimed_temporal_state,
+                        retained_temporal_state(&denied.provider_claimed_temporal_state),
                     ],
                 )
                 .map_err(RecallAdmissionLedgerError::Sqlite)?;
@@ -580,12 +657,70 @@ impl RecallAdmissionLedgerV1 {
         trace: &RecallExplainTraceV1,
         metadata: Option<&control_attribution::PreparedRecallControlMetadataV1>,
     ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
-        if metadata.is_some_and(|value| !value.matches_trace(exact_scope_sha256, trace)) {
+        // The registry's trace id is an unsalted reconciliation digest. The
+        // retained ledger is a privacy boundary, so enforce the durable,
+        // scope/request/provider-bound projection here as well as in the
+        // production builder. This also prevents a legacy or alternate sink
+        // caller from parking a dictionary-recoverable trace id in SQLite.
+        if !control_attribution::is_lower_hex_sha256(exact_scope_sha256)
+            || OwnedProviderId::new(&trace.provider_id).is_err()
+            || trace.registration_revision == 0
+            || trace.registration_revision > i64::MAX as u64
+            || trace.requested_count != trace.items.len()
+            || trace.requested_count as u64 > PROJECT_RECALL_BUDGETS.maximum_candidates
+        {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
+        let expected_trace_id = control_attribution::retained_trace_id_with_key(
+            &self.locator_key,
+            exact_scope_sha256,
+            &trace.request_id,
+            &trace.provider_id,
+            trace.registration_revision,
+        );
+        if trace.trace_id != expected_trace_id {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
+        // The sink is the last durable boundary. Every provider identity must
+        // already be the context-bound opaque projection made by
+        // `harden_candidate_identities`; a missing or legacy alias is a typed
+        // refusal and can never be serialized into the ledger.
+        let mut candidate_ids = std::collections::BTreeSet::new();
+        if trace.items.iter().enumerate().any(|(rank, item)| {
+            item.provider_rank != rank
+                || item.stage != item.host_decision.stage()
+                || !candidate_ids.insert(item.candidate_id.as_str())
+                || control_attribution::validate_retained_trace_candidate_id(&item.candidate_id)
+                    .is_err()
+        }) {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
+        // Keep the denormalized reason columns tied to the typed host
+        // decision. A legacy row can otherwise retain a raw provider detail
+        // beside a valid-looking decision JSON and reintroduce it through the
+        // explain renderer after an additive schema upgrade.
+        if trace.items.iter().any(|item| {
+            item.host_reason_code != item.host_decision.code()
+                || item.host_reason_detail != item.host_decision.detail()
+        }) {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
+        if metadata
+            .is_some_and(|value| !value.matches_trace(exact_scope_sha256, trace, &self.locator_key))
+        {
             return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
         }
         let recorded_at = try_now_micros().map_err(RecallAdmissionLedgerError::Clock)?;
         let trace_bytes = serde_json::to_vec(trace).map_err(RecallAdmissionLedgerError::Encode)?;
         let trace_sha256 = tracedecay_domain::canonical_text::sha256_hex(&trace_bytes);
+        let trace_mac = control_attribution::retained_trace_bytes_mac(
+            &self.locator_key,
+            exact_scope_sha256,
+            &trace.trace_id,
+            &trace.provider_id,
+            trace.registration_revision,
+            &trace_bytes,
+        );
         let token_summary_json = match &trace.token_summary {
             None => None,
             Some(summary) => {
@@ -598,25 +733,69 @@ impl RecallAdmissionLedgerV1 {
                 .map_err(RecallAdmissionLedgerError::Encode)?;
             let provider_explanation_json = serde_json::to_string(&item.provider_explanation)
                 .map_err(RecallAdmissionLedgerError::Encode)?;
-            item_rows.push((item, host_decision_json, provider_explanation_json));
+            let item_bytes =
+                serde_json::to_vec(item).map_err(RecallAdmissionLedgerError::Encode)?;
+            let item_mac = control_attribution::retained_item_bytes_mac(
+                &self.locator_key,
+                exact_scope_sha256,
+                &trace.trace_id,
+                &trace.provider_id,
+                trace.registration_revision,
+                item.provider_rank,
+                &item.candidate_id,
+                &item_bytes,
+            );
+            item_rows.push((
+                item,
+                host_decision_json,
+                provider_explanation_json,
+                item_mac,
+            ));
         }
 
         let mut connection = self.connection();
         let transaction = connection
             .transaction()
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        let existing: Option<(String, Option<String>)> = transaction
+        let existing: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = transaction
             .query_row(
-                "SELECT trace_sha256, control_metadata_sha256 FROM recall_explain_traces
+                "SELECT trace_sha256, trace_mac, control_metadata_sha256,
+                        scope_binding_mac, control_metadata_mac
+                 FROM recall_explain_traces
                  WHERE exact_scope_sha256 = ?1 AND trace_id = ?2",
                 params![exact_scope_sha256, trace.trace_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        if let Some((existing, existing_metadata)) = existing {
+        if let Some((
+            existing,
+            existing_trace_mac,
+            existing_metadata,
+            existing_scope_mac,
+            existing_control_mac,
+        )) = existing
+        {
             return if existing == trace_sha256
+                && existing_trace_mac.as_deref() == Some(trace_mac.as_str())
                 && existing_metadata.as_deref() == metadata.map(|value| value.metadata_sha256())
+                && existing_scope_mac.as_deref() == metadata.map(|value| value.scope_binding_mac())
+                && existing_control_mac.as_deref()
+                    == metadata.map(|value| value.control_metadata_mac())
             {
                 Ok(RecallAdmissionLedgerWriteV1::AlreadyRecorded)
             } else {
@@ -631,26 +810,30 @@ impl RecallAdmissionLedgerV1 {
                 "INSERT INTO recall_explain_traces (
                      exact_scope_sha256, trace_id, request_id, provider_id,
                      registration_revision, requested_count, degraded, trace_sha256,
-                     token_summary_json, recorded_at_utc_micros,
-                     delivery_scope_json, control_metadata_sha256
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     trace_mac, token_summary_json, recorded_at_utc_micros,
+                     delivery_scope_json, scope_binding_mac, control_metadata_sha256,
+                     control_metadata_mac
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     exact_scope_sha256,
-                    trace.trace_id,
+                    &trace.trace_id,
                     trace.request_id,
                     trace.provider_id,
                     i64::try_from(trace.registration_revision).unwrap_or(i64::MAX),
                     i64::try_from(trace.requested_count).unwrap_or(i64::MAX),
                     i64::from(trace.degraded),
                     trace_sha256,
+                    trace_mac,
                     token_summary_json,
                     recorded_at.0,
                     metadata.map(|value| value.delivery_scope_json()),
+                    metadata.map(|value| value.scope_binding_mac()),
                     metadata.map(|value| value.metadata_sha256()),
+                    metadata.map(|value| value.control_metadata_mac()),
                 ],
             )
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        for (item, host_decision_json, provider_explanation_json) in &item_rows {
+        for (item, host_decision_json, provider_explanation_json, item_mac) in &item_rows {
             let binding = metadata.and_then(|value| value.item_sql(item.provider_rank));
             transaction
                 .execute(
@@ -658,8 +841,9 @@ impl RecallAdmissionLedgerV1 {
                          exact_scope_sha256, trace_id, provider_rank, candidate_id, stage,
                          host_reason_code, host_reason_detail, host_decision_json,
                          provider_explanation_json, section, tokens,
-                         stable_memory_ref, original_sources_json, control_binding_sha256
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                         stable_memory_ref, original_sources_json, control_binding_mac,
+                         item_mac
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         exact_scope_sha256,
                         trace.trace_id,
@@ -675,7 +859,8 @@ impl RecallAdmissionLedgerV1 {
                             .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
                         binding.map(|(reference, _, _)| reference),
                         binding.map(|(_, sources, _)| sources),
-                        binding.map(|(_, _, digest)| digest),
+                        binding.map(|(_, _, mac)| mac),
+                        item_mac,
                     ],
                 )
                 .map_err(RecallAdmissionLedgerError::Sqlite)?;
@@ -722,31 +907,45 @@ impl RecallAdmissionLedgerV1 {
     /// a retained row cannot be decoded back into its typed value.
     pub fn explain_trace(
         &self,
-        trace_id: &str,
+        trace: &control_attribution::RecallControlTraceRefV1,
     ) -> Result<Option<RetainedRecallExplainTraceV1>, RecallAdmissionLedgerError> {
         let connection = self.connection();
-        let header: Option<(String, String, String, i64, i64, i64, Option<String>, i64)> =
-            connection
-                .query_row(
-                    "SELECT exact_scope_sha256, request_id, provider_id, registration_revision,
-                            requested_count, degraded, token_summary_json, recorded_at_utc_micros
-                     FROM recall_explain_traces WHERE trace_id = ?1",
-                    params![trace_id],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                            row.get(5)?,
-                            row.get(6)?,
-                            row.get(7)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(RecallAdmissionLedgerError::Sqlite)?;
+        let header: Option<(
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+            i64,
+            Option<String>,
+        )> = connection
+            .query_row(
+                "SELECT exact_scope_sha256, request_id, provider_id, registration_revision,
+                            requested_count, degraded, trace_sha256, token_summary_json,
+                            recorded_at_utc_micros, trace_mac
+                     FROM recall_explain_traces
+                     WHERE exact_scope_sha256 = ?1 AND trace_id = ?2",
+                params![trace.exact_scope_sha256(), trace.trace_id()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(RecallAdmissionLedgerError::Sqlite)?;
         let Some((
             exact_scope_sha256,
             request_id,
@@ -754,12 +953,26 @@ impl RecallAdmissionLedgerV1 {
             registration_revision,
             requested_count,
             degraded,
+            trace_sha256,
             token_summary_json,
             recorded_at_utc_micros,
+            trace_mac,
         )) = header
         else {
             return Ok(None);
         };
+        let expected_trace_id = control_attribution::retained_trace_id_with_key(
+            &self.locator_key,
+            &exact_scope_sha256,
+            &request_id,
+            &provider_id,
+            u64::try_from(registration_revision).unwrap_or(0),
+        );
+        if trace.trace_id() != expected_trace_id {
+            // Additive upgrades can leave an older unsalted trace row in the
+            // same database. Quarantine it before decoding any item bytes.
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
         let token_summary: Option<RecallExplainTokenSummaryV1> = match token_summary_json {
             None => None,
             Some(encoded) => {
@@ -769,14 +982,14 @@ impl RecallAdmissionLedgerV1 {
         let mut statement = connection
             .prepare(
                 "SELECT provider_rank, candidate_id, host_reason_code, host_reason_detail,
-                        host_decision_json, provider_explanation_json, section, tokens
+                        host_decision_json, provider_explanation_json, section, tokens, item_mac
                  FROM recall_explain_trace_items
                  WHERE exact_scope_sha256 = ?1 AND trace_id = ?2
                  ORDER BY provider_rank ASC",
             )
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
         let rows = statement
-            .query_map(params![exact_scope_sha256, trace_id], |row| {
+            .query_map(params![exact_scope_sha256, trace.trace_id()], |row| {
                 let provider_rank: i64 = row.get(0)?;
                 let host_decision_json: String = row.get(4)?;
                 let provider_explanation_json: String = row.get(5)?;
@@ -790,6 +1003,7 @@ impl RecallAdmissionLedgerV1 {
                     provider_explanation_json,
                     row.get::<_, Option<String>>(6)?,
                     tokens.map(|tokens| u64::try_from(tokens).unwrap_or(0)),
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
@@ -804,6 +1018,7 @@ impl RecallAdmissionLedgerV1 {
                 provider_explanation_json,
                 section,
                 tokens,
+                item_mac,
             ) = row.map_err(RecallAdmissionLedgerError::Sqlite)?;
             let host_decision: RecallExplainHostDecisionV1 =
                 serde_json::from_str(&host_decision_json)
@@ -811,8 +1026,32 @@ impl RecallAdmissionLedgerV1 {
             let provider_explanation: RecallExplainProviderExplanationV1 =
                 serde_json::from_str(&provider_explanation_json)
                     .map_err(RecallAdmissionLedgerError::Decode)?;
+            // Upgrade-time additive migrations leave old rows in place. A
+            // legacy row may have a perfectly valid historical digest while
+            // still carrying a provider-controlled candidate id (or a raw
+            // dedup target). Quarantine the whole trace before any caller can
+            // render those bytes.
+            if control_attribution::validate_retained_trace_candidate_id(&candidate_id).is_err() {
+                return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+            }
+            if let RecallExplainHostDecisionV1::Deduplicated {
+                duplicate_of_candidate_id,
+                ..
+            } = &host_decision
+                && control_attribution::validate_retained_trace_candidate_id(
+                    duplicate_of_candidate_id,
+                )
+                .is_err()
+            {
+                return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+            }
+            if host_reason_code != host_decision.code()
+                || host_reason_detail != host_decision.detail()
+            {
+                return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+            }
             let stage: RecallExplainStageV1 = host_decision.stage();
-            items.push(RecallExplainItemV1 {
+            let item = RecallExplainItemV1 {
                 candidate_id,
                 provider_rank,
                 stage,
@@ -822,22 +1061,64 @@ impl RecallAdmissionLedgerV1 {
                 provider_explanation,
                 section,
                 tokens,
-            });
+            };
+            let item_mac = item_mac.ok_or(RecallAdmissionLedgerError::InvalidControlMetadata)?;
+            let item_bytes =
+                serde_json::to_vec(&item).map_err(RecallAdmissionLedgerError::Encode)?;
+            if !control_attribution::is_lower_hex_sha256(&item_mac)
+                || item_mac
+                    != control_attribution::retained_item_bytes_mac(
+                        &self.locator_key,
+                        &exact_scope_sha256,
+                        trace.trace_id(),
+                        &provider_id,
+                        u64::try_from(registration_revision).unwrap_or(0),
+                        item.provider_rank,
+                        &item.candidate_id,
+                        &item_bytes,
+                    )
+            {
+                return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+            }
+            items.push(item);
         }
         let degraded = degraded != 0;
+        let trace = RecallExplainTraceV1 {
+            trace_id: trace.trace_id().to_owned(),
+            request_id,
+            provider_id,
+            registration_revision: u64::try_from(registration_revision).unwrap_or(0),
+            requested_count: usize::try_from(requested_count).unwrap_or(0),
+            degraded,
+            items,
+            token_summary,
+        };
+        // The trace digest covers every externally rendered field. Treat a
+        // modified row as unavailable instead of returning attacker/provider
+        // bytes from a host-owned SQLite file, especially for candidate ids,
+        // dedup details, or explanation text.
+        let trace_bytes = serde_json::to_vec(&trace).map_err(RecallAdmissionLedgerError::Encode)?;
+        if tracedecay_domain::canonical_text::sha256_hex(&trace_bytes) != trace_sha256 {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
+        let trace_mac = trace_mac.ok_or(RecallAdmissionLedgerError::InvalidControlMetadata)?;
+        if !control_attribution::is_lower_hex_sha256(&trace_mac)
+            || trace_mac
+                != control_attribution::retained_trace_bytes_mac(
+                    &self.locator_key,
+                    &exact_scope_sha256,
+                    &trace.trace_id,
+                    &trace.provider_id,
+                    trace.registration_revision,
+                    &trace_bytes,
+                )
+        {
+            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
+        }
         Ok(Some(RetainedRecallExplainTraceV1 {
             exact_scope_sha256: exact_scope_sha256.clone(),
             recorded_at_utc_micros,
-            trace: RecallExplainTraceV1 {
-                trace_id: trace_id.to_owned(),
-                request_id,
-                provider_id,
-                registration_revision: u64::try_from(registration_revision).unwrap_or(0),
-                requested_count: usize::try_from(requested_count).unwrap_or(0),
-                degraded,
-                items,
-                token_summary,
-            },
+            trace,
         }))
     }
 
@@ -848,22 +1129,63 @@ impl RecallAdmissionLedgerV1 {
     /// Returns [`RecallAdmissionLedgerError`] when SQLite refuses the read.
     pub fn explain_trace_ids_for_request(
         &self,
+        exact_scope_sha256: &str,
         request_id: &str,
     ) -> Result<Vec<String>, RecallAdmissionLedgerError> {
-        let connection = self.connection();
-        let mut statement = connection
-            .prepare(
-                "SELECT trace_id FROM recall_explain_traces
-                 WHERE request_id = ?1
-                 ORDER BY recorded_at_utc_micros ASC, trace_id ASC",
-            )
-            .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        let rows = statement
-            .query_map(params![request_id], |row| row.get::<_, String>(0))
-            .map_err(RecallAdmissionLedgerError::Sqlite)?;
+        let candidates = {
+            let connection = self.connection();
+            let mut statement = connection
+                .prepare(
+                    "SELECT trace_id, provider_id, registration_revision
+                     FROM recall_explain_traces
+                     WHERE exact_scope_sha256 = ?1 AND request_id = ?2
+                     ORDER BY recorded_at_utc_micros ASC, trace_id ASC",
+                )
+                .map_err(RecallAdmissionLedgerError::Sqlite)?;
+            let rows = statement
+                .query_map(params![exact_scope_sha256, request_id], |row| {
+                    let trace: String = row.get(0)?;
+                    let provider: String = row.get(1)?;
+                    let registration_revision: i64 = row.get(2)?;
+                    Ok((trace, provider, registration_revision))
+                })
+                .map_err(RecallAdmissionLedgerError::Sqlite)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(RecallAdmissionLedgerError::Sqlite)?
+        };
         let mut identities = Vec::new();
-        for row in rows {
-            identities.push(row.map_err(RecallAdmissionLedgerError::Sqlite)?);
+        for (trace_id, provider_id, registration_revision) in candidates {
+            let Some(registration_revision) = u64::try_from(registration_revision)
+                .ok()
+                .filter(|revision| *revision > 0)
+            else {
+                continue;
+            };
+            let expected_trace_id = control_attribution::retained_trace_id_with_key(
+                &self.locator_key,
+                exact_scope_sha256,
+                request_id,
+                &provider_id,
+                registration_revision,
+            );
+            // Do not expose legacy trace references from an additive
+            // migration. The corresponding row remains available only to a
+            // future migration/quarantine job, never to this read surface.
+            if trace_id == expected_trace_id {
+                let wire = format!("recall-trace-v1:{exact_scope_sha256}:{trace_id}");
+                let Ok(reference) = control_attribution::RecallControlTraceRefV1::parse(&wire)
+                else {
+                    continue;
+                };
+                match self.explain_trace(&reference) {
+                    Ok(Some(_)) => identities.push(wire),
+                    Ok(None)
+                    | Err(RecallAdmissionLedgerError::InvalidTraceReference)
+                    | Err(RecallAdmissionLedgerError::InvalidControlMetadata)
+                    | Err(RecallAdmissionLedgerError::Decode(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(identities)
     }
@@ -898,34 +1220,51 @@ impl RecallAdmissionLedgerV1 {
              ORDER BY position ASC",
         )?;
         let rows = statement.query_map(params![exact_scope_sha256, request_id], |row| {
+            let candidate_id: String = row.get(0)?;
+            let stable_memory_ref: Option<String> = row.get(1)?;
             let reason_json: String = row.get(2)?;
-            let reason = serde_json::from_str(&reason_json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
             let binding_wire: String = row.get(3)?;
             let provider_claimed_scope_binding =
-                tracedecay_memory_provider_registry::ScopeBinding::from_wire(&binding_wire)
-                    .ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            format!("unknown recall scope binding {binding_wire:?}").into(),
-                        )
-                    })?;
-            Ok(tracedecay_memory_provider_registry::DeniedRecallCandidate {
-                candidate_id: row.get(0)?,
-                stable_memory_ref: row.get(1)?,
-                reason,
-                provider_claimed_scope_binding,
-                provider_claimed_scope_sha256: row.get(4)?,
-                provider_claimed_temporal_state: row.get(5)?,
-            })
+                tracedecay_memory_provider_registry::ScopeBinding::from_wire(&binding_wire);
+            let reason = serde_json::from_str::<RecallDenialReason>(&reason_json).ok();
+            // A schema upgrade is additive, so a pre-keyed denial can remain
+            // in this table. Do not let the read helper turn its raw candidate
+            // id, stable ref, or provider detail back into a retained result.
+            // Valid rows are canonicalized and compared to the sanitized wire
+            // before they cross this read boundary; malformed/legacy rows are
+            // withheld and remain available only to an offline migration.
+            let provider_claimed_scope_sha256: Option<String> = row.get(4)?;
+            let provider_claimed_temporal_state: String = row.get(5)?;
+            let retained = match (reason, provider_claimed_scope_binding) {
+                (Some(reason), Some(provider_claimed_scope_binding))
+                    if control_attribution::validate_retained_candidate_identity(&candidate_id)
+                        .is_ok()
+                        && stable_memory_ref
+                            .as_deref()
+                            .is_none_or(control_attribution::is_opaque_retained_memory_ref)
+                        && sanitized_denial_reason_json(&reason)
+                            .ok()
+                            .is_some_and(|sanitized| sanitized == reason_json) =>
+                {
+                    Some(tracedecay_memory_provider_registry::DeniedRecallCandidate {
+                        candidate_id,
+                        stable_memory_ref,
+                        reason,
+                        provider_claimed_scope_binding,
+                        provider_claimed_scope_sha256,
+                        provider_claimed_temporal_state,
+                    })
+                }
+                _ => None,
+            };
+            Ok(retained)
         })?;
-        rows.collect()
+        rows.filter_map(|row| match row {
+            Ok(Some(retained)) => Some(Ok(retained)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
     }
 }
 
@@ -1177,6 +1516,8 @@ pub(crate) struct CognitiveRecallMountInputsV1 {
     /// that stranded a worker under one session must stay refused under
     /// every other session too.
     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+    /// Durable host secret used for all retained identity/source projections.
+    pub(crate) locator_key: control_attribution::RecallLocatorKeyV1,
 }
 
 /// Per-call ownership visible to the lane's outer timeout. This holds only
@@ -1491,6 +1832,7 @@ pub struct ProjectCognitiveRecallMountV1 {
     graph: Arc<crate::tracedecay::TraceDecay>,
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
+    locator_key: control_attribution::RecallLocatorKeyV1,
     /// Composition-time binding only; provider selection stays in the registry.
     selected_history: OnceLock<SelectedProviderHistoryV1>,
 }
@@ -1647,6 +1989,12 @@ impl ProjectCognitiveRecallMountV1 {
         Arc::clone(&self.ledger)
     }
 
+    /// The context-bound projection key shared with retained control
+    /// authorization. The key material never crosses this module boundary.
+    pub(crate) fn locator_key(&self) -> &control_attribution::RecallLocatorKeyV1 {
+        &self.locator_key
+    }
+
     /// The host-pinned routing policy every session port routes under.
     #[must_use]
     pub fn routing(&self) -> &ActiveRoutingPolicy {
@@ -1796,9 +2144,8 @@ impl ProjectCognitiveRecallMountV1 {
     /// Reads back one retained explain trace for this project.
     ///
     /// This is the bounded inspection surface over the traces the mounted
-    /// recall journey retains: the ledger file is the project store's own, so
-    /// a trace identity is a project-scoped address and no other project's
-    /// recall is reachable through it.
+    /// recall journey retains. The mounted scope is part of the query key, so
+    /// a request id reused by another checkout cannot enumerate its traces.
     ///
     /// # Errors
     ///
@@ -1806,9 +2153,19 @@ impl ProjectCognitiveRecallMountV1 {
     /// retained row cannot be decoded.
     pub fn explain_trace(
         &self,
-        trace_id: &str,
+        trace_ref: &str,
     ) -> Result<Option<RetainedRecallExplainTraceV1>, RecallAdmissionLedgerError> {
-        self.ledger.explain_trace(trace_id)
+        let trace = control_attribution::RecallControlTraceRefV1::parse(trace_ref)
+            .map_err(|_| RecallAdmissionLedgerError::InvalidTraceReference)?;
+        // The ledger is shared by the mounted route, so its `(scope, trace)`
+        // query alone is insufficient when a caller supplies a syntactically
+        // valid reference for another scope. Keep the public mount boundary
+        // exact as well; a foreign trace can never be read through this
+        // mount, even if it was inserted into the same SQLite file.
+        if trace.exact_scope_sha256() != self.scope.scope_digest.as_str() {
+            return Ok(None);
+        }
+        self.ledger.explain_trace(&trace)
     }
 
     /// Every retained trace identity for one request in this project, oldest
@@ -1821,7 +2178,8 @@ impl ProjectCognitiveRecallMountV1 {
         &self,
         request_id: &str,
     ) -> Result<Vec<String>, RecallAdmissionLedgerError> {
-        self.ledger.explain_trace_ids_for_request(request_id)
+        self.ledger
+            .explain_trace_ids_for_request(self.scope.scope_digest.as_str(), request_id)
     }
 
     /// Mints the recall port for one canonical host session.
@@ -2581,7 +2939,6 @@ async fn advisory_context_recall_with_retention(
             ),
         })
         .collect();
-    let mut pack_identity_aliases: BTreeMap<String, String> = BTreeMap::new();
     let original_sources = outcome.original_sources;
     // Confirm the actual canonical records again after provider execution.
     // A missing source or changed privacy disposition can never be rescued by
@@ -2698,6 +3055,26 @@ async fn advisory_context_recall_with_retention(
                 format!("untrusted-memory gate could not be built: {fault}"),
             );
         }
+    };
+    // The provider's candidate ids are untrusted metadata just like its
+    // explanation text. Build the complete raw-to-retained identity map
+    // before any candidate can enter an explain trace, including ids that
+    // admission denied or a host stage later withholds. Stage matching keeps
+    // using the raw ids in the in-memory receipts; the trace builder applies
+    // these aliases only when it creates retained/rendered fields.
+    let pack_identity_aliases = if let Some(report) = explain_report.as_ref() {
+        match harden_candidate_identities(&untrusted_gate, report, &mount.locator_key) {
+            Ok(aliases) => aliases,
+            Err(fault) => {
+                return untrusted_gate_faulted(
+                    routed_provider,
+                    routed_registration_revision,
+                    &fault,
+                );
+            }
+        }
+    } else {
+        BTreeMap::new()
     };
     // Provider explanations are provider-controlled bytes. They reach the
     // explain trace only through the same gate the agent-visible line passes,
@@ -2831,22 +3208,14 @@ async fn advisory_context_recall_with_retention(
                 );
             }
         };
-        let identity = match harden_candidate_identity(&untrusted_gate, candidate.candidate_id()) {
-            Ok(identity) => identity,
-            Err(fault) => {
-                return untrusted_gate_faulted(
-                    routed_provider,
-                    routed_registration_revision,
-                    &fault,
-                );
-            }
+        let Some(identity) = pack_identity_aliases.get(candidate.candidate_id()).cloned() else {
+            return AdvisoryMemoryContextV1::unavailable(
+                routed_provider.clone(),
+                routed_registration_revision,
+                AdvisoryRecallUnavailableV1::UntrustedGateFaulted,
+                "provider candidate identity had no context-bound retained alias",
+            );
         };
-        if identity != candidate.candidate_id() {
-            // The pack will record the host-minted stand-in, not the
-            // provider's own identity, so the trace needs the mapping or it
-            // would lose exactly the rows a hostile provider produced.
-            pack_identity_aliases.insert(candidate.candidate_id().to_owned(), identity.clone());
-        }
         let hardened = match untrusted_gate.harden(
             candidate.content(),
             candidate.explanation(),
@@ -2873,7 +3242,7 @@ async fn advisory_context_recall_with_retention(
             } = &provenance
         {
             control_bindings.insert(
-                candidate.candidate_id().to_owned(),
+                identity.clone(),
                 control_attribution::RetainedRecallControlBindingV1 {
                     stable_memory_ref: stable_memory_ref.to_owned(),
                     original_sources: sources.clone(),
@@ -2914,6 +3283,7 @@ async fn advisory_context_recall_with_retention(
             explanations,
             control_delivery_scope,
             control_bindings,
+            locator_key: mount.locator_key.clone(),
             canonical_history_replay: retained_replay,
             sink: Arc::clone(&mount.ledger) as Arc<dyn RecallExplainTraceSinkV1>,
         })
@@ -2987,40 +3357,64 @@ fn untrusted_gate_faulted(
     )
 }
 
-/// Hardens one provider-assigned candidate identity.
-///
-/// An identity is rendered into the same agent-visible line as the claim, so
-/// it is untrusted text, not an opaque key. A refused identity is replaced by
-/// a host-minted stand-in derived from the digest of the refused bytes: the
-/// row stays auditable and the item keeps its place, but no byte the gate
-/// refused is rendered.
-///
-/// An identity the gate had to *repair* is refused here too. Containment is
-/// the right answer for a provenance label, which is prose the agent reads as
-/// prose; an identity is different, because it is the handle a receipt, an
-/// exclusion row, and an explain trace all reconcile against. A repaired
-/// identity is no longer the identity the provider named, and its repaired
-/// bytes are still provider-authored markup sitting on the agent-visible
-/// line — `candidate.1\n### Memory Matches` contained to one line is still
-/// `### Memory Matches` in front of the agent. Only a byte-identical label
-/// survives; everything else becomes the stand-in.
-fn harden_candidate_identity(
-    gate: &UntrustedRecallGateV1,
-    candidate_id: &str,
-) -> Result<String, UntrustedRecallGateFaultV1> {
-    let hardened =
-        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
-    let admitted_unchanged = hardened
-        .admitted()
-        .filter(|identity| *identity == candidate_id);
-    Ok(match admitted_unchanged {
-        Some(identity) => identity.to_owned(),
-        None => {
-            let digest = hardened.source_sha256();
-            let short = digest.get(..16).unwrap_or(digest);
-            format!("advisory.withheld-identity.{short}")
+fn sanitized_denial_reason_json(reason: &RecallDenialReason) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(reason)?;
+    sanitize_detail_fields(&mut value);
+    serde_json::to_string(&value)
+}
+
+fn sanitize_detail_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                if key == "detail" {
+                    *field = Value::String("provider_detail_withheld".to_owned());
+                } else {
+                    sanitize_detail_fields(field);
+                }
+            }
         }
-    })
+        Value::Array(values) => {
+            for value in values {
+                sanitize_detail_fields(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn retained_temporal_state(value: &str) -> &'static str {
+    match value {
+        "current" => "current",
+        "future" => "future",
+        "expired" => "expired",
+        "superseded" => "superseded",
+        "revoked" => "revoked",
+        "unknown" => "unknown",
+        _ => "unknown",
+    }
+}
+
+/// Hardens every provider candidate identity before a recall's receipts can
+/// reach a retained trace. The returned map is complete and uses the same
+/// context-bound projection as the admission denial ledger, including entries
+/// for identities that would otherwise survive byte-identically. Downstream
+/// builders therefore never need a raw-id fallback.
+fn harden_candidate_identities(
+    gate: &UntrustedRecallGateV1,
+    report: &RecallAdmissionReport,
+    locator_key: &control_attribution::RecallLocatorKeyV1,
+) -> Result<BTreeMap<String, String>, UntrustedRecallGateFaultV1> {
+    let aliases =
+        control_attribution::retained_candidate_identity_aliases_for_report(report, locator_key);
+    for candidate_id in &report.received_candidate_ids {
+        // The gate still evaluates every provider id, even though the
+        // retained projection is opaque for all ids. A classifier refusal is
+        // represented by the same opaque projection rather than by a raw or
+        // repaired provider string.
+        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
+    }
+    Ok(aliases)
 }
 
 /// Hardens every provider-controlled string inside one provenance state.
@@ -3136,8 +3530,9 @@ pub(crate) fn mount_project_cognitive_recall(
             }
         })?
     };
-    let ledger = Arc::new(RecallAdmissionLedgerV1::open(
+    let ledger = Arc::new(RecallAdmissionLedgerV1::open_with_key(
         inputs.store_data_root.join(LEDGER_FILE_NAME),
+        inputs.locator_key.clone(),
     )?);
     Ok(Arc::new(ProjectCognitiveRecallMountV1 {
         composition: inputs.composition,
@@ -3149,6 +3544,7 @@ pub(crate) fn mount_project_cognitive_recall(
         graph: inputs.graph,
         routing: inputs.routing,
         host_limits: inputs.host_limits,
+        locator_key: inputs.locator_key,
         selected_history: OnceLock::new(),
     }))
 }
@@ -3656,6 +4052,7 @@ pub struct AdvisoryRecallExplainV1 {
     explanations: BTreeMap<String, RecallExplainProviderExplanationV1>,
     control_delivery_scope: Option<OwnedExactScope>,
     control_bindings: BTreeMap<String, control_attribution::RetainedRecallControlBindingV1>,
+    locator_key: control_attribution::RecallLocatorKeyV1,
     canonical_history_replay: Option<Arc<RetainedCanonicalHistoryReplayV1>>,
     sink: Arc<dyn RecallExplainTraceSinkV1>,
 }
@@ -3769,7 +4166,7 @@ impl AdvisoryRecallExplainV1 {
                 });
             }
         }
-        let trace = match build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        let mut trace = match build_recall_explain_trace(RecallExplainTraceInputsV1 {
             provider_id: &self.attributed_provider,
             registration_revision: self.registration_revision,
             report: &self.report,
@@ -3792,14 +4189,25 @@ impl AdvisoryRecallExplainV1 {
                 return None;
             }
         };
+        // The registry trace id is deterministic for in-memory reconciliation,
+        // but it is an unsalted digest of request metadata. Replace it before
+        // any trace reference or control metadata can cross the host boundary.
+        trace.trace_id = control_attribution::retained_trace_id_with_key(
+            &self.locator_key,
+            &self.exact_scope_sha256,
+            &self.report.request_id,
+            &self.attributed_provider,
+            self.registration_revision,
+        );
         let metadata = match self
             .control_delivery_scope
             .as_ref()
             .map(|scope| {
-                control_attribution::PreparedRecallControlMetadataV1::prepare(
+                control_attribution::PreparedRecallControlMetadataV1::prepare_with_key(
                     &trace,
                     scope,
                     &self.control_bindings,
+                    &self.locator_key,
                 )
             })
             .transpose()
@@ -3834,10 +4242,7 @@ impl AdvisoryRecallExplainV1 {
             let Some(item_ref) = metadata.item_ref(rank) else {
                 continue;
             };
-            let identity = self
-                .pack_identity_aliases
-                .get(candidate_id)
-                .unwrap_or(candidate_id);
+            let identity = self.pack_identity_aliases.get(candidate_id)?;
             if references
                 .insert(
                     identity.clone(),
@@ -4901,6 +5306,24 @@ mod advisory_rendering_tests {
     /// These are unit tests of the seam, not proof that production mounts it.
     /// The end-to-end proof lives in the mounted-journey suite below, which
     /// drives a real provider through `advisory_context_recall`.
+    fn harden_test_candidate_identity(
+        gate: &UntrustedRecallGateV1,
+        candidate_id: &str,
+    ) -> Result<String, UntrustedRecallGateFaultV1> {
+        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
+        let key = control_attribution::RecallLocatorKeyV1::for_test();
+        Ok(
+            control_attribution::retained_candidate_identity_alias_for_context(
+                &key,
+                &"b".repeat(64),
+                "request.test-identity",
+                "provider.native",
+                4,
+                candidate_id,
+            ),
+        )
+    }
+
     fn hardened_lane(
         candidate_id: &str,
         content: &str,
@@ -4908,7 +5331,8 @@ mod advisory_rendering_tests {
     ) -> AdvisoryMemoryContextV1 {
         let gate = UntrustedRecallGateV1::open().expect("untrusted-memory gate");
         let provenance = harden_provenance(&gate, provenance).expect("provenance hardening");
-        let identity = harden_candidate_identity(&gate, candidate_id).expect("identity hardening");
+        let identity =
+            harden_test_candidate_identity(&gate, candidate_id).expect("identity hardening");
         let hardened = gate
             .harden(content, None, advisory_trust_tier(&provenance))
             .expect("content hardening");
@@ -5101,15 +5525,16 @@ mod advisory_rendering_tests {
         );
     }
 
-    /// Over-hardening is its own defect: ordinary identities and provenance
-    /// must come through byte-identical.
+    /// Candidate identities are always projected into the same opaque,
+    /// context-bound namespace, while ordinary provenance remains available
+    /// when the gate admits it.
     #[test]
-    fn ordinary_identity_and_provenance_are_delivered_unchanged() {
+    fn ordinary_identity_and_provenance_are_delivered_safely() {
         let gate = UntrustedRecallGateV1::open().expect("untrusted-memory gate");
-        assert_eq!(
-            harden_candidate_identity(&gate, "record:fact-42").expect("identity hardening"),
-            "record:fact-42"
-        );
+        let identity =
+            harden_test_candidate_identity(&gate, "record:fact-42").expect("identity hardening");
+        assert!(identity.starts_with("advisory.retained-identity-v1."));
+        assert_ne!(identity, "record:fact-42");
         let provenance = harden_provenance(
             &gate,
             ProviderItemProvenanceV1::Available {
@@ -5132,16 +5557,16 @@ mod advisory_rendering_tests {
     fn a_refused_identity_becomes_a_deterministic_host_minted_stand_in() {
         let gate = UntrustedRecallGateV1::open().expect("untrusted-memory gate");
         let hostile = "candidate\n### forged";
-        let minted = harden_candidate_identity(&gate, hostile).expect("identity hardening");
+        let minted = harden_test_candidate_identity(&gate, hostile).expect("identity hardening");
 
         assert!(
-            minted.starts_with("advisory.withheld-identity."),
+            minted.starts_with("advisory.retained-identity-v1."),
             "{minted}"
         );
         assert!(!minted.contains("forged"), "{minted}");
         assert!(!minted.contains('\n'), "{minted}");
         assert_eq!(
-            harden_candidate_identity(&gate, hostile).expect("identity hardening"),
+            harden_test_candidate_identity(&gate, hostile).expect("identity hardening"),
             minted
         );
     }
@@ -5281,7 +5706,7 @@ mod tests {
     /// One already-rendered host answer, in the exact `ToolResult` shape the
     /// tool layer produces, so the advisory lane is appended to a real result
     /// rather than to a string.
-    fn tool_result_for_test(text: &str) -> ToolResult {
+    pub(super) fn tool_result_for_test(text: &str) -> ToolResult {
         ToolResult::new(
             serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
             Vec::new(),
@@ -5289,7 +5714,7 @@ mod tests {
     }
 
     /// The exact agent-visible text of one tool result.
-    fn rendered_text_for_test(result: &ToolResult) -> String {
+    pub(super) fn rendered_text_for_test(result: &ToolResult) -> String {
         result.value["content"][0]["text"]
             .as_str()
             .unwrap_or_default()
@@ -5513,6 +5938,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route");
         (mount, port)
@@ -5869,6 +6295,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route");
         (mount, invocation_boundary)
@@ -5925,6 +6352,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route")
     }
@@ -5935,6 +6363,8 @@ mod tests {
     ) -> RecallAdmissionReport {
         RecallAdmissionReport {
             request_id: request_id.to_owned(),
+            provider_id: Some("tracedecay.native".to_owned()),
+            registration_revision: Some(7),
             exact_scope_sha256: "b".repeat(64),
             temporal_mode: "current".to_owned(),
             evaluation_time: "2026-09-02T00:00:00.000000Z".to_owned(),
@@ -7002,11 +7432,11 @@ mod tests {
     #[test]
     fn ledger_retains_denials_without_content_and_refuses_divergent_replays() {
         let temporary = tempfile::tempdir().expect("ledger root");
-        let ledger = RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME))
-            .expect("open ledger");
+        let path = temporary.path().join(LEDGER_FILE_NAME);
+        let ledger = RecallAdmissionLedgerV1::open(path.clone()).expect("open ledger");
         let denied = vec![
             DeniedRecallCandidate {
-                candidate_id: "request.ledger:cross-worktree".to_owned(),
+                candidate_id: "source:/private/Authorization-Bearer-SECRET-9a7f".to_owned(),
                 stable_memory_ref: Some("memory:cross-worktree".to_owned()),
                 reason: RecallDenialReason::ScopeMismatch {
                     field: ScopeField::WorktreeIdentity,
@@ -7016,7 +7446,7 @@ mod tests {
                 provider_claimed_temporal_state: "current".to_owned(),
             },
             DeniedRecallCandidate {
-                candidate_id: "request.ledger:revoked".to_owned(),
+                candidate_id: "source:/private/revoked-token.json#L7".to_owned(),
                 stable_memory_ref: None,
                 reason: RecallDenialReason::Revoked,
                 provider_claimed_scope_binding: ScopeBinding::ProjectFacts,
@@ -7024,7 +7454,7 @@ mod tests {
                 provider_claimed_temporal_state: "revoked".to_owned(),
             },
             DeniedRecallCandidate {
-                candidate_id: "request.ledger:checkout-session-claim".to_owned(),
+                candidate_id: "source:/private/session-claim.env#L3".to_owned(),
                 stable_memory_ref: Some("memory:checkout".to_owned()),
                 reason: RecallDenialReason::ForbiddenIdentity {
                     field: ScopeField::AgentSessionId,
@@ -7032,6 +7462,16 @@ mod tests {
                 provider_claimed_scope_binding: ScopeBinding::CheckoutObservations,
                 provider_claimed_scope_sha256: None,
                 provider_claimed_temporal_state: "current".to_owned(),
+            },
+            DeniedRecallCandidate {
+                candidate_id: "source:/private/provider-detail.json#L11".to_owned(),
+                stable_memory_ref: None,
+                reason: RecallDenialReason::InvalidSourceAttribution {
+                    detail: "source:/private/Authorization-Bearer-SECRET-detail".to_owned(),
+                },
+                provider_claimed_scope_binding: ScopeBinding::ExactCodingScope,
+                provider_claimed_scope_sha256: None,
+                provider_claimed_temporal_state: "unknown".to_owned(),
             },
         ];
         let report = ledger_report("request.ledger", denied.clone());
@@ -7043,12 +7483,36 @@ mod tests {
             ledger.record(&report).expect("identical replay"),
             RecallAdmissionLedgerWriteV1::AlreadyRecorded
         );
-        assert_eq!(
-            ledger
-                .denied_candidates(&report.exact_scope_sha256, "request.ledger")
-                .expect("denial rows"),
-            denied
-        );
+        let retained_denials = ledger
+            .denied_candidates(&report.exact_scope_sha256, "request.ledger")
+            .expect("denial rows");
+        assert_eq!(retained_denials.len(), denied.len());
+        let retained_json = serde_json::to_string(&retained_denials).expect("retained denials");
+        for (raw, retained) in denied.iter().zip(&retained_denials) {
+            assert_eq!(
+                retained.candidate_id,
+                control_attribution::retained_candidate_identity_alias_for_report(
+                    &report,
+                    ledger.locator_key(),
+                    &raw.candidate_id,
+                )
+            );
+            assert_ne!(retained.candidate_id, raw.candidate_id);
+            assert!(
+                !retained_json.contains(&raw.candidate_id),
+                "raw denied candidate id reached SQLite projection: {raw:?}: {retained_json}"
+            );
+            if let Some(raw_ref) = raw.stable_memory_ref.as_deref() {
+                assert!(
+                    retained.stable_memory_ref.as_deref().is_some_and(|value| {
+                        value.starts_with("recall-memory-ref-v1:") && !value.contains(raw_ref)
+                    }),
+                    "raw denial stable ref reached SQLite projection: {raw_ref:?}: {retained_json}"
+                );
+            }
+        }
+        assert!(retained_json.contains("provider_detail_withheld"));
+        assert!(!retained_json.contains("Authorization-Bearer-SECRET-detail"));
         let divergent = ledger_report("request.ledger", Vec::new());
         assert!(matches!(
             ledger.record(&divergent),
@@ -7067,6 +7531,309 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("column names");
         assert!(!columns.iter().any(|column| column.contains("content")));
+        drop(statement);
+        drop(connection);
+        drop(ledger);
+
+        // The privacy boundary survives a real close/reopen, rather than only
+        // the in-process projection above. Read the durable rows again and
+        // assert that the provider ids never reappear after SQLite recovery.
+        let reopened = RecallAdmissionLedgerV1::open(path).expect("reopen ledger");
+        let reopened_denials = reopened
+            .denied_candidates(&report.exact_scope_sha256, "request.ledger")
+            .expect("reopened denial rows");
+        assert_eq!(reopened_denials, retained_denials);
+        let reopened_json = serde_json::to_string(&reopened_denials).expect("reopened denials");
+        for raw in &denied {
+            assert!(!reopened_json.contains(&raw.candidate_id));
+        }
+    }
+
+    #[test]
+    fn legacy_raw_denial_rows_are_withheld_after_reopen() {
+        let temporary = tempfile::tempdir().expect("ledger root");
+        let path = temporary.path().join(LEDGER_FILE_NAME);
+        let ledger = RecallAdmissionLedgerV1::open(path.clone()).expect("open ledger");
+        let raw_candidate = "source:/private/legacy-denial-secret";
+        let raw_ref = "memory:/private/legacy-denial-ref";
+        let report = ledger_report(
+            "request.legacy-denial",
+            vec![DeniedRecallCandidate {
+                candidate_id: raw_candidate.to_owned(),
+                stable_memory_ref: Some(raw_ref.to_owned()),
+                reason: RecallDenialReason::InvalidSourceAttribution {
+                    detail: raw_ref.to_owned(),
+                },
+                provider_claimed_scope_binding: ScopeBinding::ExactCodingScope,
+                provider_claimed_scope_sha256: None,
+                provider_claimed_temporal_state: "unknown".to_owned(),
+            }],
+        );
+        ledger.record(&report).expect("record denial");
+
+        // Emulate a pre-keyed row left behind by an additive upgrade. The
+        // report row remains valid, but its denial projection is no longer a
+        // safe retained identity and must be quarantined on every read.
+        let raw_reason = serde_json::to_string(&RecallDenialReason::InvalidSourceAttribution {
+            detail: raw_ref.to_owned(),
+        })
+        .expect("raw denial reason JSON");
+        ledger
+            .connection()
+            .execute(
+                "UPDATE recall_admission_denials
+                 SET candidate_id=?1, stable_memory_ref=?2, reason_json=?3
+                 WHERE exact_scope_sha256=?4 AND request_id=?5",
+                params![
+                    raw_candidate,
+                    raw_ref,
+                    raw_reason,
+                    report.exact_scope_sha256,
+                    report.request_id,
+                ],
+            )
+            .expect("inject legacy denial row");
+        assert!(
+            ledger
+                .denied_candidates(&report.exact_scope_sha256, &report.request_id)
+                .expect("legacy denial read")
+                .is_empty()
+        );
+        drop(ledger);
+
+        let reopened = RecallAdmissionLedgerV1::open(path).expect("reopen ledger");
+        let retained = reopened
+            .denied_candidates(&report.exact_scope_sha256, &report.request_id)
+            .expect("reopened legacy denial read");
+        assert!(retained.is_empty(), "legacy denial leaked: {retained:?}");
+    }
+
+    #[test]
+    fn retained_candidate_aliases_disambiguate_raw_id_collisions() {
+        let mut report = ledger_report("request.alias-collision", Vec::new());
+        report.received_count = 1;
+        report.received_candidate_ids = vec!["source.secret-value".to_owned()];
+        let key = control_attribution::RecallLocatorKeyV1::for_test();
+        let base = control_attribution::retained_candidate_identity_alias_for_report(
+            &report,
+            &key,
+            &report.received_candidate_ids[0],
+        );
+        report.received_count = 2;
+        report.received_candidate_ids.push(base.clone());
+        let aliases =
+            control_attribution::retained_candidate_identity_aliases_for_report(&report, &key);
+        assert_eq!(aliases["source.secret-value"], format!("{base}.1"));
+        assert_ne!(aliases["source.secret-value"], aliases[&base]);
+        assert!(aliases.values().all(|alias| {
+            control_attribution::validate_retained_trace_candidate_id(alias).is_ok()
+        }));
+    }
+
+    #[test]
+    fn explain_trace_listing_is_bound_to_the_requested_scope() {
+        let temporary = tempfile::tempdir().expect("ledger root");
+        let ledger = RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME))
+            .expect("open ledger");
+        let request_id = "request.shared-across-scopes";
+        let first_scope = "b".repeat(64);
+        let second_scope = "c".repeat(64);
+        let trace_for_scope = |scope: &str| RecallExplainTraceV1 {
+            trace_id: control_attribution::retained_trace_id_with_key(
+                ledger.locator_key(),
+                scope,
+                request_id,
+                NATIVE_PROVIDER_ID,
+                1,
+            ),
+            request_id: request_id.to_owned(),
+            provider_id: NATIVE_PROVIDER_ID.to_owned(),
+            registration_revision: 1,
+            requested_count: 0,
+            degraded: false,
+            items: Vec::new(),
+            token_summary: None,
+        };
+        let first_trace = trace_for_scope(&first_scope);
+        let second_trace = trace_for_scope(&second_scope);
+        ledger
+            .retain_explain_trace(&first_scope, &first_trace)
+            .expect("first scope trace");
+        ledger
+            .retain_explain_trace(&second_scope, &second_trace)
+            .expect("second scope trace");
+
+        assert_eq!(
+            ledger
+                .explain_trace_ids_for_request(&first_scope, request_id)
+                .expect("first scope trace ids"),
+            vec![format!(
+                "recall-trace-v1:{first_scope}:{}",
+                first_trace.trace_id
+            )]
+        );
+        assert_eq!(
+            ledger
+                .explain_trace_ids_for_request(&second_scope, request_id)
+                .expect("second scope trace ids"),
+            vec![format!(
+                "recall-trace-v1:{second_scope}:{}",
+                second_trace.trace_id
+            )]
+        );
+        assert!(
+            ledger
+                .explain_trace_ids_for_request(&"d".repeat(64), request_id)
+                .expect("unrelated scope trace ids")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mounted_explain_read_refuses_a_foreign_scope_in_a_shared_ledger() {
+        let fixture = project_fixture().await;
+        let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
+        let foreign_scope = resolved_scope(&fixture.project_id, "worktree.foreign");
+        let request_id = "request.foreign-mounted-trace";
+        let trace = RecallExplainTraceV1 {
+            trace_id: control_attribution::retained_trace_id_with_key(
+                mount.ledger.locator_key(),
+                foreign_scope.scope_digest.as_str(),
+                request_id,
+                NATIVE_PROVIDER_ID,
+                1,
+            ),
+            request_id: request_id.to_owned(),
+            provider_id: NATIVE_PROVIDER_ID.to_owned(),
+            registration_revision: 1,
+            requested_count: 0,
+            degraded: false,
+            items: Vec::new(),
+            token_summary: None,
+        };
+        mount
+            .ledger
+            .retain_explain_trace(foreign_scope.scope_digest.as_str(), &trace)
+            .expect("foreign trace fixture");
+        let trace_ref = control_attribution::RecallControlTraceRefV1::parse(&format!(
+            "recall-trace-v1:{}:{}",
+            foreign_scope.scope_digest, trace.trace_id
+        ))
+        .expect("foreign trace reference");
+        assert!(mount.ledger.explain_trace(&trace_ref).unwrap().is_some());
+        assert!(mount.explain_trace(trace_ref.as_str()).unwrap().is_none());
+    }
+
+    #[test]
+    fn explain_read_refuses_tampered_retained_identity_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(
+            RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME)).unwrap(),
+        );
+        let (lane, _scope, _source) =
+            history_recall_tests::control_output_fixture(ledger.clone(), "request.tampered");
+        let delivered = lane.appended_to(ToolResult::new(
+            json!({"content": [{"type": "text", "text": "{\"answer\":true}"}]}),
+            Vec::new(),
+        ));
+        let payload: Value =
+            serde_json::from_str(delivered.value["content"][0]["text"].as_str().unwrap()).unwrap();
+        let trace_ref = payload[ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"]["trace_ref"]
+            .as_str()
+            .unwrap();
+        let trace_ref = control_attribution::RecallControlTraceRefV1::parse(trace_ref).unwrap();
+        assert!(ledger.explain_trace(&trace_ref).is_ok());
+        let mut legacy_trace = ledger.explain_trace(&trace_ref).unwrap().unwrap().trace;
+        legacy_trace.items[2].candidate_id = "provider-secret:/private/credential.json".to_owned();
+        legacy_trace.items[2].host_reason_detail =
+            Some("provider-secret:/private/credential.json".to_owned());
+        let legacy_digest = tracedecay_domain::canonical_text::sha256_hex(
+            &serde_json::to_vec(&legacy_trace).unwrap(),
+        );
+        ledger
+            .connection()
+            .execute(
+                "UPDATE recall_explain_trace_items
+                 SET candidate_id=?1, host_reason_detail=?2
+                 WHERE provider_rank=2",
+                [
+                    "provider-secret:/private/credential.json".to_owned(),
+                    "provider-secret:/private/credential.json".to_owned(),
+                ],
+            )
+            .unwrap();
+        ledger
+            .connection()
+            .execute(
+                "UPDATE recall_explain_traces SET trace_sha256=?1",
+                [legacy_digest],
+            )
+            .unwrap();
+        // The read path verifies the digest over the complete externally
+        // rendered trace and rejects legacy candidate identities before
+        // returning it. A matching historical digest therefore cannot make a
+        // provider-controlled id/detail render after an upgrade.
+        assert!(matches!(
+            ledger.explain_trace(&trace_ref),
+            Err(RecallAdmissionLedgerError::InvalidControlMetadata)
+        ));
+    }
+
+    #[test]
+    fn legacy_unsalted_trace_rows_are_withheld_from_reads_and_listings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let ledger = RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME))
+            .expect("open ledger");
+        let exact_scope_sha256 = "e".repeat(64);
+        let request_id = "request.legacy-trace";
+        let provider_id = NATIVE_PROVIDER_ID;
+        let registration_revision = 1_i64;
+        let trace_id = "f".repeat(64);
+        let legacy_trace = RecallExplainTraceV1 {
+            trace_id: trace_id.clone(),
+            request_id: request_id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            registration_revision: registration_revision as u64,
+            requested_count: 0,
+            degraded: false,
+            items: Vec::new(),
+            token_summary: None,
+        };
+        let trace_sha256 = tracedecay_domain::canonical_text::sha256_hex(
+            &serde_json::to_vec(&legacy_trace).expect("legacy trace JSON"),
+        );
+        ledger
+            .connection()
+            .execute(
+                "INSERT INTO recall_explain_traces (
+                     exact_scope_sha256, trace_id, request_id, provider_id,
+                     registration_revision, requested_count, degraded, trace_sha256,
+                     token_summary_json, recorded_at_utc_micros
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, NULL, 1)",
+                params![
+                    exact_scope_sha256,
+                    trace_id,
+                    request_id,
+                    provider_id,
+                    registration_revision,
+                    trace_sha256,
+                ],
+            )
+            .expect("insert legacy trace row");
+        let trace_ref = control_attribution::RecallControlTraceRefV1::parse(&format!(
+            "recall-trace-v1:{exact_scope_sha256}:{trace_id}"
+        ))
+        .expect("legacy trace reference shape");
+        assert!(matches!(
+            ledger.explain_trace(&trace_ref),
+            Err(RecallAdmissionLedgerError::InvalidControlMetadata)
+        ));
+        assert!(
+            ledger
+                .explain_trace_ids_for_request(&exact_scope_sha256, request_id)
+                .expect("legacy trace listing")
+                .is_empty()
+        );
     }
 
     /// One real context answer, compiled through the mounted route, keeps
@@ -7184,7 +7951,7 @@ mod tests {
         .expect("recall trace metadata");
         assert_eq!(pack.recall_trace.as_ref(), Some(&emitted));
         let retained = mount
-            .explain_trace(emitted.trace_ref.rsplit(':').next().unwrap())
+            .explain_trace(&emitted.trace_ref)
             .expect("retained trace read")
             .expect("the emitted trace was retained before publication");
         assert_eq!(retained.trace.request_id, emitted.request_id);
@@ -7860,6 +8627,7 @@ mod tests {
 #[cfg(test)]
 mod history_recall_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::control_attribution::RecallControlTraceRefV1;
     use super::*;
     use tracedecay_memory_provider_registry::{
         CurrentSourceDisposition, GrantedHistorySource, HistoryRelation,
@@ -8158,9 +8926,26 @@ mod history_recall_tests {
         assert!(control.cancellation.is_cancelled());
     }
 
+    fn harden_test_candidate_identity(
+        gate: &UntrustedRecallGateV1,
+        candidate_id: &str,
+    ) -> Result<String, UntrustedRecallGateFaultV1> {
+        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
+        Ok(
+            control_attribution::retained_candidate_identity_alias_for_context(
+                &control_attribution::RecallLocatorKeyV1::for_test(),
+                &"b".repeat(64),
+                "request.test-identity",
+                "provider.native",
+                4,
+                candidate_id,
+            ),
+        )
+    }
+
     /// Drives real canonical admission, normalization, selection, source
     /// confirmation, and the untrusted gate before testing only output/retention.
-    fn control_output_fixture(
+    pub(super) fn control_output_fixture(
         sink: Arc<dyn RecallExplainTraceSinkV1>,
         request_id: &str,
     ) -> (
@@ -8212,7 +8997,7 @@ mod history_recall_tests {
                 "memory_class": "session_observation", "warnings": [], "extensions": [],
             })).unwrap()
         }).collect();
-        let admission = admit_recall_candidates(
+        let mut admission = admit_recall_candidates(
             &scope,
             request_id,
             &AdmittedTemporalQuery::current("2026-09-01T00:00:00.000000Z").unwrap(),
@@ -8220,6 +9005,9 @@ mod history_recall_tests {
             candidates,
         )
         .unwrap();
+        admission.report.provider_id =
+            Some(tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned());
+        admission.report.registration_revision = Some(31);
         assert_eq!(admission.report.admitted_count, 3, "{:?}", admission.report);
         let normalization =
             normalize_admitted_candidates(Default::default(), &admission.admitted).unwrap();
@@ -8239,8 +9027,10 @@ mod history_recall_tests {
             },
         )
         .unwrap();
-        let aliases =
-            BTreeMap::from([("aa-survivor".to_owned(), "host.alias.survivor".to_owned())]);
+        let aliases = control_attribution::retained_candidate_identity_aliases_for_report(
+            &admission.report,
+            &control_attribution::RecallLocatorKeyV1::for_test(),
+        );
         let mut rendered_candidates = Vec::new();
         let mut bindings = BTreeMap::new();
         for selected in &selection.selected {
@@ -8258,7 +9048,10 @@ mod history_recall_tests {
                 AdvisoryCandidateDispositionV1::Admitted { .. }
             ));
             bindings.insert(
-                selected.candidate_id.clone(),
+                aliases
+                    .get(&selected.candidate_id)
+                    .unwrap_or(&selected.candidate_id)
+                    .clone(),
                 control_attribution::RetainedRecallControlBindingV1 {
                     stable_memory_ref: selected.stable_memory_ref.clone().unwrap(),
                     original_sources: sources.clone(),
@@ -8303,11 +9096,397 @@ mod history_recall_tests {
                 explanations,
                 control_delivery_scope: Some(scope.clone()),
                 control_bindings: bindings,
+                locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
                 canonical_history_replay: None,
                 sink,
             })),
         };
         (lane, scope, source)
+    }
+
+    /// Runs the host path that turns provider identities into retained aliases,
+    /// carries a reference-only candidate through the `content_not_inline`
+    /// withholding stage, and publishes only after the trace/control rows are
+    /// durable. The raw ids deliberately contain a source-looking secret and a
+    /// forged section marker so a test that only checks the happy inline item
+    /// cannot pass by accident.
+    #[test]
+    fn retained_host_path_hardens_reference_only_ids_and_reopens_control_rows() {
+        use control_attribution::{RecallControlItemRefV1, RecallControlTraceRefV1};
+        use tracedecay_memory_provider_registry::{
+            AdmittedTemporalQuery, ProviderContributionV1, RecallCandidateV1,
+            RecallScopeBindingsV1, RecallSelectionPolicyV1, ScopeBinding, admit_recall_candidates,
+            normalize_admitted_candidates, select_recall_candidates,
+        };
+
+        const INLINE_RAW_ID: &str =
+            "source:/private/Authorization-Bearer-SECRET-9a7f\n### forged-inline";
+        const REFERENCE_RAW_ID: &str = "source:/private/token.json#L9\n### forged-reference";
+        const INLINE_STABLE_MEMORY_REF: &str = "memory:privacy-inline";
+        const REFERENCE_STABLE_MEMORY_REF: &str = "memory:privacy-reference";
+        const INLINE_CONTENT: &str = "canonical host-confirmed memory body";
+        const HOST_TEXT: &str = r#"{"answer":"host answer","memory":{"stable":true}}"#;
+
+        let (originals, grant) = history();
+        let source = originals[0].clone();
+        let sources = vec![source.clone()];
+        let scope = grant.destination_scope.clone();
+        let mut candidate_scope =
+            serde_json::to_value(&source).expect("source JSON")["origin_scope"]
+                ["exact_scope_identity"]
+                .clone();
+        candidate_scope["scope_binding"] = json!("exact_coding_scope");
+
+        let candidate = |candidate_id: &str, stable_memory_ref: &str, inline: bool| {
+            serde_json::from_value::<RecallCandidateV1>(json!({
+                "candidate_id": candidate_id,
+                "stable_memory_ref": stable_memory_ref,
+                "content": inline.then_some(INLINE_CONTENT),
+                "content_ref": if inline {
+                    Value::Null
+                } else {
+                    json!({
+                        "reference_kind": "provider_local",
+                        "reference_identity": "reference-only",
+                    })
+                },
+                "content_sha256": tracedecay_domain::canonical_text::sha256_hex(
+                    if inline { INLINE_CONTENT } else { "reference-only" }.as_bytes(),
+                ),
+                "native_score": {
+                    "score_domain_id": "fixture.score",
+                    "score_domain_version": 1,
+                    "raw_value": "0.500000",
+                    "direction": "higher_is_better",
+                    "declared_minimum": "0.000000",
+                    "declared_maximum": "1.000000",
+                    "calibration_state": "uncalibrated",
+                    "semantics": "fixture",
+                    "components": {},
+                },
+                "confidence": null,
+                "exact_scope_identity": candidate_scope,
+                "validity": {
+                    "observed_at": "2025-01-01T00:00:00.000000Z",
+                    "valid_from": "2025-01-01T00:00:00.000000Z",
+                    "valid_until": null,
+                    "superseded_at": null,
+                    "superseded_by": null,
+                    "revoked_at": null,
+                    "source_revision": "revision-1",
+                    "temporal_state": "current",
+                },
+                "provenance": {
+                    "state": "available",
+                    "origin_refs": ["record:first"],
+                    "observation_refs": ["first"],
+                    "source_refs": ["record:first"],
+                    "transform_chain": [],
+                    "provider_trace_refs": [],
+                    "redaction_reason": null,
+                    "original_sources": sources,
+                },
+                "explanation": {
+                    "summary": null,
+                    "matched_features": [],
+                    "activation_trace_refs": [],
+                    "limitations": [],
+                },
+                "source_refs": [],
+                "trace_refs": [],
+                "sensitivity": "unknown",
+                "memory_class": "session_observation",
+                "warnings": [],
+                "extensions": [],
+            }))
+            .expect("candidate fixture")
+        };
+        let admission = admit_recall_candidates(
+            &scope,
+            "recall.privacy.host-path",
+            &AdmittedTemporalQuery::current("2026-09-01T00:00:00.000000Z").expect("temporal query"),
+            &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+            vec![
+                candidate(INLINE_RAW_ID, INLINE_STABLE_MEMORY_REF, true),
+                candidate(REFERENCE_RAW_ID, REFERENCE_STABLE_MEMORY_REF, false),
+            ],
+        )
+        .expect("admit candidate fixture");
+        let mut admission = admission;
+        admission.report.provider_id =
+            Some(tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned());
+        admission.report.registration_revision = Some(31);
+        assert_eq!(admission.report.admitted_count, 2, "{:?}", admission.report);
+        let normalization = normalize_admitted_candidates(Default::default(), &admission.admitted)
+            .expect("normalize candidate fixture");
+        let selection = select_recall_candidates(
+            RecallSelectionPolicyV1::new(2).expect("selection policy"),
+            &normalization,
+            &admission.admitted,
+        )
+        .expect("select candidate fixture");
+        assert_eq!(selection.selected.len(), 2, "{selection:?}");
+
+        // This is the exact contribution path that records a reference-only
+        // selection as a ContentNotInline exclusion. The final advisory lane
+        // carries only inline candidates, while the explain payload retains
+        // the host withholding row for the reference candidate.
+        let contribution = ProviderContributionV1::from_selection(
+            tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
+            31,
+            &selection,
+            &admission.admitted,
+        )
+        .expect("selection contribution");
+        assert_eq!(
+            contribution.reference_only_candidate_ids,
+            vec![REFERENCE_RAW_ID]
+        );
+
+        let gate = UntrustedRecallGateV1::open().expect("untrusted-memory gate");
+        let inline_hardened_identity = harden_test_candidate_identity(&gate, INLINE_RAW_ID)
+            .expect("inline identity hardening");
+        let reference_hardened_identity = harden_test_candidate_identity(&gate, REFERENCE_RAW_ID)
+            .expect("reference identity hardening");
+        let aliases = harden_candidate_identities(
+            &gate,
+            &admission.report,
+            &control_attribution::RecallLocatorKeyV1::for_test(),
+        )
+        .expect("complete identity aliases");
+        let inline_alias = aliases[INLINE_RAW_ID].clone();
+        let reference_alias = aliases[REFERENCE_RAW_ID].clone();
+        assert_ne!(aliases[INLINE_RAW_ID], INLINE_RAW_ID);
+        assert_ne!(aliases[REFERENCE_RAW_ID], REFERENCE_RAW_ID);
+        assert_ne!(inline_alias, inline_hardened_identity);
+        assert_ne!(reference_alias, reference_hardened_identity);
+        assert!(aliases[INLINE_RAW_ID].starts_with("advisory.retained-identity-v1."));
+        assert!(aliases[REFERENCE_RAW_ID].starts_with("advisory.retained-identity-v1."));
+        let alternate_key = control_attribution::RecallLocatorKeyV1::from_material(vec![0x5A; 32])
+            .expect("alternate locator key");
+        let alternate_aliases = control_attribution::retained_candidate_identity_aliases_for_report(
+            &admission.report,
+            &alternate_key,
+        );
+        assert_ne!(
+            alternate_aliases[INLINE_RAW_ID], aliases[INLINE_RAW_ID],
+            "a durable-key change must invalidate retained candidate aliases"
+        );
+        let mut alternate_scope_report = admission.report.clone();
+        alternate_scope_report.exact_scope_sha256 = "c".repeat(64);
+        let alternate_scope_aliases =
+            control_attribution::retained_candidate_identity_aliases_for_report(
+                &alternate_scope_report,
+                &control_attribution::RecallLocatorKeyV1::for_test(),
+            );
+        assert_ne!(
+            alternate_scope_aliases[INLINE_RAW_ID], aliases[INLINE_RAW_ID],
+            "candidate aliases must be bound to the mounted scope"
+        );
+
+        let provenance = harden_provenance(
+            &gate,
+            ProviderItemProvenanceV1::Hydrated {
+                evidence: confirmed_original_sources(&sources, Some(&grant), Some(&grant))
+                    .expect("canonical source evidence"),
+            },
+        )
+        .expect("provenance hardening");
+        let hardened = gate
+            .harden(INLINE_CONTENT, None, advisory_trust_tier(&provenance))
+            .expect("content hardening");
+        assert!(matches!(
+            AdvisoryCandidateDispositionV1::from_gate(&hardened),
+            AdvisoryCandidateDispositionV1::Admitted { .. }
+        ));
+
+        let temporary = tempfile::tempdir().expect("privacy ledger root");
+        let path = temporary.path().join("privacy-host-path.sqlite3");
+        let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).expect("open ledger"));
+        let provider_id = tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned();
+        let lane = AdvisoryMemoryContextV1::Answered {
+            provider_id: provider_id.clone(),
+            registration_revision: 31,
+            degradation: None,
+            candidates: vec![AdvisoryMemoryCandidateV1 {
+                candidate_id: inline_alias.clone(),
+                content: hardened.rendered_content(),
+                explanation: hardened.rendered_explanation(),
+                disposition: AdvisoryCandidateDispositionV1::from_gate(&hardened),
+                provenance,
+            }],
+            explain: Some(Box::new(AdvisoryRecallExplainV1 {
+                exact_scope_sha256: scope.exact_scope_sha256(),
+                attributed_provider: provider_id,
+                registration_revision: 31,
+                report: admission.report,
+                normalization: Some(normalization),
+                selection: Some(selection),
+                host_withheld: vec![RecallExplainHostWithholdingV1 {
+                    candidate_id: REFERENCE_RAW_ID.to_owned(),
+                    reason_code: "content_not_inline".to_owned(),
+                    detail: Some("the host retained only the candidate reference".to_owned()),
+                }],
+                pack_identity_aliases: aliases,
+                explanations: BTreeMap::from([
+                    (
+                        INLINE_RAW_ID.to_owned(),
+                        RecallExplainProviderExplanationV1::NotProvided,
+                    ),
+                    (
+                        REFERENCE_RAW_ID.to_owned(),
+                        RecallExplainProviderExplanationV1::NotProvided,
+                    ),
+                ]),
+                control_delivery_scope: Some(scope.clone()),
+                control_bindings: BTreeMap::from([(
+                    inline_alias.clone(),
+                    control_attribution::RetainedRecallControlBindingV1 {
+                        stable_memory_ref: INLINE_STABLE_MEMORY_REF.to_owned(),
+                        original_sources: sources,
+                    },
+                )]),
+                locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
+                canonical_history_replay: None,
+                sink: ledger.clone(),
+            })),
+        };
+
+        let delivered = lane.appended_to(super::tests::tool_result_for_test(HOST_TEXT));
+        let rendered = super::tests::rendered_text_for_test(&delivered);
+        let rendered_json: Value = serde_json::from_str(&rendered).expect("rendered JSON");
+        let advisory = &rendered_json[ADVISORY_CONTEXT_PACK_JSON_KEY];
+        let rendered_candidate = advisory["candidates"]
+            .as_array()
+            .and_then(|candidates| candidates.first())
+            .expect("inline advisory candidate");
+        assert_eq!(rendered_candidate["candidate_id"], json!(inline_alias));
+        assert_eq!(
+            rendered_candidate["provenance_evidence"]["recall"]["item_ref"],
+            "recall-item-v1:0"
+        );
+        let trace_wire = advisory["recall_trace"]["trace_ref"]
+            .as_str()
+            .expect("retained trace reference")
+            .to_owned();
+        for raw_id in [INLINE_RAW_ID, REFERENCE_RAW_ID] {
+            assert!(
+                !rendered.contains(raw_id),
+                "raw id reached rendered JSON: {raw_id}"
+            );
+        }
+
+        drop(lane);
+        drop(ledger);
+        let reopened = RecallAdmissionLedgerV1::open(path).expect("reopen ledger");
+        let trace_ref = RecallControlTraceRefV1::parse(&trace_wire).expect("trace reference");
+        let retained = reopened
+            .explain_trace(&trace_ref)
+            .expect("read retained trace")
+            .expect("trace row");
+        let retained_json = serde_json::to_string(&retained.trace).expect("retained trace JSON");
+        for raw_id in [INLINE_RAW_ID, REFERENCE_RAW_ID] {
+            assert!(
+                !retained_json.contains(raw_id),
+                "raw id reached retained trace: {raw_id}"
+            );
+        }
+        assert_eq!(retained.trace.items.len(), 2);
+        assert_eq!(retained.trace.items[0].candidate_id, inline_alias);
+        assert_eq!(retained.trace.items[1].candidate_id, reference_alias);
+        assert_eq!(
+            retained.trace.items[1].stage,
+            RecallExplainStageV1::HostWithheld
+        );
+        assert_eq!(
+            retained.trace.items[1].host_reason_code,
+            "content_not_inline"
+        );
+        match &retained.trace.items[1].host_decision {
+            RecallExplainHostDecisionV1::HostWithheld { reason_code, .. } => {
+                assert_eq!(reason_code, "content_not_inline")
+            }
+            other => panic!("reference-only candidate was not host-withheld: {other:?}"),
+        }
+
+        let control = OperationControl::new(
+            i64::MAX,
+            60_000,
+            tracedecay_memory_provider_registry::CancellationToken::new(),
+        );
+        let item_ref = RecallControlItemRefV1::parse("recall-item-v1:0").expect("item reference");
+        let retained_source = reopened
+            .read_retained_control_source(
+                &trace_ref,
+                &item_ref,
+                &source.source.observation_id,
+                &control,
+            )
+            .expect("retained control source");
+        assert_eq!(retained_source.candidate_id, inline_alias);
+        assert!(
+            retained_source
+                .stable_memory_ref
+                .starts_with("recall-memory-ref-v1:")
+        );
+        assert_ne!(retained_source.stable_memory_ref, INLINE_STABLE_MEMORY_REF);
+        assert_eq!(retained_source.provider_rank, 0);
+        assert_ne!(retained_source.original_source, source);
+        let retained_source_json = serde_json::to_string(&retained_source.original_source)
+            .expect("opaque retained source JSON");
+        for raw in [
+            INLINE_RAW_ID,
+            REFERENCE_RAW_ID,
+            INLINE_STABLE_MEMORY_REF,
+            REFERENCE_STABLE_MEMORY_REF,
+            source.source.observation_id.as_str(),
+        ] {
+            assert!(
+                !retained_source_json.contains(raw),
+                "raw source locator reached reopened control value: {raw}: {retained_source_json}"
+            );
+        }
+        assert_eq!(
+            retained_source
+                .original_source
+                .source
+                .canonical_provider_id
+                .as_str(),
+            "recall.opaque"
+        );
+        let connection = reopened.connection();
+        let (retained_candidate, retained_ref, retained_sources, retained_decision): (
+            String,
+            String,
+            String,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT candidate_id, stable_memory_ref, original_sources_json, host_decision_json
+                 FROM recall_explain_trace_items WHERE provider_rank=0 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("inspect retained control row");
+        drop(connection);
+        assert_eq!(retained_candidate, inline_alias);
+        assert!(retained_ref.starts_with("recall-memory-ref-v1:"));
+        for raw in [
+            INLINE_RAW_ID,
+            REFERENCE_RAW_ID,
+            INLINE_STABLE_MEMORY_REF,
+            REFERENCE_STABLE_MEMORY_REF,
+        ] {
+            assert!(!retained_sources.contains(raw));
+            assert!(!retained_decision.contains(raw));
+        }
+        assert_eq!(
+            reopened
+                .read_retained_control_scope(&trace_ref, &control)
+                .expect("retained control scope")
+                .registration_revision,
+            31
+        );
     }
 
     #[test]
@@ -8322,6 +9501,17 @@ mod history_recall_tests {
             let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).unwrap());
             let (lane, scope, source) =
                 control_output_fixture(ledger.clone(), &format!("control-output.{name}"));
+            let survivor_identity = match &lane {
+                AdvisoryMemoryContextV1::Answered {
+                    explain: Some(explain),
+                    ..
+                } => explain
+                    .pack_identity_aliases
+                    .get("aa-survivor")
+                    .cloned()
+                    .expect("survivor identity alias"),
+                other => panic!("controlled fixture: {other:?}"),
+            };
             let (form, host_items) = host_evidence(text);
             let ordinary = lane.context_pack(form, &host_items);
             let AdvisoryContextPackV1::Compiled(ordinary) = ordinary else {
@@ -8330,13 +9520,9 @@ mod history_recall_tests {
             assert!(!ordinary.rendered.contains("recall-trace-v1:"));
             let provisional = lane.provisional_control_refs().unwrap();
             assert_eq!(provisional.len(), 3);
-            assert_eq!(
-                provisional["host.alias.survivor"].item_ref,
-                "recall-item-v1:2"
-            );
+            assert_eq!(provisional[&survivor_identity].item_ref, "recall-item-v1:2");
             let reference =
-                RecallControlTraceRefV1::parse(&provisional["host.alias.survivor"].trace_ref)
-                    .unwrap();
+                RecallControlTraceRefV1::parse(&provisional[&survivor_identity].trace_ref).unwrap();
             let control = OperationControl::new(
                 i64::MAX,
                 60_000,
@@ -8372,7 +9558,7 @@ mod history_recall_tests {
                     .collect()
             };
             assert_eq!(evidence.len(), 1, "{name}: {rendered}");
-            assert!(rendered.contains("host.alias.survivor"));
+            assert!(rendered.contains(&survivor_identity));
             assert!(!rendered.contains("recall-item-v1:0"));
             assert!(!rendered.contains("recall-item-v1:1"));
             let evidence = &evidence[0];
@@ -8396,9 +9582,22 @@ mod history_recall_tests {
             assert_eq!(retained.scope.delivery_scope, scope);
             assert_eq!(retained.scope.registration_revision, 31);
             assert_eq!(retained.provider_rank, 2);
-            assert_eq!(retained.candidate_id, "aa-survivor");
-            assert_eq!(retained.stable_memory_ref, "memory:aa-survivor");
-            assert_eq!(retained.original_source, source);
+            assert_eq!(retained.candidate_id, survivor_identity);
+            assert!(
+                retained
+                    .stable_memory_ref
+                    .starts_with("recall-memory-ref-v1:")
+            );
+            assert_ne!(retained.stable_memory_ref, "memory:aa-survivor");
+            assert_ne!(retained.original_source, source);
+            assert_eq!(
+                retained
+                    .original_source
+                    .source
+                    .canonical_provider_id
+                    .as_str(),
+                "recall.opaque"
+            );
             assert_eq!(
                 reopened
                     .read_retained_control_scope(&trace_ref, &control)
@@ -8406,7 +9605,7 @@ mod history_recall_tests {
                 retained.scope
             );
             let trace = reopened
-                .explain_trace(trace_wire.rsplit(':').next().unwrap())
+                .explain_trace(&RecallControlTraceRefV1::parse(&trace_wire).unwrap())
                 .unwrap()
                 .unwrap()
                 .trace;
@@ -8474,7 +9673,7 @@ mod history_recall_tests {
             let provisional = lane.provisional_recall_trace().unwrap();
             assert!(
                 ledger
-                    .explain_trace(provisional.trace_ref.rsplit(':').next().unwrap())
+                    .explain_trace(&RecallControlTraceRefV1::parse(&provisional.trace_ref).unwrap())
                     .unwrap()
                     .is_none()
             );
@@ -8498,10 +9697,8 @@ mod history_recall_tests {
                 .unwrap()
             };
             assert_eq!(wire, provisional);
-            let retained = ledger
-                .explain_trace(wire.trace_ref.rsplit(':').next().unwrap())
-                .unwrap()
-                .unwrap();
+            let wire_trace_ref = RecallControlTraceRefV1::parse(&wire.trace_ref).unwrap();
+            let retained = ledger.explain_trace(&wire_trace_ref).unwrap().unwrap();
             assert_eq!(retained.trace.request_id, request_id);
             assert_eq!(retained.exact_scope_sha256, scope.exact_scope_sha256());
             assert_eq!(retained.trace.requested_count, 0);
@@ -8572,6 +9769,7 @@ mod history_recall_tests {
         let reference = payload[ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"]["trace_ref"]
             .as_str()
             .unwrap();
+        let reference_ref = RecallControlTraceRefV1::parse(reference).unwrap();
         let token = tracedecay_memory_provider_registry::CancellationToken::new();
         let control = OperationControl::new(i64::MAX, 60_000, token.clone());
         let read = |request, provider, revision, expected_scope: &OwnedExactScope| {
@@ -8596,11 +9794,7 @@ mod history_recall_tests {
         assert!(trace.items.is_empty());
         assert_eq!(
             trace,
-            ledger
-                .explain_trace(reference.rsplit(':').next().unwrap())
-                .unwrap()
-                .unwrap()
-                .trace
+            ledger.explain_trace(&reference_ref).unwrap().unwrap().trace
         );
         assert!(matches!(
             read("another-request", provider, 31, &scope),

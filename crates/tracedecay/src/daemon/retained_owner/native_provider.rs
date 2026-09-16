@@ -1887,11 +1887,11 @@ fn native_read_actor_main(
                 authority,
                 reply,
             } => {
-                let outcome = admit_native_call(authority.as_deref(), &call)
-                    .and_then(|_| control_failure(&call.control))
-                    .and_then(|()| {
+                let outcome =
+                    admit_native_call(authority.as_deref(), &call).and_then(|admission| {
+                        control_failure(&call.control)?;
                         staged
-                            .stage_controlled(record, &call)
+                            .stage_controlled(record, &call, admission.as_ref())
                             .map_err(store_failure)
                     });
                 #[cfg(test)]
@@ -1942,7 +1942,7 @@ fn native_read_actor_main(
                     }
                 };
                 let mut request = request;
-                if let Some(admission) = admission {
+                if let Some(admission) = admission.as_ref() {
                     let mut projected = serde_json::json!({"history_grant":request.history_grant});
                     apply_current_admission(&mut projected, &admission);
                     request.history_grant = projected
@@ -1958,6 +1958,7 @@ fn native_read_actor_main(
                     &staged,
                     call,
                     request,
+                    admission,
                 );
                 let _ = reply.send(outcome);
             }
@@ -1974,6 +1975,7 @@ fn recall_with_runtime(
     staged: &StagedObservationStore,
     call: ProviderCall,
     request: NativeRecallRequestV1,
+    admission: Option<tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> NativeRecallOutcome {
     let snapshot = match call.control.snapshot() {
         Ok(snapshot) => snapshot,
@@ -1989,7 +1991,15 @@ fn recall_with_runtime(
     match runtime.block_on(async {
         tokio::time::timeout(
             Duration::from_millis(timeout_millis),
-            recall_project_memory(cg, project_root, profile_id, staged, &call, &request),
+            recall_project_memory(
+                cg,
+                project_root,
+                profile_id,
+                staged,
+                &call,
+                &request,
+                admission.as_ref(),
+            ),
         )
         .await
     }) {
@@ -2005,6 +2015,7 @@ async fn recall_project_memory(
     staged: &StagedObservationStore,
     call: &ProviderCall,
     request: &NativeRecallRequestV1,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> NativeRecallOutcome {
     if let Err(failure) = control_failure(&call.control) {
         return NativeRecallOutcome::Failed(failure);
@@ -2053,13 +2064,18 @@ async fn recall_project_memory(
             Ok(query) => query,
             Err(failure) => return NativeRecallOutcome::Failed(failure),
         };
-        let rows = match staged.recall_temporal(
+        // Keep the fresh host admission alongside the projected grant. The
+        // store rechecks the trusted source list before emitting any retained
+        // candidate; a request grant alone is not sufficient.
+        let rows = match staged.recall_temporal_with_admission(
             &call.exact_scope,
             &request.query,
             &temporal,
             request.history_grant.as_ref(),
+            admission,
             &owned_exclusions(&request.exclusions),
             &call.request_id,
+            Some(call),
         ) {
             Ok(rows) => rows,
             Err(_) => {
@@ -2095,11 +2111,11 @@ async fn recall_project_memory(
     if owner != expected_owner {
         return NativeRecallOutcome::Failed(NativeReadFailure::RecallScopeMismatch);
     }
-    let memory = match MemoryApplication::new(owner.clone(), DatabaseFactStore::new(target.database()))
-    {
-        Ok(memory) => memory,
-        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable),
-    };
+    let memory =
+        match MemoryApplication::new(owner.clone(), DatabaseFactStore::new(target.database())) {
+            Ok(memory) => memory,
+            Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable),
+        };
     let search_query = match native_recall_search_query(request, owner) {
         Ok(query) => query,
         Err(failure) => return NativeRecallOutcome::Failed(failure),
@@ -2144,10 +2160,13 @@ async fn recall_project_memory(
     // digest, so no other checkout and no other agent session is reachable
     // from here. A store that cannot be read fails the recall rather than
     // silently answering with facts alone.
-    let staged_rows = match staged.recall(
+    let staged_rows = match staged.recall_controlled(
         &call.exact_scope,
         &request.query,
         staged.retention().maximum_content_rows_per_scope,
+        request.history_grant.as_ref(),
+        admission,
+        call,
     ) {
         Ok(rows) => rows,
         Err(error) => {

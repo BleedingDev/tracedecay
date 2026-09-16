@@ -599,6 +599,7 @@ fn project(
                 field(&request, "selector")?,
                 call,
             )?;
+            validate_inspection_target(&selection, &request)?;
             let data = response
                 .as_ref()
                 .map(|value| project_inspection(public, &selection, value, dispatch))
@@ -956,6 +957,7 @@ fn validate_request_fields(operation: ProviderOperation, request: &Value) -> Pro
             "common_request",
             "view",
             "selector",
+            "target",
             "maximum_items",
             "maximum_bytes",
             "redaction_policy_revision",
@@ -1113,7 +1115,8 @@ pub(super) fn scope(value: &OwnedExactScope) -> ProviderControlScopeV1 {
 }
 fn stable_ref(target: &LifecycleTarget) -> ProjectionResult<&str> {
     match &target.reference {
-        LifecycleTargetReference::StableMemoryRef(value) => Ok(value),
+        LifecycleTargetReference::StableMemoryRef(value)
+        | LifecycleTargetReference::RetainedSourceLocator(value) => Ok(value),
         _ => Err("stable source target"),
     }
 }
@@ -1167,10 +1170,22 @@ pub(super) fn lifecycle_target_wire(
     )?;
     let attribution =
         source_attribution_json(source.original_attribution).map_err(|_| "original source wire")?;
+    let reference = match &source.target.reference {
+        LifecycleTargetReference::StableMemoryRef(value) => {
+            json!({"kind":"stable_memory_ref","reference":value})
+        }
+        LifecycleTargetReference::RetainedSourceLocator(value) => {
+            json!({"kind":"retained_source_locator","reference":value})
+        }
+        LifecycleTargetReference::RecallTraceRef(_)
+        | LifecycleTargetReference::ContextPackItemRef(_) => {
+            return Err("stable source target");
+        }
+    };
     Ok(
         json!({"provider_id":source.target.provider_id.as_str(),"registration_revision":source.target.registration_revision,
         "original_scope":attribution["origin_scope"],"delivery_scope":scope(&source.target.delivery_scope),"source":attribution["source"],
-        "reference":{"kind":"stable_memory_ref","reference":stable_ref(source.target)?}}),
+        "reference":reference}),
     )
 }
 
@@ -1572,6 +1587,35 @@ fn validate_inspection_selector(
     };
     require(selected == &expected, "inspection selected query")
 }
+
+fn validate_inspection_target(
+    evidence: &InspectionEvidenceV1<'_>,
+    request: &Value,
+) -> ProjectionResult<()> {
+    let expected = match evidence {
+        InspectionEvidenceV1::SourceInfluence(source)
+        | InspectionEvidenceV1::Trace(source)
+        | InspectionEvidenceV1::DeliveryReceipt { source, .. } => match &source.target.reference {
+            LifecycleTargetReference::RetainedSourceLocator(_) => {
+                Some(lifecycle_target_wire(*source)?)
+            }
+            LifecycleTargetReference::StableMemoryRef(_) => None,
+            LifecycleTargetReference::RecallTraceRef(_)
+            | LifecycleTargetReference::ContextPackItemRef(_) => {
+                return Err("inspection source target");
+            }
+        },
+        InspectionEvidenceV1::StateSummary
+        | InspectionEvidenceV1::MaintenanceReceipt { .. }
+        | InspectionEvidenceV1::SnapshotMetadata(_)
+        | InspectionEvidenceV1::CapabilityStatus => None,
+    };
+    match expected {
+        Some(expected) => eq_field(request, "target", &expected),
+        None => require(request.get("target").is_none(), "inspection target"),
+    }
+}
+
 fn project_inspection(
     public: &ProviderInspectionRequestV1,
     evidence: &InspectionEvidenceV1<'_>,
@@ -2079,8 +2123,8 @@ mod tests {
     use super::*;
 
     use tracedecay_memory_provider_registry::{
-        CancellationToken, CommittedEffectEvidence, OperationControl, OwnedVersionedId,
-        ProviderCallParts, TerminalRecord,
+        CancellationToken, CommittedEffectEvidence, OperationControl, OriginScopeEvidence,
+        OwnedVersionedId, ProviderCallParts, RecordedValidity, TerminalRecord,
     };
 
     fn call(generation: u64) -> ProviderCall {
@@ -2595,6 +2639,128 @@ mod tests {
                 assert!(validate_inspection_selector(&public, &evidence, &wrong, &call).is_err());
             }
         }
+    }
+
+    #[test]
+    fn lifecycle_target_wire_preserves_retained_locator_and_stable_reference_kinds() {
+        let call = call_for(ProviderOperation::Inspection, 3, json!({}));
+        let selector = ProviderControlSourceSelectorV1 {
+            trace_ref: "recall-trace-v1:cc".to_owned(),
+            item_ref: "recall-item-v1:0".to_owned(),
+            observation_id: "observation.locator".to_owned(),
+        };
+        let original = SourceAttribution {
+            source: OriginalSourceIdentity {
+                canonical_provider_id: OwnedProviderId::new("codex").expect("provider"),
+                canonical_session_id: "session.original".to_owned(),
+                source_key: "source.locator".to_owned(),
+                stable_record_id: Some("record.locator".to_owned()),
+                observation_id: selector.observation_id.clone(),
+                source_revision: Some("revision.locator".to_owned()),
+                content_sha256: "a".repeat(64),
+            },
+            origin_scope: OriginScopeEvidence::Recorded {
+                scope: call.exact_scope.clone(),
+                authority_ref: "host-origin.locator".to_owned(),
+            },
+            source_sequence: 1,
+            occurred_at_utc_nanos: Some(1),
+            ingested_at_utc_nanos: 2,
+            validity: RecordedValidity::default(),
+        };
+        let disposition = CurrentSourceDisposition {
+            state: SourceDisposition::Available,
+            authority_ref: "canonical.disposition".to_owned(),
+            authority_revision: Some(1),
+            checked_at_utc_nanos: 3,
+        };
+        let mut target = LifecycleTarget {
+            provider_id: call.provider_id.clone(),
+            registration_revision: call.registration_revision,
+            original_scope: original.origin_scope.clone(),
+            delivery_scope: call.exact_scope.clone(),
+            source: original.source.clone(),
+            reference: LifecycleTargetReference::RetainedSourceLocator(
+                "recall-memory-ref-v1:opaque-locator".to_owned(),
+            ),
+        };
+        let resolved = ResolvedControlSourceV1 {
+            selector: &selector,
+            target: &target,
+            original_attribution: &original,
+            current_disposition: &disposition,
+        };
+        let retained = lifecycle_target_wire(resolved).expect("retained target wire");
+        assert_eq!(
+            retained["reference"],
+            json!({
+                "kind": "retained_source_locator",
+                "reference": "recall-memory-ref-v1:opaque-locator"
+            })
+        );
+        let retained_request = json!({
+            "common_request": {},
+            "view": "source_influence",
+            "selector": {
+                "source_key": "source.locator",
+                "stable_memory_ref": "recall-memory-ref-v1:opaque-locator"
+            },
+            "target": retained,
+            "maximum_items": 1,
+            "maximum_bytes": 131072,
+            "redaction_policy_revision": 1,
+            "cursor": null
+        });
+        validate_request_fields(ProviderOperation::Inspection, &retained_request)
+            .expect("retained inspection target is an allowed request field");
+        validate_inspection_target(
+            &InspectionEvidenceV1::SourceInfluence(resolved),
+            &retained_request,
+        )
+        .expect("retained inspection target binds to host evidence");
+        let mut forged_request = retained_request.clone();
+        forged_request["target"]["source"]["source_key"] = json!("source.forged");
+        assert!(
+            validate_inspection_target(
+                &InspectionEvidenceV1::SourceInfluence(resolved),
+                &forged_request,
+            )
+            .is_err()
+        );
+
+        target.reference =
+            LifecycleTargetReference::StableMemoryRef("ncm-memory:".to_owned() + &"b".repeat(64));
+        let stable = lifecycle_target_wire(ResolvedControlSourceV1 {
+            selector: &selector,
+            target: &target,
+            original_attribution: &original,
+            current_disposition: &disposition,
+        })
+        .expect("stable target wire");
+        assert_eq!(stable["reference"]["kind"], "stable_memory_ref");
+        assert_eq!(
+            stable["reference"]["reference"],
+            "ncm-memory:".to_owned() + &"b".repeat(64)
+        );
+        let mut stable_request = retained_request;
+        stable_request
+            .as_object_mut()
+            .expect("inspection request")
+            .remove("target");
+        stable_request["selector"]["stable_memory_ref"] =
+            json!("ncm-memory:".to_owned() + &"b".repeat(64));
+        validate_request_fields(ProviderOperation::Inspection, &stable_request)
+            .expect("stable inspection request remains valid");
+        validate_inspection_target(
+            &InspectionEvidenceV1::SourceInfluence(ResolvedControlSourceV1 {
+                selector: &selector,
+                target: &target,
+                original_attribution: &original,
+                current_disposition: &disposition,
+            }),
+            &stable_request,
+        )
+        .expect("stable inspection keeps selector-only target compatibility");
     }
 
     #[test]

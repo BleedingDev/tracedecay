@@ -1589,14 +1589,14 @@ pub(crate) fn cleanup_source_snapshots(
         let [granted] = source.grant.sources.as_slice() else {
             return Err(PortabilityErrorV1::Invalid("cleanup exact source"));
         };
-        let target = source
-            .retained
-            .original_source
-            .to_owned_attribution()
-            .map_err(|_| PortabilityErrorV1::Invalid("cleanup original source"))?;
-        let digest = original_source_fence_digest(&target)?;
-        if granted.attribution != target
-            || source.grant.destination_scope != source.retained.scope.delivery_scope
+        // The retained row deliberately contains an opaque source locator. The
+        // resolver already re-authorized it and byte-compared its redaction to
+        // the row, so cleanup must use that fresh canonical grant for all
+        // provenance and fence checks. Reconstructing attribution from the
+        // opaque row would either fail after reopen or create a raw-ID escape.
+        let target = &granted.attribution;
+        let digest = original_source_fence_digest(target)?;
+        if source.grant.destination_scope != source.retained.scope.delivery_scope
             || intent.fence.provider_id != source.retained.scope.provider_id.as_str()
             || intent.fence.original_source_sha256 != digest
             || intent.provider_erasure_verified

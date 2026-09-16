@@ -1,12 +1,17 @@
 //! Original-source history selection and the existing durable delivery journey.
 use super::*;
+use crate::daemon::retained_owner::cognitive_recall::control_attribution::{
+    RecallControlTraceRefV1, RecallLocatorKeyV1, redact_retained_source_attribution,
+};
 use crate::daemon::retained_owner::provider_history::{
     HistoryGrantRevalidationV1, HistoryIdentityBridgeV1, OriginalObservationAuthorityV1,
     ProviderHistoryErrorV1, ProviderHistoryReaderV1, history_grant_from_json, history_grant_json,
-    original_source_fence_digest,
+    original_source_fence_digest, source_attribution_json,
 };
 use tracedecay_domain::{BrainId, RetrievalAnchorId};
-use tracedecay_memory_provider_registry::HistoryGrant;
+use tracedecay_memory_provider_registry::{
+    HistoryGrant, recall_admission::source_attribution::RecallSourceAttributionV1,
+};
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_store::{
     AnchorDispositionAppendOutcomeV1, RetrievalAnchorDerivativeV1,
@@ -292,6 +297,164 @@ async fn only_proven_original_sessions_enter_history_and_wire_cannot_change_them
             .unwrap()
             .withheld,
         3
+    );
+}
+
+#[tokio::test]
+async fn opaque_retained_locator_reopens_and_reauthorizes_by_exact_source_sequence() {
+    let fixture = RepositoryFixture::new();
+    let bridge = fixture.bridge();
+    let records = SettledRecordsPort {
+        records: vec![
+            fixture.record("session.source", 1, true),
+            fixture.record("session.source", 2, true),
+        ],
+    };
+    let authority = OriginalReceipts::new();
+    let provider = OwnedProviderId::new("tracedecay.native").unwrap();
+    let destination = bridge.destination("session.destination").unwrap();
+    let trace = RecallControlTraceRefV1::parse(&format!(
+        "recall-trace-v1:{}:{}",
+        destination.exact_scope_sha256(),
+        "a".repeat(64)
+    ))
+    .unwrap();
+    let candidate_id = format!("advisory.retained-identity-v1.{}", "b".repeat(64));
+    let journal = fixture.journal();
+    let opaque = {
+        let reader = ProviderHistoryReaderV1 {
+            bridge: &bridge,
+            observations: &records,
+            dispositions: &ActiveDispositions,
+            original_authority: &authority,
+            journal: &journal,
+            provider_id: &provider,
+            policy_revision: 1,
+        };
+        let page = reader
+            .select_page(&destination, 0, 1, &control())
+            .await
+            .unwrap();
+        let attribution = page.grant.unwrap().sources[0].attribution.clone();
+        let wire: RecallSourceAttributionV1 =
+            serde_json::from_value(source_attribution_json(&attribution).unwrap()).unwrap();
+        redact_retained_source_attribution(&trace, 7, 0, &candidate_id, &wire).unwrap()
+    };
+    drop(journal);
+
+    // Reopen the provider journal to model a daemon restart. The persisted
+    // opaque locator is the only source identity carried into this reader.
+    let reopened_journal = fixture.journal();
+    let reader = ProviderHistoryReaderV1 {
+        bridge: &bridge,
+        observations: &records,
+        dispositions: &ActiveDispositions,
+        original_authority: &authority,
+        journal: &reopened_journal,
+        provider_id: &provider,
+        policy_revision: 1,
+    };
+    let grant = reader
+        .authorize_retained_source_locator(
+            &destination,
+            &trace,
+            7,
+            0,
+            &candidate_id,
+            &opaque,
+            &control(),
+            false,
+            &RecallLocatorKeyV1::for_test(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant.sources.len(), 1);
+    assert_eq!(grant.sources[0].attribution.source_sequence, 1);
+    assert_eq!(
+        grant.sources[0].attribution.source.canonical_session_id,
+        "session.source"
+    );
+
+    // The persisted handle is bound to the durable host secret. A restarted
+    // reader with a different key must fail closed rather than treating an
+    // opaque locator as a provider-controlled passthrough.
+    let wrong_key = RecallLocatorKeyV1::from_material(vec![0x5A; 32]).unwrap();
+    assert!(
+        reader
+            .authorize_retained_source_locator(
+                &destination,
+                &trace,
+                7,
+                0,
+                &candidate_id,
+                &opaque,
+                &control(),
+                false,
+                &wrong_key,
+            )
+            .await
+            .is_err()
+    );
+
+    let mut tampered = opaque.clone();
+    tampered.source.content_sha256 = "e".repeat(64);
+    assert!(
+        reader
+            .authorize_retained_source_locator(
+                &destination,
+                &trace,
+                7,
+                0,
+                &candidate_id,
+                &tampered,
+                &control(),
+                false,
+                &RecallLocatorKeyV1::for_test(),
+            )
+            .await
+            .is_err()
+    );
+
+    let mut missing = opaque.clone();
+    missing.source_sequence = 99;
+    assert!(
+        reader
+            .authorize_retained_source_locator(
+                &destination,
+                &trace,
+                7,
+                0,
+                &candidate_id,
+                &missing,
+                &control(),
+                false,
+                &RecallLocatorKeyV1::for_test(),
+            )
+            .await
+            .is_err()
+    );
+
+    let wrong_context = RecallControlTraceRefV1::parse(&format!(
+        "recall-trace-v1:{}:{}",
+        destination.exact_scope_sha256(),
+        "c".repeat(64)
+    ))
+    .unwrap();
+    assert!(
+        reader
+            .authorize_retained_source_locator(
+                &destination,
+                &wrong_context,
+                7,
+                0,
+                &candidate_id,
+                &opaque,
+                &control(),
+                false,
+                &RecallLocatorKeyV1::for_test(),
+            )
+            .await
+            .is_err()
     );
 }
 
