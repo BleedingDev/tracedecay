@@ -87,7 +87,7 @@ fn test_source(
         },
         normalization_revision: 1,
         non_trivia_token_count: tokens.len() as u32,
-        eligibility: eligibility,
+        eligibility,
         tokenization_status: tracedecay_code_extraction::CloneBodyTokenizationStatusV1::Complete,
         tokenization_issues: Vec::new(),
         conservative_tokens: tokens,
