@@ -261,6 +261,22 @@ def _load_worker_platform_policy_module() -> Any:
     return module
 
 
+def _load_release_profile_module() -> Any:
+    """Load the source-tag release feature resolver without package imports."""
+    module_path = Path(__file__).with_name("resolve-release-source-profile.py")
+    spec = importlib.util.spec_from_file_location(
+        "tracedecay_distribution_release_profile", module_path
+    )
+    if spec is None or spec.loader is None:
+        _ncm_failure(f"release source profile resolver is unavailable: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:
+        _ncm_failure(f"release source profile resolver could not load: {error}")
+    return module
+
+
 def _ncm_feature_members(manifest: dict[str, Any], feature: str, label: str) -> set[str]:
     features = manifest.get("features")
     if not isinstance(features, dict):
@@ -591,6 +607,36 @@ def _require_ncm_runtime_features(
         _ncm_failure("NCM runtime encoder dependency fastembed must disable default features")
 
 
+def _require_ncm_release_profile(
+    root_manifest: dict[str, Any], release_target_manifest: dict[str, Any]
+) -> None:
+    """Ensure only the verified target opts the production CLI into NCM."""
+    features = root_manifest.get("features")
+    if not isinstance(features, dict):
+        _ncm_failure("root manifest has no feature table for release profile validation")
+    targets = release_target_manifest.get("include")
+    if not isinstance(targets, list):
+        _ncm_failure("release target manifest has no include list for release profile validation")
+
+    resolver = _load_release_profile_module()
+    for index, entry in enumerate(targets):
+        if not isinstance(entry, dict):
+            _ncm_failure(f"release target include[{index}] must be an object")
+        target = entry.get("target")
+        if not isinstance(target, str) or not target:
+            _ncm_failure(f"release target include[{index}] has no target triple")
+        expected = (
+            ("production", "memory-provider-host")
+            if target == NCM_SUPPORTED_TARGET
+            else ("production",)
+        )
+        actual = tuple(resolver.production_release_features(features, target))
+        if actual != expected:
+            _ncm_failure(
+                f"release target {target} resolves {actual!r}; expected {expected!r}"
+            )
+
+
 def validate_ncm_distribution_matrix(
     policy_path: Path,
     *,
@@ -642,6 +688,7 @@ def validate_ncm_distribution_matrix(
     _require_ncm_runtime_features(
         root_manifest, provider_manifest, runtime_manifest, runtime_policy
     )
+    _require_ncm_release_profile(root_manifest, release_target_manifest)
     for workflow_path in release_workflow_paths or []:
         _require_ncm_release_workflow(workflow_path)
 

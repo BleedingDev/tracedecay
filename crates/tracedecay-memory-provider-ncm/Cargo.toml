@@ -9,9 +9,18 @@ repository = "https://github.com/BleedingDev/tracedecay"
 
 [features]
 default = []
-rust-backend = ["dep:tracedecay-memory-ncm-runtime"]
+rust-backend = [
+    "dep:tracedecay-memory-ncm-runtime",
+    "tracedecay-memory-ncm-runtime/real-encoder",
+]
 # Pure production declarations for consumers that separately validate live health.
 test-helpers = []
+# Explicit test-only worker transport. This keeps the deterministic encoder out
+# of the production WorkerOptions surface while preserving integration fixtures.
+test-transport = [
+    "rust-backend",
+    "tracedecay-memory-ncm-runtime/test-transport",
+]
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
@@ -23,6 +32,14 @@ tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", opt
 [dev-dependencies]
 tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry" }
+
+[[test]]
+name = "rust_backend"
+required-features = ["test-transport"]
+
+[[test]]
+name = "rust_backend_conformance"
+required-features = ["test-transport"]
 
 [lints.rust]
 missing_docs = "deny"

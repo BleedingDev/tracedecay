@@ -69,6 +69,7 @@ def main() -> int:
         "hotpath-alloc": [],
         "hotpath-cpu": [],
         "hotpath-mcp": [],
+        "memory-provider-host": [],
     }
     linux_features = resolver.production_release_features(
         modern_features, "x86_64-unknown-linux-gnu"
@@ -79,7 +80,7 @@ def main() -> int:
     macos_features = resolver.production_release_features(
         modern_features, "aarch64-apple-darwin"
     )
-    if macos_features != ("production",):
+    if macos_features != ("production", "memory-provider-host"):
         raise SystemExit(f"unexpected macOS release features: {macos_features!r}")
 
     windows_features = resolver.production_release_features(

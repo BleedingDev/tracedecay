@@ -242,6 +242,7 @@ test-helpers = [
 
 test-transport = [
     "test-helpers",
+    "tracedecay-memory-provider-ncm?/test-transport",
     "tracedecay-project/test-transport",
     "tracedecay-rusqlite-runtime/test-transport",
     "tracedecay-runtime-core/test-transport",

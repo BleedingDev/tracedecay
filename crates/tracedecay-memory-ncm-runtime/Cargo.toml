@@ -15,6 +15,11 @@ path = "src/bin/tracedecay-ncm-worker.rs"
 [[bench]]
 name = "ncm_scale"
 harness = false
+required-features = ["test-transport"]
+
+[[test]]
+name = "worker"
+required-features = ["test-transport"]
 
 [dependencies]
 cap-fs-ext = "4.0.2"
@@ -39,6 +44,10 @@ libc = "0.2"
 # to skip the ORT toolchain; the worker refuses Observe/Recall without a real encoder.
 default = ["real-encoder"]
 real-encoder = ["dep:fastembed"]
+# Deterministic hash-encoder transport used by focused tests and benchmarks.
+# Production builds do not compile the option, so WorkerOptions cannot request
+# a test-double launch through the shipped API.
+test-transport = []
 
 [lints.rust]
 missing_docs = "deny"

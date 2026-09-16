@@ -15,6 +15,10 @@ doctest = false
 # `DaemonInvocationService::invoke`, publication gates, and test constructors.
 # Production code is never gated by this feature.
 test-helpers = ["tracedecay-memory-provider-ncm?/test-helpers"]
+test-transport = [
+    "test-helpers",
+    "tracedecay-memory-provider-ncm?/test-transport",
+]
 # The retained provider owner is compiled in this crate after the #707 owner
 # extraction. Keep the complete Native/NCM mount opt-in at the same boundary as
 # the source modules; the composition root forwards its public host feature
