@@ -62,15 +62,24 @@ fn search_payload(output: &std::process::Output) -> Value {
 }
 
 fn run_search(project: &Path, home: &Path, args: Value) -> std::process::Output {
+    run_json_tool(project, home, "search", args)
+}
+
+fn run_json_tool(
+    project: &Path,
+    home: &Path,
+    tool_name: &str,
+    args: Value,
+) -> std::process::Output {
     let project_arg = project.to_string_lossy().to_string();
-    let args_json = serde_json::to_string(&args).expect("serialize search arguments");
+    let args_json = serde_json::to_string(&args).expect("serialize tool arguments");
     run_tool(
         project,
         home,
         &[
             "--project",
             project_arg.as_str(),
-            "search",
+            tool_name,
             "--json",
             "--args",
             args_json.as_str(),
@@ -144,20 +153,36 @@ fn daemon_tool_searches_the_active_project() {
 fn daemon_tool_search_paginates_authenticated_cursor_over_cli_transport() {
     let source = r#"
         /// The alpha primary cursor fixture has repeated cursor and fixture evidence.
-        pub fn alpha_cursor_fixture_primary() -> u32 {
-            let alpha_cursor_fixture_primary_value = 1;
-            alpha_cursor_fixture_primary_value
+        pub fn alpha_cursor_fixture_primary(input: u32) -> u32 {
+            let one = input.wrapping_add(1);
+            let two = one.wrapping_add(2);
+            let three = two.wrapping_add(3);
+            let four = three.wrapping_add(4);
+            let five = four.wrapping_add(5);
+            let six = five.wrapping_add(6);
+            six.wrapping_add(one)
         }
 
         /// The secondary cursor fixture has alpha cursor and fixture evidence.
-        pub fn fixture_secondary() -> u32 {
-            let alpha_cursor_fixture_secondary_value = 2;
-            alpha_cursor_fixture_secondary_value
+        pub fn fixture_secondary(input: u32) -> u32 {
+            let one = input.wrapping_add(1);
+            let two = one.wrapping_add(2);
+            let three = two.wrapping_add(3);
+            let four = three.wrapping_add(4);
+            let five = four.wrapping_add(5);
+            let six = five.wrapping_add(6);
+            six.wrapping_add(one)
         }
 
         /// This alpha cursor fixture is a lower-ranked distractor.
-        pub fn fixture_distractor() -> u32 {
-            3
+        pub fn fixture_distractor(input: u32) -> u32 {
+            let one = input.wrapping_add(1);
+            let two = one.wrapping_add(2);
+            let three = two.wrapping_add(3);
+            let four = three.wrapping_add(4);
+            let five = four.wrapping_add(5);
+            let six = five.wrapping_add(6);
+            six.wrapping_add(one)
         }
     "#;
     let (_home, _project, home_path, project_path) = setup_daemon_project(source);
@@ -268,6 +293,74 @@ fn daemon_tool_search_paginates_authenticated_cursor_over_cli_transport() {
         }),
     );
     assert_search_refused(&mismatched_query, "query-mismatched cursor");
+
+    let active_project = run_json_tool(
+        &project_path,
+        &home_path,
+        "active_project",
+        json!({"format": "json"}),
+    );
+    assert!(
+        active_project.status.success(),
+        "active_project failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&active_project.stdout),
+        String::from_utf8_lossy(&active_project.stderr)
+    );
+    let active_project_payload = search_payload(&active_project);
+    let project_id = active_project_payload["project_id"]
+        .as_str()
+        .expect("active_project project_id");
+    let repository_id = active_project_payload["repository_id"]
+        .as_str()
+        .expect("active_project repository_id");
+    let symbol_occurrence_id = first_results[0]["node_id"]
+        .as_str()
+        .expect("JSON search result node_id for similar")
+        .to_owned();
+    let similar_args = json!({
+        "project_id": project_id,
+        "repository_id": repository_id,
+        "target": {
+            "kind": "symbol_occurrence",
+            "symbol_occurrence_id": symbol_occurrence_id.clone(),
+        },
+        "match_classes": ["conservative_exact"],
+        "result_limit": 10,
+        "work_limit": 20,
+        "format": "json"
+    });
+    let similar = common::poll_until(
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_millis(100),
+        || {
+            let output = run_json_tool(&project_path, &home_path, "similar", similar_args.clone());
+            let Some(payload) = try_search_payload(&output) else {
+                return None;
+            };
+            let has_source = payload["source"]["symbol_occurrence_id"] == symbol_occurrence_id;
+            let has_family = payload["families"]
+                .as_array()
+                .is_some_and(|families| !families.is_empty());
+            (output.status.success() && has_source && has_family).then_some(output)
+        },
+        || "similar did not publish a verified clone family for the search result".to_owned(),
+    );
+    let similar_payload = search_payload(&similar);
+    assert_eq!(
+        similar_payload["source"]["symbol_occurrence_id"], symbol_occurrence_id,
+        "similar must resolve the search result occurrence: {similar_payload}"
+    );
+    assert!(
+        similar_payload["families"]
+            .as_array()
+            .is_some_and(|families| families.iter().any(|family| {
+                family["match_class"] == "conservative_exact"
+                    && family["member_count"]
+                        .as_u64()
+                        .is_some_and(|count| count >= 2)
+            })),
+        "similar must return the repeated verified clone family: {similar_payload}"
+    );
 }
 
 #[test]

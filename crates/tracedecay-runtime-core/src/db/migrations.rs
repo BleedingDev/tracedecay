@@ -1,9 +1,9 @@
 //! Schema creation for the tracedecay database.
 //!
-//! This binary creates every store at one final schema shape and never steps an
-//! older shape forward. `PRAGMA user_version` records that shape as an atomic
-//! integer built into `SQLite`; a store carrying any other value was written by
-//! an incompatible binary and is refused at open with a fresh-start remedy.
+//! This binary creates every new store at one final schema shape. `PRAGMA
+//! user_version` records that shape as an atomic integer built into `SQLite`;
+//! the only older stores with an in-place path are the exact released v34 and
+//! v35 project inventories handled by `released_shape`.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -14,6 +14,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_rusqlite_runtime::runtime_ledger;
 
 mod final_shape;
+mod released_shape;
 
 pub use final_shape::{expected_final_schema_fingerprint, fingerprint_schema_objects};
 
@@ -39,8 +40,9 @@ const ROOT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
     CREATE INDEX IF NOT EXISTS idx_read_cache_session
         ON read_cache(session_id, created_at);";
 
-/// The one schema shape this binary creates and accepts. It is an identity
-/// stamp, not a ladder rung: a store at any other version is refused.
+/// The one schema shape this binary creates and accepts after any explicit
+/// released v34/v35 bridge. It is an identity stamp, not a general ladder
+/// rung: every other version is refused.
 ///
 /// Code topology lives only in the verified Grafeo generation. Exact memory
 /// content, provenance, trust, retention, and feedback live only in the
@@ -57,14 +59,13 @@ pub fn verify_admissible_final_shape_rusqlite(conn: &rusqlite::Connection) -> Re
     final_shape::require_admissible_final_shape_rusqlite(conn)
 }
 
-/// Legacy stamp retained for callers that need to identify the released v34
-/// store. It is never admitted or migrated by this binary.
-#[deprecated(note = "released stores are reset-required; no in-place migration exists")]
+/// The released project-store stamp accepted by the bounded v34/v35 -> v36
+/// migration. The migration still requires the exact tagged source inventory.
 pub const PAYLOAD_DIGEST_STEP_SOURCE_VERSION: u32 = 34;
 
-/// Legacy metadata key retained for source compatibility with old fixtures.
-/// New stores never write migration receipts.
-#[deprecated(note = "released stores are reset-required; migration receipts are not written")]
+/// Metadata key retained for source compatibility with older callers. The
+/// zero-loss bridge does not write a backfill receipt because its transaction
+/// either commits the complete v36 shape or rolls back every change.
 pub const PAYLOAD_DIGEST_BACKFILL_RECEIPT_KEY: &str = "memory_v2.payload_digest_backfill.v35";
 
 /// Reads the current schema version from `PRAGMA user_version`.
@@ -118,8 +119,8 @@ pub async fn configure_fresh_auto_vacuum(conn: &Connection, operation: &str) -> 
 }
 
 /// Creates the complete schema from scratch for a brand-new database and
-/// stamps [`SCHEMA_VERSION`]. This is the only way a store comes into
-/// existence: there is no stepwise path to this shape.
+/// stamps [`SCHEMA_VERSION`]. Released v34/v35 files enter through the
+/// explicit writer migration instead.
 pub async fn create_schema(database: &crate::db::Database) -> Result<()> {
     let writer = database.writer_connection("create schema").await?;
     let connection = writer.engine_connection();
@@ -353,10 +354,11 @@ fn unsupported_schema_version(current: u32) -> TraceDecayError {
 }
 
 /// Verifies an opened store carries the schema this binary creates, creating it
-/// when the file is still empty.
+/// when the file is still empty or running the exact released bridge for v34 or
+/// v35.
 ///
-/// This binary has no upgrade ladder: a store stamped with any other version is
-/// refused with the fresh-start remedy rather than stepped forward.
+/// A store stamped with any other version is refused with the fresh-start
+/// remedy rather than guessed forward.
 ///
 /// The schema ladder is awaited through a `dyn Future` so its concrete future
 /// type stops at this phase boundary: with the `hotpath` wrappers compiled in,
@@ -371,10 +373,15 @@ pub async fn ensure_schema_current(database: &crate::db::Database) -> Result<()>
     ladder.await
 }
 
-/// Checks an existing store before publication. There is deliberately no
-/// writer-side migration or repair path: a released v34/v35 store, or any
-/// store carrying a retired projection, must be reset as a unit.
+/// Checks an existing store before publication. A released v34/v35 store is
+/// migrated only through the explicit writer-owned transaction; every other
+/// retired or incompatible shape remains reset-required.
 pub(crate) async fn step_schema_if_pending(conn: &Connection) -> Result<bool> {
+    let current = get_version(conn).await?;
+    if matches!(current, 34 | 35) {
+        migrate_released_project_schema_connection(conn, current).await?;
+        return Ok(true);
+    }
     verify_final_schema_connection(conn).await?;
     Ok(false)
 }
@@ -386,15 +393,97 @@ async fn ensure_schema_current_engine_connection(
     if current == 0 && !store_has_objects(conn).await? {
         return create_schema_engine_connection(conn).await;
     }
+    if matches!(current, 34 | 35) {
+        migrate_released_project_schema_engine_connection(conn, current).await?;
+    }
     verify_final_schema_connection(conn).await
+}
+
+const RELEASED_SCHEMA_OPERATION: &str = "migrate released project schema";
+
+/// Runs the only supported in-place project-store migration. The source
+/// inventory and rows are checked inside the long-lease transaction; any
+/// failure rolls the transaction back before the caller can publish the
+/// connection.
+async fn migrate_released_project_schema_engine_connection(
+    conn: &DatabaseEngineWriteConnection,
+    stamp: u32,
+) -> Result<()> {
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| released_schema_failure(format!("failed to acquire lock: {error}")))?;
+    match released_shape::migrate_released_project_schema(&transaction, stamp).await {
+        Ok(()) => transaction
+            .commit()
+            .await
+            .map_err(|error| released_schema_failure(format!("failed to commit: {error}"))),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(released_schema_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+async fn migrate_released_project_schema_connection(conn: &Connection, stamp: u32) -> Result<()> {
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| released_schema_failure(format!("failed to acquire lock: {error}")))?;
+    match released_shape::migrate_released_project_schema(&transaction, stamp).await {
+        Ok(()) => transaction
+            .commit()
+            .await
+            .map_err(|error| released_schema_failure(format!("failed to commit: {error}"))),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(released_schema_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+fn released_schema_failure(message: String) -> TraceDecayError {
+    TraceDecayError::Database {
+        message,
+        operation: RELEASED_SCHEMA_OPERATION.to_owned(),
+    }
+}
+
+fn released_schema_rollback_failure(
+    error: TraceDecayError,
+    rollback_error: impl std::fmt::Display,
+) -> TraceDecayError {
+    match error {
+        TraceDecayError::ResetRequired { authority, reason } => TraceDecayError::ResetRequired {
+            authority,
+            reason: format!("{reason}; migration rollback also failed: {rollback_error}"),
+        },
+        TraceDecayError::Database { message, operation } => TraceDecayError::Database {
+            message: format!("{message}; migration rollback also failed: {rollback_error}"),
+            operation,
+        },
+        error => TraceDecayError::Database {
+            message: format!("{error}; migration rollback also failed: {rollback_error}"),
+            operation: RELEASED_SCHEMA_OPERATION.to_owned(),
+        },
+    }
 }
 
 /// Verifies that an already-existing store has the one exact final shape this
 /// binary accepts. This query-only authority intentionally cannot initialize a
 /// fresh file, so read-only mounts cannot change persisted state.
 pub(crate) async fn verify_final_schema_connection(conn: &impl QueryExecutor) -> Result<()> {
-    require_no_retired_sqlite_projection_object(conn).await?;
     let current = get_version(conn).await?;
+    if matches!(current, 34 | 35) {
+        released_shape::require_exact_source_shape(conn, current).await?;
+        return Err(TraceDecayError::Database {
+            message: format!(
+                "database schema v{current} is a released project shape; writer migration to v{SCHEMA_VERSION} is pending"
+            ),
+            operation: "verify_final_schema".to_owned(),
+        });
+    }
+    require_no_retired_sqlite_projection_object(conn).await?;
     if current != SCHEMA_VERSION {
         return Err(unsupported_schema_version(current));
     }
@@ -407,6 +496,9 @@ pub(crate) async fn ensure_schema_current_connection(conn: &Connection) -> Resul
     let current = get_version(conn).await?;
     if current == 0 && !store_has_objects(conn).await? {
         return create_schema_connection(conn).await;
+    }
+    if matches!(current, 34 | 35) {
+        migrate_released_project_schema_connection(conn, current).await?;
     }
     verify_final_schema_connection(conn).await
 }

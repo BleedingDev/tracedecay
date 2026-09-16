@@ -134,21 +134,12 @@ async fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// A store stamped with any other version was written by an incompatible
-/// binary. This binary has no ladder, so it refuses with the fresh-start
-/// remedy instead of upgrading in place. The released v34/v35 stamps are
-/// included explicitly: neither can enter a migration or repair path.
+/// A store stamped with any unsupported version was written by an incompatible
+/// binary. The released v34/v35 stamps are covered by the dedicated migration
+/// tests in `final_shape`; every other stamp remains reset-required.
 #[tokio::test]
 async fn a_store_at_another_schema_version_is_refused_with_a_fresh_start_remedy() {
-    for stamped in [
-        1_u32,
-        18,
-        24,
-        33,
-        34,
-        SCHEMA_VERSION - 1,
-        SCHEMA_VERSION + 1,
-    ] {
+    for stamped in [1_u32, 18, 24, 33, SCHEMA_VERSION + 1] {
         let (conn, _dir) = create_schema_db().await;
         set_user_version(&conn, stamped).await;
 
