@@ -847,12 +847,10 @@ fn raw_source_key_exclusion_runs_before_candidate_and_recall_byte_limits_for_old
             };
             let baseline = live.recall_selected(&namespace(), recall(), selection(None, 1));
             if byte_bound {
-                assert!(
-                    baseline.payload["common_recall"]["candidates"]
-                        .as_array()
-                        .unwrap()
-                        .is_empty(),
-                    "{baseline:?}"
+                assert_eq!(baseline.outcome, Outcome::Success, "{baseline:?}");
+                assert_eq!(
+                    baseline.payload["common_recall"]["candidates"][0]["record_id"],
+                    safe.payload["record_id"]
                 );
                 assert_eq!(baseline.payload["common_recall"]["truncated"], true);
             } else {
