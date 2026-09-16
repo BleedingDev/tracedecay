@@ -30,12 +30,12 @@
     "parity_scope": "Preserve exact Native fact/session/LCM algorithm and schema behavior from 570; implementation and behavioral gates remain planned."
   },
   "observed_pull_request": {
-    "retrieved_at": "2026-09-07",
+    "retrieved_at": "2026-09-16",
     "state": "open",
     "base_ref": "master",
-    "base_sha": "b9204dcf7de8faac4ef05af367a546aa29c32e9f",
+    "base_sha": "61ca3b08987be59acf01b0f1ec124ca78ea2fea8",
     "head_ref": "codex/tracedecay-total-redesign-plan-reopened",
-    "head_sha": "3b59bb7eb0b10b4e7a8efc668e793ef7a1d11072",
+    "head_sha": "82cb66a2e5114ccb72f56cb42817333bfaf27b3e",
     "pinned_floor_is_current_head": false
   },
   "update_procedure": {
