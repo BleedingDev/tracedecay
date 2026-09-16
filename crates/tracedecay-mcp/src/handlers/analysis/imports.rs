@@ -88,16 +88,20 @@ pub async fn handle_unused_imports(
         .filter(|file| file.disposition == SnapshotFileDispositionV1::Present)
         .filter(|file| path_is_rust(&file.logical_path))
         .filter(|file| path_matches_optional_scope(&file.logical_path, scope_prefix))
-        .map(|file| IndexedFile {
-            path: file.logical_path,
-            digest: file.content_digest,
-            import_offset: cursor.as_ref().map_or(0, |cursor| match cursor {
+        .map(|file| {
+            let path = file.logical_path;
+            let import_offset = cursor.as_ref().map_or(0, |cursor| match cursor {
                 ScanCursor::WithinFile {
-                    path,
+                    path: cursor_path,
                     import_offset,
-                } if path == &file.logical_path => *import_offset,
+                } if cursor_path == &path => *import_offset,
                 _ => 0,
-            }),
+            });
+            IndexedFile {
+                path,
+                digest: file.content_digest,
+                import_offset,
+            }
         })
         .filter(|file| {
             cursor.as_ref().is_none_or(|cursor| match cursor {
