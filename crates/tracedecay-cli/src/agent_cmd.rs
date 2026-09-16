@@ -1084,6 +1084,12 @@ fn handle_host_bundle_recovery_command_inner(
                 .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!("could not resolve host lifecycle root: {error}"),
                 })?;
+        // Recovery may re-run a host registration authority while restoring a
+        // journal. Resolve the launcher once here as well, so a recovery
+        // invoked from V2 cannot reconstruct registration with a V1 PATH
+        // binary. The generic authority constructor remains available to
+        // pure tests and read-only helpers; this CLI mutation is pinned.
+        let tracedecay_bin = lifecycle_tracedecay_bin()?;
         let mut writer =
             tracedecay_agent_hosts::agents::host_bundle::HostBundleWriterV1::open_with_lifecycle_root(
                 &home,
@@ -1146,12 +1152,15 @@ fn handle_host_bundle_recovery_command_inner(
                 .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
                     message: format!("{agent_id}: pending lifecycle journal disappeared"),
                 })?;
-            let mut registration = CatalogHostComponentRegistrationAuthority::new(
-                agent_id,
-                &home,
-                &lifecycle_root,
-                operation,
-            )?;
+            let mut registration =
+                CatalogHostComponentRegistrationAuthority::new_with_tracedecay_bin_and_dashboard(
+                    agent_id,
+                    &home,
+                    &lifecycle_root,
+                    operation,
+                    tracedecay_bin.clone(),
+                    true,
+                )?;
             let outcome =
                 tracedecay_agent_hosts::agents::host_bundle::HostComponentSetTransactionV1::new(
                     &mut writer,
