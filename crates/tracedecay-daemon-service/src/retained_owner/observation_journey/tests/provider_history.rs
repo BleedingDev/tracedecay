@@ -9,8 +9,12 @@ use crate::retained_owner::provider_history::{
     original_source_fence_digest, source_attribution_json,
 };
 use tracedecay_domain::{BrainId, RetrievalAnchorId};
+use tracedecay_memory_provider_ncm::NCM_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
-    HistoryGrant, recall_admission::source_attribution::RecallSourceAttributionV1,
+    COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES, HistoryGrant,
+    MemoryProviderV1, ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1,
+    ProviderRegistrationV1, RecallScopeBindingsV1, SelectedProviderActivationV1,
+    recall_admission::source_attribution::RecallSourceAttributionV1,
 };
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_store::{
@@ -1710,5 +1714,671 @@ async fn keyed_control_authorization_rechecks_source_and_allows_only_fresh_clean
             .authorize_retained_source(&destination, &expected, &control(), true)
             .await
             .is_err()
+    );
+}
+
+const SWITCH_NATIVE_JOURNAL: &str = "memory-observation-switch-native-v1.sqlite3";
+const SWITCH_NCM_JOURNAL: &str = "memory-observation-switch-ncm-v2.sqlite3";
+const SWITCH_NATIVE_ROLLBACK_JOURNAL: &str = "memory-observation-switch-native-rollback-v3.sqlite3";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SwitchObservedCall {
+    idempotency_key: String,
+    exact_scope_sha256: String,
+    payload_sha256: String,
+}
+
+/// A deterministic in-process NCM-shaped adapter for the product journey.
+///
+/// The real NCM acceptance path is intentionally ignored because it requires a
+/// model runtime. This double still goes through the same injected active
+/// registration, readiness handshake, observation journal, and provider
+/// dispatch route as that path, so the normal suite can prove the transition
+/// protocol without depending on a model or a worker process.
+struct SwitchNcmProvider {
+    descriptor: ProviderDescriptor,
+    handshakes: AtomicUsize,
+    observations: Mutex<Vec<SwitchObservedCall>>,
+}
+
+impl SwitchNcmProvider {
+    fn new() -> Arc<Self> {
+        let capabilities = std::iter::once(COMMON_ADVISORY_PROFILE_ID)
+            .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
+            .map(|capability| OwnedVersionedId::new(capability).expect("capability"));
+        let descriptor = ProviderDescriptor::new(
+            OwnedProviderId::new(NCM_PROVIDER_ID).expect("NCM provider identity"),
+            "4".repeat(64),
+            "switch-ncm-test-v1",
+            0,
+            capabilities,
+            crate::retained_owner::native_provider::native_provider_limits(),
+        )
+        .expect("NCM test descriptor");
+        Arc::new(Self {
+            descriptor,
+            handshakes: AtomicUsize::new(0),
+            observations: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn observation_calls(&self) -> Vec<SwitchObservedCall> {
+        self.observations.lock().unwrap().clone()
+    }
+}
+
+impl MemoryProviderV1 for SwitchNcmProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        self.handshakes.fetch_add(1, Ordering::AcqRel);
+        HandshakeResponse {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Handshake,
+                self.descriptor.provider_id.clone(),
+                TerminalCode::Success,
+                CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
+                FallbackDirective::forbidden(),
+                request.request_id.clone(),
+                request.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("NCM handshake terminal"),
+            descriptor: Some(self.descriptor.clone()),
+            provider_instance_id: Some("ncm.switch-test".to_owned()),
+            state_namespace: Some(NCM_PROVIDER_ID.to_owned()),
+            accepted_scope: Some(request.exact_scope.clone()),
+            effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
+            ready_receipt_sha256: Some(READY_RECEIPT.to_owned()),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        if call.operation == ProviderOperation::Observe {
+            self.observations.lock().unwrap().push(SwitchObservedCall {
+                idempotency_key: call
+                    .idempotency_key
+                    .clone()
+                    .expect("observation idempotency key"),
+                exact_scope_sha256: call.exact_scope.exact_scope_sha256(),
+                payload_sha256: call.payload.sha256.clone(),
+            });
+        }
+        let terminal = if call.operation == ProviderOperation::Observe {
+            TerminalRecord::new(
+                ProviderOperation::Observe,
+                call.provider_id.clone(),
+                TerminalCode::Success,
+                CommittedEffectEvidence::committed(
+                    call.expected_state_generation,
+                    call.expected_state_generation,
+                    vec!["observation:switch-ncm-test".to_owned()],
+                    PROVIDER_RECEIPT,
+                    EFFECT_DIGEST,
+                )
+                .expect("NCM committed effect"),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("NCM observation terminal")
+        } else {
+            TerminalRecord::new(
+                call.operation,
+                call.provider_id.clone(),
+                TerminalCode::SuccessZeroResults,
+                CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("NCM control terminal")
+        };
+        ProviderReply {
+            terminal,
+            payload: (call.operation == ProviderOperation::Observe).then(|| call.payload.clone()),
+            warnings: Vec::new(),
+            extensions: call.extensions.clone(),
+            state_generation: call.expected_state_generation,
+        }
+    }
+}
+
+fn switch_fabric_config() -> FabricConfig {
+    FabricConfig {
+        max_registered_providers: 1,
+        max_in_flight: 1,
+    }
+}
+
+fn switch_native_composition(
+    port: Arc<dyn NativeMemoryApplicationPort>,
+    registration_revision: u64,
+) -> Arc<ProjectMemoryProviderComposition> {
+    Arc::new(
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: switch_fabric_config(),
+            port,
+            registration_revision,
+            mode: EnabledProviderMode::Active,
+        })
+        .expect("Native active composition"),
+    )
+}
+
+fn switch_ncm_composition(
+    provider: Arc<SwitchNcmProvider>,
+    registration_revision: u64,
+) -> Arc<ProjectMemoryProviderComposition> {
+    let provider_id = OwnedProviderId::new(NCM_PROVIDER_ID).expect("NCM provider identity");
+    let registration = ProviderRegistrationV1 {
+        provider_id,
+        provider,
+        registration_revision,
+        mode: EnabledProviderMode::Active,
+        execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+        recall_scope_bindings: RecallScopeBindingsV1::from_wire(["exact_coding_scope"])
+            .expect("NCM recall binding"),
+        lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+    };
+    Arc::new(
+        ProjectMemoryProviderComposition::compose_registered(
+            SelectedProviderActivationV1::Injected {
+                fabric_config: switch_fabric_config(),
+                registration,
+            },
+            Vec::new(),
+        )
+        .expect("NCM active composition"),
+    )
+}
+
+fn switch_native_mount(
+    data_root: &Path,
+    registration_revision: u64,
+    journal_file_name: &'static str,
+) -> ObservationProviderMountV1 {
+    ObservationProviderMountV1 {
+        provider_id: OwnedProviderId::new(tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID)
+            .expect("Native provider identity"),
+        registration_revision,
+        provider_instance_id: Some(
+            crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
+        ),
+        instance_proof: None,
+        host_limits: crate::retained_owner::native_provider::native_provider_limits(),
+        state_root: data_root
+            .join(crate::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME)
+            .join("native"),
+        journal_file_name,
+        state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
+            tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned(),
+        ),
+    }
+}
+
+fn switch_ncm_mount(data_root: &Path, registration_revision: u64) -> ObservationProviderMountV1 {
+    ObservationProviderMountV1 {
+        provider_id: OwnedProviderId::new(NCM_PROVIDER_ID).expect("NCM provider identity"),
+        registration_revision,
+        provider_instance_id: Some("ncm.switch-test".to_owned()),
+        instance_proof: None,
+        host_limits: crate::retained_owner::native_provider::native_provider_limits(),
+        state_root: data_root
+            .join(crate::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME)
+            .join(NCM_PROVIDER_ID),
+        journal_file_name: SWITCH_NCM_JOURNAL,
+        state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
+            NCM_PROVIDER_ID.to_owned(),
+        ),
+    }
+}
+
+fn switch_assert_active(
+    composition: &ProjectMemoryProviderComposition,
+    provider_id: &str,
+    registration_revision: u64,
+) {
+    let registration = composition
+        .registry()
+        .expect("enabled provider composition")
+        .selected_registration()
+        .expect("selected active registration");
+    assert_eq!(registration.provider_id.as_str(), provider_id);
+    assert_eq!(registration.registration_revision, registration_revision);
+    assert_eq!(registration.mode, EnabledProviderMode::Active);
+}
+
+async fn switch_persist_position(
+    store: &impl ObservationStore,
+    observation: DurableObservationV1,
+    position: u64,
+) {
+    let anchored = anchored_write(observation);
+    let expected_cursor = store
+        .get_source_cursor(
+            anchored.observation().source(),
+            anchored.observation().scope(),
+        )
+        .await
+        .expect("read canonical source cursor");
+    assert_eq!(
+        expected_cursor
+            .as_ref()
+            .map(ObservationSourceCursorV1::position),
+        (position > 0).then_some(position),
+        "canonical source cursor must advance exactly once per committed event",
+    );
+    let write = ObservationWrite::new(
+        anchored.observation().clone(),
+        expected_cursor,
+        anchored.next_cursor().clone(),
+    )
+    .expect("source cursor transition");
+    let write = AnchoredObservationWrite::new(
+        write,
+        anchored.retrieval_anchor().clone(),
+        anchored.projection_generation().clone(),
+    )
+    .expect("anchored canonical observation");
+    store
+        .persist_observation(write)
+        .await
+        .expect("persist canonical observation");
+}
+
+fn switch_git_state(root: &Path) -> (String, String) {
+    let git = tracedecay_runtime_core::git::try_git_program().expect("git");
+    let branch = std::process::Command::new(&git)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("read git branch");
+    assert!(branch.status.success(), "git branch read failed");
+    let head = std::process::Command::new(&git)
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("read git head");
+    assert!(head.status.success(), "git head read failed");
+    (
+        String::from_utf8(branch.stdout)
+            .expect("branch UTF-8")
+            .trim()
+            .to_owned(),
+        String::from_utf8(head.stdout)
+            .expect("head UTF-8")
+            .trim()
+            .to_owned(),
+    )
+}
+
+fn switch_journal_delivery_rows(path: &Path) -> (String, i64, Vec<String>) {
+    let connection = rusqlite::Connection::open(path).expect("switch journal");
+    let (provider_id, registration_revision) = connection
+        .query_row(
+            "SELECT provider_id, registration_revision \
+             FROM tdmem_observation_delivery_v1 LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("provider lane row");
+    let mut statement = connection
+        .prepare(
+            "SELECT idempotency_key FROM tdmem_observation_delivery_v1 \
+             ORDER BY idempotency_key",
+        )
+        .expect("delivery keys");
+    let keys = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("delivery key rows")
+        .flatten()
+        .collect();
+    (provider_id, registration_revision, keys)
+}
+
+async fn switch_replay_and_assert(
+    journey: &ProjectObservationJourneyV1,
+    store: &GlobalDbObservationStore,
+    expected_source_event_ids: &[String],
+    expected_admitted: u64,
+) {
+    let pass = run_startup_replay(journey, store, &HostCancellationToken::new())
+        .await
+        .expect("startup canonical replay");
+    assert_eq!(pass.admitted, expected_admitted);
+    journey.wake_delivery();
+    let rows = wait_for_deliveries(journey.journal_path(), expected_source_event_ids.len()).await;
+    let actual_source_event_ids = rows
+        .iter()
+        .map(|(source_event_id, _, _)| source_event_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_source_event_ids, expected_source_event_ids);
+    assert!(
+        rows.iter()
+            .all(|(_, state, attempts)| state == "acknowledged" && *attempts == 1)
+    );
+}
+
+fn switch_sorted_ids(observations: &[DurableObservationV1]) -> Vec<String> {
+    let mut ids = observations
+        .iter()
+        .map(|observation| observation.observation_id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_ncm_native_active_rollback_preserves_canonical_history_and_source_control() {
+    let temp = TempDir::new().expect("temporary provider-switch root");
+    let profile_root = temp.path().join("profile");
+    let project_root = temp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("project root");
+    git(&project_root, &["init", "-q", "-b", "observation-journey"]);
+    git(
+        &project_root,
+        &["config", "user.name", "Provider Switch Test"],
+    );
+    git(
+        &project_root,
+        &["config", "user.email", "provider-switch@example.invalid"],
+    );
+    std::fs::write(project_root.join("tracked"), "source-control-continuity").expect("tracked");
+    git(&project_root, &["add", "tracked"]);
+    git(
+        &project_root,
+        &["commit", "-q", "-m", "provider switch baseline"],
+    );
+    let source_control_before = switch_git_state(&project_root);
+
+    let project_id = ProjectId::new("project.native-ncm-native-rollback").expect("project id");
+    let runtime =
+        HostAdmissionTestRuntimeV1::project(&profile_root, &project_root, project_id.clone())
+            .await
+            .expect("registered project database");
+    let store = runtime
+        .registered_database_arc(HostAdmissionScope::Project)
+        .expect("project database")
+        .observation_store();
+    let profile_id = UserProfileId::new("profile.native-ncm-native-rollback").expect("profile");
+    let resolved_scope = scope(project_id.clone());
+    let journey_root = temp.path().join("journey");
+    std::fs::create_dir_all(&journey_root).expect("journey root");
+    let session_id = SessionId::new("session.native-ncm-native-rollback").expect("session");
+    let observations = (0..=2)
+        .map(|position| {
+            canonical_observation_at(
+                &project_id,
+                &session_id,
+                match position {
+                    0 => "native active history",
+                    1 => "NCM active history",
+                    _ => "native rollback history",
+                },
+                position,
+            )
+        })
+        .collect::<Vec<_>>();
+    let canonical_source_event_ids = observations
+        .iter()
+        .map(|observation| observation.observation_id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    let expected_native_history = switch_sorted_ids(&observations[..1]);
+    let expected_ncm_history = switch_sorted_ids(&observations[..2]);
+    let expected_source_event_ids = switch_sorted_ids(&observations);
+
+    // Native active revision 1 receives the first canonical event, then the
+    // same mounted journey receives a second event before the first restart.
+    switch_persist_position(&store, observations[0].clone(), 0).await;
+    let native_first_port = Arc::new(JourneyNativePort::new());
+    let native_first_composition = switch_native_composition(
+        Arc::clone(&native_first_port) as Arc<dyn NativeMemoryApplicationPort>,
+        1,
+    );
+    switch_assert_active(native_first_composition.as_ref(), "tracedecay.native", 1);
+    let native_first_journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+        composition: Arc::clone(&native_first_composition),
+        profile_id: profile_id.clone(),
+        scope: resolved_scope.clone(),
+        authoritative_project_id: project_id.clone(),
+        store_data_root: journey_root.clone(),
+        provider: switch_native_mount(&journey_root, 1, SWITCH_NATIVE_JOURNAL),
+        policy: ObservationJourneyPolicyV1::project_default(),
+    })
+    .expect("Native active journey");
+    switch_replay_and_assert(
+        native_first_journey.as_ref(),
+        &store,
+        &expected_native_history,
+        1,
+    )
+    .await;
+    assert_eq!(native_first_port.observe_calls.load(Ordering::Acquire), 1);
+    assert_eq!(switch_git_state(&project_root), source_control_before);
+
+    switch_persist_position(&store, observations[1].clone(), 1).await;
+    let second_pass = native_first_journey
+        .replay_canonical_observations(&store, REPLAY_LIVE_PAGES, open_bounds())
+        .await
+        .expect("Native live replay");
+    assert_eq!(second_pass.admitted, 1);
+    native_first_journey.wake_delivery();
+    let native_rows = wait_for_deliveries(native_first_journey.journal_path(), 2).await;
+    assert_eq!(
+        native_rows
+            .iter()
+            .map(|(source_event_id, _, _)| source_event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_ncm_history
+    );
+    assert_eq!(native_first_port.observe_calls.load(Ordering::Acquire), 2);
+    assert_eq!(switch_git_state(&project_root), source_control_before);
+    assert!(
+        native_first_journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_empty()
+    );
+    drop(native_first_journey);
+    drop(native_first_composition);
+
+    // NCM active revision 2 starts from the canonical history and receives a
+    // new event while active. Its second mount below is the restart boundary
+    // that must not re-deliver any of the three already settled events.
+    let ncm_provider = SwitchNcmProvider::new();
+    let ncm_composition = switch_ncm_composition(Arc::clone(&ncm_provider), 2);
+    switch_assert_active(ncm_composition.as_ref(), NCM_PROVIDER_ID, 2);
+    let ncm_journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+        composition: Arc::clone(&ncm_composition),
+        profile_id: profile_id.clone(),
+        scope: resolved_scope.clone(),
+        authoritative_project_id: project_id.clone(),
+        store_data_root: journey_root.clone(),
+        provider: switch_ncm_mount(&journey_root, 2),
+        policy: ObservationJourneyPolicyV1::project_default(),
+    })
+    .expect("NCM active journey");
+    switch_replay_and_assert(ncm_journey.as_ref(), &store, &expected_ncm_history, 2).await;
+    switch_persist_position(&store, observations[2].clone(), 2).await;
+    let ncm_tail = ncm_journey
+        .replay_canonical_observations(&store, REPLAY_LIVE_PAGES, open_bounds())
+        .await
+        .expect("NCM live replay");
+    assert_eq!(ncm_tail.admitted, 1);
+    ncm_journey.wake_delivery();
+    let ncm_rows = wait_for_deliveries(ncm_journey.journal_path(), 3).await;
+    assert_eq!(
+        ncm_rows
+            .iter()
+            .map(|(source_event_id, _, _)| source_event_id.clone())
+            .collect::<Vec<_>>(),
+        expected_source_event_ids
+    );
+    let ncm_calls_before_restart = ncm_provider.observation_calls();
+    assert_eq!(ncm_calls_before_restart.len(), 3);
+    let ncm_handshakes_before_restart = ncm_provider.handshakes.load(Ordering::Acquire);
+    assert!(ncm_handshakes_before_restart > 0);
+    let expected_exact_scope =
+        exact_scope_for_session(&profile_id, &resolved_scope, session_id.as_str())
+            .expect("canonical exact scope");
+    assert_eq!(
+        ncm_calls_before_restart
+            .iter()
+            .map(|call| call.exact_scope_sha256.clone())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([expected_exact_scope.exact_scope_sha256()]),
+        "the active NCM route must retain the canonical exact coding scope"
+    );
+    assert!(
+        ncm_calls_before_restart
+            .iter()
+            .all(|call| call.payload_sha256.len() == 64)
+    );
+    assert_eq!(switch_git_state(&project_root), source_control_before);
+    assert!(
+        ncm_journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_empty()
+    );
+    drop(ncm_journey);
+    drop(ncm_composition);
+
+    // Restart NCM over its same durable lane. Startup replay must resume at
+    // the NCM watermark, leaving both the provider call census and receipts
+    // unchanged before Native is selected again.
+    let ncm_restart_provider = SwitchNcmProvider::new();
+    let ncm_restart_composition = switch_ncm_composition(Arc::clone(&ncm_restart_provider), 2);
+    switch_assert_active(ncm_restart_composition.as_ref(), NCM_PROVIDER_ID, 2);
+    let ncm_restart_journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+        composition: Arc::clone(&ncm_restart_composition),
+        profile_id: profile_id.clone(),
+        scope: resolved_scope.clone(),
+        authoritative_project_id: project_id.clone(),
+        store_data_root: journey_root.clone(),
+        provider: switch_ncm_mount(&journey_root, 2),
+        policy: ObservationJourneyPolicyV1::project_default(),
+    })
+    .expect("restarted NCM active journey");
+    switch_replay_and_assert(
+        ncm_restart_journey.as_ref(),
+        &store,
+        &expected_source_event_ids,
+        0,
+    )
+    .await;
+    assert!(ncm_restart_provider.observation_calls().is_empty());
+    assert!(ncm_restart_provider.handshakes.load(Ordering::Acquire) > 0);
+    assert_eq!(ncm_provider.observation_calls(), ncm_calls_before_restart);
+    assert!(ncm_provider.handshakes.load(Ordering::Acquire) >= ncm_handshakes_before_restart);
+    assert_eq!(switch_git_state(&project_root), source_control_before);
+    assert!(
+        ncm_restart_journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_empty()
+    );
+    drop(ncm_restart_journey);
+    drop(ncm_restart_composition);
+
+    // Native is selected again under a fresh product revision. A fresh
+    // incarnation receives the complete canonical history exactly once,
+    // proving rollback is a route change over the store rather than a rewind
+    // or loss of canonical source events.
+    let native_rollback_port = Arc::new(JourneyNativePort::new());
+    let native_rollback_composition = switch_native_composition(
+        Arc::clone(&native_rollback_port) as Arc<dyn NativeMemoryApplicationPort>,
+        3,
+    );
+    switch_assert_active(native_rollback_composition.as_ref(), "tracedecay.native", 3);
+    let native_rollback_journey =
+        mount_project_observation_journey(ObservationJourneyMountInputsV1 {
+            composition: Arc::clone(&native_rollback_composition),
+            profile_id: profile_id.clone(),
+            scope: resolved_scope.clone(),
+            authoritative_project_id: project_id.clone(),
+            store_data_root: journey_root.clone(),
+            provider: switch_native_mount(&journey_root, 3, SWITCH_NATIVE_ROLLBACK_JOURNAL),
+            policy: ObservationJourneyPolicyV1::project_default(),
+        })
+        .expect("Native rollback journey");
+    switch_replay_and_assert(
+        native_rollback_journey.as_ref(),
+        &store,
+        &expected_source_event_ids,
+        3,
+    )
+    .await;
+    assert_eq!(
+        native_rollback_port.observe_calls.load(Ordering::Acquire),
+        3
+    );
+    assert_eq!(
+        native_rollback_port.delivered.lock().unwrap().len(),
+        expected_source_event_ids.len(),
+        "Native rollback must see every canonical event exactly once"
+    );
+    assert!(
+        native_rollback_port
+            .delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|delivery| delivery.exact_scope == expected_exact_scope)
+    );
+    assert_eq!(switch_git_state(&project_root), source_control_before);
+
+    let canonical_rows = store
+        .replay_admitted_observations(
+            ObservationReplayRequest::new(0, 16).expect("canonical replay request"),
+        )
+        .await
+        .expect("canonical history remains readable");
+    assert_eq!(
+        canonical_rows
+            .iter()
+            .map(|record| record.observation().observation_id().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        canonical_source_event_ids
+    );
+
+    let (native_id, native_revision, native_keys) =
+        switch_journal_delivery_rows(&journey_root.join(SWITCH_NATIVE_JOURNAL));
+    assert_eq!(
+        (native_id.as_str(), native_revision),
+        ("tracedecay.native", 1)
+    );
+    assert_eq!(native_keys.len(), 2);
+    let (ncm_id, ncm_revision, ncm_keys) =
+        switch_journal_delivery_rows(&journey_root.join(SWITCH_NCM_JOURNAL));
+    assert_eq!((ncm_id.as_str(), ncm_revision), (NCM_PROVIDER_ID, 2));
+    assert_eq!(ncm_keys.len(), 3);
+    assert_eq!(
+        ncm_provider
+            .observation_calls()
+            .into_iter()
+            .map(|call| call.idempotency_key)
+            .collect::<BTreeSet<_>>(),
+        ncm_keys.into_iter().collect::<BTreeSet<_>>(),
+        "NCM must receive each canonical delivery key once"
+    );
+    let (rollback_id, rollback_revision, rollback_keys) =
+        switch_journal_delivery_rows(&journey_root.join(SWITCH_NATIVE_ROLLBACK_JOURNAL));
+    assert_eq!(
+        (rollback_id.as_str(), rollback_revision),
+        ("tracedecay.native", 3)
+    );
+    assert_eq!(rollback_keys.len(), expected_source_event_ids.len());
+    assert!(
+        native_rollback_journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+            .is_empty()
     );
 }
