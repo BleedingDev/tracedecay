@@ -71,6 +71,16 @@ const RELEASED_CONFIGURATION_RETIRED_TABLES: &[(&str, &str)] = &[
     ),
 ];
 
+// These are the two version markers persisted by the configuration store's
+// snapshot-entry codec. A released shape may only be converged when both
+// markers still describe the payload contract understood by current readers.
+const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION: i64 = 1;
+const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION: i64 = 1;
+const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION_REASON: &str =
+    "released configuration store holds a configuration entry with an unsupported schema revision";
+const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON: &str =
+    "released configuration store holds a configuration entry with an unsupported encoded payload version";
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {
     #[error("configuration reset required: {reason}")]
@@ -625,6 +635,45 @@ async fn released_configuration_data_reset_reason(
     if rows.next().await?.is_some() {
         return Ok(Some(
             "released configuration store holds a retired setting entry with no lossless migration",
+        ));
+    }
+
+    let mut rows = connection
+        .query(
+            &format!(
+                "SELECT 1
+                 FROM configuration_entries
+                 WHERE schema_revision != {}
+                 LIMIT 1",
+                RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION,
+            ),
+            (),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Ok(Some(RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION_REASON));
+    }
+
+    let mut rows = connection
+        .query(
+            &format!(
+                "SELECT 1
+                 FROM configuration_entries
+                 WHERE CASE
+                     WHEN json_valid(typed_value) = 0 THEN 1
+                     WHEN COALESCE(json_type(typed_value, '$.schema_version'), '') != 'integer' THEN 1
+                     WHEN COALESCE(json_extract(typed_value, '$.schema_version'), -1) != {} THEN 1
+                     ELSE 0
+                 END = 1
+                 LIMIT 1",
+                RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION,
+            ),
+            (),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Ok(Some(
+            RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON,
         ));
     }
 

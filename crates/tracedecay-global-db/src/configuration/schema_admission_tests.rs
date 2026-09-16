@@ -218,8 +218,9 @@ async fn released_connection() -> (
                  'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                  'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
                  'actor.1', 'canonical_initialization', 1);
-             INSERT INTO configuration_entries VALUES
-                ('revision.1', 'analyzer.settings.v1', 'project', 'project.1', 1, '{\"kept\":true}');",
+            INSERT INTO configuration_entries VALUES
+                ('revision.1', 'analyzer.settings.v1', 'project', 'project.1', 1,
+                 '{\"schema_version\":1,\"value\":{\"kind\":\"analyzer_settings\",\"value\":{\"schema_version\":1,\"selections\":[]}},\"provenance\":[{\"layer\":{\"kind\":\"default\"},\"revision_id\":\"configuration.registry.default.v1\",\"disposition\":\"defaulted\",\"safe_reason\":\"registry_default\"}]}');",
         )
         .await
         .unwrap();
@@ -381,7 +382,7 @@ async fn released_configuration_shape_is_admitted_and_converged_with_rows_intact
             .unwrap()
             .get::<String>(0)
             .unwrap(),
-        "{\"kept\":true}"
+        "{\"schema_version\":1,\"value\":{\"kind\":\"analyzer_settings\",\"value\":{\"schema_version\":1,\"selections\":[]}},\"provenance\":[{\"layer\":{\"kind\":\"default\"},\"revision_id\":\"configuration.registry.default.v1\",\"disposition\":\"defaulted\",\"safe_reason\":\"registry_default\"}]}"
     );
     drop(rows);
     ensure_configuration_schema(&*connection, None)
@@ -500,6 +501,68 @@ async fn released_configuration_shape_with_credential_rows_stays_reset_required(
         .await,
         1,
         "refusal must not discard the unknown row"
+    );
+}
+
+#[tokio::test]
+async fn released_configuration_shape_with_current_key_schema_revision_stays_reset_required() {
+    let (_directory, connection) = released_connection().await;
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO configuration_entries VALUES
+                ('revision.1', 'diagnostics.prewarm.v1', 'default', NULL, 2,
+                 '{"schema_version":1,"value":{"kind":"boolean","value":false},"provenance":[{"layer":{"kind":"default"},"revision_id":"configuration.registry.default.v1","disposition":"defaulted","safe_reason":"registry_default"}]}');
+            "#,
+        )
+        .await
+        .unwrap();
+    let before = sqlite_objects(&connection).await;
+
+    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
+    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
+    assert_eq!(
+        count(
+            &*connection,
+            "SELECT COUNT(*) FROM configuration_entries
+             WHERE key = 'diagnostics.prewarm.v1' AND schema_revision = 2",
+        )
+        .await,
+        1,
+        "unsupported entry schema revision must remain available for reset"
+    );
+}
+
+#[tokio::test]
+async fn released_configuration_shape_with_current_key_payload_version_stays_reset_required() {
+    let (_directory, connection) = released_connection().await;
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO configuration_entries VALUES
+                ('revision.1', 'diagnostics.prewarm.v1', 'default', NULL, 1,
+                 '{"schema_version":2,"value":{"kind":"boolean","value":false},"provenance":[{"layer":{"kind":"default"},"revision_id":"configuration.registry.default.v1","disposition":"defaulted","safe_reason":"registry_default"}]}');
+            "#,
+        )
+        .await
+        .unwrap();
+    let before = sqlite_objects(&connection).await;
+
+    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
+    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
+    assert_eq!(
+        count(
+            &*connection,
+            "SELECT COUNT(*) FROM configuration_entries
+             WHERE key = 'diagnostics.prewarm.v1' AND json_extract(typed_value, '$.schema_version') = 2",
+        )
+        .await,
+        1,
+        "unsupported encoded payload version must remain available for reset"
     );
 }
 
