@@ -744,6 +744,53 @@ pub fn which_tracedecay() -> Option<String> {
     which_tracedecay_path().and_then(|path| path.to_str().map(normalize_path_separators))
 }
 
+/// Resolve the executable that owns the current lifecycle command.
+///
+/// Lifecycle mutations must be rendered with the exact binary that the
+/// operator invoked. In particular, a source-built V2 binary commonly runs
+/// from Cargo's target directory while a stable V1 binary is also available
+/// on `PATH`; falling back to `PATH` in that situation silently installs V1
+/// hooks and service units. Keep this resolver deliberately separate from
+/// [`which_tracedecay`], whose PATH-aware behavior is still useful for
+/// discovery and read-only compatibility probes.
+///
+/// A missing or unsuitable current executable is an error rather than a cue to
+/// search `PATH`. That fail-closed behavior preserves the lifecycle binary
+/// identity across every artifact produced by one command.
+pub fn resolve_lifecycle_executable() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().map_err(|error| TraceDecayError::Config {
+        message: format!("could not determine the current tracedecay executable: {error}"),
+    })?;
+    resolve_lifecycle_executable_from(&current_exe)
+}
+
+fn resolve_lifecycle_executable_from(current_exe: &Path) -> Result<PathBuf> {
+    let current_exe =
+        absolute_executable_path(current_exe).ok_or_else(|| TraceDecayError::Config {
+            message: format!(
+                "could not resolve the current tracedecay executable path: {}",
+                current_exe.display()
+            ),
+        })?;
+    if !is_tracedecay_exe(&current_exe) {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "the current executable is not a tracedecay binary: {}",
+                current_exe.display()
+            ),
+        });
+    }
+    if !current_exe.is_file() {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "the current tracedecay executable is unavailable: {}",
+                current_exe.display()
+            ),
+        });
+    }
+    Ok(current_exe)
+}
+
 /// Finds the tracedecay binary without converting its platform-native path.
 #[hotpath::measure(label = "agent_hosts.agents.which_tracedecay")]
 pub fn which_tracedecay_path() -> Option<PathBuf> {

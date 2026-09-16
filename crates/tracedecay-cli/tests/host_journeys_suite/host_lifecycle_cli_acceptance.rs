@@ -287,6 +287,44 @@ impl IsolatedCli {
         command
     }
 
+    fn invoked_bin(&self) -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_tracedecay"))
+    }
+
+    fn shadowing_v1_bin(&self) -> PathBuf {
+        let v1_dir = self.home.path().join("stable-v1-bin");
+        fs::create_dir_all(&v1_dir).unwrap();
+        let v1 = v1_dir.join(if cfg!(windows) {
+            "tracedecay.exe"
+        } else {
+            "tracedecay"
+        });
+        fs::write(&v1, b"stable V1 placeholder").unwrap();
+        v1
+    }
+
+    /// Put a distinct V1-looking executable ahead of the normal fixture PATH.
+    /// The child still launches the V2 test binary directly, so lifecycle
+    /// output must follow `current_exe()` rather than this shadowing entry.
+    fn command_with_shadowing_v1(&self, args: &[&str]) -> Command {
+        let v1_dir = self.shadowing_v1_bin().parent().unwrap().to_path_buf();
+        let path = std::env::join_paths([&v1_dir, &self.bin_dir]).unwrap();
+        let mut command = self.command(args);
+        command.env("PATH", path);
+        command
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_fixture_systemctl(&self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let systemctl = self.bin_dir.join("systemctl");
+        fs::write(&systemctl, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&systemctl).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(systemctl, permissions).unwrap();
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().unwrap()
     }
@@ -332,10 +370,7 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
             .iter()
             .find(|server| server["name"].as_str() == Some("tracedecay"))
             .unwrap();
-        assert_eq!(
-            entry["command"].as_str(),
-            cli.bin_dir.join("tracedecay").to_str()
-        );
+        assert_eq!(entry["command"].as_str(), cli.invoked_bin().to_str());
         assert_eq!(entry["transport"].as_str(), Some("stdio"));
         assert_eq!(entry["args"].as_array().unwrap()[0].as_str(), Some("serve"));
         let prompt = fs::read_to_string(cli.home.path().join(".vibe/prompts/cli.md")).unwrap();
@@ -378,19 +413,13 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
     let entry = &config[root]["tracedecay"];
     match case.host {
         HostKindV1::Cline => {
-            assert_eq!(
-                entry["command"],
-                serde_json::json!(cli.bin_dir.join("tracedecay"))
-            );
+            assert_eq!(entry["command"], serde_json::json!(cli.invoked_bin()));
             assert_eq!(entry["args"], serde_json::json!(["serve"]));
             assert_eq!(entry["disabled"], false);
             assert_eq!(entry["autoApprove"], serde_json::json!([]));
         }
         HostKindV1::Devin | HostKindV1::Antigravity => {
-            assert_eq!(
-                entry["command"],
-                serde_json::json!(cli.bin_dir.join("tracedecay"))
-            );
+            assert_eq!(entry["command"], serde_json::json!(cli.invoked_bin()));
             assert_eq!(entry["args"], serde_json::json!(["serve"]));
             assert_eq!(entry["env"], serde_json::json!({}));
             assert_eq!(entry["transport"], "stdio");
@@ -411,7 +440,7 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
                 assert_eq!(cli_plugin["ui"]["theme"], "dark");
                 assert_eq!(
                     cli_plugin["mcpServers"]["tracedecay"]["command"],
-                    serde_json::json!(cli.bin_dir.join("tracedecay"))
+                    serde_json::json!(cli.invoked_bin())
                 );
                 assert_eq!(
                     cli_plugin["mcpServers"]["tracedecay"]["args"],
@@ -420,17 +449,11 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
             }
         }
         HostKindV1::Zed => {
-            assert_eq!(
-                entry["command"],
-                serde_json::json!(cli.bin_dir.join("tracedecay"))
-            );
+            assert_eq!(entry["command"], serde_json::json!(cli.invoked_bin()));
             assert_eq!(entry["args"], serde_json::json!(["serve"]));
         }
         HostKindV1::RooCode => {
-            assert_eq!(
-                entry["command"],
-                serde_json::json!(cli.bin_dir.join("tracedecay"))
-            );
+            assert_eq!(entry["command"], serde_json::json!(cli.invoked_bin()));
             assert_eq!(entry["args"], serde_json::json!(["serve"]));
             assert_eq!(entry["disabled"], false);
             assert_eq!(entry["alwaysAllow"], serde_json::json!([]));
@@ -439,7 +462,7 @@ fn assert_documented_mcp_registration(case: HostCase, cli: &IsolatedCli) {
             assert_eq!(entry["type"], "local");
             assert_eq!(
                 entry["command"],
-                serde_json::json!([cli.bin_dir.join("tracedecay"), "serve"])
+                serde_json::json!([cli.invoked_bin(), "serve"])
             );
             assert_eq!(entry["enabled"], true);
         }
@@ -871,6 +894,110 @@ fn production_cli_completes_deterministic_lifecycle_for_config_native_hosts() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn production_cli_pins_lifecycle_outputs_to_invoked_v2_with_v1_on_path() {
+    let cli = IsolatedCli::new();
+    cli.install_fixture_systemctl();
+    let invoked_v2 = cli.invoked_bin();
+    let shadowing_v1 = cli.shadowing_v1_bin();
+    let invoked_v2_text = invoked_v2.to_str().expect("UTF-8 test binary path");
+    let shadowing_v1_text = shadowing_v1.to_str().expect("UTF-8 V1 fixture path");
+
+    // Exercise the default install, update-plugin, repair, read-only
+    // preflight, and an explicit component-set lifecycle while PATH offers a
+    // different (V1) tracedecay entry first.
+    for (phase, args) in [
+        ("install", vec!["install", "--agent", "opencode"]),
+        ("update-plugin", vec!["update-plugin"]),
+        ("reinstall", vec!["reinstall"]),
+        ("preflight", vec!["reinstall", "--dry-run"]),
+        (
+            "component-set",
+            vec![
+                "install",
+                "--agent",
+                "opencode",
+                "--component",
+                "core",
+                "--yes",
+            ],
+        ),
+    ] {
+        let output = cli.command_with_shadowing_v1(&args).output().unwrap();
+        assert_success("opencode", phase, output);
+    }
+
+    let receipt = latest_receipt(&cli, HostKindV1::OpenCode);
+    assert_receipt_digests(&cli, &receipt);
+    for component in &receipt.component_receipts {
+        for artifact in &component.artifacts {
+            let path = cli.home.path().join(&artifact.relative_path);
+            let contents = fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("read rendered artifact {}: {error}", path.display())
+            });
+            assert!(
+                !contents.contains(shadowing_v1_text),
+                "{} contains the PATH V1 binary",
+                artifact.relative_path
+            );
+        }
+    }
+    let plugin = fs::read_to_string(
+        cli.home
+            .path()
+            .join(".config/opencode/plugins/tracedecay.ts"),
+    )
+    .unwrap();
+    assert!(plugin.contains(invoked_v2_text));
+    let registration = fs::read_to_string(
+        cli.home
+            .path()
+            .join(".config/opencode/tracedecay/opencode.registration.json"),
+    )
+    .unwrap();
+    assert!(registration.contains(invoked_v2_text));
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(cli.home.path().join(".config/opencode/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        config["mcp"]["tracedecay"]["command"],
+        serde_json::json!([invoked_v2_text, "serve"])
+    );
+    assert_eq!(
+        config["lsp"]["tracedecay"]["command"],
+        serde_json::json!([invoked_v2_text, "lsp", "bridge", "--stdio"])
+    );
+
+    let socket = cli.home.path().join("daemon.sock");
+    let output = cli
+        .command_with_shadowing_v1(&[
+            "daemon",
+            "install-service",
+            "--no-start",
+            "--socket",
+            socket.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success("opencode", "service installation", output);
+    let unit = fs::read_to_string(
+        cli.home
+            .path()
+            .join(".config/systemd/user/tracedecay.service"),
+    )
+    .unwrap();
+    assert!(
+        unit.contains(&format!("ExecStart={invoked_v2_text} daemon run")),
+        "service unit lost the V2 executable"
+    );
+    assert!(
+        !unit.contains(&format!("ExecStart={shadowing_v1_text} daemon run")),
+        "service unit points at V1"
+    );
+}
+
 #[test]
 fn production_cli_installs_devin_project_mcp_without_touching_siblings() {
     let cli = IsolatedCli::new();
@@ -893,7 +1020,7 @@ fn production_cli_installs_devin_project_mcp_without_touching_siblings() {
     assert_eq!(config["mcpServers"]["foreign"]["command"], "foreign-bin");
     assert_eq!(
         config["mcpServers"]["tracedecay"]["command"],
-        serde_json::json!(cli.bin_dir.join("tracedecay"))
+        serde_json::json!(cli.invoked_bin())
     );
     assert_eq!(
         config["mcpServers"]["tracedecay"]["args"],
@@ -930,7 +1057,7 @@ fn production_cli_installs_zed_project_mcp_without_touching_siblings() {
     );
     assert_eq!(
         config["context_servers"]["tracedecay"]["command"],
-        serde_json::json!(cli.bin_dir.join("tracedecay"))
+        serde_json::json!(cli.invoked_bin())
     );
     assert_eq!(
         config["context_servers"]["tracedecay"]["args"],
@@ -961,14 +1088,7 @@ fn production_cli_installs_vibe_project_components_without_touching_siblings() {
     let config = fs::read_to_string(&config).unwrap();
     assert!(config.contains("name = \"foreign\"\ncommand = \"foreign-bin\""));
     assert!(config.contains("name = \"tracedecay\""));
-    assert!(
-        config.contains(
-            cli.bin_dir
-                .join("tracedecay")
-                .to_str()
-                .expect("UTF-8 test path")
-        )
-    );
+    assert!(config.contains(cli.invoked_bin().to_str().expect("UTF-8 test path")));
     let prompt = fs::read_to_string(&prompt).unwrap();
     assert!(prompt.contains("Keep this text."));
     assert!(prompt.contains("## Prefer tracedecay MCP tools"));

@@ -1473,9 +1473,11 @@ async fn dispatch_daemon_command(action: DaemonAction) -> tracedecay_domain::err
             remote_tls_cert,
             remote_tls_key,
         } => {
-            let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay_path()
-                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-                    message: "tracedecay not found on PATH".to_string(),
+            let tracedecay_bin = tracedecay_agent_hosts::agents::resolve_lifecycle_executable()
+                .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "could not resolve the current tracedecay executable for service installation: {error}"
+                    ),
                 })?;
             let remote_tls = tracedecay_daemon_control::RemoteBrainTlsConfig::from_optional_parts(
                 remote_listen,

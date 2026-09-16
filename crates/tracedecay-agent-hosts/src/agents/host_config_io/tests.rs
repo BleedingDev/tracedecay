@@ -353,6 +353,43 @@ mod path_normalize_tests {
             normalize_path_separators(&current_exe.to_string_lossy())
         );
     }
+
+    #[test]
+    fn lifecycle_executable_prefers_current_binary_over_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_exe = dir.path().join("target/debug").join(tracedecay_bin_name());
+        let path_exe = dir.path().join("stable/bin").join(tracedecay_bin_name());
+        std::fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(path_exe.parent().unwrap()).unwrap();
+        std::fs::write(&current_exe, b"v2").unwrap();
+        std::fs::write(&path_exe, b"v1").unwrap();
+
+        let resolved = resolve_lifecycle_executable_from(&current_exe).unwrap();
+
+        assert_eq!(resolved, current_exe);
+    }
+
+    #[test]
+    fn lifecycle_executable_rejects_non_tracedecay_current_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_exe = dir.path().join("target/debug/other");
+        std::fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
+        std::fs::write(&current_exe, b"not tracedecay").unwrap();
+
+        let error = resolve_lifecycle_executable_from(&current_exe).unwrap_err();
+
+        assert!(error.to_string().contains("not a tracedecay binary"));
+    }
+
+    #[test]
+    fn lifecycle_executable_rejects_missing_current_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_exe = dir.path().join("target/debug").join(tracedecay_bin_name());
+
+        let error = resolve_lifecycle_executable_from(&current_exe).unwrap_err();
+
+        assert!(error.to_string().contains("is unavailable"));
+    }
 }
 
 #[allow(clippy::unwrap_used)]

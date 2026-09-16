@@ -76,6 +76,11 @@ pub(crate) async fn handle_host_bundle_component_command(
             .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("could not resolve host lifecycle root: {error}"),
             })?;
+    // Resolve this once for the complete component transaction. Every
+    // registration and rendered artifact in this command must invoke the
+    // binary that launched it, even when a different stable binary shadows it
+    // on PATH.
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     let mut user_config = tracedecay_session_memory::user_config::UserConfig::load();
     let explicitly_scoped = agent.is_some();
     let agent_ids = match agent {
@@ -108,7 +113,12 @@ pub(crate) async fn handle_host_bundle_component_command(
             );
             continue;
         }
-        let component_set = canonical_host_component_set(agent_id, options.component, now_unix)?;
+        let component_set = canonical_host_component_set_with_tracedecay_bin(
+            agent_id,
+            options.component,
+            now_unix,
+            &tracedecay_bin,
+        )?;
         let Some(component_set) = component_set else {
             if explicitly_scoped {
                 return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -131,6 +141,7 @@ pub(crate) async fn handle_host_bundle_component_command(
                 &options,
                 &home,
                 &lifecycle_root,
+                &tracedecay_bin,
             )?;
         } else {
             apply_canonical_component_set(
@@ -140,7 +151,7 @@ pub(crate) async fn handle_host_bundle_component_command(
                 &options,
                 &home,
                 &lifecycle_root,
-                &ComponentSetApplyContext::resolved(),
+                &ComponentSetApplyContext::with_tracedecay_bin_and_dashboard(&tracedecay_bin, true),
             )?;
         }
     }
@@ -172,6 +183,7 @@ fn unsupported_host_component_set_message(agent: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn canonical_host_component_set(
     agent: &str,
     component: Option<crate::cli::HostBundleComponentArg>,
@@ -191,6 +203,18 @@ fn component_is_not_applicable(agent: &str, component: crate::cli::HostBundleCom
         !tracedecay_agent_hosts::agents::host_bundle_registry::supported_components(host)
             .contains(&host_bundle_component(component))
     })
+}
+
+fn lifecycle_tracedecay_bin() -> tracedecay_domain::errors::Result<String> {
+    let path = tracedecay_agent_hosts::agents::resolve_lifecycle_executable()?;
+    path.to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "the current tracedecay executable path is not valid UTF-8: {}",
+                path.display()
+            ),
+        })
 }
 
 fn canonical_host_component_set_with_tracedecay_bin(
@@ -253,12 +277,32 @@ fn ensure_artifact_only_restore_boundary(
 }
 
 #[hotpath::measure(label = "cli.agent.artifact")]
+#[cfg(test)]
 fn apply_host_bundle_artifact_action_at(
     action: crate::cli::HostBundleAction,
     options: crate::cli::HostBundleCliOptions,
     home: &Path,
     lifecycle_root: &Path,
     now_unix: u64,
+) -> tracedecay_domain::errors::Result<[u8; 16]> {
+    apply_host_bundle_artifact_action_at_with_tracedecay_bin(
+        action,
+        options,
+        home,
+        lifecycle_root,
+        now_unix,
+        &tracedecay_agent_hosts::agents::which_tracedecay()
+            .unwrap_or_else(|| "tracedecay".to_string()),
+    )
+}
+
+fn apply_host_bundle_artifact_action_at_with_tracedecay_bin(
+    action: crate::cli::HostBundleAction,
+    options: crate::cli::HostBundleCliOptions,
+    home: &Path,
+    lifecycle_root: &Path,
+    now_unix: u64,
+    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<[u8; 16]> {
     if options.dry_run {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -306,10 +350,15 @@ fn apply_host_bundle_artifact_action_at(
             });
         }
     };
-    let component_set = canonical_host_component_set(agent_id, Some(component), now_unix)?
-        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-            message: unsupported_host_component_set_message(agent_id),
-        })?;
+    let component_set = canonical_host_component_set_with_tracedecay_bin(
+        agent_id,
+        Some(component),
+        now_unix,
+        tracedecay_bin,
+    )?
+    .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+        message: unsupported_host_component_set_message(agent_id),
+    })?;
     ensure_artifact_only_restore_boundary(agent_id, &component_set, home, lifecycle_root)?;
     let [entry] = component_set.component_set.components.as_slice() else {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -362,6 +411,7 @@ pub(crate) async fn handle_host_bundle_artifact_command(
             .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("could not resolve host lifecycle root: {error}"),
             })?;
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| tracedecay_domain::errors::TraceDecayError::Config {
@@ -372,8 +422,14 @@ pub(crate) async fn handle_host_bundle_artifact_command(
         &action,
         crate::cli::HostBundleAction::ArtifactRestore { .. }
     );
-    let operation_id =
-        apply_host_bundle_artifact_action_at(action, options, &home, &lifecycle_root, now_unix)?;
+    let operation_id = apply_host_bundle_artifact_action_at_with_tracedecay_bin(
+        action,
+        options,
+        &home,
+        &lifecycle_root,
+        now_unix,
+        &tracedecay_bin,
+    )?;
     if is_restore {
         eprintln!(
             "\x1b[32m✔\x1b[0m managed artifact files restored; host registration was not changed; receipt {}",
@@ -452,6 +508,7 @@ fn dry_run_canonical_component_set(
     options: &crate::cli::HostBundleCliOptions,
     home: &Path,
     lifecycle_root: &Path,
+    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<()> {
     let preview = preview_canonical_component_set(
         agent_id,
@@ -460,7 +517,7 @@ fn dry_run_canonical_component_set(
         options,
         home,
         lifecycle_root,
-        None,
+        Some(tracedecay_bin),
     )?;
     eprintln!(
         "{} {:?}: plan={}, registration_base={}, registration_current={}, artifacts={}, confirmation={}",
@@ -562,6 +619,7 @@ fn preview_canonical_component_set(
     home: &Path,
     lifecycle_root: &Path,
     install_context: Option<&tracedecay_agent_hosts::agents::InstallContext>,
+    tracedecay_bin: Option<&str>,
 ) -> tracedecay_domain::errors::Result<
     tracedecay_agent_hosts::agents::host_bundle::HostComponentSetLifecyclePreviewV1,
 > {
@@ -577,12 +635,24 @@ fn preview_canonical_component_set(
                 install.dashboard,
             )?
         }
-        None => CatalogHostComponentRegistrationAuthority::new(
-            agent_id,
-            home,
-            lifecycle_root,
-            request.lifecycle.operation,
-        )?,
+        None => match tracedecay_bin {
+            Some(tracedecay_bin) => {
+                CatalogHostComponentRegistrationAuthority::new_with_tracedecay_bin_and_dashboard(
+                    agent_id,
+                    home,
+                    lifecycle_root,
+                    request.lifecycle.operation,
+                    tracedecay_bin.to_string(),
+                    true,
+                )?
+            }
+            None => CatalogHostComponentRegistrationAuthority::new(
+                agent_id,
+                home,
+                lifecycle_root,
+                request.lifecycle.operation,
+            )?,
+        },
     };
     tracedecay_agent_hosts::agents::host_bundle::dry_run_host_component_set_lifecycle_with_lifecycle_root_at(
         home,
@@ -646,14 +716,24 @@ struct ComponentSetApplyContext {
 }
 
 impl ComponentSetApplyContext {
-    /// The production context: the resolved installed binary, dashboard on.
+    /// The explicitly pinned lifecycle binary with the requested dashboard
+    /// policy. Production callers resolve once and reuse this context for the
+    /// whole component transaction.
+    fn with_tracedecay_bin_and_dashboard(tracedecay_bin: &str, dashboard: bool) -> Self {
+        Self {
+            tracedecay_bin: tracedecay_bin.to_string(),
+            dashboard,
+        }
+    }
+
+    /// Test-only compatibility helper for pure component lifecycle tests.
+    #[cfg(test)]
     fn resolved() -> Self {
         Self::resolved_with_dashboard(true)
     }
 
-    /// The production binary with the dashboard registration decided by the
-    /// caller, which is what the lifecycle commands pass through from
-    /// `--no-dashboard` and the per-agent dashboard policy.
+    /// Test-only compatibility helper that exercises the legacy PATH probe.
+    #[cfg(test)]
     fn resolved_with_dashboard(dashboard: bool) -> Self {
         Self {
             tracedecay_bin: tracedecay_agent_hosts::agents::which_tracedecay()
@@ -665,10 +745,7 @@ impl ComponentSetApplyContext {
     /// A pinned fixture binary, dashboard on exactly as in production.
     #[cfg(test)]
     fn with_tracedecay_bin(tracedecay_bin: &str) -> Self {
-        Self {
-            tracedecay_bin: tracedecay_bin.to_string(),
-            dashboard: true,
-        }
+        Self::with_tracedecay_bin_and_dashboard(tracedecay_bin, true)
     }
 }
 
@@ -806,12 +883,33 @@ fn apply_canonical_component_set(
 /// Apply the agent's default component set. `dashboard` decides whether the
 /// dashboard component is registered with it; uninstall paths pass `true`
 /// because removal must cover everything an install could have written.
+#[cfg(test)]
 fn apply_default_canonical_component_set(
     agent_id: &str,
     operation: HostBundleCliOperation,
     home: &Path,
     dashboard: bool,
     adopt: bool,
+) -> tracedecay_domain::errors::Result<()> {
+    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay()
+        .unwrap_or_else(|| "tracedecay".to_string());
+    apply_default_canonical_component_set_with_tracedecay_bin(
+        agent_id,
+        operation,
+        home,
+        dashboard,
+        adopt,
+        &tracedecay_bin,
+    )
+}
+
+fn apply_default_canonical_component_set_with_tracedecay_bin(
+    agent_id: &str,
+    operation: HostBundleCliOperation,
+    home: &Path,
+    dashboard: bool,
+    adopt: bool,
+    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<()> {
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -820,11 +918,10 @@ fn apply_default_canonical_component_set(
         })?
         .as_secs();
     let component_set =
-        canonical_host_component_set(agent_id, None, now_unix)?.ok_or_else(|| {
-            tracedecay_domain::errors::TraceDecayError::Config {
+        canonical_host_component_set_with_tracedecay_bin(agent_id, None, now_unix, tracedecay_bin)?
+            .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
                 message: unsupported_host_component_set_message(agent_id),
-            }
-        })?;
+            })?;
     let lifecycle_root =
         tracedecay_agent_hosts::agents::host_bundle::resolved_host_bundle_lifecycle_root()
             .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
@@ -842,7 +939,7 @@ fn apply_default_canonical_component_set(
         },
         home,
         &lifecycle_root,
-        &ComponentSetApplyContext::resolved_with_dashboard(dashboard),
+        &ComponentSetApplyContext::with_tracedecay_bin_and_dashboard(tracedecay_bin, dashboard),
     )?;
     Ok(())
 }
@@ -865,11 +962,12 @@ pub(crate) async fn handle_project_local_lifecycle_command(
             message: "could not determine home directory".to_string(),
         }
     })?;
-    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
+    let tracedecay_bin = lifecycle_tracedecay_bin().map_err(|error| {
         tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay not found on PATH. Install the checksummed GitHub release:\n  \
-                      https://github.com/ScriptedAlchemy/tracedecay/releases/latest"
-                .to_string(),
+            message: format!(
+                "{error}. Install the checksummed GitHub release:\n  \
+                 https://github.com/ScriptedAlchemy/tracedecay/releases/latest"
+            ),
         }
     })?;
     let project_path = std::env::current_dir().map_err(|error| {
@@ -1167,11 +1265,12 @@ pub(crate) async fn handle_install_command(
             message: "could not determine home directory".to_string(),
         }
     })?;
-    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
+    let tracedecay_bin = lifecycle_tracedecay_bin().map_err(|error| {
         tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay not found on PATH. Install the checksummed GitHub release:\n  \
-                          https://github.com/ScriptedAlchemy/tracedecay/releases/latest"
-                .to_string(),
+            message: format!(
+                "{error}. Install the checksummed GitHub release:\n  \
+                 https://github.com/ScriptedAlchemy/tracedecay/releases/latest"
+            ),
         }
     })?;
     let mut user_cfg = load_host_lifecycle_user_config()?;
@@ -1193,12 +1292,13 @@ pub(crate) async fn handle_install_command(
             dashboard: !no_dashboard,
         };
         prepare_native_activation_if_needed(ag.as_ref(), &context)?;
-        apply_default_canonical_component_set(
+        apply_default_canonical_component_set_with_tracedecay_bin(
             &id,
             HostBundleCliOperation::Install,
             &home,
             !no_dashboard,
             adopt,
+            &tracedecay_bin,
         )?;
         refreshed_ids.insert(id.clone());
         if let Some(options) = automation.filter(|_| id == "codex") {
@@ -1230,12 +1330,13 @@ pub(crate) async fn handle_install_command(
 
         for id in &to_uninstall {
             let ag = tracedecay_agent_hosts::agents::get_integration(id)?;
-            apply_default_canonical_component_set(
+            apply_default_canonical_component_set_with_tracedecay_bin(
                 id,
                 HostBundleCliOperation::Uninstall,
                 &home,
                 true,
                 false,
+                &tracedecay_bin,
             )?;
             removed_names.push(ag.name().to_string());
             user_cfg.installed_agents.retain(|a| a != id);
@@ -1251,12 +1352,13 @@ pub(crate) async fn handle_install_command(
                 dashboard: !no_dashboard,
             };
             prepare_native_activation_if_needed(ag.as_ref(), &context)?;
-            apply_default_canonical_component_set(
+            apply_default_canonical_component_set_with_tracedecay_bin(
                 id,
                 HostBundleCliOperation::Install,
                 &home,
                 !no_dashboard,
                 adopt,
+                &tracedecay_bin,
             )?;
             refreshed_ids.insert(id.clone());
             installed_names.push(ag.name().to_string());
@@ -1315,11 +1417,7 @@ pub(crate) async fn handle_reinstall_command(adopt: bool) -> tracedecay_domain::
             message: "could not determine home directory".to_string(),
         }
     })?;
-    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay not found on PATH".to_string(),
-        }
-    })?;
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     let mut user_cfg = load_host_lifecycle_user_config()?;
 
     if user_cfg.installed_agents.is_empty() {
@@ -1381,11 +1479,7 @@ pub(crate) async fn handle_update_plugin_command(
             message: "could not determine home directory".to_string(),
         }
     })?;
-    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay not found on PATH".to_string(),
-        }
-    })?;
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     let user_cfg = load_host_lifecycle_user_config()?;
 
     for id in &user_cfg.installed_agents {
@@ -1399,12 +1493,13 @@ pub(crate) async fn handle_update_plugin_command(
             dashboard,
         };
         prepare_native_activation_if_needed(integration.as_ref(), &context)?;
-        apply_default_canonical_component_set(
+        apply_default_canonical_component_set_with_tracedecay_bin(
             id,
             HostBundleCliOperation::Update,
             &home,
             dashboard,
             adopt,
+            &tracedecay_bin,
         )?;
     }
     Ok(())
@@ -1417,9 +1512,9 @@ pub(crate) fn handle_reinstall_preflight_command() -> tracedecay_domain::errors:
             message: "could not determine home directory".to_string(),
         }
     })?;
-    let tracedecay_bin = tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
+    let tracedecay_bin = lifecycle_tracedecay_bin().map_err(|error| {
         tracedecay_domain::errors::TraceDecayError::Config {
-            message: "could not resolve the canonical preflight binary".to_string(),
+            message: format!("could not resolve the canonical preflight binary: {error}"),
         }
     })?;
     let user_config = load_host_lifecycle_user_config()?;
@@ -1517,7 +1612,13 @@ fn preflight_agent_integration(
             message: "system clock is before the Unix epoch".to_string(),
         })?
         .as_secs();
-    let Some(component_set) = canonical_host_component_set(agent_id, None, now_unix)? else {
+    let Some(component_set) = canonical_host_component_set_with_tracedecay_bin(
+        agent_id,
+        None,
+        now_unix,
+        &install_context.tracedecay_bin,
+    )?
+    else {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: unsupported_host_component_set_message(agent_id),
         });
@@ -1562,6 +1663,7 @@ fn preflight_agent_integration(
         home,
         &lifecycle_root,
         Some(install_context),
+        None,
     )?;
     Ok(format!(
         "signed repair plan valid; registration {}",
@@ -1676,12 +1778,13 @@ async fn reinstall_agent_integrations_with_dashboard_policies(
             results.push((id.clone(), Err(error)));
             continue;
         }
-        match apply_default_canonical_component_set(
+        match apply_default_canonical_component_set_with_tracedecay_bin(
             id,
             HostBundleCliOperation::Repair,
             home,
             dashboard,
             adopt,
+            tracedecay_bin,
         ) {
             Ok(()) => {
                 results.push((id.clone(), Ok(AgentReinstallOutcome::Installed)));
@@ -1704,15 +1807,17 @@ pub(crate) async fn handle_uninstall_command(
             message: "could not determine home directory".to_string(),
         }
     })?;
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     let mut user_cfg = load_host_lifecycle_user_config()?;
 
     if let Some(id) = agent {
-        apply_default_canonical_component_set(
+        apply_default_canonical_component_set_with_tracedecay_bin(
             &id,
             HostBundleCliOperation::Uninstall,
             &home,
             true,
             false,
+            &tracedecay_bin,
         )?;
         user_cfg.installed_agents.retain(|a| a != &id);
         user_cfg.agent_dashboard_enabled.remove(&id);
@@ -1723,12 +1828,13 @@ pub(crate) async fn handle_uninstall_command(
             })?;
     } else {
         for id in user_cfg.installed_agents.clone() {
-            apply_default_canonical_component_set(
+            apply_default_canonical_component_set_with_tracedecay_bin(
                 &id,
                 HostBundleCliOperation::Uninstall,
                 &home,
                 true,
                 false,
+                &tracedecay_bin,
             )?;
         }
         user_cfg.installed_agents.clear();
@@ -1942,6 +2048,7 @@ mod tests {
             home.path(),
             lifecycle.path(),
             None,
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -1965,6 +2072,7 @@ mod tests {
             &confirmed,
             home.path(),
             lifecycle.path(),
+            None,
             None,
         )
         .expect("explicit adoption authority must let the same repair plan");

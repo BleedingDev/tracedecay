@@ -27,7 +27,7 @@ const DAEMON_RESTART_LEASE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub(crate) async fn refresh_generated_plugins() -> tracedecay_domain::errors::Result<()> {
     let home = tracedecay_home_dir()?;
-    let tracedecay_bin = tracedecay_bin_for_generated_artifacts()?;
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
     refresh_generated_plugins_at(
         tracedecay_agent_hosts::agents::all_integrations(),
         &home,
@@ -138,16 +138,11 @@ fn refresh_generated_plugins_at(
 /// service is installed.
 fn refresh_daemon_service(
     previous_state: daemon_control::DaemonServiceState,
+    tracedecay_bin: &Path,
 ) -> tracedecay_domain::errors::Result<Option<(PathBuf, PathBuf)>> {
     if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         return Ok(None);
     }
-    let tracedecay_bin =
-        tracedecay_agent_hosts::agents::which_tracedecay_path().ok_or_else(|| {
-            tracedecay_domain::errors::TraceDecayError::Config {
-                message: "tracedecay not found on PATH".to_string(),
-            }
-        })?;
     let spec = daemon_control::service_spec(tracedecay_bin, None)?;
     refresh_daemon_service_with_spec(previous_state, &spec)
 }
@@ -181,8 +176,9 @@ fn print_daemon_transport_location(socket_path: &Path) {
 
 fn refresh_daemon_service_after_update(
     previous_state: daemon_control::DaemonServiceState,
+    tracedecay_bin: &Path,
 ) -> tracedecay_domain::errors::Result<()> {
-    match refresh_daemon_service(previous_state)? {
+    match refresh_daemon_service(previous_state, tracedecay_bin)? {
         Some((service_path, socket_path)) => {
             eprintln!(
                 "\x1b[32m✔\x1b[0m Daemon service refreshed at {}",
@@ -269,7 +265,8 @@ pub(crate) fn restart_daemon_service() -> tracedecay_domain::errors::Result<()> 
             });
         }
     };
-    let operation_result = refresh_daemon_service(stopped_state);
+    let operation_result = lifecycle_tracedecay_executable()
+        .and_then(|tracedecay_bin| refresh_daemon_service(stopped_state, &tracedecay_bin));
     let restore_result = guard.finish_with_state(desired_state);
     match combine_operation_and_restore("daemon restart", operation_result, restore_result)? {
         Some((service_path, socket_path)) => {
@@ -292,21 +289,24 @@ fn tracedecay_home_dir() -> tracedecay_domain::errors::Result<PathBuf> {
     })
 }
 
-pub(crate) fn tracedecay_bin_on_path() -> tracedecay_domain::errors::Result<String> {
-    tracedecay_agent_hosts::agents::which_tracedecay().ok_or_else(|| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay not found on PATH".to_string(),
-        }
-    })
+fn lifecycle_tracedecay_executable() -> tracedecay_domain::errors::Result<PathBuf> {
+    tracedecay_agent_hosts::agents::resolve_lifecycle_executable()
 }
 
-fn tracedecay_bin_for_generated_artifacts() -> tracedecay_domain::errors::Result<String> {
-    current_tracedecay_exe().map_or_else(tracedecay_bin_on_path, Ok)
+fn lifecycle_tracedecay_bin() -> tracedecay_domain::errors::Result<String> {
+    let path = lifecycle_tracedecay_executable()?;
+    lifecycle_bin_text(&path)
 }
 
-fn current_tracedecay_exe() -> Option<String> {
-    let current = std::env::current_exe().ok()?;
-    current_tracedecay_exe_from(Some(&current))
+fn lifecycle_bin_text(path: &Path) -> tracedecay_domain::errors::Result<String> {
+    path.to_str()
+        .map(|path| path.replace('\\', "/"))
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "the current tracedecay executable path is not valid UTF-8: {}",
+                path.display()
+            ),
+        })
 }
 
 fn current_tracedecay_exe_from(current: Option<&Path>) -> Option<String> {
@@ -491,7 +491,7 @@ fn prepare_post_update_lease(
 /// otherwise the currently running binary.
 fn post_update_binary(installed: Option<&Path>) -> tracedecay_domain::errors::Result<String> {
     let current = std::env::current_exe().ok();
-    post_update_binary_from(installed, current.as_deref()).map_or_else(tracedecay_bin_on_path, Ok)
+    post_update_binary_from(installed, current.as_deref()).map_or_else(lifecycle_tracedecay_bin, Ok)
 }
 
 fn post_update_binary_from(installed: Option<&Path>, current: Option<&Path>) -> Option<String> {
@@ -616,23 +616,18 @@ pub(crate) fn install_pass_covers_tracked_agents(
 /// version markers stay put.
 async fn reinstall_tracked_agents_under_lease(
     user_config: &UserConfig,
+    tracedecay_bin: &str,
     lifecycle_lease: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
 ) -> ReinstallOutcome {
-    let (Some(home), Some(bin)) = (
-        tracedecay_agent_hosts::agents::home_dir(),
-        tracedecay_agent_hosts::agents::which_tracedecay(),
-    ) else {
+    let Some(home) = tracedecay_agent_hosts::agents::home_dir() else {
         return ReinstallOutcome::PartialFailure {
-            failed: vec![
-                "<environment>: could not resolve home directory or tracedecay binary on PATH"
-                    .to_string(),
-            ],
+            failed: vec!["<environment>: could not resolve the home directory".to_string()],
         };
     };
     let results = crate::agent_cmd::reinstall_agent_integrations_under_lease(
         &user_config.installed_agents,
         &home,
-        &bin,
+        tracedecay_bin,
         lifecycle_lease,
     )
     .await;
@@ -643,20 +638,32 @@ pub(crate) async fn run_post_update_tasks(
     no_reinstall: bool,
     lifecycle_lease: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
 ) -> tracedecay_domain::errors::Result<()> {
+    // Resolve the lifecycle executable once and carry this exact path through
+    // generated plugins, tracked-agent reinstall, and daemon refresh.
+    let tracedecay_bin = lifecycle_tracedecay_executable()?;
+    let tracedecay_bin_text = lifecycle_bin_text(&tracedecay_bin)?;
     eprintln!("\nPreparing safe post-update maintenance.");
     eprintln!("  Waiting for TraceDecay writers to shut down cleanly — do not interrupt.");
     let previous_daemon_state = daemon_control::verify_installed_service_quiesced_under_lease()?;
     eprintln!("\x1b[32m✔\x1b[0m TraceDecay writers stopped; exclusive maintenance window active.");
-    let mutation_result = run_post_update_mutations(no_reinstall, lifecycle_lease).await;
-    let restart_result = refresh_daemon_service_after_update(previous_daemon_state);
+    let mutation_result =
+        run_post_update_mutations(no_reinstall, lifecycle_lease, &tracedecay_bin_text).await;
+    let restart_result =
+        refresh_daemon_service_after_update(previous_daemon_state, &tracedecay_bin);
     combine_operation_and_restore("post-update maintenance", mutation_result, restart_result)
 }
 
 async fn run_post_update_mutations(
     no_reinstall: bool,
     lifecycle_lease: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
+    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<()> {
-    refresh_generated_plugins().await?;
+    let home = tracedecay_home_dir()?;
+    refresh_generated_plugins_at(
+        tracedecay_agent_hosts::agents::all_integrations(),
+        &home,
+        tracedecay_bin,
+    )?;
 
     if no_reinstall {
         eprintln!("Skipping agent integration refresh (--no-reinstall).");
@@ -698,23 +705,28 @@ async fn run_post_update_mutations(
             config.installed_agents.join(", ")
         );
     }
-    let reinstall_result =
-        match reinstall_tracked_agents_under_lease(&config, lifecycle_lease).await {
-            ReinstallOutcome::AllOk => {
-                if let Err(err) = record_completed_reinstall_pass(&mut config) {
-                    eprintln!("warning: {err}");
-                }
-                Ok(())
+    let reinstall_result = match reinstall_tracked_agents_under_lease(
+        &config,
+        tracedecay_bin,
+        lifecycle_lease,
+    )
+    .await
+    {
+        ReinstallOutcome::AllOk => {
+            if let Err(err) = record_completed_reinstall_pass(&mut config) {
+                eprintln!("warning: {err}");
             }
-            ReinstallOutcome::PartialFailure { failed } => {
-                eprintln!(
-                    "  \x1b[33mwarning:\x1b[0m agent install failed for: {}; \
+            Ok(())
+        }
+        ReinstallOutcome::PartialFailure { failed } => {
+            eprintln!(
+                "  \x1b[33mwarning:\x1b[0m agent install failed for: {}; \
                  it will be retried on the next tracedecay command.",
-                    failed.join(", ")
-                );
-                Ok(())
-            }
-        };
+                failed.join(", ")
+            );
+            Ok(())
+        }
+    };
     reconcile_materialized_managed_skills_after_update();
     reinstall_result
 }
