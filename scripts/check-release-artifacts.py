@@ -8,6 +8,8 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import stat
+import tarfile
 from typing import Any
 
 
@@ -15,6 +17,7 @@ REQUIRED_TARGET_FIELDS = ("name", "runner", "target", "archive")
 SUPPORTED_ARCHIVES = {"tar.gz", "zip"}
 WORKER_POLICY_NAME = "tracedecay-ncm-worker"
 WORKER_MANIFEST_NAME = "worker-manifest.json"
+WORKER_TARGET_TRIPLE = "aarch64-apple-darwin"
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -233,6 +236,126 @@ def verify_sidecar_checksums(path: Path, archives: set[str]) -> None:
             )
 
 
+def _load_worker_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise SystemExit(f"cannot read worker manifest {path}: {error}") from error
+    if not raw:
+        raise SystemExit(f"worker manifest is empty: {path}")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid worker manifest {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SystemExit("worker manifest must be a JSON object")
+    if value.get("worker") != WORKER_POLICY_NAME:
+        raise SystemExit(
+            f"worker manifest names {value.get('worker')!r}, expected {WORKER_POLICY_NAME!r}"
+        )
+    targets = value.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise SystemExit("worker manifest has no target pins")
+    seen: set[str] = set()
+    for index, target in enumerate(targets):
+        if not isinstance(target, dict):
+            raise SystemExit(f"worker manifest target {index} must be an object")
+        triple = target.get("triple")
+        if not isinstance(triple, str) or not triple or triple in seen:
+            raise SystemExit(f"worker manifest target {index} has an invalid or duplicate triple")
+        seen.add(triple)
+        byte_count = target.get("bytes")
+        if isinstance(byte_count, bool) or not isinstance(byte_count, int) or byte_count <= 0:
+            raise SystemExit(f"worker manifest target {triple} has an invalid byte count")
+        digest = target.get("sha256")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise SystemExit(f"worker manifest target {triple} has an invalid sha256")
+    if WORKER_TARGET_TRIPLE not in seen:
+        raise SystemExit(f"worker manifest does not pin {WORKER_TARGET_TRIPLE}")
+    return raw, value
+
+
+def verify_sidecar_archives(
+    path: Path,
+    archives: set[str],
+    targets: list[dict[str, Any]],
+    worker_manifest: Path,
+) -> None:
+    """Verify sidecar contents against the checked-in worker trust root."""
+    manifest_bytes, manifest = _load_worker_manifest(worker_manifest)
+    manifest_targets = {
+        target["triple"]: target for target in manifest["targets"]
+    }
+    expected_archives = {}
+    for target in targets:
+        sidecar = target.get("sidecar")
+        if sidecar is None:
+            continue
+        matches = [
+            asset
+            for asset in archives
+            if asset.endswith(f"-{target['name']}.{sidecar['archive']}")
+        ]
+        if len(matches) != 1:
+            raise SystemExit(
+                f"NCM sidecar archive is missing for release target {target['name']}"
+            )
+        archive = matches[0]
+        expected_archives[archive] = target
+
+    for archive_name, release_target in sorted(expected_archives.items()):
+        archive_path = path / archive_name
+        if archive_path.is_symlink():
+            raise SystemExit(f"NCM sidecar archive must not be a symlink: {archive_name}")
+        try:
+            with tarfile.open(archive_path, mode="r:gz") as bundle:
+                members = bundle.getmembers()
+                names = [member.name for member in members]
+                expected_names = [WORKER_POLICY_NAME, WORKER_MANIFEST_NAME]
+                if names != expected_names:
+                    raise SystemExit(
+                        f"NCM sidecar {archive_name} must contain exactly "
+                        f"{', '.join(expected_names)}; got {', '.join(names)}"
+                    )
+                by_name = {member.name: member for member in members}
+                worker_member = by_name[WORKER_POLICY_NAME]
+                manifest_member = by_name[WORKER_MANIFEST_NAME]
+                if not worker_member.isreg() or not manifest_member.isreg():
+                    raise SystemExit(f"NCM sidecar {archive_name} contains a non-file entry")
+                if stat.S_IMODE(worker_member.mode) != 0o755:
+                    raise SystemExit(f"NCM worker entry in {archive_name} is not executable")
+                if stat.S_IMODE(manifest_member.mode) != 0o644:
+                    raise SystemExit(f"NCM worker manifest entry in {archive_name} has wrong mode")
+                worker_file = bundle.extractfile(worker_member)
+                manifest_file = bundle.extractfile(manifest_member)
+                if worker_file is None or manifest_file is None:
+                    raise SystemExit(f"NCM sidecar {archive_name} has unreadable entries")
+                worker_bytes = worker_file.read()
+                packaged_manifest = manifest_file.read()
+        except (OSError, tarfile.TarError) as error:
+            raise SystemExit(f"invalid NCM sidecar archive {archive_name}: {error}") from error
+
+        if packaged_manifest != manifest_bytes:
+            raise SystemExit(
+                f"NCM sidecar {archive_name} does not carry the trusted worker manifest"
+            )
+        pin = manifest_targets.get(release_target["target"])
+        if pin is None:
+            raise SystemExit(
+                f"worker manifest has no pin for release target {release_target['target']}"
+            )
+        if len(worker_bytes) != pin["bytes"]:
+            raise SystemExit(
+                f"NCM worker size mismatch for {archive_name}: "
+                f"{len(worker_bytes)} != {pin['bytes']}"
+            )
+        digest = hashlib.sha256(worker_bytes).hexdigest()
+        if digest != pin["sha256"]:
+            raise SystemExit(
+                f"NCM worker digest mismatch for {archive_name}: {digest} != {pin['sha256']}"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -242,6 +365,7 @@ def main() -> int:
     parser.add_argument("--profile", choices=("stable", "beta"), default="stable")
     parser.add_argument("--mcpbs", type=Path)
     parser.add_argument("--sidecars", type=Path)
+    parser.add_argument("--worker-manifest", type=Path)
     arguments = parser.parse_args()
     targets = target_matrix(arguments.manifest, arguments.worker_platforms)
     binary_prefix = "tracedecay-beta" if arguments.profile == "beta" else "tracedecay"
@@ -272,12 +396,24 @@ def main() -> int:
     }
     if expected_sidecars and arguments.sidecars is None:
         raise SystemExit("release validation requires an NCM sidecar directory")
+    if expected_sidecars and arguments.worker_manifest is None:
+        raise SystemExit("release validation requires a trusted worker manifest")
+    if not expected_sidecars and arguments.worker_manifest is not None:
+        raise SystemExit("a worker manifest is only valid when sidecar assets are expected")
     if arguments.sidecars is not None:
         actual_sidecars = files(arguments.sidecars)
         require_exact("NCM sidecar", actual_sidecars, expected_sidecars)
+        if arguments.worker_manifest is None:
+            raise SystemExit("release validation requires a trusted worker manifest")
         verify_sidecar_checksums(
             arguments.sidecars,
             {asset for asset in expected_sidecars if not asset.endswith(".sha256")},
+        )
+        verify_sidecar_archives(
+            arguments.sidecars,
+            {asset for asset in expected_sidecars if not asset.endswith(".sha256")},
+            targets,
+            arguments.worker_manifest,
         )
     print("release artifact coverage matches target manifest")
     return 0

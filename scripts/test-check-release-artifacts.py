@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 
 SCRIPT = Path(__file__).with_name("check-release-artifacts.py")
+WORKER_BYTES = b"worker sidecar"
 
 
 LEGACY_TARGETS = {
@@ -110,6 +113,7 @@ def invoke(
     if sidecars:
         command.extend(["--sidecars", str(root / "sidecars")])
         command.extend(["--worker-platforms", str(root / "worker-platforms.json")])
+        command.extend(["--worker-manifest", str(root / "worker-manifest.json")])
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -129,9 +133,41 @@ def write_cli_assets(root: Path, targets: dict[str, object], profile: str = "sta
 def write_sidecar(root: Path, profile: str = "stable") -> str:
     sidecars = root / "sidecars"
     sidecars.mkdir(exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "worker": "tracedecay-ncm-worker",
+        "protocol_version": 1,
+        "protocol_identity": "tracedecay.ncm.worker.v1",
+        "targets": [
+            {
+                "triple": "aarch64-apple-darwin",
+                "os": "macos",
+                "arch": "aarch64",
+                "family": "unix",
+                "bytes": len(WORKER_BYTES),
+                "sha256": hashlib.sha256(WORKER_BYTES).hexdigest(),
+            }
+        ],
+    }
+    manifest_path = root / "worker-manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     prefix = "tracedecay-ncm-worker-beta" if profile == "beta" else "tracedecay-ncm-worker"
     archive = f"{prefix}-v1.2.3-aarch64-macos.tar.gz"
-    (sidecars / archive).write_bytes(b"worker sidecar")
+    archive_path = sidecars / archive
+    with tarfile.open(archive_path, mode="w:gz") as bundle:
+        worker_info = tarfile.TarInfo("tracedecay-ncm-worker")
+        worker_info.mode = 0o755
+        worker_info.uid = worker_info.gid = 0
+        worker_info.mtime = 0
+        worker_info.size = len(WORKER_BYTES)
+        bundle.addfile(worker_info, io.BytesIO(WORKER_BYTES))
+        manifest_bytes = manifest_path.read_bytes()
+        manifest_info = tarfile.TarInfo("worker-manifest.json")
+        manifest_info.mode = 0o644
+        manifest_info.uid = manifest_info.gid = 0
+        manifest_info.mtime = 0
+        manifest_info.size = len(manifest_bytes)
+        bundle.addfile(manifest_info, io.BytesIO(manifest_bytes))
     digest = hashlib.sha256((sidecars / archive).read_bytes()).hexdigest()
     (sidecars / f"{archive}.sha256").write_text(
         f"{digest}  {archive}\n", encoding="utf-8"
