@@ -42,6 +42,8 @@ const NCM_JOURNAL_FILE_NAME: &str = "memory-observation-ncm-journal-v1.sqlite3";
 const OBSERVATION_KIND: &str = "session.message_committed.v1";
 const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 const NCM_PROVIDER_ID: &str = "ncm";
+const HERMES_CANONICAL_PROVIDER_ID: &str = "hermes";
+const HERMES_HISTORY_CONTROL_REASON: &str = "hook_origin_reader_no_hermes_mapping";
 const JOURNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLEMENT_BUDGET: Duration = Duration::from_secs(60);
 
@@ -420,6 +422,7 @@ impl HermesJourney {
             "the fixture must state that it exercised register(ctx) without stock Hermes"
         );
         assert_eq!(result["context_engine_callback"], "complete");
+        assert_hermes_history_control_gate(&result);
         result
     }
 
@@ -730,6 +733,28 @@ fn assert_fixture_replay(fixture: &Value) {
     assert!(ids.iter().all(Value::is_string));
 }
 
+/// Hermes' LCM admission names the canonical host provider `hermes`, while
+/// the current retained-owner history reader resolves only Claude/Codex host
+/// origins. Keep that capability boundary explicit in the live fixture: a
+/// missing source resolution is an unsupported provider-history control, not
+/// an empty history result that could be mistaken for a successful binding.
+fn assert_hermes_history_control_gate(fixture: &Value) {
+    assert_eq!(
+        fixture["canonical_provider_id"],
+        HERMES_CANONICAL_PROVIDER_ID
+    );
+    let control = fixture
+        .get("history_control")
+        .expect("Hermes fixture reports its history/control capability gate");
+    assert_eq!(control["capability"], "provider_history");
+    assert_eq!(
+        control["canonical_provider_id"],
+        HERMES_CANONICAL_PROVIDER_ID
+    );
+    assert_eq!(control["state"], "unsupported");
+    assert_eq!(control["source_resolution"], HERMES_HISTORY_CONTROL_REASON);
+}
+
 fn assert_settled_rows(rows: &[JournalInspectionRowV1], provider: ActiveProvider) {
     assert_eq!(rows.len(), 2, "one Hermes user and one assistant message");
     let mut source_sequences = rows
@@ -770,6 +795,33 @@ fn capture_admissions(
             assert_eq!(admitted.idempotency_key, row.idempotency_key);
             assert_eq!(admitted.payload.sha256, row.payload_sha256);
             assert_eq!(admitted.extensions_digest, row.extensions_digest);
+            let payload: Value = serde_json::from_slice(&admitted.payload.bytes)
+                .expect("canonical retained Hermes payload");
+            let canonical: tracedecay_domain::observation::CanonicalObservationEnvelopeV1 =
+                serde_json::from_value(
+                    payload
+                        .get("canonical_payload")
+                        .cloned()
+                        .expect("retained payload canonical source envelope"),
+                )
+                .expect("retained Hermes canonical source envelope");
+            canonical
+                .validate()
+                .expect("valid retained Hermes canonical source envelope");
+            assert_eq!(
+                canonical.provider().as_str(),
+                HERMES_CANONICAL_PROVIDER_ID,
+                "admission source must preserve Hermes' canonical provider identity"
+            );
+            assert_eq!(
+                canonical.relations().session_id().as_str(),
+                SESSION_ID,
+                "admission source must preserve Hermes' session identity"
+            );
+            assert!(
+                payload.get("history_grant").is_none(),
+                "Hermes history/control is explicitly unsupported until its host origin is mapped"
+            );
             admitted
         })
         .collect::<Vec<_>>();

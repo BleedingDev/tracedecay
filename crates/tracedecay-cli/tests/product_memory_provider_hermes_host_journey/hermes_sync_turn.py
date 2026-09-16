@@ -248,6 +248,20 @@ print(
             "project_root": provider.project_root,
             "sync": "complete",
             "installed_provider_id": provider.provider_id,
+            # Hermes' transcript admission is live and project-scoped. Its
+            # canonical source provider is deliberately reported separately
+            # from the installed TraceDecay memory-provider ID so a later
+            # history/control assertion cannot silently conflate the two.
+            "canonical_provider_id": "hermes",
+            # The current daemon history reader has no Hermes host-origin
+            # mapping. Report that boundary as a typed capability state rather
+            # than making an absent source look like an empty history binding.
+            "history_control": {
+                "capability": "provider_history",
+                "canonical_provider_id": "hermes",
+                "state": "unsupported",
+                "source_resolution": "hook_origin_reader_no_hermes_mapping",
+            },
             "host_boundary": "register_ctx_fixture",
             "context_engine_callback": "complete",
             "replay": {
