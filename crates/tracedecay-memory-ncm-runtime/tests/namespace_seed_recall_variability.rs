@@ -592,7 +592,6 @@ fn spawn_real_worker() -> (TempDir, WorkerClient) {
         BINARY,
         &root_path,
         WorkerOptions {
-            test_double: false,
             reconciliation_deadline: CALL_DEADLINE,
             ..WorkerOptions::default()
         },

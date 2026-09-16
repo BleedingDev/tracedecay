@@ -10,7 +10,7 @@ The `rust-backend` feature supplies `RustNcmSurface`, a supervised-worker implem
 - an admitted absolute `StateRoot`;
 - `WorkerOptions` controlling launch, restart, encoder mode, and reconciliation.
 
-Production uses the worker's offline pinned MiniLM encoder. Tests set `WorkerOptions::test_double = true`, which selects the deterministic hash encoder explicitly; this identity is rejected by production model gates and is not a production fallback.
+Production uses the worker's offline pinned MiniLM encoder. Tests opt into the `test-transport` feature and set `WorkerOptions::test_double = true`, which selects the deterministic hash encoder explicitly. The feature is excluded from production builds; this identity is rejected by production model gates and is not a production fallback.
 
 The descriptor keeps the reserved provider ID `ncm`. Its version is `ncm-biomem-rs.v1+<config-sha256-prefix>`. Capabilities are limited to health, observation, recall, feedback, maintenance, inspection, correction, deletion by source, and own-format snapshot export/restore. Replay is not advertised and returns a typed unsupported terminal. Limits remain the frozen v1 limits: 256 KiB request, 1 MiB reply, 16 observation items, 16 recall candidates, one concurrent operation, 30 seconds, 256 MiB snapshot storage, and 1,000 inspection items.
 
@@ -61,11 +61,11 @@ At the provider boundary, successful `SnapshotExport` payloads are validated aga
 The acceptance recipe is:
 
 ```sh
-RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend
-RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --features rust-backend --test ncm_adapter
+RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --features rust-backend,test-transport --test rust_backend
+RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --features rust-backend,test-transport --test ncm_adapter
 RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --test ncm_adapter
-RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --test rust_backend
-RUSTC_WRAPPER= cargo clippy -p tracedecay-memory-provider-ncm --features rust-backend --all-targets
+RUSTC_WRAPPER= cargo test -p tracedecay-memory-provider-ncm --features rust-backend,test-transport --test rust_backend
+RUSTC_WRAPPER= cargo clippy -p tracedecay-memory-provider-ncm --features rust-backend,test-transport --all-targets
 RUSTC_WRAPPER= cargo clippy -p tracedecay-memory-provider-ncm --all-targets
 ```
 

@@ -116,7 +116,17 @@ def main() -> int:
     if model_root is not None:
         env["TRACEDECAY_NCM_REAL_MODEL_ROOT"] = str(model_root)
 
-    base = ["cargo", "test", "--locked", "-p", CRATE, "--features", "rust-backend", "--test", SUITE]
+    base = [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        CRATE,
+        "--features",
+        "rust-backend,test-transport",
+        "--test",
+        SUITE,
+    ]
     commands: list[list[str]] = []
 
     listing = run([*base, "--", "--list"], cwd=repo, env=env, timeout=3600)

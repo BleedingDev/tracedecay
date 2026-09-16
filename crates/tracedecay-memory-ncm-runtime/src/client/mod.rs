@@ -31,6 +31,7 @@ pub struct WorkerOptions {
     /// Whether the provider is admitted to launch a worker.
     pub enabled: bool,
     /// Launch the named hash-encoder test double.
+    #[cfg(feature = "test-transport")]
     pub test_double: bool,
     /// Permit startup without a locally loaded production encoder.
     pub no_encoder_required: bool,
@@ -44,6 +45,7 @@ impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
             enabled: true,
+            #[cfg(feature = "test-transport")]
             test_double: false,
             no_encoder_required: false,
             max_restart_attempts: 3,
@@ -142,9 +144,20 @@ impl WorkerClient {
         if !options.enabled {
             return Err(ClientError::Disabled);
         }
-        if !root.as_ref().is_absolute() {
+        let binary = binary_path.as_ref();
+        if !binary.is_absolute() {
+            return Err(ClientError::Spawn(
+                "worker binary path must be absolute".to_owned(),
+            ));
+        }
+        let state_root = root.as_ref();
+        if !state_root.is_absolute() {
             return Err(ClientError::Spawn("state root must be absolute".to_owned()));
         }
+        #[cfg(feature = "test-transport")]
+        let test_double = options.test_double;
+        #[cfg(not(feature = "test-transport"))]
+        let test_double = false;
         let (calls, receiver) = mpsc::sync_channel(MAX_QUEUED_REQUESTS);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -155,9 +168,9 @@ impl WorkerClient {
         let lifecycle = Arc::new(LifecycleState::default());
         let owner_lifecycle = Arc::clone(&lifecycle);
         let launch = Launch {
-            binary: binary_path.as_ref().to_path_buf(),
-            root: root.as_ref().to_path_buf(),
-            test_double: options.test_double,
+            binary: binary.to_path_buf(),
+            root: state_root.to_path_buf(),
+            test_double,
             no_encoder_required: options.no_encoder_required,
             max_restart_attempts: options.max_restart_attempts,
         };
@@ -182,7 +195,7 @@ impl WorkerClient {
             owner: Mutex::new(Some(owner)),
             pid,
             reconciliation_deadline: options.reconciliation_deadline,
-            root: root.as_ref().to_path_buf(),
+            root: state_root.to_path_buf(),
             lifecycle,
         })
     }
@@ -731,6 +744,15 @@ fn idempotency_key(request: &Request) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_requires_an_absolute_worker_path() {
+        let root = tempfile::tempdir().expect("state root");
+        assert!(matches!(
+            WorkerClient::spawn("tracedecay-ncm-worker", root.path(), WorkerOptions::default()),
+            Err(ClientError::Spawn(detail)) if detail == "worker binary path must be absolute"
+        ));
+    }
 
     #[test]
     fn idempotency_key_reads_common_control_before_legacy_fields() {

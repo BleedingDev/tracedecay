@@ -199,7 +199,8 @@ The checker uses only the Python standard library. It:
 1. builds the real-feature worker and checks for `fastembed` and ONNX Runtime artifact strings;
 2. launches that same artifact twice and proves through the handshake that a production launch reports the pinned MiniLM identity while only a `--test-double` launch reports `test-double/hash` (the double is a launch flag frozen by task 017, so the literal is present in the bytes of every build);
 3. lists every Cargo population before running it and rejects empty selections;
-4. executes core/runtime no-default-feature tests and the adapter with `rust-backend`;
+4. executes core/runtime no-default-feature tests and the adapter with explicit `test-transport`
+   in addition to `rust-backend`, keeping the deterministic worker transport out of production;
 5. explicitly executes the normally ignored real-encoder conformance population;
 6. runs real observe → consolidate → worker restart → persisted recall → source deletion → absent
    recall → restart → still absent → replay refused → pre-deletion snapshot restore without
@@ -231,8 +232,8 @@ The host integration owner must preserve these boundaries:
   `RustNcmSurface::from_production_worker(Arc::clone(&worker))` to declare pinned identity without
   a startup preflight. Run `prove_provider_instance` once on the retained delivery thread before
   observation delivery; descriptors and accepted readiness remain local to each mount.
-  `worker_binary` and `state_root` must be absolute; production
-  `WorkerOptions::default()` must not set `test_double`.
+  `worker_binary` and `state_root` must be absolute; production builds do not expose
+  `WorkerOptions::test_double` (the field is available only with `test-transport`).
 - Wrap the surface with `NcmProviderAdapter::new(Arc::new(surface))`; do not bypass exact-scope,
   sanitization, readiness, terminal, or payload-containment checks.
 - Keep `NcmNamespace::from_exact_scope` unchanged, including `agent_session_id` and

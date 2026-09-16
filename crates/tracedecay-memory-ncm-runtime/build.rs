@@ -11,6 +11,12 @@ const WORKER_MANIFEST: &str = "../../product/ncm/reference/worker-manifest.json"
 fn main() -> Result<(), Box<dyn Error>> {
     let mut output = io::BufWriter::new(io::stdout().lock());
     writeln!(output, "cargo:rerun-if-changed={WORKER_MANIFEST}")?;
+    writeln!(output, "cargo:rerun-if-env-changed=TARGET")?;
+    let target = env::var("TARGET")?;
+    writeln!(
+        output,
+        "cargo:rustc-env=TRACEDECAY_NCM_TARGET_TRIPLE={target}"
+    )?;
     output.flush()?;
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);

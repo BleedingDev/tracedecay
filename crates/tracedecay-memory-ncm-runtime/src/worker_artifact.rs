@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// The executable name admitted by the NCM worker manifest.
-pub(crate) const WORKER_NAME: &str = "tracedecay-ncm-worker";
+pub const WORKER_NAME: &str = "tracedecay-ncm-worker";
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
 const REFERENCE_MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -21,7 +21,7 @@ const REFERENCE_MANIFEST: &str = include_str!(concat!(
 
 /// A checked-in executable identity could not be established or matched.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WorkerIntegrityError {
+pub enum WorkerIntegrityError {
     /// The checked-in manifest is malformed or internally inconsistent.
     Manifest(String),
     /// The current compilation target has no admitted worker artifact.
@@ -87,7 +87,7 @@ struct WorkerTarget {
 }
 
 struct CurrentTarget {
-    triple: &'static str,
+    triple: String,
     os: &'static str,
     arch: &'static str,
     family: &'static str,
@@ -99,14 +99,42 @@ struct CurrentTarget {
 /// and create-new file make the launch pathname stable after verification, and
 /// the file is made read-only before it is returned. Dropping this value
 /// removes the staging artifact after the caller has reaped its child.
-pub(crate) struct VerifiedWorkerArtifact {
+pub struct VerifiedWorkerArtifact {
     _directory: TempDir,
     path: PathBuf,
+    digest: String,
+    manifest: Vec<u8>,
+    manifest_digest: String,
 }
 
 impl VerifiedWorkerArtifact {
-    pub(crate) fn path(&self) -> &Path {
+    /// Returns the private staged executable path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the lowercase SHA-256 digest of the verified executable bytes.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.digest
+    }
+
+    /// Returns the exact manifest bytes verified beside the source executable.
+    ///
+    /// The bytes are retained so an installer can publish the manifest beside
+    /// the staged executable without reopening a potentially changed source
+    /// path. The slice is empty only for the crate-private unit-test helper
+    /// that stages an already-selected target without a manifest.
+    #[must_use]
+    pub fn manifest_bytes(&self) -> &[u8] {
+        &self.manifest
+    }
+
+    /// Returns the canonical JSON SHA-256 digest of the verified manifest.
+    #[must_use]
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_digest
     }
 }
 
@@ -115,7 +143,7 @@ impl VerifiedWorkerArtifact {
 ///
 /// This function performs only local reads, hashing, and private staging. It
 /// does not resolve, download, or replace an executable or any model artifact.
-pub(crate) fn stage_verified_worker_binary(
+pub fn stage_verified_worker_binary(
     path: &Path,
 ) -> Result<VerifiedWorkerArtifact, WorkerIntegrityError> {
     let manifest_path = manifest_path(path)?;
@@ -129,8 +157,7 @@ fn stage_verified_worker_binary_at(
 ) -> Result<VerifiedWorkerArtifact, WorkerIntegrityError> {
     let trusted_manifest = parse_manifest(trusted_manifest_text, "embedded reference manifest")?;
     validate_manifest(&trusted_manifest)?;
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+    let manifest_text = open_worker_manifest(&manifest_path)?;
     let manifest = parse_manifest(&manifest_text, &manifest_path.display().to_string())?;
     validate_manifest(&manifest)?;
     let expected_manifest_digest = canonical_manifest_digest(trusted_manifest_text)?;
@@ -154,7 +181,10 @@ fn stage_verified_worker_binary_at(
     }
 
     let file = open_worker_binary(path)?;
-    stage_verified_file(file, target)
+    let mut artifact = stage_verified_file(file, target)?;
+    artifact.manifest = manifest_text.into_bytes();
+    artifact.manifest_digest = actual_manifest_digest;
+    Ok(artifact)
 }
 
 fn stage_verified_file(
@@ -238,6 +268,9 @@ fn stage_verified_file(
     Ok(VerifiedWorkerArtifact {
         _directory: staging,
         path: staged_path,
+        digest: actual,
+        manifest: Vec::new(),
+        manifest_digest: String::new(),
     })
 }
 
@@ -265,6 +298,57 @@ fn open_worker_binary(path: &Path) -> Result<File, WorkerIntegrityError> {
         }
         options
             .open(path)
+            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))
+    }
+}
+
+fn open_worker_manifest(path: &Path) -> Result<String, WorkerIntegrityError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(WorkerIntegrityError::Manifest(format!(
+                    "worker manifest must be a regular sibling file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(WorkerIntegrityError::Read(error.to_string())),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(WorkerIntegrityError::Manifest(format!(
+                "worker manifest must be a regular sibling file: {}",
+                path.display()
+            )));
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+        return Ok(text);
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(WorkerIntegrityError::Manifest(format!(
+                "worker manifest must be a regular sibling file: {}",
+                path.display()
+            )));
+        }
+        options
+            .open(path)
+            .and_then(|mut file| {
+                let mut text = String::new();
+                file.read_to_string(&mut text).map(|_| text)
+            })
             .map_err(|error| WorkerIntegrityError::Read(error.to_string()))
     }
 }
@@ -299,13 +383,23 @@ fn manifest_path(binary: &Path) -> Result<PathBuf, WorkerIntegrityError> {
                 "worker path has no parent for manifest binding".to_owned(),
             )
         })?;
-    if sibling.is_file() {
-        return Ok(sibling);
+    let metadata = match fs::symlink_metadata(&sibling) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WorkerIntegrityError::Manifest(format!(
+                "worker manifest must be beside the worker: {}",
+                sibling.display()
+            )));
+        }
+        Err(error) => return Err(WorkerIntegrityError::Read(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(WorkerIntegrityError::Manifest(format!(
+            "worker manifest must be a regular sibling file: {}",
+            sibling.display()
+        )));
     }
-    Err(WorkerIntegrityError::Manifest(format!(
-        "worker manifest must be beside the worker: {}",
-        sibling.display()
-    )))
+    Ok(sibling)
 }
 
 fn validate_manifest(manifest: &WorkerManifest) -> Result<(), WorkerIntegrityError> {
@@ -403,6 +497,18 @@ const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 const CURRENT_TARGET_TRIPLE: &str = "aarch64-unknown-linux-musl";
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
 const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
+    all(target_os = "linux", target_arch = "aarch64", target_env = "musl"),
+    all(target_os = "linux", target_arch = "x86_64", target_env = "musl")
+))]
+fn current_target_triple() -> String {
+    CURRENT_TARGET_TRIPLE.to_owned()
+}
+
 #[cfg(not(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "x86_64"),
@@ -411,10 +517,18 @@ const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
     all(target_os = "linux", target_arch = "aarch64", target_env = "musl"),
     all(target_os = "linux", target_arch = "x86_64", target_env = "musl")
 )))]
-const CURRENT_TARGET_TRIPLE: &str = "unsupported";
-
-const fn current_target_triple() -> &'static str {
-    CURRENT_TARGET_TRIPLE
+fn current_target_triple() -> String {
+    option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let platform = match std::env::consts::OS {
+                "macos" => "apple-darwin",
+                "windows" => "pc-windows-msvc",
+                "linux" => "unknown-linux-gnu",
+                other => other,
+            };
+            format!("{}-{platform}", std::env::consts::ARCH)
+        })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -544,6 +658,27 @@ mod tests {
         assert!(matches!(
             open_worker_binary(&link),
             Err(WorkerIntegrityError::NotRegularFile)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_manifest_symlink_is_rejected_before_artifact_hashing() {
+        let root = TempDir::new().expect("fixture root");
+        let worker = root.path().join(WORKER_NAME);
+        let manifest_path = root.path().join("worker-manifest.json");
+        let trusted_path = root.path().join("trusted-worker-manifest.json");
+        let bytes = b"fixture worker bytes";
+        let trusted = fixture_manifest(bytes);
+        executable(&worker, bytes);
+        fs::write(&trusted_path, &trusted).expect("write trusted manifest");
+        std::os::unix::fs::symlink(&trusted_path, &manifest_path)
+            .expect("create sibling manifest symlink");
+
+        assert!(matches!(
+            stage_verified_worker_binary_at(&worker, &manifest_path, &trusted),
+            Err(WorkerIntegrityError::Manifest(detail))
+                if detail.contains("regular sibling file")
         ));
     }
 
