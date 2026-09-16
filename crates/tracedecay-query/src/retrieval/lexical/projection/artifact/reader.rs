@@ -2,9 +2,10 @@ pub(super) mod clone_cursor;
 mod family_report;
 
 pub use clone_cursor::{
-    CloneArtifactCursorPositionV2, CloneArtifactCursorV2, CloneCursorCodecV1,
-    CloneCursorErrorV1, CloneCursorReadErrorV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
-    CloneFingerprintDiscoveryPositionV2,
+    CLONE_CURSOR_PREFIX_V2, CLONE_REDUNDANCY_CURSOR_PREFIX_V2, CloneArtifactCursorPositionV2,
+    CloneArtifactCursorV2, CloneCursorCodecV1, CloneCursorErrorV1, CloneCursorReadErrorV1,
+    CloneFamilyCursorPositionV2, CloneFamilyCursorV2, CloneFingerprintDiscoveryPositionV2,
+    CloneRedundancyCursorPositionV2, CloneRedundancyCursorV2,
 };
 pub use family_report::{CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1};
 
@@ -32,8 +33,8 @@ use tracedecay_code_index::production::CodeIndexExecutionControlV1;
 use tracedecay_domain::{
     CodeGenerationId, CodeSearchChunkGrainV1, CodeSearchChunkId, CompactCandidate,
     ComponentRevision, EvidenceRole, ExactAdmissionProof, ExactFieldV1, ExactTechnicalTermKindV1,
-    FixedPointScore, LogicalEvidenceId, ManifestDigest, RetrieverBatch, RetrieverCoverage,
-    RetrieverKind, RetrieverOutcome, RetrievalRequest, ScoreDomainId, SourceOccurrenceId,
+    FixedPointScore, LogicalEvidenceId, ManifestDigest, RetrievalRequest, RetrieverBatch,
+    RetrieverCoverage, RetrieverKind, RetrieverOutcome, ScoreDomainId, SourceOccurrenceId,
     SourceSpan, SymbolOccurrenceId, UtcMicros, canonical_sha256,
 };
 use tracedecay_private_fs::open_private_file;
@@ -41,10 +42,10 @@ use tracedecay_private_fs::open_private_file;
 use super::builder::compute_section_digests;
 use super::clone_census::{CodeLexicalCloneIndexCensusV1, read_clone_index_census};
 use super::fingerprints::{
+    AuthenticatedCloneFingerprintArtifactReadV1, AuthenticatedCloneSelectedBlockArtifactReadV1,
     CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1, CloneFingerprintArtifactReadV1,
     CloneFingerprintReadRequestV1, CloneSelectedBlockArtifactCandidateV1,
-    CloneSelectedBlockArtifactReadV1, AuthenticatedCloneFingerprintArtifactReadV1,
-    AuthenticatedCloneSelectedBlockArtifactReadV1, read_clone_fingerprint_page,
+    CloneSelectedBlockArtifactReadV1, read_clone_fingerprint_page,
 };
 use super::format::{
     ArtifactRowV1, CodeLexicalArtifactOccurrenceV1, CodeLexicalImportMembershipWitnessV1,
@@ -308,16 +309,17 @@ pub struct AuthenticatedCloneArtifactPageV1<T> {
     pub next_cursor: Option<String>,
 }
 
-fn map_authenticated_artifact_error(
-    error: CodeLexicalArtifactErrorV1,
-) -> CloneCursorReadErrorV1 {
+fn map_authenticated_artifact_error(error: CodeLexicalArtifactErrorV1) -> CloneCursorReadErrorV1 {
     match error {
         CodeLexicalArtifactErrorV1::Contract(message)
             if matches!(
                 message.as_str(),
                 "clone exact cursor does not match its artifact, key, or authority"
                     | "clone fingerprint cursor does not match its artifact, generation, or request"
-            ) => CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale),
+            ) =>
+        {
+            CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale)
+        }
         error => CloneCursorReadErrorV1::Artifact(error),
     }
 }
@@ -332,6 +334,7 @@ fn clone_authority_digest(
         &authority.worktree_id,
         &authority.source_generation,
         &authority.snapshot_digest,
+        &authority.symbol_occurrence_id,
     ))
     .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))
 }
@@ -968,9 +971,7 @@ impl CodeLexicalArtifactReaderV1 {
                     now,
                 )?;
                 if !matches!(decoded.after, CloneArtifactCursorPositionV2::Exact { .. }) {
-                    return Err(CloneCursorReadErrorV1::Cursor(
-                        CloneCursorErrorV1::Invalid,
-                    ));
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
                 }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })
@@ -987,6 +988,49 @@ impl CodeLexicalArtifactReaderV1 {
             members: page.members,
             next_cursor,
         })
+    }
+
+    /// Verify an exact cursor's authority bindings and report whether its
+    /// operation descriptor belongs to `key`.  Similar requests can expose
+    /// several exact keys, so the caller must identify the one key that owns
+    /// an incoming cursor before opening any stream; reusing one cursor for
+    /// every key would either duplicate rows or reject a valid continuation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_cursor_matches_key_authenticated(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        encoded: &str,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<bool, CloneCursorReadErrorV1> {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let decoded = codec.decode_artifact_unbound(
+            encoded,
+            self.receipt.artifact_digest(),
+            &self.metadata.generation,
+            snapshot_digest,
+            now,
+        )?;
+        if !matches!(decoded.after, CloneArtifactCursorPositionV2::Exact { .. }) {
+            return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
+        }
+        let authority_digest =
+            clone_authority_digest(authority).map_err(CloneCursorReadErrorV1::Artifact)?;
+        let descriptor = canonical_sha256(&(
+            "tracedecay.clone-exact-request.v1",
+            self.receipt.artifact_digest(),
+            &authority_digest,
+            key,
+        ))
+        .map_err(|error| {
+            CloneCursorReadErrorV1::Artifact(CodeLexicalArtifactErrorV1::Contract(
+                error.to_string(),
+            ))
+        })?;
+        Ok(decoded.query_descriptor == descriptor)
     }
 
     pub fn clone_fingerprint_page(
@@ -1048,9 +1092,7 @@ impl CodeLexicalArtifactReaderV1 {
                     CloneArtifactCursorPositionV2::Fingerprint { .. }
                         | CloneArtifactCursorPositionV2::FingerprintDiscovery { .. }
                 ) {
-                    return Err(CloneCursorReadErrorV1::Cursor(
-                        CloneCursorErrorV1::Invalid,
-                    ));
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
                 }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })
@@ -1319,9 +1361,7 @@ impl CodeLexicalArtifactReaderV1 {
                     CloneArtifactCursorPositionV2::Fingerprint { .. }
                         | CloneArtifactCursorPositionV2::FingerprintDiscovery { .. }
                 ) {
-                    return Err(CloneCursorReadErrorV1::Cursor(
-                        CloneCursorErrorV1::Invalid,
-                    ));
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
                 }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })

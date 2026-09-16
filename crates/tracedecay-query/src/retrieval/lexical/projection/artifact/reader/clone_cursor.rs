@@ -24,12 +24,18 @@ use tracedecay_domain::{
 
 use crate::retrieval::{QueryAuthorityErrorV1, QueryAuthorityV1};
 
-const CLONE_CURSOR_PREFIX_V2: &str = "ccclone2.";
+pub const CLONE_CURSOR_PREFIX_V2: &str = "ccclone2.";
+/// Prefix for the authenticated cursor that joins a family-stream position
+/// with an exact-member position.  It is intentionally distinct from the
+/// single-stream prefixes so a member cursor can never be fed to the family
+/// reader by accident.
+pub const CLONE_REDUNDANCY_CURSOR_PREFIX_V2: &str = "ccredundancy2.";
 const CLONE_CURSOR_REVISION_V2: u16 = 2;
 const CLONE_CURSOR_TTL_MICROS_V1: i64 = 15 * 60 * 1_000_000;
 const CLONE_CURSOR_MAX_ENCODED_BYTES_V1: usize = 32 * 1024;
 const CLONE_ARTIFACT_CURSOR_OPERATION_V1: &str = "tracedecay.clone-artifact-cursor.v2";
 const CLONE_FAMILY_CURSOR_OPERATION_V1: &str = "tracedecay.clone-family-cursor.v2";
+const CLONE_REDUNDANCY_CURSOR_OPERATION_V1: &str = "tracedecay.clone-redundancy-cursor.v2";
 const CLONE_CURSOR_SCOPE_DIGEST_DOMAIN_V1: &str = "tracedecay.clone-cursor-scope.v1";
 
 /// Typed failure from clone cursor parsing, authentication, and binding.
@@ -180,6 +186,31 @@ pub struct CloneFamilyCursorV2 {
     pub expires_at: UtcMicros,
 }
 
+/// Authenticated continuation for a redundancy page that stopped while
+/// expanding one family.  The family cursor points to the boundary before
+/// `family_key`; the member cursor points into that family's exact posting
+/// stream.  Both values are covered by the outer MAC and the member cursor
+/// is independently authenticated when it is consumed by the exact reader.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneRedundancyCursorPositionV2 {
+    pub family_cursor: Option<String>,
+    pub family_key: CloneExactKeyV1,
+    pub member_cursor: String,
+}
+
+/// Authenticated redundancy continuation body returned after verification.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneRedundancyCursorV2 {
+    pub artifact_digest: ManifestDigest,
+    pub generation: CodeGenerationId,
+    pub snapshot_digest: ManifestDigest,
+    pub query_descriptor: ManifestDigest,
+    pub after: CloneRedundancyCursorPositionV2,
+    pub expires_at: UtcMicros,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CloneArtifactCursorPayloadV2 {
@@ -225,6 +256,30 @@ struct AuthenticatedCloneArtifactCursorV2 {
 #[serde(deny_unknown_fields)]
 struct AuthenticatedCloneFamilyCursorV2 {
     payload: CloneFamilyCursorPayloadV2,
+    authentication: QueryDigest,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CloneRedundancyCursorPayloadV2 {
+    revision: u16,
+    operation: String,
+    authentication_key_id: RetrievalCursorKeyId,
+    principal: PrincipalId,
+    scope_digest: ManifestDigest,
+    authorization_revision: AuthorizationRevision,
+    artifact_digest: ManifestDigest,
+    generation: CodeGenerationId,
+    snapshot_digest: ManifestDigest,
+    query_descriptor: ManifestDigest,
+    after: CloneRedundancyCursorPositionV2,
+    expires_at: UtcMicros,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedCloneRedundancyCursorV2 {
+    payload: CloneRedundancyCursorPayloadV2,
     authentication: QueryDigest,
 }
 
@@ -532,6 +587,98 @@ impl<'a> CloneCursorCodecV1<'a> {
         })
     }
 
+    /// Sign a redundancy continuation that joins the family and member
+    /// streams.  The nested cursors stay opaque here; the outer authority
+    /// binds them to the admitted request and the immutable clone artifact.
+    pub fn issue_redundancy(
+        &self,
+        artifact_digest: ManifestDigest,
+        generation: CodeGenerationId,
+        snapshot_digest: ManifestDigest,
+        query_descriptor: ManifestDigest,
+        after: CloneRedundancyCursorPositionV2,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorErrorV1> {
+        validate_redundancy_position(&after)?;
+        let expires_at = expiry_from(now)?;
+        let payload = CloneRedundancyCursorPayloadV2 {
+            revision: CLONE_CURSOR_REVISION_V2,
+            operation: CLONE_REDUNDANCY_CURSOR_OPERATION_V1.to_owned(),
+            authentication_key_id: self.authority.active_query_key_id(),
+            principal: self.request.principal.clone(),
+            scope_digest: scope_digest(self.request)?,
+            authorization_revision: self.request.snapshot.authorization_revision.clone(),
+            artifact_digest,
+            generation,
+            snapshot_digest,
+            query_descriptor,
+            after,
+            expires_at,
+        };
+        let authentication = self.authenticate(&payload)?;
+        encode_envelope_with_prefix(
+            &AuthenticatedCloneRedundancyCursorV2 {
+                payload,
+                authentication,
+            },
+            CLONE_REDUNDANCY_CURSOR_PREFIX_V2,
+        )
+    }
+
+    /// Verify a redundancy continuation against the current immutable
+    /// artifact, generation, snapshot, and complete redundancy descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_redundancy(
+        &self,
+        encoded: &str,
+        artifact_digest: &ManifestDigest,
+        generation: &CodeGenerationId,
+        snapshot_digest: &ManifestDigest,
+        query_descriptor: &ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<CloneRedundancyCursorV2, CloneCursorErrorV1> {
+        let envelope = decode_envelope_with_prefix::<AuthenticatedCloneRedundancyCursorV2>(
+            encoded,
+            CLONE_REDUNDANCY_CURSOR_PREFIX_V2,
+        )?;
+        let payload_bytes =
+            serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
+        self.verify(
+            &envelope.payload.authentication_key_id,
+            &payload_bytes,
+            &envelope.authentication,
+        )?;
+        let payload = envelope.payload;
+        validate_common(
+            &payload.operation,
+            CLONE_REDUNDANCY_CURSOR_OPERATION_V1,
+            payload.revision,
+            &payload.principal,
+            &payload.scope_digest,
+            &payload.authorization_revision,
+            &payload.artifact_digest,
+            artifact_digest,
+            &payload.generation,
+            generation,
+            &payload.snapshot_digest,
+            snapshot_digest,
+            &payload.query_descriptor,
+            Some(query_descriptor),
+            payload.expires_at,
+            now,
+            self.request,
+        )?;
+        validate_redundancy_position(&payload.after)?;
+        Ok(CloneRedundancyCursorV2 {
+            artifact_digest: payload.artifact_digest,
+            generation: payload.generation,
+            snapshot_digest: payload.snapshot_digest,
+            query_descriptor: payload.query_descriptor,
+            after: payload.after,
+            expires_at: payload.expires_at,
+        })
+    }
+
     fn authenticate<P: Serialize>(&self, payload: &P) -> Result<QueryDigest, CloneCursorErrorV1> {
         let bytes = serde_json::to_vec(payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.authority
@@ -569,6 +716,18 @@ fn validate_artifact_position(
         if comparison_body_digest.is_some() != comparison_payload_digest.is_some() {
             return Err(CloneCursorErrorV1::Invalid);
         }
+    }
+    Ok(())
+}
+
+fn validate_redundancy_position(
+    position: &CloneRedundancyCursorPositionV2,
+) -> Result<(), CloneCursorErrorV1> {
+    if position.member_cursor.is_empty() {
+        return Err(CloneCursorErrorV1::Invalid);
+    }
+    if position.family_cursor.as_deref().is_some_and(str::is_empty) {
+        return Err(CloneCursorErrorV1::Invalid);
     }
     Ok(())
 }
@@ -622,11 +781,25 @@ fn validate_common(
 }
 
 fn encode_envelope<T: Serialize>(envelope: &T) -> Result<String, CloneCursorErrorV1> {
+    encode_envelope_with_prefix(envelope, CLONE_CURSOR_PREFIX_V2)
+}
+
+fn encode_envelope_with_prefix<T: Serialize>(
+    envelope: &T,
+    prefix: &str,
+) -> Result<String, CloneCursorErrorV1> {
     let bytes = serde_json::to_vec(envelope).map_err(|_| CloneCursorErrorV1::Invalid)?;
-    Ok(format!("{CLONE_CURSOR_PREFIX_V2}{}", hex::encode(bytes)))
+    Ok(format!("{prefix}{}", hex::encode(bytes)))
 }
 
 fn decode_envelope<T>(encoded: &str) -> Result<T, CloneCursorErrorV1>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    decode_envelope_with_prefix(encoded, CLONE_CURSOR_PREFIX_V2)
+}
+
+fn decode_envelope_with_prefix<T>(encoded: &str, prefix: &str) -> Result<T, CloneCursorErrorV1>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
@@ -634,7 +807,7 @@ where
         return Err(CloneCursorErrorV1::Invalid);
     }
     let encoded = encoded
-        .strip_prefix(CLONE_CURSOR_PREFIX_V2)
+        .strip_prefix(prefix)
         .ok_or(CloneCursorErrorV1::Invalid)?;
     let bytes = hex::decode(encoded).map_err(|_| CloneCursorErrorV1::Invalid)?;
     if hex::encode(&bytes) != encoded {
