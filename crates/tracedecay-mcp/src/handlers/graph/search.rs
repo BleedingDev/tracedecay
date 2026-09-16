@@ -1211,6 +1211,7 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
         repository_id.clone(),
         &mut remaining_wire_occurrences,
     )?;
+    ensure_similar_near_continuation(&near, near_wire_limit_reached)?;
     wire_limit_reached |= near_wire_limit_reached;
     complete &= matches!(near.coverage, SimilarNearCoverageV1::Complete);
     touched_files.extend(near_touched_files);
@@ -1242,6 +1243,20 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
     let value =
         hotpath::measure_block!("mcp.graph.similar.serialize", serde_json::to_value(result)?);
     Ok(generic_tool_result(ctx, &args, &value, touched_files))
+}
+
+fn ensure_similar_near_continuation(
+    near: &SimilarNearResultV1,
+    wire_limit_reached: bool,
+) -> Result<()> {
+    if wire_limit_reached && near.next_cursor.is_none() {
+        return Err(TraceDecayError::ProjectRoute {
+            reason_code: "similar-pagination-unavailable".to_owned(),
+            retryable: true,
+            detail: "verified similar near results omitted occurrences without an authenticated continuation".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn code_index_source_extent(
@@ -2168,6 +2183,170 @@ mod tests {
             assert_eq!(wire["error"]["data"]["reason_code"], reason_code);
             assert_eq!(wire["error"]["data"]["retryable"], retryable);
         }
+    }
+
+    fn similar_test_digest(fill: char) -> tracedecay_domain::ManifestDigest {
+        tracedecay_domain::ManifestDigest::new(format!("sha256:{}", fill.to_string().repeat(64)))
+            .expect("fixture digest")
+    }
+
+    fn similar_test_payload(fill: char) -> tracedecay_code_index::clones::CloneBodyPayloadV1 {
+        use tracedecay_code_extraction::{
+            CloneBodyRenameStatusV1, CloneBodyTokenizationStatusV1, ConservativeCloneTokenV1,
+        };
+
+        let token = ConservativeCloneTokenV1::Syntax {
+            syntax_kind: "identifier".to_owned(),
+            text: "fixture".to_owned(),
+        };
+        let tokens = vec![token; 8];
+        tracedecay_code_index::clones::CloneBodyPayloadV1 {
+            payload_digest: similar_test_digest(fill),
+            language: "rust".to_owned(),
+            symbol_kind: "function".to_owned(),
+            body_digest: similar_test_digest(fill),
+            token_count: tokens.len() as u32,
+            conservative_normalization_revision: 1,
+            conservative_digest: similar_test_digest(fill),
+            conservative_tokens: tokens.clone(),
+            tokenization_status: CloneBodyTokenizationStatusV1::Complete,
+            tokenization_issues: Vec::new(),
+            rename_normalization_revision: Some(1),
+            rename_digest: Some(similar_test_digest(fill)),
+            rename_tokens: Some(tokens),
+            rename_coverage: CloneBodyRenameStatusV1::Complete,
+            rename_issues: Vec::new(),
+        }
+    }
+
+    fn similar_test_occurrence(
+        project_id: &str,
+        repository_id: &str,
+        symbol_occurrence_id: &str,
+        path: &str,
+        payload_digest: tracedecay_domain::ManifestDigest,
+    ) -> tracedecay_code_index::clones::CloneBodyOccurrenceV1 {
+        tracedecay_code_index::clones::CloneBodyOccurrenceV1 {
+            project_id: tracedecay_domain::ProjectId::new(project_id).expect("fixture project"),
+            repository_id: tracedecay_domain::RepositoryId::new(repository_id)
+                .expect("fixture repository"),
+            worktree_id: None,
+            source_generation: tracedecay_domain::CodeGenerationId::new("generation.similar")
+                .expect("fixture generation"),
+            snapshot_digest: similar_test_digest('a'),
+            symbol_occurrence_id: tracedecay_domain::SymbolOccurrenceId::new(symbol_occurrence_id)
+                .expect("fixture symbol occurrence"),
+            path: path.to_owned(),
+            body_span: tracedecay_domain::SourceSpan {
+                start_byte: 0,
+                end_byte: 80,
+            },
+            payload_digest,
+            eligibility: tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible,
+        }
+    }
+
+    #[test]
+    fn near_wire_truncation_keeps_the_authenticated_cursor_for_omitted_occurrences() {
+        let project = "project.similar-pagination";
+        let repository = "repository.similar-pagination";
+        let source_payload = similar_test_payload('a');
+        let candidate_payload = similar_test_payload('b');
+        let source = tracedecay_code_index::clones::CodeIndexCloneBodyV1 {
+            payload: std::sync::Arc::new(source_payload),
+            occurrence: similar_test_occurrence(
+                project,
+                repository,
+                "symbol.source",
+                "src/source.rs",
+                similar_test_digest('a'),
+            ),
+        };
+        let candidate_a = similar_test_occurrence(
+            project,
+            repository,
+            "symbol.candidate.a",
+            "src/candidate-a.rs",
+            similar_test_digest('b'),
+        );
+        let candidate_b = similar_test_occurrence(
+            project,
+            repository,
+            "symbol.candidate.b",
+            "src/candidate-b.rs",
+            similar_test_digest('b'),
+        );
+        let candidate =
+            tracedecay_query::retrieval::lexical::CloneSelectedBlockArtifactCandidateV1 {
+                payload: candidate_payload,
+                occurrences: vec![candidate_a.clone(), candidate_b],
+                anchors: Vec::new(),
+                containment:
+                    tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::Equal,
+            };
+        let near = tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
+            tracedecay_query::retrieval::lexical::AuthenticatedCloneSelectedBlockArtifactReadV1 {
+                page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
+                    members: vec![candidate],
+                    next_cursor: Some("ccclone2.authenticated-occurrence-tail".to_owned()),
+                },
+                stream: tracedecay_query::retrieval::lexical::CloneFingerprintStreamDescriptorV1 {
+                    language: "rust".to_owned(),
+                    class: tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
+                    normalization_revision: 1,
+                    rename_tier_unavailable: None,
+                },
+                coverage: tracedecay_domain::RetrieverCoverage::default(),
+                partial_reasons: Vec::new(),
+                accounting:
+                    tracedecay_query::retrieval::lexical::CloneFingerprintReadAccountingV1::default(
+                    ),
+            },
+        );
+        let mut remaining = 1;
+        let (result, touched_files, wire_limit_reached) = similar_near_result(
+            &source,
+            SimilarSourceExtentV1::SelectedTokenRange { start: 0, end: 8 },
+            near,
+            tracedecay_domain::ProjectId::new(project).expect("fixture project"),
+            tracedecay_domain::RepositoryId::new(repository).expect("fixture repository"),
+            &mut remaining,
+        )
+        .expect("near page flattens");
+
+        assert!(wire_limit_reached);
+        assert_eq!(remaining, 0);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].candidate.symbol_occurrence_id.as_str(),
+            "symbol.candidate.a"
+        );
+        assert_eq!(
+            result.next_cursor.as_deref(),
+            Some("ccclone2.authenticated-occurrence-tail")
+        );
+        assert_eq!(touched_files, vec!["src/candidate-a.rs"]);
+    }
+
+    #[test]
+    fn near_wire_truncation_without_a_cursor_fails_closed() {
+        let near = SimilarNearResultV1 {
+            extent: SimilarSourceExtentV1::WholeBody,
+            matches: Vec::new(),
+            coverage: SimilarNearCoverageV1::Complete,
+            next_cursor: None,
+        };
+
+        let error = ensure_similar_near_continuation(&near, true)
+            .expect_err("omitted near occurrences require a continuation");
+        assert_eq!(
+            error.project_route_context(),
+            Some((
+                "similar-pagination-unavailable",
+                true,
+                "verified similar near results omitted occurrences without an authenticated continuation",
+            ))
+        );
     }
 
     fn context_memory_hit(content: &str) -> FactSearchHitV1 {

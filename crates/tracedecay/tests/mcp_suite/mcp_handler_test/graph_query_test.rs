@@ -1419,6 +1419,173 @@ async fn similar_serves_verified_exact_and_rename_normalized_families() {
 }
 
 #[tokio::test]
+async fn similar_near_pages_resume_each_occurrence_and_refuse_a_tampered_cursor() {
+    let source_body = "
+        let one = parse(input);
+        let two = transform(one);
+        let three = validate(two);
+        let four = persist(three);
+        let five = audit(four);
+        let six = publish(five);
+        let seven = archive(six);
+        finish(seven, input, one, two, three, four, five, six);
+        1
+    ";
+    let repeated_near_body = "
+        let one = parse(input);
+        let two = transform(one);
+        let three = validate(two);
+        let four = persist(three);
+        let five = audit(four);
+        let six = publish(five);
+        let seven = archive(six);
+        finish(seven, input, one, two, three, four, five, six);
+        2
+    ";
+    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(
+            project.join("src/source.rs"),
+            format!("pub fn source_copy(input: Input) -> u32 {{ {source_body} }}\n"),
+        )
+        .unwrap();
+        for (path, name) in [
+            ("src/near_a.rs", "near_a"),
+            ("src/near_b.rs", "near_b"),
+            ("src/near_c.rs", "near_c"),
+            ("src/near_d.rs", "near_d"),
+        ] {
+            fs::write(
+                project.join(path),
+                format!("pub fn {name}(input: Input) -> u32 {{ {repeated_near_body} }}\n"),
+            )
+            .unwrap();
+        }
+    })
+    .await;
+    let source = graph_node_id(&fixture, "source_copy").await;
+    let project_id = fixture
+        .production
+        .harness
+        .project_id(fixture.project_root())
+        .await
+        .expect("fixture project identity");
+    let repository_id =
+        tracedecay_code_index_runtime::code_index_scheduler::identity::repository_id_for(
+            fixture.project_root(),
+        )
+        .expect("fixture repository identity");
+
+    let request = |cursor: Option<String>| {
+        let mut arguments = json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["rename_normalized_exact"],
+            "result_limit": 1,
+            "work_limit": 20,
+        });
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = json!(cursor);
+        }
+        arguments
+    };
+
+    let first = call_production_tool(&fixture, "tracedecay_similar", request(None), None, None)
+        .await
+        .expect("first near page");
+    let first: Value = serde_json::from_str(extract_text(&first.value)).unwrap();
+    let first_match = first["near"]["matches"]
+        .as_array()
+        .expect("first near matches");
+    assert_eq!(
+        first_match.len(),
+        1,
+        "wire page must contain one occurrence"
+    );
+    let first_cursor = first["near"]["next_cursor"]
+        .as_str()
+        .expect("truncated candidate must expose a continuation")
+        .to_owned();
+    let first_candidate = first_match[0]["candidate"]["symbol_occurrence_id"]
+        .as_str()
+        .expect("first candidate occurrence id")
+        .to_owned();
+    let first_path = first_match[0]["candidate"]["path"]
+        .as_str()
+        .expect("first candidate path")
+        .to_owned();
+
+    let mut seen_ids = vec![first_candidate];
+    let mut seen_paths = vec![first_path];
+    let mut cursor = Some(first_cursor.clone());
+    while let Some(cursor_value) = cursor.take() {
+        let page = call_production_tool(
+            &fixture,
+            "tracedecay_similar",
+            request(Some(cursor_value)),
+            None,
+            None,
+        )
+        .await
+        .expect("near continuation page");
+        let page: Value = serde_json::from_str(extract_text(&page.value)).unwrap();
+        let matches = page["near"]["matches"]
+            .as_array()
+            .expect("near continuation matches");
+        assert_eq!(matches.len(), 1, "each near page must honor result_limit");
+        let candidate = &matches[0]["candidate"];
+        let id = candidate["symbol_occurrence_id"]
+            .as_str()
+            .expect("near continuation occurrence id")
+            .to_owned();
+        let path = candidate["path"]
+            .as_str()
+            .expect("near continuation path")
+            .to_owned();
+        assert!(!seen_ids.contains(&id), "near pagination duplicated {id}");
+        seen_ids.push(id);
+        seen_paths.push(path);
+        cursor = page["near"]["next_cursor"].as_str().map(str::to_owned);
+        assert!(seen_ids.len() <= 8, "near pagination did not terminate");
+    }
+    assert_eq!(
+        seen_paths.len(),
+        4,
+        "all repeated candidate occurrences remain"
+    );
+    assert!(
+        seen_paths.iter().all(|path| path.starts_with("src/near_")),
+        "near pagination must not return the source occurrence: {seen_paths:?}"
+    );
+
+    let mut tampered_cursor = first_cursor.into_bytes();
+    let last = tampered_cursor
+        .last_mut()
+        .expect("authenticated cursor has bytes");
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    let tampered_cursor = String::from_utf8(tampered_cursor).expect("cursor remains UTF-8");
+    let tampered = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        request(Some(tampered_cursor)),
+        None,
+        None,
+    )
+    .await
+    .expect_err("tampered near cursor must be rejected");
+    assert!(
+        tampered.to_string().contains("invalid_request"),
+        "tampered near cursor must remain a typed invalid request: {tampered}"
+    );
+
+    shutdown_graph_fixture(fixture).await;
+}
+
+#[tokio::test]
 async fn redundancy_reports_ranked_repository_exact_families_with_bounded_pages() {
     let large_body = "
         let one = parse(input);
