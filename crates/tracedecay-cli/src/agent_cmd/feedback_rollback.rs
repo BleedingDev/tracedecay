@@ -219,6 +219,7 @@ pub(crate) async fn handle_feedback_rollback_command(
 
 fn feedback_rollback_inputs(
     agent_id: &str,
+    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<(
     PathBuf,
     PathBuf,
@@ -247,10 +248,11 @@ fn feedback_rollback_inputs(
         })?;
     let component = selected_feedback_component(&previous)?;
     let mut target =
-        tracedecay_agent_hosts::agents::host_bundle_registry::verified_embedded_host_bundle(
+        tracedecay_agent_hosts::agents::host_bundle_registry::verified_embedded_host_bundle_with_tracedecay_bin(
             host,
             component,
             0,
+            tracedecay_bin,
             crate::product_runtime::PRODUCT_FULL_SHA,
         )
         .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
@@ -1107,7 +1109,9 @@ fn persist_feedback_state(
 }
 
 fn feedback_rollback_dry_run(agent_id: &str) -> tracedecay_domain::errors::Result<()> {
-    let (home, _lifecycle_root, aggregate, target) = feedback_rollback_inputs(agent_id)?;
+    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
+    let (home, _lifecycle_root, aggregate, target) =
+        feedback_rollback_inputs(agent_id, &tracedecay_bin)?;
     let (previous, previous_receipt) = live_feedback_receipt(&home, &aggregate)?;
     let verifier = feedback_pair_verifier(&previous, &target.manifest)?;
     let request = feedback_request(
@@ -1151,9 +1155,11 @@ fn feedback_rollback_apply(
     agent_id: &str,
     state_path: &Path,
 ) -> tracedecay_domain::errors::Result<()> {
+    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
     let dashboard_enabled =
         load_host_lifecycle_user_config()?.dashboard_enabled_for_agent(agent_id);
-    let (home, lifecycle_root, aggregate, target) = feedback_rollback_inputs(agent_id)?;
+    let (home, lifecycle_root, aggregate, target) =
+        feedback_rollback_inputs(agent_id, &tracedecay_bin)?;
     let (previous, _previous_receipt) = live_feedback_receipt(&home, &aggregate)?;
     let previous_contents = read_feedback_repair_contents(&home, &previous)?;
     let artifact_permissions = snapshot_feedback_artifact_permissions(&home, &previous)?;
@@ -1236,7 +1242,7 @@ fn feedback_rollback_apply(
         // Feedback rollback is a lifecycle mutation too: its registration
         // restore must render hooks/MCP commands from the exact binary that
         // launched this command, never a different version found on PATH.
-        tracedecay_bin: super::lifecycle_tracedecay_bin()?,
+        tracedecay_bin,
         tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
         project_root: None,
         dashboard: state.dashboard_enabled,
@@ -1313,6 +1319,7 @@ fn feedback_rollback_apply(
 
 #[hotpath::measure(label = "cli.agent.feedback")]
 fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Result<()> {
+    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
     let bytes = fs::read(state_path).map_err(|error| {
         tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
@@ -1590,7 +1597,7 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
     let writer = lifecycle.into_storage();
     let context = tracedecay_agent_hosts::agents::InstallContext {
         home,
-        tracedecay_bin: super::lifecycle_tracedecay_bin()?,
+        tracedecay_bin,
         tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
         project_root: None,
         dashboard: state.dashboard_enabled,

@@ -328,7 +328,7 @@ pub fn verified_embedded_host_bundle(
 }
 
 #[hotpath::measure(label = "host_bundle_registry_verify")]
-fn verified_embedded_host_bundle_with_tracedecay_bin(
+pub fn verified_embedded_host_bundle_with_tracedecay_bin(
     host: HostKindV1,
     component: HostBundleComponentV1,
     _now_unix: u64,
