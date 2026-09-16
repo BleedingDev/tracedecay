@@ -306,7 +306,7 @@ mod enabled {
         );
         assert_eq!(
             response.terminal.diagnostic_id(),
-            Some("ncm.rust.worker_spawn_failed")
+            Some("ncm.rust.worker_unavailable")
         );
         assert!(response.provider_instance_id.is_none());
         assert!(response.ready_receipt_sha256.is_none());

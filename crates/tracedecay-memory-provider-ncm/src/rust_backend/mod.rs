@@ -200,7 +200,10 @@ impl RustNcmSurface {
             // is absent or exits: handshakes report the existing typed
             // unavailable terminal, exactly as missing-model preflight does.
             Err(
-                ClientError::Spawn(_) | ClientError::RestartExhausted | ClientError::WorkerExited,
+                ClientError::Spawn(_)
+                | ClientError::Unavailable(_)
+                | ClientError::RestartExhausted
+                | ClientError::WorkerExited,
             ) => (fallback_descriptor.clone(), None),
             Err(error) => {
                 return Err(RustNcmError::HandshakeIdentity(error.to_string()));

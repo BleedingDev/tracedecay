@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for the dormant-by-default memory-provider host verifier.
-
-Shape note: these fixtures used to model the pre-mount program -- one registry
-feature edge, an enabled Native activation reachable only from a
-`#[cfg(any(test, feature = "test-transport"))]` match arm, and no root-crate
-consumer of the provider boundary.  Production has since mounted the
-observation journey and the cognitive-recall route and resolves activation from
-the authoritative runtime configuration.  The fixtures now model that shape,
-and the negative cases below still pin every invariant the old ones did:
-the host feature stays optional and outside the *transitive* `default`
-closure, every host-support dependency stays optional and reachable only
-through the host feature, default configuration stays dormant, production can
-only pass `FromRuntimeConfiguration`, the pinned selector stays test-gated, the
-enabled activation is built exactly once inside the resolved arm, and the two
-exact mount files may consume the registry but may not compose, enable, name
-the concrete Native adapter, or branch on a provider name.
-
-The negative cases below are deliberately written as *bypasses* rather than as
-deletions: a check that only notices a missing fragment is satisfied by a
-violation that keeps every fragment and adds something.  So the suite moves the
-enabled construction instead of deleting it, shadows the resolved activation
-instead of removing the resolve call, inserts a resolver arm instead of
-dropping one, relocates the boundary refusal into `#[cfg(test)]` instead of
-erasing it, and hides an indented production item after a test module.
-"""
+"""Focused tests for the #707 Native/NCM composition-boundary guard."""
 
 from __future__ import annotations
 
@@ -48,26 +24,58 @@ def load_checker() -> ModuleType:
 
 CHECKER = load_checker()
 
-VALID_MANIFEST = '''[features]
+ROOT_MANIFEST = """[features]
 default = ["production"]
-production = ["token-counting"]
-token-counting = []
+production = []
 memory-provider-host = [
+    "dep:chrono",
     "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-provider-ncm",
+    "dep:tracedecay-memory-observation",
+    "dep:tracedecay-memory-hygiene",
+    "tracedecay-daemon-service/memory-provider-host",
+]
+
+[dependencies]
+tracedecay-daemon-service = { path = "../tracedecay-daemon-service" }
+chrono = { version = "0.4", optional = true }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
+tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
+"""
+
+SERVICE_MANIFEST = """[features]
+test-helpers = ["tracedecay-memory-provider-ncm?/test-helpers"]
+memory-provider-host = [
+    "dep:chrono",
+    "dep:hmac",
+    "dep:rusqlite",
+    "dep:zeroize",
+    "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-provider-ncm",
     "dep:tracedecay-memory-observation",
     "dep:tracedecay-memory-hygiene",
 ]
 
 [dependencies]
+chrono = { version = "0.4", optional = true }
+hmac = { version = "0.13", optional = true }
+rusqlite = { version = "0.40", optional = true }
+zeroize = { version = "1", optional = true }
 tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }
 tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
 tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
-'''
+"""
 
-VALID_CONFIG = '''pub struct TraceDecayConfig {
-    #[serde(default)]
+CONFIG = """use tracedecay_domain::configuration::{
+    MemoryProviderNcmObserverV1, MemoryProviderRecallRoutingV1,
+};
+
+pub struct TraceDecayConfig {
     pub memory_provider_native_enabled: bool,
-    #[serde(default)]
+    pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
 }
 
@@ -75,151 +83,107 @@ impl Default for TraceDecayConfig {
     fn default() -> Self {
         Self {
             memory_provider_native_enabled: false,
+            memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
         }
     }
 }
-'''
+"""
 
-VALID_ROUTING_GATE = '''#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+ROUTING = """#[derive(Default)]
 pub struct MemoryProviderRecallRoutingV1 {
     #[serde(default)]
     pub active_provider: Option<String>,
-    #[serde(default)]
-    pub fallback: Option<MemoryProviderRecallFallbackV1>,
 }
-'''
+"""
 
-VALID_MOUNT = '''#[cfg(feature = "memory-provider-host")]
-pub(super) enum ProjectMemoryProviderActivation {
-    Disabled,
-    NativeObserver,
-    NativeActive,
-}
+ROOT_COMPOSITION = """#[cfg(feature = "memory-provider-host")]
+mod ncm_observer;
 
-pub(super) enum ProjectMemoryProviderActivationSelector {
+#[cfg(feature = "memory-provider-host")]
+type ProjectMemoryProviderActivation =
+    tracedecay_domain::configuration::MemoryProviderSelectionV1;
+
+#[cfg(feature = "memory-provider-host")]
+enum ProjectMemoryProviderActivationSelector {
     FromRuntimeConfiguration,
-    /// Pin one activation explicitly. Test and transport builds only.
-    #[cfg(any(test, feature = "test-transport"))]
-    Pinned(ProjectMemoryProviderActivation),
 }
 
+#[cfg(feature = "memory-provider-host")]
 impl ProjectMemoryProviderActivationSelector {
     fn resolve(
         self,
         runtime_configuration: &PinnedRuntimeConfiguration,
     ) -> Result<ProjectMemoryProviderActivation> {
-        match self {
-            Self::FromRuntimeConfiguration => {
-                resolve_memory_provider_activation(runtime_configuration.config())
-            }
-            #[cfg(any(test, feature = "test-transport"))]
-            Self::Pinned(activation) => Ok(activation),
-        }
+        let config = runtime_configuration.config();
+        tracedecay_domain::configuration::MemoryProviderSelectionV1::resolve(
+            config.memory_provider_native_enabled,
+            &config.memory_provider_ncm_observer,
+            &config.memory_provider_recall_routing,
+        )
+        .map_err(|error| TraceDecayError::Config { message: error.to_string() })
     }
 }
 
-fn resolve_memory_provider_activation(
-    config: &TraceDecayConfig,
-) -> Result<ProjectMemoryProviderActivation> {
-    let routing = &config.memory_provider_recall_routing;
-    match (
-        config.memory_provider_native_enabled,
-        routing.active_provider.as_deref(),
-    ) {
-        (false, None) => Ok(ProjectMemoryProviderActivation::Disabled),
-        (false, Some(provider)) => Err(TraceDecayError::Config {
-            message: format!("routing names '{provider}' while the host is disabled"),
-        }),
-        (true, None) => Ok(ProjectMemoryProviderActivation::NativeObserver),
-        (true, Some(provider)) if is_mountable_active_provider(provider) => {
-            Ok(ProjectMemoryProviderActivation::NativeActive)
-        }
-        (true, Some(provider)) => Err(TraceDecayError::Config {
-            message: format!("routing names unmountable provider '{provider}'"),
-        }),
-    }
-}
-
-#[cfg(feature = "memory-provider-host")]
-async fn mount_project_memory_provider_host(
-    activation: ProjectMemoryProviderActivation,
-) -> Result<crate::mcp::server::MemoryProviderHostMount> {
-    let enabled_mode = match activation {
-        ProjectMemoryProviderActivation::Disabled => None,
-        ProjectMemoryProviderActivation::NativeObserver => Some(EnabledProviderMode::Observer),
-        ProjectMemoryProviderActivation::NativeActive => Some(EnabledProviderMode::Active),
-    };
-    let activation = match enabled_mode {
-        None => tracedecay_memory_provider_registry::NativeProviderActivation::Disabled,
-        Some(mode) => {
-            tracedecay_memory_provider_registry::NativeProviderActivation::Enabled { port, mode }
-        }
-    };
-    let composition =
-        tracedecay_memory_provider_registry::ProjectMemoryProviderComposition::compose(activation)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("could not compose project memory-provider host: {error}"),
-            })?;
-    Ok(Arc::new(composition))
-}
-
-pub(super) async fn production_project_server() -> Result<()> {
-    production_project_server_with_activation(
+pub(super) async fn production_project_server(
+    runtime: ProductionProjectCompositionRuntime,
+) -> Result<()> {
+    production_project_server_inner(
+        runtime,
         ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
     )
     .await
 }
 
-pub(super) async fn production_project_server_with_activation(
+async fn production_project_server_inner(
+    runtime: ProductionProjectCompositionRuntime,
     activation: ProjectMemoryProviderActivationSelector,
 ) -> Result<()> {
-    Box::pin(production_project_server_inner(activation)).await
+    compose_core_server(runtime, activation).await
 }
 
-async fn production_project_server_inner(
+async fn compose_core_server(
+    runtime: ProductionProjectCompositionRuntime,
     activation: ProjectMemoryProviderActivationSelector,
 ) -> Result<()> {
-    let memory_provider_activation = activation.resolve(&runtime_configuration)?;
-    let memory_provider_host_mount = mount_project_memory_provider_host(
-        memory_provider_activation,
-    )?;
-    let cognitive_recall_mount = match (
-        memory_provider_host_mount.registry().is_some(),
-        project_recall_routing_policy(memory_provider_activation, &runtime_configuration.config)?,
-    ) {
-        (true, Some(routing)) => Some(mount_project_cognitive_recall(routing)?),
-        _ => None,
-    };
-    let observation_journey_mount = if memory_provider_host_mount.registry().is_some() {
-        Some(mount_and_replay().await?)
-    } else {
-        None
-    };
+    let runtime_configuration = runtime.configuration();
+    let memory_provider_activation = self.activation.clone().resolve(runtime_configuration)?;
+    let ncm_registration_factory = ncm_registration_factory(
+        ncm_observer::construct_ncm_registration_with_authority(/* factory args */),
+    );
+    let memory_provider_host =
+        tracedecay_daemon_service::retained_owner::mount_project_memory_provider_host(
+            tracedecay_daemon_service::retained_owner::ProjectMemoryProviderHostInputsV1 {
+                activation: memory_provider_activation,
+                ncm_registration_factory,
+            },
+        )
+        .await?;
+    let full = tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
+        &memory_provider_host,
+    )
+    .await?;
+    let context = context
+        .with_memory_provider_host_mount(memory_provider_host)
+        .with_cognitive_recall_mount(full.cognitive_recall_mount())
+        .with_observation_journey_mount(full.observation_journey());
     Ok(())
 }
-'''
+"""
 
-VALID_ACTIVATION_HARNESS = '''#[cfg(any(test, feature = "test-transport"))]
-#[doc(hidden)]
-pub async fn open_with_native_provider_for_test() {
-    open_with_live_profile_root(
-        ProjectMemoryProviderActivationSelector::Pinned(
-            ProjectMemoryProviderActivation::NativeActive,
-        ),
-    );
+NCM_COMPOSITION = """fn construct_ncm_registration_with_authority() {
+    let _adapter = tracedecay_memory_provider_ncm::NcmProviderAdapter;
+    let _registry = tracedecay_memory_provider_registry::ProviderRegistrationV1;
 }
-'''
+"""
 
-VALID_RETENTION = '''#[cfg(feature = "memory-provider-host")]
-pub(crate) type MemoryProviderHostMount =
-    Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>;
-'''
-
-VALID_RETAINED_OWNER = '''#[cfg(feature = "memory-provider-host")]
+SERVICE_OWNER = """#[cfg(feature = "memory-provider-host")]
 pub(crate) mod cognitive_recall;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_common_factory_tests.rs"]
+mod native_common_factory_tests;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
@@ -227,1113 +191,406 @@ mod native_provider_parity_tests;
 pub(crate) mod native_staged_observations;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
-'''
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_control;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_history;
 
-VALID_NATIVE_ADAPTER = '''use tracedecay_memory_provider_native::NativeProvider;
-use tracedecay_memory_provider_registry::NativeMemoryApplicationPort;
-'''
+#[cfg(feature = "memory-provider-host")]
+pub async fn mount_project_memory_provider_host(
+    inputs: ProjectMemoryProviderHostInputsV1,
+) -> Result<ProjectMemoryProviderHostMountV1, String> {
+    if inputs.activation.is_disabled() {
+        return Ok(ProjectMemoryProviderComposition::Disabled);
+    }
+    let mut selected = None;
+    let mut observers = Vec::new();
+    let mut observation_provider_mounts = Vec::new();
+    for (kind, participation) in [
+        (MemoryProviderKindV1::Native, inputs.activation.native),
+        (MemoryProviderKindV1::Ncm, inputs.activation.ncm),
+    ] {
+        let mode = match participation {
+            MemoryProviderParticipationV1::Disabled => continue,
+            MemoryProviderParticipationV1::Observer => EnabledProviderMode::Observer,
+            MemoryProviderParticipationV1::Active => EnabledProviderMode::Active,
+        };
+        let registration = match kind {
+            MemoryProviderKindV1::Native => {
+                let provider = NativeProvider::new(
+                    native_provider::project_native_memory_application_port_off_runtime(),
+                )?;
+                Ok((provider, NativeObservationMount))
+            }
+            MemoryProviderKindV1::Ncm => {
+                let tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Enabled {
+                    worker_binary,
+                    state_root,
+                } = inputs.ncm_observer
+                else {
+                    return Err("selected NCM participation is disabled".to_owned());
+                };
+                let registration = tokio::task::spawn_blocking(move || {
+                    inputs.ncm_registration_factory(worker_binary, state_root, mode)
+                })
+                .await??;
+                Ok(registration)
+            }
+        };
+        match registration {
+            Ok((registration, mount)) => {
+                if mode == EnabledProviderMode::Active {
+                    selected = Some(registration);
+                } else {
+                    observers.push(registration);
+                }
+                observation_provider_mounts.push((mount, history_mount));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let composition = ProjectMemoryProviderComposition::compose_registered(
+        match selected {
+            Some(registration) => SelectedProviderActivationV1::Injected { registration },
+            None => SelectedProviderActivationV1::ObserversOnly,
+        },
+        observers,
+    )?;
+    let cognitive = cognitive_recall::mount_project_cognitive_recall(composition)?;
+    Ok(ProjectMemoryProviderHostMountV1 { composition, cognitive })
+}
 
-VALID_NATIVE_PROVIDER = (
-    VALID_NATIVE_ADAPTER
-    + '#[cfg(test)]\n'
-    + '#[path = "native_baseline_tests.rs"]\n'
-    + "mod baseline_tests;\n"
-    + '#[cfg(test)]\n'
-    + '#[path = "native_provider_tests.rs"]\n'
-    + "mod tests;\n"
-)
+#[cfg(feature = "memory-provider-host")]
+pub async fn mount_project_memory_provider_full(
+    host: &Arc<ProjectMemoryProviderHostMountV1>,
+) -> Result<ProjectMemoryProviderFullMountV1, String> {
+    let journey = observation_journey::mount_observer_dormant(host).await?;
+    Ok(ProjectMemoryProviderFullMountV1 {
+        observation_journeys: vec![journey],
+        provider_control_mount: provider_control_mount(),
+    })
+}
+"""
 
-# The mounted cognitive-recall route: consumes an already-composed registry,
-# refuses a disabled composition, and composes nothing itself.  Its enabled
-# composition appears only inside the trailing `#[cfg(test)] mod tests`.
-VALID_COGNITIVE_RECALL = '''use tracedecay_memory_provider_registry::{
-    ActiveRoutingPolicy, ProjectMemoryProviderComposition,
-};
-
-pub(crate) fn mount_project_cognitive_recall(
+COGNITIVE_RECALL = """pub(crate) fn mount_project_cognitive_recall(
     inputs: CognitiveRecallMountInputsV1,
-) -> Result<Arc<ProjectCognitiveRecallMountV1>, CognitiveRecallMountError> {
+) -> Result<ProjectCognitiveRecallMountV1, CognitiveRecallMountError> {
     inputs
         .composition
         .registry()
         .ok_or(CognitiveRecallMountError::CompositionDisabled)?;
-    Ok(Arc::new(ProjectCognitiveRecallMountV1 {
-        composition: inputs.composition,
-    }))
+    let ledger = RecallAdmissionLedgerV1::open(inputs.store_data_root)?;
+    Ok(ProjectCognitiveRecallMountV1 { ledger })
 }
 
 #[cfg(test)]
 mod tests {
-    use tracedecay_memory_provider_registry::NativeProviderActivation;
-
-    fn composition() -> Arc<ProjectMemoryProviderComposition> {
-        Arc::new(
-            ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-                port,
-            })
-            .expect("compose"),
-        )
+    fn fixture() {
+        let _ = ProjectMemoryProviderComposition::compose(activation);
     }
 }
-'''
+"""
 
-# The mounted observation journey: the only root-crate file allowed to name the
-# durable journal and the hygiene pipeline.
-VALID_OBSERVATION_JOURNEY = '''use tracedecay_memory_hygiene::SanitizationDisposition;
-use tracedecay_memory_observation::SqliteObservationJournal;
-use tracedecay_memory_provider_registry::{
-    NATIVE_PROVIDER_ID, OwnedProviderId, ProjectMemoryProviderComposition,
-};
-
-pub(crate) fn mount_project_observation_journey(
+OBSERVATION_JOURNEY = """pub(crate) fn mount_project_observation_journey(
     inputs: ObservationJourneyMountInputsV1,
-) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
+) -> Result<ProjectObservationJourneyV1, ObservationJourneyError> {
+    let journey = construct_project_observation_journey(inputs)?;
+    journey.start_delivery_worker()?;
+    Ok(journey)
+}
+
+fn construct_project_observation_journey(
+    inputs: ObservationJourneyMountInputsV1,
+) -> Result<ProjectObservationJourneyV1, ObservationJourneyError> {
     inputs
         .composition
         .registry()
         .ok_or(ObservationJourneyError::CompositionDisabled)?;
-    let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)
-        .map_err(ObservationJourneyError::Contract)?;
-    Ok(Arc::new(ProjectObservationJourneyV1 {
-        composition: inputs.composition,
-        provider_id,
-    }))
+    let journal = SqliteObservationJournal::open(inputs.store_data_root)?;
+    Ok(ProjectObservationJourneyV1 { journal })
 }
 
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "claude_host_journey_tests.rs"]
+mod claude_host_journey_tests;
+"""
+
+NATIVE_PROVIDER = """use tracedecay_memory_provider_registry::NativeProvider;
 #[cfg(test)]
-mod tests {
-    use tracedecay_memory_provider_registry::NativeProviderActivation;
+#[path = "native_baseline_tests.rs"]
+mod baseline_tests;
+#[cfg(test)]
+#[path = "native_provider_tests.rs"]
+mod tests;
+"""
 
-    fn composition() -> Arc<ProjectMemoryProviderComposition> {
-        Arc::new(
-            ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-                port,
-            })
-            .expect("compose"),
-        )
-    }
-}
-'''
+NATIVE_PROVIDER_TESTS = """#[path = "native_common_tests.rs"]
+mod common_profile;
+"""
 
-NATIVE_ADAPTER_PATHS = (
-    Path("crates/tracedecay/src/daemon/retained_owner/native_provider.rs"),
-    Path("crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs"),
-    Path(
-        "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs"
-    ),
-    Path("crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs"),
-    Path(
-        "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs"
-    ),
-)
-COGNITIVE_RECALL_PATH = Path(
-    "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
-)
-OBSERVATION_JOURNEY_PATH = Path(
-    "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs"
-)
-RETAINED_OWNER_PATH = Path("crates/tracedecay/src/daemon/retained_owner.rs")
+def write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 class MemoryCompositionFeatureTest(unittest.TestCase):
     def fixture(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
         directory = tempfile.TemporaryDirectory()
         repo = Path(directory.name)
-        manifest = repo / "crates/tracedecay/Cargo.toml"
-        mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-        retention = repo / "crates/tracedecay/src/mcp/server/construction.rs"
-        harness = repo / "crates/tracedecay/src/daemon/production_harness.rs"
-        config = repo / "crates/tracedecay/src/config.rs"
-        routing_gate = repo / "crates/tracedecay-domain/src/configuration.rs"
-        manifest.parent.mkdir(parents=True)
-        mount.parent.mkdir(parents=True)
-        retention.parent.mkdir(parents=True)
-        routing_gate.parent.mkdir(parents=True)
-        manifest.write_text(VALID_MANIFEST, encoding="utf-8")
-        mount.write_text(VALID_MOUNT, encoding="utf-8")
-        harness.write_text(VALID_ACTIVATION_HARNESS, encoding="utf-8")
-        retention.write_text(VALID_RETENTION, encoding="utf-8")
-        config.write_text(VALID_CONFIG, encoding="utf-8")
-        routing_gate.write_text(VALID_ROUTING_GATE, encoding="utf-8")
-        (repo / "crates/tracedecay/src/lib.rs").write_text(
-            "pub mod stable;\n", encoding="utf-8"
+        write(repo / CHECKER.ROOT_MANIFEST, ROOT_MANIFEST)
+        write(repo / CHECKER.SERVICE_MANIFEST, SERVICE_MANIFEST)
+        write(
+            repo / "crates/tracedecay-configuration/src/config/model.rs",
+            CONFIG,
+        )
+        write(repo / "crates/tracedecay-domain/src/configuration.rs", ROUTING)
+        write(repo / CHECKER.ROOT_COMPOSITION, ROOT_COMPOSITION)
+        write(repo / CHECKER.NCM_COMPOSITION, NCM_COMPOSITION)
+        write(repo / CHECKER.SERVICE_OWNER, SERVICE_OWNER)
+        write(
+            repo / (CHECKER.SERVICE_SOURCE / "lib.rs"),
+            "pub mod retained_owner;\n",
+        )
+        write(
+            repo / (CHECKER.ROOT_SOURCE / "lib.rs"),
+            "pub mod daemon;\n",
         )
         return directory, repo
 
-    def write_feature_gated_native_adapters(self, repo: Path) -> None:
-        retained_owner = repo / RETAINED_OWNER_PATH
-        retained_owner.write_text(VALID_RETAINED_OWNER, encoding="utf-8")
-        for relative in NATIVE_ADAPTER_PATHS:
-            path = repo / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
+    def write_service_files(self, repo: Path) -> None:
+        sources = {
+            "native_provider.rs": NATIVE_PROVIDER,
+            "native_provider_tests.rs": NATIVE_PROVIDER_TESTS,
+            "native_provider_parity_tests.rs": "",
+            "native_baseline_tests.rs": "",
+            "native_staged_observations.rs": "",
+            "native_common_tests.rs": "",
+            "native_common_factory_tests.rs": "",
+            "claude_host_journey_tests.rs": "",
+            "cognitive_recall.rs": COGNITIVE_RECALL,
+            "observation_journey.rs": OBSERVATION_JOURNEY,
+            "provider_control.rs": "",
+            "provider_history.rs": "",
+        }
+        for name, source in sources.items():
+            write(repo / (CHECKER.SERVICE_OWNER_ROOT / name), source)
+
+    def valid_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        directory, repo = self.fixture()
+        self.write_service_files(repo)
+        return directory, repo
+
+    def test_valid_native_ncm_service_mount_passes(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            self.assertEqual(CHECKER.check_repository(repo), [])
+
+    def test_missing_native_participation_wiring_fails(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            path = repo / CHECKER.SERVICE_OWNER
             path.write_text(
-                VALID_NATIVE_PROVIDER
-                if relative == NATIVE_ADAPTER_PATHS[0]
-                else VALID_NATIVE_ADAPTER,
-                encoding="utf-8",
-            )
-
-    def write_provider_boundary_mounts(self, repo: Path) -> None:
-        retained_owner = repo / RETAINED_OWNER_PATH
-        retained_owner.parent.mkdir(parents=True, exist_ok=True)
-        retained_owner.write_text(VALID_RETAINED_OWNER, encoding="utf-8")
-        for relative, source in (
-            (COGNITIVE_RECALL_PATH, VALID_COGNITIVE_RECALL),
-            (OBSERVATION_JOURNEY_PATH, VALID_OBSERVATION_JOURNEY),
-        ):
-            path = repo / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(source, encoding="utf-8")
-
-    def test_valid_feature_and_mount_pass(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.assertEqual(CHECKER.check_repository(repo), [])
-
-    def test_default_feature_activation_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    'default = ["production"]',
-                    'default = ["production", "memory-provider-host"]',
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("default features must remain exactly" in error for error in errors)
-            )
-
-    def test_non_optional_registry_dependency_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    'tracedecay-memory-provider-registry = { path = '
-                    '"../tracedecay-memory-provider-registry", optional = true }',
-                    'tracedecay-memory-provider-registry = { path = '
-                    '"../tracedecay-memory-provider-registry" }',
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "dependency tracedecay-memory-provider-registry must be optional"
-                    in error
-                    for error in errors
-                )
-            )
-
-    def test_non_optional_support_dependency_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    'tracedecay-memory-observation = { path = '
-                    '"../tracedecay-memory-observation", optional = true }',
-                    'tracedecay-memory-observation = { path = '
-                    '"../tracedecay-memory-observation" }',
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "dependency tracedecay-memory-observation must be optional" in error
-                    for error in errors
-                )
-            )
-
-    def test_extra_host_feature_edge_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    '    "dep:tracedecay-memory-hygiene",\n',
-                    '    "dep:tracedecay-memory-hygiene",\n    "semantic-fastembed",\n',
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "feature memory-provider-host must contain exactly" in error
-                    for error in errors
-                )
-            )
-
-    def test_production_reaching_support_dependency_directly_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    'production = ["token-counting"]',
-                    'production = ["token-counting", '
-                    '"dep:tracedecay-memory-hygiene"]',
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must reach tracedecay-memory-hygiene only through" in error
-                    for error in errors
-                )
-            )
-
-    def test_default_configuration_must_keep_host_dormant(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            config = repo / "crates/tracedecay/src/config.rs"
-            config.write_text(
-                VALID_CONFIG.replace(
-                    "memory_provider_native_enabled: false,",
-                    "memory_provider_native_enabled: true,",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must default the provider host to dormant" in error
-                    for error in errors
-                )
-            )
-
-    def test_routing_gate_must_default_to_no_active_provider(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            routing_gate = repo / "crates/tracedecay-domain/src/configuration.rs"
-            routing_gate.write_text(
-                VALID_ROUTING_GATE.replace(
-                    "    #[serde(default)]\n    pub active_provider: Option<String>,",
-                    "    pub active_provider: String,",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must default to no active provider" in error for error in errors
-                )
-            )
-
-    def test_concrete_adapter_in_mount_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT + "use tracedecay_memory_provider_native::NativeProvider;\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(any("NativeProvider" in error for error in errors))
-
-    def test_activation_seam_does_not_trip_adapter_heuristic(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            errors = CHECKER.check_repository(repo)
-            self.assertFalse(
-                any("concrete Native adapter" in error for error in errors)
-            )
-
-    def test_mount_without_a_pinned_selector_variant_passes(self) -> None:
-        """The gate must not demand the removed pinned-activation seam.
-
-        `ProjectMemoryProviderActivationSelector::Pinned`, its resolve arm and
-        its only construction (`open_with_native_provider_for_test`) were
-        removed: `production_harness.rs` is upstream-owned and its
-        convergence-map entry authorizes only the shared shutdown deadline, so
-        the seam was unauthorized. A composition whose selector carries exactly
-        one variant is therefore the *correct* shape, and the gate must accept
-        it. The pinned spellings stay forbidden -- see
-        `test_production_entry_cannot_pin_an_activation` and
-        `test_pinned_selector_outside_gated_harness_fails`.
-        """
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            seamless = VALID_MOUNT.replace(
-                "    /// Pin one activation explicitly. Test and transport builds only.\n"
-                '    #[cfg(any(test, feature = "test-transport"))]\n'
-                "    Pinned(ProjectMemoryProviderActivation),\n",
-                "",
-                1,
-            ).replace(
-                '            #[cfg(any(test, feature = "test-transport"))]\n'
-                "            Self::Pinned(activation) => Ok(activation),\n",
-                "",
-                1,
-            )
-            # `PinnedRuntimeConfiguration` is an unrelated identifier and stays.
-            self.assertNotIn("Pinned(ProjectMemoryProviderActivation)", seamless)
-            self.assertNotIn("Self::Pinned", seamless)
-            mount.write_text(seamless, encoding="utf-8")
-            self.assertEqual(CHECKER.check_repository(repo), [])
-
-    def test_production_entry_cannot_pin_an_activation(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,\n"
-                    "    )",
-                    "ProjectMemoryProviderActivationSelector::Pinned(\n"
-                    "            ProjectMemoryProviderActivation::NativeActive,\n"
-                    "        ),\n    )",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("must not pin an activation selector" in error for error in errors)
-            )
-
-    def test_enabled_activation_outside_resolved_arm_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                "fn eager() {\n"
-                "    let _ = tracedecay_memory_provider_registry::"
-                "NativeProviderActivation::Enabled { port };\n"
-                "}\n" + VALID_MOUNT,
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must be constructed exactly once in production" in error
-                    for error in errors
-                )
-            )
-
-    def test_resolver_must_refuse_routing_while_host_disabled(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "        (false, Some(provider)) => Err(TraceDecayError::Config {\n"
-                    "            message: format!(\"routing names '{provider}' while "
-                    'the host is disabled"),\n'
-                    "        }),",
-                    "        (false, Some(_provider)) => "
-                    "Ok(ProjectMemoryProviderActivation::NativeObserver),",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "missing or duplicated exact arm" in error
-                    and "(false, Some(provider)) => Err(TraceDecayError::Config {"
-                    in error
-                    for error in errors
-                )
-            )
-
-    def test_resolver_must_not_promote_enabled_host_to_active(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "(true, None) => Ok(ProjectMemoryProviderActivation::NativeObserver),",
-                    "(true, None) => Ok(ProjectMemoryProviderActivation::NativeActive),",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "missing or duplicated exact arm" in error
-                    and "NativeObserver" in error
-                    for error in errors
-                )
-            )
-
-    def test_native_active_call_outside_gated_harness_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            leaked = repo / "crates/tracedecay/src/eager.rs"
-            leaked.write_text(
-                "fn eager() { activate(ProjectMemoryProviderActivation::NativeActive); }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(any("activation leaked" in error for error in errors))
-
-    def test_pinned_selector_outside_gated_harness_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            leaked = repo / "crates/tracedecay/src/eager.rs"
-            leaked.write_text(
-                "fn eager() { open(ProjectMemoryProviderActivationSelector::Pinned(mode)); }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "pinned activation selector leaked outside" in error
-                    for error in errors
-                )
-            )
-
-    def test_feature_gated_native_adapter_allowlist_passes(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_feature_gated_native_adapters(repo)
-            self.assertEqual(CHECKER.check_repository(repo), [])
-
-    def test_native_adapter_lookalikes_still_fail(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            lookalikes = (
-                Path(
-                    "crates/tracedecay/src/daemon/retained_owner/"
-                    "native_provider_copy.rs"
-                ),
-                Path("crates/tracedecay/src/daemon/foreign_native_provider.rs"),
-            )
-            for relative in lookalikes:
-                path = repo / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(VALID_NATIVE_ADAPTER, encoding="utf-8")
-            errors = CHECKER.check_repository(repo)
-            for relative in lookalikes:
-                self.assertTrue(
-                    any(str(relative) in error for error in errors),
-                    (relative, errors),
-                )
-
-    def test_allowlisted_native_adapter_requires_feature_gate(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_feature_gated_native_adapters(repo)
-            retained_owner = repo / RETAINED_OWNER_PATH
-            retained_owner.write_text(
-                VALID_RETAINED_OWNER.replace(
-                    '#[cfg(feature = "memory-provider-host")]\n'
-                    "pub(crate) mod native_provider;",
-                    "pub(crate) mod native_provider;",
-                    1,
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(any("must be feature-gated" in error for error in errors))
-
-    def test_enabled_activation_in_allowlisted_adapter_still_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_feature_gated_native_adapters(repo)
-            adapter = repo / NATIVE_ADAPTER_PATHS[0]
-            adapter.write_text(
-                VALID_NATIVE_ADAPTER
-                + "fn eager() { activate(NativeProviderActivation::Enabled { port }); }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must keep the provider host dormant" in error
-                    and str(NATIVE_ADAPTER_PATHS[0]) in error
-                    for error in errors
-                )
-            )
-
-    def test_registry_leak_outside_mount_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            leaked = repo / "crates/tracedecay/src/dashboard.rs"
-            leaked.write_text(
-                "use tracedecay_memory_provider_registry::ProjectMemoryProviderComposition;\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(any("leaked outside" in error for error in errors))
-
-    def test_retention_mount_must_not_compose(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            retention = repo / "crates/tracedecay/src/mcp/server/construction.rs"
-            retention.write_text(
-                VALID_RETENTION
-                + "fn sneak() { let _ = tracedecay_memory_provider_registry::"
-                "ProjectMemoryProviderComposition::compose(activation); }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("must not compose providers" in error for error in errors)
-            )
-
-    def test_enabled_activation_in_root_source_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            enabled = repo / "crates/tracedecay/src/eager.rs"
-            enabled.write_text(
-                "fn eager() { activate(NativeProviderActivation::Enabled { port }); }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("must keep the provider host dormant" in error for error in errors)
-            )
-
-    def test_provider_boundary_mounts_pass(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            self.assertEqual(CHECKER.check_repository(repo), [])
-
-    def test_provider_boundary_mount_requires_feature_gate(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            retained_owner = repo / RETAINED_OWNER_PATH
-            retained_owner.write_text(
-                VALID_RETAINED_OWNER.replace(
-                    '#[cfg(feature = "memory-provider-host")]\n'
-                    "pub(crate) mod observation_journey;",
-                    "pub(crate) mod observation_journey;",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "provider-boundary mount" in error
-                    and "must be feature-gated" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                )
-            )
-            # Losing the gate also drops the allowlist, so the registry
-            # reference in that file is a leak again.
-            self.assertTrue(
-                any(
-                    "registry dependency leaked outside" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                )
-            )
-
-    def test_provider_boundary_mount_must_refuse_disabled_composition(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            recall.write_text(
-                VALID_COGNITIVE_RECALL.replace(
-                    "    inputs\n"
-                    "        .composition\n"
-                    "        .registry()\n"
-                    "        .ok_or(CognitiveRecallMountError::CompositionDisabled)?;\n",
+                SERVICE_OWNER.replace(
+                    "(MemoryProviderKindV1::Native, inputs.activation.native),\n",
                     "",
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
             self.assertTrue(
-                any(
-                    "must open with its registry refusal" in error
-                    and str(COGNITIVE_RECALL_PATH) in error
-                    for error in errors
-                )
-            )
-
-    def test_provider_boundary_mount_cannot_compose_providers(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            recall.write_text(
-                VALID_COGNITIVE_RECALL.replace(
-                    "#[cfg(test)]\nmod tests {",
-                    "fn sneak() {\n"
-                    "    let _ = ProjectMemoryProviderComposition::compose(activation);\n"
-                    "}\n\n#[cfg(test)]\nmod tests {",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not name ProjectMemoryProviderComposition::compose" in error
-                    and str(COGNITIVE_RECALL_PATH) in error
-                    for error in errors
-                )
-            )
-
-    def test_provider_boundary_mount_cannot_enable_activation(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            journey = repo / OBSERVATION_JOURNEY_PATH
-            journey.write_text(
-                VALID_OBSERVATION_JOURNEY.replace(
-                    "#[cfg(test)]\nmod tests {",
-                    "fn sneak() {\n"
-                    "    let _ = NativeProviderActivation::Enabled { port };\n"
-                    "}\n\n#[cfg(test)]\nmod tests {",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must keep the provider host dormant" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                )
-            )
-
-    def test_provider_boundary_mount_cannot_branch_on_provider_name(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            journey = repo / OBSERVATION_JOURNEY_PATH
-            journey.write_text(
-                VALID_OBSERVATION_JOURNEY.replace(
-                    "#[cfg(test)]\nmod tests {",
-                    "fn route(provider: &str) -> bool {\n"
-                    '    provider == "tracedecay.native"\n'
-                    "}\n\n#[cfg(test)]\nmod tests {",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not branch on a provider identity" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                )
-            )
-
-    def test_indented_production_item_after_tests_is_still_scanned(self) -> None:
-        # The old gate split the production region on indentation: every line
-        # after the test marker starting with whitespace was treated as test
-        # code.  Rust allows indented top-level items, so a production
-        # function parked after the test module was invisible.  The region is
-        # now cut by the test module's balanced braces, so anything after its
-        # real closing brace -- indented or not -- is production again.
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            recall.write_text(
-                VALID_COGNITIVE_RECALL
-                + "    pub(crate) fn after_tests() {\n"
-                "        let _ = ProjectMemoryProviderComposition::compose(\n"
-                "            NativeProviderActivation::Enabled { port },\n"
-                "        );\n"
-                "    }\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not name ProjectMemoryProviderComposition::compose" in error
-                    and str(COGNITIVE_RECALL_PATH) in error
-                    for error in errors
-                ),
-                errors,
-            )
-            self.assertTrue(
-                any(
-                    "must not name NativeProviderActivation::Enabled" in error
-                    and str(COGNITIVE_RECALL_PATH) in error
-                    for error in errors
-                ),
+                any("missing Native participation wiring" in error for error in errors),
                 errors,
             )
 
-    def test_second_named_test_module_is_also_stripped(self) -> None:
-        # ...and the same balanced-brace extraction means a differently named
-        # test module is stripped too, so a legitimate fixture never trips the
-        # production scans just because it is not called `tests`.
-        directory, repo = self.fixture()
+    def test_missing_ncm_participation_wiring_fails(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            recall.write_text(
-                VALID_COGNITIVE_RECALL
-                + "#[cfg(test)]\nmod journey_tests {\n"
-                "    use tracedecay_memory_provider_registry::NativeProviderActivation;\n"
-                "    fn fixture() {\n"
-                "        let _ = ProjectMemoryProviderComposition::compose(\n"
-                "            NativeProviderActivation::Enabled { port },\n"
-                "        );\n"
-                "    }\n}\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(CHECKER.check_repository(repo), [])
-
-    def test_prose_about_provider_names_is_not_read_as_branching(self) -> None:
-        # The branching scan runs against a code mask, so a doc comment or an
-        # assertion string that quotes a provider identity is not a branch.
-        # Before this, a `#[cfg(test)]` assertion containing a provider id was
-        # enough to fail the live gate -- a false positive that teaches people
-        # to loosen the rule.
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            recall.write_text(
-                "/// Never write `provider == \"tracedecay.native\"` here: provider\n"
-                "/// identity recognition belongs to the registry.\n"
-                + VALID_COGNITIVE_RECALL,
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertEqual(
-                [error for error in errors if "branch on a provider identity" in error],
-                [],
-            )
-
-    # -- bypasses the previous gate accepted -------------------------------
-
-    def test_transitive_default_closure_reaching_the_host_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            manifest = repo / "crates/tracedecay/Cargo.toml"
-            manifest.write_text(
-                VALID_MANIFEST.replace(
-                    'production = ["token-counting"]',
-                    'production = ["token-counting", "shipped-extras"]\n'
-                    'shipped-extras = ["memory-provider-host"]',
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace(
+                    "(MemoryProviderKindV1::Ncm, inputs.activation.ncm),",
+                    "",
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
             self.assertTrue(
-                any(
-                    "must stay outside the default feature closure" in error
-                    for error in errors
-                ),
-                errors,
-            )
-            self.assertTrue(
-                any(
-                    "must stay outside the production feature closure" in error
-                    for error in errors
-                ),
+                any("missing NCM participation wiring" in error for error in errors),
                 errors,
             )
 
-    def test_shadowing_the_resolved_activation_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_missing_native_constructor_fails(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "    let memory_provider_activation = "
-                    "activation.resolve(&runtime_configuration)?;",
-                    "    let memory_provider_activation = "
-                    "activation.resolve(&runtime_configuration)?;\n"
-                    "    let memory_provider_activation = forced_activation();",
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace("NativeProvider::new(", "NativeProvider::from_port("),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("NativeProvider::new" in error for error in errors), errors)
+
+    def test_missing_ncm_factory_fails(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace("inputs.ncm_registration_factory", "inputs.other_factory"),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("ncm_registration_factory" in error for error in errors), errors)
+
+    def test_root_must_call_service_mount(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            path = repo / CHECKER.ROOT_COMPOSITION
+            path.write_text(
+                ROOT_COMPOSITION.replace(
+                    "tracedecay_daemon_service::retained_owner::mount_project_memory_provider_host(",
+                    "legacy_mount_project_memory_provider_host(",
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
             self.assertTrue(
-                any("must be bound exactly once and immutably" in error for error in errors),
+                any("mount_project_memory_provider_host" in error for error in errors),
                 errors,
             )
 
-    def test_overwriting_the_resolved_activation_fails(self) -> None:
+    def test_root_must_forward_ncm_factory(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            path = repo / CHECKER.ROOT_COMPOSITION
+            path.write_text(
+                ROOT_COMPOSITION.replace(
+                    "ncm_observer::construct_ncm_registration_with_authority(",
+                    "legacy_ncm_registration(",
+                ),
+                encoding="utf-8",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("construct_ncm_registration" in error for error in errors), errors)
+
+    def test_root_retained_owner_file_is_stale(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            write(
+                repo / "crates/tracedecay/src/daemon/retained_owner.rs",
+                "mod stale;\n",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("stale root retained_owner file" in error for error in errors), errors)
+
+    def test_root_retained_owner_reference_is_stale(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            write(
+                repo / (CHECKER.ROOT_SOURCE / "stale.rs"),
+                "fn stale() { crate::daemon::retained_owner::native_provider(); }\n",
+            )
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("stale root retained_owner reference" in error for error in errors), errors)
+
+    def test_missing_service_owner_fails(self) -> None:
         directory, repo = self.fixture()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "    let memory_provider_activation = "
-                    "activation.resolve(&runtime_configuration)?;",
-                    "    let mut memory_provider_activation = "
-                    "activation.resolve(&runtime_configuration)?;\n"
-                    "    memory_provider_activation = "
-                    "ProjectMemoryProviderActivation::NativeActive;",
+            (repo / CHECKER.SERVICE_OWNER).unlink()
+            errors = CHECKER.check_repository(repo)
+            self.assertTrue(any("daemon-service retained_owner.rs" in error for error in errors), errors)
+
+    def test_service_module_must_be_feature_gated(self) -> None:
+        directory, repo = self.valid_repo()
+        with directory:
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace(
+                    '#[cfg(feature = "memory-provider-host")]\npub(crate) mod observation_journey;',
+                    "pub(crate) mod observation_journey;",
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
             self.assertTrue(
-                any(
-                    "must resolve the activation exactly once" in error
-                    or "must never be reassigned" in error
-                    for error in errors
-                ),
+                any("module must be feature-gated" in error and "observation_journey" in error for error in errors),
                 errors,
             )
 
-    def test_mounting_an_activation_the_selector_did_not_resolve_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_service_ncm_branch_cannot_be_dropped(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "    let memory_provider_host_mount = "
-                    "mount_project_memory_provider_host(\n"
-                    "        memory_provider_activation,\n    )?;",
-                    "    let forced = ProjectMemoryProviderActivation::NativeActive;\n"
-                    "    let memory_provider_host_mount = "
-                    "mount_project_memory_provider_host(\n        forced,\n    )?;",
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not construct a ProjectMemoryProviderActivation" in error
-                    for error in errors
-                ),
-                errors,
-            )
-
-    def test_moving_the_enabled_construction_to_another_function_fails(self) -> None:
-        # A *moved* construction keeps the "exactly one" count intact, which is
-        # why the gate has to prove containment in the resolved arm rather than
-        # count occurrences and compare offsets.
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "            tracedecay_memory_provider_registry::"
-                    "NativeProviderActivation::Enabled { port, mode }\n",
-                    "            eager_enabled(port, mode)\n",
-                ).replace(
-                    '#[cfg(feature = "memory-provider-host")]\n'
-                    "fn mount_project_memory_provider_host(",
-                    '#[cfg(feature = "memory-provider-host")]\n'
-                    "fn eager_enabled(port: Port, mode: Mode) -> Activation {\n"
-                    "    tracedecay_memory_provider_registry::"
-                    "NativeProviderActivation::Enabled { port, mode }\n"
-                    "}\n\n"
-                    '#[cfg(feature = "memory-provider-host")]\n'
-                    "fn mount_project_memory_provider_host(",
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace(
+                    "MemoryProviderKindV1::Ncm => {",
+                    "MemoryProviderKindV1::Native => {",
                     1,
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "only inside the resolved" in error and "arm" in error
-                    for error in errors
-                ),
-                errors,
-            )
+            self.assertTrue(any("missing its NCM mount arm" in error for error in errors), errors)
 
-    def test_inserted_resolver_arm_that_shadows_the_refusal_fails(self) -> None:
-        # Every required arm is still present here; the violation is the *new*
-        # arm in front of the hard error, which downgrades a routed provider to
-        # dormant instead of failing project open.
-        directory, repo = self.fixture()
+    def test_service_native_branch_cannot_be_dropped(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT.replace(
-                    "        (false, Some(provider)) => Err(TraceDecayError::Config {",
-                    "        (false, Some(_ignored)) => "
-                    "Ok(ProjectMemoryProviderActivation::Disabled),\n"
-                    "        (false, Some(provider)) => Err(TraceDecayError::Config {",
+            path = repo / CHECKER.SERVICE_OWNER
+            path.write_text(
+                SERVICE_OWNER.replace(
+                    "MemoryProviderKindV1::Native => {",
+                    "MemoryProviderKindV1::Ncm => {",
                     1,
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must be exactly, and in this order" in error for error in errors
-                ),
-                errors,
-            )
+            self.assertTrue(any("missing its Native mount arm" in error for error in errors), errors)
 
-    def test_refusal_relocated_into_the_boundary_test_module_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_default_feature_reaching_host_fails(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            self.write_provider_boundary_mounts(repo)
-            recall = repo / COGNITIVE_RECALL_PATH
-            refusal = (
-                "    inputs\n"
-                "        .composition\n"
-                "        .registry()\n"
-                "        .ok_or(CognitiveRecallMountError::CompositionDisabled)?;\n"
-            )
-            recall.write_text(
-                VALID_COGNITIVE_RECALL.replace(refusal, "", 1).replace(
-                    "#[cfg(test)]\nmod tests {",
-                    "#[cfg(test)]\nmod tests {\n    fn refusal_shape() {\n"
-                    + refusal
-                    + "    }\n",
-                    1,
+            path = repo / CHECKER.ROOT_MANIFEST
+            path.write_text(
+                ROOT_MANIFEST.replace(
+                    'production = []',
+                    'production = ["shipped"]\nshipped = ["memory-provider-host"]',
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must open with its registry refusal" in error
-                    and str(COGNITIVE_RECALL_PATH) in error
-                    for error in errors
-                ),
-                errors,
-            )
+            self.assertTrue(any("outside the production feature closure" in error for error in errors), errors)
 
-    def test_side_effect_before_the_boundary_refusal_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_ncm_dependency_must_be_optional(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            self.write_provider_boundary_mounts(repo)
-            journey = repo / OBSERVATION_JOURNEY_PATH
-            journey.write_text(
-                VALID_OBSERVATION_JOURNEY.replace(
-                    "    inputs\n        .composition\n        .registry()\n",
-                    "    let early = SqliteObservationJournal::open(&inputs.root)?;\n"
-                    "    inputs\n        .composition\n        .registry()\n",
-                    1,
+            path = repo / CHECKER.SERVICE_MANIFEST
+            path.write_text(
+                SERVICE_MANIFEST.replace(
+                    'tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }',
+                    'tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", features = ["rust-backend"] }',
                 ),
                 encoding="utf-8",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must open with its registry refusal" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                ),
-                errors,
-            )
+            self.assertTrue(any("daemon-service dependency tracedecay-memory-provider-ncm must be optional" in error for error in errors), errors)
 
-    def test_match_based_provider_dispatch_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_root_direct_registry_leak_fails(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT
-                + "fn pick(provider: &str) -> bool {\n"
-                '    match provider {\n        "provider.ncm-local" => true,\n'
-                "        _ => false,\n    }\n}\n",
-                encoding="utf-8",
+            write(
+                repo / (CHECKER.ROOT_SOURCE / "leak.rs"),
+                "use tracedecay_memory_provider_registry::ProjectMemoryProviderComposition;\n",
             )
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("match arm pattern" in error for error in errors), errors
-            )
+            self.assertTrue(any("registry dependency leaked" in error for error in errors), errors)
 
-    def test_constant_based_provider_comparison_fails(self) -> None:
-        directory, repo = self.fixture()
+    def test_observation_and_recall_mounts_are_service_owned(self) -> None:
+        directory, repo = self.valid_repo()
         with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT
-                + "fn pick(provider: &str) -> bool {\n"
-                "    provider == tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID\n"
-                "}\n",
-                encoding="utf-8",
-            )
+            root = repo / CHECKER.ROOT_SOURCE
+            write(root / "daemon" / "retained_owner" / "cognitive_recall.rs", "fn stale() {}\n")
             errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not branch on a provider identity (comparison)" in error
-                    for error in errors
-                ),
-                errors,
-            )
-
-    def test_unknown_provider_identity_comparison_fails(self) -> None:
-        # The rule cannot be a list of provider names this gate happens to
-        # know; an identity it has never heard of must fail just the same.
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT
-                + "fn pick(provider: &str) -> bool {\n"
-                '    provider == "provider.acme-brain"\n'
-                "}\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not branch on a provider identity" in error
-                    for error in errors
-                ),
-                errors,
-            )
-
-    def test_matches_macro_provider_dispatch_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            mount = repo / "crates/tracedecay/src/daemon/project_composition.rs"
-            mount.write_text(
-                VALID_MOUNT
-                + "fn pick(provider_id: &str) -> bool {\n"
-                '    matches!(provider_id, "tracedecay.native")\n'
-                "}\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any("matches! macro" in error for error in errors), errors
-            )
-
-    def test_helper_mediated_provider_branching_fails(self) -> None:
-        # A locally defined recogniser is still name dispatch in this layer:
-        # the helper's own body lives in the same production region.
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            journey = repo / OBSERVATION_JOURNEY_PATH
-            journey.write_text(
-                VALID_OBSERVATION_JOURNEY.replace(
-                    "pub(crate) fn mount_project_observation_journey(",
-                    "fn is_native(provider_id: &str) -> bool {\n"
-                    "    provider_id.eq_ignore_ascii_case(NATIVE_PROVIDER_ID)\n"
-                    "}\n\npub(crate) fn mount_project_observation_journey(",
-                    1,
-                ),
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "must not branch on a provider identity" in error
-                    and str(OBSERVATION_JOURNEY_PATH) in error
-                    for error in errors
-                ),
-                errors,
-            )
-
-    def test_support_crate_leak_outside_observation_journey_fails(self) -> None:
-        directory, repo = self.fixture()
-        with directory:
-            self.write_provider_boundary_mounts(repo)
-            leaked = repo / "crates/tracedecay/src/dashboard.rs"
-            leaked.write_text(
-                "use tracedecay_memory_hygiene::SanitizationDisposition;\n",
-                encoding="utf-8",
-            )
-            errors = CHECKER.check_repository(repo)
-            self.assertTrue(
-                any(
-                    "host-support crate tracedecay_memory_hygiene leaked outside"
-                    in error
-                    for error in errors
-                )
-            )
+            self.assertTrue(any("stale root retained_owner directory" in error for error in errors), errors)
 
 
 if __name__ == "__main__":
