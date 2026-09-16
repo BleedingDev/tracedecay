@@ -5,11 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
+use tracedecay_application::observability::BoundedObservabilityProducerV1;
 use tracedecay_automation::managed_skills::validate_skill_id;
 use tracedecay_automation_runtime::automation::AutomationRunControl;
 use tracedecay_automation_runtime::automation::backend::CodexAppServerBackend;
 use tracedecay_automation_runtime::automation::config::{
     AutomationConfig, from_configuration_snapshot,
+};
+use tracedecay_automation_runtime::automation::effect_runtime::{
+    AutomationEffectAdmission, AutomationEffectAuthority, AutomationSettledTerminal,
+    RetainedAutomationSettlementOutcome,
 };
 use tracedecay_automation_runtime::automation::host_io::HostIo;
 use tracedecay_automation_runtime::automation::managed_skills::{
@@ -18,8 +23,16 @@ use tracedecay_automation_runtime::automation::managed_skills::{
     save_managed_skill,
 };
 use tracedecay_automation_runtime::automation::run_ledger::AutomationTrigger;
+use tracedecay_automation_runtime::automation::runner::{
+    MemoryCuratorAutomationOptions, RetainedAutomationRun, SessionReflectorAutomationOptions,
+    SkillWriterAutomationOptions, run_memory_curator_with_backend_for_retained_settlement,
+    run_session_reflector_with_backend_for_retained_settlement,
+    run_skill_writer_with_backend_for_retained_settlement,
+};
 use tracedecay_automation_runtime::automation::skill_writer::deploy_managed_skills_to_project;
+use tracedecay_automation_runtime::ports::session_evidence::{LcmGrepSort, LcmScope};
 use tracedecay_contracts::now_micros;
+use tracedecay_contracts::retained_surfaces::{LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1};
 #[cfg(feature = "test-transport")]
 use tracedecay_daemon_identity::authority;
 use tracedecay_daemon_service::DaemonInvocationService;
@@ -60,6 +73,205 @@ impl DashboardAutomationRequestRuntime {
 
     fn execution(&self) -> (&AutomationConfig, &CodexAppServerBackend) {
         (&self.config, &self.backend)
+    }
+}
+
+fn dashboard_memory_curator_options(
+    fact_review_limit: Option<usize>,
+    min_confidence: Option<f64>,
+) -> MemoryCuratorAutomationOptions {
+    let mut options = MemoryCuratorAutomationOptions {
+        trigger: AutomationTrigger::Dashboard,
+        ..MemoryCuratorAutomationOptions::default()
+    };
+    if let Some(fact_review_limit) = fact_review_limit {
+        options.fact_review_limit = fact_review_limit;
+    }
+    if let Some(min_confidence) = min_confidence {
+        options.min_confidence = min_confidence;
+    }
+    options
+}
+
+fn dashboard_session_reflector_options(
+    provider: Option<String>,
+    query: Option<String>,
+    evidence_limit: Option<usize>,
+    scope: Option<LcmSearchScopeV1>,
+    session_id: Option<String>,
+    include_summaries: Option<bool>,
+    include_recent_sessions: Option<bool>,
+    recent_sessions_limit: Option<usize>,
+    sort: Option<LcmGrepSortV1>,
+    source: Option<String>,
+    role: Option<LcmRoleV1>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+) -> SessionReflectorAutomationOptions {
+    let mut options = SessionReflectorAutomationOptions {
+        trigger: AutomationTrigger::Dashboard,
+        session_id,
+        source,
+        role: role.map(dashboard_lcm_role).map(str::to_owned),
+        start_time,
+        end_time,
+        ..SessionReflectorAutomationOptions::default()
+    };
+    if let Some(provider) = provider {
+        options.provider = provider;
+    }
+    if let Some(query) = query {
+        options.query = query;
+    }
+    if let Some(evidence_limit) = evidence_limit {
+        options.evidence_limit = evidence_limit;
+    }
+    if let Some(scope) = scope {
+        options.scope = dashboard_lcm_scope(scope);
+    }
+    if let Some(include_summaries) = include_summaries {
+        options.include_summaries = include_summaries;
+    }
+    if let Some(include_recent_sessions) = include_recent_sessions {
+        options.include_recent_sessions = include_recent_sessions;
+    }
+    if let Some(recent_sessions_limit) = recent_sessions_limit {
+        options.recent_sessions_limit = recent_sessions_limit;
+    }
+    if let Some(sort) = sort {
+        options.sort = dashboard_lcm_sort(sort);
+    }
+    options
+}
+
+fn dashboard_skill_writer_options(
+    provider: Option<String>,
+    query: Option<String>,
+    evidence_limit: Option<usize>,
+    include_recent_sessions: Option<bool>,
+    recent_sessions_limit: Option<usize>,
+    profile_root: &Path,
+) -> SkillWriterAutomationOptions {
+    let mut options = SkillWriterAutomationOptions {
+        trigger: AutomationTrigger::Dashboard,
+        profile_root: Some(profile_root.to_path_buf()),
+        ..SkillWriterAutomationOptions::default()
+    };
+    if let Some(provider) = provider {
+        options.provider = provider;
+    }
+    if let Some(query) = query {
+        options.query = query;
+    }
+    if let Some(evidence_limit) = evidence_limit {
+        options.evidence_limit = evidence_limit;
+    }
+    if let Some(include_recent_sessions) = include_recent_sessions {
+        options.include_recent_sessions = include_recent_sessions;
+    }
+    if let Some(recent_sessions_limit) = recent_sessions_limit {
+        options.recent_sessions_limit = recent_sessions_limit;
+    }
+    options
+}
+
+fn dashboard_lcm_scope(scope: LcmSearchScopeV1) -> LcmScope {
+    match scope {
+        LcmSearchScopeV1::Current => LcmScope::Current,
+        LcmSearchScopeV1::Session => LcmScope::Session,
+        LcmSearchScopeV1::All => LcmScope::All,
+    }
+}
+
+fn dashboard_lcm_sort(sort: LcmGrepSortV1) -> LcmGrepSort {
+    match sort {
+        LcmGrepSortV1::Recency => LcmGrepSort::Recency,
+        LcmGrepSortV1::Relevance => LcmGrepSort::Relevance,
+        LcmGrepSortV1::Hybrid => LcmGrepSort::Hybrid,
+    }
+}
+
+fn dashboard_lcm_role(role: LcmRoleV1) -> &'static str {
+    match role {
+        LcmRoleV1::System => "system",
+        LcmRoleV1::User => "user",
+        LcmRoleV1::Assistant => "assistant",
+        LcmRoleV1::Tool => "tool",
+        LcmRoleV1::Unknown => "unknown",
+    }
+}
+
+enum DashboardAutomationAdmission {
+    Execute(Box<AutomationEffectAuthority>),
+    Replay(Box<AutomationSettledTerminal>),
+}
+
+async fn prepare_dashboard_automation_effect(
+    invocation_service: &DaemonInvocationService,
+    cg: &TraceDecay,
+    request_control: &DashboardHttpRequestControlV1,
+    configuration_digest: tracedecay_domain::ManifestDigest,
+    request: tracedecay_contracts::retained_surfaces::AutomationRunRequestV1,
+) -> DashboardAutomationResult<DashboardAutomationAdmission> {
+    let admission = tracedecay_daemon_service::automation_effect::prepare(
+        invocation_service,
+        cg,
+        cg.project_root(),
+        &cg.store_layout().dashboard_root,
+        request_control.request_id(),
+        request_control.deadline(),
+        request_control.cancellation(),
+        request_control.observed_at(),
+        configuration_digest,
+        request,
+    )
+    .await
+    .map_err(automation_failed)?;
+    match admission {
+        AutomationEffectAdmission::Execute(effect) => {
+            Ok(DashboardAutomationAdmission::Execute(effect))
+        }
+        AutomationEffectAdmission::Replay(terminal) => {
+            Ok(DashboardAutomationAdmission::Replay(terminal))
+        }
+        AutomationEffectAdmission::PreAdmissionProblem(envelope) => Err(
+            DashboardAutomationAuthorityErrorV1::ApplicationProblem(envelope),
+        ),
+        AutomationEffectAdmission::Conflict => Err(automation_admission_conflict()),
+    }
+}
+
+async fn settle_dashboard_automation_run<T>(
+    effect: Box<AutomationEffectAuthority>,
+    retained_run: RetainedAutomationRun<T>,
+    producer: &Arc<BoundedObservabilityProducerV1>,
+    project_root: &Path,
+    surface: &'static str,
+) -> DashboardAutomationResult<DashboardAutomationRunOutcomeV1>
+where
+    T: Send + 'static,
+{
+    let observer = tracedecay_daemon_service::automation_observation::automation_run_observer(
+        Arc::clone(producer),
+        project_root.to_path_buf(),
+        surface,
+    );
+    let waiter = effect.start_retained_automation_settlement(retained_run, Some(observer), |run| {
+        (run.ledger_record, run.committed_receipt)
+    });
+    match waiter.wait().await.map_err(automation_failed)? {
+        RetainedAutomationSettlementOutcome::Run {
+            terminal,
+            record: _record,
+        } => automation_terminal_run(&terminal),
+        RetainedAutomationSettlementOutcome::Problem {
+            problem,
+            record: _record,
+        } => Err(automation_problem(problem)),
+        RetainedAutomationSettlementOutcome::Reused { record: _record }
+        | RetainedAutomationSettlementOutcome::AbandonedObserved { record: _record } => Err(
+            automation_failed("dashboard automation cannot reuse a scheduler-only skip"),
+        ),
     }
 }
 
@@ -341,14 +553,14 @@ where
 #[hotpath::measure(label = "daemon.dashboard.automation.execute", future = true)]
 #[expect(
     clippy::too_many_lines,
-    reason = "The observation producer and pinned configuration are admitted before any UserJob or retained effect is reserved."
+    reason = "The observation producer and pinned configuration are admitted before any typed dashboard task or retained effect is reserved."
 )]
 async fn execute_dashboard_automation_run(
     cg: &TraceDecay,
     profile_root: PathBuf,
     request: DashboardAutomationRunRequestV1,
     request_control: DashboardHttpRequestControlV1,
-    _run_control: &AutomationRunControl,
+    run_control: &AutomationRunControl,
     invocation_service: &DaemonInvocationService,
 ) -> DashboardAutomationResult<DashboardAutomationRunOutcomeV1> {
     let producer = crate::daemon::project_automation_observation_producer(
@@ -378,6 +590,173 @@ async fn execute_dashboard_automation_run(
     let runtime = DashboardAutomationRequestRuntime::new(&config);
     let (config, backend) = runtime.execution();
     let run = match request {
+        DashboardAutomationRunRequestV1::MemoryCurator {
+            fact_review_limit,
+            min_confidence,
+        } => {
+            let mut options = dashboard_memory_curator_options(fact_review_limit, min_confidence);
+            let run_id = request_control.request_id().as_str().to_owned();
+            options.run_id = Some(run_id.clone());
+            let automation_context = cg.automation_project_context().map_err(automation_failed)?;
+            let admission = prepare_dashboard_automation_effect(
+                invocation_service,
+                cg,
+                &request_control,
+                configuration_digest,
+                tracedecay_automation_runtime::automation::effect_runtime::memory_curator_run_request(
+                    &run_id,
+                    options.fact_review_limit,
+                    options.min_confidence,
+                )
+                .map_err(automation_failed)?,
+            )
+            .await?;
+            let effect = match admission {
+                DashboardAutomationAdmission::Execute(effect) => effect,
+                DashboardAutomationAdmission::Replay(terminal) => {
+                    return automation_terminal_run(&terminal);
+                }
+            };
+            let retained_run = run_memory_curator_with_backend_for_retained_settlement(
+                &automation_context,
+                config,
+                pinned.revision_id(),
+                backend,
+                options,
+                run_control,
+            )
+            .await;
+            settle_dashboard_automation_run(
+                effect,
+                retained_run,
+                &producer,
+                cg.project_root(),
+                "dashboard_memory_curator",
+            )
+            .await?
+        }
+        DashboardAutomationRunRequestV1::SessionReflector {
+            provider,
+            query,
+            evidence_limit,
+            scope,
+            session_id,
+            include_summaries,
+            include_recent_sessions,
+            recent_sessions_limit,
+            sort,
+            source,
+            role,
+            start_time,
+            end_time,
+        } => {
+            let mut options = dashboard_session_reflector_options(
+                provider,
+                query,
+                evidence_limit,
+                scope,
+                session_id,
+                include_summaries,
+                include_recent_sessions,
+                recent_sessions_limit,
+                sort,
+                source,
+                role,
+                start_time,
+                end_time,
+            );
+            let run_id = request_control.request_id().as_str().to_owned();
+            options.run_id = Some(run_id.clone());
+            let automation_context = cg.automation_project_context().map_err(automation_failed)?;
+            let admission = prepare_dashboard_automation_effect(
+                invocation_service,
+                cg,
+                &request_control,
+                configuration_digest,
+                tracedecay_automation_runtime::automation::effect_runtime::session_reflector_run_request(
+                    &run_id,
+                    &options,
+                )
+                .map_err(automation_failed)?,
+            )
+            .await?;
+            let effect = match admission {
+                DashboardAutomationAdmission::Execute(effect) => effect,
+                DashboardAutomationAdmission::Replay(terminal) => {
+                    return automation_terminal_run(&terminal);
+                }
+            };
+            let retained_run = run_session_reflector_with_backend_for_retained_settlement(
+                &automation_context,
+                config,
+                run_control,
+                pinned.revision_id(),
+                backend,
+                options,
+            )
+            .await;
+            settle_dashboard_automation_run(
+                effect,
+                retained_run,
+                &producer,
+                cg.project_root(),
+                "dashboard_session_reflector",
+            )
+            .await?
+        }
+        DashboardAutomationRunRequestV1::SkillWriter {
+            provider,
+            query,
+            evidence_limit,
+            include_recent_sessions,
+            recent_sessions_limit,
+        } => {
+            let mut options = dashboard_skill_writer_options(
+                provider,
+                query,
+                evidence_limit,
+                include_recent_sessions,
+                recent_sessions_limit,
+                &profile_root,
+            );
+            let run_id = request_control.request_id().as_str().to_owned();
+            options.run_id = Some(run_id.clone());
+            let automation_context = cg.automation_project_context().map_err(automation_failed)?;
+            let admission = prepare_dashboard_automation_effect(
+                invocation_service,
+                cg,
+                &request_control,
+                configuration_digest,
+                tracedecay_automation_runtime::automation::effect_runtime::skill_writer_run_request(
+                    &run_id,
+                    &options,
+                )
+                .map_err(automation_failed)?,
+            )
+            .await?;
+            let effect = match admission {
+                DashboardAutomationAdmission::Execute(effect) => effect,
+                DashboardAutomationAdmission::Replay(terminal) => {
+                    return automation_terminal_run(&terminal);
+                }
+            };
+            let retained_run = run_skill_writer_with_backend_for_retained_settlement(
+                &automation_context,
+                config,
+                pinned.revision_id(),
+                backend,
+                options,
+            )
+            .await;
+            settle_dashboard_automation_run(
+                effect,
+                retained_run,
+                &producer,
+                cg.project_root(),
+                "dashboard_skill_writer",
+            )
+            .await?
+        }
         DashboardAutomationRunRequestV1::UserJob { job_id, run_id } => {
             let job = tracedecay_automation_runtime::automation::jobs::find_job(
                 &cg.store_layout().dashboard_root,
@@ -625,8 +1004,14 @@ fn automation_problem(
 
 #[cfg(test)]
 mod tests {
-    use super::DashboardAutomationRequestRuntime;
+    use super::{
+        DashboardAutomationRequestRuntime, dashboard_memory_curator_options,
+        dashboard_session_reflector_options, dashboard_skill_writer_options,
+    };
     use tracedecay_automation_runtime::automation::config::AutomationConfig;
+    use tracedecay_automation_runtime::automation::run_ledger::AutomationTrigger;
+    use tracedecay_automation_runtime::ports::session_evidence::{LcmGrepSort, LcmScope};
+    use tracedecay_contracts::retained_surfaces::{LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1};
 
     #[test]
     fn dashboard_user_job_caps_backend_calls_for_the_wall_budget() {
@@ -638,5 +1023,62 @@ mod tests {
         let runtime = DashboardAutomationRequestRuntime::new(&configured);
 
         assert_eq!(runtime.execution().0.timeout_secs, 120);
+    }
+
+    #[test]
+    fn dashboard_typed_options_project_explicit_fields() {
+        let memory = dashboard_memory_curator_options(Some(42), Some(0.81));
+        assert_eq!(memory.trigger, AutomationTrigger::Dashboard);
+        assert_eq!(memory.fact_review_limit, 42);
+        assert_eq!(memory.min_confidence, 0.81);
+
+        let session = dashboard_session_reflector_options(
+            Some("cursor".to_owned()),
+            Some("workflow correction".to_owned()),
+            Some(7),
+            Some(LcmSearchScopeV1::Session),
+            Some("session-1".to_owned()),
+            Some(true),
+            Some(true),
+            Some(3),
+            Some(LcmGrepSortV1::Relevance),
+            Some("codex".to_owned()),
+            Some(LcmRoleV1::Assistant),
+            Some(10),
+            Some(20),
+        );
+        assert_eq!(session.trigger, AutomationTrigger::Dashboard);
+        assert_eq!(session.provider, "cursor");
+        assert_eq!(session.query, "workflow correction");
+        assert_eq!(session.evidence_limit, 7);
+        assert_eq!(session.scope, LcmScope::Session);
+        assert_eq!(session.session_id.as_deref(), Some("session-1"));
+        assert!(session.include_summaries);
+        assert!(session.include_recent_sessions);
+        assert_eq!(session.recent_sessions_limit, 3);
+        assert_eq!(session.sort, LcmGrepSort::Relevance);
+        assert_eq!(session.source.as_deref(), Some("codex"));
+        assert_eq!(session.role.as_deref(), Some("assistant"));
+        assert_eq!(session.start_time, Some(10));
+        assert_eq!(session.end_time, Some(20));
+
+        let skill = dashboard_skill_writer_options(
+            Some("all".to_owned()),
+            Some("repeated correction".to_owned()),
+            Some(9),
+            Some(false),
+            Some(2),
+            std::path::Path::new("/profile"),
+        );
+        assert_eq!(skill.trigger, AutomationTrigger::Dashboard);
+        assert_eq!(skill.provider, "all");
+        assert_eq!(skill.query, "repeated correction");
+        assert_eq!(skill.evidence_limit, 9);
+        assert!(!skill.include_recent_sessions);
+        assert_eq!(skill.recent_sessions_limit, 2);
+        assert_eq!(
+            skill.profile_root.as_deref(),
+            Some(std::path::Path::new("/profile"))
+        );
     }
 }
