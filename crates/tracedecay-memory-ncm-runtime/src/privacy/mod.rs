@@ -417,6 +417,18 @@ fn finish_rebuild(
     };
     handle.commit_seq = meta.commit_seq;
     handle.epoch = meta.epoch;
+    // The durable rebuild is complete, but publication is still an
+    // interruptible part of the request.  Leave the resident handle fenced so
+    // the next handshake reconciles the committed kernel instead of serving a
+    // stale live view after the caller's budget has expired.
+    if remaining_ms(deadline, started) == 0 {
+        handle.fenced = true;
+        return EngineReply::new(
+            Outcome::EffectUnknown,
+            meta.commit_seq,
+            json!({"commit_seq": meta.commit_seq}),
+        );
+    }
     if let Some(engine) = engine
         && engine.consume_fault(FaultPoint::AfterCommitBeforePublish)
     {
@@ -606,10 +618,14 @@ fn sanitized_replay(
             .filter(|capsule| capsule.status == CapsuleStatus::Revoked)
             .count(),
     )
-    .unwrap_or(u64::MAX);
+    .map_err(|_| corrupt_reply(pending.event_seq, "excluded record count overflow"))?;
     let mut expected_seq = 1_u64;
     let mut previous_tick = None;
-    let mut validate_state_digests = true;
+    // The original kernel digest chain is independently checkable until the
+    // first erased observation.  Once that input is gone, continue validating
+    // every retained operation against its capsule and replay the sanitized
+    // kernel; never disable validation for the rest of the journal.
+    let mut original_state_chain_valid = true;
     for event in events {
         let durable = validate_recovery_event(&event, expected_seq, pending.event_seq)?;
         validate_event_payload_digest(&event, &durable, &capsules)?;
@@ -623,23 +639,23 @@ fn sanitized_replay(
         expected_seq = expected_seq
             .checked_add(1)
             .ok_or_else(|| corrupt_reply(pending.event_seq, "event sequence overflow"))?;
-        if validate_state_digests {
-            if operation_contains_revoked_observe(&durable.operation, &by_record) {
-                validate_state_digests = false;
-            } else {
-                replay_recovery_event(
-                    &mut validation_kernel,
-                    &event,
-                    &durable.operation,
-                    &capsules,
+        if original_state_chain_valid
+            && operation_contains_revoked_observe(&durable.operation, &by_record)
+        {
+            original_state_chain_valid = false;
+        } else if original_state_chain_valid {
+            replay_recovery_event(
+                &mut validation_kernel,
+                &event,
+                &durable.operation,
+                &capsules,
+                pending.event_seq,
+            )?;
+            if sha256_hex(&validation_kernel.state_digest()) != durable.state_digest {
+                return Err(corrupt_reply(
                     pending.event_seq,
-                )?;
-                if sha256_hex(&validation_kernel.state_digest()) != durable.state_digest {
-                    return Err(corrupt_reply(
-                        pending.event_seq,
-                        "replayed state digest mismatch",
-                    ));
-                }
+                    "replayed state digest mismatch",
+                ));
             }
         }
         let operations = match durable.operation {
@@ -655,6 +671,12 @@ fn sanitized_replay(
                     let capsule = by_record.get(&record_id).ok_or_else(|| {
                         corrupt_reply(event.seq, "observe receipt capsule is missing")
                     })?;
+                    if capsule.commit_seq != event.seq {
+                        return Err(corrupt_reply(
+                            event.seq,
+                            "observe receipt capsule sequence mismatch",
+                        ));
+                    }
                     if capsule.status == CapsuleStatus::Revoked {
                         continue;
                     }
@@ -672,14 +694,40 @@ fn sanitized_replay(
                             },
                         )
                         .map_err(|error| core_reply(error, event.seq))?;
+                    let record = kernel.records.get(observed.record_id).ok_or_else(|| {
+                        corrupt_reply(event.seq, "sanitized observe record is missing")
+                    })?;
+                    if record.ltm_key != capsule.ltm_key {
+                        return Err(corrupt_reply(
+                            event.seq,
+                            "sanitized observe LTM key mismatch",
+                        ));
+                    }
                     old_to_new.insert(record_id, observed.record_id);
-                    replayed_records = replayed_records.saturating_add(1);
+                    replayed_records = replayed_records.checked_add(1).ok_or_else(|| {
+                        corrupt_reply(event.seq, "replayed record count overflow")
+                    })?;
                 }
                 DurableOperation::Feedback { record_ids } => {
-                    let retained = record_ids
-                        .into_iter()
-                        .filter_map(|record_id| old_to_new.get(&record_id).copied())
-                        .collect::<Vec<_>>();
+                    let mut seen = BTreeSet::new();
+                    let mut retained = Vec::with_capacity(record_ids.len());
+                    for record_id in record_ids {
+                        if !seen.insert(record_id) {
+                            return Err(corrupt_reply(
+                                event.seq,
+                                "feedback receipt contains duplicate record IDs",
+                            ));
+                        }
+                        let capsule = by_record.get(&record_id).ok_or_else(|| {
+                            corrupt_reply(event.seq, "feedback receipt capsule is missing")
+                        })?;
+                        if capsule.status == CapsuleStatus::Revoked {
+                            continue;
+                        }
+                        retained.push(old_to_new.get(&record_id).copied().ok_or_else(|| {
+                            corrupt_reply(event.seq, "feedback record was not replayed")
+                        })?);
+                    }
                     if !retained.is_empty() {
                         kernel
                             .feedback(&retained)
@@ -691,14 +739,26 @@ fn sanitized_replay(
                     superseding,
                     evidence,
                 } => {
-                    if let (Some(old), Some(new)) = (
-                        old_to_new.get(&superseded).copied(),
-                        old_to_new.get(&superseding).copied(),
-                    ) {
-                        kernel
-                            .correction(old, new, evidence)
-                            .map_err(|error| core_reply(error, event.seq))?;
+                    let superseded_capsule = by_record.get(&superseded).ok_or_else(|| {
+                        corrupt_reply(event.seq, "correction superseded capsule is missing")
+                    })?;
+                    let superseding_capsule = by_record.get(&superseding).ok_or_else(|| {
+                        corrupt_reply(event.seq, "correction superseding capsule is missing")
+                    })?;
+                    if superseded_capsule.status == CapsuleStatus::Revoked
+                        || superseding_capsule.status == CapsuleStatus::Revoked
+                    {
+                        continue;
                     }
+                    let old = old_to_new.get(&superseded).copied().ok_or_else(|| {
+                        corrupt_reply(event.seq, "correction superseded record was not replayed")
+                    })?;
+                    let new = old_to_new.get(&superseding).copied().ok_or_else(|| {
+                        corrupt_reply(event.seq, "correction superseding record was not replayed")
+                    })?;
+                    kernel
+                        .correction(old, new, evidence)
+                        .map_err(|error| core_reply(error, event.seq))?;
                 }
                 DurableOperation::Maintenance { kind } => {
                     crate::engine::apply_recovery_maintenance(&mut kernel, &kind)
@@ -889,15 +949,31 @@ fn lookup_replay(
             handle.commit_seq,
         )));
     }
-    let mut durable: DurableReceipt = serde_json::from_str(&receipt_json)
-        .map_err(|error| corrupt_reply(seq, &format!("decode deletion receipt: {error}")))?;
-    if durable.reply.state_generation != seq {
-        return Err(corrupt_reply(seq, "deletion receipt sequence mismatch"));
+    let event = handle
+        .store
+        .event(seq)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+        .ok_or_else(|| corrupt_reply(handle.commit_seq, "idempotency event is missing"))?;
+    if event.idempotency_key.as_deref() != Some(key)
+        || event.payload_sha256 != stored_digest
+        || event.receipt != receipt_json
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "idempotency envelope does not match its journal row",
+        ));
     }
-    if let Some(object) = durable.reply.payload.as_object_mut() {
+    let capsules = handle
+        .store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let durable = validate_recovery_event(&event, seq, handle.commit_seq)?;
+    validate_event_payload_digest(&event, &durable, &capsules)?;
+    let mut reply = durable.reply;
+    if let Some(object) = reply.payload.as_object_mut() {
         object.insert("replayed".to_owned(), Value::Bool(true));
     }
-    Ok(Some(durable.reply))
+    Ok(Some(reply))
 }
 
 fn durable_receipt(

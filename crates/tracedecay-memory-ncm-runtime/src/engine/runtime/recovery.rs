@@ -74,6 +74,10 @@ pub(super) fn recover_kernel(
     let capsules = store
         .capsules_in_commit_order(false)
         .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let all_capsules = store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    validate_checkpoint_chain(store, applied_seq, &kernel, meta, &all_capsules)?;
     for capsule in &capsules {
         let provenance: serde_json::Value = serde_json::from_str(&capsule.provenance)
             .map_err(|_| corrupt_reply(meta.commit_seq, "invalid capsule provenance"))?;
@@ -120,6 +124,59 @@ pub(super) fn recover_kernel(
         ));
     }
     Ok(kernel)
+}
+
+/// Binds a checkpoint to the journal prefix it claims to replace.
+///
+/// A checkpoint row and its kernel digest are stored in the same mutation as
+/// the event that produced them.  Checking only the checkpoint bytes would
+/// therefore allow a detached checkpoint to hide a missing or corrupted
+/// journal prefix.  Validate every prefix envelope and require the event at
+/// the checkpoint sequence to carry the same state digest before replaying
+/// any suffix.
+fn validate_checkpoint_chain(
+    store: &NamespaceStore,
+    checkpoint_seq: u64,
+    checkpoint_kernel: &NcmKernel,
+    meta: &StoreMeta,
+    capsules: &[StoredCapsule],
+) -> Result<(), EngineReply> {
+    if checkpoint_seq == 0 {
+        return Ok(());
+    }
+    let expected_checkpoint_digest = sha256_hex(&checkpoint_kernel.state_digest());
+    let events = store
+        .events_after(0)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let mut expected_seq = 1_u64;
+    let mut checkpoint_receipt = None;
+    for event in events {
+        if event.seq > checkpoint_seq {
+            break;
+        }
+        let durable = validate_recovery_event(&event, expected_seq, meta.commit_seq)?;
+        validate_event_payload_digest(&event, &durable, capsules)?;
+        if event.seq == checkpoint_seq {
+            checkpoint_receipt = Some(durable.state_digest);
+            break;
+        }
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt_reply(meta.commit_seq, "checkpoint sequence overflow"))?;
+    }
+    if expected_seq != checkpoint_seq {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "checkpoint journal prefix has a sequence gap",
+        ));
+    }
+    if checkpoint_receipt.as_deref() != Some(expected_checkpoint_digest.as_str()) {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "checkpoint is detached from its journal receipt",
+        ));
+    }
+    Ok(())
 }
 
 /// Validates one journal row before any recovery or privacy replay can use it.
@@ -190,7 +247,10 @@ pub(crate) fn validate_recovery_event(
         DurableOperation::Observe { .. } => event.kind == "observe",
         DurableOperation::Feedback { .. } => event.kind == "feedback",
         DurableOperation::Correction { .. } => event.kind == "correction",
-        DurableOperation::Maintenance { .. } => event.kind == "maintenance",
+        DurableOperation::Maintenance { kind } => {
+            event.kind == "maintenance"
+                || (matches!(kind, MaintenanceKind::Checkpoint) && event.kind == "snapshot_restore")
+        }
         DurableOperation::DeletionFence { .. } => event.kind == "deletion_fence",
         DurableOperation::DeleteBySource { .. } => event.kind == "delete_by_source",
     };
@@ -236,6 +296,9 @@ pub(crate) fn validate_event_payload_digest(
             )
         }
         DurableOperation::Maintenance { kind } => {
+            if event.kind == "snapshot_restore" && matches!(kind, MaintenanceKind::Checkpoint) {
+                return Ok(());
+            }
             if let Some(common) = durable.reply.payload.get("common_maintenance") {
                 let digest = common
                     .get("request_semantic_sha256")
@@ -427,12 +490,43 @@ pub(crate) fn validate_pending_deletion_fence(
     }
     let deleted_ids = deleted_record_ids.iter().copied().collect::<BTreeSet<_>>();
     if deleted_ids.len() != deleted_record_ids.len()
+        || !deleted_record_ids
+            .windows(2)
+            .all(|window| window[0] < window[1])
         || u64::try_from(deleted_record_ids.len()).ok() != Some(*deleted_records)
         || usize::try_from(*deleted_records).is_err()
     {
         return Err(corrupt_reply(
             meta.commit_seq,
             "pending deletion fence record set is invalid",
+        ));
+    }
+    let previously_deleted = validated
+        .iter()
+        .take(validated.len().saturating_sub(1))
+        .flat_map(|(_, durable)| match &durable.operation {
+            DurableOperation::DeletionFence {
+                deleted_record_ids, ..
+            }
+            | DurableOperation::DeleteBySource {
+                deleted_record_ids, ..
+            } => deleted_record_ids.iter().copied().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_deleted = capsules
+        .iter()
+        .filter(|capsule| {
+            capsule.status == crate::store::CapsuleStatus::Revoked
+                && capsule.commit_seq < event.seq
+                && !previously_deleted.contains(&capsule.record_id)
+        })
+        .map(|capsule| capsule.record_id)
+        .collect::<BTreeSet<_>>();
+    if deleted_ids != expected_deleted {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "pending deletion fence record set is not exact",
         ));
     }
     for record_id in &deleted_ids {
@@ -445,9 +539,7 @@ pub(crate) fn validate_pending_deletion_fence(
                 "pending deletion fence references an unknown record",
             ));
         };
-        if capsule.status != crate::store::CapsuleStatus::Revoked
-            || !sources.contains(&capsule.source_id)
-            || capsule.commit_seq >= event.seq
+        if capsule.status != crate::store::CapsuleStatus::Revoked || capsule.commit_seq >= event.seq
         {
             return Err(corrupt_reply(
                 meta.commit_seq,
