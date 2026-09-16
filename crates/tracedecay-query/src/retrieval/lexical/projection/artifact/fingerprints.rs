@@ -264,7 +264,7 @@ pub(super) fn read_clone_fingerprint_page(
         selected_block.map(CloneSelectedBlockV1::tokens),
     ))
     .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-    let (after, discovery_after, discovery_complete_resume, pending_comparison) = match cursor {
+    let (after, discovery_after, discovery_complete_resume, mut pending_comparison) = match cursor {
         Some(cursor)
             if cursor.artifact_digest == *receipt.artifact_digest()
                 && cursor.generation == *receipt.generation()
@@ -721,7 +721,6 @@ pub(super) fn read_clone_fingerprint_page(
     let candidate_count = candidates.len();
     let mut members = Vec::new();
     let mut last_compared = after;
-    let mut pending_comparison = pending_comparison;
     let mut has_more = false;
     for (ordinal, (key, candidate)) in candidates.into_iter().enumerate() {
         if accounting.candidate_bodies_compared == CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1 {
