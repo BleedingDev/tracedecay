@@ -6,6 +6,7 @@
 
 use super::*;
 use std::fs;
+use std::path::PathBuf;
 
 use tracedecay_contracts::result::ApplicationProblem;
 use tracedecay_contracts::retained_surfaces::{
