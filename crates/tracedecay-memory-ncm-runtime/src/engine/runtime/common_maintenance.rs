@@ -150,6 +150,7 @@ impl Request {
         }
         Ok(CommonMaintenanceContext {
             admission: self.maintenance_capsule.clone(),
+            request_idempotency_key: self.idempotency_key.clone(),
             public_idempotency_key: admission.idempotency_key,
             request_semantic_sha256,
             expected_generation: self.expected_generation,
@@ -182,6 +183,7 @@ struct CommonOutput {
 #[serde(deny_unknown_fields)]
 struct EventBasis {
     kind: MaintenanceKind,
+    idempotency_key: String,
     sequence: u64,
     payload_sha256: String,
     created_tick: u64,
@@ -200,6 +202,7 @@ struct RetainedReceipt {
 /// Admission and bounded scan evidence handed to the existing maintenance transaction.
 pub(super) struct CommonMaintenanceContext {
     admission: EncodedAdmission,
+    request_idempotency_key: String,
     public_idempotency_key: String,
     pub(super) request_semantic_sha256: String,
     expected_generation: u64,
@@ -305,6 +308,7 @@ impl CommonMaintenanceContext {
             },
             event_basis: EventBasis {
                 kind: kind.clone(),
+                idempotency_key: self.request_idempotency_key.clone(),
                 sequence: reply.state_generation,
                 payload_sha256: self.request_semantic_sha256.clone(),
                 created_tick: after.scheduler.tick.0,
@@ -559,7 +563,7 @@ fn checked_event(
     };
     let outcome = &retained.outcome;
     let basis = &retained.event_basis;
-    if event.idempotency_key.is_none()
+    if event.idempotency_key.as_deref() != Some(basis.idempotency_key.as_str())
         || admission.namespace != namespace
         || admission.request_semantic_sha256 != retained.request_semantic_sha256
         || event.payload_sha256 != retained.request_semantic_sha256

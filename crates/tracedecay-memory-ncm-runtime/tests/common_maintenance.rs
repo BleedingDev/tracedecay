@@ -552,6 +552,54 @@ fn corrupted_common_maintenance_evidence_is_rejected_for_retry_inspection_and_ex
 }
 
 #[test]
+fn maintenance_event_key_mismatch_is_rejected_as_corrupt() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "event-key").state_generation;
+    let original = request("event-key-mismatch", "repair", generation);
+    let committed = invoke(&live, original);
+    assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let key = digest(b"event-key-mismatch");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    receipt["reply"]["payload"]["common_maintenance"]["event_basis"]["idempotency_key"] =
+        json!("other-event-key");
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
+            [serde_json::to_string(&receipt).unwrap(), key],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = engine(&directory);
+    assert_eq!(
+        inspect_receipt(&reopened, "event-key-mismatch").outcome,
+        Outcome::Corrupt
+    );
+    assert_eq!(
+        snapshot::export(&reopened, &namespace(), DEADLINE)
+            .unwrap_err()
+            .outcome,
+        Outcome::Corrupt
+    );
+}
+
+#[test]
 fn empty_and_dry_run_maintenance_do_not_invent_retained_effects() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);
