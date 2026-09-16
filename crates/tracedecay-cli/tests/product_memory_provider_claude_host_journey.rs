@@ -63,11 +63,32 @@ use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
 };
+use tracedecay_domain::{
+    CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
+    CanonicalObservationFactV1, CanonicalObservationIdV1, CanonicalObservationRelationsV1,
+    ObservationId, ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
+    ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
+    ProjectId, ProviderId, RetentionClass, SessionId,
+};
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
     ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
     RetentionPolicyV1, SqliteObservationJournal,
 };
+use tracedecay_sessions::admission::HostAdmissionScope;
+use tracedecay_sessions::observation::{
+    CaptureObservationOutcome, CaptureObservationRequest, ObservationApplication,
+    ObservationCancellation,
+};
+
+/// The provider-control journey needs one source with a real canonical
+/// revision. The shipped Claude/Codex normalizers currently emit revision-less
+/// file evidence, so the test-owned producer below feeds the same public
+/// parser, sanitizer, and registered observation store a canonical envelope
+/// carrying this revision.
+const REVISION_FIXTURE_SOURCE_KEY: &str = "host-provider-control-revision-source";
+const REVISION_FIXTURE_RECORD_ID: &str = "host-provider-control-revision-record";
+const REVISION_FIXTURE_REVISION: &str = "host-provider-control-source-revision-v1";
 
 /// The Claude Code session id the whole journey is bound to.
 const CLAUDE_SESSION: &str = "claude-cli-journey-session";
@@ -551,6 +572,133 @@ impl ClaudeHostJourney {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
+    }
+
+    /// Append one canonical source through the public parser, privacy
+    /// sanitizer, and registered observation store while the shipped daemon
+    /// is stopped. The normal host normalizers intentionally leave
+    /// `evidence.revision` empty; this producer gives the live provider
+    /// control journey a real source revision so the current-revision
+    /// correction path is exercised before the stale-revision refusal.
+    ///
+    /// The canonical envelope itself is the native fixture record. Snapshot
+    /// ordering keeps the fixture independent of a physical transcript byte
+    /// offset while still binding its source range through the parser and
+    /// observation identity.
+    fn produce_revision_fixture(
+        &self,
+        session_id: &str,
+        project_id: &str,
+    ) -> CanonicalObservationIdV1 {
+        assert!(
+            self.daemon.is_none(),
+            "the canonical producer fixture requires the shipped daemon to be stopped"
+        );
+        let provider = ProviderId::new(if self.codex { "codex" } else { "claude" })
+            .expect("canonical fixture provider");
+        let session = SessionId::new(session_id.to_owned()).expect("canonical fixture session");
+        let source_key =
+            SessionId::new(REVISION_FIXTURE_SOURCE_KEY).expect("canonical fixture source key");
+        let project_id =
+            ProjectId::new(project_id.to_owned()).expect("canonical fixture project id");
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        let generation =
+            ObservationSourceGenerationV1::new(1).expect("canonical fixture generation");
+        let range = ObservationSourceRangeV1::new(0, 1).expect("canonical fixture source range");
+        let stable_record_id =
+            ObservationId::new(REVISION_FIXTURE_RECORD_ID).expect("canonical fixture record id");
+        let envelope = CanonicalObservationEnvelopeV1::new(
+            provider.clone(),
+            "message",
+            stable_record_id.clone(),
+            CanonicalObservationRelationsV1::new(session.clone()),
+            vec![CanonicalObservationFactV1::Message {
+                role: CanonicalMessageRoleV1::Assistant,
+                content: json!({
+                    "text": format!(
+                        "{JOURNEY_TERM} source revision fixture preserves the control path"
+                    ),
+                }),
+                model: Some("host-provider-control-fixture".to_owned()),
+                timestamp: Some(1_750_000_000),
+            }],
+            CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::SnapshotOrder, range)
+                .with_revision(REVISION_FIXTURE_REVISION)
+                .expect("canonical fixture source revision"),
+        )
+        .expect("canonical fixture envelope");
+        let native_record = serde_json::to_vec(&envelope).expect("canonical fixture bytes");
+        let parsed = tracedecay_privacy::parse_normalized_observation_record_v1(
+            &native_record,
+            range,
+            ObservationOrderingDomainV1::SnapshotOrder,
+            |native| {
+                serde_json::from_value(native)
+                    .map_err(|_| tracedecay_privacy::ObservationRecordParseErrorV1::Malformed)
+            },
+        )
+        .expect("parse canonical revision fixture");
+        let identity = ObservationIdentityMaterialV1::for_native_record(
+            ObservationSourceIdentityV1::for_provider_source(provider, session, source_key)
+                .expect("canonical fixture source identity"),
+            scope.clone(),
+            generation,
+            range,
+            ObservationOrderingDomainV1::SnapshotOrder,
+            stable_record_id,
+        )
+        .expect("canonical fixture identity");
+        let observation_id =
+            CanonicalObservationIdV1::derive(&identity).expect("canonical fixture observation id");
+        let request = CaptureObservationRequest::new(
+            parsed,
+            identity,
+            None,
+            RetentionClass::new("retention.host-provider-control-journey")
+                .expect("canonical fixture retention"),
+            ObservationCancellation::default(),
+        )
+        .expect("canonical fixture capture request");
+
+        let profile = self.profile.clone();
+        let project = self.project.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("canonical fixture runtime");
+        runtime.block_on(async move {
+            let host_runtime =
+                tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+                    &profile, &project, project_id,
+                )
+                .await
+                .expect("open registered canonical fixture authority");
+            let store = host_runtime
+                .observation_store(HostAdmissionScope::Project)
+                .expect("bind registered canonical fixture store");
+            let application = ObservationApplication::new(
+                store,
+                tracedecay_privacy::RecordSanitizerV1::observation_v1()
+                    .expect("canonical fixture observation sanitizer"),
+            );
+            let outcome = application
+                .capture_observation(request)
+                .await
+                .expect("persist canonical revision fixture");
+            assert!(
+                matches!(
+                    outcome,
+                    CaptureObservationOutcome::Persisted { .. }
+                        | CaptureObservationOutcome::AcceptedForReplay { .. }
+                ),
+                "canonical revision fixture must cross the durable admission boundary: {outcome:?}"
+            );
+            drop(application);
+            drop(host_runtime);
+        });
+        observation_id
     }
 
     /// Initializes through the daemon-owned scheduler, grading its real
@@ -2216,7 +2364,7 @@ fn assert_host_memory_journey_with_provider(
 
     // Capture canonical source identities and the actual A scope before any
     // recall can add provider-addressed history deliveries to this journal.
-    let original_sources = capture_original_hook_sources(&journey, &mid_session_replayed);
+    let mut original_sources = capture_original_hook_sources(&journey, &mid_session_replayed);
 
     // 9. The originating session can recall exactly what its hooks observed.
     let original =
@@ -2225,7 +2373,12 @@ fn assert_host_memory_journey_with_provider(
     // 10. A fresh daemon and a different agent session must recall those same
     //     durable messages. B starts through the shipped lifecycle with an
     //     empty transcript: route binding must add no canonical messages.
+    let project_id = journey.project_id();
     journey.stop_daemon();
+    // Add one producer-owned canonical source with a non-null revision while
+    // the daemon is down. The following single restart must replay it into
+    // the selected provider journal alongside the four real hook messages.
+    let revision_fixture_id = journey.produce_revision_fixture(journey.session_id(), &project_id);
     journey.start_daemon();
     let next_session = if journey.codex {
         "5ab47634-f1b2-4ccd-a1c3-2b0c2a9a3e10"
@@ -2240,13 +2393,16 @@ fn assert_host_memory_journey_with_provider(
         "next SessionStart must publish its route: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let after_start = journey.await_settled_journal(2 * ROWS_PER_TURN);
-    assert_eq!(
-        journal_row_identities(&after_start),
-        mid_session_settled,
-        "starting an empty session must preserve the original deliveries"
+    let expected_source_count = 2 * ROWS_PER_TURN + 1;
+    let after_start = journey.await_settled_journal(expected_source_count);
+    let after_start_identities = journal_row_identities(&after_start);
+    assert!(
+        mid_session_settled
+            .iter()
+            .all(|identity| after_start_identities.contains(identity)),
+        "starting the destination session must preserve every original delivery"
     );
-    assert_settled_session_messages(&after_start, 2 * ROWS_PER_TURN);
+    assert_settled_session_messages(&after_start, expected_source_count);
     let selected_journal = journey
         .journal_for(active_provider.is_ncm())
         .expect("selected provider journal after bootstrap");
@@ -2261,6 +2417,15 @@ fn assert_host_memory_journey_with_provider(
         );
     }
     journey.assert_observer_settled(&after_start, &observer_final);
+    let (revision_source_event_id, revision_source) =
+        capture_revision_fixture_source(&journey, &after_start, &revision_fixture_id);
+    assert!(
+        original_sources
+            .insert(revision_source_event_id, revision_source)
+            .is_none(),
+        "the revision producer must add one distinct canonical source"
+    );
+    assert_eq!(original_sources.len(), expected_source_count);
     let recalled = assert_recalled_session_messages(&journey, next_session, &original_sources);
     assert_eq!(
         recalled.0, original.0,
@@ -2609,6 +2774,80 @@ fn capture_original_hook_sources(
     originals
 }
 
+/// Capture the producer fixture's admitted source from the same provider
+/// journal surface as the hook rows. This keeps the later control selector
+/// bound to the source the restarted daemon actually replayed, while making
+/// the non-null canonical revision an explicit assertion of the producer
+/// contract.
+fn capture_revision_fixture_source(
+    journey: &ClaudeHostJourney,
+    rows: &[JournalInspectionRowV1],
+    fixture_observation_id: &CanonicalObservationIdV1,
+) -> (String, Value) {
+    let journal = journey
+        .journal_for(journey.active_provider.is_ncm())
+        .expect("selected host journal");
+    let matching = rows
+        .iter()
+        .filter(|row| row.source_stream == "session_observation_store")
+        .filter_map(|row| {
+            let admitted = journal
+                .read_admitted_observation_by_idempotency(&row.idempotency_key)
+                .expect("read revision fixture admission");
+            let Some(admitted) = admitted else {
+                return None;
+            };
+            (admitted.source.source_event_id == fixture_observation_id.as_str())
+                .then_some((row, admitted))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "the restarted provider must admit the revision fixture exactly once"
+    );
+    let (_, admitted) = matching.into_iter().next().expect("revision fixture row");
+    let payload: Value =
+        serde_json::from_slice(&admitted.payload.bytes).expect("revision fixture payload");
+    let canonical: CanonicalObservationEnvelopeV1 =
+        serde_json::from_value(payload["canonical_payload"].clone())
+            .expect("revision fixture canonical envelope");
+    canonical
+        .validate()
+        .expect("revision fixture canonical envelope validates");
+    assert_eq!(
+        canonical.provider().as_str(),
+        if journey.codex { "codex" } else { "claude" }
+    );
+    assert_eq!(
+        canonical.relations().session_id().as_str(),
+        journey.session_id()
+    );
+    assert_eq!(
+        canonical.stable_record_id().as_str(),
+        REVISION_FIXTURE_RECORD_ID
+    );
+    assert_eq!(
+        canonical.evidence().revision(),
+        Some(REVISION_FIXTURE_REVISION),
+        "the producer fixture must retain its canonical source revision"
+    );
+    assert_eq!(
+        admitted.source.source_event_id,
+        fixture_observation_id.as_str(),
+        "the journal source event must retain the producer fixture observation id"
+    );
+    let captured = json!({
+        "canonical_provider_id": canonical.provider().as_str(),
+        "canonical_session_id": canonical.relations().session_id().as_str(),
+        "stable_record_id": canonical.stable_record_id().as_str(),
+        "source_revision": canonical.evidence().revision(),
+        "source_sequence": admitted.source.source_sequence.0,
+        "original_scope": admitted_scope(&admitted),
+    });
+    (admitted.source.source_event_id.clone(), captured)
+}
+
 /// Only explicitly identified history rows are excluded from hook counts.
 /// The complete source and receipt assertions run immediately after recall.
 fn assert_history_stream(row: &JournalInspectionRowV1, admitted: &AdmittedObservationV1) -> Value {
@@ -2853,8 +3092,8 @@ fn assert_recalled_session_messages(
     let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
     assert_eq!(
         candidates.len(),
-        2 * ROWS_PER_TURN,
-        "the healthy journey must recall every admitted Claude message exactly once (origin_session={}): {lane}; bounded Native diagnostics: {}",
+        original_sources.len(),
+        "the healthy journey must recall every admitted canonical source exactly once (origin_session={}): {lane}; bounded Native diagnostics: {}",
         recalled_session_id == journey.session_id(),
         journey.native_recall_failure_diagnostics()
     );

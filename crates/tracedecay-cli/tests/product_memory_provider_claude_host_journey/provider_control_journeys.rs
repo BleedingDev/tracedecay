@@ -29,7 +29,6 @@ use tracedecay_domain::UtcMicros;
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
 const FAULTY_NATIVE_JOURNAL: &str = JOURNAL_FILE_NAME;
-const CORRECTION_UNAVAILABLE_REVISION: &str = "revision.unavailable";
 const STALE_SOURCE_REVISION: &str = "stale-source-revision";
 
 #[derive(Clone, Debug)]
@@ -107,11 +106,29 @@ fn source_and_state(
     let candidate = lane["candidates"]
         .as_array()
         .and_then(|candidates| {
-            candidates.iter().find(|candidate| {
-                candidate["provenance_evidence"]["sources"]
-                    .as_array()
-                    .is_some_and(|sources| !sources.is_empty())
-            })
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate["provenance_evidence"]["sources"]
+                        .as_array()
+                        .is_some_and(|sources| !sources.is_empty())
+                })
+                .find(|candidate| {
+                    candidate["provenance_evidence"]["sources"]
+                        .as_array()
+                        .is_some_and(|sources| {
+                            sources
+                                .iter()
+                                .any(|source| source["source"]["source_revision"].is_string())
+                        })
+                })
+                .or_else(|| {
+                    candidates.iter().find(|candidate| {
+                        candidate["provenance_evidence"]["sources"]
+                            .as_array()
+                            .is_some_and(|sources| !sources.is_empty())
+                    })
+                })
         })
         .expect("recall must expose a canonical source candidate");
     let evidence = &candidate["provenance_evidence"];
@@ -133,6 +150,11 @@ fn source_and_state(
     let source_revision = source["source"]["source_revision"]
         .as_str()
         .map(str::to_owned);
+    assert_eq!(
+        source_revision.as_deref(),
+        Some(super::REVISION_FIXTURE_REVISION),
+        "provider controls must target the producer fixture with a canonical source revision"
+    );
     let selector = ProviderControlSourceSelectorV1 {
         trace_ref,
         item_ref,
@@ -475,8 +497,9 @@ fn assert_feedback_idempotency(
 fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &RecalledSource) {
     let expected = source
         .source_revision
-        .clone()
-        .unwrap_or_else(|| CORRECTION_UNAVAILABLE_REVISION.to_owned());
+        .as_deref()
+        .expect("correction journey requires a canonical source revision")
+        .to_owned();
     let current_request = ProviderControlRequestV1::Correction(ProviderCorrectionRequestV1 {
         source: source.selector.clone(),
         expected_source_revision: expected.clone(),
@@ -493,41 +516,83 @@ fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &Reca
         current_request,
     )
     .expect("current correction RPC transport");
-    if source.source_revision.is_none() {
-        // Claude and Codex canonical file-byte evidence currently has no
-        // source revision. Keep this assertion truthful: the host must refuse
-        // current correction rather than inventing one. The stale attempt
-        // below still runs so both revision refusal identities are exercised.
-        assert_outer_problem(&response, "conflict");
-    } else {
-        let current = typed_result(&response);
-        assert_success(&current, "current correction");
-        let ProviderControlOperationResultV1::Correction(Some(correction)) = &current.result else {
-            panic!("current correction must include typed provider evidence: {current:?}");
-        };
-        assert_eq!(&correction.source, &source.selector);
-        assert_eq!(
-            correction.target.source.source_revision.as_deref(),
-            source.source_revision.as_deref()
-        );
-        assert_eq!(
-            correction.receipt.state_generation_before,
-            current
-                .effect
-                .state_generation_before
-                .expect("correction generation")
-        );
-        assert!(
-            correction.receipt.state_generation_after > correction.receipt.state_generation_before,
-            "current correction must advance provider state: {:?}",
-            correction.receipt
-        );
-        assert_eq!(
-            current.effect.state,
-            ProviderControlEffectStateV1::Committed,
-            "current correction must commit a provider effect: {current:?}"
-        );
-    }
+    let current = typed_result(&response);
+    assert_success(&current, "current correction");
+    let ProviderControlOperationResultV1::Correction(Some(correction)) = &current.result else {
+        panic!("current correction must include typed provider evidence: {current:?}");
+    };
+    assert_eq!(&correction.source, &source.selector);
+    assert_eq!(
+        correction.target.source.source_revision.as_deref(),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        correction.receipt.state_generation_before,
+        current
+            .effect
+            .state_generation_before
+            .expect("correction generation")
+    );
+    assert!(
+        correction.receipt.state_generation_after > correction.receipt.state_generation_before,
+        "current correction must advance provider state: {:?}",
+        correction.receipt
+    );
+    assert!(
+        correction.affected_provider_effects > 0,
+        "current correction must affect the admitted provider source: {correction:?}"
+    );
+    assert_eq!(
+        current.effect.state,
+        ProviderControlEffectStateV1::Committed,
+        "current correction must commit a provider effect: {current:?}"
+    );
+
+    // Restart the shipped daemon before replaying the same correction identity.
+    // The duplicate result must retain the original receipt and observe the
+    // persisted post-commit generation; an in-memory-only correction would
+    // either apply twice or lose this receipt.
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.await_startup_history();
+    let duplicate_response = invoke(
+        journey,
+        "host-provider-control.correction.current",
+        current_request,
+    )
+    .expect("replayed current correction RPC transport");
+    let duplicate = typed_result(&duplicate_response);
+    assert_success(&duplicate, "replayed current correction");
+    let ProviderControlOperationResultV1::Correction(Some(duplicate_correction)) =
+        &duplicate.result
+    else {
+        panic!("replayed current correction must retain typed provider evidence: {duplicate:?}");
+    };
+    assert_eq!(
+        duplicate.effect.state,
+        ProviderControlEffectStateV1::Duplicate,
+        "replayed current correction must be exactly once: {duplicate:?}"
+    );
+    assert_eq!(
+        duplicate.effect.duplicate_of_idempotency_key, current.idempotency_key,
+        "replayed current correction must identify its original operation"
+    );
+    assert_eq!(
+        duplicate_correction.receipt, correction.receipt,
+        "replayed current correction must retain the committed receipt"
+    );
+    assert_eq!(
+        duplicate.effect.state_generation_before, duplicate.effect.state_generation_after,
+        "replayed current correction cannot advance provider state"
+    );
+    assert_eq!(
+        duplicate.effect.state_generation_before, current.effect.state_generation_after,
+        "replayed current correction must observe persisted post-commit state"
+    );
+    assert_eq!(
+        duplicate.effect.provider_receipt_digest, current.effect.provider_receipt_digest,
+        "replayed current correction must retain the provider receipt digest"
+    );
 
     let stale = ProviderControlRequestV1::Correction(ProviderCorrectionRequestV1 {
         source: source.selector.clone(),
@@ -541,7 +606,29 @@ fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &Reca
     });
     let response = invoke(journey, "host-provider-control.correction.stale", stale)
         .expect("stale correction RPC transport");
-    assert_outer_problem(&response, "conflict");
+    match &response.outcome {
+        DaemonInvocationOutcome::RetainedApplication { .. } => {
+            let stale = typed_result(&response);
+            assert_eq!(
+                stale.terminal,
+                ProviderControlTerminalV1::Conflict,
+                "stale correction must retain a typed conflict terminal: {stale:?}"
+            );
+            assert_eq!(
+                stale.effect.state,
+                ProviderControlEffectStateV1::None,
+                "stale correction must have no provider effect: {stale:?}"
+            );
+            assert!(
+                matches!(
+                    stale.result,
+                    ProviderControlOperationResultV1::Correction(None)
+                ),
+                "stale correction must retain no operation result: {stale:?}"
+            );
+        }
+        _ => assert_outer_problem(&response, "conflict"),
+    }
 }
 
 fn assert_wrong_selector_is_hidden_as_missing_grant(
