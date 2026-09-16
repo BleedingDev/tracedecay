@@ -391,6 +391,31 @@ impl RecallDenialReason {
             Self::ConfidenceMalformed { .. } => "confidence_malformed",
         }
     }
+
+    /// Returns the reason safe to embed in a retained explain trace.
+    ///
+    /// Parser diagnostics are provider-controlled strings even though the
+    /// surrounding denial variant is host-owned. Replace those diagnostics
+    /// before serializing the typed decision so a caller cannot bypass the
+    /// trace's bounded detail projection by inspecting its nested reason.
+    pub(crate) fn retained_for_trace(&self) -> Self {
+        match self {
+            Self::InvalidValidityRecord { .. } => Self::InvalidValidityRecord {
+                detail: "provider_validity_detail_withheld".to_owned(),
+            },
+            Self::InvalidSourceAttribution { .. } => Self::InvalidSourceAttribution {
+                detail: "provider_source_detail_withheld".to_owned(),
+            },
+            Self::NativeScoreMalformed {
+                defect: NativeScoreDefect::Undecodable { .. },
+            } => Self::NativeScoreMalformed {
+                defect: NativeScoreDefect::Undecodable {
+                    detail: "provider_score_detail_withheld".to_owned(),
+                },
+            },
+            _ => self.clone(),
+        }
+    }
 }
 
 /// Why a supplied provider confidence datum cannot be admitted.
@@ -1287,6 +1312,15 @@ pub struct DeniedRecallCandidate {
 pub struct RecallAdmissionReport {
     /// Request identity the admission ran under.
     pub request_id: String,
+    /// Provider identity and registration revision that produced this report,
+    /// when the report came from an admitted provider call. Pure admission
+    /// helpers that have no call envelope leave this absent; retained-state
+    /// projections use a fixed opaque sentinel in that case.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Registration revision that produced this report, when known.
+    #[serde(default)]
+    pub registration_revision: Option<u64>,
     /// Digest of the admitted exact scope.
     pub exact_scope_sha256: String,
     /// Admitted temporal mode.
@@ -1435,7 +1469,7 @@ pub(crate) fn admit_recall_reply_with_profile(
             )
         })
         .transpose()?;
-    admit_recall_candidates_with_context(
+    let mut admission = admit_recall_candidates_with_context(
         &call.exact_scope,
         &call.request_id,
         temporal,
@@ -1443,7 +1477,13 @@ pub(crate) fn admit_recall_reply_with_profile(
         outcome.candidates,
         Some(&context.exclusions),
         common_profile.as_ref(),
-    )
+    )?;
+    // The pure admission helper intentionally has no provider-call envelope.
+    // Attach the exact routed identity here, before observers persist the
+    // report, so every retained projection can share one context-bound alias.
+    admission.report.provider_id = Some(call.provider_id.as_str().to_owned());
+    admission.report.registration_revision = Some(call.registration_revision);
+    Ok(admission)
 }
 
 /// Decodes one canonical recall outcome payload without admitting anything.
@@ -1594,6 +1634,8 @@ fn admit_recall_candidates_with_context(
     Ok(RecallAdmission {
         report: RecallAdmissionReport {
             request_id: request_id.to_owned(),
+            provider_id: None,
+            registration_revision: None,
             exact_scope_sha256: admitted_scope.exact_scope_sha256(),
             temporal_mode: temporal.mode.as_wire().to_owned(),
             evaluation_time: temporal.evaluation_time.clone(),

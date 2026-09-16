@@ -471,10 +471,8 @@ pub(super) fn warn_transcript_catch_up_failure(
         source::TranscriptIngestError::Store(tracedecay_store::TranscriptStoreError::Storage {
             source,
             ..
-        }) => {
-            tracedecay_privacy::sanitize_provider_metadata_text(&source.to_string())
-                .filter(|detail| detail.len() <= 1024)
-        }
+        }) => tracedecay_privacy::sanitize_provider_metadata_text(&source.to_string())
+            .filter(|detail| detail.len() <= 1024),
         _ => None,
     };
     tracing::warn!(

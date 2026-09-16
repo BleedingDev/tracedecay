@@ -91,11 +91,11 @@ pub use recall_context_pack::{
 };
 pub use recall_explain_trace::{
     ContainedExplanationRedactorV1, EXPLAIN_TRACE_BOUNDARY_LABEL, MAX_EXPLAIN_EXPLANATION_CHARS,
-    RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1, RecallExplainItemV1,
-    RecallExplainProviderExplanationV1, RecallExplainStageV1, RecallExplainTokenSummaryV1,
-    RecallExplainTraceError, RecallExplainTraceInputsV1, RecallExplainTraceV1,
-    RecallExplanationRedactorV1, build_recall_explain_trace, explanation_source_sha256,
-    is_contained_explanation,
+    RETAINED_CANDIDATE_ID_PREFIX, RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1,
+    RecallExplainItemV1, RecallExplainProviderExplanationV1, RecallExplainStageV1,
+    RecallExplainTokenSummaryV1, RecallExplainTraceError, RecallExplainTraceInputsV1,
+    RecallExplainTraceV1, RecallExplanationRedactorV1, build_recall_explain_trace,
+    explanation_source_sha256, is_contained_explanation,
 };
 pub use recall_normalization::{
     HOST_NORMALIZATION_POLICY_ID, HOST_NORMALIZATION_POLICY_REVISION, HostNormalizedScoreV1,

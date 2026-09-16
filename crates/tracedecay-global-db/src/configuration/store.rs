@@ -13,6 +13,7 @@ use super::resolver::{ConfigurationResolutionV1, registry_default_candidate};
 use super::schema::ConfigurationSchemaError;
 use crate::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use thiserror::Error;
+use tracedecay_contracts::now_micros;
 use tracedecay_domain::configuration::{
     ACCESS_RULES_SETTING_KEY, AuthorityRef, CandidateDispositionV1, ChangePlanId,
     CodeIndexWorkerSelectionV1, ConfigurationAuditEvent, ConfigurationAuditEventId,
@@ -87,6 +88,29 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
     #[hotpath::skip]
     pub const fn new_registered(db: &'db RegisteredGlobalDb) -> Self {
         Self { db }
+    }
+
+    /// Loads the durable host secret used for retained recall locators. The
+    /// configuration audit key is initialized through the same transactional
+    /// schema authority when a fresh store has no key yet, then projected into
+    /// an independent recall-specific subkey. Missing or malformed material
+    /// fails closed; the raw audit key never leaves this crate.
+    pub async fn load_recall_locator_key(&self) -> ConfigurationStoreResult<Vec<u8>> {
+        let read = self.db.read_snapshot().await.map_err(unavailable_store)?;
+        if let Some(audit_key) = audit::read_audit_redaction_key(&read).await? {
+            return Ok(audit::derive_recall_locator_key(&audit_key)?.to_vec());
+        }
+        drop(read);
+
+        let transaction = self
+            .db
+            .begin_write_transaction()
+            .await
+            .map_err(unavailable_store)?;
+        let audit_key = audit::ensure_audit_redaction_key(&transaction, now_micros()).await?;
+        let recall_key = audit::derive_recall_locator_key(&audit_key)?.to_vec();
+        transaction.commit().await.map_err(unavailable_store)?;
+        Ok(recall_key)
     }
 
     /// Reports whether this exact final-shape control-plane store has no
@@ -982,3 +1006,36 @@ impl ConfigurationControlStore for OwnedGlobalDbConfigurationControlStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod recall_locator_key_tests {
+    use super::GlobalDbConfigurationControlStore;
+    use crate::tests::harness::RegisteredGlobalDbTestRuntime;
+
+    #[tokio::test]
+    async fn recall_locator_key_persists_across_registered_store_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = RegisteredGlobalDbTestRuntime::profile(directory.path())
+            .await
+            .unwrap();
+
+        let first = GlobalDbConfigurationControlStore::new_registered(runtime.profile_database())
+            .load_recall_locator_key()
+            .await
+            .unwrap();
+        let same_mount =
+            GlobalDbConfigurationControlStore::new_registered(runtime.profile_database())
+                .load_recall_locator_key()
+                .await
+                .unwrap();
+        assert_eq!(first, same_mount);
+
+        let runtime = runtime.reopen_profile_database_for_test().await.unwrap();
+        let after_reopen =
+            GlobalDbConfigurationControlStore::new_registered(runtime.profile_database())
+                .load_recall_locator_key()
+                .await
+                .unwrap();
+        assert_eq!(first, after_reopen);
+    }
+}

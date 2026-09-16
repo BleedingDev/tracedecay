@@ -79,7 +79,6 @@ use tracedecay_memory_provider_api::{
     ProviderLimits, ProviderOperation, ProviderReply,
 };
 
-use crate::{COMMON_ADVISORY_PROFILE_ID, ProjectMemoryProviderComposition};
 use crate::provider_invocation::{
     ProviderInvocationBoundaryV1, ProviderInvocationFaultV1, ProviderInvocationRequestV1,
 };
@@ -98,6 +97,7 @@ use crate::recall_selection::{
     RecallSelectionError, RecallSelectionPolicyError, RecallSelectionPolicyV1, RecallSelectionV1,
     select_recall_candidates,
 };
+use crate::{COMMON_ADVISORY_PROFILE_ID, ProjectMemoryProviderComposition};
 
 /// Objective sent with every recall. The contract carries the objective as
 /// bounded free text, but the Native adapter interprets it as its retrieval

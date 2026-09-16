@@ -17,7 +17,7 @@ use serde_json::json;
 use tracedecay_memory_provider_registry::{
     AdvisoryLaneV1, ContainedExplanationRedactorV1, ContextPackPolicyV1, ContextPackRenderFormV1,
     ContextSectionKind, HostContextItemV1, O200kBaseContextTokenizer, ProviderContributionV1,
-    RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1,
+    RETAINED_CANDIDATE_ID_PREFIX, RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1,
     RecallExplainProviderExplanationV1, RecallExplainStageV1, RecallExplainTraceError,
     RecallExplainTraceInputsV1, RecallExplainTraceV1, RecallExplanationRedactorV1,
     RecallSelectionPolicyV1, admit_recall_candidates, build_recall_explain_trace,
@@ -102,7 +102,98 @@ fn duplicate_candidate(id: &str) -> tracedecay_memory_provider_registry::RecallC
 fn trace_of(
     inputs: RecallExplainTraceInputsV1<'_>,
 ) -> Result<RecallExplainTraceV1, RecallExplainTraceError> {
-    build_recall_explain_trace(inputs)
+    // Pure admission fixtures do not have a provider-call envelope. The
+    // production path attaches these fields before a report can reach an
+    // explain trace; synthesize the same attribution for the legacy fixture
+    // reports while preserving any explicitly supplied mismatch.
+    let mut report = inputs.report.clone();
+    if report.provider_id.is_none() && report.registration_revision.is_none() {
+        report.provider_id = Some(inputs.provider_id.to_owned());
+        report.registration_revision = Some(inputs.registration_revision);
+    }
+    // Most fixtures model a host that observed no identity substitution. The
+    // production builder still receives canonical opaque aliases; this helper
+    // translates its output back to fixture ids so the older stage assertions
+    // remain focused on reconciliation rather than alias spelling.
+    if inputs.pack_identity_aliases.is_empty() {
+        let fixture_aliases = inputs
+            .report
+            .received_candidate_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, candidate_id)| {
+                (
+                    candidate_id.clone(),
+                    format!("{RETAINED_CANDIDATE_ID_PREFIX}{:064x}", rank + 1),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let trace = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+            provider_id: inputs.provider_id,
+            registration_revision: inputs.registration_revision,
+            report: &report,
+            normalization: inputs.normalization,
+            selection: inputs.selection,
+            pack: inputs.pack,
+            host_withheld: inputs.host_withheld,
+            pack_identity_aliases: &fixture_aliases,
+            redactor: inputs.redactor,
+        })?;
+        return Ok(restore_fixture_identities(trace, &fixture_aliases));
+    }
+    build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: inputs.provider_id,
+        registration_revision: inputs.registration_revision,
+        report: &report,
+        normalization: inputs.normalization,
+        selection: inputs.selection,
+        pack: inputs.pack,
+        host_withheld: inputs.host_withheld,
+        pack_identity_aliases: inputs.pack_identity_aliases,
+        redactor: inputs.redactor,
+    })
+}
+
+fn restore_fixture_identities(
+    mut trace: RecallExplainTraceV1,
+    aliases: &BTreeMap<String, String>,
+) -> RecallExplainTraceV1 {
+    let reverse = aliases
+        .iter()
+        .map(|(candidate_id, retained)| (retained.as_str(), candidate_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    for item in &mut trace.items {
+        if let Some(candidate_id) = reverse.get(item.candidate_id.as_str()) {
+            item.candidate_id = (*candidate_id).to_owned();
+        }
+        if let RecallExplainHostDecisionV1::Deduplicated {
+            duplicate_of_candidate_id,
+            ..
+        } = &mut item.host_decision
+        {
+            if let Some(candidate_id) = reverse.get(duplicate_of_candidate_id.as_str()) {
+                *duplicate_of_candidate_id = (*candidate_id).to_owned();
+            }
+        }
+        if let Some(detail) = item.host_reason_detail.as_mut()
+            && let Some(retained) = detail.strip_prefix("duplicate_of=")
+            && let Some(candidate_id) = reverse.get(retained)
+        {
+            *detail = format!("duplicate_of={candidate_id}");
+        }
+    }
+    trace
+}
+
+fn report_attributed_to(
+    report: &tracedecay_memory_provider_registry::RecallAdmissionReport,
+    provider_id: &str,
+    registration_revision: u64,
+) -> tracedecay_memory_provider_registry::RecallAdmissionReport {
+    let mut report = report.clone();
+    report.provider_id = Some(provider_id.to_owned());
+    report.registration_revision = Some(registration_revision);
+    report
 }
 
 /// End to end: one denied candidate, one duplicate, one selected-and-injected
@@ -311,6 +402,128 @@ fn trace_id_is_deterministic_and_distinguishes_distinct_recalls() -> Result<(), 
     let trace_3 = bare("provider.other", &admission.report)?;
     assert_ne!(trace_1.trace_id, trace_3.trace_id);
 
+    Ok(())
+}
+
+/// Explain traces must stay attached to the routed provider call that
+/// produced their admission report. A stale provider or registration
+/// revision would otherwise let later receipts be presented as evidence for
+/// a different provider instance.
+#[test]
+fn admission_attribution_mismatch_refuses_trace_without_echoing_private_ids()
+-> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-attribution-mismatch",
+        &current_query(),
+        &authorized_exact(),
+        vec![distinct_candidate("candidate", "a standalone body")],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native-private", 7);
+
+    let provider_error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.other-private",
+        registration_revision: 7,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &BTreeMap::new(),
+        redactor: &CONTAINED,
+    })
+    .expect_err("a report from another provider must fail closed");
+    let provider_error_text = provider_error.to_string();
+    assert!(matches!(
+        provider_error,
+        RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "provider_id"
+        }
+    ));
+    assert!(!provider_error_text.contains("provider.native-private"));
+    assert!(!provider_error_text.contains("provider.other-private"));
+
+    let revision_error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native-private",
+        registration_revision: 8,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &BTreeMap::new(),
+        redactor: &CONTAINED,
+    })
+    .expect_err("a report from another registration revision must fail closed");
+    let revision_error_text = revision_error.to_string();
+    assert!(matches!(
+        revision_error,
+        RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "registration_revision"
+        }
+    ));
+    assert!(!revision_error_text.contains("provider.native-private"));
+
+    let mut missing_metadata = admission.report.clone();
+    missing_metadata.received_candidate_ids = vec!["candidate".to_owned()];
+    let missing_error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native-private",
+        registration_revision: 7,
+        report: &missing_metadata,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &BTreeMap::new(),
+        redactor: &CONTAINED,
+    })
+    .expect_err("an unbound report must fail closed");
+    assert!(matches!(
+        missing_error,
+        RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "provider_id"
+        }
+    ));
+
+    Ok(())
+}
+
+/// A retained alias map is only usable with the admission attribution that
+/// authorized that recall. Supplying a host-minted alias from another routed
+/// provider must stop before any candidate identity is rendered.
+#[test]
+fn retained_alias_substitution_across_provider_context_refuses_trace() -> Result<(), Box<dyn Error>>
+{
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-alias-context-substitution",
+        &current_query(),
+        &authorized_exact(),
+        vec![distinct_candidate("private-candidate", "a standalone body")],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native", 7);
+    let aliases = BTreeMap::from([(
+        "private-candidate".to_owned(),
+        format!("{RETAINED_CANDIDATE_ID_PREFIX}{}", "b".repeat(64)),
+    )]);
+    let error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.other",
+        registration_revision: 7,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &aliases,
+        redactor: &CONTAINED,
+    })
+    .expect_err("an alias from another provider context must fail closed");
+    assert!(matches!(
+        error,
+        RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "provider_id"
+        }
+    ));
     Ok(())
 }
 
@@ -922,5 +1135,321 @@ fn host_withheld_candidates_keep_a_row_with_the_host_reason() -> Result<(), Box<
         "{error:?}"
     );
 
+    Ok(())
+}
+
+/// Provider candidate ids are untrusted metadata even when they only appear
+/// in stage receipts or reference-only host withholding. The host keeps raw
+/// ids for reconciliation, but the retained trace must carry only the
+/// host-minted identity aliases, including the target named by a dedup row.
+///
+/// Real defect this catches: sanitizing the injected pack item while copying
+/// the raw admission, deduplication, or host-withholding ids into the audit
+/// trace. This fixture deliberately supplies no control metadata so the
+/// assertion covers the trace bytes themselves.
+#[test]
+fn retained_trace_aliases_secret_and_source_ids_in_every_identity_field()
+-> Result<(), Box<dyn Error>> {
+    const SECRET_ID: &str = "source:private/Authorization-Bearer-SECRET-9a7f";
+    const SURVIVOR_ID: &str = "source:/checkout/private/credentials.toml#L42";
+    const WITHHELD_ID: &str = "source:/checkout/private/token.json#L9";
+    const DENIED_ID: &str = "source:/private/denied-secret.env#L1";
+    const SECRET_ALIAS: &str = "advisory.retained-identity-v1.0000000000000000000000000000000000000000000000000000000000000001";
+    const SURVIVOR_ALIAS: &str = "advisory.retained-identity-v1.0000000000000000000000000000000000000000000000000000000000000002";
+    const WITHHELD_ALIAS: &str = "advisory.retained-identity-v1.0000000000000000000000000000000000000000000000000000000000000003";
+    const DENIED_ALIAS: &str = "advisory.retained-identity-v1.0000000000000000000000000000000000000000000000000000000000000004";
+
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-privacy-ids",
+        &current_query(),
+        &authorized_exact(),
+        vec![
+            distinct_candidate(SURVIVOR_ID, "the same body is returned twice"),
+            distinct_candidate(SECRET_ID, "the same body is returned twice"),
+            distinct_candidate(WITHHELD_ID, "a reference-only body is withheld"),
+            denied_candidate(DENIED_ID),
+        ],
+    )?;
+    let normalization = normalize_admitted_candidates(Default::default(), &admission.admitted)?;
+    let selection = select_recall_candidates(
+        RecallSelectionPolicyV1::new(10)?,
+        &normalization,
+        &admission.admitted,
+    )?;
+    assert_eq!(selection.deduplicated.len(), 1);
+
+    let withheld = [RecallExplainHostWithholdingV1 {
+        candidate_id: WITHHELD_ID.to_owned(),
+        reason_code: "content_not_inline".to_owned(),
+        detail: Some("the host retained only the candidate reference".to_owned()),
+    }];
+    let aliases = BTreeMap::from([
+        (SECRET_ID.to_owned(), SECRET_ALIAS.to_owned()),
+        (SURVIVOR_ID.to_owned(), SURVIVOR_ALIAS.to_owned()),
+        (WITHHELD_ID.to_owned(), WITHHELD_ALIAS.to_owned()),
+        (DENIED_ID.to_owned(), DENIED_ALIAS.to_owned()),
+    ]);
+    let trace = trace_of(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 7,
+        report: &admission.report,
+        normalization: Some(&normalization),
+        selection: Some(&selection),
+        pack: None,
+        host_withheld: &withheld,
+        pack_identity_aliases: &aliases,
+        redactor: &CONTAINED,
+    })?;
+
+    assert_eq!(
+        trace
+            .items
+            .iter()
+            .map(|item| item.candidate_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![SURVIVOR_ALIAS, SECRET_ALIAS, WITHHELD_ALIAS, DENIED_ALIAS]
+    );
+    assert!(trace.item(SECRET_ID).is_none());
+    assert!(trace.item(SURVIVOR_ID).is_none());
+    assert!(trace.item(WITHHELD_ID).is_none());
+    assert!(trace.item(DENIED_ID).is_none());
+    assert_eq!(
+        trace.item(DENIED_ALIAS).expect("denied row").stage,
+        RecallExplainStageV1::Denied
+    );
+    assert_eq!(
+        trace.item(WITHHELD_ALIAS).expect("withheld row").stage,
+        RecallExplainStageV1::HostWithheld
+    );
+    match &trace
+        .item(SECRET_ALIAS)
+        .expect("deduplicated row")
+        .host_decision
+    {
+        RecallExplainHostDecisionV1::Deduplicated {
+            duplicate_of_candidate_id,
+            ..
+        } => assert_eq!(duplicate_of_candidate_id, SURVIVOR_ALIAS),
+        other => panic!("secret id must be the deduplicated row, got {other:?}"),
+    }
+    assert_eq!(
+        trace
+            .item(SECRET_ALIAS)
+            .expect("deduplicated row")
+            .host_reason_detail
+            .as_deref(),
+        Some(
+            "duplicate_of=advisory.retained-identity-v1.0000000000000000000000000000000000000000000000000000000000000002"
+        )
+    );
+
+    let retained_bytes = serde_json::to_vec(&trace)?;
+    let retained = String::from_utf8(retained_bytes).expect("trace JSON is UTF-8");
+    for raw_id in [SECRET_ID, SURVIVOR_ID, WITHHELD_ID, DENIED_ID] {
+        assert!(
+            !retained.contains(raw_id),
+            "raw provider identity reached retained trace bytes: {raw_id}: {retained}"
+        );
+    }
+    for alias in [SECRET_ALIAS, SURVIVOR_ALIAS, WITHHELD_ALIAS, DENIED_ALIAS] {
+        assert!(retained.contains(alias), "retained alias missing: {alias}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn retained_trace_refuses_an_incomplete_identity_alias_map() -> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-missing-identity-alias",
+        &current_query(),
+        &authorized_exact(),
+        vec![distinct_candidate(
+            "source:/private/secret.txt#L1",
+            "a candidate whose retained identity must be explicit",
+        )],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native", 7);
+    let error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 7,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &BTreeMap::new(),
+        redactor: &CONTAINED,
+    })
+    .expect_err("a trace must never fall back to a raw provider identity");
+    assert!(matches!(
+        error,
+        RecallExplainTraceError::MissingIdentityAlias { candidate_id }
+            if candidate_id == "source:/private/secret.txt#L1"
+    ));
+    Ok(())
+}
+
+#[test]
+fn retained_trace_refuses_ambiguous_identity_aliases() -> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-ambiguous-identity-alias",
+        &current_query(),
+        &authorized_exact(),
+        vec![
+            distinct_candidate("source:/private/one.txt#L1", "one"),
+            distinct_candidate("source:/private/two.txt#L2", "two"),
+        ],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native", 7);
+    let aliases = BTreeMap::from([
+        (
+            "source:/private/one.txt#L1".to_owned(),
+            format!("{RETAINED_CANDIDATE_ID_PREFIX}{}", "a".repeat(64)),
+        ),
+        (
+            "source:/private/two.txt#L2".to_owned(),
+            format!("{RETAINED_CANDIDATE_ID_PREFIX}{}", "a".repeat(64)),
+        ),
+    ]);
+    let error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 7,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &aliases,
+        redactor: &CONTAINED,
+    })
+    .expect_err("ambiguous retained identities must refuse trace retention");
+    assert!(matches!(
+        error,
+        RecallExplainTraceError::IdentityAliasCollision {
+            candidate_id,
+            conflicting_candidate_id,
+            retained_identity,
+        } if candidate_id == "source:/private/two.txt#L2"
+            && conflicting_candidate_id == "source:/private/one.txt#L1"
+            && retained_identity
+                == "advisory.retained-identity-v1.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+    Ok(())
+}
+
+#[test]
+fn retained_trace_refuses_unsafe_raw_or_alias_chain_identities() -> Result<(), Box<dyn Error>> {
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-unsafe-retained-alias",
+        &current_query(),
+        &authorized_exact(),
+        vec![distinct_candidate("safe-candidate", "safe body")],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native", 1);
+    let aliases = BTreeMap::from([(
+        "safe-candidate".to_owned(),
+        "source:/private/secret.txt#L1".to_owned(),
+    )]);
+    let error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 1,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &aliases,
+        redactor: &CONTAINED,
+    })
+    .expect_err("path-bearing aliases must never cross the retained boundary");
+    assert!(matches!(
+        error,
+        RecallExplainTraceError::UnsafeIdentityAlias {
+            candidate_id,
+            retained_identity,
+        } if candidate_id == "safe-candidate"
+            && retained_identity == "source:/private/secret.txt#L1"
+    ));
+
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-alias-chain",
+        &current_query(),
+        &authorized_exact(),
+        vec![
+            distinct_candidate("safe-candidate", "safe body"),
+            distinct_candidate("other-candidate", "other body"),
+        ],
+    )?;
+    let report = report_attributed_to(&admission.report, "provider.native", 1);
+    let aliases = BTreeMap::from([
+        ("safe-candidate".to_owned(), "other-candidate".to_owned()),
+        (
+            "other-candidate".to_owned(),
+            "advisory.opaque.other".to_owned(),
+        ),
+    ]);
+    let error = build_recall_explain_trace(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 1,
+        report: &report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &[],
+        pack_identity_aliases: &aliases,
+        redactor: &CONTAINED,
+    })
+    .expect_err("an alias pointing at another provider key must be refused");
+    assert!(matches!(
+        error,
+        RecallExplainTraceError::UnsafeIdentityAlias {
+            candidate_id,
+            retained_identity,
+        } if candidate_id == "safe-candidate" && retained_identity == "other-candidate"
+    ));
+    Ok(())
+}
+
+#[test]
+fn retained_trace_sanitizes_host_withholding_detail_and_reason_code() -> Result<(), Box<dyn Error>>
+{
+    const SECRET_DETAIL: &str = "source:/private/Authorization-Bearer-SECRET-9a7f\n### forged";
+    let admission = admit_recall_candidates(
+        &admitted_scope(),
+        "request-sanitize-host-detail",
+        &current_query(),
+        &authorized_exact(),
+        vec![distinct_candidate("detail-candidate", "body")],
+    )?;
+    let withheld = [RecallExplainHostWithholdingV1 {
+        candidate_id: "detail-candidate".to_owned(),
+        reason_code: "host-reason\nforged".to_owned(),
+        detail: Some(SECRET_DETAIL.to_owned()),
+    }];
+    let trace = trace_of(RecallExplainTraceInputsV1 {
+        provider_id: "provider.native",
+        registration_revision: 1,
+        report: &admission.report,
+        normalization: None,
+        selection: None,
+        pack: None,
+        host_withheld: &withheld,
+        pack_identity_aliases: &no_aliases(),
+        redactor: &CONTAINED,
+    })?;
+    let item = trace.item("detail-candidate").expect("withheld trace row");
+    assert_eq!(item.host_reason_code, "host_reason_withheld");
+    assert_eq!(
+        item.host_reason_detail.as_deref(),
+        Some("host_detail_withheld")
+    );
+    let retained = serde_json::to_string(&trace)?;
+    assert!(!retained.contains(SECRET_DETAIL));
     Ok(())
 }

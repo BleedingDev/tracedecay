@@ -21,9 +21,11 @@ use core::fmt;
 /// Canonical Memory Provider V1 contract-set identity.
 pub const CONTRACT_SET_ID: &str = "tracedecay.memory.provider.contract-set.v1";
 /// SHA-256 of the canonical contract-set source.
-pub const CONTRACT_SET_SHA256: &str = "1ef1efaf0097c032a3717212e566063360327947ddef294db0df7abfa3644d15";
+pub const CONTRACT_SET_SHA256: &str =
+    "1ef1efaf0097c032a3717212e566063360327947ddef294db0df7abfa3644d15";
 /// SHA-256 of the generator that emitted this file.
-pub const GENERATOR_SHA256: &str = "12501dc6d3c2222acb157cd1a0cb465b3958c5e5a2fa630d0b7eeb812448d367";
+pub const GENERATOR_SHA256: &str =
+    "12501dc6d3c2222acb157cd1a0cb465b3958c5e5a2fa630d0b7eeb812448d367";
 
 /// Canonical exact-scope digest algorithm.
 pub const EXACT_SCOPE_DIGEST_ALGORITHM: &str = "sha256";
@@ -40,7 +42,8 @@ pub const EXACT_SCOPE_DIGEST_STRING_FIELDS: &[&str] = &[
     "resolved_scope_digest",
 ];
 /// Canonical framing for every exact-scope string field.
-pub const EXACT_SCOPE_DIGEST_STRING_FIELD_ENCODING: &str = "u64_big_endian_byte_length_then_utf8_bytes";
+pub const EXACT_SCOPE_DIGEST_STRING_FIELD_ENCODING: &str =
+    "u64_big_endian_byte_length_then_utf8_bytes";
 /// Canonical exact-scope digest output encoding.
 pub const EXACT_SCOPE_DIGEST_OUTPUT_ENCODING: &str = "lowercase_hex_64";
 /// Canonical string values for the fixed exact-scope digest golden vector.
@@ -54,7 +57,8 @@ pub const EXACT_SCOPE_DIGEST_GOLDEN_STRINGS: &[&str] = &[
     "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 ];
 /// Expected lowercase SHA-256 for the fixed exact-scope digest golden vector.
-pub const EXACT_SCOPE_DIGEST_GOLDEN_SHA256: &str = "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52";
+pub const EXACT_SCOPE_DIGEST_GOLDEN_SHA256: &str =
+    "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52";
 
 /// One canonical finite provider limit used during handshake negotiation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -159,13 +163,34 @@ pub const TERMINAL_DIAGNOSTIC_ID_MAX_BYTES: usize = 128;
 
 /// Conservative API-only terminal text bounds in field order.
 pub const TERMINAL_TEXT_LIMITS: &[TerminalTextLimitSpec] = &[
-    TerminalTextLimitSpec { field: "operation_id", maximum_bytes: TERMINAL_OPERATION_ID_MAX_BYTES },
-    TerminalTextLimitSpec { field: "committed_boundary", maximum_bytes: TERMINAL_COMMITTED_BOUNDARY_MAX_BYTES },
-    TerminalTextLimitSpec { field: "effect_item_ref", maximum_bytes: TERMINAL_EFFECT_ITEM_REF_MAX_BYTES },
-    TerminalTextLimitSpec { field: "reconciliation_action", maximum_bytes: TERMINAL_RECONCILIATION_ACTION_MAX_BYTES },
-    TerminalTextLimitSpec { field: "fallback_policy_id", maximum_bytes: TERMINAL_FALLBACK_POLICY_ID_MAX_BYTES },
-    TerminalTextLimitSpec { field: "fallback_reason", maximum_bytes: TERMINAL_FALLBACK_REASON_MAX_BYTES },
-    TerminalTextLimitSpec { field: "diagnostic_id", maximum_bytes: TERMINAL_DIAGNOSTIC_ID_MAX_BYTES },
+    TerminalTextLimitSpec {
+        field: "operation_id",
+        maximum_bytes: TERMINAL_OPERATION_ID_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "committed_boundary",
+        maximum_bytes: TERMINAL_COMMITTED_BOUNDARY_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "effect_item_ref",
+        maximum_bytes: TERMINAL_EFFECT_ITEM_REF_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "reconciliation_action",
+        maximum_bytes: TERMINAL_RECONCILIATION_ACTION_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "fallback_policy_id",
+        maximum_bytes: TERMINAL_FALLBACK_POLICY_ID_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "fallback_reason",
+        maximum_bytes: TERMINAL_FALLBACK_REASON_MAX_BYTES,
+    },
+    TerminalTextLimitSpec {
+        field: "diagnostic_id",
+        maximum_bytes: TERMINAL_DIAGNOSTIC_ID_MAX_BYTES,
+    },
 ];
 
 /// One canonical contract in the M1 authority set.
@@ -1469,15 +1494,21 @@ impl RetryClass {
             Self::AfterIdentityRefresh => "after_identity_refresh",
             Self::AfterStateRefreshOrRequestChange => "after_state_refresh_or_request_change",
             Self::AfterBackoffOrCapacityChange => "after_backoff_or_capacity_change",
-            Self::NewRequestOnlyAfterEffectReconciliation => "new_request_only_after_effect_reconciliation",
+            Self::NewRequestOnlyAfterEffectReconciliation => {
+                "new_request_only_after_effect_reconciliation"
+            }
             Self::AfterBoundedBackoffAndHealth => "after_bounded_backoff_and_health",
             Self::AfterOperatorResetOrMigration => "after_operator_reset_or_migration",
             Self::AfterMigrationOrCompatibleState => "after_migration_or_compatible_state",
             Self::ResumeOrNewRequest => "resume_or_new_request",
             Self::ResumeOrReconcileBeforeRetry => "resume_or_reconcile_before_retry",
             Self::ReconcileBeforeAnyRetry => "reconcile_before_any_retry",
-            Self::AfterImplementationFixAndEffectReconciliation => "after_implementation_fix_and_effect_reconciliation",
-            Self::AfterBoundedBackoffOrFixAndEffectReconciliation => "after_bounded_backoff_or_fix_and_effect_reconciliation",
+            Self::AfterImplementationFixAndEffectReconciliation => {
+                "after_implementation_fix_and_effect_reconciliation"
+            }
+            Self::AfterBoundedBackoffOrFixAndEffectReconciliation => {
+                "after_bounded_backoff_or_fix_and_effect_reconciliation"
+            }
         }
     }
 
@@ -1488,20 +1519,28 @@ impl RetryClass {
             "never" => Some(Self::Never),
             "after_request_change" => Some(Self::AfterRequestChange),
             "after_authorization_change" => Some(Self::AfterAuthorizationChange),
-            "after_provider_or_configuration_change" => Some(Self::AfterProviderOrConfigurationChange),
+            "after_provider_or_configuration_change" => {
+                Some(Self::AfterProviderOrConfigurationChange)
+            }
             "after_scope_admission" => Some(Self::AfterScopeAdmission),
             "after_identity_refresh" => Some(Self::AfterIdentityRefresh),
             "after_state_refresh_or_request_change" => Some(Self::AfterStateRefreshOrRequestChange),
             "after_backoff_or_capacity_change" => Some(Self::AfterBackoffOrCapacityChange),
-            "new_request_only_after_effect_reconciliation" => Some(Self::NewRequestOnlyAfterEffectReconciliation),
+            "new_request_only_after_effect_reconciliation" => {
+                Some(Self::NewRequestOnlyAfterEffectReconciliation)
+            }
             "after_bounded_backoff_and_health" => Some(Self::AfterBoundedBackoffAndHealth),
             "after_operator_reset_or_migration" => Some(Self::AfterOperatorResetOrMigration),
             "after_migration_or_compatible_state" => Some(Self::AfterMigrationOrCompatibleState),
             "resume_or_new_request" => Some(Self::ResumeOrNewRequest),
             "resume_or_reconcile_before_retry" => Some(Self::ResumeOrReconcileBeforeRetry),
             "reconcile_before_any_retry" => Some(Self::ReconcileBeforeAnyRetry),
-            "after_implementation_fix_and_effect_reconciliation" => Some(Self::AfterImplementationFixAndEffectReconciliation),
-            "after_bounded_backoff_or_fix_and_effect_reconciliation" => Some(Self::AfterBoundedBackoffOrFixAndEffectReconciliation),
+            "after_implementation_fix_and_effect_reconciliation" => {
+                Some(Self::AfterImplementationFixAndEffectReconciliation)
+            }
+            "after_bounded_backoff_or_fix_and_effect_reconciliation" => {
+                Some(Self::AfterBoundedBackoffOrFixAndEffectReconciliation)
+            }
             _ => None,
         }
     }

@@ -2632,11 +2632,7 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
         observation_candidate_fields(&source, &exact),
     );
     let (common_composition, common_recording) = compose_profile_fixture(common, true);
-    let port = mount(
-        common_composition,
-        Arc::new(LedgerObserver::default()),
-    )
-    .unwrap();
+    let port = mount(common_composition, Arc::new(LedgerObserver::default())).unwrap();
     let outcome = port
         .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
@@ -2655,11 +2651,7 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
     )]);
     let (legacy_composition, legacy_recording) = compose_profile_fixture(legacy, false);
     assert_eq!(common_recording.descriptor(), legacy_recording.descriptor());
-    let port = mount(
-        legacy_composition,
-        Arc::new(LedgerObserver::default()),
-    )
-    .unwrap();
+    let port = mount(legacy_composition, Arc::new(LedgerObserver::default())).unwrap();
     let outcome = port
         .recall_admitted_with_history(
             request(scope, 60_000_000, false),
@@ -2682,10 +2674,9 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
             .authorizes(ScopeBinding::ProfileFacts)
     );
     assert!(outcome.original_sources.is_empty());
-    let recall_capability = OwnedVersionedId::new(
-        tracedecay_memory_provider_registry::RECALL_QUERY_CAPABILITY_ID,
-    )
-    .unwrap();
+    let recall_capability =
+        OwnedVersionedId::new(tracedecay_memory_provider_registry::RECALL_QUERY_CAPABILITY_ID)
+            .unwrap();
     let common_capabilities = BTreeSet::from([
         recall_capability.clone(),
         OwnedVersionedId::new(tracedecay_memory_provider_registry::COMMON_ADVISORY_PROFILE_ID)

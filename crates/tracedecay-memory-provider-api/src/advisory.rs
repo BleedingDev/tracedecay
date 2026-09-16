@@ -560,6 +560,10 @@ impl RestoreDispositionCheckpoint {
 pub enum LifecycleTargetReference {
     /// Stable provider memory reference preserved across admitted requests.
     StableMemoryRef(String),
+    /// Opaque host-retained locator resolved by the producing provider from the
+    /// freshly authorized source binding. The value is never a provider stable
+    /// reference and must remain opaque across the host/provider boundary.
+    RetainedSourceLocator(String),
     /// Retained recall trace that resolves to the original candidate/source.
     RecallTraceRef(String),
     /// Retained context-pack item that resolves to the producing provider.
@@ -597,6 +601,7 @@ impl LifecycleTarget {
         self.source.validate()?;
         let value = match &self.reference {
             LifecycleTargetReference::StableMemoryRef(value)
+            | LifecycleTargetReference::RetainedSourceLocator(value)
             | LifecycleTargetReference::RecallTraceRef(value)
             | LifecycleTargetReference::ContextPackItemRef(value) => value,
         };

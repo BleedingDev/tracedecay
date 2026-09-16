@@ -2919,7 +2919,9 @@ mod tests {
         value["warnings"] = json!(["host: no provider reply was witnessed"]);
         let retained: ProviderControlResultV1 =
             serde_json::from_value(value.clone()).expect("retained host uncertainty");
-        retained.validate_for(request).expect("unknown without a provider reply");
+        retained
+            .validate_for(request)
+            .expect("unknown without a provider reply");
         assert!(retained.effect.provider_receipt_digest.is_none());
 
         let mut observed = value.clone();
@@ -2964,7 +2966,10 @@ mod tests {
             malformed[field] = bad;
             let rejected = serde_json::from_value::<ProviderControlResultV1>(malformed)
                 .map_or(true, |result| result.validate_for(request).is_err());
-            assert!(rejected, "host uncertainty must retain the {field} contract");
+            assert!(
+                rejected,
+                "host uncertainty must retain the {field} contract"
+            );
         }
     }
 

@@ -28,6 +28,7 @@ pub(super) fn encode_audit_payload(
 }
 
 pub(super) const CONFIGURATION_AUDIT_REDACTION_KEY_BYTES: usize = 32;
+const RECALL_LOCATOR_SUBKEY_DOMAIN: &[u8] = b"tracedecay.recall-locator-redaction-subkey.v1";
 
 pub(super) async fn read_audit_redaction_key(
     transaction: &impl QueryExecutor,
@@ -73,6 +74,24 @@ pub(super) async fn ensure_audit_redaction_key(
         .await
         .map_err(unavailable_store)?;
     Ok(material)
+}
+
+/// Derives an independent recall projection key from the durable audit key.
+/// The audit key itself remains reserved for configuration audit commitments;
+/// a domain-separated HMAC prevents cross-subsystem key reuse.
+pub(super) fn derive_recall_locator_key(
+    audit_key: &[u8],
+) -> ConfigurationStoreResult<Zeroizing<Vec<u8>>> {
+    if audit_key.len() != CONFIGURATION_AUDIT_REDACTION_KEY_BYTES {
+        return Err(invalid_store_data(
+            "configuration audit redaction key is not canonical",
+        ));
+    }
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(audit_key)
+        .map_err(|_| invalid_store_data("configuration audit redaction key is invalid"))?;
+    mac.update(&(RECALL_LOCATOR_SUBKEY_DOMAIN.len() as u64).to_be_bytes());
+    mac.update(RECALL_LOCATOR_SUBKEY_DOMAIN);
+    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
 
 pub(super) fn audit_target_commitment(
@@ -525,4 +544,106 @@ pub(super) async fn audit_from_transaction(
         events.push(event);
     }
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY_TABLE_SQL: &str = "
+        CREATE TABLE configuration_audit_redaction_keys (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            key_material BLOB NOT NULL CHECK (length(key_material) = 32),
+            created_at INTEGER NOT NULL
+        )";
+
+    #[tokio::test]
+    async fn audit_redaction_key_persists_and_reopens_stably() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configuration.db");
+        let first = {
+            let connection = tracedecay_runtime_core::db::engine::TestConnection::open(&path);
+            connection.execute_batch(KEY_TABLE_SQL).await.unwrap();
+            ensure_audit_redaction_key(&connection, UtcMicros(11))
+                .await
+                .unwrap()
+                .to_vec()
+        };
+
+        let reopened = tracedecay_runtime_core::db::engine::TestConnection::open(&path);
+        let second = ensure_audit_redaction_key(&reopened, UtcMicros(22))
+            .await
+            .unwrap()
+            .to_vec();
+        assert_eq!(first, second);
+
+        let stored = read_audit_redaction_key(&reopened).await.unwrap().unwrap();
+        assert_eq!(stored.as_slice(), first.as_slice());
+    }
+
+    #[tokio::test]
+    async fn malformed_persisted_audit_redaction_key_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("configuration.db");
+        let connection = tracedecay_runtime_core::db::engine::TestConnection::open(&path);
+        connection
+            .execute_batch(
+                "CREATE TABLE configuration_audit_redaction_keys (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    key_material BLOB NOT NULL,
+                    created_at INTEGER NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO configuration_audit_redaction_keys
+                 (singleton, key_material, created_at) VALUES (1, ?1, ?2)",
+                params![
+                    vec![0_u8; CONFIGURATION_AUDIT_REDACTION_KEY_BYTES - 1],
+                    11_i64
+                ],
+            )
+            .await
+            .unwrap();
+
+        let error = read_audit_redaction_key(&connection).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigurationStoreError::InvalidData(message)
+                if message.contains("redaction key is not canonical")
+        ));
+    }
+
+    #[test]
+    fn recall_locator_key_uses_a_domain_separated_hmac() {
+        let audit_key = vec![0x42_u8; CONFIGURATION_AUDIT_REDACTION_KEY_BYTES];
+        let derived = derive_recall_locator_key(&audit_key).unwrap();
+
+        let mut expected = <Hmac<Sha256> as KeyInit>::new_from_slice(&audit_key).unwrap();
+        expected.update(&(RECALL_LOCATOR_SUBKEY_DOMAIN.len() as u64).to_be_bytes());
+        expected.update(RECALL_LOCATOR_SUBKEY_DOMAIN);
+        let expected = expected.finalize().into_bytes().to_vec();
+        assert_eq!(derived.as_slice(), expected.as_slice());
+
+        let mut alternate_domain = <Hmac<Sha256> as KeyInit>::new_from_slice(&audit_key).unwrap();
+        let alternate_domain_bytes = b"tracedecay.configuration-audit.v1";
+        alternate_domain.update(&(alternate_domain_bytes.len() as u64).to_be_bytes());
+        alternate_domain.update(alternate_domain_bytes);
+        let alternate = alternate_domain.finalize().into_bytes();
+        assert_ne!(derived.as_slice(), alternate.as_slice());
+        assert_ne!(derived.as_slice(), audit_key.as_slice());
+    }
+
+    #[test]
+    fn recall_locator_key_rejects_noncanonical_audit_key_lengths() {
+        let error = derive_recall_locator_key(&[0_u8; CONFIGURATION_AUDIT_REDACTION_KEY_BYTES - 1])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigurationStoreError::InvalidData(message)
+                if message.contains("redaction key is not canonical")
+        ));
+    }
 }

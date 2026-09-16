@@ -1346,13 +1346,9 @@ async fn open_registered_test_database_with(
 ) -> tracedecay_domain::errors::Result<(RegisteredGlobalDbLeaseV1, RegisteredGlobalDbOwnerV1)> {
     // Erase the instrumented publication future before it enters the shared
     // fixture layout; otherwise every host-admission caller inherits its depth.
-    let open: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>> =
-        Box::pin(open_registered_test_database_with_identity(
-            path,
-            scope,
-            write_authority,
-            None,
-        ));
+    let open: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>> = Box::pin(
+        open_registered_test_database_with_identity(path, scope, write_authority, None),
+    );
     open.await
 }
 

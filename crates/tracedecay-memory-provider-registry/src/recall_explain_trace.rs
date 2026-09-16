@@ -45,6 +45,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::recall_admission::{RecallAdmissionReport, RecallDenialReason};
+
+/// Prefix for host-minted candidate identities in retained traces.
+///
+/// The host composition supplies the keyed projection. This crate validates
+/// only its closed wire shape; it never derives or accepts an unhashed
+/// provider identity as a retained alias.
+pub const RETAINED_CANDIDATE_ID_PREFIX: &str = "advisory.retained-identity-v1.";
 use crate::recall_context_pack::{
     ContextItemProvenanceV1, ContextPackV1, ProviderExclusionReason, uncontained_item_identity,
 };
@@ -239,7 +246,9 @@ impl RecallExplainHostDecisionV1 {
                     ))
                 }
             },
-            Self::HostWithheld { detail, .. } => detail.clone(),
+            Self::HostWithheld { detail, .. } => {
+                detail.as_deref().map(|_| "host_detail_withheld".to_owned())
+            }
             Self::PackExcluded { reason } => provider_exclusion_reason_detail(reason),
         }
     }
@@ -323,11 +332,22 @@ fn denial_reason_detail(reason: &RecallDenialReason) -> Option<String> {
         RecallDenialReason::ScopeMismatch { field }
         | RecallDenialReason::UnknownIdentity { field }
         | RecallDenialReason::ForbiddenIdentity { field } => Some(format!("field={field:?}")),
-        RecallDenialReason::InvalidValidityRecord { detail }
-        | RecallDenialReason::InvalidSourceAttribution { detail } => Some(detail.clone()),
+        // These diagnostics originate in provider-controlled payloads. Keep
+        // only the typed denial label; the original parser text can contain a
+        // source path, candidate id, or other secret-looking bytes.
+        RecallDenialReason::InvalidValidityRecord { .. } => {
+            Some("provider_validity_detail_withheld".to_owned())
+        }
+        RecallDenialReason::InvalidSourceAttribution { .. } => {
+            Some("provider_source_detail_withheld".to_owned())
+        }
         RecallDenialReason::RequestExcluded { field } => Some(format!("field={field}")),
-        RecallDenialReason::NativeScoreMalformed { defect } => Some(format!("{defect:?}")),
-        RecallDenialReason::ConfidenceMalformed { defect } => Some(format!("{defect:?}")),
+        RecallDenialReason::NativeScoreMalformed { defect } => {
+            Some(format!("native_score_defect={}", defect.label()))
+        }
+        RecallDenialReason::ConfidenceMalformed { defect } => {
+            Some(format!("confidence_defect={}", defect.label()))
+        }
         RecallDenialReason::StaleIdentity
         | RecallDenialReason::NotYetValid
         | RecallDenialReason::Expired
@@ -602,6 +622,17 @@ impl RecallExplainTraceV1 {
 /// would read as a complete account of the recall.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RecallExplainTraceError {
+    /// The admission report was produced under a different routed provider or
+    /// registration revision than the attribution attached to the trace.
+    ///
+    /// The values are deliberately omitted from the error. Provider ids can
+    /// contain provider-controlled or otherwise private metadata, and a
+    /// failed trace must not turn them into a diagnostic side channel.
+    #[error("admission report attribution does not match the explain trace {field}")]
+    AdmissionAttributionMismatch {
+        /// Attribution field that failed the host-owned equality check.
+        field: &'static str,
+    },
     /// The admission report's received count and its received-identity ledger
     /// disagree.
     #[error(
@@ -650,6 +681,37 @@ pub enum RecallExplainTraceError {
         /// The unaccounted identity.
         candidate_id: String,
     },
+    /// The host did not provide the retained identity for one provider
+    /// candidate. A trace cannot fall back to the provider bytes because the
+    /// candidate id is rendered and retained as metadata.
+    #[error("candidate {candidate_id} has no retained identity alias")]
+    MissingIdentityAlias {
+        /// Provider identity that was not mapped to a retained identity.
+        candidate_id: String,
+    },
+    /// Two provider candidates were mapped to one retained identity. The
+    /// trace would be ambiguous for both audit lookup and control metadata.
+    #[error(
+        "candidates {candidate_id} and {conflicting_candidate_id} share retained identity \
+         {retained_identity}"
+    )]
+    IdentityAliasCollision {
+        /// Candidate whose alias was encountered second.
+        candidate_id: String,
+        /// Candidate whose alias occupied the retained identity first.
+        conflicting_candidate_id: String,
+        /// The duplicated retained identity.
+        retained_identity: String,
+    },
+    /// A retained identity contains provider-controlled path, control, or
+    /// alias-chain syntax. Such a value cannot be written to the trace.
+    #[error("candidate {candidate_id} has an unsafe retained identity {retained_identity}")]
+    UnsafeIdentityAlias {
+        /// Provider candidate whose projection was unsafe.
+        candidate_id: String,
+        /// Rejected retained value.
+        retained_identity: String,
+    },
 }
 
 /// Everything one explain trace is reconciled from.
@@ -674,14 +736,18 @@ pub struct RecallExplainTraceInputsV1<'inputs> {
     /// Candidates a host stage between selection and pack compilation
     /// withheld. Empty when no such stage withheld anything.
     pub host_withheld: &'inputs [RecallExplainHostWithholdingV1],
-    /// Identities the host substituted between selection and pack
-    /// compilation, as `provider candidate id -> identity the pack recorded`.
+    /// Complete retained identities for provider candidate ids, as
+    /// `provider candidate id -> retained host identity`.
     ///
     /// A host that refuses a provider's own candidate identity renders the
     /// item under a minted stand-in, so the pack's rows no longer carry the
     /// identity selection used. Without this mapping the reconciliation would
-    /// lose exactly the rows a hostile provider produced. Empty when the host
-    /// substituted nothing.
+    /// lose exactly the rows a hostile provider produced. Production supplies
+    /// an entry for every returned identity, including candidates denied
+    /// before normalization and candidates withheld before pack compilation;
+    /// unchanged identities map to themselves. The builder keeps the source
+    /// ids for internal matching and applies this map only to retained trace
+    /// fields. A missing or duplicated retained identity is refused.
     pub pack_identity_aliases: &'inputs BTreeMap<String, String>,
     /// The gate that decides what of each provider explanation is retained.
     pub redactor: &'inputs dyn RecallExplanationRedactorV1,
@@ -702,6 +768,7 @@ fn place(
     slots: &mut [Option<RecallExplainItemV1>],
     rank_of: &BTreeMap<&str, usize>,
     candidate_id: &str,
+    identity_aliases: &BTreeMap<String, String>,
     decision: RecallExplainHostDecisionV1,
     provider_explanation: RecallExplainProviderExplanationV1,
 ) -> Result<(), RecallExplainTraceError> {
@@ -712,6 +779,12 @@ fn place(
             stage: stage.label(),
         });
     };
+    let retained_identity = identity_aliases.get(candidate_id).ok_or_else(|| {
+        RecallExplainTraceError::MissingIdentityAlias {
+            candidate_id: candidate_id.to_owned(),
+        }
+    })?;
+    let decision = retain_decision_identity(decision, identity_aliases)?;
     let Some(slot) = slots.get_mut(rank) else {
         return Err(RecallExplainTraceError::UnknownCandidate {
             candidate_id: candidate_id.to_owned(),
@@ -732,7 +805,7 @@ fn place(
         _ => (None, None),
     };
     *slot = Some(RecallExplainItemV1 {
-        candidate_id: candidate_id.to_owned(),
+        candidate_id: retained_identity.clone(),
         provider_rank: rank,
         stage,
         host_reason_code: decision.code().to_owned(),
@@ -743,6 +816,106 @@ fn place(
         tokens,
     });
     Ok(())
+}
+
+/// Rewrites identity-bearing host details after the stage has been matched by
+/// the provider id. Deduplication is the only decision whose derived detail
+/// contains another candidate id; rebuilding the variant makes its
+/// `host_reason_detail` use the same retained identity as the row.
+fn retain_decision_identity(
+    decision: RecallExplainHostDecisionV1,
+    identity_aliases: &BTreeMap<String, String>,
+) -> Result<RecallExplainHostDecisionV1, RecallExplainTraceError> {
+    match decision {
+        RecallExplainHostDecisionV1::Deduplicated {
+            duplicate_of_candidate_id,
+            reason,
+        } => Ok(RecallExplainHostDecisionV1::Deduplicated {
+            duplicate_of_candidate_id: identity_aliases
+                .get(&duplicate_of_candidate_id)
+                .ok_or_else(|| RecallExplainTraceError::MissingIdentityAlias {
+                    candidate_id: duplicate_of_candidate_id.clone(),
+                })?
+                .clone(),
+            reason,
+        }),
+        decision => Ok(decision),
+    }
+}
+
+fn validate_identity_aliases(
+    report: &RecallAdmissionReport,
+    identity_aliases: &BTreeMap<String, String>,
+) -> Result<(), RecallExplainTraceError> {
+    let raw_ids = report
+        .received_candidate_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut retained_to_provider = BTreeMap::new();
+    for candidate_id in &report.received_candidate_ids {
+        let Some(retained_identity) = identity_aliases.get(candidate_id) else {
+            return Err(RecallExplainTraceError::MissingIdentityAlias {
+                candidate_id: candidate_id.clone(),
+            });
+        };
+        if !safe_retained_identity(candidate_id, retained_identity, &raw_ids, identity_aliases) {
+            return Err(RecallExplainTraceError::UnsafeIdentityAlias {
+                candidate_id: candidate_id.clone(),
+                retained_identity: retained_identity.clone(),
+            });
+        }
+        if let Some(conflicting_candidate_id) =
+            retained_to_provider.insert(retained_identity.as_str(), candidate_id.as_str())
+        {
+            return Err(RecallExplainTraceError::IdentityAliasCollision {
+                candidate_id: candidate_id.clone(),
+                conflicting_candidate_id: conflicting_candidate_id.to_owned(),
+                retained_identity: retained_identity.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks the bytes that may cross the retained trace boundary. Production
+/// supplies canonical context-bound aliases. Raw ids, path syntax, controls,
+/// and alias chains are refused, even when a caller labels them as aliases.
+fn safe_retained_identity(
+    candidate_id: &str,
+    retained_identity: &str,
+    raw_ids: &BTreeSet<&str>,
+    identity_aliases: &BTreeMap<String, String>,
+) -> bool {
+    if !is_canonical_retained_identity(retained_identity) {
+        return false;
+    }
+    // A value that is another provider key would create an alias chain or
+    // re-introduce a raw identity during a later stage lookup.
+    if raw_ids.contains(retained_identity) && retained_identity != candidate_id {
+        return false;
+    }
+    !identity_aliases
+        .keys()
+        .any(|key| key != candidate_id && key == retained_identity)
+}
+
+fn is_canonical_retained_identity(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(RETAINED_CANDIDATE_ID_PREFIX) else {
+        return false;
+    };
+    let (digest, disambiguator) = suffix
+        .split_once('.')
+        .map_or((suffix, None), |(digest, suffix)| (digest, Some(suffix)));
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && disambiguator.is_none_or(|suffix| {
+            !suffix.is_empty()
+                && !suffix.starts_with('0')
+                && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn explanation_for(
@@ -787,6 +960,17 @@ pub fn build_recall_explain_trace(
         redactor,
     } = inputs;
 
+    if report.provider_id.as_deref() != Some(provider_id) {
+        return Err(RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "provider_id",
+        });
+    }
+    if report.registration_revision != Some(registration_revision) {
+        return Err(RecallExplainTraceError::AdmissionAttributionMismatch {
+            field: "registration_revision",
+        });
+    }
+
     if report.received_candidate_ids.len() != report.received_count {
         return Err(RecallExplainTraceError::ReceivedLedgerMismatch {
             received_count: report.received_count,
@@ -801,6 +985,7 @@ pub fn build_recall_explain_trace(
             });
         }
     }
+    validate_identity_aliases(report, pack_identity_aliases)?;
     let mut slots: Vec<Option<RecallExplainItemV1>> =
         vec![None; report.received_candidate_ids.len()];
 
@@ -809,8 +994,9 @@ pub fn build_recall_explain_trace(
             &mut slots,
             &rank_of,
             &denied.candidate_id,
+            pack_identity_aliases,
             RecallExplainHostDecisionV1::Denied {
-                reason: denied.reason.clone(),
+                reason: denied.reason.retained_for_trace(),
             },
             // A denied candidate never reached normalization, so the host
             // never retained its explanation. This is a typed absence, not a
@@ -825,6 +1011,7 @@ pub fn build_recall_explain_trace(
                 &mut slots,
                 &rank_of,
                 &dedup.candidate_id,
+                pack_identity_aliases,
                 RecallExplainHostDecisionV1::Deduplicated {
                     duplicate_of_candidate_id: dedup.duplicate_of_candidate_id.clone(),
                     reason: dedup.reason,
@@ -837,6 +1024,7 @@ pub fn build_recall_explain_trace(
                 &mut slots,
                 &rank_of,
                 &excluded.candidate_id,
+                pack_identity_aliases,
                 RecallExplainHostDecisionV1::BudgetExcluded {
                     host_order_position: excluded.host_order_position,
                     reason: excluded.reason,
@@ -853,9 +1041,13 @@ pub fn build_recall_explain_trace(
             &mut slots,
             &rank_of,
             &withholding.candidate_id,
+            pack_identity_aliases,
             RecallExplainHostDecisionV1::HostWithheld {
-                reason_code: withholding.reason_code.clone(),
-                detail: withholding.detail.clone(),
+                reason_code: sanitize_host_reason_code(&withholding.reason_code),
+                detail: withholding
+                    .detail
+                    .as_deref()
+                    .map(|_| "host_detail_withheld".to_owned()),
             },
             explanation_for(normalization, redactor, &withholding.candidate_id),
         )?;
@@ -872,7 +1064,11 @@ pub fn build_recall_explain_trace(
                 Some(pack) => pack_decision(
                     pack,
                     candidate_id,
-                    pack_identity_aliases.get(candidate_id).map(String::as_str),
+                    pack_identity_aliases.get(candidate_id).ok_or_else(|| {
+                        RecallExplainTraceError::MissingIdentityAlias {
+                            candidate_id: candidate_id.to_owned(),
+                        }
+                    })?,
                 )
                 .ok_or_else(|| RecallExplainTraceError::CandidateUnaccounted {
                     candidate_id: candidate_id.to_owned(),
@@ -882,6 +1078,7 @@ pub fn build_recall_explain_trace(
                 &mut slots,
                 &rank_of,
                 candidate_id,
+                pack_identity_aliases,
                 decision,
                 explanation_for(normalization, redactor, candidate_id),
             )?;
@@ -908,8 +1105,14 @@ pub fn build_recall_explain_trace(
             (None, None) => RecallExplainHostDecisionV1::NormalizationUnavailable,
         };
         let provider_explanation = explanation_for(normalization, redactor, candidate_id);
+        let decision = retain_decision_identity(decision, pack_identity_aliases)?;
         *slot = Some(RecallExplainItemV1 {
-            candidate_id: candidate_id.clone(),
+            candidate_id: pack_identity_aliases
+                .get(candidate_id)
+                .ok_or_else(|| RecallExplainTraceError::MissingIdentityAlias {
+                    candidate_id: candidate_id.clone(),
+                })?
+                .clone(),
             provider_rank: rank,
             stage: decision.stage(),
             host_reason_code: decision.code().to_owned(),
@@ -958,6 +1161,22 @@ pub fn build_recall_explain_trace(
     })
 }
 
+/// Keeps only the closed host reason-code vocabulary at the retained
+/// boundary. Unknown or malformed stage labels are still represented, but
+/// under one opaque host-owned code rather than copying provider bytes.
+fn sanitize_host_reason_code(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        value.to_owned()
+    } else {
+        "host_reason_withheld".to_owned()
+    }
+}
+
 /// The pack's verdict for one selected candidate.
 ///
 /// A containment refusal is recorded under a host-minted stand-in identity —
@@ -966,9 +1185,8 @@ pub fn build_recall_explain_trace(
 fn pack_decision(
     pack: &ContextPackV1,
     candidate_id: &str,
-    pack_identity: Option<&str>,
+    pack_identity: &str,
 ) -> Option<RecallExplainHostDecisionV1> {
-    let pack_identity = pack_identity.unwrap_or(candidate_id);
     let injected = pack.items().find_map(|item| match &item.provenance {
         ContextItemProvenanceV1::Provider {
             candidate_id: item_candidate_id,
