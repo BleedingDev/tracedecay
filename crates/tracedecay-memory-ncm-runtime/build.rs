@@ -3,12 +3,15 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 const WORKER_MANIFEST: &str = "../../product/ncm/reference/worker-manifest.json";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    println!("cargo:rerun-if-changed={WORKER_MANIFEST}");
+    let mut output = io::BufWriter::new(io::stdout().lock());
+    writeln!(output, "cargo:rerun-if-changed={WORKER_MANIFEST}")?;
+    output.flush()?;
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
     let profile_dir = out_dir
