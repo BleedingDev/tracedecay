@@ -660,6 +660,7 @@ fn replay_state_digest_prefix(
                 "fence anchor checkpoint projection mismatch",
             ));
         }
+        validate_checkpoint_chain(store, checkpoint.seq, &envelope.kernel, &meta, capsules)?;
         (envelope.kernel, checkpoint.seq)
     } else {
         let mut kernel = NcmKernel::new(store.identity().seed, config)
