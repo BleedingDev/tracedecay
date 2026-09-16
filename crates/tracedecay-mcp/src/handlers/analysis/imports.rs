@@ -105,8 +105,8 @@ pub async fn handle_unused_imports(
         })
         .filter(|file| {
             cursor.as_ref().is_none_or(|cursor| match cursor {
-                ScanCursor::AfterPath(after) => file.path.as_str() > after,
-                ScanCursor::WithinFile { path, .. } => file.path.as_str() >= path,
+                ScanCursor::AfterPath(after) => file.path.as_str() > after.as_str(),
+                ScanCursor::WithinFile { path, .. } => file.path.as_str() >= path.as_str(),
             })
         })
         .collect::<Vec<_>>();
@@ -285,7 +285,8 @@ fn read_sources(
         let source = match graph.read_indexed_source_file(&file.path) {
             Ok(source) => source,
             Err(error) => {
-                incomplete.push(incomplete_file(&file.path, reason_code_for(&error)));
+                let reason_code = reason_code_for(&error);
+                incomplete.push(incomplete_file(&file.path, &reason_code));
                 continue;
             }
         };
@@ -545,11 +546,11 @@ fn incomplete_file(path: &str, reason: &str) -> Value {
     json!({ "file": path, "reason_code": reason })
 }
 
-fn reason_code_for(error: &TraceDecayError) -> &'static str {
-    error
-        .project_route_context()
-        .map(|context| context.0)
-        .unwrap_or("source_read_unavailable")
+fn reason_code_for(error: &TraceDecayError) -> String {
+    error.project_route_context().map_or_else(
+        || "source_read_unavailable".to_owned(),
+        |context| context.0.to_owned(),
+    )
 }
 
 fn ensure_request_open(context: &tracedecay_contracts::RequestContext) -> Result<()> {

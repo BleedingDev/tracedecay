@@ -438,6 +438,7 @@ async fn admit_hook_v2_envelope_with_lifecycle(
     native_session_id: Option<SessionId>,
     mount: Option<HookV2LifecycleMountV1<'_>>,
     host_response_available: bool,
+    live_origin: Option<LiveOriginAdmissionV1<'_>>,
     now: UtcMicros,
 ) -> HookV2AdmissionOutcomeV1 {
     Box::pin(admit_hook_v2_envelope_with_lifecycle_inner(
@@ -446,6 +447,7 @@ async fn admit_hook_v2_envelope_with_lifecycle(
         native_session_id,
         mount,
         host_response_available,
+        live_origin,
         now,
     ))
     .await

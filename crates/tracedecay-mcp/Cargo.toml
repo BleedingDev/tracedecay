@@ -73,6 +73,7 @@ tracedecay-maintenance = { path = "../tracedecay-maintenance", version = "0.1.0"
 tracedecay-mcp-catalog = { path = "../tracedecay-mcp-catalog", version = "0.1.0" }
 tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
 tracedecay-project = { path = "../tracedecay-project", version = "0.1.0-beta.37" }
+tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
 tracedecay-session-memory = { path = "../tracedecay-session-memory", version = "0.1.0" }

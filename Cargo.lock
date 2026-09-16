@@ -6698,6 +6698,7 @@ dependencies = [
  "tracedecay-maintenance",
  "tracedecay-mcp-catalog",
  "tracedecay-privacy",
+ "tracedecay-private-fs",
  "tracedecay-project",
  "tracedecay-query",
  "tracedecay-runtime-core",
