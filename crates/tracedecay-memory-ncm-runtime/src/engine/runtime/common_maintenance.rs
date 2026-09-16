@@ -442,6 +442,9 @@ fn no_change_reply(
     cursor: u64,
 ) -> EngineReply {
     EngineReply::new(
+        // The engine outcome has no coverage-partial variant.  The typed
+        // payload marker is preserved here; the NCM adapter projects it to
+        // TerminalCode::Partial before exposing the reply to the host.
         Outcome::Success,
         generation,
         json!({
