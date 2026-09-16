@@ -405,6 +405,7 @@ pub struct ProjectMemoryProviderHostMountV1 {
         Arc<provider_history::ProviderHistoryAuthorityMountV1>,
     )>,
     cognitive_recall_mount: Option<Arc<ProjectCognitiveRecallMountV1>>,
+    native_session_retrieval_mount: Option<Arc<native_authority::NativeSessionRetrievalMountV1>>,
     locator_key: cognitive_recall::control_attribution::RecallLocatorKeyV1,
 }
 
@@ -430,6 +431,18 @@ impl ProjectMemoryProviderHostMountV1 {
     /// provider. The route remains owned by this same host generation.
     pub fn cognitive_recall_mount(&self) -> Option<Arc<ProjectCognitiveRecallMountV1>> {
         self.cognitive_recall_mount.as_ref().map(Arc::clone)
+    }
+
+    /// Binds the canonical project session retrieval service to the Native
+    /// owner that was constructed during core composition.
+    pub fn bind_session_retrieval(
+        &self,
+        retrieval: Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
+    ) -> Result<(), String> {
+        let Some(mount) = self.native_session_retrieval_mount.as_ref() else {
+            return Ok(());
+        };
+        mount.bind(retrieval).map_err(str::to_owned)
     }
 }
 
@@ -671,6 +684,7 @@ pub async fn mount_project_memory_provider_host(
             composition: Arc::new(ProjectMemoryProviderComposition::Disabled),
             observation_provider_mounts: Vec::new(),
             cognitive_recall_mount: None,
+            native_session_retrieval_mount: None,
             locator_key,
         }));
     }
@@ -678,6 +692,7 @@ pub async fn mount_project_memory_provider_host(
     let mut selected = None;
     let mut observers = Vec::new();
     let mut observation_provider_mounts = Vec::new();
+    let mut native_session_retrieval_mount = None;
     for (kind, participation) in [
         (MemoryProviderKindV1::Native, inputs.activation.native),
         (MemoryProviderKindV1::Ncm, inputs.activation.ncm),
@@ -706,9 +721,16 @@ pub async fn mount_project_memory_provider_host(
             MemoryProviderKindV1::Native => {
                 async {
                     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&inputs.graph)));
-                    let port = native_provider::project_native_memory_application_port_off_runtime(
+                    let session_retrieval = Arc::new(
+                        native_authority::NativeSessionRetrievalMountV1::for_project(
+                            inputs.profile_id.clone(),
+                            inputs.scope.clone(),
+                        ),
+                    );
+                    let port = native_provider::project_native_memory_application_port_off_runtime_with_session_retrieval(
                         graph_cell,
                         inputs.canonical_project_path.clone(),
+                        Arc::clone(&session_retrieval),
                     )
                     .await
                     .map_err(|error| {
@@ -747,6 +769,10 @@ pub async fn mount_project_memory_provider_host(
                             ObservationMountActivationV1::AfterPublication
                         },
                     };
+                    // The provider registration owns the port, while the
+                    // host retains this handle to bind the canonical session
+                    // service after full application admission.
+                    native_session_retrieval_mount = Some(session_retrieval);
                     Ok((registration, mount))
                 }
                 .await
@@ -875,6 +901,7 @@ pub async fn mount_project_memory_provider_host(
         composition,
         observation_provider_mounts,
         cognitive_recall_mount,
+        native_session_retrieval_mount,
         locator_key,
     }))
 }
@@ -1123,9 +1150,7 @@ pub async fn mount_project_memory_provider_full(
 }
 
 #[cfg(feature = "memory-provider-host")]
-async fn shutdown_partial_provider_journeys(
-    journeys: &[Arc<ProjectObservationJourneyMountV1>],
-) {
+async fn shutdown_partial_provider_journeys(journeys: &[Arc<ProjectObservationJourneyMountV1>]) {
     let deadline = tokio::time::Instant::now() + crate::TASK_ABORT_DEADLINE;
     for journey in journeys {
         for failure in journey.shutdown(deadline).await {

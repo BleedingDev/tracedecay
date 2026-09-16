@@ -7,8 +7,9 @@
 //! therefore consume the same proof regardless of whether the destination is
 //! Native or another provider.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use tracedecay_contracts::CancellationSignal;
 use tracedecay_domain::CanonicalObservationIdV1;
 use tracedecay_global_db::GlobalDbObservationStore;
 use tracedecay_memory_observation::{
@@ -19,7 +20,10 @@ use tracedecay_memory_provider_registry::{
     AdvisoryContractError, ApiError, HistoryGrant, OperationControl, OriginScopeEvidence,
     OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, SourceAttribution, TerminalCode,
 };
-use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1;
+use tracedecay_session_runtime::session_retrieval::{
+    SessionApplicationRetrievalFutureV1, SessionApplicationRetrievalPortV1,
+    SessionRetrievalServiceOutcome, SessionRetrievalUnavailable,
+};
 use tracedecay_store::{ObservationAdmissionPort, ObservationStoreError, StoredObservation};
 
 use super::provider_history::{
@@ -72,6 +76,103 @@ pub(crate) struct NativeCanonicalAuthorityProofV1 {
     pub(crate) source_identity: OriginalSourceIdentity,
     /// Canonical session retrieval port for destination reads.
     pub(crate) session_retrieval: Arc<dyn SessionApplicationRetrievalPortV1>,
+}
+
+/// Late-bound canonical session authority for a Native owner.
+///
+/// Native's provider port is constructed during the core server phase, before
+/// the project session database and its application retrieval service are
+/// admitted.  This mount keeps that construction order explicit: the Native
+/// owner receives a proxy during core composition, and the one canonical
+/// retrieval service is installed once the full server has published it.
+///
+/// The optional checkout scope is retained on the mount so the Native port can
+/// reject an exact-scope call that does not belong to this host generation
+/// before it asks the mounted service to read anything.
+pub(crate) struct NativeSessionRetrievalMountV1 {
+    authority: OnceLock<Arc<dyn SessionApplicationRetrievalPortV1>>,
+    profile_id: Option<tracedecay_domain::UserProfileId>,
+    scope: Option<tracedecay_contracts::ResolvedScope>,
+}
+
+impl Default for NativeSessionRetrievalMountV1 {
+    fn default() -> Self {
+        Self {
+            authority: OnceLock::new(),
+            profile_id: None,
+            scope: None,
+        }
+    }
+}
+
+impl NativeSessionRetrievalMountV1 {
+    /// Creates a mount bound to the exact checkout served by one host.
+    pub(crate) fn for_project(
+        profile_id: tracedecay_domain::UserProfileId,
+        scope: tracedecay_contracts::ResolvedScope,
+    ) -> Self {
+        Self {
+            authority: OnceLock::new(),
+            profile_id: Some(profile_id),
+            scope: Some(scope),
+        }
+    }
+
+    /// Installs the canonical retrieval service after session admission.
+    pub(crate) fn bind(
+        &self,
+        authority: Arc<dyn SessionApplicationRetrievalPortV1>,
+    ) -> Result<(), &'static str> {
+        self.authority
+            .set(authority)
+            .map_err(|_| "Native session retrieval authority already mounted")
+    }
+
+    /// Returns the host scope when this mount was created by project
+    /// composition.  Direct unit-test constructors intentionally have no
+    /// retained host scope and derive their request scope at the port edge.
+    pub(crate) fn host_scope(&self) -> Option<&tracedecay_contracts::ResolvedScope> {
+        self.scope.as_ref()
+    }
+
+    /// Returns the host profile identity when this mount was created by
+    /// project composition.
+    pub(crate) fn host_profile_id(&self) -> Option<&tracedecay_domain::UserProfileId> {
+        self.profile_id.as_ref()
+    }
+
+    fn unavailable() -> SessionRetrievalServiceOutcome {
+        SessionRetrievalServiceOutcome::Unavailable(
+            SessionRetrievalUnavailable::service_not_configured(),
+        )
+    }
+}
+
+impl SessionApplicationRetrievalPortV1 for NativeSessionRetrievalMountV1 {
+    fn retrieve_admitted<'a>(
+        &'a self,
+        context: &'a tracedecay_contracts::RequestContext,
+        query: tracedecay_session_memory::session::SessionTemporalQuery,
+    ) -> SessionApplicationRetrievalFutureV1<'a> {
+        match self.authority.get() {
+            Some(authority) => authority.retrieve_admitted(context, query),
+            None => Box::pin(async { Self::unavailable() }),
+        }
+    }
+
+    fn retrieve_admitted_with_cancellation<'a>(
+        &'a self,
+        context: &'a tracedecay_contracts::RequestContext,
+        cancellation: &'a CancellationSignal,
+        query: tracedecay_session_memory::session::SessionTemporalQuery,
+    ) -> SessionApplicationRetrievalFutureV1<'a> {
+        match self.authority.get() {
+            Some(authority) => {
+                authority.retrieve_admitted_with_cancellation(context, cancellation, query)
+            }
+            None => Box::pin(async { Self::unavailable() }),
+        }
+    }
 }
 
 /// Failure while assembling or revalidating a canonical Native authority
