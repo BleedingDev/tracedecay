@@ -1109,19 +1109,26 @@ mod tests {
         let authority = authority(&request);
         let codec = codec(&request, &authority);
         let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let completed = (digest("body.completed"), digest("payload.completed"));
+        let pending = (digest("body.pending"), digest("payload.pending"));
+        let (completed, pending) = if completed < pending {
+            (completed, pending)
+        } else {
+            (pending, completed)
+        };
         let discovery = CloneFingerprintDiscoveryPositionV2 {
             posting_count: 31,
             fingerprint: 7,
             symbol_occurrence_id: None,
             token_position: None,
-            pending_comparison_body_digest: Some(digest("body.pending")),
-            pending_comparison_payload_digest: Some(digest("payload.pending")),
+            pending_comparison_body_digest: Some(pending.0.clone()),
+            pending_comparison_payload_digest: Some(pending.1.clone()),
             complete: true,
         };
         let position = CloneArtifactCursorPositionV2::FingerprintDiscovery {
             discovery: discovery.clone(),
-            comparison_body_digest: Some(digest("body.completed")),
-            comparison_payload_digest: Some(digest("payload.completed")),
+            comparison_body_digest: Some(completed.0),
+            comparison_payload_digest: Some(completed.1),
         };
         let encoded = codec
             .issue_artifact(
