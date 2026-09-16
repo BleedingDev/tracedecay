@@ -510,6 +510,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn staged_artifact_executes_sealed_bytes_after_source_replacement() {
+        let source_root = TempDir::new().expect("source root");
+        let source = source_root.path().join("worker");
+        let original = b"#!/bin/sh\nprintf '%s' verified\n";
+        executable(&source, original);
+
+        let artifact = stage_verified_file(
+            open_worker_binary(&source).expect("open source"),
+            &target_for(original),
+        )
+        .expect("stage source");
+        fs::write(&source, b"#!/bin/sh\nprintf '%s' replaced\n").expect("replace source");
+
+        let output = std::process::Command::new(artifact.path())
+            .output()
+            .expect("execute staged worker");
+        assert!(output.status.success(), "staged worker failed: {output:?}");
+        assert_eq!(output.stdout, b"verified");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn source_symlink_is_rejected_before_verification() {
         let root = TempDir::new().expect("source root");
         let target = root.path().join("target");
