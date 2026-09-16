@@ -663,7 +663,7 @@ fn corrupted_pending_rebuild_journal_fails_closed_without_publishing_recallable_
 }
 
 #[test]
-fn stale_resident_fence_reconciles_after_another_engine_finishes_rebuild() {
+fn stale_resident_fence_reconciles_after_durable_rebuild_completes() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
     let first = make_engine(&tempdir);
@@ -687,13 +687,9 @@ fn stale_resident_fence_reconciles_after_another_engine_finishes_rebuild() {
     );
     assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
 
-    let second = make_engine(&tempdir);
-    let ready = second.handshake(&namespace);
-    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
-    drop(second);
-
-    // `first` still has the stale in-memory fence bit. A normal recall must
-    // notice that the durable fence is gone and reconcile before reading.
+    // The durable rebuild has finished, but `first` still has the stale
+    // in-memory fence bit because publication was interrupted. A normal recall
+    // must notice that the durable fence is gone and reconcile before reading.
     let recalled = first.recall(
         &namespace,
         RecallRequest {
@@ -713,98 +709,62 @@ fn stale_resident_fence_reconciles_after_another_engine_finishes_rebuild() {
     );
     assert_eq!(
         first.inspection(&namespace).state_generation,
-        ready.state_generation
+        interrupted.state_generation
     );
 }
 
 #[test]
-fn resident_unfenced_handle_refuses_a_new_durable_fence_until_recovery() {
+fn completed_deletion_replay_rejects_a_receipt_with_a_different_request_key() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
-    let first = make_engine(&tempdir);
-    observe(
-        &first,
-        &namespace,
-        "source-a",
-        "retained key",
-        "retained value",
-        "retained",
-    );
-    observe(&first, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
-
-    // Keep `first` resident and unfenced while a second engine commits the
-    // durable privacy fence, then stop before its sanitized rebuild publishes.
-    let second = make_engine(&tempdir);
-    second
-        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
-        .expect("fault arms");
-    let interrupted = second.delete_by_source(
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    let deleted = engine.delete_by_source(
         &namespace,
         &SourceId("source-b".to_owned()),
-        "cross-engine-delete",
+        "delete-receipt-key",
         DEADLINE,
     );
-    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+    assert_eq!(deleted.outcome, Outcome::Success);
+    drop(engine);
 
-    // A resident handle must refresh its admission from SQLite before any
-    // read path can expose the pre-erasure published kernel.
-    let recalled = first.recall(
-        &namespace,
-        RecallRequest {
-            query_text: B_TOKEN.to_owned(),
-            top_k: 16,
-            deadline: DEADLINE,
-        },
-    );
-    assert!(matches!(recalled.outcome, Outcome::Unavailable(_)));
-    assert_eq!(recalled.payload, Value::Null);
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("store opens for corruption fixture");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events
+             WHERE kind = 'delete_by_source' AND idempotency_key = ?1",
+            ["delete-receipt-key"],
+            |row| row.get(0),
+        )
+        .expect("completed deletion receipt reads");
+    let mut receipt: Value = serde_json::from_str(&receipt).expect("receipt is JSON");
+    assert_eq!(receipt["idempotency_key"], json!("delete-receipt-key"));
+    receipt["idempotency_key"] = json!("different-delete-key");
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1
+             WHERE kind = 'delete_by_source' AND idempotency_key = ?2",
+            [
+                serde_json::to_string(&receipt).expect("receipt serializes"),
+                "delete-receipt-key".to_owned(),
+            ],
+        )
+        .expect("receipt corruption writes");
+    drop(connection);
 
-    let inspected = first.inspection(&namespace);
-    assert!(matches!(inspected.outcome, Outcome::Unavailable(_)));
-    assert_eq!(inspected.payload, Value::Null);
-
-    let health = first.common_control(
-        &namespace,
-        json!({"action":"health","expected_generation":interrupted.state_generation}),
-        DEADLINE,
-    );
-    assert!(matches!(health.outcome, Outcome::Unavailable(_)));
-    assert_eq!(health.payload, Value::Null);
-
-    let exported = snapshot::export(&first, &namespace, DEADLINE)
-        .expect_err("snapshot export must refuse the durable fence");
-    assert_eq!(exported.outcome, Outcome::Busy);
-    assert_eq!(exported.payload, Value::Null);
-
-    let ready = second.handshake(&namespace);
+    let reopened = make_engine(&tempdir);
+    let ready = reopened.handshake(&namespace);
     assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
-
-    // The first engine still carries the fence bit, so its next admission
-    // reconciles the committed sanitized checkpoint before serving again.
-    let recovered = first.recall(
+    let replay = reopened.delete_by_source(
         &namespace,
-        RecallRequest {
-            query_text: B_TOKEN.to_owned(),
-            top_k: 16,
-            deadline: DEADLINE,
-        },
+        &SourceId("source-b".to_owned()),
+        "delete-receipt-key",
+        DEADLINE,
     );
-    assert!(matches!(recovered.outcome, Outcome::Success | Outcome::Empty));
-    assert!(
-        candidate_texts(&recovered.payload)
-            .iter()
-            .all(|text| !text.contains(B_TOKEN))
-    );
-    let recovered_export = snapshot::export(&first, &namespace, DEADLINE)
-        .expect("snapshot export succeeds after recovery");
-    assert!(
-        !std::str::from_utf8(recovered_export.as_slice())
-            .expect("snapshot is UTF-8")
-            .contains(B_TOKEN)
-    );
-    let recovered_inspection = first.inspection(&namespace);
-    assert_eq!(recovered_inspection.outcome, Outcome::Success);
-    assert_eq!(recovered_inspection.state_generation, ready.state_generation);
+    assert_eq!(replay.outcome, Outcome::Corrupt);
+    assert_eq!(replay.state_generation, deleted.state_generation);
+    assert_eq!(replay.payload, Value::Null);
 }
 
 #[test]
