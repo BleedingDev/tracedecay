@@ -249,8 +249,8 @@ fn common_control_recovery_recomputes_semantics_from_receipt_input() {
         )
         .unwrap();
     let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
-    assert!(receipt["operation"]["canonical_input"].is_object());
-    receipt["operation"]["canonical_input"] = json!({"tampered": true});
+    assert!(receipt["operation"]["common_control"]["canonical_input"].is_object());
+    receipt["operation"]["common_control"]["canonical_input"] = json!({"tampered": true});
     let state_digest = receipt["state_digest"].as_str().unwrap().to_owned();
     let integrity = IntegrityBasis {
         reply: &receipt["reply"],
