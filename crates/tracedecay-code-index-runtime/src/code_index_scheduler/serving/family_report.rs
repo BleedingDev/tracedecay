@@ -3,7 +3,7 @@ use std::path::{Component, Path};
 use tracedecay_code_index::clones::{
     CloneExactKeyV1, CloneNormalizationClassV1, CodeIndexCloneBodyV1,
 };
-use tracedecay_code_index::production::CodeIndexExecutionControlV1;
+use tracedecay_code_index::production::{CodeIndexExecutionControlV1, CodeIndexInterruptionV1};
 use tracedecay_contracts::retrieval::{
     RedundancyCoverageV1, RedundancyFamilyV1, RedundancyPartialReasonV1, RedundancyRankingV1,
     RedundancyResultV1, SimilarFamilyV1, SimilarMatchClassV1, SimilarOccurrenceV1,
@@ -17,13 +17,81 @@ use tracedecay_query::retrieval::lexical::{
 use super::ProductionCodeIndexQueryOwnersV1;
 use crate::query::retrieval::ports::RetrievalPortError;
 
+const REDUNDANCY_MEMBER_CURSOR_PREFIX_V1: &str = "tracedecay.redundancy-member.v1:";
+
+/// A redundancy result cursor has to resume two ordered streams at once:
+/// the family stream and the member stream inside the family that was
+/// truncated. Keeping the family cursor from before that family prevents a
+/// member continuation from being passed to the family reader (which would
+/// either skip the family or reject the cursor as the wrong artifact kind).
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RedundancyMemberContinuationCursorV1 {
+    family_cursor: Option<String>,
+    family_key: CloneExactKeyV1,
+    member_cursor: CloneArtifactCursorV1,
+}
+
+impl RedundancyMemberContinuationCursorV1 {
+    fn encode(&self) -> Result<String, RetrievalPortError> {
+        serde_json::to_string(self)
+            .map(|payload| format!("{REDUNDANCY_MEMBER_CURSOR_PREFIX_V1}{payload}"))
+            .map_err(|error| {
+                RetrievalPortError::Contract(format!(
+                    "failed to encode redundancy member cursor: {error}"
+                ))
+            })
+    }
+
+    fn decode(cursor: &str) -> Result<Self, RetrievalPortError> {
+        let payload = cursor
+            .strip_prefix(REDUNDANCY_MEMBER_CURSOR_PREFIX_V1)
+            .ok_or_else(|| {
+                RetrievalPortError::Contract(
+                    "redundancy member cursor has an unknown encoding".to_owned(),
+                )
+            })?;
+        serde_json::from_str(payload).map_err(|error| {
+            RetrievalPortError::Contract(format!("invalid redundancy member cursor: {error}"))
+        })
+    }
+}
+
+fn decode_redundancy_cursor(
+    cursor: Option<&str>,
+) -> Result<(Option<String>, Option<RedundancyMemberContinuationCursorV1>), RetrievalPortError> {
+    let Some(cursor) = cursor else {
+        return Ok((None, None));
+    };
+    if cursor.starts_with(REDUNDANCY_MEMBER_CURSOR_PREFIX_V1) {
+        let continuation = RedundancyMemberContinuationCursorV1::decode(cursor)?;
+        return Ok((continuation.family_cursor.clone(), Some(continuation)));
+    }
+    // Cursors minted before member continuation was introduced remain valid
+    // family cursors and can continue paging from the family reader directly.
+    Ok((Some(cursor.to_owned()), None))
+}
+
+fn redundancy_checkpoint(
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<(), RetrievalPortError> {
+    if control.is_cancelled() || control.is_deadline_exceeded() {
+        Err(RetrievalPortError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 impl ProductionCodeIndexQueryOwnersV1 {
     pub(crate) fn redundancy(
         &self,
         request: &CodeIndexRedundancyQueryV1,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<RedundancyResultV1, RetrievalPortError> {
+        redundancy_checkpoint(control)?;
         let family_page_limit = request.family_limit.min(request.work_limit / 3).max(1);
+        let (family_cursor, mut member_continuation) =
+            decode_redundancy_cursor(request.cursor.as_deref())?;
         let pull_request_scope_digest = match &request.scope {
             CodeIndexRedundancyScopeV1::PullRequest {
                 provider,
@@ -59,22 +127,33 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 pull_request_paths,
                 pull_request_scope_digest.as_ref(),
                 request.include_generated_paths,
-                request.cursor.as_deref(),
+                family_cursor.as_deref(),
                 family_page_limit,
                 control,
             )
             .map_err(redundancy_artifact_error)?;
+        if member_continuation.is_some() && page.families.is_empty() {
+            return Err(RetrievalPortError::StaleEvidence);
+        }
         let page_continuation = page.next_cursor.clone();
         let mut families = Vec::with_capacity(page.families.len());
         let mut examined_families = 0usize;
         let mut examined_members = 0usize;
         let mut work_spent = 0usize;
         let mut work_exhausted = false;
-        let mut report_continuation = request.cursor.clone();
+        let mut member_pagination_incomplete = false;
+        let mut report_continuation = family_cursor.clone();
+        let mut candidate_family_cursor = family_cursor;
         for candidate in page.families {
+            redundancy_checkpoint(control)?;
             if work_spent.saturating_add(3) > request.work_limit {
                 work_exhausted = true;
                 break;
+            }
+            if let Some(continuation) = member_continuation.as_ref() {
+                if continuation.family_key != candidate.key {
+                    return Err(RetrievalPortError::StaleEvidence);
+                }
             }
             examined_families = examined_families.saturating_add(1);
             work_spent = work_spent.saturating_add(1);
@@ -97,6 +176,9 @@ impl ProductionCodeIndexQueryOwnersV1 {
             work_spent = work_spent.saturating_add(1);
             examined_members = examined_members.saturating_add(1);
             let remaining_work = request.work_limit.saturating_sub(work_spent);
+            let member_cursor = member_continuation
+                .as_ref()
+                .map(|continuation| &continuation.member_cursor);
             let read = self.verified_redundancy_members(
                 &source,
                 &candidate.key,
@@ -104,6 +186,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 request.include_generated_paths,
                 request.member_limit.saturating_sub(1),
                 remaining_work,
+                member_cursor,
                 control,
             )?;
             work_spent = work_spent.saturating_add(read.work_spent);
@@ -116,7 +199,6 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     .map(|member| similar_occurrence(&member.occurrence)),
             );
             work_exhausted |= read.work_exhausted;
-            report_continuation = Some(candidate.continuation);
             let match_class = match candidate.key.class {
                 CloneNormalizationClassV1::Conservative => SimilarMatchClassV1::ConservativeExact,
                 CloneNormalizationClassV1::Rename => SimilarMatchClassV1::RenameNormalizedExact,
@@ -148,6 +230,26 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 reviewable_source_bytes: candidate.reviewable_source_bytes,
                 generated_members,
             });
+            if !read.complete {
+                member_pagination_incomplete = true;
+                let member_cursor = read.next_cursor.clone().ok_or_else(|| {
+                    RetrievalPortError::AuthorityUnavailable(
+                        "incomplete clone family page has no member continuation".to_owned(),
+                    )
+                })?;
+                report_continuation = Some(
+                    RedundancyMemberContinuationCursorV1 {
+                        family_cursor: candidate_family_cursor.clone(),
+                        family_key: candidate.key,
+                        member_cursor,
+                    }
+                    .encode()?,
+                );
+                break;
+            }
+            report_continuation = Some(candidate.continuation.clone());
+            candidate_family_cursor = Some(candidate.continuation);
+            member_continuation = None;
             if work_exhausted {
                 break;
             }
@@ -156,6 +258,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
         let (coverage, next_cursor) = redundancy_coverage(
             work_exhausted,
             family_page_limit < request.family_limit,
+            member_pagination_incomplete,
             page_continuation,
             report_continuation,
             examined_families,
@@ -178,12 +281,14 @@ impl ProductionCodeIndexQueryOwnersV1 {
         include_generated_paths: bool,
         result_limit: usize,
         work_limit: usize,
+        start_cursor: Option<&CloneArtifactCursorV1>,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<RedundancyMemberReadV1, RetrievalPortError> {
         let mut members = Vec::new();
-        let mut cursor = None;
+        let mut cursor = start_cursor.cloned();
         let mut work_spent = 0usize;
         loop {
+            redundancy_checkpoint(control)?;
             if members.len() >= result_limit {
                 return Ok(RedundancyMemberReadV1 {
                     members,
@@ -214,7 +319,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     page_limit,
                     control,
                 )
-                .map_err(|error| RetrievalPortError::AuthorityUnavailable(error.to_string()))?;
+                .map_err(redundancy_artifact_error)?;
             work_spent = work_spent.saturating_add(page.members.len());
             for member in page.members {
                 if report_path_matches(&member.occurrence.path, path, include_generated_paths)
@@ -246,9 +351,17 @@ impl ProductionCodeIndexQueryOwnersV1 {
 fn redundancy_artifact_error(error: CodeLexicalArtifactErrorV1) -> RetrievalPortError {
     match error {
         CodeLexicalArtifactErrorV1::Contract(message)
-            if message == "clone family cursor does not match its artifact or request" =>
+            if matches!(
+                message.as_str(),
+                "clone family cursor does not match its artifact or request"
+                    | "clone exact cursor does not match its artifact, key, or authority"
+            ) =>
         {
             RetrievalPortError::StaleEvidence
+        }
+        CodeLexicalArtifactErrorV1::Interrupted(CodeIndexInterruptionV1::Cancelled)
+        | CodeLexicalArtifactErrorV1::Interrupted(CodeIndexInterruptionV1::DeadlineExceeded) => {
+            RetrievalPortError::Cancelled
         }
         error => RetrievalPortError::AuthorityUnavailable(error.to_string()),
     }
@@ -297,12 +410,19 @@ fn similar_occurrence(
 fn redundancy_coverage(
     work_exhausted: bool,
     family_budget_limited: bool,
+    member_pagination_incomplete: bool,
     page_continuation: Option<String>,
     report_continuation: Option<String>,
     examined_families: usize,
     examined_members: usize,
 ) -> (RedundancyCoverageV1, Option<String>) {
-    if work_exhausted || (family_budget_limited && page_continuation.is_some()) {
+    // The public V1 reason set has no member-limit variant. A bounded member
+    // page therefore uses WorkLimit, while its composite cursor still tells
+    // the next request exactly which family and member row to resume.
+    if work_exhausted
+        || member_pagination_incomplete
+        || (family_budget_limited && page_continuation.is_some())
+    {
         (
             RedundancyCoverageV1::Partial {
                 reason: RedundancyPartialReasonV1::WorkLimit,
@@ -332,13 +452,5 @@ fn redundancy_coverage(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::is_generated_path;
-
-    #[test]
-    fn generated_member_labels_follow_the_canonical_path_policy() {
-        assert!(is_generated_path("vendor/generated.rs"));
-        assert!(is_generated_path("src/node_modules/generated.ts"));
-        assert!(!is_generated_path("src/generated.rs"));
-    }
-}
+#[path = "family_report_tests.rs"]
+mod tests;
