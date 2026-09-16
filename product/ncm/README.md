@@ -44,7 +44,8 @@ Production launch verifies the executable against the offline
 worker name, protocol version and identity, target triple metadata, byte length, and SHA-256. A
 missing, unsupported, or mismatched artifact returns typed worker-unavailable state and performs no
 download or replacement. For an installed bundle, ship `worker-manifest.json` beside the worker;
-source-tree builds fall back to the checked-in reference manifest. The checked-in artifact pin
+Cargo source builds copy the checked-in reference manifest beside the worker output, just as an
+installed bundle must ship `worker-manifest.json` beside its worker. The checked-in artifact pin
 currently covers `aarch64-apple-darwin`; a platform must have its own built artifact and manifest
 entry before it is advertised as supported.
 

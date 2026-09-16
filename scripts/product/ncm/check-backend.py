@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import struct
@@ -27,6 +28,10 @@ TASK_ID = "ncm-rs-022"
 MODEL_CACHE_REPOSITORY = "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2"
 TEST_DOUBLE_MARKER = b"test-double/hash"
 REAL_ARTIFACT_MARKERS = (b"fastembed", b"onnxruntime")
+WORKER_MANIFEST_SCHEMA_VERSION = 1
+WORKER_NAME = "tracedecay-ncm-worker"
+WORKER_PROTOCOL_VERSION = 1
+WORKER_PROTOCOL_IDENTITY = "tracedecay.ncm.worker.v1"
 
 
 class GateFailure(RuntimeError):
@@ -116,7 +121,115 @@ def worker_path(repo: Path, environment: dict[str, str]) -> Path:
     return target_dir(repo, environment) / "debug" / name
 
 
-def verify_worker_artifact(path: Path) -> dict[str, Any]:
+def current_worker_target() -> tuple[str, str, str, str]:
+    """Return the target tuple used by the Rust worker admission contract."""
+    machine = platform.machine().lower()
+    if sys.platform == "darwin":
+        if machine in {"arm64", "aarch64"}:
+            return "aarch64-apple-darwin", "macos", "aarch64", "unix"
+        if machine in {"x86_64", "amd64"}:
+            return "x86_64-apple-darwin", "macos", "x86_64", "unix"
+    if sys.platform.startswith("linux"):
+        if machine in {"arm64", "aarch64"}:
+            arch = "aarch64"
+        elif machine in {"x86_64", "amd64"}:
+            arch = "x86_64"
+        else:
+            raise GateFailure(f"worker target is unsupported on this machine: {machine}")
+        libc = platform.libc_ver()[0].lower()
+        family = "musl" if "musl" in libc else "gnu"
+        return f"{arch}-unknown-linux-{family}", "linux", arch, "unix"
+    raise GateFailure(f"worker target is unsupported on this platform: {sys.platform}")
+
+
+def worker_manifest_path(path: Path) -> Path:
+    """Resolve the manifest explicitly bound beside a worker.
+
+    The current working directory and binary ancestors are deliberately absent.
+    Cargo copies the checked-in trust root beside source-built worker outputs,
+    so source and installed workers use the same sibling binding.
+    """
+    sibling = path.parent / "worker-manifest.json"
+    if sibling.is_file():
+        return sibling
+    raise GateFailure(f"worker manifest must be beside the worker: {sibling}")
+
+
+def validate_worker_manifest(manifest: dict[str, Any], *, target: tuple[str, str, str, str]) -> dict[str, Any]:
+    """Validate the fields shared with ``worker_artifact.rs``."""
+    require(
+        set(manifest) == {"schema_version", "worker", "protocol_version", "protocol_identity", "targets"},
+        "worker manifest has unexpected or missing fields",
+    )
+    require(
+        isinstance(manifest["schema_version"], int)
+        and not isinstance(manifest["schema_version"], bool)
+        and manifest["schema_version"] == WORKER_MANIFEST_SCHEMA_VERSION,
+        f"worker manifest schema version is unsupported: {manifest['schema_version']}",
+    )
+    require(
+        manifest["worker"] == WORKER_NAME,
+        f"worker manifest names {manifest['worker']}, expected {WORKER_NAME}",
+    )
+    require(
+        isinstance(manifest["protocol_version"], int)
+        and not isinstance(manifest["protocol_version"], bool)
+        and manifest["protocol_version"] == WORKER_PROTOCOL_VERSION,
+        f"worker manifest protocol version is unsupported: {manifest['protocol_version']}",
+    )
+    require(
+        manifest["protocol_identity"] == WORKER_PROTOCOL_IDENTITY,
+        f"worker manifest protocol identity is unsupported: {manifest['protocol_identity']}",
+    )
+    targets = manifest["targets"]
+    require(isinstance(targets, list) and bool(targets), "worker manifest has no supported targets")
+    seen: set[str] = set()
+    for item in targets:
+        require(isinstance(item, dict), "worker manifest target is not an object")
+        require(
+            set(item) == {"triple", "os", "arch", "family", "bytes", "sha256"},
+            "worker manifest target has unexpected or missing fields",
+        )
+        triple = item["triple"]
+        require(
+            isinstance(triple, str)
+            and isinstance(item["os"], str)
+            and isinstance(item["arch"], str)
+            and isinstance(item["family"], str)
+            and triple not in seen,
+            f"worker manifest repeats target {triple}",
+        )
+        seen.add(triple)
+        require(
+            isinstance(item["bytes"], int)
+            and not isinstance(item["bytes"], bool)
+            and 0 < item["bytes"] <= 2**64 - 1,
+            f"worker manifest target {triple} has an invalid byte count",
+        )
+        digest = item["sha256"]
+        require(
+            isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+            f"worker manifest target {triple} has an invalid sha256",
+        )
+    triple, os_name, arch, family = target
+    selected = next((item for item in targets if item["triple"] == triple), None)
+    require(selected is not None, f"worker target is not supported: {triple}")
+    require((selected["os"], selected["arch"], selected["family"]) == (os_name, arch, family),
+            f"worker manifest target metadata does not match {triple}")
+    return selected
+
+
+def read_worker_manifest(path: Path, *, label: str) -> dict[str, Any]:
+    """Read one strict worker manifest."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateFailure(f"read {label} worker manifest {path}: {error}") from error
+    require(isinstance(value, dict), f"{label} worker manifest is not an object")
+    return value
+
+
+def verify_worker_artifact(path: Path, *, repo: Path) -> dict[str, Any]:
     """Prove real native inference is linked into the worker artifact.
 
     The same artifact serves production and ``--test-double`` launches (task
@@ -124,13 +237,38 @@ def verify_worker_artifact(path: Path) -> dict[str, Any]:
     literal is necessarily present in the bytes. Which encoder is active is
     proven per launch by the handshake identity check in ``worker_identity``.
     """
+    require(not path.is_symlink(), f"worker artifact must not be a symlink: {path}")
     require(path.is_file(), f"worker artifact missing: {path}")
+    trusted_manifest_path = repo / "product" / "ncm" / "reference" / "worker-manifest.json"
+    require(trusted_manifest_path.is_file(), f"trusted worker manifest missing: {trusted_manifest_path}")
+    target = current_worker_target()
+    trusted_manifest = read_worker_manifest(trusted_manifest_path, label="trusted")
+    selected_manifest_path = worker_manifest_path(path)
+    selected_manifest = read_worker_manifest(selected_manifest_path, label="selected")
+    trusted_digest = sha256_bytes(canonical_json(trusted_manifest))
+    selected_digest = sha256_bytes(canonical_json(selected_manifest))
+    require(
+        selected_digest == trusted_digest,
+        f"worker manifest is stale or not sourced from the trusted build root: expected {trusted_digest}, got {selected_digest}",
+    )
+    target_pin = validate_worker_manifest(trusted_manifest, target=target)
+    validate_worker_manifest(selected_manifest, target=target)
+    metadata = path.stat()
+    require((metadata.st_mode & 0o111) != 0, f"worker artifact is not executable: {path}")
+    require(metadata.st_size == target_pin["bytes"],
+            f"worker artifact size mismatch: expected {target_pin['bytes']} bytes, got {metadata.st_size}")
     data = path.read_bytes()
+    digest = sha256_bytes(data)
+    require(digest == target_pin["sha256"],
+            f"worker artifact digest mismatch: expected {target_pin['sha256']}, got {digest}")
     markers = {marker.decode(): marker in data for marker in REAL_ARTIFACT_MARKERS}
     return {
         "path": str(path),
         "bytes": len(data),
-        "sha256": sha256_bytes(data),
+        "sha256": digest,
+        "manifest_path": str(selected_manifest_path),
+        "manifest_sha256": selected_digest,
+        "target": target_pin["triple"],
         "required_markers": markers,
     }
 
@@ -786,7 +924,7 @@ def main() -> int:
     commands.append(build)
     try:
         run(build, cwd=repo, environment=production_environment)
-        artifact = verify_worker_artifact(worker_path(repo, production_environment))
+        artifact = verify_worker_artifact(worker_path(repo, production_environment), repo=repo)
         if not all(artifact["required_markers"].values()):
             blockers.append(
                 f"backend_artifact_identity_test: worker lacks real encoder markers: {artifact['required_markers']}"

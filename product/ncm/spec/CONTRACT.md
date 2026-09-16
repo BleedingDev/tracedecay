@@ -152,9 +152,10 @@ before allocation. No model download inside the worker; `embedding::install` is 
 separate step.
 
 Before a production child is spawned, the client verifies the configured executable against the
-offline `worker-manifest.json` shipped beside an installed worker, or the checked-in reference
-manifest for a source-tree build: worker name, protocol version and identity, current target
-metadata, byte length, and SHA-256 must all match. A missing, unsupported, or mismatched artifact
+offline `worker-manifest.json` shipped beside the worker: worker name, protocol version and
+identity, current target metadata, byte length, and SHA-256 must all match. Cargo source builds
+copy the checked-in reference manifest beside their worker output, so source and installed
+launches use the same explicit sibling binding. A missing, unsupported, or mismatched artifact
 returns typed `Unavailable` and never launches a process. The named
 `--test-double` mode bypasses this production artifact admission only for transport tests; it
 cannot satisfy production readiness. The existing model manifest and per-file model digest checks

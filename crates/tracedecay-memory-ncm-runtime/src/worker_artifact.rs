@@ -14,10 +14,6 @@ use tempfile::TempDir;
 /// The executable name admitted by the NCM worker manifest.
 pub(crate) const WORKER_NAME: &str = "tracedecay-ncm-worker";
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-const REFERENCE_MANIFEST_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../product/ncm/reference/worker-manifest.json"
-);
 const REFERENCE_MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../product/ncm/reference/worker-manifest.json"
@@ -303,21 +299,10 @@ fn manifest_path(binary: &Path) -> Result<PathBuf, WorkerIntegrityError> {
     if sibling.is_file() {
         return Ok(sibling);
     }
-    if source_tree_binary(binary) {
-        return Ok(PathBuf::from(REFERENCE_MANIFEST_PATH));
-    }
     Err(WorkerIntegrityError::Manifest(format!(
-        "installed worker manifest must be beside the worker: {}",
+        "worker manifest must be beside the worker: {}",
         sibling.display()
     )))
-}
-
-fn source_tree_binary(binary: &Path) -> bool {
-    binary.ancestors().any(|ancestor| {
-        ancestor
-            .file_name()
-            .is_some_and(|name| name == std::ffi::OsStr::new("target"))
-    })
 }
 
 fn validate_manifest(manifest: &WorkerManifest) -> Result<(), WorkerIntegrityError> {

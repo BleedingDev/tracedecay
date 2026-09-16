@@ -2,6 +2,7 @@
 name = "tracedecay-memory-ncm-runtime"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 publish = false
 license = "MIT"
 description = "NCM runtime: real text encoder, durable provider-owned store, transactional engine, deletion/recovery, supervised worker and wire transport"
