@@ -1,6 +1,6 @@
 use serde_json::Value;
 use tracedecay_session_memory::provider_usage::{
-    ProviderUsageCostSummaryV1, ProviderUsageCoverageV1,
+    ProviderUsageCostSummaryV1, ProviderUsageCoverageV1, ProviderUsageTaskCostSummaryV1,
 };
 
 use crate::{
@@ -12,6 +12,20 @@ use crate::{
 pub(crate) async fn handle_cost(
     range: String,
     by_model: bool,
+    export: Option<String>,
+) -> tracedecay_domain::errors::Result<()> {
+    handle_cost_with_task(range, by_model, false, export).await
+}
+
+/// Cost command entrypoint with task-category grouping enabled by the CLI
+/// parser when requested. The three-argument wrapper above stays available to
+/// callers compiled against the pre-task flag surface while the parser owner
+/// wires this entrypoint to `--by-task`.
+#[hotpath::measure(label = "cli.cost.read.with_task", future = true)]
+pub(crate) async fn handle_cost_with_task(
+    range: String,
+    by_model: bool,
+    by_task: bool,
     export: Option<String>,
 ) -> tracedecay_domain::errors::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -38,6 +52,7 @@ pub(crate) async fn handle_cost(
             &today.provider_usage,
             &range,
             by_model,
+            by_task,
             export.as_deref(),
             &summary,
         )
@@ -49,13 +64,16 @@ fn print_cost_summary(
     today: &ProviderUsageCostSummaryV1,
     range: &str,
     by_model: bool,
+    by_task: bool,
     export: Option<&str>,
     summary: &CostSummaryPayload,
 ) -> tracedecay_domain::errors::Result<()> {
     if let Some(fmt) = export {
-        print_cost_export(fmt, range, by_model, summary)?;
+        print_cost_export(fmt, range, by_model, by_task, summary)?;
     } else if by_model {
         print_model_table(summary);
+    } else if by_task {
+        print_task_table(summary);
     } else {
         print_default_summary(today, range, summary);
     }
@@ -66,6 +84,7 @@ fn print_cost_export(
     fmt: &str,
     range: &str,
     by_model: bool,
+    by_task: bool,
     summary: &CostSummaryPayload,
 ) -> tracedecay_domain::errors::Result<()> {
     let usage = &summary.provider_usage;
@@ -81,16 +100,18 @@ fn print_cost_export(
                 "tokens_saved": summary.tokens_saved,
                 "efficiency_ratio": summary.efficiency_ratio,
                 "by_model": usage.by_model,
+                "task_usage": summary.task_usage,
+                "by_task": summary.task_usage.as_ref().map(|task_usage| &task_usage.by_task),
             });
             println!("{}", serde_json::to_string_pretty(&obj)?);
         }
-        "csv" => print_cost_csv(summary, by_model),
+        "csv" => print_cost_csv(summary, by_model, by_task),
         _ => eprintln!("Unknown export format '{fmt}'. Use 'json' or 'csv'."),
     }
     Ok(())
 }
 
-fn print_cost_csv(summary: &CostSummaryPayload, by_model: bool) {
+fn print_cost_csv(summary: &CostSummaryPayload, by_model: bool, by_task: bool) {
     let usage = &summary.provider_usage;
     if by_model {
         println!("provider,model,cost_usd,tokens");
@@ -104,6 +125,28 @@ fn print_cost_csv(summary: &CostSummaryPayload, by_model: bool) {
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "unavailable".to_owned());
             println!("{},{},{cost},{tokens}", model.provider, model.model);
+        }
+    } else if by_task {
+        let Some(task_usage) = summary.task_usage.as_ref() else {
+            println!("task_category,cost_usd,tokens,usage_events");
+            println!("unavailable,unavailable,unavailable,0");
+            return;
+        };
+        println!("task_category,cost_usd,tokens,usage_events");
+        for task in &task_usage.by_task {
+            let category = task.task_category.as_deref().unwrap_or("unattributed");
+            let cost = task
+                .cost_usd
+                .map(|cost| format!("{cost:.4}"))
+                .unwrap_or_else(|| "unavailable".to_owned());
+            let tokens = task
+                .total_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned());
+            println!("{category},{cost},{tokens},{}", task.usage_events);
+        }
+        if task_usage.by_task.is_empty() {
+            println!("unavailable,unavailable,unavailable,0");
         }
     } else {
         println!("total_cost_usd,input_tokens,output_tokens,tokens_saved,efficiency");
@@ -155,6 +198,58 @@ fn print_model_table(summary: &CostSummaryPayload) {
             "  {:<12} {:<24} {:>10} {:>10} {:>6}",
             model.provider, model.model, cost, token_count, share
         );
+    }
+}
+
+fn print_task_table(summary: &CostSummaryPayload) {
+    let Some(usage) = summary.task_usage.as_ref() else {
+        println!("Task cost attribution is unavailable from current provider usage evidence.");
+        return;
+    };
+    if usage.coverage == ProviderUsageCoverageV1::Unavailable {
+        println!("Task cost attribution is unavailable from current provider usage evidence.");
+        return;
+    }
+    println!(
+        "  {:<20} {:>10} {:>10} {:>6}",
+        "Task category", "Cost", "Tokens", "Share"
+    );
+    for task in &usage.by_task {
+        let category = task.task_category.as_deref().unwrap_or("unattributed");
+        let share = usage
+            .total_cost_usd
+            .zip(task.cost_usd)
+            .filter(|(total, _)| *total > 0.0)
+            .map(|(total, cost)| format!("{:.0}%", cost / total * 100.0))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let token_count = task
+            .total_tokens
+            .map(tracedecay_runtime_core::text::format_token_count)
+            .unwrap_or_else(|| "unknown".to_owned());
+        let cost = task
+            .cost_usd
+            .map(|cost| format!("${cost:.2}"))
+            .unwrap_or_else(|| "unavailable".to_owned());
+        println!(
+            "  {:<20} {:>10} {:>10} {:>6}",
+            category, cost, token_count, share
+        );
+    }
+    if usage.unattributed_events > 0 {
+        println!();
+        println!(
+            "  {} usage event(s) have no exact task-category evidence; coverage is {}.",
+            usage.unattributed_events,
+            coverage_label(usage)
+        );
+    }
+}
+
+fn coverage_label(usage: &ProviderUsageTaskCostSummaryV1) -> &'static str {
+    match usage.coverage {
+        ProviderUsageCoverageV1::Complete => "complete",
+        ProviderUsageCoverageV1::Partial => "partial",
+        ProviderUsageCoverageV1::Unavailable => "unavailable",
     }
 }
 

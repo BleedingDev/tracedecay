@@ -149,6 +149,69 @@ pub struct ProviderUsageCostSummaryV1 {
     pub by_model: Vec<ProviderUsageModelCostV1>,
 }
 
+/// Stable identity used to join a provider-usage delta with task-category
+/// evidence collected by a host adapter.
+///
+/// Provider usage deliberately stays provider-neutral and does not depend on
+/// the host classifier crate. Callers that have an exact task observation can
+/// build this key from the delta and supply the classifier's wire value to
+/// [`price_provider_usage_by_task`]. A missing key is intentionally reported as
+/// unattributed instead of being inferred from the provider or model.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ProviderUsageTaskAttributionKeyV1 {
+    pub observation_id: String,
+    pub usage_ordinal: u32,
+}
+
+impl ProviderUsageTaskAttributionKeyV1 {
+    pub fn from_delta(delta: &ProviderUsageDeltaV1) -> Self {
+        Self {
+            observation_id: delta.observation_id.clone(),
+            usage_ordinal: delta.usage_ordinal,
+        }
+    }
+}
+
+/// Exact task-category evidence for provider usage deltas.
+///
+/// The category strings are the classifier's stable wire values (for example,
+/// `coding` or `testing`). This map is intentionally supplied by the
+/// composition layer because `session-memory` cannot import host-specific
+/// classifiers without creating a dependency cycle.
+pub type ProviderUsageTaskAttributionMapV1 = BTreeMap<ProviderUsageTaskAttributionKeyV1, String>;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProviderUsageTaskCostV1 {
+    /// `None` is the explicit unattributed bucket when no exact task evidence
+    /// covers the usage delta.
+    pub task_category: Option<String>,
+    pub usage_events: u64,
+    pub total_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+}
+
+/// Provider usage costs grouped by exact host task-category evidence.
+///
+/// This is a separate projection from [`ProviderUsageCostSummaryV1`] so the
+/// existing provider/model accounting contract remains unchanged. Coverage is
+/// partial whenever any included usage event lacks task evidence or cannot be
+/// priced. The aggregate dollar total is withheld in that case, matching the
+/// all-provider projection's conservative semantics.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ProviderUsageTaskCostSummaryV1 {
+    pub coverage: ProviderUsageCoverageV1,
+    pub pricing_revision: String,
+    pub usage_events: u64,
+    pub unpriced_events: u64,
+    pub unattributed_events: u64,
+    pub total_cost_usd: Option<f64>,
+    pub total_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
+    pub total_cache_read_tokens: Option<u64>,
+    pub total_cache_write_tokens: Option<u64>,
+    pub by_task: Vec<ProviderUsageTaskCostV1>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum ScanStep {
     Continue(ProviderUsageCursorV1),
@@ -499,6 +562,45 @@ impl ModelCostAccumulator {
         ProviderUsageModelCostV1 {
             provider,
             model,
+            usage_events: self.usage_events,
+            total_tokens: self.tokens.finish(),
+            cost_usd: self.cost_complete.then_some(self.cost_usd),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskCostAccumulator {
+    usage_events: u64,
+    tokens: FieldSum,
+    cost_usd: f64,
+    cost_complete: bool,
+}
+
+impl TaskCostAccumulator {
+    fn add(&mut self, counters: &Counters, cost_usd: Option<f64>) {
+        self.usage_events = self.usage_events.saturating_add(1);
+        self.tokens.add(match (counters.input, counters.output) {
+            (Some(input), Some(output)) => input.checked_add(output),
+            _ => None,
+        });
+        if self.usage_events == 1 {
+            self.cost_complete = true;
+        }
+        match cost_usd {
+            Some(cost) => {
+                self.cost_usd += cost;
+                if !self.cost_usd.is_finite() {
+                    self.cost_complete = false;
+                }
+            }
+            None => self.cost_complete = false,
+        }
+    }
+
+    fn finish(self, task_category: Option<String>) -> ProviderUsageTaskCostV1 {
+        ProviderUsageTaskCostV1 {
+            task_category,
             usage_events: self.usage_events,
             total_tokens: self.tokens.finish(),
             cost_usd: self.cost_complete.then_some(self.cost_usd),
@@ -908,6 +1010,115 @@ pub fn price_provider_usage(
         by_model: by_model
             .into_iter()
             .map(|((provider, model), summary)| summary.finish(provider, model))
+            .collect(),
+    }
+}
+
+/// Prices provider usage while grouping each included delta by exact host
+/// task-category evidence.
+///
+/// The attribution map is an input to this read model, not something inferred
+/// from model names, providers, or legacy transcript tables. Deltas absent from
+/// the map are retained in the explicit `None`/unattributed bucket and make the
+/// projection partial. This lets callers show useful lower-bound rows without
+/// claiming complete task accounting.
+pub fn price_provider_usage_by_task(
+    aggregate: &ProviderUsageAggregateV1,
+    prices: &PriceTable,
+    since_seconds: i64,
+    task_categories: &ProviderUsageTaskAttributionMapV1,
+) -> ProviderUsageTaskCostSummaryV1 {
+    let mut totals = CounterSum::default();
+    let mut total_cost_usd = 0.0;
+    let mut usage_events = 0_u64;
+    let mut unpriced_events = 0_u64;
+    let mut unattributed_events = 0_u64;
+    let mut complete = aggregate.coverage == ProviderUsageCoverageV1::Complete;
+    let mut by_task: BTreeMap<Option<String>, TaskCostAccumulator> = BTreeMap::new();
+
+    for delta in &aggregate.deltas {
+        if since_seconds > 0 {
+            match delta.native_timestamp {
+                Some(timestamp) if timestamp < since_seconds => continue,
+                Some(_) => {}
+                None => {
+                    complete = false;
+                    unpriced_events = unpriced_events.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        usage_events = usage_events.saturating_add(1);
+        let counters = Counters {
+            input: delta.counters.input_tokens,
+            output: delta.counters.output_tokens,
+            cache_read: delta.counters.cache_read_tokens,
+            cache_write: delta.counters.cache_write_tokens,
+            reasoning: delta.counters.reasoning_tokens,
+            total: delta.counters.total_tokens,
+        };
+        totals.add(&counters);
+        let cost = delta.model.as_deref().and_then(|model| {
+            cost_of_usage(
+                prices,
+                &delta.provider,
+                model,
+                counters.input?,
+                counters.output?,
+                counters.cache_read,
+                counters.cache_write,
+            )
+        });
+        match cost {
+            Some(cost) => {
+                total_cost_usd += cost;
+                if !total_cost_usd.is_finite() {
+                    complete = false;
+                }
+            }
+            None => {
+                complete = false;
+                unpriced_events = unpriced_events.saturating_add(1);
+            }
+        }
+
+        let task_category = task_categories
+            .get(&ProviderUsageTaskAttributionKeyV1::from_delta(delta))
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|category| !category.is_empty())
+            .map(str::to_owned);
+        if task_category.is_none() {
+            complete = false;
+            unattributed_events = unattributed_events.saturating_add(1);
+        }
+        by_task
+            .entry(task_category)
+            .or_default()
+            .add(&counters, cost);
+    }
+
+    let totals = totals.finish();
+    ProviderUsageTaskCostSummaryV1 {
+        coverage: if complete {
+            ProviderUsageCoverageV1::Complete
+        } else if aggregate.coverage == ProviderUsageCoverageV1::Unavailable && usage_events == 0 {
+            ProviderUsageCoverageV1::Unavailable
+        } else {
+            ProviderUsageCoverageV1::Partial
+        },
+        pricing_revision: prices.revision.clone(),
+        usage_events,
+        unpriced_events,
+        unattributed_events,
+        total_cost_usd: complete.then_some(total_cost_usd),
+        total_input_tokens: totals.input_tokens,
+        total_output_tokens: totals.output_tokens,
+        total_cache_read_tokens: totals.cache_read_tokens,
+        total_cache_write_tokens: totals.cache_write_tokens,
+        by_task: by_task
+            .into_iter()
+            .map(|(task_category, summary)| summary.finish(task_category))
             .collect(),
     }
 }

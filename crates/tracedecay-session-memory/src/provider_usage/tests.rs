@@ -9,7 +9,8 @@ use tracedecay_domain::{
 
 use super::{
     AggregatedProviderUsageCountersV1, ProviderUsageCoverageV1, ProviderUsageIssueKindV1,
-    ProviderUsageScanV1, ScanStep, price_provider_usage, reduce_provider_usage,
+    ProviderUsageScanV1, ProviderUsageTaskAttributionKeyV1, ScanStep, price_provider_usage,
+    price_provider_usage_by_task, reduce_provider_usage,
 };
 use crate::provider_pricing::{ModelPrice, PriceTable};
 
@@ -667,6 +668,140 @@ fn all_provider_pricing_is_exact_and_unknown_models_remain_unpriced() {
     assert_eq!(summary.coverage, ProviderUsageCoverageV1::Partial);
     assert_eq!(summary.total_cost_usd, None);
     assert_eq!(summary.unpriced_events, 1);
+}
+
+#[test]
+fn task_pricing_uses_exact_evidence_and_preserves_category_costs() {
+    let prices = PriceTable {
+        models: BTreeMap::from([
+            (
+                "anthropic/claude-test".to_owned(),
+                ModelPrice {
+                    prompt_per_mtok: 3.0,
+                    completion_per_mtok: 15.0,
+                    cache_read_per_mtok: Some(0.3),
+                    cache_write_per_mtok: Some(3.75),
+                },
+            ),
+            (
+                "openai/gpt-test".to_owned(),
+                ModelPrice {
+                    prompt_per_mtok: 2.0,
+                    completion_per_mtok: 8.0,
+                    cache_read_per_mtok: Some(0.2),
+                    cache_write_per_mtok: Some(2.5),
+                },
+            ),
+        ]),
+        available: true,
+        source: "fixture",
+        revision: "sha256:fixture".to_owned(),
+    };
+    let mut claude = observation(
+        1,
+        0,
+        "claude",
+        "claude-session",
+        ProviderUsageCounterSemanticsV1::Delta,
+        counters(1_000_000, 100_000),
+    );
+    claude.model = ProviderUsageModelV1::Known {
+        model: "claude-test".to_owned(),
+    };
+    let mut codex = observation(
+        2,
+        0,
+        "codex",
+        "codex-session",
+        ProviderUsageCounterSemanticsV1::Delta,
+        counters(1_000_000, 100_000),
+    );
+    codex.model = ProviderUsageModelV1::Known {
+        model: "gpt-test".to_owned(),
+    };
+
+    let aggregate = reduce_provider_usage(&[claude, codex]);
+    let task_categories = aggregate
+        .deltas
+        .iter()
+        .map(|delta| {
+            (
+                ProviderUsageTaskAttributionKeyV1::from_delta(delta),
+                if delta.provider == "claude" {
+                    "coding".to_owned()
+                } else {
+                    "testing".to_owned()
+                },
+            )
+        })
+        .collect();
+
+    let summary = price_provider_usage_by_task(&aggregate, &prices, 0, &task_categories);
+
+    assert_eq!(summary.coverage, ProviderUsageCoverageV1::Complete);
+    assert_eq!(summary.usage_events, 2);
+    assert_eq!(summary.unpriced_events, 0);
+    assert_eq!(summary.unattributed_events, 0);
+    assert!(
+        summary
+            .total_cost_usd
+            .is_some_and(|cost| (cost - 7.3).abs() < 1e-9)
+    );
+    assert_eq!(summary.by_task.len(), 2);
+    assert_eq!(summary.by_task[0].task_category.as_deref(), Some("coding"));
+    assert_eq!(summary.by_task[0].usage_events, 1);
+    assert_eq!(summary.by_task[1].task_category.as_deref(), Some("testing"));
+    assert_eq!(summary.by_task[1].usage_events, 1);
+}
+
+#[test]
+fn task_pricing_marks_missing_evidence_unattributed_and_partial() {
+    let prices = PriceTable {
+        models: BTreeMap::from([(
+            "openai/gpt-test".to_owned(),
+            ModelPrice {
+                prompt_per_mtok: 2.0,
+                completion_per_mtok: 8.0,
+                cache_read_per_mtok: Some(0.2),
+                cache_write_per_mtok: Some(2.5),
+            },
+        )]),
+        available: true,
+        source: "fixture",
+        revision: "sha256:fixture".to_owned(),
+    };
+    let first = observation(
+        1,
+        0,
+        "codex",
+        "codex-session",
+        ProviderUsageCounterSemanticsV1::Delta,
+        counters(1_000_000, 100_000),
+    );
+    let second = observation(
+        2,
+        0,
+        "codex",
+        "codex-session",
+        ProviderUsageCounterSemanticsV1::Delta,
+        counters(500_000, 50_000),
+    );
+
+    let aggregate = reduce_provider_usage(&[first, second]);
+    let key = ProviderUsageTaskAttributionKeyV1::from_delta(&aggregate.deltas[0]);
+    let task_categories = BTreeMap::from([(key, "coding".to_owned())]);
+    let summary = price_provider_usage_by_task(&aggregate, &prices, 0, &task_categories);
+
+    assert_eq!(summary.coverage, ProviderUsageCoverageV1::Partial);
+    assert_eq!(summary.usage_events, 2);
+    assert_eq!(summary.unpriced_events, 0);
+    assert_eq!(summary.unattributed_events, 1);
+    assert_eq!(summary.total_cost_usd, None);
+    assert_eq!(summary.by_task.len(), 2);
+    assert_eq!(summary.by_task[0].task_category, None);
+    assert_eq!(summary.by_task[0].usage_events, 1);
+    assert_eq!(summary.by_task[0].cost_usd, Some(1.4));
+    assert_eq!(summary.by_task[1].task_category.as_deref(), Some("coding"));
 }
 
 #[test]

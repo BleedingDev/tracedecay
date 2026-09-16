@@ -1,5 +1,7 @@
 use serde::Deserialize;
-use tracedecay_session_memory::provider_usage::ProviderUsageCostSummaryV1;
+use tracedecay_session_memory::provider_usage::{
+    ProviderUsageCostSummaryV1, ProviderUsageTaskCostSummaryV1,
+};
 
 #[derive(Deserialize)]
 pub(crate) struct CostAdminPayload {
@@ -10,6 +12,10 @@ pub(crate) struct CostAdminPayload {
 #[derive(Deserialize)]
 pub(crate) struct CostSummaryPayload {
     pub(crate) provider_usage: ProviderUsageCostSummaryV1,
+    /// Optional until the daemon has exact host task evidence for this
+    /// profile. Missing data must stay distinguishable from zero cost.
+    #[serde(default)]
+    pub(crate) task_usage: Option<ProviderUsageTaskCostSummaryV1>,
     pub(crate) tokens_saved: u64,
     pub(crate) efficiency_ratio: Option<f64>,
 }
