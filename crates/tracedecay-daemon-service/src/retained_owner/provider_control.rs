@@ -662,7 +662,9 @@ impl ProjectProviderControlPortV1 {
                 "provider lifecycle target",
             ))
         })?;
-        Ok(AuthorizedControlSourceV1 { authorized, target })
+        let source = AuthorizedControlSourceV1 { authorized, target };
+        validate_source_grant_binding(&source)?;
+        Ok(source)
     }
 
     /// Resolve a source for a control that will use the mounted provider.
@@ -683,30 +685,7 @@ impl ProjectProviderControlPortV1 {
             .resolve_source(selector, include_unavailable, &invocation.control)
             .await?;
         let granted = source.granted_source()?;
-        let retained_attribution = source
-            .authorized
-            .retained
-            .original_source
-            .to_owned_attribution()
-            .map_err(|_| {
-                ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
-                    "retained source attribution",
-                ))
-            })?;
-        if source.authorized.grant.destination_scope
-            != source.authorized.retained.scope.delivery_scope
-            || source.target.provider_id != source.authorized.retained.scope.provider_id
-            || source.target.registration_revision
-                != source.authorized.retained.scope.registration_revision
-            || source.target.delivery_scope != source.authorized.retained.scope.delivery_scope
-            || source.target.original_scope != granted.attribution.origin_scope
-            || source.target.source != granted.attribution.source
-            || retained_attribution != granted.attribution
-        {
-            return Err(ControlFailureV1::new(
-                ControlFailureStageV1::InvalidBinding("source grant at use"),
-            ));
-        }
+        validate_source_grant_binding(&source)?;
         let current_scope = self
             .authority()?
             .current_destination_scope(
@@ -850,6 +829,48 @@ impl ProjectProviderControlPortV1 {
                 }))
             }
         }
+    }
+}
+
+/// Check the immutable relationship between the retained selector evidence,
+/// the fresh host grant, and the private lifecycle target. Every source use
+/// must carry the same provider revision, exact delivery/origin scopes, source
+/// sequence, and complete original identity; a selector or stale grant cannot
+/// rewrite one of those fields after authorization.
+fn validate_source_grant_binding(source: &AuthorizedControlSourceV1) -> ControlResult<()> {
+    let granted = source.granted_source()?;
+    let retained_attribution = source
+        .authorized
+        .retained
+        .original_source
+        .to_owned_attribution()
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
+                "retained source attribution",
+            ))
+        })?;
+    if source.authorized.grant.destination_scope != source.authorized.retained.scope.delivery_scope
+        || source.target.provider_id != source.authorized.retained.scope.provider_id
+        || source.target.registration_revision
+            != source.authorized.retained.scope.registration_revision
+        || source.target.delivery_scope != source.authorized.retained.scope.delivery_scope
+        || source.target.original_scope != granted.attribution.origin_scope
+        || source.target.source != granted.attribution.source
+        || retained_attribution != granted.attribution
+    {
+        return Err(ControlFailureV1::new(
+            ControlFailureStageV1::InvalidBinding("source grant at use"),
+        ));
+    }
+    match &source.target.reference {
+        LifecycleTargetReference::RetainedSourceLocator(reference)
+            if reference == &source.authorized.retained.stable_memory_ref =>
+        {
+            Ok(())
+        }
+        _ => Err(ControlFailureV1::new(
+            ControlFailureStageV1::InvalidBinding("source locator at use"),
+        )),
     }
 }
 
