@@ -2337,9 +2337,9 @@ mod identity_revision_tests {
         }
         for index in 0..5 {
             let mut changed = identity();
-            changed.encoder_files[index].sha256 = "f".repeat(64);
+            changed.encoder_files[index].sha256 = "0".repeat(64);
             if index == 0 {
-                changed.encoder_artifact_sha256 = "f".repeat(64);
+                changed.encoder_artifact_sha256 = "0".repeat(64);
             }
             assert_ne!(
                 descriptor_digest(&changed),
@@ -2389,6 +2389,12 @@ mod identity_revision_tests {
     fn revision_two_wire_identity_round_trips_and_rejects_missing_artifacts() {
         let expected = identity();
         let mut payload = identity_request_payload(Some(&expected));
+        payload["algorithm"] = json!({
+            "profile": ALGORITHM_PROFILE,
+            "config_sha256": expected.config_sha256,
+        });
+        payload["projection_sha256"] = Value::String(expected.projection_sha256.clone());
+        payload["epoch"] = Value::from(expected.epoch);
         payload["identity_revision"] = Value::from(u64::from(IDENTITY_REVISION_V2));
         let worker = expected.worker.as_ref().expect("worker");
         payload["worker"] = json!({
