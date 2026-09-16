@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 //! Acceptance coverage for stable records, correction lineage, and read-only recall.
 
+use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::centers::read::CompoundWeights;
 use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
-use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::recall::{
-    recall, RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy,
+    RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy, recall,
 };
 use tracedecay_memory_ncm_core::records::{RecordInput, RecordState, RecordTable, Support};
 use tracedecay_memory_ncm_core::{
@@ -648,9 +648,11 @@ fn recall_budget_skips_oversized_ranked_candidate_and_keeps_later_fits() {
             .sum::<usize>(),
         config.max_recall_bytes
     );
-    assert!(!found
-        .iter()
-        .any(|candidate| candidate.record_id == oversized));
+    assert!(
+        !found
+            .iter()
+            .any(|candidate| candidate.record_id == oversized)
+    );
 }
 
 #[test]
@@ -844,4 +846,107 @@ fn operation_bounds_reject_more_than_sixteen_centers_or_candidates() {
     )
     .expect_err("top-k bound");
     assert_eq!(error, CoreError::BudgetExceeded("recall candidates"));
+}
+
+#[test]
+fn equal_activation_order_is_record_stable_across_restart() {
+    let config = config();
+    let mut records = RecordTable::new(&config);
+    let first = records
+        .insert(record_input("source-a", "same-key", "first", 0))
+        .expect("first record");
+    let second = records
+        .insert(record_input("source-b", "same-key", "second", 0))
+        .expect("second record");
+    let mut stm = MemoryCenters::new(config.stm.clone(), 91).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 92).expect("LTM");
+    let mut support = Support::new(&config);
+    let key = unit(STM_DIM, 0, 1.0);
+    let ltm_key = unit(LTM_DIM, 0, 1.0);
+    let context = unit(CONTEXT_DIM, 0, 1.0);
+
+    // Allocate the higher record ID first so center-index order cannot decide
+    // the final result order when both activations are exactly equal.
+    activate_record(&mut stm, &key, &ltm_key, second, 1.0, &mut support);
+    activate_record(&mut stm, &key, &ltm_key, first, 1.0, &mut support);
+    let policy = RecallPolicy {
+        min_activation: 0.0,
+        max_candidates: 2,
+        ..RecallPolicy::default()
+    };
+
+    let output = recall(
+        &key, &ltm_key, &context, &stm, &ltm, 0.0, &records, &support, &policy, 2,
+    )
+    .expect("recall");
+    let (found, truncated, _) = candidates(output.clone());
+    assert_eq!(
+        found
+            .iter()
+            .map(|candidate| candidate.record_id)
+            .collect::<Vec<_>>(),
+        vec![first, second]
+    );
+    assert!(!truncated);
+
+    let bytes = serde_json::to_vec(&(&stm, &ltm, &records, &support)).expect("serialize state");
+    let (restored_stm, restored_ltm, restored_records, restored_support): (
+        MemoryCenters,
+        MemoryCenters,
+        RecordTable,
+        Support,
+    ) = serde_json::from_slice(&bytes).expect("deserialize state");
+    let restored = recall(
+        &key,
+        &ltm_key,
+        &context,
+        &restored_stm,
+        &restored_ltm,
+        0.0,
+        &restored_records,
+        &restored_support,
+        &policy,
+        2,
+    )
+    .expect("restored recall");
+    assert_eq!(restored, output);
+}
+
+#[test]
+fn nonfinite_center_intensity_fails_closed_before_recall_hydration() {
+    let config = config();
+    let mut records = RecordTable::new(&config);
+    let id = records
+        .insert(record_input("source", "known", "fact", 0))
+        .expect("record");
+    let mut stm = MemoryCenters::new(config.stm.clone(), 93).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 94).expect("LTM");
+    let mut support = Support::new(&config);
+    let key = unit(STM_DIM, 0, 1.0);
+    let ltm_key = unit(LTM_DIM, 0, 1.0);
+    let context = unit(CONTEXT_DIM, 0, 1.0);
+    activate_record(&mut stm, &key, &ltm_key, id, 1.0, &mut support);
+
+    for intensity in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        stm.intensity[0] = intensity;
+        assert_eq!(
+            recall(
+                &key,
+                &ltm_key,
+                &context,
+                &stm,
+                &ltm,
+                0.0,
+                &records,
+                &support,
+                &RecallPolicy {
+                    min_activation: 0.0,
+                    ..RecallPolicy::default()
+                },
+                1,
+            ),
+            Err(CoreError::NonFinite("center intensity")),
+            "non-finite persisted scores must fail closed",
+        );
+    }
 }
