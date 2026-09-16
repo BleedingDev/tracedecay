@@ -257,7 +257,7 @@ fn assert_health(journey: &ClaudeHostJourney, state: &ProviderControlStateSelect
     .expect("provider Health RPC transport");
     let result = typed_result(&response);
     assert_success(&result, label);
-    let ProviderControlOperationResultV1::Health(Some(health)) = result.result else {
+    let ProviderControlOperationResultV1::Health(Some(health)) = &result.result else {
         panic!("{label} must include typed health evidence: {result:?}");
     };
     assert_eq!(
@@ -284,7 +284,7 @@ fn assert_maintenance(journey: &ClaudeHostJourney, state: &ProviderControlStateS
     .expect("provider maintenance RPC transport");
     let result = typed_result(&response);
     assert_success(&result, "maintenance");
-    let ProviderControlOperationResultV1::Maintenance(Some(maintenance)) = result.result else {
+    let ProviderControlOperationResultV1::Maintenance(Some(maintenance)) = &result.result else {
         panic!("maintenance must include typed maintenance evidence: {result:?}");
     };
     assert_eq!(
@@ -312,7 +312,7 @@ fn assert_feedback_idempotency(
     let first = typed_result(&first);
     assert_success(&first, "feedback");
     assert!(matches!(
-        first.result,
+        &first.result,
         ProviderControlOperationResultV1::Feedback(Some(_))
     ));
     assert_eq!(
@@ -326,7 +326,7 @@ fn assert_feedback_idempotency(
     let duplicate = typed_result(&duplicate);
     assert_success(&duplicate, "duplicate feedback");
     assert!(matches!(
-        duplicate.result,
+        &duplicate.result,
         ProviderControlOperationResultV1::Feedback(Some(_))
     ));
     assert_eq!(
@@ -373,7 +373,7 @@ fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &Reca
     let current = typed_result(&response);
     assert_success(&current, "current correction");
     assert!(matches!(
-        current.result,
+        &current.result,
         ProviderControlOperationResultV1::Correction(Some(_))
     ));
 
@@ -529,10 +529,10 @@ fn assert_delete_by_source_non_resurrection(
     .expect("delete-by-source RPC transport");
     let result = typed_result(&response);
     assert_success(&result, "delete-by-source");
-    let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = result.result else {
+    let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result else {
         panic!("delete-by-source must include typed deletion evidence: {result:?}");
     };
-    assert_eq!(deletion.source, *selector);
+    assert_eq!(&deletion.source, selector);
 
     let after_delete = restart_and_recall(journey, session_id);
     let lane = assert_answered_lane(&after_delete, CONFIGURED_PROVIDER_ID);
