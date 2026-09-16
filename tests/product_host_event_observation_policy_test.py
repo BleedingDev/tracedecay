@@ -174,7 +174,10 @@ class HostEventObservationPolicyTest(unittest.TestCase):
             if row["event_id"]
             in {
                 "application.tool_execution_settled.v1",
+                "application.source_edit_settled.v1",
                 "application.test_execution_settled.v1",
+                "application.feedback_outcome_settled.v1",
+                "application.automation_outcome_settled.v1",
             }
         }
         expected_authorities = {
@@ -182,13 +185,27 @@ class HostEventObservationPolicyTest(unittest.TestCase):
                 "crates/tracedecay-mcp/src/server/settlement.rs",
                 "crates/tracedecay-application/src/observability/delivery_settlement.rs",
             },
+            "application.source_edit_settled.v1": {
+                "crates/tracedecay-source-edit/src/file_authority.rs",
+                "crates/tracedecay-source-edit/src/execute.rs",
+            },
             "application.test_execution_settled.v1": {
                 "crates/tracedecay-application/src/observability/delivery_settlement.rs",
+            },
+            "application.feedback_outcome_settled.v1": {
+                "crates/tracedecay-application/src/feedback/observations.rs",
+            },
+            "application.automation_outcome_settled.v1": {
+                "crates/tracedecay-automation-runtime/src/automation/observation.rs",
+                "crates/tracedecay/src/daemon/scheduler/automation_observation.rs",
             },
         }
         stale_authorities = {
             "crates/tracedecay/src/mcp/server/dispatch_settlement.rs",
             "crates/tracedecay-usecases/src/observability/delivery_settlement.rs",
+            "crates/tracedecay-application/src/work_owner_observation.rs",
+            "crates/tracedecay-usecases/src/feedback/observations.rs",
+            "crates/tracedecay/src/daemon/automation_observation.rs",
         }
         for event_id, authorities in expected_authorities.items():
             commit_point = events[event_id]["canonical_commit_point"]

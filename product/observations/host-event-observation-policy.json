@@ -514,8 +514,8 @@
         "authority": "Exact admitted worktree source-edit authority",
         "settled_state": "Atomic publication succeeded and expected file identity/generation was advanced",
         "source_paths": [
-          "crates/tracedecay-application/src/work_owner_observation.rs",
-          "crates/tracedecay-mcp/src/server/settlement.rs"
+          "crates/tracedecay-source-edit/src/file_authority.rs",
+          "crates/tracedecay-source-edit/src/execute.rs"
         ],
         "receipt_fields": ["operation_id", "worktree_id", "file_identity", "before_digest", "after_digest", "commit_generation"],
         "ordering_authority": "The source-edit publication generation and after digest, not editor-buffer time.",
@@ -795,7 +795,7 @@
         "point_id": "native_feedback_log.outcome_commit",
         "authority": "TraceDecay feedback outcome authority",
         "settled_state": "Feedback source event and resulting trust/outcome transition are durably recorded",
-        "source_paths": ["crates/tracedecay-usecases/src/feedback/observations.rs"],
+        "source_paths": ["crates/tracedecay-application/src/feedback/observations.rs"],
         "receipt_fields": ["feedback_event_id", "target_identity", "outcome", "transition_digest", "resolved_scope_digest"],
         "ordering_authority": "Feedback log settlement and target identity, not UI preview order.",
         "provider_fanout": "Only after feedback is settled; provider output cannot rewrite Native feedback."
@@ -850,7 +850,7 @@
         "authority": "TraceDecay automation run authority",
         "settled_state": "Run ledger contains a terminal outcome, input/evidence identity, and any committed effect receipt",
         "source_paths": [
-          "crates/tracedecay/src/daemon/automation_observation.rs",
+          "crates/tracedecay-automation-runtime/src/automation/observation.rs",
           "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
         ],
         "receipt_fields": ["run_id", "terminal_outcome", "input_digest", "effect_digest", "resolved_scope_digest"],
