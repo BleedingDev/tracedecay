@@ -620,4 +620,12 @@ impl DaemonInvocationService {
             mounted.remove(&database_path);
         }
     }
+
+    /// Test-only census for the session-holder leases retained by project
+    /// publication. A failed open must return this to its pre-open count
+    /// before a retry can mount the same profile and project stores again.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn session_holder_database_count(&self) -> usize {
+        self.session_holder_databases.lock().await.len()
+    }
 }

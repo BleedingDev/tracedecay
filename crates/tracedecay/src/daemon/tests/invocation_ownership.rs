@@ -30,6 +30,16 @@ use tracedecay_daemon_service::{
     DaemonInvocationProblem, ProjectRuntimePublicationStateV1, RegisteredRetainedRuntime,
 };
 
+static PROJECT_OPEN_FAILURE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ProjectOpenFailureReset;
+
+impl Drop for ProjectOpenFailureReset {
+    fn drop(&mut self) {
+        super::super::project_composition::clear_project_open_failure();
+    }
+}
+
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -467,6 +477,169 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     assert!(
         shutdown.project_servers.is_clean(),
         "the retained owner must shut down cleanly: {shutdown:?}"
+    );
+}
+
+/// A failure after dependent owner registration must remove every owner the
+/// attempt mounted before the next open. In particular, runtime retirement is
+/// reopenable here: terminal retirement would leave the root fenced and make
+/// the final retry fail before it could publish a new runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_full_publication_unwinds_every_owner_before_retry() {
+    let _failure_lock = PROJECT_OPEN_FAILURE_TEST_LOCK.lock().await;
+    let _failure_reset = ProjectOpenFailureReset;
+    let (_temp, _database_scope, engine, handshake) =
+        unopened_committed_fixture("failed-full-publication-retry").await;
+    let canonical_project = handshake
+        .project_path
+        .as_deref()
+        .expect("project alias")
+        .canonicalize()
+        .expect("canonical project root");
+    let route = super::super::ProjectRouteKey::from_handshake(&canonical_project, &handshake)
+        .expect("project route");
+    let project_id = engine
+        .store_administration
+        .registered_profile_database()
+        .await
+        .expect("profile database")
+        .project_registry_context_by_alias(&canonical_project)
+        .await
+        .expect("project registry context")
+        .expect("registered project context")
+        .project
+        .project_id;
+    let holder_count_before = engine
+        .invocation
+        .service
+        .session_holder_database_count()
+        .await;
+
+    super::super::project_composition::fail_project_open_after(
+        super::super::project_composition::ProjectOpenFailurePhase::DependentOwners,
+    );
+    let failure = engine
+        .project_server(&handshake)
+        .await
+        .expect_err("injected dependent-owner failure");
+    assert!(
+        failure
+            .to_string()
+            .contains("injected project-open failure"),
+        "the test must stop at the requested publication phase: {failure}"
+    );
+
+    assert!(
+        engine
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .get_route(&route)
+            .is_none(),
+        "failed publication must remove the MCP route before retry"
+    );
+    assert!(
+        engine
+            .http_application_registry
+            .resolve(&project_id)
+            .await
+            .expect("failed HTTP route resolution")
+            .is_none(),
+        "failed publication must leave the HTTP route unreachable"
+    );
+    assert_eq!(
+        engine
+            .invocation
+            .service
+            .project_runtimes
+            .publication_state(&canonical_project),
+        None,
+        "failed publication must remove its runtime publication"
+    );
+    assert!(
+        !engine
+            .invocation
+            .service
+            .project_runtimes
+            .holds::<RegisteredRetainedRuntime>(&canonical_project)
+            .await,
+        "failed publication must remove the retained runtime owner"
+    );
+    assert!(
+        engine
+            .invocation
+            .service
+            .lsp_owner(Some(&canonical_project))
+            .await
+            .is_none(),
+        "failed publication must remove the LSP owner"
+    );
+    assert!(
+        engine
+            .invocation
+            .service
+            .feedback_cycle(Some(&canonical_project))
+            .await
+            .is_none(),
+        "failed publication must remove the feedback owner"
+    );
+    assert_eq!(
+        engine
+            .invocation
+            .service
+            .session_holder_database_count()
+            .await,
+        holder_count_before,
+        "failed publication must release every session-holder lease it added"
+    );
+
+    let retried = engine
+        .project_server(&handshake)
+        .await
+        .expect("same project must retry after transactional rollback");
+    assert_eq!(
+        engine
+            .invocation
+            .service
+            .project_runtimes
+            .publication_state(&canonical_project),
+        Some(ProjectRuntimePublicationStateV1::Ready),
+        "retry must reach the full Ready publication"
+    );
+    assert!(
+        engine
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .get_route(&route)
+            .is_some_and(|(_, server)| std::sync::Arc::ptr_eq(server, &retried)),
+        "retry must publish its new full server in the MCP registry"
+    );
+    assert!(
+        engine
+            .http_application_registry
+            .resolve(&project_id)
+            .await
+            .expect("retry HTTP route resolution")
+            .is_some(),
+        "retry must mount the HTTP route after full publication"
+    );
+    assert!(
+        engine
+            .invocation
+            .service
+            .session_holder_database_count()
+            .await
+            > holder_count_before,
+        "retry must remount its session-holder leases"
+    );
+
+    let shutdown = engine.shutdown_all().await;
+    assert!(
+        shutdown.project_servers.is_clean(),
+        "retry publication must shut down cleanly: {shutdown:?}"
     );
 }
 
