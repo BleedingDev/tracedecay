@@ -4,6 +4,10 @@
 //! content-free transport spool. It has no daemon, database, query, model,
 //! session, memory, sync, or indexing authority.
 
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod tests;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,9 +15,10 @@ use tracedecay_domain::UtcMicros;
 
 use crate::{
     HookConfigurationFileReaderV1, HookConfigurationReadOutcomeV1, HookConfigurationSubscriberV1,
-    HookEventEnvelopeV2, HookHostV1, HookScopeBindingV1, HookSpoolConfigV1, HookSpoolError,
-    HookSpoolV1, NativeEnvelopeMaterialV1, NativeHookDecodeError, OpenCodePluginSurfaceV1,
-    decode_native_hook_event, decode_opencode_plugin_event, hook_configuration_path,
+    HookDeliveryReceiptSpoolV1, HookEventEnvelopeV2, HookHostV1, HookScopeBindingV1,
+    HookSpoolConfigV1, HookSpoolError, HookSpoolV1, NativeEnvelopeMaterialV1,
+    NativeHookDecodeError, OpenCodePluginSurfaceV1, decode_native_hook_event,
+    decode_opencode_plugin_event, hook_configuration_path, hook_delivery_receipt_spool_root,
 };
 
 /// The real host surface that supplied native hook bytes.
@@ -61,7 +66,7 @@ pub fn capture_native_event_for_replay(
     now: UtcMicros,
     wait_budget: Duration,
 ) -> NativeHookCaptureOutcomeV1 {
-    let outcome = capture_native_event_for_replay_inner(
+    let outcome = match capture_native_event_inner(
         data_root,
         worktree_id,
         source,
@@ -69,7 +74,141 @@ pub fn capture_native_event_for_replay(
         material,
         now,
         wait_budget,
+        false,
+    ) {
+        Ok(_) => NativeHookCaptureOutcomeV1::Captured,
+        Err(outcome) => outcome,
+    };
+    record_capture_outcome(outcome);
+    outcome
+}
+
+/// Captures a native event only after admitting the delivery receipt writer and
+/// its capacity. The returned writer lease must be retained by the caller
+/// through the host response write/flush and the subsequent receipt append.
+/// This ordering means a full or contended delivery spool refuses before the
+/// replay envelope becomes durable, and a retry can reuse the exact receipt
+/// identity without replacing the first retained evidence.
+#[hotpath::measure(label = "hooks.capture.native_event_with_delivery_writer")]
+pub fn capture_native_event_with_delivery_writer(
+    data_root: &Path,
+    worktree_id: [u8; 16],
+    source: NativeHookCaptureSourceV1,
+    payload: &[u8],
+    material: NativeEnvelopeMaterialV1,
+    now: UtcMicros,
+    wait_budget: Duration,
+) -> Result<HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1> {
+    let result = capture_native_event_inner(
+        data_root,
+        worktree_id,
+        source,
+        payload,
+        material,
+        now,
+        wait_budget,
+        true,
     );
+    match result {
+        Ok(Some(writer)) => {
+            record_capture_outcome(NativeHookCaptureOutcomeV1::Captured);
+            Ok(writer)
+        }
+        Ok(None) => {
+            record_capture_outcome(NativeHookCaptureOutcomeV1::Unavailable);
+            Err(NativeHookCaptureOutcomeV1::Unavailable)
+        }
+        Err(outcome) => {
+            record_capture_outcome(outcome);
+            Err(outcome)
+        }
+    }
+}
+
+fn capture_native_event_inner(
+    data_root: &Path,
+    worktree_id: [u8; 16],
+    source: NativeHookCaptureSourceV1,
+    payload: &[u8],
+    material: NativeEnvelopeMaterialV1,
+    now: UtcMicros,
+    wait_budget: Duration,
+    admit_delivery: bool,
+) -> Result<Option<HookDeliveryReceiptSpoolV1>, NativeHookCaptureOutcomeV1> {
+    let host = source.host();
+    let decoded_result = match source {
+        NativeHookCaptureSourceV1::Host(host) => decode_native_hook_event(host, payload),
+        NativeHookCaptureSourceV1::OpenCodeToolExecuteAfter => {
+            decode_opencode_plugin_event(OpenCodePluginSurfaceV1::ToolExecuteAfter, payload)
+        }
+    };
+    let decoded = match decoded_result {
+        Ok(decoded) => decoded,
+        Err(
+            NativeHookDecodeError::UnsupportedNativeEvent
+            | NativeHookDecodeError::UnsupportedNativeFamily,
+        ) => return Err(NativeHookCaptureOutcomeV1::Unsupported),
+        Err(_) => return Err(NativeHookCaptureOutcomeV1::Rejected),
+    };
+    let subscriber = HookConfigurationSubscriberV1::new(HookConfigurationFileReaderV1::new(
+        hook_configuration_path(data_root, worktree_id, host),
+    ));
+    let HookConfigurationReadOutcomeV1::Bound(snapshot) = subscriber.load_current(host, now) else {
+        return Err(NativeHookCaptureOutcomeV1::Unbound);
+    };
+    let envelope = match decoded.into_envelope(&snapshot.binding, material) {
+        Ok(envelope) => envelope,
+        Err(_) => return Err(NativeHookCaptureOutcomeV1::Rejected),
+    };
+
+    // Decode and binding validation are complete before any delivery spool
+    // admission. The writer lease stays alive through the replay append and is
+    // returned to the host path for the response flush and receipt append.
+    let delivery_writer = if admit_delivery {
+        let writer = HookDeliveryReceiptSpoolV1::open_within(
+            hook_delivery_receipt_spool_root(data_root, host),
+            wait_budget,
+        )
+        .map_err(delivery_admission_outcome)?;
+        let candidate = native_hook_delivery_settlement(source, material, now)
+            .ok_or(NativeHookCaptureOutcomeV1::Rejected)?;
+        let candidate = crate::HookDeliverySourceReceiptV1::new(candidate)
+            .map_err(delivery_admission_outcome)?;
+        writer
+            .admit_capacity(&candidate)
+            .map_err(delivery_admission_outcome)?;
+        Some(writer)
+    } else {
+        None
+    };
+
+    let spool_root = data_root.join("hook-v2-spool").join(host.hook_key());
+    let mut spool = match HookSpoolV1::open_within(
+        spool_root,
+        HookSpoolConfigV1::stock(host),
+        now,
+        wait_budget,
+    ) {
+        Ok((spool, _)) => spool,
+        Err(HookSpoolError::AdmissionTimedOut) => {
+            return Err(NativeHookCaptureOutcomeV1::AdmissionTimedOut);
+        }
+        Err(HookSpoolError::SpoolFull) => return Err(NativeHookCaptureOutcomeV1::Full),
+        Err(HookSpoolError::ResetRequired { .. }) => {
+            return Err(NativeHookCaptureOutcomeV1::ResetRequired);
+        }
+        Err(_) => return Err(NativeHookCaptureOutcomeV1::Unavailable),
+    };
+    let envelope = redelivered_envelope(&mut spool, &snapshot.binding, envelope);
+    match spool.append(envelope, &snapshot.binding, now) {
+        Ok(_) => Ok(delivery_writer),
+        Err(HookSpoolError::SpoolFull) => Err(NativeHookCaptureOutcomeV1::Full),
+        Err(HookSpoolError::ResetRequired { .. }) => Err(NativeHookCaptureOutcomeV1::ResetRequired),
+        Err(_) => Err(NativeHookCaptureOutcomeV1::Unavailable),
+    }
+}
+
+fn record_capture_outcome(outcome: NativeHookCaptureOutcomeV1) {
     #[cfg(feature = "hotpath")]
     {
         hotpath::gauge!(match outcome {
@@ -85,67 +224,7 @@ pub fn capture_native_event_for_replay(
         })
         .inc(1);
     }
-    outcome
-}
-
-fn capture_native_event_for_replay_inner(
-    data_root: &Path,
-    worktree_id: [u8; 16],
-    source: NativeHookCaptureSourceV1,
-    payload: &[u8],
-    material: NativeEnvelopeMaterialV1,
-    now: UtcMicros,
-    wait_budget: Duration,
-) -> NativeHookCaptureOutcomeV1 {
-    let host = source.host();
-    let decoded_result = match source {
-        NativeHookCaptureSourceV1::Host(host) => decode_native_hook_event(host, payload),
-        NativeHookCaptureSourceV1::OpenCodeToolExecuteAfter => {
-            decode_opencode_plugin_event(OpenCodePluginSurfaceV1::ToolExecuteAfter, payload)
-        }
-    };
-    let decoded = match decoded_result {
-        Ok(decoded) => decoded,
-        Err(
-            NativeHookDecodeError::UnsupportedNativeEvent
-            | NativeHookDecodeError::UnsupportedNativeFamily,
-        ) => return NativeHookCaptureOutcomeV1::Unsupported,
-        Err(_) => return NativeHookCaptureOutcomeV1::Rejected,
-    };
-    let subscriber = HookConfigurationSubscriberV1::new(HookConfigurationFileReaderV1::new(
-        hook_configuration_path(data_root, worktree_id, host),
-    ));
-    let HookConfigurationReadOutcomeV1::Bound(snapshot) = subscriber.load_current(host, now) else {
-        return NativeHookCaptureOutcomeV1::Unbound;
-    };
-    let envelope = match decoded.into_envelope(&snapshot.binding, material) {
-        Ok(envelope) => envelope,
-        Err(_) => return NativeHookCaptureOutcomeV1::Rejected,
-    };
-    let spool_root = data_root.join("hook-v2-spool").join(host.hook_key());
-    let mut spool = match HookSpoolV1::open_within(
-        spool_root,
-        HookSpoolConfigV1::stock(host),
-        now,
-        wait_budget,
-    ) {
-        Ok((spool, _)) => spool,
-        Err(HookSpoolError::AdmissionTimedOut) => {
-            return NativeHookCaptureOutcomeV1::AdmissionTimedOut;
-        }
-        Err(HookSpoolError::SpoolFull) => return NativeHookCaptureOutcomeV1::Full,
-        Err(HookSpoolError::ResetRequired { .. }) => {
-            return NativeHookCaptureOutcomeV1::ResetRequired;
-        }
-        Err(_) => return NativeHookCaptureOutcomeV1::Unavailable,
-    };
-    let envelope = redelivered_envelope(&mut spool, &snapshot.binding, envelope);
-    match spool.append(envelope, &snapshot.binding, now) {
-        Ok(_) => NativeHookCaptureOutcomeV1::Captured,
-        Err(HookSpoolError::SpoolFull) => NativeHookCaptureOutcomeV1::Full,
-        Err(HookSpoolError::ResetRequired { .. }) => NativeHookCaptureOutcomeV1::ResetRequired,
-        Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
-    }
+    let _ = outcome;
 }
 
 /// Reuses the queued envelope when this callback is a redelivery of an event
@@ -178,4 +257,64 @@ fn redelivered_envelope(
     } else {
         envelope
     }
+}
+
+fn delivery_admission_outcome(
+    error: crate::delivery_spool::HookDeliverySpoolError,
+) -> NativeHookCaptureOutcomeV1 {
+    use crate::delivery_spool::HookDeliverySpoolError;
+    match error {
+        HookDeliverySpoolError::AdmissionTimedOut => NativeHookCaptureOutcomeV1::AdmissionTimedOut,
+        HookDeliverySpoolError::Full => NativeHookCaptureOutcomeV1::Full,
+        _ => NativeHookCaptureOutcomeV1::Unavailable,
+    }
+}
+
+/// Derives native output settlement identity; callers persist only after the
+/// host has flushed its response. The receipt spool hashes this stable
+/// identity without delivery timestamps, so retries reuse the first durable
+/// receipt and its original evidence.
+pub fn native_hook_delivery_settlement(
+    source: NativeHookCaptureSourceV1,
+    material: NativeEnvelopeMaterialV1,
+    delivered_at: UtcMicros,
+) -> Option<tracedecay_domain::DeliverySettlementV1> {
+    let host = source.host();
+    let owner = tracedecay_domain::canonical_sha256(&(
+        "tracedecay.native-hook-output-delivery.v1",
+        host.hook_key(),
+        material.event_id,
+    ))
+    .ok()?;
+    let channel = tracedecay_domain::canonical_sha256(&(
+        "tracedecay.native-hook-output-channel.v1",
+        host.hook_key(),
+        material.protected_session_id,
+    ))
+    .ok()?;
+    let attempted_at = std::cmp::max(material.observed_at, delivered_at);
+    Some(tracedecay_domain::DeliverySettlementV1 {
+        attempt: tracedecay_domain::DeliverySettlementAttemptV1 {
+            owner_event_id: format!(
+                "hook:native:{}",
+                owner.as_str().trim_start_matches("sha256:")
+            ),
+            event_class: tracedecay_domain::DeliveryEventClassV1::Activity,
+            channel: tracedecay_domain::DeliveryChannelIdentityV1 {
+                surface: tracedecay_domain::DeliverySurfaceFamilyV1::Hook,
+                channel_ref: format!(
+                    "hook:{}:{}",
+                    host.hook_key(),
+                    channel.as_str().trim_start_matches("sha256:")
+                ),
+            },
+            work_attempt: None,
+            eligible: 1,
+            valid_at: material.observed_at,
+            attempted_at,
+        },
+        outcome: tracedecay_domain::DeliverySettlementOutcomeV1::Delivered,
+        settled_at: attempted_at,
+        drop_reason: None,
+    })
 }

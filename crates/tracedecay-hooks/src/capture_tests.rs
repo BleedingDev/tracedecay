@@ -30,11 +30,14 @@ impl Drop for TestDir {
     }
 }
 const HOST: HookHostV1 = HookHostV1::ClaudeCode;
+const WORKTREE_ID: [u8; 16] = [3; 16];
 const PAYLOAD: &[u8] = include_bytes!("../fixtures/host_events/claude/stop.json");
 fn bind(root: &Path) {
     std::fs::create_dir_all(root).unwrap();
     HookConfigurationPublisherV1::new(HookConfigurationFileWriterV1::new(hook_configuration_path(
-        root, HOST,
+        root,
+        WORKTREE_ID,
+        HOST,
     )))
     .publish(HookConfigurationSnapshotV1 {
         schema_version: HOOK_CONFIGURATION_SCHEMA_VERSION,
@@ -63,6 +66,7 @@ fn capture(
 ) -> Result<HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1> {
     capture_native_event_with_delivery_writer(
         root,
+        WORKTREE_ID,
         NativeHookCaptureSourceV1::Host(HOST),
         payload,
         material(10),
@@ -237,6 +241,7 @@ fn full_receipt_queue_admits_same_identity_retry_without_replacing_evidence() {
     assert_eq!(original.receipt_id, retry.receipt_id);
     let writer = capture_native_event_with_delivery_writer(
         &root.0,
+        WORKTREE_ID,
         NativeHookCaptureSourceV1::Host(HOST),
         PAYLOAD,
         material(20),
