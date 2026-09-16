@@ -1339,6 +1339,10 @@ impl<'owner> HostFixture<'owner> {
 
     fn stop_daemon(&mut self) -> FixtureResult<Value> {
         let slot = self.daemon_slot.take().ok_or("no daemon to restart")?;
+        // The journal reader belongs to the daemon incarnation that just
+        // stopped. Drop it before opening the durable store after restart so
+        // fixture settlement observes the new process through a fresh handle.
+        self.journey.reset_journal_readers();
         let exit = self.processes.stop(slot)?;
         // There is no in-flight CLI action at this serialized lifecycle
         // boundary. Join/verify every worker before opening the state again.

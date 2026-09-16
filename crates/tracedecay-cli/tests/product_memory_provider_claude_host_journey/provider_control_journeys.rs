@@ -1,8 +1,10 @@
 //! Real provider-control journeys over the Claude/Codex host fixture.
 //!
 //! Every selector below is taken from the preceding production recall result.
-//! Requests cross the same authenticated daemon RPC used by the comparison
-//! fixture, and every refusal is asserted from the typed application outcome.
+//! Read requests use the shipped `tracedecay tool` surface; mutation retries
+//! stay on the authenticated daemon RPC so the test can hold their request
+//! identity stable across a daemon restart. Every refusal is asserted from the
+//! typed application outcome.
 
 use super::*;
 use std::fs;
@@ -148,6 +150,16 @@ fn source_and_state(
                 .or_else(|| sources.first())
         })
         .expect("canonical source evidence");
+    let expected_provider = if journey.codex { "codex" } else { "claude" };
+    assert_eq!(
+        source["source"]["canonical_provider_id"], expected_provider,
+        "provider-control selector must retain the recalled host identity"
+    );
+    assert_eq!(
+        source["source"]["canonical_session_id"],
+        journey.session_id(),
+        "provider-control selector must retain the recalled origin session"
+    );
     let observation_id = source["source"]["observation_id"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -235,6 +247,31 @@ fn typed_result(response: &DaemonInvocationResponse) -> ProviderControlResultV1 
     }
 }
 
+/// Decode the typed provider-control result printed by the real CLI surface.
+/// The dynamic tool command emits the application envelope verbatim; the
+/// provider result is the evidence packet's payload. Keeping this helper next
+/// to the RPC decoder makes it explicit which checks exercise the public CLI
+/// route and which checks require a caller-controlled request identity.
+fn typed_tool_result(
+    journey: &ClaudeHostJourney,
+    tool_name: &str,
+    arguments: Value,
+) -> ProviderControlResultV1 {
+    let envelope = journey.tool_result(tool_name, &arguments);
+    assert_eq!(
+        envelope["outcome"], "evidence",
+        "{tool_name} must return an evidence envelope: {envelope}"
+    );
+    let payload = envelope
+        .pointer("/outcome/value/payload")
+        .cloned()
+        .filter(|payload| !payload.is_null())
+        .unwrap_or_else(|| panic!("{tool_name} omitted its typed payload: {envelope}"));
+    serde_json::from_value(payload).unwrap_or_else(|error| {
+        panic!("{tool_name} returned an undecodable provider result: {error}")
+    })
+}
+
 fn assert_outer_problem(response: &DaemonInvocationResponse, expected: &str) {
     match &response.outcome {
         DaemonInvocationOutcome::RetainedApplicationProblem { problem, .. } => match expected {
@@ -280,10 +317,10 @@ fn assert_health(
     state: &ProviderControlStateSelectorV1,
     label: &str,
 ) -> u64 {
-    let response = invoke(
+    let result = typed_tool_result(
         journey,
-        &format!("host-provider-control.{label}"),
-        ProviderControlRequestV1::Health(ProviderHealthRequestV1 {
+        "tracedecay_provider_health",
+        serde_json::to_value(ProviderHealthRequestV1 {
             state: state.clone(),
             requested_checks: vec![
                 ProviderControlHealthCheckV1::Protocol,
@@ -294,10 +331,9 @@ fn assert_health(
                 ProviderControlHealthCheckV1::Recovery,
                 ProviderControlHealthCheckV1::Privacy,
             ],
-        }),
-    )
-    .expect("provider Health RPC transport");
-    let result = typed_result(&response);
+        })
+        .expect("provider Health request JSON"),
+    );
     assert_success(&result, label);
     let ProviderControlOperationResultV1::Health(Some(health)) = &result.result else {
         panic!("{label} must include typed health evidence: {result:?}");
@@ -502,7 +538,7 @@ fn assert_feedback_idempotency(
     );
 }
 
-fn assert_correction_revision_refusal(journey: &ClaudeHostJourney, source: &RecalledSource) {
+fn assert_correction_revision_refusal(journey: &mut ClaudeHostJourney, source: &RecalledSource) {
     let expected = source
         .source_revision
         .as_deref()

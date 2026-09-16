@@ -45,7 +45,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -196,14 +196,17 @@ struct ClaudeHostJourney {
     profile: PathBuf,
     project: PathBuf,
     bin_dir: PathBuf,
-    /// The observer's read handle on the durable journal, opened once.
+    /// The observer's read handle on the durable journal for the current
+    /// daemon incarnation.
     ///
     /// Opening the store initializes its schema inside a write transaction, so
     /// re-opening it on every poll would contend with the daemon's own writer
     /// for the duration of the journey. The observation is a read; it takes one
-    /// handle and keeps it.
-    journal: OnceLock<SqliteObservationJournal>,
-    ncm_journal: OnceLock<SqliteObservationJournal>,
+    /// handle and keeps it until the daemon stops. The slot is cleared at every
+    /// lifecycle boundary so a later read cannot retain a stale SQLite
+    /// connection across a restart.
+    journal: RefCell<Option<Arc<SqliteObservationJournal>>>,
+    ncm_journal: RefCell<Option<Arc<SqliteObservationJournal>>>,
     live_origin_diagnostics: RefCell<Vec<Value>>,
 }
 
@@ -253,8 +256,8 @@ impl ClaudeHostJourney {
             profile,
             project,
             bin_dir,
-            journal: OnceLock::new(),
-            ncm_journal: OnceLock::new(),
+            journal: RefCell::new(None),
+            ncm_journal: RefCell::new(None),
             live_origin_diagnostics: RefCell::new(Vec::new()),
         }
     }
@@ -568,10 +571,20 @@ impl ClaudeHostJourney {
     }
 
     fn stop_daemon(&mut self) {
+        self.reset_journal_readers();
         if let Some(mut daemon) = self.daemon.take() {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
+    }
+
+    /// Drop all journal connections before a daemon restart. Opening a fresh
+    /// reader after startup is part of the assertion: it proves the test sees
+    /// the durable store published by the new daemon process rather than a
+    /// connection that was opened before the lifecycle boundary.
+    fn reset_journal_readers(&mut self) {
+        self.journal.get_mut().take();
+        self.ncm_journal.get_mut().take();
     }
 
     /// Append one canonical source through the public parser, privacy
@@ -1414,19 +1427,19 @@ impl ClaudeHostJourney {
         )
     }
 
-    /// The read handle on the durable journal, opened the first time the store
-    /// exists and reused for the rest of the journey.
+    /// The read handle on the durable journal, opened once per daemon
+    /// incarnation and reused for the rest of that incarnation.
     ///
     /// `None` only while the mounted journey has not created its store yet,
     /// which is genuinely "no deliveries"; a store that exists but refuses to
     /// open fails the test loudly rather than reading as an empty journal.
-    fn journal_for(&self, ncm: bool) -> Option<&SqliteObservationJournal> {
+    fn journal_for(&self, ncm: bool) -> Option<Arc<SqliteObservationJournal>> {
         let slot = if ncm {
             &self.ncm_journal
         } else {
             &self.journal
         };
-        if let Some(journal) = slot.get() {
+        if let Some(journal) = slot.borrow().as_ref().cloned() {
             return Some(journal);
         }
         // Both are host-owned journals under this isolated canonical profile.
@@ -1439,10 +1452,12 @@ impl ClaudeHostJourney {
                 JOURNAL_FILE_NAME
             },
         )?;
-        let journal = SqliteObservationJournal::open(&path, inspection_retention_policy())
-            .expect("the durable observation journal must open through its own store API");
-        let _ = slot.set(journal);
-        slot.get()
+        let journal = Arc::new(
+            SqliteObservationJournal::open(&path, inspection_retention_policy())
+                .expect("the durable observation journal must open through its own store API"),
+        );
+        *slot.borrow_mut() = Some(Arc::clone(&journal));
+        Some(journal)
     }
 
     /// Every delivery the durable observation journal holds, read through the
@@ -2421,6 +2436,7 @@ fn assert_host_memory_journey_with_provider(
             "empty SessionStart must not add another delivery receipt"
         );
     }
+    drop(selected_journal);
     journey.assert_observer_settled(&after_start, &observer_final);
     let (revision_source_event_id, revision_source) =
         capture_revision_fixture_source(&journey, &after_start, &revision_fixture_id);
