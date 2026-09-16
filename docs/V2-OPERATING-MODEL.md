@@ -21,11 +21,11 @@ truth for capabilities not yet delivered.
   stores are not product authorities.
 - Grafeo is the sole persisted/query graph projection: code symbol, file, and
   chunk nodes; relation and traversal indexes; Git/evidence, session, memory,
-  work, and workflow relation topology. It holds no vector index: dense code
-  retrieval is retired (plan-set index, rejected decision 11), and shared-code
-  facts live in the sealed code generation, not in Grafeo. Canonical events,
-  facts, source content, and reconstruction manifests remain in their domain
-  stores and are sufficient to rebuild every projection.
+  work, and workflow relation topology. It remains graph-only and holds no
+  vector index. Dense code retrieval is a separate opt-in semantic authority;
+  shared-code facts live in the sealed code generation, not in Grafeo.
+  Canonical events, facts, source content, and reconstruction manifests remain
+  in their domain stores and are sufficient to rebuild every projection.
 - SQLite is relational only: registry/configuration, source cursors, admission,
   idempotency, inbox/outbox, journals, leases, receipts, redaction, retention,
   raw content and exact evidence spans, manifests, and accounting. It neither
@@ -167,6 +167,61 @@ ordinal; retention, redaction, or authorization is reported as the typed reason
 when exact payload cannot be supplied. No compact result may dump unrelated
 transcript activity or silently imply complete coverage.
 
+## Opt-in dense semantic code retrieval
+
+V2 has four independent code-retrieval authorities: exact/lexical search, the
+code graph, source-bound shared-code detection, and an opt-in dense semantic
+lane. The dense lane augments the shared retrieval kernel; it does not replace
+or reorder the exact, lexical, or graph baseline. Requests without semantic
+opt-in, and baseline requests while semantic work is unavailable, retain their
+existing readiness, ranking, cursor, hydration, and fallback behavior.
+
+The first implementation is CPU-only FastEmbed with a pinned Jina model and an
+immutable exact-flat cosine/dot-product scan. ANN, GPU execution, and
+reranking are outside the V2 contract. Semantic candidates are independently
+validated and then pass through the existing fusion and evidence rules, with
+exact literals remaining the non-demotable first tier.
+
+Requests choose one of two explicit modes. `fallback` may augment a baseline
+result when a complete compatible semantic generation is ready; missing,
+stale, corrupt, unauthorized, or over-budget semantic state yields a typed
+lane disposition and contributes no candidates. `strict` requires semantic
+execution and returns a typed unavailable or failed outcome for those states;
+it never aliases semantic to lexical or silently selects another model. A
+request that does not explicitly require semantic retrieval is never made
+strict by ambient configuration.
+
+The semantic request is bound to four authenticated identities: model,
+projection, vector generation, and source. Each identity is verified by its
+immutable manifest/content digest and daemon authorization. Model identity pins
+the exact Jina artifact and tokenizer/config; projection identity pins
+preprocessing, dimension, metric, normalization, chunker, runtime, and privacy
+epoch; vector-generation identity pins the projection, complete source
+manifest, exact-flat parameters, and row/output digests; source identity pins
+project/repository/worktree/ref, code generation, and source/content digests.
+Any mismatch, stale generation, or unauthorized scope is typed unavailable.
+
+Code-semantic acquisition, installation, projection checkpoints, vector
+generations, active-pointer publication, readiness, and rollback are a
+separate lifecycle from NCM semantic memory. NCM artifacts, workers, stores,
+and activation state are not reused by inference. Acquisition/import is an
+explicit bounded background or administrative operation: there are no
+query-path downloads, hub lookups, ambient-cache discovery, or network
+fallbacks. Projection publishes only complete immutable generations through
+one atomic pointer. Restart resumes a journaled checkpoint; partial or mixed
+generations remain unservable. Failed publication or restart keeps, or
+compare-and-swaps back to, the prior compatible generation. With no compatible
+generation, fallback serves the exact/lexical/graph baseline and strict returns
+typed unavailable.
+
+Activation requires a versioned real-repository quality gate using the same
+query kernel. The gate covers conceptual semantic positives and negatives,
+deterministic repeated results, exact scope and source identity, stale/deletion/
+parse-error/budget outcomes, and declared CPU, memory, and indexing budgets;
+protected exact, lexical, and graph strata must show no regression. A failed
+gate leaves the semantic pointer inactive while baseline retrieval remains
+usable.
+
 ## Validation
 
 All runtime validation uses isolated temporary home, profile, project, and
@@ -174,8 +229,9 @@ socket paths. Never install, dogfood, start, restart, or test a V2 daemon
 against an operator's live TraceDecay profile. Acceptance is direct production
 behavior: exact final-store admission, authoritative reset/recreation, bounded
 host ingestion, project-wide fact scope, deterministic lossless retrieval,
-truthful truncation/omission outcomes, and the explicit replacement contract's
-backup, validation, cutover, crash recovery, and rollback behavior.
+truthful truncation/omission outcomes, the opt-in dense semantic contract and
+quality gate, and the explicit replacement contract's backup, validation,
+cutover, crash recovery, and rollback behavior.
 
 The replacement contract is accepted, but its release implementation gate is
 pending. Focused source-shape/transaction rollback coverage, replacement

@@ -98,13 +98,10 @@ invariants and do not by themselves keep a journey open.
   receipt-owned paths and a drift-converges acceptance test. Operational
   closure still requires the measured doctor journey and a clean Cursor
   install/upgrade/doctor pass on an operator machine.)
-- Semantic search is disabled by an invalid configuration snapshot. Plan 20
-  owns final-snapshot validity and explicit reset/recreation; Plan 31 owns
-  semantic activation.
-  Exact, lexical, and graph retrieval remain the required available fallback.
-  This snapshot does not mean semantic search is product-disabled.
-  (Superseded 2026-09-13: dense semantic retrieval is retired by rejected
-  decision 11; there is no activation to repair.)
+- Semantic search was observed disabled by an invalid configuration snapshot.
+  Plan 20 owns final-snapshot validity and explicit reset/recreation. V2 now
+  includes opt-in dense code semantics under the contract below; exact,
+  lexical, and graph retrieval remain the required baseline and fallback.
 - A live profile was observed 237 minutes stale (the index later reported
   285 minutes stale while this reconciliation was being checked). Plan 25 and
   the active incremental-indexing slice own cadence/freshness diagnosis; the
@@ -246,46 +243,66 @@ records the rejected mechanism, the reason, and the retained replacement:
     mutations remain separate explicitly named operations owned by their
     capability; Doctor may link to their documentation but never invokes or
     advertises them as Doctor actions.
-11. **Neural dense code retrieval is retired (decided 2026-09-13).** The
-    FastEmbed/ONNX Runtime and Model2Vec embedding backends, model catalogs and
-    acquisition, ORT execution providers, session pools, code-search vector
-    generations, Grafeo vector indexes, exact-flat and ANN vector search,
-    neural reranking, semantic activation/qualification/calibration/rollback,
-    dense query fusion, and every API, CLI, MCP, LSP, dashboard, installer,
-    release, and CI surface that exposes them are deleted, not deprecated.
-    Dense retrieval produced an opaque distance that still required source
-    inspection, and bought it with model downloads, runtime qualification,
-    vector publication, activation state, a long failure-mode surface, and a
-    measured full-repository run that reached roughly 19 GiB peak RSS while
-    still processing 415,965 documents; Model2Vec shrank the memory but kept
-    nearly all of that machinery. `tracedecay-semantic` and
-    `tracedecay-semantic-contracts` leave the workspace; `fastembed`, `ort`,
-    `ort-sys`, and Model2Vec-only dependencies leave the lockfile; a fresh
-    installation downloads no model, loads no inference runtime, builds no
-    vectors, and exposes no activation workflow. Old dense stores are reset,
-    never migrated. Plan 31 is retired as an authority; its lexical-fallback
-    and exact-tier obligations already belong to Plans 05, 15, and 25. The
-    retained replacement is exactly three code-intelligence authorities and no
-    fourth "semantic" one: lexical search (exact, fielded, phrase, proximity,
-    bounded identifier/path splitting, and named query-time aliases that stay
-    visible — never a silent alias from "semantic" to lexical), the code
-    graph, and source-bound shared-code detection. Shared-code detection
-    computes conservative and rename-normalized body tokens during the
-    existing parse, persists content-addressed clone payloads, occurrence
-    bindings, and exact digest postings inside the sealed code generation,
-    serves token-verified exact and renamed copies, and later adds positional
-    winnowed fingerprint postings with bounded anchor-chained verification and
-    explicit differences. A digest is an index key, never evidence; clone
-    facts update at changed-symbol granularity, never gate lexical or graph
-    readiness, and report exhausted budgets as partial coverage rather than
-    absence. The request-time AST/CFG/call-sequence/shingle/body-vector-cosine
-    redundancy scan is deleted with the dense stack; `tracedecay_similar` and
-    `tracedecay_redundancy` are redefined over verified shared code and never
-    report "dead code", "equivalent implementation", "safe to merge", or a
-    single similarity percentage. Deterministic memory, session, LCM, and Work
-    machinery has no embedding dependency and is untouched; version-vector
-    terms such as `VectorWatermark`, snapshot vectors, and scope digests are
-    not vectors in this sense.
+11. **The 2026-09-13 dense-retrieval retirement is reversed (decided
+    2026-09-16).** True dense semantic code search is part of V2 as a fourth,
+    opt-in code-retrieval authority alongside exact/lexical search, the code
+    graph, and source-bound shared-code detection. The first implementation is
+    CPU-only FastEmbed with a pinned Jina model and immutable exact-flat vector
+    search. ANN, GPU execution, and reranking are outside this contract. The
+    semantic lane has its own model, projection, vector-generation, activation,
+    restart, rollback, and quality lifecycle, separate from NCM semantic
+    memory. The detailed contract below supersedes the retirement text and the
+    archival Plan 31 disposition.
+
+## Dense semantic code-search contract
+
+The semantic lane augments the one shared retrieval kernel. Exact literals
+remain the non-demotable first tier; lexical and graph matching retain their
+current ranking, readiness, cursor, hydration, and fallback behavior. A query
+that does not opt in remains the exact/lexical/graph baseline, and baseline
+queries never wait for semantic indexing or model work.
+
+- **Modes.** `fallback` mode may add semantic candidates when a complete,
+  compatible generation is available. Missing, stale, corrupt, unauthorized,
+  or over-budget semantic state contributes no candidates and returns a typed
+  lane disposition while the exact/lexical/graph result remains authoritative.
+  `strict` mode requires the semantic lane and returns a typed unavailable or
+  failed outcome for those states; it never silently aliases semantic to
+  lexical or selects another model. Strictness applies only to requests that
+  explicitly require semantic retrieval.
+- **Initial engine.** Embed the sanitized query and code chunks through the
+  verified CPU FastEmbed/Jina artifact and scan the immutable vector generation
+  with exact-flat cosine/dot-product search. Do not add ANN, GPU, or reranking
+  behavior to this V2 contract.
+- **Authenticated identities.** Every model, projection, vector-generation,
+  and source identity is bound to a verified manifest/content digest and the
+  daemon's authorization. Model identity pins the exact Jina artifact and
+  tokenizer/config; projection identity pins preprocessing, dimension, metric,
+  normalization, chunker, runtime, and privacy epoch; vector-generation identity
+  pins that projection, a complete source manifest, exact-flat parameters, and
+  row/output digests; source identity pins project/repository/worktree/ref,
+  code generation, and source/content digests. Any mismatch is unavailable.
+- **Separate lifecycle.** Code-semantic acquisition, installation, projection
+  checkpoints, immutable vector generations, active-pointer publication,
+  readiness, and rollback are owned by a code-semantic lifecycle. NCM model,
+  projection, worker, store, and activation state are separate authorities;
+  neither lane shares artifacts or lifecycle state by inference.
+- **Offline query and recovery.** Acquisition/import is an explicit bounded
+  background or administrative operation. There are no query-path downloads,
+  hub lookups, ambient-cache discovery, or network fallbacks. Projection work
+  publishes only a complete immutable generation through one atomic pointer.
+  Restart resumes a journaled checkpoint; partial or mixed generations remain
+  unservable. A failed publication or restart keeps the prior compatible
+  generation for fallback or restores it by compare-and-swap; with no
+  compatible generation, fallback serves the baseline and strict returns typed
+  unavailable.
+- **Quality gate.** Before activation, a versioned real-repository oracle must
+  pass semantic-positive recall and ordering floors for conceptual queries,
+  correctly empty semantic negatives, deterministic repeated results, exact
+  scope/source identity, truthful stale/deletion/parse-error/budget outcomes,
+  and declared CPU/memory/indexing budgets. Protected exact, lexical, and graph
+  strata must show no regression. A failed gate leaves the semantic pointer
+  inactive while the baseline remains usable.
 
 ### Frontend rejection record
 
@@ -392,12 +409,13 @@ delivery phases:
   `EvidenceSpanRecordV1` anchors. Plan 15 owns retrieval/quantifier evaluation,
   and Plan 25 exact code generations, typed graph evidence, and the
   source-bound shared-code facts (clone payloads, occurrence bindings, and
-  postings) sealed inside them; exact lexical inclusion is authoritative and
-  there is no semantic augmentation tier (rejected decision 11). Plan 16 owns
-  authorized `QueryCollection` / `WorkspaceCollection` identity, membership,
-  scope digests, and snapshot vectors; membership never grants ownership or
-  authorization. Plan 24 references evidence IDs and anchors without copying
-  their authority.
+  postings) sealed inside them. The dense semantic lane follows the contract
+  above and remains an independent opt-in authority; exact lexical inclusion
+  is authoritative and semantic failure cannot change the baseline. Plan 16
+  owns authorized `QueryCollection` / `WorkspaceCollection` identity,
+  membership, scope digests, and snapshot vectors; membership never grants
+  ownership or authorization. Plan 24 references evidence IDs and anchors
+  without copying their authority.
 - Plan 35 owns LSP projection, including the versioned TraceDecay context
   extension carried over standard LSP/JSON-RPC framing, and short-lived
   one-way investigation and task-cue handoff projections; Plan 17 freezes the
@@ -433,7 +451,7 @@ delivery phases:
 | Project memory and facts (active) | Project/profile ownership, evidence, corrections, trust, curation, deletion lineage, and generation-bound repository provenance anchors. |
 | Session and LCM retrieval (active) | Occurrences, copies, authentic summaries, supersession, current/as-of/evolution retrieval, stable context assembly, and daemon-owned refresh. |
 | Code intelligence and lexical retrieval (active) | Deterministic extraction with typed edge authority and coverage, exact occurrence identity plus evidenced/abstaining lineage, generation-bound managed diagnostics/tests, a non-demotable exact/phrase/BM25 tier, typed quantifier inputs, legacy-behavior parity, and typed read-only Git status/diff/history/blame/hunk intelligence enriched by graph impact. Worktree-aware incremental indexing reuses content-addressed parse/chunk artifacts while retaining exact worktree and generation identity. |
-| Source-bound shared-code detection (active; replaces retired dense retrieval) | Conservative and rename-normalized body tokens computed during the existing parse for functions, methods, and stably identified closures; content-addressed clone payloads, occurrence bindings, and exact digest postings sealed in the code generation with its publication, privacy domain, budgets, integrity digest, and pagination; token-verified exact and renamed copies through `tracedecay_similar`; repository, revision-pair, branch-diff, PR change-set, and authorized-project-set clone families and review candidates through `tracedecay_redundancy`; then positional winnowed fingerprint postings (`k = 7`, `w = 8`, positions retained) with rare-first posting reads, bounded candidate admission, anchor-chained bounded token diff, separate left/right coverage, explicit differences, and non-transitive verified pairs. Clone facts update at changed-symbol granularity, never gate lexical or graph readiness, and report exhausted posting or verification budgets as partial coverage, never as "no similar implementations". |
+| Source-bound shared-code detection (active; complements dense semantic retrieval) | Conservative and rename-normalized body tokens computed during the existing parse for functions, methods, and stably identified closures; content-addressed clone payloads, occurrence bindings, and exact digest postings sealed in the code generation with its publication, privacy domain, budgets, integrity digest, and pagination; token-verified exact and renamed copies through `tracedecay_similar`; repository, revision-pair, branch-diff, PR change-set, and authorized-project-set clone families and review candidates through `tracedecay_redundancy`; then positional winnowed fingerprint postings (`k = 7`, `w = 8`, positions retained) with rare-first posting reads, bounded candidate admission, anchor-chained bounded token diff, separate left/right coverage, explicit differences, and non-transitive verified pairs. Clone facts update at changed-symbol granularity, never gate lexical, graph, or dense-semantic readiness, and report exhausted posting or verification budgets as partial coverage, never as "no similar implementations". |
 | Policy, application, catalog, and configuration (active) | Typed use cases, grants, routing, replay, operations, capabilities, analyzer policy/settings, one runtime configuration authority, daemon-serialized Git index transactions with compare-and-swap and receipts, and typed branch-aware feedback-cycle orchestration. |
 | CLI, MCP, HTTP, LSP, and SDK delivery (active) | One revisioned schema authority, dispatcher, binding taxonomy, semantic problem model, capability intersection, executable lifecycle/stream/cancellation contract, stable errors/cursors, canonical output, managed diagnostics, semantic parity, Git preview/apply bindings, and negotiated context and handoff operations. |
 
@@ -916,12 +934,15 @@ Unmeasured speculative optimizations and placeholder benchmarks do not ship.
 - Capture, storage, and memory: [Plans 01](01-domain-crate.md), [02](02-store-crate.md),
   [03](03-capture-crate.md), [04](04-projectors-crate.md), and
   [18](18-secret-detection-redaction-and-private-data-safety.md).
-- Temporal, lexical, and shared-code retrieval: [Plans 05](05-query-crate.md),
+- Temporal, lexical, graph, shared-code, and opt-in dense semantic retrieval:
+  [Plans 05](05-query-crate.md),
   [15](15-search-quality-evaluation-and-retrieval-research.md),
   [23](23-session-lcm-temporal-retrieval-and-evaluation.md), and
-  [25](25-code-intelligence-indexing-crate.md).
-  [Plan 31](31-native-fastembed-semantic-code-search.md) is retired by
-  rejected decision 11 and is archival.
+  [25](25-code-intelligence-indexing-crate.md), with the active V2 code
+  retrieval replacement plan owning the dense lane contract. [Plan 31]
+  (31-native-fastembed-semantic-code-search.md) is an archival historical
+  design superseded by the contract above; it is not an implementation
+  authority.
   Indexing runtime is `tracedecay-code-index-runtime`; generation retention is
   `tracedecay-code-index-retention`.
 - Policy and delivery surfaces: [Plans 06](06-policy-crate.md), [08](08-tool-catalog-crate.md),
@@ -993,11 +1014,12 @@ Unmeasured speculative optimizations and placeholder benchmarks do not ship.
 Embedded graph storage
 ([Plan 39](39-embedded-grafeo-graph-database.md)) threads through the active
 delivery slices rather than creating a standalone product or service.
-`tracedecay-graph-db` is the sole Grafeo dependency boundary and is graph-only:
-its vector indexes retire with dense retrieval (rejected decision 11). Code,
-Git, session/LCM, memory, Work, and workflow crates keep their typed domain
-contracts while graph-shaped data moves off custom adjacency structures and
-SQLite. Relational journals, receipts, raw content,
+`tracedecay-graph-db` is the sole Grafeo dependency boundary and remains
+graph-only. Dense semantic vectors belong to the separate opt-in code-semantic
+authority and never become a Grafeo vector index. Code, Git, session/LCM,
+memory, Work, and workflow crates keep their typed domain contracts while
+graph-shaped data moves off custom adjacency structures and SQLite. Relational
+journals, receipts, raw content,
 configuration, and execution fencing remain in SQLite. The cutover is
 fresh-profile, embedded, in-process, and single-authority: no sidecar,
 `petgraph`, migration, backfill, dual-write, or compatibility reader.

@@ -1,15 +1,18 @@
 ---
 name: V2 code retrieval replacement
-overview: Replace V1 semantic-search expectations with the latest V2 lexical, graph, and verified shared-code authorities, remove the retired dense stack, and prove useful deterministic search through every public surface.
+overview: Replace V1 search expectations with V2 exact, lexical, graph, verified shared-code, and opt-in dense semantic authorities, then prove useful deterministic search through every public surface.
 todos:
   - id: define-search-oracle
-    content: "Freeze a compact real-repository search corpus with independently specified exact and conceptual positives, negatives, scope, ordering, coverage and partial-result obligations, and allowed relevance differences from V1 before changing lexical or shared-code behavior."
+    content: "Freeze a compact real-repository search corpus with independently specified exact and conceptual positives, negatives, semantic modes, identity mismatches, scope, ordering, coverage, partial-result obligations, and allowed relevance differences from V1 before changing retrieval behavior."
     status: pending
-  - id: delete-retired-dense-stack
-    content: "Remove all remaining dense code-search crates, dependencies, lifecycle state, model acquisition, vector generations, activation and rollback paths, fixtures, configuration, release handling, and public API, CLI, MCP, LSP, SDK, and dashboard surfaces after the PR #707 merge."
+  - id: implement-opt-in-dense-semantic-authority
+    content: "Implement the opt-in fourth dense semantic code-search authority with CPU FastEmbed/Jina embedding, immutable exact-flat vectors, verified identities, and typed lifecycle/readiness outcomes."
     status: pending
-  - id: enforce-no-semantic-alias
-    content: "Remove or return a typed explicit disposition for legacy semantic-only requests and configuration; never silently route a semantic name to lexical search."
+  - id: separate-semantic-lifecycle
+    content: "Keep code-semantic model acquisition, projection, checkpoints, generations, activation, restart, and rollback separate from NCM semantic-memory lifecycle; never download or discover artifacts on the query path."
+    status: pending
+  - id: enforce-semantic-modes-and-fallback
+    content: "Define explicit fallback and strict semantic modes; preserve exact, lexical, and graph ranking/readiness/fallback semantics and never silently alias semantic to lexical or substitute a model."
     status: pending
   - id: finish-lexical-query-semantics
     content: "Implement and directly test all-terms-first lexical matching with graduated relaxation, exact identifier preservation, field and phrase behavior, proximity, bounded identifier and path splitting, deterministic ordering, stable cursors, and truthful truncation or partial coverage."
@@ -27,7 +30,7 @@ todos:
     content: "Run identical representative queries through MCP, CLI, dashboard, host integrations, LSP, API, and SDK adapters and prove they delegate to one ranking, cursor, hydration, authorization, and store-selection implementation."
     status: pending
   - id: establish-search-quality-floor
-    content: "Run the versioned oracle across exact symbols, concepts, phrases, paths, relations, renamed copies, near misses, unrelated code, parse errors, deletion, stale generations, budget exhaustion, and wrong scope; require the expected positives, correctly empty negatives, stable relevance, and truthful coverage without a model runtime."
+    content: "Run the versioned oracle across exact symbols, concepts, phrases, paths, relations, renamed copies, semantic positives/negatives, near misses, unrelated code, parse errors, deletion, stale generations, identity mismatch, budget exhaustion, restart/rollback, and wrong scope; require semantic quality floors, no protected baseline regression, stable relevance, and truthful coverage."
     status: pending
 isProject: false
 ---
@@ -36,17 +39,27 @@ isProject: false
 
 ## Execution Notes
 
-PR #707 decision 11 retires neural dense code retrieval. The replacement goal called “semantic search fixed” is therefore satisfied by useful lexical search, code-graph traversal, and verified source-bound shared-code detection. NCM semantic memory recall is a separate provider concern and does not become code search.
+The 2026-09-13 dense-retrieval retirement is superseded by the V2 decision
+recorded in the plan-set index. The replacement includes a fourth, opt-in dense
+semantic code-search authority alongside exact/lexical search, the code graph,
+and source-bound shared-code detection. NCM semantic memory remains a separate
+provider and lifecycle concern.
 
-Latest #707 appears to have completed much of the removal and lexical routing, while the shared-code authority still needs implementation and full product wiring. A deletion-only merge would leave `tracedecay_similar` and `tracedecay_redundancy` without their intended replacement behavior.
+The first semantic implementation is CPU-only FastEmbed/Jina with immutable
+exact-flat vector search. It must be independently admitted, identity-bound,
+and quality-gated; it never delays or changes the exact/lexical/graph baseline.
+ANN, GPU execution, and reranking are outside this plan.
 
 ## Constraints
 
-- Exactly three code-intelligence authorities: lexical search, the code graph, and source-bound shared-code detection.
-- No FastEmbed, ONNX Runtime, Model2Vec, vector index, vector generation, activation, calibration, neural reranking, or dense fusion in code retrieval.
+- Four independent code-intelligence authorities: exact/lexical search, the code graph, source-bound shared-code detection, and opt-in dense semantic search.
+- The initial dense lane is CPU FastEmbed/Jina embedding plus immutable exact-flat cosine/dot-product search. Do not add ANN, GPU execution, or reranking scope.
+- Model, projection, vector-generation, and source identities are authenticated by verified manifests/content digests and daemon authorization; mismatches are typed unavailable.
+- Code-semantic artifacts, checkpoints, generations, activation, restart, and rollback are separate from NCM semantic-memory state. Query paths never download, discover, or network-fallback to model artifacts.
+- `fallback` mode preserves the exact/lexical/graph result when semantic state is missing or unusable; `strict` mode returns typed unavailable/failed semantic outcome and never silently aliases to lexical or substitutes a model.
 - Digests are lookup keys and corruption checks, not proof that two implementations are equivalent.
 - Budget exhaustion and unavailable hydration report partial coverage and preserved rank; they never become empty-complete answers.
-- Keep tests on real parse-to-generation-to-retrieval journeys rather than direct ad hoc scanners.
+- Keep tests on real parse-to-generation-to-retrieval journeys, including semantic generation publication/restart/rollback and the versioned quality oracle, rather than direct ad hoc scanners.
 
 ## Operator Guidance
 
