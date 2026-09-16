@@ -1,8 +1,90 @@
 //! Real offline worker on the canonical commit, late-enable, and restart path.
 
 use super::*;
-use crate::daemon::project_composition::{NcmWorkerOwnerSlot, construct_ncm_observer};
-use tracedecay_memory_provider_registry::ObservationProviderMountV1;
+use tracedecay_memory_provider_ncm::{
+    NcmCognitiveSurface, NcmProviderAdapter, RustNcmConfig, RustNcmSurface, RustNcmWorkerOwner,
+    StateRoot, WorkerOptions,
+};
+use tracedecay_memory_provider_registry::{
+    ObservationInstanceProofV1, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
+    ObserverProviderRegistration,
+};
+
+/// Keep the worker owner with the fixture so a test can prove the final strong
+/// owner closes only after the mounted journeys and their provider adapters
+/// have been dropped. The service test must construct the provider through the
+/// provider crate's topology-neutral surface instead of reaching back into the
+/// retired binary composition root.
+struct NcmObserverFixture {
+    observer: ObserverProviderRegistration,
+    mount: ObservationProviderMountV1,
+    worker_owner: Arc<RustNcmWorkerOwner>,
+}
+
+#[derive(Debug)]
+struct NcmInstanceProof(Arc<RustNcmSurface>);
+
+impl ObservationInstanceProofV1 for NcmInstanceProof {
+    fn prove(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Option<String>, TerminalCode> {
+        self.0.prove_provider_instance(deadline, cancelled)
+    }
+}
+
+/// Builds one observer registration from the provider's neutral Rust surface.
+/// Construction remains lazy with respect to worker/model startup: the worker
+/// owner starts its child only when the observation journey performs readiness.
+fn construct_ncm_observer(
+    worker_binary: PathBuf,
+    state_root: PathBuf,
+    registration_revision: u64,
+) -> Result<NcmObserverFixture, String> {
+    let admitted_state_root = StateRoot::new(state_root).map_err(|error| error.to_string())?;
+    let mount_state_root = admitted_state_root.path().to_path_buf();
+    let worker_owner = Arc::new(
+        RustNcmWorkerOwner::new(RustNcmConfig {
+            worker_binary,
+            state_root: admitted_state_root,
+            worker_options: WorkerOptions::default(),
+        })
+        .map_err(|error| error.to_string())?,
+    );
+    let surface = Arc::new(
+        RustNcmSurface::from_production_worker(Arc::clone(&worker_owner))
+            .map_err(|error| error.to_string())?,
+    );
+    let descriptor = surface.descriptor();
+    let provider_instance_id = surface
+        .provider_instance_id()
+        .map_err(|error| error.to_string())?;
+    let instance_proof = Some(
+        Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
+    );
+    let provider = Arc::new(
+        NcmProviderAdapter::new(Arc::clone(&surface) as Arc<dyn NcmCognitiveSurface>)
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(NcmObserverFixture {
+        observer: ObserverProviderRegistration {
+            provider,
+            registration_revision,
+        },
+        mount: ObservationProviderMountV1 {
+            provider_id: descriptor.provider_id,
+            registration_revision,
+            provider_instance_id,
+            instance_proof,
+            host_limits: descriptor.limits,
+            state_root: mount_state_root.join("namespaces"),
+            journal_file_name: "memory-observation-ncm-journal-v1.sqlite3",
+            state_namespace_policy: ObservationStateNamespacePolicyV1::AdapterAttestedExactScope,
+        },
+        worker_owner,
+    })
+}
 
 /// Requires the actual production worker and a canonically installed model.
 /// The fixture shares immutable model artifacts only; every mutable namespace,
@@ -47,8 +129,8 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         provider,
         policy: ObservationJourneyPolicyV1::project_default(),
     };
-    let native_metadata = crate::retained_owner::native_observation_mount(&journal_root, 1)
-        .unwrap();
+    let native_metadata =
+        crate::retained_owner::native_observation_mount(&journal_root, 1).unwrap();
     let native = mount_project_observation_journey(inputs(
         composition(port.clone()),
         native_metadata.clone(),
@@ -100,15 +182,16 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         }
         let worker = worker.clone();
         let ncm_root = ncm_root.clone();
-        let owners = Arc::new(NcmWorkerOwnerSlot::default());
-        let construction_owners = owners.clone();
-        let observer_profile = profile_id.clone();
-        let (observer, ncm_metadata) = tokio::task::spawn_blocking(move || {
-            construct_ncm_observer(&construction_owners, &observer_profile, worker, ncm_root, 1)
-        })
-        .await
-        .unwrap()
-        .unwrap();
+        let fixture =
+            tokio::task::spawn_blocking(move || construct_ncm_observer(worker, ncm_root, 1))
+                .await
+                .unwrap()
+                .unwrap();
+        let NcmObserverFixture {
+            observer,
+            mount: ncm_metadata,
+            worker_owner,
+        } = fixture;
         let composition = Arc::new(
             ProjectMemoryProviderComposition::compose_with_observers(
                 NativeProviderActivation::Enabled {
@@ -183,7 +266,7 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         drop(ncm);
         drop(composition);
         // The last strong daemon owner must close before a fresh worker opens.
-        tokio::task::spawn_blocking(move || drop(owners))
+        tokio::task::spawn_blocking(move || drop(worker_owner))
             .await
             .unwrap();
     }
@@ -324,14 +407,16 @@ async fn unavailable_ncm_observer_preserves_native_canonical_acknowledgement() {
     std::fs::create_dir_all(&root).unwrap();
     let worker = temp.path().join("absent-worker");
     let state_root = temp.path().join("ncm");
-    let owners = NcmWorkerOwnerSlot::default();
-    let observer_profile = UserProfileId::new("profile.unavailable-ncm-observer").unwrap();
-    let (observer, metadata) = tokio::task::spawn_blocking(move || {
-        construct_ncm_observer(&owners, &observer_profile, worker, state_root, 1)
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let fixture =
+        tokio::task::spawn_blocking(move || construct_ncm_observer(worker, state_root, 1))
+            .await
+            .unwrap()
+            .unwrap();
+    let NcmObserverFixture {
+        observer,
+        mount: metadata,
+        worker_owner,
+    } = fixture;
     assert!(metadata.provider_instance_id.is_none());
     let port = Arc::new(JourneyNativePort::new());
     let composition = Arc::new(
@@ -434,6 +519,10 @@ async fn unavailable_ncm_observer_preserves_native_canonical_acknowledgement() {
     for journey in [&native, &ncm] {
         assert!(journey.shutdown(deadline).await.is_empty());
     }
+    drop(ncm);
+    drop(native);
+    drop(composition);
+    drop(worker_owner);
 }
 
 /// Bounded, content-free delivery evidence for a failed real-worker assertion.
