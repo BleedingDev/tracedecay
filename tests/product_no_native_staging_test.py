@@ -127,6 +127,12 @@ class NoNativeStagingTest(unittest.TestCase):
             "direct observation journal open_existing",
         )
 
+    def test_direct_observation_journal_value_reopen_is_rejected(self) -> None:
+        self.assert_rejected(
+            "pub fn reopen() { let _ = observation_journal.open_existing(path); }\n",
+            "direct observation journal open_existing",
+        )
+
     def test_test_file_is_not_a_production_native_path(self) -> None:
         result = self.run_checker(
             {

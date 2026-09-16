@@ -63,6 +63,7 @@ DIRECT_JOURNAL_OPEN_EXISTING = re.compile(
     r"\b(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"(?:SqliteObservationJournal|ObservationJournal)"
     r"\s*::\s*open_existing\s*\("
+    r"|\b(?:observation_)?journal\s*\.\s*open_existing\s*\("
 )
 PROVIDER_SCHEMA_MIGRATION_OR_BACKFILL = re.compile(
     r"\b(?:migrat\w*|upgrade\w*|downgrade\w*|backfill\w*)\b",
