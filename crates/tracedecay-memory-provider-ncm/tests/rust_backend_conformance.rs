@@ -847,66 +847,54 @@ mod enabled {
         );
         assert!(direct.payload.is_none());
 
-        let first = invoke_common_maintenance(
-            provider.as_ref(),
-            &exact_scope,
-            "paged-maintenance",
-            "repair",
-            1,
-            None,
+        let mut cursor = None;
+        let mut partial_pages = 0;
+        loop {
+            let reply = invoke_common_maintenance(
+                provider.as_ref(),
+                &exact_scope,
+                "paged-maintenance",
+                "repair",
+                1,
+                cursor.as_deref(),
+            );
+            match reply.terminal.terminal_code() {
+                TerminalCode::Partial => {
+                    assert_eq!(
+                        reply.terminal.committed_effect().state(),
+                        CommittedEffectState::None
+                    );
+                    let payload = response_json(&reply);
+                    assert_eq!(payload["partial"], true);
+                    assert!(payload.get("no_change").is_none());
+                    let next = payload["resume_cursor"]
+                        .as_str()
+                        .expect("maintenance cursor")
+                        .to_owned();
+                    assert_ne!(cursor.as_deref(), Some(next.as_str()));
+                    cursor = Some(next);
+                    partial_pages += 1;
+                    assert!(partial_pages <= 32, "maintenance did not converge");
+                }
+                TerminalCode::Success => {
+                    assert_eq!(
+                        reply.terminal.committed_effect().state(),
+                        CommittedEffectState::Committed
+                    );
+                    let payload = response_json(&reply);
+                    assert_eq!(payload["partial"], false);
+                    assert!(payload["resume_cursor"].is_null());
+                    assert_eq!(payload["state_generation_before"], generation);
+                    assert_eq!(payload["state_generation_after"], generation + 1);
+                    break;
+                }
+                code => panic!("unexpected maintenance terminal code: {code:?}"),
+            }
+        }
+        assert!(
+            partial_pages >= 2,
+            "fixture must exercise multiple maintenance pages"
         );
-        assert_eq!(first.terminal.terminal_code(), TerminalCode::Partial);
-        assert_eq!(
-            first.terminal.committed_effect().state(),
-            CommittedEffectState::None
-        );
-        let first_payload = response_json(&first);
-        assert_eq!(first_payload["partial"], true);
-        assert!(first_payload.get("no_change").is_none());
-        let first_cursor = first_payload["resume_cursor"]
-            .as_str()
-            .expect("first maintenance cursor")
-            .to_owned();
-
-        let second = invoke_common_maintenance(
-            provider.as_ref(),
-            &exact_scope,
-            "paged-maintenance",
-            "repair",
-            1,
-            Some(&first_cursor),
-        );
-        assert_eq!(second.terminal.terminal_code(), TerminalCode::Partial);
-        assert_eq!(
-            second.terminal.committed_effect().state(),
-            CommittedEffectState::None
-        );
-        let second_payload = response_json(&second);
-        assert_eq!(second_payload["partial"], true);
-        let second_cursor = second_payload["resume_cursor"]
-            .as_str()
-            .expect("second maintenance cursor")
-            .to_owned();
-        assert_ne!(second_cursor, first_cursor);
-
-        let completed = invoke_common_maintenance(
-            provider.as_ref(),
-            &exact_scope,
-            "paged-maintenance",
-            "repair",
-            1,
-            Some(&second_cursor),
-        );
-        assert_eq!(completed.terminal.terminal_code(), TerminalCode::Success);
-        assert_eq!(
-            completed.terminal.committed_effect().state(),
-            CommittedEffectState::Committed
-        );
-        let completed_payload = response_json(&completed);
-        assert_eq!(completed_payload["partial"], false);
-        assert!(completed_payload["resume_cursor"].is_null());
-        assert_eq!(completed_payload["state_generation_before"], generation);
-        assert_eq!(completed_payload["state_generation_after"], generation + 1);
     }
 
     #[test]
