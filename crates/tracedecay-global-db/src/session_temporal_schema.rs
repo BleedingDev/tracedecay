@@ -676,11 +676,17 @@ pub(crate) async fn migrate_released_v3_session_temporal_schema(
                ON refresh_binding.session_id = batch_binding.session_id
               AND refresh_binding.operation_id = batch_binding.operation_id
               AND refresh_binding.generation = batch_binding.generation
+             LEFT JOIN session_temporal_generations AS active_generation
+               ON active_generation.session_id = receipt.session_id
+              AND active_generation.generation = json_extract(
+                    receipt.frozen_watermarks_json, '$.active_generation'
+                  )
              WHERE json_type(receipt.frozen_watermarks_json, '$.active_generation')
                        IS NOT 'integer'
                 OR json_extract(receipt.frozen_watermarks_json, '$.active_generation') <= 0
                 OR json_extract(receipt.frozen_watermarks_json, '$.active_generation')
                        > receipt.generation
+                OR active_generation.session_id IS NULL
                 OR batch_binding.session_id IS NULL
                 OR (
                     batch_binding.session_id IS NOT NULL
@@ -730,6 +736,8 @@ pub(crate) async fn migrate_released_v3_session_temporal_schema(
                    OR current.occurrence_count + current.copy_count + current.assertion_count
                       < previous.occurrence_count + previous.copy_count
                         + previous.assertion_count
+                   OR current.source_through < previous.source_through
+                   OR current.projection_through < previous.projection_through
                  )
                )
                OR (
@@ -737,18 +745,40 @@ pub(crate) async fn migrate_released_v3_session_temporal_schema(
                  AND json_extract(
                        current.frozen_watermarks_json, '$.active_generation'
                      ) <> current.generation
-                 AND current.occurrence_count + current.copy_count + current.assertion_count
-                     < COALESCE((
-                         SELECT baseline.occurrence_count + baseline.copy_count
-                                + baseline.assertion_count
-                         FROM session_temporal_projection_receipts AS baseline
-                         WHERE baseline.session_id = current.session_id
-                           AND baseline.generation = json_extract(
-                               current.frozen_watermarks_json, '$.active_generation'
-                           )
-                         ORDER BY baseline.batch_ordinal DESC
-                         LIMIT 1
+                 AND (
+                     current.occurrence_count + current.copy_count + current.assertion_count
+                         < COALESCE((
+                             SELECT baseline.occurrence_count + baseline.copy_count
+                                    + baseline.assertion_count
+                             FROM session_temporal_projection_receipts AS baseline
+                             WHERE baseline.session_id = current.session_id
+                               AND baseline.generation = json_extract(
+                                   current.frozen_watermarks_json, '$.active_generation'
+                               )
+                             ORDER BY baseline.batch_ordinal DESC
+                             LIMIT 1
+                           ), 0)
+                     OR current.source_through < COALESCE((
+                           SELECT baseline.source_through
+                           FROM session_temporal_projection_receipts AS baseline
+                           WHERE baseline.session_id = current.session_id
+                             AND baseline.generation = json_extract(
+                                 current.frozen_watermarks_json, '$.active_generation'
+                             )
+                           ORDER BY baseline.batch_ordinal DESC
+                           LIMIT 1
                        ), 0)
+                     OR current.projection_through < COALESCE((
+                           SELECT baseline.projection_through
+                           FROM session_temporal_projection_receipts AS baseline
+                           WHERE baseline.session_id = current.session_id
+                             AND baseline.generation = json_extract(
+                                 current.frozen_watermarks_json, '$.active_generation'
+                             )
+                           ORDER BY baseline.batch_ordinal DESC
+                           LIMIT 1
+                       ), 0)
+                 )
                )
              LIMIT 1",
             (),
@@ -821,7 +851,10 @@ pub(crate) async fn migrate_released_v3_session_temporal_schema(
         ));
     }
     validate_temporal_table_shapes(conn).await?;
-    admission::validate_current_session_temporal_schema(conn).await
+    // The enclosing schema stage repairs the released authority trigger
+    // bodies after this migration. Validate the final table/FTS/publication
+    // shape here without requiring that trigger repair to have happened yet.
+    admission::validate_current_session_temporal_schema_shape(conn).await
 }
 
 /// Installs the final schema into a store already proven fresh by admission.

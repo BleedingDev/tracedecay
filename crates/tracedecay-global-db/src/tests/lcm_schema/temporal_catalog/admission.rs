@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 
 async fn persisted_column_names(db_path: &Path, table: &str) -> Vec<String> {
@@ -121,9 +123,61 @@ async fn convert_final_temporal_schema_to_released_v3(db_path: &Path) {
     let projection_receipt_triggers =
         table_trigger_sql(&conn, "session_temporal_projection_receipts").await;
     assert_eq!(projection_receipt_triggers.len(), 3);
+    let mut batch_binding_trigger_rows = conn
+        .query(
+            "SELECT name, sql
+             FROM sqlite_master
+             WHERE type = 'trigger'
+               AND tbl_name = 'session_refresh_batch_bindings'
+               AND sql IS NOT NULL
+             ORDER BY name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut batch_binding_triggers = Vec::new();
+    let mut batch_binding_trigger_names = Vec::new();
+    while let Some(row) = batch_binding_trigger_rows.next().await.unwrap() {
+        batch_binding_trigger_names.push(row.get::<String>(0).unwrap());
+        batch_binding_triggers.push(row.get::<String>(1).unwrap());
+    }
+    drop(batch_binding_trigger_rows);
+    for name in batch_binding_trigger_names {
+        conn.execute(&format!("DROP TRIGGER \"{name}\""), ())
+            .await
+            .unwrap();
+    }
 
+    // Keep the fixture faithful when it carries child rows. The production
+    // migration is additive, while this test-only shape conversion must
+    // rebuild both released tables. Back up every affected row before the
+    // parent tables (and their foreign-key children) are dropped.
     conn.execute_batch(
-        "DROP TABLE session_temporal_projection_receipts;
+        "CREATE TEMP TABLE retained_v3_projection_receipts AS
+             SELECT session_id, generation, batch_ordinal, batch_digest,
+                    frozen_watermarks_json, source_through, projection_through,
+                    occurrence_count, occurrence_digest, dimension_count,
+                    dimension_digest, copy_count, copy_digest, assertion_count,
+                    assertion_digest, supersession_count, supersession_digest,
+                    current_count, current_digest, fts_count, fts_digest,
+                    committed_at
+             FROM session_temporal_projection_receipts;
+         CREATE TEMP TABLE retained_v3_relation_receipts AS
+             SELECT session_id, generation, scope_kind, scope_id,
+                    expected_graph_watermark, state, graph_watermark,
+                    created_at, applied_at
+             FROM session_relation_receipts;
+         CREATE TEMP TABLE retained_v3_relation_effect_journal AS
+             SELECT session_id, generation, projection_json, created_at
+             FROM session_relation_effect_journal;
+         CREATE TEMP TABLE retained_v3_refresh_batch_bindings AS
+             SELECT session_id, operation_id, progress_ordinal, generation,
+                    batch_ordinal
+             FROM session_refresh_batch_bindings;
+         DELETE FROM session_refresh_batch_bindings;
+         DELETE FROM session_relation_effect_journal;
+         PRAGMA foreign_keys = OFF;
+         DROP TABLE session_temporal_projection_receipts;
          DROP TABLE session_relation_receipts;",
     )
     .await
@@ -134,6 +188,55 @@ async fn convert_final_temporal_schema_to_released_v3(db_path: &Path) {
     conn.execute_batch(SESSION_RELATION_RECEIPTS_WITHOUT_RECOVERY_DDL)
         .await
         .unwrap();
+    conn.execute_batch(
+        "INSERT INTO session_temporal_projection_receipts (
+             session_id, generation, batch_ordinal, batch_digest,
+             frozen_watermarks_json, source_through, projection_through,
+             occurrence_count, occurrence_digest, dimension_count,
+             dimension_digest, copy_count, copy_digest, assertion_count,
+             assertion_digest, supersession_count, supersession_digest,
+             current_count, current_digest, fts_count, fts_digest, committed_at
+         )
+         SELECT session_id, generation, batch_ordinal, batch_digest,
+                frozen_watermarks_json, source_through, projection_through,
+                occurrence_count, occurrence_digest, dimension_count,
+                dimension_digest, copy_count, copy_digest, assertion_count,
+                assertion_digest, supersession_count, supersession_digest,
+                current_count, current_digest, fts_count, fts_digest,
+                committed_at
+         FROM retained_v3_projection_receipts;
+         INSERT INTO session_relation_receipts (
+             session_id, generation, scope_kind, scope_id,
+             expected_graph_watermark, state, graph_watermark, created_at,
+             applied_at
+         )
+         SELECT session_id, generation, scope_kind, scope_id,
+                expected_graph_watermark, state, graph_watermark, created_at,
+                applied_at
+         FROM retained_v3_relation_receipts;
+         INSERT INTO session_relation_effect_journal (
+             session_id, generation, projection_json, created_at
+         )
+         SELECT session_id, generation, projection_json, created_at
+         FROM retained_v3_relation_effect_journal;
+         INSERT INTO session_refresh_batch_bindings (
+             session_id, operation_id, progress_ordinal, generation,
+             batch_ordinal
+         )
+         SELECT session_id, operation_id, progress_ordinal, generation,
+                batch_ordinal
+         FROM retained_v3_refresh_batch_bindings;
+         DROP TABLE retained_v3_projection_receipts;
+         DROP TABLE retained_v3_relation_receipts;
+         DROP TABLE retained_v3_relation_effect_journal;
+         DROP TABLE retained_v3_refresh_batch_bindings;
+         PRAGMA foreign_keys = ON;",
+    )
+    .await
+    .unwrap();
+    for trigger in &batch_binding_triggers {
+        conn.execute_batch(trigger).await.unwrap();
+    }
     for trigger in &projection_receipt_triggers {
         conn.execute_batch(trigger).await.unwrap();
     }
@@ -593,6 +696,861 @@ async fn insert_seeded_active_released_v3_refresh_receipts(
     drop(conn);
     drop(raw_db);
     restore_schema_triggers(db_path, &triggers).await;
+}
+
+/// Seeds one complete released-v3 temporal projection, including every
+/// durable relation, projection, FTS, and graph-publication row. The fixture
+/// intentionally keeps the rows small but cross-links them exactly as a
+/// persisted daemon store would, so a migration that rebuilds a parent table
+/// cannot silently discard a child row without this test noticing.
+async fn seed_released_v3_temporal_fixture(db_path: &Path) {
+    let triggers = suspend_schema_triggers(db_path).await;
+    let raw_db = TestConnection::open(db_path);
+    let conn = (*raw_db).clone();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO sessions (
+             provider, session_id, project_key, project_path, title,
+             started_at, ended_at, transcript_path, metadata_json
+         ) VALUES (
+             'fixture', 'temporal-fixture', '/fixture/project', '/fixture/project',
+             'released temporal fixture', 100, 200, '/fixture/session.jsonl',
+             '{\"fixture\":true}'
+         );
+         INSERT INTO session_messages (
+             provider, message_id, session_id, role, timestamp, ordinal, text,
+             kind, model, tool_names, source_path, source_offset, metadata_json
+         ) VALUES (
+             'fixture', 'temporal-message-one', 'temporal-fixture', 'user',
+             101, 0, 'preserve every temporal row', 'text', NULL, NULL,
+             '/fixture/session.jsonl', 0, '{\"ordinal\":0}'
+         );
+         INSERT INTO sanitization_receipts (
+             receipt_id, sanitizer_version, payload_digest, receipt_json
+         ) VALUES (
+             'temporal-fixture-receipt', 'fixture-sanitizer-v1',
+             'temporal-fixture-payload-digest', '{\"sanitized\":true}'
+         );
+         INSERT INTO observations (
+             observation_id, payload_digest, receipt_id, observation_json,
+             committed_cursor_json
+         ) VALUES (
+             'temporal-fixture-observation', 'temporal-fixture-payload-digest',
+             'temporal-fixture-receipt',
+             '{\"identity\":{\"source\":{\"provider\":\"fixture\",\"source_key\":\"fixture\"}}}',
+             '{\"source\":5}'
+         );
+         INSERT INTO retrieval_anchors (
+             anchor_id, anchor_json, owner_json, projection_generation
+         ) VALUES
+             ('temporal-fixture-anchor-subject', '{\"kind\":\"subject\"}',
+              '{\"owner\":\"temporal-fixture\"}', 'fixture-g1'),
+             ('temporal-fixture-anchor-object', '{\"kind\":\"object\"}',
+              '{\"owner\":\"temporal-fixture\"}', 'fixture-g1'),
+             ('temporal-fixture-anchor-occurrence', '{\"kind\":\"occurrence\"}',
+              '{\"owner\":\"temporal-fixture\"}', 'fixture-g1'),
+             ('temporal-fixture-anchor-summary', '{\"kind\":\"summary\"}',
+              '{\"owner\":\"temporal-fixture\"}', 'fixture-g1');
+         INSERT INTO session_temporal_generations (
+             session_id, generation, state, frozen_watermarks_json,
+             created_at, ready_at, activated_at, completed_at
+         ) VALUES (
+             'temporal-fixture', 1, 'active',
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             100, 101, 102, NULL
+         ), (
+             'temporal-fixture', 2, 'superseded',
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             103, 104, 105, 106
+         );
+         INSERT INTO session_relation_receipts (
+             session_id, generation, scope_kind, scope_id,
+             expected_graph_watermark, state, graph_watermark, created_at,
+             applied_at
+         ) VALUES
+             ('temporal-fixture', 1, 'project_sessions', 'fixture-project',
+              'fixture-watermark-1', 'applied', 'fixture-watermark-1', 102, 103),
+             ('temporal-fixture', 2, 'profile_sessions', 'fixture-profile',
+              'fixture-watermark-2', 'applied', 'fixture-watermark-2', 105, 106);
+         INSERT INTO session_relation_effect_journal (
+             session_id, generation, projection_json, created_at
+         ) VALUES
+             ('temporal-fixture', 1, '{\"relation\":1}', 103),
+             ('temporal-fixture', 2, '{\"relation\":2}', 106);
+         INSERT INTO session_external_payload_manifests (
+             payload_ref, session_id, payload_digest, manifest_json,
+             receipt_id, created_at
+         ) VALUES (
+             'temporal-fixture-payload', 'temporal-fixture',
+             'temporal-fixture-payload-digest',
+             '{\"bytes\":24,\"encoding\":\"utf8\"}',
+             'temporal-fixture-receipt', 104
+         );
+         INSERT INTO session_refresh_operations (
+             session_id, operation_id, request_digest, target_frontier_json,
+             state, created_at, updated_at, terminal_at, failure_code
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete',
+             'temporal-refresh-request-digest',
+             '{\"observed_through\":5,\"committed_through\":0}',
+             'complete', 100, 104, 104, NULL
+         ), (
+             'temporal-fixture', 'temporal-refresh-failed',
+             'temporal-refresh-failed-request-digest',
+             '{\"observed_through\":5,\"committed_through\":5}',
+             'failed', 107, 108, 108, 'fixture-failure'
+         );
+         INSERT INTO session_refresh_bindings (
+             session_id, operation_id, scope_kind, source_frontier,
+             target_frontier, projector_version, config_digest, generation,
+             frozen_watermarks_json, binding_digest, created_at
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 'session_store',
+             0, 5, 'session-temporal-projector.v1',
+             'temporal-fixture-config-digest', 1,
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             'temporal-refresh-request-digest', 100
+         ), (
+             'temporal-fixture', 'temporal-refresh-failed', 'session_store',
+             5, 5, 'session-temporal-projector.v1',
+             'temporal-fixture-failed-config-digest', 2,
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             'temporal-refresh-failed-request-digest', 107
+         );
+         INSERT INTO session_refresh_progress (
+             session_id, operation_id, progress_ordinal, frontier_json,
+             coverage_json, committed_batches, committed_records, recorded_at
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 0,
+             '{\"observed_through\":5,\"committed_through\":5}',
+             '{\"visible\":5,\"hidden\":0,\"unknown\":0,\"redacted\":0}',
+             1, 5, 104
+         );
+         INSERT INTO session_refresh_batch_bindings (
+             session_id, operation_id, progress_ordinal, generation,
+             batch_ordinal
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 0, 1, 0
+         );
+         INSERT INTO session_refresh_receipts (
+             session_id, operation_id, terminal_state, frontier_json,
+             coverage_json, failure_code, terminal_at
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 'complete',
+             '{\"observed_through\":5,\"committed_through\":5}',
+             '{\"visible\":5,\"hidden\":0,\"unknown\":0,\"redacted\":0}',
+             NULL, 104
+         ), (
+             'temporal-fixture', 'temporal-refresh-failed', 'failed',
+             '{\"observed_through\":5,\"committed_through\":5}',
+             '{\"visible\":0,\"hidden\":0,\"unknown\":0,\"redacted\":0}',
+             'fixture-failure', 108
+         );
+         INSERT INTO session_query_cursor_keys (
+             key_id, key_version, key_material, created_at, retired_at
+         ) VALUES
+             ('temporal-fixture-key-1', 1, X'01020304', 100, 111),
+             ('temporal-fixture-key-2', 2, X'05060708', 111, NULL);
+         INSERT INTO session_temporal_projection_receipts (
+             session_id, generation, batch_ordinal, batch_digest,
+             frozen_watermarks_json, source_through, projection_through,
+             occurrence_count, occurrence_digest, dimension_count,
+             dimension_digest, copy_count, copy_digest, assertion_count,
+             assertion_digest, supersession_count, supersession_digest,
+             current_count, current_digest, fts_count, fts_digest,
+             committed_at
+         ) VALUES (
+             'temporal-fixture', 1, 0,
+             'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             5, 5,
+             2, 'sha256:fixture-occurrences', 1, 'sha256:fixture-dimensions',
+             1, 'sha256:fixture-copies', 2, 'sha256:fixture-assertions',
+             1, 'sha256:fixture-supersession', 2, 'sha256:fixture-current',
+             2, 'sha256:fixture-fts', 104
+         );
+         INSERT INTO session_temporal_observation_effects (
+             observation_id, observation_sequence, session_id, receipt_id,
+             effect_digest, output_count, recorded_at
+         ) VALUES (
+             'temporal-fixture-observation',
+             (SELECT sequence FROM observations
+              WHERE observation_id = 'temporal-fixture-observation'),
+             'temporal-fixture', 'temporal-fixture-receipt',
+             'sha256:fixture-effect', 2, 104
+         );
+         INSERT INTO session_threads (
+             session_id, generation, thread_id, grouping_provenance, created_at
+         ) VALUES (
+             'temporal-fixture', 1, 'temporal-fixture-thread',
+             'fixture-thread-grouping', 100
+         );
+         INSERT INTO session_turns (
+             session_id, generation, turn_id, ordinal, grouping_provenance,
+             created_at
+         ) VALUES (
+             'temporal-fixture', 1, 'temporal-fixture-turn', 0,
+             'fixture-turn-grouping', 100
+         );
+         INSERT INTO session_agents (
+             session_id, generation, agent_id, agent_json, created_at
+         ) VALUES (
+             'temporal-fixture', 1, 'temporal-fixture-agent',
+             '{\"provider\":\"fixture\",\"name\":\"agent\"}', 100
+         );
+         INSERT INTO session_occurrences (
+             session_id, generation, occurrence_id, source_observation_id,
+             source_provider, projection_output_ordinal, retrieval_anchor_id,
+             thread_id, thread_grouping_json, turn_id, turn_grouping_json,
+             message_id, agent_id, role, knowledge_at, valid_time_json,
+             evidence_json, sanitized_content_digest, sanitized_content_bytes,
+             snippet_text, index_text
+         ) VALUES
+             (
+                 'temporal-fixture', 1, 'temporal-fixture-occurrence-1',
+                 'temporal-fixture-observation', 'fixture', 0,
+                 'temporal-fixture-anchor-occurrence',
+                 'temporal-fixture-thread', '{\"group\":\"thread\"}',
+                 'temporal-fixture-turn', '{\"group\":\"turn\"}',
+                 'temporal-message-one', 'temporal-fixture-agent', 'user', 101,
+                 '{\"kind\":\"known\",\"valid_at\":101}',
+                 '{\"evidence\":\"one\"}',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 24, 'first retained occurrence', 'preserve fixture occurrence one'
+             ), (
+                 'temporal-fixture', 1, 'temporal-fixture-occurrence-2',
+                 'temporal-fixture-observation', 'fixture', 1,
+                 'temporal-fixture-anchor-occurrence',
+                 'temporal-fixture-thread', '{\"group\":\"thread\"}',
+                 'temporal-fixture-turn', '{\"group\":\"turn\"}',
+                 'temporal-message-one', 'temporal-fixture-agent', 'assistant', 102,
+                 '{\"kind\":\"unknown\"}',
+                 '{\"evidence\":\"two\"}',
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                 25, 'second retained occurrence', 'preserve fixture occurrence two'
+             );
+         INSERT INTO session_turn_members (
+             session_id, generation, turn_id, occurrence_id, ordinal
+         ) VALUES
+             ('temporal-fixture', 1, 'temporal-fixture-turn',
+              'temporal-fixture-occurrence-1', 0),
+             ('temporal-fixture', 1, 'temporal-fixture-turn',
+              'temporal-fixture-occurrence-2', 1);
+         INSERT INTO session_assertions (
+             session_id, generation, assertion_id, assertion_kind,
+             subject_anchor_id, object_anchor_id, knowledge_at, valid_time_json,
+             evidence_json
+         ) VALUES
+             (
+                 'temporal-fixture', 1, 'temporal-fixture-assertion-1',
+                 'supports', 'temporal-fixture-anchor-subject',
+                 'temporal-fixture-anchor-object', 101,
+                 '{\"kind\":\"known\",\"valid_at\":101}',
+                 '{\"source\":\"occurrence-1\"}'
+             ), (
+                 'temporal-fixture', 1, 'temporal-fixture-assertion-2',
+                 'corrects', 'temporal-fixture-anchor-subject',
+                 'temporal-fixture-anchor-object', 102,
+                 '{\"kind\":\"unknown\"}',
+                 '{\"source\":\"occurrence-2\"}'
+             );
+         INSERT INTO session_assertion_supersession (
+             session_id, generation, superseded_assertion_id,
+             superseding_assertion_id, created_at
+         ) VALUES (
+             'temporal-fixture', 1, 'temporal-fixture-assertion-1',
+             'temporal-fixture-assertion-2', 102
+         );
+         INSERT INTO session_current_entities (
+             session_id, generation, entity_kind, entity_id,
+             current_assertion_id, current_occurrence_id, coverage_json
+         ) VALUES
+             (
+                 'temporal-fixture', 1, 'assertion_anchor',
+                 'temporal-fixture-anchor-subject',
+                 'temporal-fixture-assertion-2', NULL,
+                 '{\"through\":102,\"source\":\"fixture\"}'
+             ), (
+                 'temporal-fixture', 1, 'occurrence_anchor',
+                 'temporal-fixture-anchor-occurrence', NULL,
+                 'temporal-fixture-occurrence-2',
+                 '{\"through\":102,\"source\":\"fixture\"}'
+             );
+         INSERT INTO session_derived_evidence (
+             session_id, generation, evidence_kind, evidence_id,
+             retrieval_anchor_id, thread_id, first_occurrence_id,
+             last_occurrence_id, algorithm_version, configuration_digest,
+             member_count, member_digest, evidence_json
+         ) VALUES (
+             'temporal-fixture', 1, 'span', 'temporal-fixture-span',
+             'temporal-fixture-anchor-occurrence', 'temporal-fixture-thread',
+             'temporal-fixture-occurrence-1', 'temporal-fixture-occurrence-2',
+             'fixture-span-v1', 'temporal-fixture-evidence-config', 2,
+             'sha256:fixture-evidence-members', '{\"kind\":\"span\"}'
+         );
+         INSERT INTO session_derived_evidence_members (
+             session_id, generation, evidence_kind, evidence_id, ordinal,
+             occurrence_id, member_role
+         ) VALUES
+             (
+                 'temporal-fixture', 1, 'span', 'temporal-fixture-span', 0,
+                 'temporal-fixture-occurrence-1', 'first'
+             ), (
+                 'temporal-fixture', 1, 'span', 'temporal-fixture-span', 1,
+                 'temporal-fixture-occurrence-2', 'last'
+             );
+         INSERT INTO session_summary_nodes (
+             summary_id, session_id, summary_anchor_id, summary_text, index_text,
+             source_horizon_json, publication_json, created_at
+         ) VALUES (
+             'temporal-fixture-summary', 'temporal-fixture',
+             'temporal-fixture-anchor-summary', 'retained summary text',
+             'retained summary index',
+             '{\"source_through\":5,\"generation\":1}',
+             '{\"published\":true}', 105
+         );
+         INSERT INTO session_summary_availability (
+             session_id, generation, summary_id, availability,
+             source_horizon_json, reason, checked_at
+         ) VALUES (
+             'temporal-fixture', 1, 'temporal-fixture-summary', 'available',
+             '{\"source_through\":5}', NULL, 105
+         );
+         INSERT INTO session_occurrences_fts (rowid, index_text, snippet_text)
+         SELECT rowid, index_text, snippet_text FROM session_occurrences;
+         INSERT INTO session_summary_nodes_fts (rowid, summary_text, index_text)
+         SELECT rowid, summary_text, index_text FROM session_summary_nodes;
+         INSERT INTO graph_publication_replay_v1 (
+             sequence, shard_id, namespace, projection, generation,
+             idempotency_key, input_digest, dependency_generation_closure_digest,
+             direct_dependency_bytes, expected_prior_head,
+             expected_recovered_digest, canonical_replay_source_digest,
+             canonical_replay_source
+         ) VALUES
+             (
+                 1, 'fixture-shard', 'fixture-namespace', 'fixture-projection',
+                 '1', 'fixture-replay-1', 'fixture-input-1', 'fixture-deps-1',
+                 2, NULL, 'fixture-recovered-1', 'fixture-source-digest-1', X'01'
+             ), (
+                 2, 'fixture-shard', 'fixture-namespace', 'fixture-projection',
+                 '2', 'fixture-replay-2', 'fixture-input-2', 'fixture-deps-2',
+                 2, 'fixture-recovered-1', 'fixture-recovered-2',
+                 'fixture-source-digest-2', X'0203'
+             );
+         INSERT INTO graph_publication_replay_dependencies_v1 (
+             owner_replay_sequence, ordinal, dependency_replay_sequence,
+             shard_id, namespace, projection, generation
+         ) VALUES (
+             2, 0, 1, 'fixture-shard', 'fixture-namespace',
+             'fixture-projection', '1'
+         );
+         INSERT INTO graph_publication_replay_tombstones_v1 (
+             replay_sequence, shard_id, namespace, projection, generation,
+             idempotency_key, input_digest, dependency_generation_closure_digest,
+             direct_dependency_bytes, expected_prior_head,
+             expected_recovered_digest, canonical_replay_source_digest
+         ) VALUES (
+             3, 'fixture-shard', 'fixture-namespace', 'fixture-projection',
+             '3', 'fixture-tombstone-3', 'fixture-input-3', 'fixture-deps-3',
+             2, 'fixture-recovered-2', 'fixture-recovered-3',
+             'fixture-source-digest-3'
+         );
+         INSERT INTO graph_publication_replay_tombstone_dependencies_v1 (
+             tombstone_replay_sequence, ordinal, shard_id, namespace,
+             projection, generation
+         ) VALUES (
+             3, 0, 'fixture-shard', 'fixture-namespace', 'fixture-projection', '1'
+         );
+         INSERT INTO graph_verified_heads_v1 (
+             shard_id, namespace, projection, replay_sequence, recovered_digest
+         ) VALUES (
+             'fixture-shard', 'fixture-namespace', 'fixture-projection', 2,
+             'fixture-recovered-2'
+         );
+         PRAGMA foreign_keys = ON;",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(raw_db);
+    restore_schema_triggers(db_path, &triggers).await;
+}
+
+/// Adds a second batch to the retained fixture so migration admission has to
+/// compare source and projection frontiers across adjacent receipt rows.
+async fn append_released_v3_temporal_fixture_batch(db_path: &Path) {
+    let triggers = suspend_schema_triggers(db_path).await;
+    let raw_db = TestConnection::open(db_path);
+    let conn = (*raw_db).clone();
+    conn.execute_batch(
+        "UPDATE session_refresh_operations
+         SET target_frontier_json =
+                 '{\"observed_through\":6,\"committed_through\":0}',
+             updated_at = 105
+         WHERE session_id = 'temporal-fixture'
+           AND operation_id = 'temporal-refresh-complete';
+         UPDATE session_refresh_bindings
+         SET target_frontier = 6
+         WHERE session_id = 'temporal-fixture'
+           AND operation_id = 'temporal-refresh-complete';
+         INSERT INTO session_temporal_projection_receipts (
+             session_id, generation, batch_ordinal, batch_digest,
+             frozen_watermarks_json, source_through, projection_through,
+             occurrence_count, occurrence_digest, dimension_count,
+             dimension_digest, copy_count, copy_digest, assertion_count,
+             assertion_digest, supersession_count, supersession_digest,
+             current_count, current_digest, fts_count, fts_digest,
+             committed_at
+         ) VALUES (
+             'temporal-fixture', 1, 1,
+             'sha256:1111111111111111111111111111111111111111111111111111111111111111',
+             '{\"active_generation\":1,\"source_frontier\":5,\"projection_frontier\":5,\"summary_frontier\":1,\"cursor_key\":1}',
+             6, 6,
+             3, 'sha256:temporal-fixture-occurrences-2',
+             1, 'sha256:temporal-fixture-dimensions-2',
+             1, 'sha256:temporal-fixture-copies-2',
+             2, 'sha256:temporal-fixture-assertions-2',
+             1, 'sha256:temporal-fixture-supersession-2',
+             2, 'sha256:temporal-fixture-current-2',
+             2, 'sha256:temporal-fixture-fts-2', 105
+         );
+         INSERT INTO session_refresh_progress (
+             session_id, operation_id, progress_ordinal, frontier_json,
+             coverage_json, committed_batches, committed_records, recorded_at
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 1,
+             '{\"observed_through\":6,\"committed_through\":6}',
+             '{\"visible\":6,\"hidden\":0,\"unknown\":0,\"redacted\":0}',
+             2, 6, 105
+         );
+         INSERT INTO session_refresh_batch_bindings (
+             session_id, operation_id, progress_ordinal, generation,
+             batch_ordinal
+         ) VALUES (
+             'temporal-fixture', 'temporal-refresh-complete', 1, 1, 1
+         );
+         UPDATE session_refresh_receipts
+         SET frontier_json =
+                 '{\"observed_through\":6,\"committed_through\":6}'
+         WHERE session_id = 'temporal-fixture'
+           AND operation_id = 'temporal-refresh-complete';",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+    drop(raw_db);
+    restore_schema_triggers(db_path, &triggers).await;
+}
+
+/// The release columns shared by v3 and v4. The migration adds only derived
+/// receipt counters and recovery fields; all values returned here must remain
+/// byte-for-byte stable across the migration.
+async fn released_v3_temporal_fixture_rows(db_path: &Path) -> Vec<(String, String)> {
+    let raw_db = TestConnection::open(db_path);
+    let conn = (*raw_db).clone();
+    let queries = [
+        (
+            "session_summary_nodes",
+            "SELECT json_array(summary_id, session_id, summary_anchor_id, summary_text,
+                    index_text, source_horizon_json, publication_json, created_at)
+             FROM session_summary_nodes ORDER BY summary_id",
+        ),
+        (
+            "session_relation_receipts",
+            "SELECT json_array(session_id, generation, scope_kind, scope_id,
+                    expected_graph_watermark, state, graph_watermark, created_at, applied_at)
+             FROM session_relation_receipts ORDER BY session_id, generation",
+        ),
+        (
+            "session_relation_effect_journal",
+            "SELECT json_array(session_id, generation, projection_json, created_at)
+             FROM session_relation_effect_journal ORDER BY session_id, generation",
+        ),
+        (
+            "session_external_payload_manifests",
+            "SELECT json_array(payload_ref, session_id, payload_digest, manifest_json,
+                    receipt_id, created_at)
+             FROM session_external_payload_manifests ORDER BY payload_ref",
+        ),
+        (
+            "session_refresh_operations",
+            "SELECT json_array(session_id, operation_id, request_digest,
+                    target_frontier_json, state, created_at, updated_at, terminal_at,
+                    failure_code)
+             FROM session_refresh_operations ORDER BY session_id, operation_id",
+        ),
+        (
+            "session_refresh_bindings",
+            "SELECT json_array(session_id, operation_id, scope_kind, source_frontier,
+                    target_frontier, projector_version, config_digest, generation,
+                    frozen_watermarks_json, binding_digest, created_at)
+             FROM session_refresh_bindings ORDER BY session_id, operation_id",
+        ),
+        (
+            "session_refresh_progress",
+            "SELECT json_array(session_id, operation_id, progress_ordinal, frontier_json,
+                    coverage_json, committed_batches, committed_records, recorded_at)
+             FROM session_refresh_progress ORDER BY session_id, operation_id, progress_ordinal",
+        ),
+        (
+            "session_refresh_batch_bindings",
+            "SELECT json_array(session_id, operation_id, progress_ordinal, generation,
+                    batch_ordinal)
+             FROM session_refresh_batch_bindings
+             ORDER BY session_id, operation_id, progress_ordinal",
+        ),
+        (
+            "session_refresh_receipts",
+            "SELECT json_array(session_id, operation_id, terminal_state, frontier_json,
+                    coverage_json, failure_code, terminal_at)
+             FROM session_refresh_receipts ORDER BY session_id, operation_id",
+        ),
+        (
+            "session_query_cursor_keys",
+            "SELECT json_array(key_id, key_version, hex(key_material), created_at, retired_at)
+             FROM session_query_cursor_keys ORDER BY key_version",
+        ),
+        (
+            "session_temporal_generations",
+            "SELECT json_array(session_id, generation, state, frozen_watermarks_json,
+                    created_at, ready_at, activated_at, completed_at)
+             FROM session_temporal_generations ORDER BY session_id, generation",
+        ),
+        (
+            "session_temporal_projection_receipts",
+            "SELECT json_array(session_id, generation, batch_ordinal, batch_digest,
+                    frozen_watermarks_json, source_through, projection_through,
+                    occurrence_count, occurrence_digest, dimension_count, dimension_digest,
+                    copy_count, copy_digest, assertion_count, assertion_digest,
+                    supersession_count, supersession_digest, current_count, current_digest,
+                    fts_count, fts_digest, committed_at)
+             FROM session_temporal_projection_receipts
+             ORDER BY session_id, generation, batch_ordinal",
+        ),
+        (
+            "session_temporal_observation_effects",
+            "SELECT json_array(observation_id, observation_sequence, session_id, receipt_id,
+                    effect_digest, output_count, recorded_at)
+             FROM session_temporal_observation_effects ORDER BY observation_id",
+        ),
+        (
+            "session_turns",
+            "SELECT json_array(session_id, generation, turn_id, ordinal,
+                    grouping_provenance, created_at)
+             FROM session_turns ORDER BY session_id, generation, turn_id",
+        ),
+        (
+            "session_threads",
+            "SELECT json_array(session_id, generation, thread_id, grouping_provenance,
+                    created_at)
+             FROM session_threads ORDER BY session_id, generation, thread_id",
+        ),
+        (
+            "session_agents",
+            "SELECT json_array(session_id, generation, agent_id, agent_json, created_at)
+             FROM session_agents ORDER BY session_id, generation, agent_id",
+        ),
+        (
+            "session_occurrences",
+            "SELECT json_array(session_id, generation, occurrence_id,
+                    source_observation_id, source_provider, projection_output_ordinal,
+                    retrieval_anchor_id, thread_id, thread_grouping_json, turn_id,
+                    turn_grouping_json, message_id, agent_id, role, knowledge_at,
+                    valid_time_json, evidence_json, sanitized_content_digest,
+                    sanitized_content_bytes, snippet_text, index_text)
+             FROM session_occurrences ORDER BY session_id, generation, occurrence_id",
+        ),
+        (
+            "session_turn_members",
+            "SELECT json_array(session_id, generation, turn_id, occurrence_id, ordinal)
+             FROM session_turn_members
+             ORDER BY session_id, generation, turn_id, occurrence_id",
+        ),
+        (
+            "session_assertions",
+            "SELECT json_array(session_id, generation, assertion_id, assertion_kind,
+                    subject_anchor_id, object_anchor_id, knowledge_at, valid_time_json,
+                    evidence_json)
+             FROM session_assertions ORDER BY session_id, generation, assertion_id",
+        ),
+        (
+            "session_assertion_supersession",
+            "SELECT json_array(session_id, generation, superseded_assertion_id,
+                    superseding_assertion_id, created_at)
+             FROM session_assertion_supersession
+             ORDER BY session_id, generation, superseded_assertion_id,
+                      superseding_assertion_id",
+        ),
+        (
+            "session_current_entities",
+            "SELECT json_array(session_id, generation, entity_kind, entity_id,
+                    current_assertion_id, current_occurrence_id, coverage_json)
+             FROM session_current_entities
+             ORDER BY session_id, generation, entity_kind, entity_id",
+        ),
+        (
+            "session_derived_evidence",
+            "SELECT json_array(session_id, generation, evidence_kind, evidence_id,
+                    retrieval_anchor_id, thread_id, first_occurrence_id,
+                    last_occurrence_id, algorithm_version, configuration_digest,
+                    member_count, member_digest, evidence_json)
+             FROM session_derived_evidence
+             ORDER BY session_id, generation, evidence_kind, evidence_id",
+        ),
+        (
+            "session_derived_evidence_members",
+            "SELECT json_array(session_id, generation, evidence_kind, evidence_id,
+                    ordinal, occurrence_id, member_role)
+             FROM session_derived_evidence_members
+             ORDER BY session_id, generation, evidence_kind, evidence_id, ordinal",
+        ),
+        (
+            "session_summary_availability",
+            "SELECT json_array(session_id, generation, summary_id, availability,
+                    source_horizon_json, reason, checked_at)
+             FROM session_summary_availability
+             ORDER BY session_id, generation, summary_id",
+        ),
+        (
+            "session_occurrences_fts",
+            "SELECT json_array(rowid, index_text, snippet_text)
+             FROM session_occurrences_fts ORDER BY rowid",
+        ),
+        (
+            "session_summary_nodes_fts",
+            "SELECT json_array(rowid, summary_text, index_text)
+             FROM session_summary_nodes_fts ORDER BY rowid",
+        ),
+        (
+            "graph_publication_replay_v1",
+            "SELECT json_array(sequence, shard_id, namespace, projection, generation,
+                    idempotency_key, input_digest, dependency_generation_closure_digest,
+                    direct_dependency_bytes, expected_prior_head, expected_recovered_digest,
+                    canonical_replay_source_digest, hex(canonical_replay_source))
+             FROM graph_publication_replay_v1 ORDER BY sequence",
+        ),
+        (
+            "graph_publication_replay_dependencies_v1",
+            "SELECT json_array(owner_replay_sequence, ordinal, dependency_replay_sequence,
+                    shard_id, namespace, projection, generation)
+             FROM graph_publication_replay_dependencies_v1
+             ORDER BY owner_replay_sequence, ordinal",
+        ),
+        (
+            "graph_publication_replay_tombstones_v1",
+            "SELECT json_array(replay_sequence, shard_id, namespace, projection, generation,
+                    idempotency_key, input_digest, dependency_generation_closure_digest,
+                    direct_dependency_bytes, expected_prior_head, expected_recovered_digest,
+                    canonical_replay_source_digest)
+             FROM graph_publication_replay_tombstones_v1 ORDER BY replay_sequence",
+        ),
+        (
+            "graph_publication_replay_tombstone_dependencies_v1",
+            "SELECT json_array(tombstone_replay_sequence, ordinal, shard_id, namespace,
+                    projection, generation)
+             FROM graph_publication_replay_tombstone_dependencies_v1
+             ORDER BY tombstone_replay_sequence, ordinal",
+        ),
+        (
+            "graph_verified_heads_v1",
+            "SELECT json_array(shard_id, namespace, projection, replay_sequence,
+                    recovered_digest)
+             FROM graph_verified_heads_v1 ORDER BY shard_id, namespace, projection",
+        ),
+    ];
+    let mut snapshot = Vec::new();
+    for (table, sql) in queries {
+        let mut rows = conn.query(sql, ()).await.unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            snapshot.push((table.to_owned(), row.get::<String>(0).unwrap()));
+        }
+    }
+    snapshot
+}
+
+#[tokio::test]
+async fn released_v3_migration_preserves_complete_temporal_and_publication_fixture() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
+    let db = open_global_db(&db_path)
+        .await
+        .expect("fresh initialization should install the final temporal schema");
+    drop(db);
+    seed_released_v3_temporal_fixture(&db_path).await;
+    append_released_v3_temporal_fixture_batch(&db_path).await;
+    let retained = released_v3_temporal_fixture_rows(&db_path).await;
+    let retained_tables = retained
+        .iter()
+        .map(|(table, _)| table.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        retained_tables.contains("session_occurrences")
+            && retained_tables.contains("session_threads")
+            && retained_tables.contains("session_turns")
+            && retained_tables.contains("session_assertions")
+            && retained_tables.contains("session_current_entities")
+            && retained_tables.contains("session_derived_evidence")
+            && retained_tables.contains("session_derived_evidence_members")
+            && retained_tables.contains("session_turn_members")
+            && retained_tables.contains("session_external_payload_manifests")
+            && retained_tables.contains("session_refresh_operations")
+            && retained_tables.contains("session_refresh_receipts")
+            && retained_tables.contains("session_summary_nodes")
+            && retained_tables.contains("session_query_cursor_keys")
+            && retained_tables.contains("session_temporal_generations")
+            && retained_tables.contains("session_temporal_observation_effects")
+            && retained_tables.contains("session_temporal_projection_receipts")
+            && retained_tables.contains("session_occurrences_fts")
+            && retained_tables.contains("session_summary_nodes_fts")
+            && retained_tables.contains("graph_publication_replay_v1")
+            && retained_tables.contains("graph_publication_replay_dependencies_v1")
+            && retained_tables.contains("graph_publication_replay_tombstones_v1")
+            && retained_tables.contains("graph_publication_replay_tombstone_dependencies_v1")
+            && retained_tables.contains("graph_verified_heads_v1"),
+        "the fixture must cover every durable temporal and publication authority"
+    );
+    convert_final_temporal_schema_to_released_v3(&db_path).await;
+
+    open_global_db(&db_path)
+        .await
+        .expect("the complete released-v3 store should migrate transactionally");
+    assert_eq!(temporal_schema_version(&db_path).await, 4);
+    assert_eq!(
+        released_v3_temporal_fixture_rows(&db_path).await,
+        retained,
+        "released-v3 migration must preserve every temporal and publication row"
+    );
+    assert_eq!(
+        row_count(&db_path, "session_occurrences_fts").await,
+        2,
+        "occurrence FTS rows must remain queryable after migration"
+    );
+    assert_eq!(
+        row_count(&db_path, "session_summary_nodes_fts").await,
+        1,
+        "summary FTS rows must remain queryable after migration"
+    );
+    assert_eq!(
+        row_count(&db_path, "graph_publication_replay_v1").await,
+        2,
+        "graph publication replays must remain durable after migration"
+    );
+    assert_eq!(
+        persisted_column_names(&db_path, "session_temporal_projection_receipts")
+            .await
+            .last()
+            .map(String::as_str),
+        Some("committed_copy_count")
+    );
+    assert_eq!(
+        persisted_column_names(&db_path, "session_relation_receipts")
+            .await
+            .last()
+            .map(String::as_str),
+        Some("recovery_next_attempt_at")
+    );
+}
+
+async fn assert_released_v3_migration_rolls_back_an_injected_frontier_regression(
+    db_path: &Path,
+    frontier_column: &str,
+) {
+    let db = open_global_db(db_path)
+        .await
+        .expect("fresh initialization should install the final temporal schema");
+    drop(db);
+    seed_released_v3_temporal_fixture(db_path).await;
+    append_released_v3_temporal_fixture_batch(db_path).await;
+    convert_final_temporal_schema_to_released_v3(db_path).await;
+
+    // This is deliberately injected after released-v3 conversion. It passes
+    // the released table/trigger admission contract, then fails the migration
+    // frontier proof after ALTER TABLE has run, exercising the enclosing
+    // schema transaction's rollback path.
+    let triggers = suspend_schema_triggers(db_path).await;
+    let raw_db = TestConnection::open(db_path);
+    let conn = (*raw_db).clone();
+    let update = match frontier_column {
+        "source_through" => {
+            "UPDATE session_temporal_projection_receipts
+             SET source_through = 4
+             WHERE session_id = 'temporal-fixture'
+               AND generation = 1
+               AND batch_ordinal = 1"
+        }
+        "projection_through" => {
+            "UPDATE session_temporal_projection_receipts
+             SET projection_through = 4
+             WHERE session_id = 'temporal-fixture'
+               AND generation = 1
+               AND batch_ordinal = 1"
+        }
+        other => panic!("unsupported frontier regression fixture: {other}"),
+    };
+    conn.execute(update, ()).await.unwrap();
+    drop(conn);
+    drop(raw_db);
+    restore_schema_triggers(db_path, &triggers).await;
+
+    let before_rows = released_v3_temporal_fixture_rows(db_path).await;
+    let before_catalog = temporal_schema_object_catalog(db_path).await;
+    let error = match open_global_db(db_path).await {
+        Ok(_) => panic!("an injected {frontier_column} regression must require reset"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .reset_required_context()
+            .map(|(authority, _)| authority),
+        Some("session temporal")
+    );
+    assert_eq!(temporal_schema_version(db_path).await, 3);
+    assert_eq!(
+        released_v3_temporal_fixture_rows(db_path).await,
+        before_rows,
+        "a migration failure after ALTER TABLE must restore every retained row"
+    );
+    assert_eq!(
+        temporal_schema_object_catalog(db_path).await,
+        before_catalog,
+        "a migration failure must restore the released schema catalog"
+    );
+    assert!(
+        !persisted_column_names(db_path, "session_temporal_projection_receipts")
+            .await
+            .iter()
+            .any(|column| column == "batch_item_count"),
+        "a rolled-back migration must not leave derived receipt counters"
+    );
+    assert!(
+        !persisted_column_names(db_path, "session_relation_receipts")
+            .await
+            .iter()
+            .any(|column| column == "recovery_state"),
+        "a rolled-back migration must not leave receipt recovery columns"
+    );
+}
+
+#[tokio::test]
+async fn released_v3_migration_rolls_back_an_injected_source_frontier_regression() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
+    assert_released_v3_migration_rolls_back_an_injected_frontier_regression(
+        &db_path,
+        "source_through",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn released_v3_migration_rolls_back_an_injected_projection_frontier_regression() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
+    assert_released_v3_migration_rolls_back_an_injected_frontier_regression(
+        &db_path,
+        "projection_through",
+    )
+    .await;
 }
 
 #[tokio::test]
