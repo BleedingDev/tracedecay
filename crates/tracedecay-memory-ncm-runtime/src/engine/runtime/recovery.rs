@@ -548,18 +548,12 @@ pub(crate) fn validate_pending_deletion_fence(
         }
     }
 
-    let anchor = if event.seq == 1 {
-        // The initial kernel digest is deterministic from the persisted store
-        // identity. A first-event fence therefore still has an independent
-        // anchor instead of trusting the fence receipt's copied digest.
-        let config: NcmConfig =
-            serde_json::from_str(&store.identity().config_json).map_err(|error| {
-                corrupt_reply(meta.commit_seq, &format!("decode store config: {error}"))
-            })?;
-        let kernel = NcmKernel::new(store.identity().seed, config)
-            .map_err(|error| core_reply(error, meta.commit_seq))?;
-        sha256_hex(&kernel.state_digest())
-    } else {
+    // Recompute the complete pre-fence state from an independent checkpoint
+    // and its journal suffix. A copied state digest in the fence receipt is
+    // not an anchor: a corrupt store can otherwise rewrite both that receipt
+    // field and its public integrity digest together.
+    let anchor = replay_state_digest_prefix(store, event.seq.saturating_sub(1), &capsules)?;
+    if event.seq > 1 {
         let previous = store
             .event(event.seq - 1)
             .map_err(|error| store_reply(error, meta.commit_seq))?
@@ -568,8 +562,13 @@ pub(crate) fn validate_pending_deletion_fence(
             })?;
         let previous_receipt = validate_recovery_event(&previous, previous.seq, meta.commit_seq)?;
         validate_event_payload_digest(&previous, &previous_receipt, &capsules)?;
-        previous_receipt.state_digest
-    };
+        if previous_receipt.state_digest != anchor {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "deletion fence anchor differs from prior receipt",
+            ));
+        }
+    }
     if anchor != *pre_fence_state_digest || anchor != durable.state_digest {
         return Err(corrupt_reply(
             meta.commit_seq,
@@ -590,6 +589,124 @@ pub(crate) fn validate_pending_deletion_fence(
         event_seq: event.seq,
         state_digest: durable.state_digest.clone(),
     }))
+}
+
+/// Replays the journal up to (and including) `target_seq` from the newest
+/// checkpoint that precedes it, independently recomputing each receipt's
+/// state digest. This is used for the deletion fence's pre-erasure anchor.
+fn replay_state_digest_prefix(
+    store: &NamespaceStore,
+    target_seq: u64,
+    capsules: &[StoredCapsule],
+) -> Result<String, EngineReply> {
+    let meta = store
+        .meta()
+        .map_err(|error| store_reply(error, target_seq))?;
+    if target_seq > meta.commit_seq {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "state digest prefix exceeds metadata sequence",
+        ));
+    }
+    let config: NcmConfig =
+        serde_json::from_str(&store.identity().config_json).map_err(|error| {
+            corrupt_reply(
+                meta.commit_seq,
+                &format!("decode store config for fence anchor: {error}"),
+            )
+        })?;
+    let projections: tracedecay_memory_ncm_core::projections::ProjectionBundle =
+        serde_json::from_slice(&store.identity().projection_bytes).map_err(|error| {
+            corrupt_reply(
+                meta.commit_seq,
+                &format!("decode store projections for fence anchor: {error}"),
+            )
+        })?;
+    let checkpoint = store
+        .latest_checkpoint()
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let (mut kernel, mut applied_seq) = if let Some(checkpoint) = checkpoint {
+        if checkpoint.seq > target_seq || checkpoint.epoch > meta.epoch {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "fence anchor checkpoint is from a later generation",
+            ));
+        }
+        let envelope: CheckpointEnvelope =
+            serde_json::from_slice(&checkpoint.state).map_err(|error| {
+                corrupt_reply(
+                    meta.commit_seq,
+                    &format!("decode fence anchor checkpoint: {error}"),
+                )
+            })?;
+        if envelope.state_digest != sha256_hex(&envelope.kernel.state_digest())
+            || envelope.kernel.config != config
+        {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "fence anchor checkpoint digest or config mismatch",
+            ));
+        }
+        let projection_bytes =
+            serde_json::to_vec(&envelope.kernel.projections).map_err(|error| {
+                corrupt_reply(
+                    meta.commit_seq,
+                    &format!("serialize fence anchor projections: {error}"),
+                )
+            })?;
+        if projection_bytes != store.identity().projection_bytes {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "fence anchor checkpoint projection mismatch",
+            ));
+        }
+        (envelope.kernel, checkpoint.seq)
+    } else {
+        let mut kernel = NcmKernel::new(store.identity().seed, config)
+            .map_err(|error| core_reply(error, meta.commit_seq))?;
+        kernel.projections = projections;
+        (kernel, 0)
+    };
+    if applied_seq == target_seq {
+        return Ok(sha256_hex(&kernel.state_digest()));
+    }
+    let events = store
+        .events_after(applied_seq)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let mut expected_seq = applied_seq
+        .checked_add(1)
+        .ok_or_else(|| corrupt_reply(meta.commit_seq, "fence anchor sequence overflow"))?;
+    for event in events {
+        if event.seq > target_seq {
+            break;
+        }
+        let durable = validate_recovery_event(&event, expected_seq, target_seq)?;
+        validate_event_payload_digest(&event, &durable, capsules)?;
+        replay_event(
+            &mut kernel,
+            &event,
+            &durable.operation,
+            capsules,
+            target_seq,
+        )?;
+        if sha256_hex(&kernel.state_digest()) != durable.state_digest {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "fence anchor journal state digest mismatch",
+            ));
+        }
+        applied_seq = event.seq;
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt_reply(meta.commit_seq, "fence anchor sequence overflow"))?;
+    }
+    if applied_seq != target_seq {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "fence anchor journal prefix is incomplete",
+        ));
+    }
+    Ok(sha256_hex(&kernel.state_digest()))
 }
 
 pub(crate) fn replay_event(
