@@ -6371,6 +6371,7 @@ dependencies = [
  "tracedecay-source-edit",
  "tracedecay-store",
  "tracedecay-store-runtime",
+ "tracedecay-temporal-query",
  "tracedecay-tool-catalog",
  "tracing",
  "tracing-subscriber",
