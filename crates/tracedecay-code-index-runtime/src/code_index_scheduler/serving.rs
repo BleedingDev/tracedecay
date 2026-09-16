@@ -603,36 +603,46 @@ impl ProductionCodeIndexQueryOwnersV1 {
         // classes instead of resetting a per-family page size on each key.
         let mut remaining_results = request.result_limit;
         let mut remaining_work = request.work_limit.saturating_sub(1);
-        let mut exact_groups = Vec::new();
-        for key in source
+        let exact_keys = source
             .payload
             .exact_keys(source.occurrence.eligibility)
             .into_iter()
             .filter(|key| request.match_classes.contains(&key.class))
-        {
+            .collect::<Vec<_>>();
+        let mut exact_groups = Vec::new();
+        for (key_index, key) in exact_keys.iter().cloned().enumerate() {
             if remaining_results == 0 || remaining_work == 0 {
+                // Keep every key whose stream was never visited in the
+                // response. An omitted key is indistinguishable from a key
+                // with no matches at the MCP boundary; marking it incomplete
+                // makes the shared-budget cutoff visible to the caller. A
+                // per-key continuation is minted only after that key has
+                // actually been read, so an unvisited key is intentionally
+                // restartable from the original request.
+                exact_groups.extend(incomplete_exact_groups(&exact_keys[key_index..]));
                 break;
             }
             let page_limit = remaining_results.min(remaining_work);
-            let (members, complete, next_cursor) = self.verified_exact_clone_page(
+            let page = self.verified_exact_clone_page(
                 &source,
                 &key,
                 request.cursor.as_ref(),
                 page_limit,
                 control,
             )?;
-            remaining_results = remaining_results.saturating_sub(members.len());
-            // Count verified members plus one lookahead slot consumed by the
-            // last exact-page fetch when the postings continue.
-            let work_spent = members.len() + usize::from(next_cursor.is_some());
-            remaining_work = remaining_work.saturating_sub(work_spent.max(1));
-            if !members.is_empty() || !complete {
+            remaining_results = remaining_results.saturating_sub(page.members.len());
+            // The reader reports every decoded posting row, including rows
+            // rejected by the source/payload verification and the lookahead
+            // row. Counting only returned members lets a hot or invalid
+            // stream consume the shared budget without being accounted for.
+            remaining_work = remaining_work.saturating_sub(page.work_spent.max(1));
+            if !page.members.is_empty() || !page.complete {
                 exact_groups.push(
                     tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
                         key,
-                        members,
-                        complete,
-                        next_cursor,
+                        members: page.members,
+                        complete: page.complete,
+                        next_cursor: page.next_cursor,
                     },
                 );
             }
@@ -653,22 +663,20 @@ impl ProductionCodeIndexQueryOwnersV1 {
         start_cursor: Option<&tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
         limit: usize,
         control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<
-        (
-            Vec<tracedecay_query::retrieval::lexical::CloneExactArtifactMemberV1>,
-            bool,
-            Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
-        ),
-        RetrievalPortError,
-    > {
+    ) -> Result<VerifiedExactClonePageV1, RetrievalPortError> {
         let mut members = Vec::new();
         let mut cursor = start_cursor.cloned();
         let mut complete = false;
+        let mut work_spent = 0usize;
         while members.len() < limit {
             let page = self
                 .hydration
                 .clone_exact_page(&source.occurrence, key, cursor.as_ref(), limit, control)
                 .map_err(|error| RetrievalPortError::AuthorityUnavailable(error.to_string()))?;
+            // `clone_exact_page` fetches one lookahead row when a continuation
+            // exists. Count the whole decoded page, including members later
+            // rejected by the source/payload verification below.
+            work_spent = work_spent.saturating_add(page.members.len());
             for member in page.members {
                 if member.occurrence.symbol_occurrence_id == source.occurrence.symbol_occurrence_id
                 {
@@ -688,19 +696,98 @@ impl ProductionCodeIndexQueryOwnersV1 {
             }
             match page.next_cursor {
                 Some(next) if members.len() < limit => cursor = Some(next),
-                Some(next) => return Ok((members, false, Some(next))),
+                Some(next) => {
+                    return Ok(VerifiedExactClonePageV1 {
+                        members,
+                        complete: false,
+                        next_cursor: Some(next),
+                        work_spent,
+                    });
+                }
                 None => {
                     complete = true;
                     break;
                 }
             }
         }
-        Ok((members, complete, None))
+        Ok(VerifiedExactClonePageV1 {
+            members,
+            complete,
+            next_cursor: None,
+            work_spent,
+        })
     }
 
     #[cfg(test)]
     pub fn is_artifact_backed(&self) -> bool {
         true
+    }
+}
+
+/// Verified exact members and the raw artifact rows consumed to obtain them.
+/// The latter is internal accounting for a request-wide similarity budget;
+/// it never becomes part of the public result contract.
+struct VerifiedExactClonePageV1 {
+    members: Vec<tracedecay_query::retrieval::lexical::CloneExactArtifactMemberV1>,
+    complete: bool,
+    next_cursor: Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+    work_spent: usize,
+}
+
+/// Preserve the request's class order when a shared budget ends before a
+/// stream is opened. These placeholders let the surface fold every requested
+/// stream into its overall coverage instead of treating an omitted stream as
+/// an empty, complete one.
+fn incomplete_exact_groups(
+    keys: &[tracedecay_code_index::clones::CloneExactKeyV1],
+) -> impl Iterator<Item = tracedecay_query::code_search::CodeIndexSimilarExactGroupV1> + '_ {
+    keys.iter().cloned().map(
+        |key| tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+            key,
+            members: Vec::new(),
+            complete: false,
+            next_cursor: None,
+        },
+    )
+}
+
+#[cfg(test)]
+mod similar_serving_tests {
+    use super::*;
+
+    fn exact_key(
+        class: tracedecay_code_index::clones::CloneNormalizationClassV1,
+        fill: char,
+    ) -> tracedecay_code_index::clones::CloneExactKeyV1 {
+        tracedecay_code_index::clones::CloneExactKeyV1 {
+            class,
+            normalization_revision: 1,
+            digest: ManifestDigest::new(format!("sha256:{}", fill.to_string().repeat(64)))
+                .expect("valid exact key digest"),
+        }
+    }
+
+    #[test]
+    fn unvisited_exact_classes_are_explicitly_incomplete_and_restartable() {
+        let keys = [
+            exact_key(
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
+                'a',
+            ),
+            exact_key(
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
+                'b',
+            ),
+        ];
+
+        let groups = incomplete_exact_groups(&keys).collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), keys.len());
+        assert_eq!(groups[0].key, keys[0]);
+        assert_eq!(groups[1].key, keys[1]);
+        assert!(groups.iter().all(|group| {
+            !group.complete && group.members.is_empty() && group.next_cursor.is_none()
+        }));
     }
 }
 
