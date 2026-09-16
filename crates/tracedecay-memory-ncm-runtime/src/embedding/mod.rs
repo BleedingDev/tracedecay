@@ -20,8 +20,6 @@ use cap_std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
-#[cfg(feature = "real-encoder")]
-use std::fs;
 use std::io::Read;
 #[cfg(feature = "real-encoder")]
 use std::io::Write;
@@ -29,6 +27,8 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "real-encoder")]
 use std::sync::Mutex;
 use tracedecay_memory_ncm_core::types::AffectVector;
+
+pub mod model_lifecycle;
 
 /// Short model identity used by the runtime and readiness receipts.
 pub const MODEL_NAME: &str = "paraphrase-multilingual-MiniLM-L12-v2";
@@ -277,75 +277,7 @@ pub fn offline_probe(root: &StateRoot) -> bool {
 /// download from starting when it is already expired; ONNX and HTTP work are
 /// synchronous and cannot be interrupted once started.
 pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, EncoderError> {
-    if deadline.remaining_ms == 0 {
-        return Err(EncoderError::Cancelled);
-    }
-    ensure_authoritative_environment()?;
-    let reference = PinnedEncoder::reference()?;
-    ensure_manifest_is_pinned(&reference)?;
-
-    #[cfg(feature = "real-encoder")]
-    {
-        let (models_dir, models_directory) = prepare_model_cache(root)?;
-
-        // A previous interrupted download may already contain the pinned
-        // snapshot. Verify and materialize it before invoking FastEmbed so a
-        // cache hit stays offline and no downloader is given an admitted
-        // state path to mutate.
-        match materialize_verified_snapshot(&models_dir, &reference) {
-            Ok(manifest) => {
-                validate_materialized_encoder(&models_dir, &manifest)?;
-                ensure_pinned_metadata(&manifest, &reference)?;
-                write_manifest(&models_dir, &manifest)?;
-                return encoder_identity(&manifest);
-            }
-            Err(EncoderError::ArtifactsMissing(_)) => {}
-            Err(error) => return Err(error),
-        }
-
-        // FastEmbed's Hugging Face cache uses symlinks in snapshots and its
-        // downloader accepts only a path. Keep that mutable path in a private
-        // mode-700 temporary directory; the admitted root is populated only
-        // after the complete snapshot has been read, hashed, and materialized.
-        let staging = tempfile::Builder::new()
-            .prefix("tracedecay-ncm-install-")
-            .tempdir()
-            .map_err(|error| EncoderError::Inference(format!("create model staging: {error}")))?;
-        let staging_models = staging.path().join("models");
-        fs::create_dir(&staging_models).map_err(|error| {
-            EncoderError::Inference(format!("create model staging directory: {error}"))
-        })?;
-        let options =
-            fastembed::TextInitOptions::new(fastembed::EmbeddingModel::ParaphraseMLMiniLML12V2)
-                .with_cache_dir(staging_models.clone())
-                .with_max_length(MAX_LENGTH)
-                .with_show_download_progress(false);
-        let _model = fastembed::TextEmbedding::try_new(options)
-            .map_err(|error| EncoderError::Inference(format!("install encoder: {error}")))?;
-
-        if deadline.remaining_ms == 0 {
-            return Err(EncoderError::Cancelled);
-        }
-
-        // Release the ORT session before reading the large ONNX buffer for the
-        // digest. The user-defined validation below then constructs inference
-        // from those exact verified buffers.
-        drop(_model);
-        let manifest = materialize_verified_snapshot(&staging_models, &reference)?;
-        ensure_pinned_metadata(&manifest, &reference)?;
-        validate_materialized_encoder(&staging_models, &manifest)?;
-        publish_materialized_snapshot(&staging_models, &models_dir, &models_directory, &manifest)?;
-        write_manifest(&models_dir, &manifest)?;
-        encoder_identity(&manifest)
-    }
-
-    #[cfg(not(feature = "real-encoder"))]
-    {
-        let _ = root;
-        Err(EncoderError::ArtifactsMissing(
-            "real-encoder feature is disabled".to_owned(),
-        ))
-    }
+    model_lifecycle::install(root, deadline)
 }
 
 /// Production ONNX encoder for Xenova's multilingual MiniLM export.
