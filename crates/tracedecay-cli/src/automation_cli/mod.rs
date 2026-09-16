@@ -31,6 +31,18 @@ async fn daemon_automation_action(
     crate::commands::daemon_tool_json(Some(project_path), "tracedecay_admin_project", args).await
 }
 
+/// Dispatch one typed manual automation request through the daemon's
+/// automation authority. This deliberately has its own internal tool name;
+/// the administrative project RPC is reserved for counters, status, and
+/// read-only maintenance actions and must not become a second automation
+/// executor.
+pub(crate) async fn daemon_automation_run(
+    project_path: &std::path::Path,
+    args: serde_json::Value,
+) -> tracedecay_domain::errors::Result<serde_json::Value> {
+    crate::commands::daemon_tool_json(Some(project_path), "tracedecay_automation_run", args).await
+}
+
 pub(crate) async fn handle_automation_command(
     action: AutomationAction,
 ) -> tracedecay_domain::errors::Result<()> {
@@ -39,6 +51,13 @@ pub(crate) async fn handle_automation_command(
             hotpath::future!(
                 config::handle_automation_config_command(action),
                 label = "cli.automation.config"
+            )
+            .await
+        }
+        AutomationAction::Run { action } => {
+            hotpath::future!(
+                runs::handle_automation_run_command(action),
+                label = "cli.automation.run"
             )
             .await
         }

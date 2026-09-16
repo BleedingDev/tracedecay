@@ -8,6 +8,11 @@ pub enum AutomationAction {
         #[command(subcommand)]
         action: AutomationConfigAction,
     },
+    /// Run one typed self-improvement automation task.
+    Run {
+        #[command(subcommand)]
+        action: AutomationRunAction,
+    },
     /// Inspect automation run history.
     Runs {
         #[command(subcommand)]
@@ -22,6 +27,101 @@ pub enum AutomationAction {
     Facts {
         #[command(subcommand)]
         action: AutomationFactsAction,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub enum AutomationRunAction {
+    /// Run the autonomous memory curator against bounded canonical facts.
+    #[command(name = "memory-curation")]
+    MemoryCuration {
+        /// Maximum number of canonical facts included in the bounded review.
+        #[arg(
+            long,
+            default_value_t = tracedecay_automation_runtime::automation::runner::CURATION_DEFAULT_FACT_REVIEW_LIMIT
+        )]
+        fact_review_limit: usize,
+        /// Confidence floor below which backend operations are rejected.
+        #[arg(
+            long,
+            default_value_t = tracedecay_automation_runtime::automation::runner::CURATION_DEFAULT_MIN_CONFIDENCE
+        )]
+        min_confidence: f64,
+        /// Project path (default: current directory, with discovery).
+        #[arg(short, long)]
+        path: Option<String>,
+    },
+    /// Run the bounded session reflector against canonical session evidence.
+    #[command(name = "session-reflection")]
+    SessionReflection {
+        /// LCM provider to inspect.
+        #[arg(long, default_value = "cursor")]
+        provider: String,
+        /// Bounded evidence query.
+        #[arg(long, default_value = "remember prefer decision requirement workflow")]
+        query: String,
+        /// Maximum evidence snippets included in the review request.
+        #[arg(long, default_value_t = 20)]
+        evidence_limit: usize,
+        /// LCM evidence scope: all, session, or current.
+        #[arg(long, default_value = "all")]
+        scope: String,
+        /// Provider-local session id filter.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Include bounded summary nodes in the evidence request.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        include_summaries: bool,
+        /// Include bounded turn slices from recently active sessions.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        include_recent_sessions: bool,
+        /// Number of recently active sessions to include.
+        #[arg(long, default_value_t = 3)]
+        recent_sessions_limit: usize,
+        /// LCM evidence sort: recency, relevance, or hybrid.
+        #[arg(long, default_value = "recency")]
+        sort: String,
+        /// Optional raw-message source filter.
+        #[arg(long)]
+        source: Option<String>,
+        /// Optional raw-message role filter.
+        #[arg(long)]
+        role: Option<String>,
+        /// Inclusive minimum raw-message timestamp in microseconds.
+        #[arg(long)]
+        start_time: Option<i64>,
+        /// Inclusive maximum raw-message timestamp in microseconds.
+        #[arg(long)]
+        end_time: Option<i64>,
+        /// Project path (default: current directory, with discovery).
+        #[arg(short, long)]
+        path: Option<String>,
+    },
+    /// Run the bounded managed-skill writer against canonical session evidence.
+    #[command(name = "skill-writing")]
+    SkillWriting {
+        /// LCM provider to inspect. Use all for unified evidence.
+        #[arg(long, default_value = "all")]
+        provider: String,
+        /// Bounded evidence query.
+        #[arg(
+            long,
+            default_value = "workflow correction repeated skill tool pattern"
+        )]
+        query: String,
+        /// Maximum evidence snippets included in the review request.
+        #[arg(long, default_value_t = 20)]
+        evidence_limit: usize,
+        /// Include bounded turn slices from recently active sessions.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        include_recent_sessions: bool,
+        /// Number of recently active sessions to include.
+        #[arg(long, default_value_t = 3)]
+        recent_sessions_limit: usize,
+        /// Project path (default: current directory, with discovery).
+        #[arg(short, long)]
+        path: Option<String>,
     },
 }
 

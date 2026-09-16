@@ -1,8 +1,9 @@
 use super::{
-    AutomationAction, AutomationConfigAction, AutomationConfigScope, AutomationRunsAction,
-    AutomationSkillsAction, BranchAction, Cli, Commands, DaemonAction, FeedbackRollbackAction,
-    HostBundleAction, LspAction, MemoryAction, PackageHookAction, ProfileStorageAction,
-    RemoteAction, ScoopPackageHookAction, SessionsAction, SessionsRefreshAction,
+    AutomationAction, AutomationConfigAction, AutomationConfigScope, AutomationRunAction,
+    AutomationRunsAction, AutomationSkillsAction, BranchAction, Cli, Commands, DaemonAction,
+    FeedbackRollbackAction, HostBundleAction, LspAction, MemoryAction, PackageHookAction,
+    ProfileStorageAction, RemoteAction, ScoopPackageHookAction, SessionsAction,
+    SessionsRefreshAction,
 };
 use clap::{Parser, error::ErrorKind};
 
@@ -1012,6 +1013,143 @@ fn automation_runs_commands_parse_history_flags() {
             && kind == "codex_handoff"
             && json
             && path.as_deref() == Some("/tmp/project")
+    ));
+}
+
+#[test]
+fn automation_run_commands_parse_typed_v2_options() {
+    let memory = Cli::try_parse_from([
+        "tracedecay",
+        "automation",
+        "run",
+        "memory-curation",
+        "--fact-review-limit",
+        "31",
+        "--min-confidence",
+        "0.81",
+        "--path",
+        "/tmp/project",
+    ])
+    .expect("memory-curation should parse");
+    assert!(matches!(
+        memory.command,
+        Some(Commands::Automation {
+            action: AutomationAction::Run {
+                action: AutomationRunAction::MemoryCuration {
+                    fact_review_limit,
+                    min_confidence,
+                    path,
+                }
+            }
+        }) if fact_review_limit == 31
+            && (min_confidence - 0.81).abs() < f64::EPSILON
+            && path.as_deref() == Some("/tmp/project")
+    ));
+
+    let session = Cli::try_parse_from([
+        "tracedecay",
+        "automation",
+        "run",
+        "session-reflection",
+        "--provider",
+        "claude",
+        "--query",
+        "decisions",
+        "--evidence-limit",
+        "11",
+        "--scope",
+        "session",
+        "--session-id",
+        "session-3",
+        "--include-summaries",
+        "false",
+        "--include-recent-sessions",
+        "false",
+        "--recent-sessions-limit",
+        "4",
+        "--sort",
+        "hybrid",
+        "--source",
+        "assistant",
+        "--role",
+        "user",
+        "--start-time",
+        "10",
+        "--end-time",
+        "20",
+    ])
+    .expect("session-reflection should parse");
+    assert!(matches!(
+        session.command,
+        Some(Commands::Automation {
+            action: AutomationAction::Run {
+                action: AutomationRunAction::SessionReflection {
+                    provider,
+                    query,
+                    evidence_limit,
+                    scope,
+                    session_id,
+                    include_summaries,
+                    include_recent_sessions,
+                    recent_sessions_limit,
+                    sort,
+                    source,
+                    role,
+                    start_time,
+                    end_time,
+                    path,
+                }
+            }
+        }) if provider == "claude"
+            && query == "decisions"
+            && evidence_limit == 11
+            && scope == "session"
+            && session_id.as_deref() == Some("session-3")
+            && !include_summaries
+            && !include_recent_sessions
+            && recent_sessions_limit == 4
+            && sort == "hybrid"
+            && source.as_deref() == Some("assistant")
+            && role.as_deref() == Some("user")
+            && start_time == Some(10)
+            && end_time == Some(20)
+            && path.is_none()
+    ));
+
+    let skill = Cli::try_parse_from([
+        "tracedecay",
+        "automation",
+        "run",
+        "skill-writing",
+        "--provider",
+        "all",
+        "--query",
+        "repeated workflow",
+        "--evidence-limit",
+        "13",
+        "--recent-sessions-limit",
+        "5",
+    ])
+    .expect("skill-writing should parse");
+    assert!(matches!(
+        skill.command,
+        Some(Commands::Automation {
+            action: AutomationAction::Run {
+                action: AutomationRunAction::SkillWriting {
+                    provider,
+                    query,
+                    evidence_limit,
+                    include_recent_sessions,
+                    recent_sessions_limit,
+                    path,
+                }
+            }
+        }) if provider == "all"
+            && query == "repeated workflow"
+            && evidence_limit == 13
+            && include_recent_sessions
+            && recent_sessions_limit == 5
+            && path.is_none()
     ));
 }
 
