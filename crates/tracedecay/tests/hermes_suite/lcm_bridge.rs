@@ -37,6 +37,7 @@ for _name in ("tools.py", "schemas.py", "__init__.py"):
 const PLUGIN_LOAD_PRELUDE: &str = r#"
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -753,6 +754,15 @@ calls = []
 
 def fake_call_tracedecay_tool(name, args, **kwargs):
     calls.append((name, args, kwargs))
+    if name == "tracedecay_lcm_preflight":
+        return json.dumps({
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "ok",
+                "should_compress": False,
+                "reason": "below_threshold",
+                "replay_messages": [],
+            })}]
+        })
     return json.dumps({"ok": True, "tool": name})
 
 plugin.tools.call_tracedecay_tool = fake_call_tracedecay_tool
@@ -790,64 +800,197 @@ assert json.loads(describe_payload_result) == {"ok": True, "tool": "tracedecay_l
 assert json.loads(expand_result) == {"ok": True, "tool": "tracedecay_lcm_expand"}
 assert json.loads(direct_result) == {"ok": True, "tool": "tracedecay_lcm_grep"}
 assert json.loads(implicit_current_result) == {"ok": True, "tool": "tracedecay_lcm_grep"}
-# Read tools dispatch straight to the daemon-owned CLI route: no local
-# preflight interception, and current-turn messages never leave the host.
-assert len(calls) == 7
-assert calls[0][0] == "tracedecay_lcm_grep"
-assert calls[0][1]["query"] == "orchard"
-assert calls[0][1]["scope"] == "current"
-assert calls[0][1]["sort"] == "relevance"
-assert calls[0][1]["source"] == "cli"
-assert calls[0][1]["role"] == "assistant"
-assert calls[0][1]["start_time"] == 1
-assert calls[0][1]["end_time"] == 2
-assert "session_scope" not in calls[0][1]
-assert "time_from" not in calls[0][1]
-assert "time_to" not in calls[0][1]
-assert "messages" not in calls[0][1]
-assert "project_root" not in calls[0][1]
+# Native reads dispatch through the daemon-owned route. A changed host turn
+# is published once by typed preflight before the first read that carries it;
+# read arguments themselves never contain the live messages list.
+assert len(calls) == 9
+assert [call[0] for call in calls] == [
+    "tracedecay_lcm_preflight",
+    "tracedecay_lcm_grep",
+    "tracedecay_lcm_preflight",
+    "tracedecay_lcm_load_session",
+    "tracedecay_lcm_describe",
+    "tracedecay_lcm_describe",
+    "tracedecay_lcm_expand",
+    "tracedecay_lcm_grep",
+    "tracedecay_lcm_grep",
+]
+assert calls[0][1]["provider"] == "hermes"
 assert calls[0][1]["session_id"] == "session-1"
+assert calls[0][1]["messages"] == [{"role": "user", "content": "current turn"}]
 assert calls[0][2] == {"project_root": "/tmp/project"}
-assert calls[1][0] == "tracedecay_lcm_load_session"
-assert calls[1][1]["content_limit"] == 123
-assert calls[1][1]["roles"] == ["user", "tool"]
-assert calls[1][1]["start_time"] == 1
-assert calls[1][1]["end_time"] == 2
-assert "max_content_chars" not in calls[1][1]
-assert "role" not in calls[1][1]
-assert "time_from" not in calls[1][1]
-assert "time_to" not in calls[1][1]
-assert "messages" not in calls[1][1]
-assert calls[2][0] == "tracedecay_lcm_describe"
-assert calls[2][1]["target"] == {"kind": "summary_node", "node_id": "7"}
-assert "node_id" not in calls[2][1]
-assert calls[3][0] == "tracedecay_lcm_describe"
-assert calls[3][1]["target"] == {"kind": "external_payload", "payload_ref": "payload_123.payload"}
-assert "externalized_ref" not in calls[3][1]
-assert calls[4][0] == "tracedecay_lcm_expand"
-assert calls[4][1]["target"] == {"kind": "raw_message", "store_id": 42}
-assert calls[4][1]["session_id"] == "session-foreign"
-assert calls[4][1]["content_limit"] == 308
-assert "source_offset" not in calls[4][1]
-assert "source_limit" not in calls[4][1]
-assert "store_id" not in calls[4][1]
-assert "max_tokens" not in calls[4][1]
-assert calls[5][0] == "tracedecay_lcm_grep"
-assert calls[5][1]["query"] == "direct"
-assert calls[5][1]["scope"] == "all"
-assert "session_scope" not in calls[5][1]
-assert "project_root" not in calls[5][1]
-assert calls[5][2] == {"project_root": "/tmp/project"}
-assert calls[5][1]["session_id"] == "session-1"
-assert calls[6][0] == "tracedecay_lcm_grep"
-assert calls[6][1]["query"] == "implicit"
-assert calls[6][1]["scope"] == "current"
-assert "session_scope" not in calls[6][1]
-assert "project_root" not in calls[6][1]
-assert calls[6][2] == {"project_root": "/tmp/project"}
-assert calls[6][1]["session_id"] == "session-1"
+assert calls[2][1]["messages"] == [{"role": "assistant", "content": "load turn"}]
+assert calls[2][2] == {"project_root": "/tmp/project"}
+
+dispatch_calls = [call for call in calls if call[0] != "tracedecay_lcm_preflight"]
+assert dispatch_calls[0][1]["query"] == "orchard"
+assert dispatch_calls[0][1]["scope"] == "current"
+assert dispatch_calls[0][1]["sort"] == "relevance"
+assert dispatch_calls[0][1]["source"] == "cli"
+assert dispatch_calls[0][1]["role"] == "assistant"
+assert dispatch_calls[0][1]["start_time"] == 1
+assert dispatch_calls[0][1]["end_time"] == 2
+assert "session_scope" not in dispatch_calls[0][1]
+assert "time_from" not in dispatch_calls[0][1]
+assert "time_to" not in dispatch_calls[0][1]
+assert "messages" not in dispatch_calls[0][1]
+assert "project_root" not in dispatch_calls[0][1]
+assert dispatch_calls[0][1]["session_id"] == "session-1"
+assert dispatch_calls[0][2] == {"project_root": "/tmp/project"}
+assert dispatch_calls[1][0] == "tracedecay_lcm_load_session"
+assert dispatch_calls[1][1]["content_limit"] == 123
+assert dispatch_calls[1][1]["roles"] == ["user", "tool"]
+assert dispatch_calls[1][1]["start_time"] == 1
+assert dispatch_calls[1][1]["end_time"] == 2
+assert "max_content_chars" not in dispatch_calls[1][1]
+assert "role" not in dispatch_calls[1][1]
+assert "time_from" not in dispatch_calls[1][1]
+assert "time_to" not in dispatch_calls[1][1]
+assert "messages" not in dispatch_calls[1][1]
+assert dispatch_calls[2][0] == "tracedecay_lcm_describe"
+assert dispatch_calls[2][1]["target"] == {"kind": "summary_node", "node_id": "7"}
+assert "node_id" not in dispatch_calls[2][1]
+assert dispatch_calls[3][0] == "tracedecay_lcm_describe"
+assert dispatch_calls[3][1]["target"] == {"kind": "external_payload", "payload_ref": "payload_123.payload"}
+assert "externalized_ref" not in dispatch_calls[3][1]
+assert dispatch_calls[4][0] == "tracedecay_lcm_expand"
+assert dispatch_calls[4][1]["target"] == {"kind": "raw_message", "store_id": 42}
+assert dispatch_calls[4][1]["session_id"] == "session-foreign"
+assert dispatch_calls[4][1]["content_limit"] == 308
+assert "source_offset" not in dispatch_calls[4][1]
+assert "source_limit" not in dispatch_calls[4][1]
+assert "store_id" not in dispatch_calls[4][1]
+assert "max_tokens" not in dispatch_calls[4][1]
+assert dispatch_calls[5][0] == "tracedecay_lcm_grep"
+assert dispatch_calls[5][1]["query"] == "direct"
+assert dispatch_calls[5][1]["scope"] == "all"
+assert "session_scope" not in dispatch_calls[5][1]
+assert "project_root" not in dispatch_calls[5][1]
+assert dispatch_calls[5][2] == {"project_root": "/tmp/project"}
+assert dispatch_calls[5][1]["session_id"] == "session-1"
+assert dispatch_calls[6][0] == "tracedecay_lcm_grep"
+assert dispatch_calls[6][1]["query"] == "implicit"
+assert dispatch_calls[6][1]["scope"] == "current"
+assert "session_scope" not in dispatch_calls[6][1]
+assert "project_root" not in dispatch_calls[6][1]
+assert dispatch_calls[6][2] == {"project_root": "/tmp/project"}
+assert dispatch_calls[6][1]["session_id"] == "session-1"
 "#,
         "generated context engine should expose Hermes-style native LCM surface",
+    );
+}
+
+#[test]
+fn generated_context_engine_restores_typed_lcm_preflight_and_compress() {
+    run_generated_plugin_script(
+        "check_context_engine_typed_lcm_lifecycle.py",
+        r#"
+import json
+
+plugin._resolved_project_scope = lambda path, *_args: path
+engine = plugin.TraceDecayContextEngine(config={
+    "context_length": 1000,
+    "threshold_tokens": 90,
+    "fresh_tail_count": 7,
+    "leaf_chunk_tokens": 123,
+    "dynamic_leaf_chunk_enabled": True,
+    "dynamic_leaf_chunk_max": 456,
+    "max_assembly_tokens": 789,
+    "reserve_tokens_floor": 11,
+    "summary_fan_in": 3,
+    "incremental_max_depth": 2,
+    "ignore_session_patterns": ["cron-*"],
+    "stateless_session_patterns": "probe-*,dry-run",
+    "ignore_message_patterns": ["heartbeat"],
+})
+engine.initialize(
+    session_id="session-typed",
+    project_root="/tmp/project",
+)
+
+calls = []
+replay = [
+    {"role": "system", "content": "system"},
+    {"role": "assistant", "content": "summary"},
+]
+
+def fake_call_tracedecay_tool(name, args, **kwargs):
+    calls.append((name, dict(args), dict(kwargs)))
+    if name == "tracedecay_lcm_preflight":
+        payload = {
+            "status": "ready",
+            "should_compress": True,
+            "reason": "pressure",
+            "replay_messages": [],
+        }
+    elif name == "tracedecay_lcm_compress":
+        payload = {
+            "status": "compressed",
+            "reason": "summary_committed",
+            "summary_nodes_created": 1,
+            "replay_messages": replay,
+            "replay_token_estimate": 5,
+            "replay_over_budget": False,
+        }
+    else:
+        raise AssertionError(f"unexpected route: {name}")
+    return json.dumps({
+        "content": [{"type": "text", "text": json.dumps(payload)}],
+    })
+
+plugin.tools.call_tracedecay_tool = fake_call_tracedecay_tool
+assert engine.should_compress_preflight(
+    [{"role": "user", "content": "turn"}],
+    current_tokens=95,
+) is True
+assert len(calls) == 1
+preflight_name, preflight_args, preflight_kwargs = calls[0]
+assert preflight_name == "tracedecay_lcm_preflight"
+assert preflight_kwargs == {"project_root": "/tmp/project"}
+assert preflight_args["provider"] == "hermes"
+assert preflight_args["session_id"] == "session-typed"
+assert preflight_args["messages"] == [{"role": "user", "content": "turn"}]
+assert preflight_args["current_tokens"] == 95
+assert preflight_args["threshold_tokens"] == 90
+assert preflight_args["context_length"] == 1000
+assert preflight_args["fresh_tail_count"] == 7
+assert preflight_args["leaf_chunk_tokens"] == 123
+assert preflight_args["dynamic_leaf_chunk_enabled"] is True
+assert preflight_args["dynamic_leaf_chunk_max"] == 456
+assert preflight_args["max_assembly_tokens"] == 789
+assert preflight_args["reserve_tokens_floor"] == 11
+assert preflight_args["summary_fan_in"] == 3
+assert preflight_args["incremental_max_depth"] == 2
+assert preflight_args["ignore_session_patterns"] == ["cron-*"]
+assert preflight_args["stateless_session_patterns"] == ["probe-*", "dry-run"]
+assert preflight_args["ignore_message_patterns"] == ["heartbeat"]
+assert "storage_scope" not in preflight_args
+
+result = engine.compress(
+    [{"role": "user", "content": "turn"}],
+    current_tokens=95,
+    focus_topic="typed lifecycle",
+    summarizer={"mode": "provided", "summary_text": "host-authored"},
+)
+assert result == replay
+assert engine.compression_count == 1
+assert engine.last_compress_result["status"] == "compressed"
+assert engine.get_status()["awaiting_real_usage_after_compression"] is True
+assert len(calls) == 2
+compress_name, compress_args, compress_kwargs = calls[1]
+assert compress_name == "tracedecay_lcm_compress"
+assert compress_kwargs == {"project_root": "/tmp/project"}
+assert compress_args["provider"] == "hermes"
+assert compress_args["session_id"] == "session-typed"
+assert compress_args["messages"] == [{"role": "user", "content": "turn"}]
+assert compress_args["current_tokens"] == 95
+assert compress_args["focus_topic"] == "typed lifecycle"
+assert compress_args["summarizer"] == {"mode": "hermes_auxiliary"}
+assert compress_args["response_handle_project_root"] == "/tmp/project"
+assert "summary_text" not in json.dumps(compress_args)
+assert "storage_scope" not in compress_args
+"#,
+        "generated Hermes engine should use the daemon-owned typed LCM lifecycle routes",
     );
 }
 
@@ -1031,6 +1174,7 @@ fn generated_context_engine_registers_when_supported() {
         r#"
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -1107,6 +1251,15 @@ calls = []
 
 def fake_call_tracedecay_tool(name, args, **kwargs):
     calls.append((name, args, kwargs))
+    if name == "tracedecay_lcm_preflight":
+        return json.dumps({
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "ready",
+                "should_compress": False,
+                "reason": "below_threshold",
+                "replay_messages": [],
+            })}]
+        })
     return "{}"
 
 plugin.tools.call_tracedecay_tool = fake_call_tracedecay_tool
@@ -1135,7 +1288,23 @@ profile_engine = plugin.TraceDecayContextEngine()
 profile_engine.initialize(session_id="initial", hermes_home="/tmp/hermes")
 profile_engine.on_session_start(session_id="next")
 assert profile_engine.should_compress_preflight(messages=[], current_tokens=321) is False
-assert calls == []
+assert [call[0] for call in calls] == [
+    "tracedecay_lcm_preflight",
+    "tracedecay_lcm_preflight",
+    "tracedecay_lcm_preflight",
+    "tracedecay_lcm_preflight",
+]
+assert calls[0][1]["storage_scope"] == "user"
+assert calls[0][1]["current_tokens"] == 123
+assert calls[0][2] == {}
+assert "storage_scope" not in calls[1][1]
+assert calls[1][1]["current_tokens"] == 456
+assert calls[1][2] == {"project_root": "/tmp/project"}
+assert calls[2][1]["current_tokens"] == 789
+assert calls[2][2] == {"project_root": "/tmp/project"}
+assert calls[3][1]["storage_scope"] == "user"
+assert calls[3][1]["current_tokens"] == 321
+assert calls[3][2] == {}
 
 class LegacyCtx:
     def register_tool(self, *args, **kwargs):

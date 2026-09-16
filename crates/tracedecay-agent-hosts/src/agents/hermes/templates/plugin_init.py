@@ -1126,6 +1126,17 @@ PLUGIN_CONFIG_FIELDS = {
     "context_threshold": ("", "Compression trigger as a fraction of the context window (default: hermes compression.threshold)."),
     "threshold_tokens": ("", "Absolute compression trigger in tokens (overrides context_threshold)."),
     "context_length": ("", "Context window override when the host does not report one."),
+    "fresh_tail_count": ("", "Newest messages kept verbatim by the daemon (default: 64)."),
+    "leaf_chunk_tokens": ("", "Token budget for one LCM leaf chunk (default: 20000)."),
+    "dynamic_leaf_chunk_enabled": ("", "Allow the daemon to grow leaf chunks under backlog pressure."),
+    "dynamic_leaf_chunk_max": ("", "Maximum dynamic leaf chunk size (default: 40000)."),
+    "max_assembly_tokens": ("", "Maximum assembled replay size; zero derives it from context."),
+    "reserve_tokens_floor": ("", "Context headroom reserved when deriving replay size."),
+    "summary_fan_in": ("", "Summary nodes condensed per parent (default: 4)."),
+    "incremental_max_depth": ("", "Maximum daemon condensation depth (default: 1)."),
+    "ignore_session_patterns": ("", "Comma-separated session patterns excluded from LCM."),
+    "stateless_session_patterns": ("", "Comma-separated session patterns treated as stateless."),
+    "ignore_message_patterns": ("", "Comma-separated message patterns excluded from LCM storage."),
     "expansion_model": ("", "Model used for lcm_expand_query synthesis."),
     "expansion_context_tokens": ("", "Expanded-context budget for lcm_expand_query (default 32000)."),
     "expansion_timeout_ms": ("", "lcm_expand_query synthesis timeout in milliseconds."),
@@ -1316,6 +1327,183 @@ def _lcm_int_setting(config, env_key, *names, default=None):
         except (TypeError, ValueError):
             pass
     return _configured_int(config, *names, default=default)
+
+def _configured_bool(config, *names, default=None):
+    value = _configured_value(config, *names, default=default)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return default
+    return bool(value)
+
+def _parse_lcm_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+def _lcm_bool_setting(config, env_key, *names, default=None):
+    raw = os.environ.get(env_key)
+    if raw is not None:
+        normalized = raw.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+        return default
+    return _configured_bool(config, *names, default=default)
+
+def _lcm_list_setting(config, env_key, *names, default=None):
+    raw = os.environ.get(env_key)
+    if raw is not None:
+        return _parse_lcm_list(raw)
+    value = _configured_value(config, *names, default=default)
+    if value is None:
+        return default
+    return _parse_lcm_list(value)
+
+def _lcm_reserve_tokens_floor_setting(config, context_length):
+    value = _lcm_int_setting(
+        config,
+        "LCM_RESERVE_TOKENS_FLOOR",
+        "reserve_tokens_floor",
+        default=None,
+    )
+    if value is not None:
+        return max(0, value)
+    try:
+        return 4096 if int(context_length or 0) > 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+def _lcm_config_args(config, hermes_home=None, runtime_context_length=None):
+    """Project Hermes LCM settings onto the typed daemon request.
+
+    The generated host never opens an LCM store. It only supplies the
+    provider/session pressure and policy values to the daemon-owned route.
+    Defaults mirror the typed LCM policy, while explicit host/environment
+    values remain available for parity with Hermes' own compression config.
+    """
+    context_length = runtime_context_length
+    if context_length is None:
+        context_length = _configured_int(
+            config,
+            "context_length",
+            "max_context_tokens",
+            "model_context_tokens",
+        )
+    args = {
+        "fresh_tail_count": _lcm_int_setting(
+            config, "LCM_FRESH_TAIL_COUNT", "fresh_tail_count", default=64
+        ),
+        "leaf_chunk_tokens": _lcm_int_setting(
+            config, "LCM_LEAF_CHUNK_TOKENS", "leaf_chunk_tokens", default=20000
+        ),
+        "dynamic_leaf_chunk_enabled": _lcm_bool_setting(
+            config,
+            "LCM_DYNAMIC_LEAF_CHUNK_ENABLED",
+            "dynamic_leaf_chunk_enabled",
+            default=False,
+        ),
+        "dynamic_leaf_chunk_max": _lcm_int_setting(
+            config,
+            "LCM_DYNAMIC_LEAF_CHUNK_MAX",
+            "dynamic_leaf_chunk_max",
+            default=40000,
+        ),
+        "max_assembly_tokens": _lcm_int_setting(
+            config, "LCM_MAX_ASSEMBLY_TOKENS", "max_assembly_tokens", default=0
+        ),
+        "reserve_tokens_floor": _lcm_reserve_tokens_floor_setting(
+            config, context_length
+        ),
+        "context_length": context_length,
+        "summary_fan_in": _lcm_int_setting(
+            config,
+            "LCM_CONDENSATION_FANIN",
+            "summary_fan_in",
+            "condensation_fanin",
+            default=4,
+        ),
+        "incremental_max_depth": _lcm_int_setting(
+            config,
+            "LCM_INCREMENTAL_MAX_DEPTH",
+            "incremental_max_depth",
+            default=1,
+        ),
+    }
+    threshold_tokens = _configured_threshold_tokens(
+        config,
+        hermes_home=hermes_home,
+        context_length_override=context_length,
+    )
+    if threshold_tokens is not None:
+        args["threshold_tokens"] = threshold_tokens
+    for env_key, name in (
+        ("LCM_IGNORE_SESSION_PATTERNS", "ignore_session_patterns"),
+        ("LCM_STATELESS_SESSION_PATTERNS", "stateless_session_patterns"),
+        ("LCM_IGNORE_MESSAGE_PATTERNS", "ignore_message_patterns"),
+    ):
+        patterns = _lcm_list_setting(config, env_key, name)
+        if patterns:
+            args[name] = patterns
+    return {key: value for key, value in args.items() if value is not None}
+
+def _apply_lcm_option_overrides(args, kwargs, keys):
+    """Copy explicit host hook overrides into a typed LCM request."""
+    for key in keys:
+        if key in kwargs and kwargs[key] is not None:
+            args[key] = kwargs[key]
+
+def _replay_message_list(value):
+    """Validate a daemon replay as a host message list before adoption."""
+    if not isinstance(value, list):
+        return None
+    if any(not isinstance(item, dict) or not item.get("role") for item in value):
+        return None
+    return list(value)
+
+def _compression_replay_is_compacted(result):
+    if not isinstance(result, dict):
+        return False
+    return any(
+        bool(result.get(key))
+        for key in (
+            "contract_truncated",
+            "replay_messages_truncated_for_mcp",
+            "replay_messages_compacted_for_mcp",
+        )
+    )
+
+def _compression_result_completed(result):
+    """Recognize the daemon's successful `ok` response and host alias."""
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    status = str(result.get("status") or "").lower()
+    if status == "compressed":
+        return True
+    return status == "ok" and bool(result.get("summary_nodes_created"))
+
+def _messages_hash(messages):
+    """Return a stable digest for current-turn preflight de-duplication."""
+    try:
+        encoded = json.dumps(
+            messages or [],
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        encoded = repr(messages)
+    return hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest()
 
 def _config_bool_disabled(value):
     if isinstance(value, bool):
@@ -1726,6 +1914,7 @@ class _EngineSessionState:
         "last_compress_result",
         "_last_compress_aborted",
         "_last_summary_error",
+        "_last_preflight_signature",
         "_runtime_context_length",
         "_session_start_context_length",
     )
@@ -1748,6 +1937,7 @@ class _EngineSessionState:
         self.last_compress_result = None
         self._last_compress_aborted = False
         self._last_summary_error = None
+        self._last_preflight_signature = None
         self._runtime_context_length = None
         self._session_start_context_length = None
 
@@ -1827,6 +2017,7 @@ class TraceDecayContextEngine(ContextEngine):
     last_compress_result = _engine_session_property("last_compress_result")
     _last_compress_aborted = _engine_session_property("_last_compress_aborted")
     _last_summary_error = _engine_session_property("_last_summary_error")
+    _last_preflight_signature = _engine_session_property("_last_preflight_signature")
     _runtime_context_length = _engine_session_property("_runtime_context_length")
     _session_start_context_length = _engine_session_property("_session_start_context_length")
 
@@ -1869,6 +2060,9 @@ class TraceDecayContextEngine(ContextEngine):
                         source = self._session_states.get(_ENGINE_DEFAULT_SESSION)
                     if source is not None:
                         state.adopt(source)
+                    # Compression rotation carries counters and model/window
+                    # state, but the new session must publish its own turn.
+                    state._last_preflight_signature = None
                     self._session_states[session_key] = state
             # Bind the calling thread so session-less calls (compress,
             # update_from_response, should_compress) resolve this session.
@@ -2023,23 +2217,80 @@ class TraceDecayContextEngine(ContextEngine):
         }
 
     def should_compress_preflight(self, messages, current_tokens=None, **kwargs):
-        del messages, current_tokens, kwargs
-        # Hermes does not expose an authentic raw-compression protocol. Its
-        # transcript still ingests through the daemon, but compaction is a
-        # typed unavailable capability.
-        return False
+        """Ask the daemon whether the active replay should be compacted."""
+        result = self._preflight_probe(messages, current_tokens=current_tokens, **kwargs)
+        if not isinstance(result, dict) or result.get("error"):
+            return False
+        original = list(messages or [])
+        replay = _replay_message_list(result.get("replay_messages"))
+        if (
+            replay is not None
+            and replay != original
+            and (replay or not original)
+            and not _compression_replay_is_compacted(result)
+        ):
+            return True
+        return bool(result.get("should_compress"))
 
     def _preflight_probe(self, messages, current_tokens=None, **kwargs):
-        del messages, current_tokens, kwargs
-        return {
-            "status": "unavailable",
-            "reason": "host_raw_compression_unavailable",
-            "should_compress": False,
-        }
+        if not self.active_session_id:
+            return {
+                "status": "unavailable",
+                "reason": "no_active_session",
+                "should_compress": False,
+            }
+        project_root = kwargs.get("project_root") or self.project_root
+        args = self._tool_args()
+        args.update(
+            _lcm_config_args(
+                self.config,
+                self.hermes_home,
+                runtime_context_length=self._effective_context_length(),
+            )
+        )
+        args.update({
+            "provider": STANDARD_HERMES_LCM_PROVIDER,
+            "session_id": self.active_session_id,
+            "messages": list(messages or []),
+            "current_tokens": current_tokens,
+        })
+        _apply_lcm_option_overrides(args, kwargs, (
+            "threshold_tokens",
+            "max_assembly_tokens",
+            "leaf_chunk_tokens",
+            "max_source_messages",
+            "summary_fan_in",
+            "incremental_max_depth",
+            "fresh_tail_count",
+            "dynamic_leaf_chunk_enabled",
+            "dynamic_leaf_chunk_max",
+            "context_length",
+            "reserve_tokens_floor",
+            "ignore_session_patterns",
+            "stateless_session_patterns",
+            "ignore_message_patterns",
+        ))
+        args = _lcm_store_args(args, project_root)
+        return call_tracedecay_json(
+            "tracedecay_lcm_preflight",
+            args,
+            **_project_call_kwargs(project_root),
+        )
 
     def should_compress(self, prompt_tokens=None, **kwargs):
-        del prompt_tokens, kwargs
-        return False
+        # Hermes calls this frequently. Use the local threshold when known and
+        # pay for the daemon preflight only near the active context budget.
+        state = self._state()
+        try:
+            tokens = int(prompt_tokens) if prompt_tokens is not None else None
+        except (TypeError, ValueError):
+            tokens = None
+        if tokens is not None and state.threshold_tokens and tokens < state.threshold_tokens:
+            return False
+        result = self._preflight_probe([], current_tokens=prompt_tokens, **kwargs)
+        return isinstance(result, dict) and not result.get("error") and bool(
+            result.get("should_compress")
+        )
 
     def has_content_to_compress(self, messages, current_tokens=None, **kwargs):
         del current_tokens, kwargs
@@ -2051,8 +2302,30 @@ class TraceDecayContextEngine(ContextEngine):
         return len(non_empty) >= 2
 
     def should_defer_preflight_to_real_usage(self, rough_tokens=None):
-        del rough_tokens
-        return False
+        diagnostic = (
+            self.last_compress_result.get("compression_diagnostic")
+            if isinstance(self.last_compress_result, dict)
+            else None
+        )
+        boundary_deferred = bool(
+            isinstance(diagnostic, dict)
+            and diagnostic.get("type") == "replay_boundary_rejection"
+            and diagnostic.get("defer_preflight_to_real_usage")
+        )
+        if not boundary_deferred and not _compression_result_completed(
+            self.last_compress_result
+        ):
+            return False
+        try:
+            rough = int(rough_tokens or 0)
+            real = int(self.last_real_prompt_tokens or 0)
+        except (TypeError, ValueError):
+            return False
+        if real <= 0 or rough <= real:
+            return False
+        # Very large estimates should still reach daemon preflight instead of
+        # being hidden by stale host-side accounting.
+        return rough <= real * 10
 
     def carry_over_new_session_context(self, old_session_id, new_session_id):
         old_session_id = str(old_session_id or "")
@@ -2089,7 +2362,10 @@ class TraceDecayContextEngine(ContextEngine):
                 schema["name"] for schema in self.get_tool_schemas()
             ),
             "last_compress_result": last_result,
-            "awaiting_real_usage_after_compression": False,
+            "awaiting_real_usage_after_compression": (
+                _compression_result_completed(self.last_compress_result)
+                and not self.last_real_prompt_tokens
+            ),
             "live_ingest": {
                 "registered_tool_names": sorted(_REGISTERED_TOOL_NAMES),
                 "context_tool_names": sorted(_CONTEXT_TOOL_NAMES),
@@ -2119,8 +2395,10 @@ class TraceDecayContextEngine(ContextEngine):
         if tracedecay_name is None:
             return tools.error_payload(f"unknown LCM tool: {tool_name}")
 
+        messages = kwargs.get("messages")
         preflight_kwargs = dict(kwargs)
         preflight_kwargs.pop("messages", None)
+        self._current_turn_preflight(messages, **preflight_kwargs)
 
         tool_args = _translate_lcm_args(native_name, dict(tool_args))
         if tool_args.get("error"):
@@ -2151,6 +2429,59 @@ class TraceDecayContextEngine(ContextEngine):
                 preflight_kwargs.get("project_root") or self.project_root
             ),
         )
+
+    def _current_turn_preflight(self, messages, **kwargs):
+        """Publish a changed host turn once before a native LCM read.
+
+        Hermes passes the live transcript as an integration kwarg. The
+        daemon's typed preflight is the authenticated ingest boundary, so the
+        host never opens a V1 store and repeated reads do not ingest the same
+        message list again.
+        """
+        if not messages or not self.active_session_id:
+            return
+        project_root = kwargs.get("project_root") or self.project_root
+        signature = f"{self.active_session_id}:{_messages_hash(messages)}"
+        if signature == self._last_preflight_signature:
+            return
+        args = _lcm_config_args(
+            self.config,
+            self.hermes_home,
+            runtime_context_length=self._effective_context_length(),
+        )
+        args.update({
+            "provider": STANDARD_HERMES_LCM_PROVIDER,
+            "session_id": self.active_session_id,
+            "messages": list(messages),
+        })
+        _apply_lcm_option_overrides(args, kwargs, (
+            "current_tokens",
+            "threshold_tokens",
+            "max_assembly_tokens",
+            "leaf_chunk_tokens",
+            "max_source_messages",
+            "summary_fan_in",
+            "incremental_max_depth",
+            "fresh_tail_count",
+            "dynamic_leaf_chunk_enabled",
+            "dynamic_leaf_chunk_max",
+            "context_length",
+            "reserve_tokens_floor",
+            "ignore_session_patterns",
+            "stateless_session_patterns",
+            "ignore_message_patterns",
+        ))
+        args = _lcm_store_args(args, project_root)
+        try:
+            result = call_tracedecay_json(
+                "tracedecay_lcm_preflight",
+                args,
+                **_project_call_kwargs(project_root),
+            )
+            if isinstance(result, dict) and not result.get("error"):
+                self._last_preflight_signature = signature
+        except Exception as exc:
+            logger.warning("LCM current-turn preflight failed: %s", exc)
 
     def expand_query(self, prompt, query=None, node_ids=None, **kwargs):
         kwargs = dict(kwargs)
@@ -2186,18 +2517,139 @@ class TraceDecayContextEngine(ContextEngine):
         return _synthesize_expand_query_payload(retrieval, agent=synthesis_agent, **synthesis_kwargs)
 
     def compress(self, messages, current_tokens=None, focus_topic=None, **kwargs):
-        """Return the unchanged transcript when host compaction is unavailable."""
-        del current_tokens, focus_topic, kwargs
+        """Ask the daemon for an authoritative compacted replay.
+
+        The ContextEngine contract is a message list. The typed daemon result
+        remains on ``last_compress_result`` for diagnostics, while malformed,
+        truncated, or non-shrinking replays fail closed to the original list.
+        Hermes never supplies summary text here: ``hermes_auxiliary`` keeps
+        summarization inside the daemon-owned authority boundary.
+        """
         original = list(messages or [])
-        reason = "host_raw_compression_unavailable"
-        self.last_compress_result = {
-            "status": "unavailable",
-            "reason": reason,
-            "semantic_error": True,
-        }
-        self._last_compress_aborted = True
-        self._last_summary_error = reason
-        return original
+        self._last_compress_aborted = False
+        self._last_summary_error = None
+        try:
+            result = self._compress_to_result(
+                original,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                **kwargs,
+            )
+        except Exception as exc:
+            result = {"status": "error", "reason": str(exc)}
+        self.last_compress_result = result if isinstance(result, dict) else {}
+        if not isinstance(result, dict) or result.get("error") or result.get("status") == "error":
+            reason = (
+                result.get("error") or result.get("reason") or "compression error"
+                if isinstance(result, dict)
+                else "invalid compression result"
+            )
+            self._last_compress_aborted = True
+            self._last_summary_error = str(reason)
+            return original
+        if result.get("status") == "needs_summary":
+            # The host cannot mint or inject summaries. A daemon response in
+            # this state means its authoritative summarizer was unavailable.
+            reason = "daemon returned needs_summary without completing compression"
+            self._last_compress_aborted = True
+            self._last_summary_error = reason
+            return original
+        if result.get("replay_over_budget") is True or _compression_replay_is_compacted(result):
+            reason = str(
+                result.get("context_recovery_hint")
+                or result.get("reason")
+                or "compression replay exceeded the response budget"
+            )
+            self._last_compress_aborted = True
+            self._last_summary_error = reason
+            return original
+        replay = _replay_message_list(result.get("replay_messages"))
+        if replay is None or (not replay and original):
+            self._last_compress_aborted = True
+            self._last_summary_error = str(result.get("reason") or "no usable replay")
+            return original
+        if replay == original:
+            return original
+        self.compression_count += 1
+        result.setdefault("status", "compressed")
+        self._last_preflight_signature = None
+        return replay
+
+    def _compress_to_result(self, messages, current_tokens=None, focus_topic=None, **kwargs):
+        """Build and send one typed daemon-owned compression request."""
+        if not self.active_session_id:
+            return {
+                "status": "unavailable",
+                "reason": "no_active_session",
+                "replay_messages": [],
+            }
+        project_root = kwargs.get("project_root") or self.project_root
+        args = _lcm_config_args(
+            self.config,
+            self.hermes_home,
+            runtime_context_length=self._effective_context_length(),
+        )
+        args.update({
+            "provider": STANDARD_HERMES_LCM_PROVIDER,
+            "session_id": self.active_session_id,
+            "messages": list(messages or []),
+            # This is an enum object in the typed Rust contract. Summary text
+            # is deliberately absent: daemon authority selects its provider.
+            "summarizer": {"mode": "hermes_auxiliary"},
+        })
+        if current_tokens is not None:
+            args["current_tokens"] = current_tokens
+        if focus_topic is not None:
+            args["focus_topic"] = focus_topic
+        if project_root:
+            # CLI stores oversized response handles under this project while
+            # the request itself remains routed by the transport kwarg.
+            args["response_handle_project_root"] = project_root
+        _apply_lcm_option_overrides(args, kwargs, (
+            "expected_current_frontier_store_id",
+            "threshold_tokens",
+            "max_assembly_tokens",
+            "leaf_chunk_tokens",
+            "max_source_messages",
+            "summary_fan_in",
+            "incremental_max_depth",
+            "fresh_tail_count",
+            "dynamic_leaf_chunk_enabled",
+            "dynamic_leaf_chunk_max",
+            "context_length",
+            "reserve_tokens_floor",
+            "ignore_session_patterns",
+            "stateless_session_patterns",
+            "ignore_message_patterns",
+        ))
+        # A caller-provided summarizer can only restate daemon authority. Do
+        # not forward `provided`/`fake` summary text from a host integration.
+        requested_summarizer = kwargs.get("summarizer")
+        if (
+            isinstance(requested_summarizer, dict)
+            and requested_summarizer.get("mode") == "hermes_auxiliary"
+        ):
+            args["summarizer"] = {"mode": "hermes_auxiliary"}
+        if kwargs.get("force") and not args.get("max_assembly_tokens"):
+            try:
+                current = int(current_tokens or 0)
+            except (TypeError, ValueError):
+                current = 0
+            if current > 1:
+                args["max_assembly_tokens"] = current - 1
+            elif args.get("threshold_tokens"):
+                try:
+                    threshold = int(args["threshold_tokens"])
+                    if threshold > 1:
+                        args["max_assembly_tokens"] = threshold - 1
+                except (TypeError, ValueError):
+                    pass
+        args = _lcm_store_args(args, project_root)
+        return call_tracedecay_json(
+            "tracedecay_lcm_compress",
+            args,
+            **_project_call_kwargs(project_root),
+        )
 
 class TracedecayMemoryProvider(MemoryProvider):
     provider_id = "tracedecay"
