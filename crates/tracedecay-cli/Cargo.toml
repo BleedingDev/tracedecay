@@ -46,6 +46,13 @@ path = "tests/product_memory_provider_claude_host_journey.rs"
 required-features = ["memory-provider-host", "test-transport"]
 
 [[test]]
+name = "product_memory_provider_hermes_host_journey"
+path = "tests/product_memory_provider_hermes_host_journey.rs"
+# This journey loads the generated Hermes plugin and drives its real provider
+# callback against the live daemon/provider mount.
+required-features = ["memory-provider-host", "test-transport"]
+
+[[test]]
 name = "work_loop_journey"
 path = "tests/work_loop_journey.rs"
 required-features = ["test-transport"]
