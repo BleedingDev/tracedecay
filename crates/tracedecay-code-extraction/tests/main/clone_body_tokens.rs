@@ -1,13 +1,47 @@
 #[cfg(feature = "lang-clojure")]
 use tracedecay_code_extraction::ClojureExtractor;
+#[cfg(feature = "lang-pascal")]
+use tracedecay_code_extraction::PascalExtractor;
 #[cfg(feature = "lang-perl")]
 use tracedecay_code_extraction::PerlExtractor;
 use tracedecay_code_extraction::{
     CloneBodyEligibilityV1, CloneBodyTokenizationIssueV1, CloneBodyTokenizationStatusV1,
-    ConservativeCloneTokenV1, LanguageExtractor, PythonExtractor, RustExtractor,
+    ConservativeCloneTokenV1, CppExtractor, ExtractedCloneBodyV1, ExtractionArtifactV1,
+    GoExtractor, JavaExtractor, KotlinExtractor, LanguageExtractor, PythonExtractor, RustExtractor,
     TypeScriptExtractor,
 };
 use tracedecay_domain::NodeKind;
+
+fn body_for_kind<'a>(
+    artifact: &'a ExtractionArtifactV1,
+    kind: &NodeKind,
+) -> &'a ExtractedCloneBodyV1 {
+    artifact
+        .clone_bodies
+        .iter()
+        .find(|body| &body.symbol_kind == kind)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing clone body for {kind:?}; nodes: {:?}",
+                artifact.result.nodes
+            )
+        })
+}
+
+fn assert_complete_body(body: &ExtractedCloneBodyV1, label: &str) {
+    assert_eq!(
+        body.tokenization_status,
+        CloneBodyTokenizationStatusV1::Complete,
+        "{label}: {:?}",
+        body.tokenization_issues
+    );
+    assert!(
+        body.tokenization_issues.is_empty(),
+        "{label}: {:?}",
+        body.tokenization_issues
+    );
+    assert!(!body.body_span.is_empty(), "{label}: empty body span");
+}
 
 fn tokens(
     extractor: &dyn LanguageExtractor,
@@ -252,4 +286,228 @@ fn clone_bodies_bind_to_method_and_stable_arrow_occurrences() {
         assert_eq!(body.language, expected_language);
         assert!(!body.body_span.is_empty());
     }
+}
+
+#[test]
+fn clone_admission_covers_language_specific_callable_kinds() {
+    for (extractor, path, source, kind) in [
+        (
+            &CppExtractor as &dyn LanguageExtractor,
+            "src/box.cpp",
+            r#"
+class Box {
+public:
+    Box(int value) : value(value) { initialize(); }
+private:
+    int value;
+    void initialize() { value += 1; }
+};
+"#,
+            NodeKind::Constructor,
+        ),
+        (
+            &GoExtractor,
+            "src/box.go",
+            r#"
+package model
+
+type Box struct { value int }
+
+func (b *Box) Reset() {
+    b.value = 0
+    notify()
+}
+"#,
+            NodeKind::StructMethod,
+        ),
+        (
+            &JavaExtractor,
+            "src/Box.java",
+            r#"
+class Box {
+    private int value;
+
+    Box(int value) {
+        this.value = value;
+        validate(value);
+    }
+}
+"#,
+            NodeKind::Constructor,
+        ),
+        (
+            &KotlinExtractor,
+            "src/Box.kt",
+            r#"
+class Box(val value: Int) {
+    constructor(value: Int, extra: Int) : this(value) {
+        val total = value + extra
+        println(total)
+    }
+}
+"#,
+            NodeKind::Constructor,
+        ),
+        (
+            &TypeScriptExtractor,
+            "src/box.ts",
+            r#"
+class Box {
+    constructor(value: number) {
+        initialize(value);
+        record(value);
+    }
+}
+"#,
+            NodeKind::Constructor,
+        ),
+    ] {
+        let artifact = extractor.extract_artifact(path, source);
+        assert!(
+            artifact.result.errors.is_empty(),
+            "{path}: {:?}",
+            artifact.result.errors
+        );
+        let body = body_for_kind(&artifact, &kind);
+        let node = artifact
+            .result
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind)
+            .expect("callable node");
+        assert_eq!(body.symbol_occurrence_id, node.id, "{path}");
+        assert_complete_body(body, path);
+    }
+
+    let artifact = KotlinExtractor.extract_artifact(
+        "src/box.kt",
+        r#"
+class Box {
+    fun reset(value: Int): Int {
+        val next = value + 1
+        println(next)
+        return next
+    }
+}
+"#,
+    );
+    assert!(
+        artifact.result.errors.is_empty(),
+        "{:?}",
+        artifact.result.errors
+    );
+    assert_complete_body(body_for_kind(&artifact, &NodeKind::Method), "kotlin method");
+}
+
+#[test]
+fn abstract_methods_are_retained_as_conservative_partial_evidence() {
+    for (extractor, path, source) in [
+        (
+            &CppExtractor as &dyn LanguageExtractor,
+            "src/shape.cpp",
+            r#"
+class Shape {
+public:
+    virtual double area() = 0;
+};
+"#,
+        ),
+        (
+            &JavaExtractor,
+            "src/Shape.java",
+            r#"
+public abstract class Shape {
+    public abstract double area();
+}
+"#,
+        ),
+        (
+            &KotlinExtractor,
+            "src/Shape.kt",
+            r#"
+interface Shape {
+    fun area(): Double
+}
+"#,
+        ),
+    ] {
+        let artifact = extractor.extract_artifact(path, source);
+        assert!(
+            artifact.result.errors.is_empty(),
+            "{path}: {:?}",
+            artifact.result.errors
+        );
+        let body = body_for_kind(&artifact, &NodeKind::AbstractMethod);
+        assert_eq!(
+            body.tokenization_status,
+            CloneBodyTokenizationStatusV1::Partial,
+            "{path}"
+        );
+        assert!(
+            body.tokenization_issues
+                .contains(&CloneBodyTokenizationIssueV1::BodyBoundaryUnavailable),
+            "{path}: {:?}",
+            body.tokenization_issues
+        );
+        assert_eq!(
+            body.eligibility,
+            CloneBodyEligibilityV1::ExcludedIncompleteTokenization,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(feature = "lang-pascal")]
+#[test]
+fn pascal_procedures_receive_bounded_clone_bodies() {
+    let source = r#"
+program CloneBody;
+
+procedure Emit(value: Integer);
+begin
+    WriteLn(value);
+end;
+
+begin
+end.
+"#;
+    let artifact = PascalExtractor.extract_artifact("src/clone_body.pas", source);
+    assert!(
+        artifact.result.errors.is_empty(),
+        "{:?}",
+        artifact.result.errors
+    );
+    let body = body_for_kind(&artifact, &NodeKind::Procedure);
+    let node = artifact
+        .result
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::Procedure)
+        .expect("procedure node");
+    assert_eq!(body.symbol_occurrence_id, node.id);
+    assert_complete_body(body, "pascal procedure");
+}
+
+#[test]
+fn test_framework_closures_use_only_their_bounded_callback_body() {
+    let source = r#"
+describe("suite", () => {
+    setup();
+    verify();
+});
+"#;
+    let artifact = TypeScriptExtractor.extract_artifact("src/suite.ts", source);
+    assert!(
+        artifact.result.errors.is_empty(),
+        "{:?}",
+        artifact.result.errors
+    );
+    let body = body_for_kind(&artifact, &NodeKind::Function);
+    assert_complete_body(body, "typescript test callback");
+    let start = usize::try_from(body.body_span.start_byte).expect("body start");
+    let end = usize::try_from(body.body_span.end_byte).expect("body end");
+    let body_source = &source[start..end];
+    assert!(body_source.contains("setup"));
+    assert!(body_source.contains("verify"));
+    assert!(!body_source.contains("describe"));
 }

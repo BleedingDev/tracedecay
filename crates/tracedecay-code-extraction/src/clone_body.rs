@@ -105,6 +105,25 @@ struct CallableOccurrence {
     syntax_span: SyntaxSpan,
 }
 
+/// Keep clone-body admission aligned with every callable vocabulary variant
+/// that an extractor can persist. `NodeKind::is_callable_kind` intentionally
+/// serves coverage accounting and has a narrower contract, so clone evidence
+/// uses this local admission predicate instead of widening that domain API.
+/// Parser-represented closures continue through the existing function/arrow
+/// variants and are emitted only when `callable_syntax` finds their body.
+fn is_clone_callable_kind(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function
+            | NodeKind::Method
+            | NodeKind::ArrowFunction
+            | NodeKind::Constructor
+            | NodeKind::StructMethod
+            | NodeKind::AbstractMethod
+            | NodeKind::Procedure
+    )
+}
+
 type SyntaxSpan = (usize, usize, usize, usize);
 
 pub(crate) fn attach_conservative_clone_bodies(
@@ -119,7 +138,7 @@ pub(crate) fn attach_conservative_clone_bodies(
         .result
         .nodes
         .iter()
-        .filter(|node| node.kind.is_callable_kind())
+        .filter(|node| is_clone_callable_kind(&node.kind))
     {
         callables.push(CallableOccurrence {
             symbol_kind: node.kind.clone(),
@@ -387,8 +406,7 @@ pub(super) struct CallableSyntax<'tree> {
 }
 
 fn callable_syntax(owner: TreeSitterNode<'_>) -> Option<CallableSyntax<'_>> {
-    owner
-        .child_by_field_name("body")
+    callable_body(owner)
         .map(|body| CallableSyntax {
             owner,
             body,
@@ -396,13 +414,11 @@ fn callable_syntax(owner: TreeSitterNode<'_>) -> Option<CallableSyntax<'_>> {
         })
         .or_else(|| {
             SyntaxPreorder::new(owner).skip(1).find_map(|candidate| {
-                candidate
-                    .child_by_field_name("body")
-                    .map(|body| CallableSyntax {
-                        owner: candidate,
-                        body,
-                        body_boundary_complete: true,
-                    })
+                callable_body(candidate).map(|body| CallableSyntax {
+                    owner: candidate,
+                    body,
+                    body_boundary_complete: true,
+                })
             })
         })
         .or(Some(CallableSyntax {
@@ -410,6 +426,41 @@ fn callable_syntax(owner: TreeSitterNode<'_>) -> Option<CallableSyntax<'_>> {
             body: owner,
             body_boundary_complete: false,
         }))
+}
+
+/// Return a parser-owned body node only when its boundary is explicit in the
+/// grammar. Most adapters expose a `body` field; Kotlin's grammar keeps the
+/// equivalent nodes as direct children of declarations, constructors, and
+/// lambdas, so those cases are listed narrowly here. A missing body remains a
+/// typed partial result through `callable_syntax` instead of guessing a range.
+fn callable_body(owner: TreeSitterNode<'_>) -> Option<TreeSitterNode<'_>> {
+    owner.child_by_field_name("body").or_else(|| {
+        let body_kind = match owner.kind() {
+            "function_declaration" | "anonymous_function" => "function_body",
+            "secondary_constructor" | "lambda_literal" => "statements",
+            _ => return None,
+        };
+        direct_child_by_kind(owner, body_kind)
+    })
+}
+
+fn direct_child_by_kind(
+    owner: TreeSitterNode<'_>,
+    expected_kind: &str,
+) -> Option<TreeSitterNode<'_>> {
+    let mut cursor = owner.walk();
+    if !cursor.goto_first_child() {
+        return None;
+    }
+    loop {
+        let child = cursor.node();
+        if child.kind() == expected_kind {
+            return Some(child);
+        }
+        if !cursor.goto_next_sibling() {
+            return None;
+        }
+    }
 }
 
 fn syntax_owner(
