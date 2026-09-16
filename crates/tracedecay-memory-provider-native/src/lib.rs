@@ -27,14 +27,15 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, OwnedVersionedId, ProviderCall,
-    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
+    ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, OperationControl,
+    OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply,
+    TerminalRecord,
 };
 
 /// Stable logical provider identity for TraceDecay Native memory.
@@ -97,6 +98,9 @@ pub const NATIVE_STAGED_SESSION_OBSERVATION_KIND: &str = "session.message_commit
 /// Payload contract paired with [`NATIVE_STAGED_SESSION_OBSERVATION_KIND`].
 pub const NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID: &str =
     "tracedecay.memory.observation.session-message.v1";
+
+const OBSERVATION_ENVELOPE_FIELDS: [&str; 3] =
+    ["canonical_payload", "observation_kind", "payload_contract"];
 
 const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
@@ -326,6 +330,11 @@ pub struct NativeProvider {
     descriptor: ProviderDescriptor,
     state_generation: AtomicU64,
     descriptor_drifted: AtomicBool,
+    /// Serializes live descriptor refresh, identity validation, and the
+    /// application-port contact that follows it. Without one gate, a caller
+    /// can validate generation N and contact the port after another caller
+    /// has projected generation N+1.
+    dispatch_lock: Mutex<()>,
 }
 
 impl NativeProvider {
@@ -352,6 +361,7 @@ impl NativeProvider {
             descriptor,
             state_generation,
             descriptor_drifted: AtomicBool::new(false),
+            dispatch_lock: Mutex::new(()),
         })
     }
 
@@ -362,31 +372,47 @@ impl NativeProvider {
     }
 
     fn refresh_descriptor(&self) -> Option<ProviderDescriptor> {
+        self.refresh_descriptor_with_control(None).ok().flatten()
+    }
+
+    fn refresh_descriptor_with_control(
+        &self,
+        control: Option<&OperationControl>,
+    ) -> Result<Option<ProviderDescriptor>, TerminalCode> {
         if self.descriptor_drifted.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
+        }
+        if let Some(control) = control {
+            control.snapshot()?;
         }
         let port_candidate = self.port.descriptor();
+        // The descriptor call is the first contact with the application port.
+        // Sample live control again at this boundary so a cancellation racing
+        // that contact cannot proceed to an operation call.
+        if let Some(control) = control {
+            control.snapshot()?;
+        }
         if port_candidate.validate().is_err() {
             self.descriptor_drifted.store(true, Ordering::Release);
-            return None;
+            return Ok(None);
         }
         let candidate = project_descriptor(port_candidate);
         if !same_immutable_descriptor(&self.descriptor, &candidate) {
             self.descriptor_drifted.store(true, Ordering::Release);
-            return None;
+            return Ok(None);
         }
 
         let previous_generation = self.state_generation.load(Ordering::Acquire);
         if candidate.state_generation < previous_generation {
             self.descriptor_drifted.store(true, Ordering::Release);
-            return None;
+            return Ok(None);
         }
         self.state_generation
             .fetch_max(candidate.state_generation, Ordering::AcqRel);
         if self.descriptor_drifted.load(Ordering::Acquire) {
-            None
+            Ok(None)
         } else {
-            Some(self.descriptor_snapshot())
+            Ok(Some(self.descriptor_snapshot()))
         }
     }
 
@@ -522,9 +548,12 @@ impl NativeProvider {
             return false;
         }
 
-        let effect = reply.terminal.committed_effect();
-        if effect.state_generation_before() != Some(call.expected_state_generation)
-            || effect.state_generation_after() != Some(reply.state_generation)
+        if !valid_effect_for_operation(call, reply)
+            || !valid_effect_generations(call, reply)
+            || reply
+                .terminal
+                .validate_duplicate_binding_for_call(call)
+                .is_err()
         {
             return false;
         }
@@ -613,11 +642,17 @@ impl NativeProvider {
     fn parse_observation<'call>(
         call: &'call ProviderCall,
     ) -> Result<NativeObservation<'call>, ObservationParseError> {
-        let envelope = serde_json::from_slice::<Value>(&call.payload.bytes)
-            .map_err(|_| ObservationParseError::Malformed)?;
+        let envelope = parse_canonical_observation(&call.payload.bytes)?;
         let object = envelope
             .as_object()
             .ok_or(ObservationParseError::Malformed)?;
+        if object.len() != 3
+            || object
+                .keys()
+                .any(|key| !OBSERVATION_ENVELOPE_FIELDS.contains(&key.as_str()))
+        {
+            return Err(ObservationParseError::Malformed);
+        }
         let observation_kind = object
             .get("observation_kind")
             .and_then(Value::as_str)
@@ -632,7 +667,7 @@ impl NativeProvider {
             .to_owned();
         let canonical_payload = object
             .get("canonical_payload")
-            .filter(|value| !value.is_null())
+            .filter(|value| value.as_object().is_some_and(|payload| !payload.is_empty()))
             .cloned()
             .ok_or(ObservationParseError::Malformed)?;
 
@@ -711,8 +746,20 @@ impl NativeProvider {
 
 impl MemoryProvider for NativeProvider {
     fn descriptor(&self) -> ProviderDescriptor {
-        match self.refresh_descriptor() {
-            Some(descriptor) => descriptor,
+        // A port callback may ask for the current descriptor while the
+        // adapter is contacting that same port. Do not wait recursively in
+        // that case: the in-flight operation's projected snapshot is the
+        // only descriptor that is safe to expose until the gate is released.
+        let dispatch = match self.dispatch_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        match dispatch {
+            Some(_dispatch) => match self.refresh_descriptor() {
+                Some(descriptor) => descriptor,
+                None => self.descriptor_snapshot(),
+            },
             None => self.descriptor_snapshot(),
         }
     }
@@ -746,12 +793,26 @@ impl MemoryProvider for NativeProvider {
                 "native.handshake_request_control_terminal",
             );
         }
-        if self.refresh_descriptor().is_none() {
-            return self.reject_handshake(
-                request,
-                TerminalCode::ContractViolation,
-                "native.descriptor_drift",
-            );
+        let _dispatch = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.refresh_descriptor_with_control(Some(&request.control)) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return self.reject_handshake(
+                    request,
+                    TerminalCode::ContractViolation,
+                    "native.descriptor_drift",
+                );
+            }
+            Err(code) => {
+                return self.reject_handshake(
+                    request,
+                    code,
+                    "native.handshake_request_control_terminal",
+                );
+            }
         }
         if let Err(code) = request.control.snapshot() {
             return self.reject_handshake(
@@ -831,18 +892,31 @@ impl MemoryProvider for NativeProvider {
         } else {
             None
         };
-        match self.refresh_descriptor() {
-            Some(_) => {}
-            None => {
+        let _dispatch = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match self.refresh_descriptor_with_control(Some(&call.control)) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
                 return self.reject(
                     call,
                     TerminalCode::ContractViolation,
                     "native.descriptor_drift",
                 );
             }
+            Err(code) => return self.reject(call, code, "native.request_control_terminal"),
         }
         if let Err(code) = call.control.snapshot() {
             return self.reject(call, code, "native.request_control_terminal");
+        }
+        let current_generation = self.state_generation.load(Ordering::Acquire);
+        if call.expected_state_generation != current_generation {
+            return self.reject(
+                call,
+                TerminalCode::StaleIdentity,
+                "native.state_generation_mismatch",
+            );
         }
         match call.operation {
             ProviderOperation::Health => {
@@ -890,6 +964,223 @@ impl MemoryProvider for NativeProvider {
                 TerminalCode::InvalidRequest,
                 "native.operation_dispatch_unreachable",
             ),
+        }
+    }
+}
+
+fn valid_effect_for_operation(call: &ProviderCall, reply: &ProviderReply) -> bool {
+    let state = reply.terminal.committed_effect().state();
+    if !call.operation.mutates_provider_state() {
+        return state == tracedecay_memory_provider_api::contract::CommittedEffectState::None;
+    }
+
+    match reply.terminal.terminal_code() {
+        TerminalCode::Success => matches!(
+            state,
+            tracedecay_memory_provider_api::contract::CommittedEffectState::None
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Committed
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Duplicate
+        ),
+        // A mutating operation may complete with no effect, a committed
+        // effect, or a duplicate acknowledgement under `success`, but these
+        // read/query terminals cannot stand in for that operation-specific
+        // settlement.
+        TerminalCode::SuccessZeroResults | TerminalCode::Partial => false,
+        TerminalCode::PartialEffect => {
+            state == tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
+        }
+        TerminalCode::EffectUnknown => {
+            state == tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
+        }
+        TerminalCode::DeadlineExceeded | TerminalCode::Cancelled => matches!(
+            state,
+            tracedecay_memory_provider_api::contract::CommittedEffectState::None
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
+        ),
+        TerminalCode::ProviderUnavailable => matches!(
+            state,
+            tracedecay_memory_provider_api::contract::CommittedEffectState::None
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
+        ),
+        TerminalCode::ContractViolation | TerminalCode::InternalFailure => matches!(
+            state,
+            tracedecay_memory_provider_api::contract::CommittedEffectState::None
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
+                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
+        ),
+        _ => state == tracedecay_memory_provider_api::contract::CommittedEffectState::None,
+    }
+}
+
+fn valid_effect_generations(call: &ProviderCall, reply: &ProviderReply) -> bool {
+    let effect = reply.terminal.committed_effect();
+    if effect.state() == tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown {
+        // Unknown evidence intentionally carries no generation claim. Its
+        // receipt and reconciliation action are the witness retained for
+        // later inspection, so requiring `Some` here would erase the only
+        // truthful effect state the provider can report after uncertainty.
+        return true;
+    }
+    effect.state_generation_before() == Some(call.expected_state_generation)
+        && effect.state_generation_after() == Some(reply.state_generation)
+}
+
+fn parse_canonical_observation(bytes: &[u8]) -> Result<Value, ObservationParseError> {
+    let envelope =
+        serde_json::from_slice::<Value>(bytes).map_err(|_| ObservationParseError::Malformed)?;
+    if json_has_duplicate_object_keys(bytes).map_err(|_| ObservationParseError::Malformed)? {
+        return Err(ObservationParseError::Malformed);
+    }
+    let canonical = serde_json::to_vec(&envelope).map_err(|_| ObservationParseError::Malformed)?;
+    if canonical.as_slice() != bytes || contains_floating_number(&envelope) {
+        return Err(ObservationParseError::Malformed);
+    }
+    Ok(envelope)
+}
+
+fn contains_floating_number(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.as_i64().is_none() && number.as_u64().is_none(),
+        Value::Array(values) => values.iter().any(contains_floating_number),
+        Value::Object(values) => values.values().any(contains_floating_number),
+        Value::Null | Value::Bool(_) | Value::String(_) => false,
+    }
+}
+
+fn json_has_duplicate_object_keys(bytes: &[u8]) -> Result<bool, ()> {
+    let mut scanner = JsonKeyScanner {
+        bytes,
+        index: 0,
+        duplicated: false,
+    };
+    scanner.parse_value()?;
+    scanner.skip_whitespace();
+    if scanner.index != bytes.len() {
+        return Err(());
+    }
+    Ok(scanner.duplicated)
+}
+
+struct JsonKeyScanner<'bytes> {
+    bytes: &'bytes [u8],
+    index: usize,
+    duplicated: bool,
+}
+
+impl JsonKeyScanner<'_> {
+    fn parse_value(&mut self) -> Result<(), ()> {
+        self.skip_whitespace();
+        match self.bytes.get(self.index).copied() {
+            Some(b'{') => self.parse_object(),
+            Some(b'[') => self.parse_array(),
+            Some(b'"') => self.parse_string().map(|_| ()),
+            Some(b'-' | b'0'..=b'9' | b't' | b'f' | b'n') => self.parse_atom(),
+            _ => Err(()),
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<(), ()> {
+        self.consume(b'{')?;
+        self.skip_whitespace();
+        if self.consume_if(b'}') {
+            return Ok(());
+        }
+
+        let mut keys = BTreeSet::new();
+        loop {
+            self.skip_whitespace();
+            let key_literal = self.parse_string()?;
+            let key = serde_json::from_slice::<String>(key_literal).map_err(|_| ())?;
+            if !keys.insert(key) {
+                self.duplicated = true;
+            }
+            self.skip_whitespace();
+            self.consume(b':')?;
+            self.parse_value()?;
+            self.skip_whitespace();
+            if self.consume_if(b'}') {
+                return Ok(());
+            }
+            self.consume(b',')?;
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<(), ()> {
+        self.consume(b'[')?;
+        self.skip_whitespace();
+        if self.consume_if(b']') {
+            return Ok(());
+        }
+        loop {
+            self.parse_value()?;
+            self.skip_whitespace();
+            if self.consume_if(b']') {
+                return Ok(());
+            }
+            self.consume(b',')?;
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<(), ()> {
+        let start = self.index;
+        while let Some(byte) = self.bytes.get(self.index).copied() {
+            if matches!(
+                byte,
+                b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b':'
+            ) {
+                break;
+            }
+            self.index = self.index.saturating_add(1);
+        }
+        (self.index > start).then_some(()).ok_or(())
+    }
+
+    fn parse_string(&mut self) -> Result<&[u8], ()> {
+        let start = self.index;
+        self.consume(b'"')?;
+        loop {
+            match self.bytes.get(self.index).copied() {
+                Some(b'"') => {
+                    self.index = self.index.saturating_add(1);
+                    return Ok(&self.bytes[start..self.index]);
+                }
+                Some(b'\\') => {
+                    self.index = self.index.saturating_add(2);
+                    if self.index > self.bytes.len() {
+                        return Err(());
+                    }
+                }
+                Some(byte) if byte < 0x20 => return Err(()),
+                Some(_) => self.index = self.index.saturating_add(1),
+                None => return Err(()),
+            }
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.bytes.get(self.index),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            self.index = self.index.saturating_add(1);
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> Result<(), ()> {
+        if self.consume_if(expected) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn consume_if(&mut self, expected: u8) -> bool {
+        if self.bytes.get(self.index) == Some(&expected) {
+            self.index = self.index.saturating_add(1);
+            true
+        } else {
+            false
         }
     }
 }
