@@ -833,6 +833,13 @@ async fn install_registered_schema_stage_sequence(
         session_temporal_schema::SessionTemporalSchemaAdmission::Fresh => {
             session_temporal_schema::install_session_temporal_schema(transaction).await?;
         }
+        session_temporal_schema::SessionTemporalSchemaAdmission::WithoutReceiptRecovery => {
+            session_temporal_schema::migrate_session_relation_receipt_recovery(transaction).await?;
+        }
+        session_temporal_schema::SessionTemporalSchemaAdmission::ReleasedV3 => {
+            session_temporal_schema::migrate_released_v3_session_temporal_schema(transaction)
+                .await?;
+        }
         session_temporal_schema::SessionTemporalSchemaAdmission::Current => {}
     }
     observation::ensure_observation_schema(transaction).await?;
@@ -897,7 +904,18 @@ async fn install_registered_schema_stage_sequence(
         })?;
     tracedecay_sessions::runtime::workflow_index::ensure_workflow_index_schema(transaction)
         .await
-        .map_err(|error| global_db_operation_error("initialize workflow index schema", error))?;
+        .map_err(|error| match error {
+            tracedecay_sessions::runtime::workflow_index::WorkflowIndexError::ResetRequired {
+                found_version,
+                required_version,
+            } => tracedecay_domain::errors::TraceDecayError::reset_required(
+                "workflow",
+                format!(
+                    "workflow index schema {found_version:?} is incompatible with required schema {required_version}"
+                ),
+            ),
+            error => global_db_operation_error("initialize workflow index schema", error),
+        })?;
     Ok(())
 }
 

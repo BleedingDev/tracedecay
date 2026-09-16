@@ -41,6 +41,12 @@ pub const MAX_WORKFLOW_LIMIT: usize = MAX_SESSIONS_FOR_LIMIT;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkflowIndexError {
     Db(String),
+    /// Persisted workflow-index state is from an unknown schema or has
+    /// structural drift and cannot be repaired without discarding the store.
+    ResetRequired {
+        found_version: Option<i64>,
+        required_version: i64,
+    },
     /// Caller-supplied argument was invalid (empty run id, …).
     InvalidArgument(String),
     /// A required higher-level read authority was not supplied.
@@ -53,6 +59,13 @@ impl std::fmt::Display for WorkflowIndexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(message) => write!(f, "workflow index db error: {message}"),
+            Self::ResetRequired {
+                found_version,
+                required_version,
+            } => write!(
+                f,
+                "workflow index schema {found_version:?} is incompatible with required schema {required_version}"
+            ),
             Self::InvalidArgument(message) => write!(f, "{message}"),
             Self::AuthorityUnavailable { authority } => {
                 write!(f, "workflow index authority unavailable: {authority}")
@@ -100,16 +113,20 @@ impl From<crate::runtime::git_correlation::GitCorrelationError> for WorkflowInde
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowIndexSchemaAdmission {
+    Current,
+    Fresh,
+}
+
 /// Ensures the workflow-index tables exist in the session store. Version-gated
 /// through the shared `session_schema_migrations` table exactly like
 /// [`crate::runtime::git_correlation::ensure_git_correlation_receipt_schema_in_transaction`],
 /// so both stores register under their own migration name in one table.
 pub async fn ensure_workflow_index_schema(conn: &impl Executor) -> Result<(), WorkflowIndexError> {
-    if schema_version(conn)
-        .await
-        .is_some_and(|version| version >= WORKFLOW_INDEX_SCHEMA_VERSION)
-    {
-        return Ok(());
+    match require_admissible_workflow_index_schema(conn).await? {
+        WorkflowIndexSchemaAdmission::Current => return Ok(()),
+        WorkflowIndexSchemaAdmission::Fresh => {}
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_schema_migrations (
@@ -172,15 +189,244 @@ pub async fn ensure_workflow_index_schema(conn: &impl Executor) -> Result<(), Wo
     Ok(())
 }
 
-async fn schema_version(conn: &impl QueryExecutor) -> Option<i64> {
+pub async fn require_admissible_workflow_index_schema(
+    conn: &impl QueryExecutor,
+) -> Result<WorkflowIndexSchemaAdmission, WorkflowIndexError> {
+    let version = schema_version(conn).await?;
+    match version {
+        Some(WORKFLOW_INDEX_SCHEMA_VERSION) => {
+            if validate_workflow_index_schema(conn).await? {
+                Ok(WorkflowIndexSchemaAdmission::Current)
+            } else {
+                Err(WorkflowIndexError::ResetRequired {
+                    found_version: Some(WORKFLOW_INDEX_SCHEMA_VERSION),
+                    required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+                })
+            }
+        }
+        Some(found_version) => Err(WorkflowIndexError::ResetRequired {
+            found_version: Some(found_version),
+            required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+        }),
+        None if workflow_index_objects_exist(conn).await? => {
+            Err(WorkflowIndexError::ResetRequired {
+                found_version: None,
+                required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+            })
+        }
+        None => Ok(WorkflowIndexSchemaAdmission::Fresh),
+    }
+}
+
+async fn schema_version(conn: &impl QueryExecutor) -> Result<Option<i64>, WorkflowIndexError> {
+    let mut tables = conn
+        .query(
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'session_schema_migrations'",
+            (),
+        )
+        .await?;
+    if tables.next().await?.is_none() {
+        return Ok(None);
+    }
     let mut rows = conn
         .query(
             "SELECT version FROM session_schema_migrations WHERE name = ?1",
             params![MIGRATION_NAME],
         )
-        .await
-        .ok()?;
-    rows.next().await.ok()??.get(0).ok()
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+const WORKFLOW_INDEX_TABLE_COLUMNS: &[(&str, &[(&str, &str, i64, i64, Option<&str>)])] = &[
+    (
+        "workflow_runs",
+        &[
+            ("run_id", "TEXT", 0, 1, None),
+            ("parent_session_id", "TEXT", 1, 0, Some("''")),
+            ("name", "TEXT", 0, 0, None),
+            ("description", "TEXT", 0, 0, None),
+            ("phase_json", "TEXT", 0, 0, None),
+            ("status", "TEXT", 1, 0, Some("'unknown'")),
+            ("started_ts", "INTEGER", 0, 0, None),
+            ("ended_ts", "INTEGER", 0, 0, None),
+            ("result_summary", "TEXT", 0, 0, None),
+            ("agent_count", "INTEGER", 1, 0, Some("0")),
+            ("created_at", "INTEGER", 1, 0, Some("(unixepoch())")),
+            ("updated_at", "INTEGER", 1, 0, Some("(unixepoch())")),
+        ],
+    ),
+    (
+        "workflow_agents",
+        &[
+            ("run_id", "TEXT", 1, 1, None),
+            ("agent_label", "TEXT", 1, 2, None),
+            ("agent_id", "TEXT", 1, 3, Some("''")),
+            ("phase", "TEXT", 0, 0, None),
+            ("transcript_path", "TEXT", 0, 0, None),
+            ("agent_session_id", "TEXT", 0, 0, None),
+            ("status", "TEXT", 1, 0, Some("'unknown'")),
+            ("model", "TEXT", 0, 0, None),
+            ("tokens", "INTEGER", 1, 0, Some("0")),
+            ("started_ts", "INTEGER", 0, 0, None),
+            ("ended_ts", "INTEGER", 0, 0, None),
+            ("created_at", "INTEGER", 1, 0, Some("(unixepoch())")),
+            ("updated_at", "INTEGER", 1, 0, Some("(unixepoch())")),
+        ],
+    ),
+    (
+        "workflow_index_meta",
+        &[
+            ("key", "TEXT", 0, 1, None),
+            ("value", "INTEGER", 1, 0, None),
+            ("updated_at", "INTEGER", 1, 0, Some("(unixepoch())")),
+        ],
+    ),
+];
+
+const WORKFLOW_INDEXES: &[(&str, &str)] = &[
+    (
+        "idx_workflow_runs_parent",
+        "CREATE INDEX idx_workflow_runs_parent
+            ON workflow_runs(parent_session_id, started_ts)",
+    ),
+    (
+        "idx_workflow_agents_run",
+        "CREATE INDEX idx_workflow_agents_run
+            ON workflow_agents(run_id, phase)",
+    ),
+];
+
+const WORKFLOW_INDEX_SCHEMA_OBJECTS: &[&str] = &[
+    "idx_workflow_agents_run",
+    "idx_workflow_runs_parent",
+    "workflow_agents",
+    "workflow_index_meta",
+    "workflow_runs",
+];
+
+async fn workflow_index_objects_exist(
+    conn: &impl QueryExecutor,
+) -> Result<bool, WorkflowIndexError> {
+    Ok(!workflow_index_schema_inventory(conn).await?.is_empty())
+}
+
+async fn validate_workflow_index_schema(
+    conn: &impl QueryExecutor,
+) -> Result<bool, WorkflowIndexError> {
+    let expected_objects = WORKFLOW_INDEX_SCHEMA_OBJECTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if workflow_index_schema_inventory(conn).await? != expected_objects {
+        return Ok(false);
+    }
+    for (table, expected_columns) in WORKFLOW_INDEX_TABLE_COLUMNS {
+        let mut rows = conn
+            .query(
+                "SELECT type FROM sqlite_master WHERE name = ?1",
+                params![*table],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        if row.get::<String>(0)? != "table" {
+            return Ok(false);
+        }
+        drop(rows);
+
+        let mut rows = conn
+            .query(
+                "SELECT name, type, notnull, pk, dflt_value
+                 FROM pragma_table_info(?1) ORDER BY cid",
+                params![*table],
+            )
+            .await?;
+        let mut actual = Vec::with_capacity(expected_columns.len());
+        while let Some(row) = rows.next().await? {
+            actual.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<Option<String>>(4)?,
+            ));
+        }
+        if actual.len() != expected_columns.len()
+            || actual
+                .iter()
+                .zip(expected_columns)
+                .any(|(actual, expected)| {
+                    actual.0 != expected.0
+                        || !actual.1.eq_ignore_ascii_case(expected.1)
+                        || actual.2 != expected.2
+                        || actual.3 != expected.3
+                        || actual.4.as_deref() != expected.4
+                })
+        {
+            return Ok(false);
+        }
+    }
+
+    for (name, expected_sql) in WORKFLOW_INDEXES {
+        let mut rows = conn
+            .query(
+                "SELECT type, COALESCE(sql, '') FROM sqlite_master WHERE name = ?1",
+                params![*name],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        if row.get::<String>(0)? != "index"
+            || compact_sql(&row.get::<String>(1)?) != compact_sql(expected_sql)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn workflow_index_schema_inventory(
+    conn: &impl QueryExecutor,
+) -> Result<BTreeSet<String>, WorkflowIndexError> {
+    let mut rows = conn
+        .query(
+            "SELECT name
+             FROM sqlite_master
+             WHERE name IN (
+                 'workflow_runs',
+                 'workflow_agents',
+                 'workflow_index_meta',
+                 'idx_workflow_runs_parent',
+                 'idx_workflow_agents_run'
+             )
+                OR name GLOB 'workflow_runs_*'
+                OR name GLOB 'workflow_agents_*'
+                OR name GLOB 'workflow_index_meta_*'
+                OR name GLOB 'idx_workflow_runs_*'
+                OR name GLOB 'idx_workflow_agents_*'
+                OR name GLOB 'idx_workflow_index_meta_*'
+             ORDER BY name",
+            (),
+        )
+        .await?;
+    let mut names = BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        names.insert(row.get::<String>(0)?);
+    }
+    Ok(names)
+}
+
+fn compact_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]

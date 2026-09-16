@@ -43,6 +43,28 @@ fn sample_run(run_id: &str, parent: &str) -> WorkflowRun {
     }
 }
 
+async fn schema_snapshot(
+    conn: &tracedecay_runtime_core::db::engine::TestConnection,
+) -> Vec<(String, Option<String>)> {
+    let mut rows = conn
+        .query(
+            "SELECT name, sql FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut snapshot = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        snapshot.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<Option<String>>(1).unwrap(),
+        ));
+    }
+    snapshot
+}
+
 #[test]
 fn status_from_disk_folds_known_and_unknown() {
     assert_eq!(
@@ -86,6 +108,31 @@ async fn schema_read_failures_are_not_reported_as_empty_or_absent() {
     assert!(agents_for_run(&conn, "wf_x", 10).await.is_err());
     let scope = vec![("claude".to_owned(), "sess".to_owned())];
     assert!(runs_for_git_scope(&conn, Some(&scope), 10).await.is_err());
+}
+
+#[tokio::test]
+async fn drifted_workflow_index_requires_reset_without_mutation() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    conn.execute_batch(
+        "CREATE INDEX idx_workflow_runs_unexpected
+         ON workflow_runs(run_id);",
+    )
+    .await
+    .unwrap();
+    let before = schema_snapshot(&conn).await;
+
+    let error = require_admissible_workflow_index_schema(&conn)
+        .await
+        .expect_err("an extra workflow-index object must require reset");
+    assert!(matches!(
+        error,
+        WorkflowIndexError::ResetRequired {
+            found_version: Some(WORKFLOW_INDEX_SCHEMA_VERSION),
+            required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+        }
+    ));
+    assert_eq!(schema_snapshot(&conn).await, before);
 }
 
 #[tokio::test]
