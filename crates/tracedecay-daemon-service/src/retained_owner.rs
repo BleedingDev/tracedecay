@@ -590,7 +590,12 @@ impl ProjectMemoryProviderFullMountV1 {
         Arc::clone(&self.provider_control_mount)
     }
 
-    /// Activates dormant journeys after the full MCP server is reachable.
+    /// Activates dormant journeys before the full MCP publication fence.
+    ///
+    /// Required deferred journeys also wait for their provider instance and
+    /// journaled deliveries to settle. The full recall route must not become
+    /// visible while startup replay is only queued: a provider can truthfully
+    /// answer an empty recall during that window.
     pub async fn activate_after_publication(
         &self,
         observation_store: tracedecay_global_db::GlobalDbObservationStore,
@@ -606,13 +611,19 @@ impl ProjectMemoryProviderFullMountV1 {
             let activation = if requirement
                 == tracedecay_memory_provider_registry::ObservationMountRequirementV1::Required
             {
-                observation_journey::activate_required_with_startup_replay(
+                let activation = observation_journey::activate_required_with_startup_replay(
                     Arc::clone(&journey),
                     observation_store.clone(),
                     cancellation,
                 )
-                .await
-                .map(|_| ())
+                .await;
+                match activation {
+                    Ok(_) => journey
+                        .await_delivery_settled(cancellation, std::time::Duration::from_secs(10))
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                }
             } else {
                 journey
                     .start_observer_with_live_replay(observation_store.clone())
@@ -623,7 +634,7 @@ impl ProjectMemoryProviderFullMountV1 {
                     == tracedecay_memory_provider_registry::ObservationMountRequirementV1::Required
                 {
                     return Err(format!(
-                        "required memory observation activation failed after full publication: {error}"
+                        "required memory observation activation failed before full publication: {error}"
                     ));
                 }
                 tracing::warn!(

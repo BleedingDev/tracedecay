@@ -81,19 +81,20 @@ use tracedecay_memory_observation::{
     AdapterFailureV1, AdmissionDecisionV1, AdmittedObservationV1, AttemptRefusalCategoryV1,
     BackpressureGateV1, BackpressureHaltV1, BackpressurePolicyV1, BackpressureReasonV1,
     BackpressureStateV1, CanonicalSettlementReceiptV1, DeliveryAttemptV1, DeliveryControlV1,
-    DeliveryRuntimeV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1, DrainStopV1,
-    ForgetSourceKeyV1, IdempotencyInputV1, IngressBatchReportV1, IngressControlV1, IngressHaltV1,
-    IngressRuntimeV1, IngressStopReasonV1, LeaseRequestV1, LeasedObservationV1,
+    DeliveryRuntimeV1, DeliveryStateV1, DeliveryWakeV1, DispatchPolicyV1, DispatchRequestV1,
+    DrainStopV1, ForgetSourceKeyV1, IdempotencyInputV1, IngressBatchReportV1, IngressControlV1,
+    IngressHaltV1, IngressRuntimeV1, IngressStopReasonV1, LeaseRequestV1, LeasedObservationV1,
     OBSERVATION_CONTRACT_ID, ObservationAdmissionAdapterV1, ObservationDispatchPortV1,
-    ObservationIdV1, ObservationIdempotencyKeyV1, ObservationJournalError, ObservationLaneKeyV1,
-    ObservationLoadClassV1, ObservationPrivacyV1, ObservationRuntimeError, PrivacyClassificationV1,
-    ProvenanceOriginV1, ProviderCheckpointV1, ProviderDeliveryAdapterV1, ProviderReplayPositionV1,
-    ProviderTargetV1, QueueBacklogV1, RecoveryBudgetV1, RecoveryControlV1, RecoveryPlanV1,
-    RecoveryRuntimeV1, RecoveryTargetKeyV1, RetentionClassV1, RetentionPolicyV1,
-    RetentionSweepScheduleV1, RetentionSweeperV1, RetentionTickV1, RetryBackoffV1,
-    SanitizationBindingV1, ShutdownRequestV1, SourceAuthorityV1, SourceRecordV1, SourceSequenceV1,
-    SourceStreamIdV1, SourceStreamKeyV1, SqliteObservationJournal, TerminalIdentityMismatchV1,
-    WakeOutcomeV1, WithheldAdmissionV1, extensions_digest,
+    ObservationIdV1, ObservationIdempotencyKeyV1, ObservationJournalError,
+    ObservationJournalReaderV1, ObservationLaneKeyV1, ObservationLoadClassV1, ObservationPrivacyV1,
+    ObservationRuntimeError, PrivacyClassificationV1, ProvenanceOriginV1, ProviderCheckpointV1,
+    ProviderDeliveryAdapterV1, ProviderReplayPositionV1, ProviderTargetV1, QueueBacklogV1,
+    RecoveryBudgetV1, RecoveryControlV1, RecoveryPlanV1, RecoveryRuntimeV1, RecoveryTargetKeyV1,
+    RetentionClassV1, RetentionPolicyV1, RetentionSweepScheduleV1, RetentionSweeperV1,
+    RetentionTickV1, RetryBackoffV1, SanitizationBindingV1, ShutdownRequestV1, SourceAuthorityV1,
+    SourceRecordV1, SourceSequenceV1, SourceStreamIdV1, SourceStreamKeyV1,
+    SqliteObservationJournal, TerminalIdentityMismatchV1, WakeOutcomeV1, WithheldAdmissionV1,
+    extensions_digest,
 };
 #[cfg(test)]
 use tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
@@ -486,6 +487,14 @@ pub(crate) enum ObservationJourneyError {
     DeadlineExceeded {
         /// Records this pass admitted before it reached the deadline.
         admitted: u64,
+    },
+    /// A required provider delivery reached a terminal state without a
+    /// committed or duplicate acknowledgement. Publishing the recall route
+    /// after this state would turn a failed replay into an empty answer.
+    #[error("required provider delivery settled as {state:?} rather than an acknowledged effect")]
+    RequiredDeliveryFailed {
+        /// Terminal state recorded by the durable journal.
+        state: DeliveryStateV1,
     },
 }
 
@@ -4411,6 +4420,98 @@ impl ProjectObservationJourneyV1 {
         self.wake.signal();
     }
 
+    /// Waits until this journey has proved its provider instance and has no
+    /// durable delivery still in flight.
+    ///
+    /// Required provider mounts use this as the publication barrier. Startup
+    /// replay appends to the journal before the provider worker necessarily
+    /// drains it; publishing a recall route at that point lets a valid empty
+    /// provider answer race the first delivery and look like there was no
+    /// memory. The journal remains the authority here: `Pending`, `Leased`,
+    /// and `EffectUnknown` all keep the route behind the barrier, while a
+    /// terminal row is already settled and may be observed by recall.
+    pub(crate) async fn await_delivery_settled(
+        &self,
+        cancellation: &HostCancellationToken,
+        within: Duration,
+    ) -> Result<(), ObservationJourneyError> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if cancellation.is_cancelled() || self.stopping.is_cancelled() {
+                return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+            }
+
+            let journal = Arc::clone(&self.journal);
+            let provider_id = self.provider_id.clone();
+            let unsettled = tokio::task::spawn_blocking(move || {
+                journal
+                    .inspect(&tracedecay_memory_observation::JournalInspectionFilterV1 {
+                        provider_id: Some(provider_id),
+                        states: vec![
+                            DeliveryStateV1::Pending,
+                            DeliveryStateV1::Leased,
+                            DeliveryStateV1::EffectUnknown,
+                        ],
+                        limit: 1,
+                        ..Default::default()
+                    })
+                    .map(|page| page.total_rows)
+            })
+            .await
+            .map_err(ObservationJourneyError::IngestTask)?
+            .map_err(ObservationJourneyError::Journal)?;
+            if self.provider_instance_id.is_ready() && unsettled == 0 {
+                let journal = Arc::clone(&self.journal);
+                let provider_id = self.provider_id.clone();
+                let failed = tokio::task::spawn_blocking(move || {
+                    journal
+                        .inspect(&tracedecay_memory_observation::JournalInspectionFilterV1 {
+                            provider_id: Some(provider_id),
+                            states: vec![
+                                DeliveryStateV1::Rejected,
+                                DeliveryStateV1::Cancelled,
+                                DeliveryStateV1::Expired,
+                                DeliveryStateV1::Exhausted,
+                            ],
+                            limit: 1,
+                            ..Default::default()
+                        })
+                        .map(|page| page.rows.into_iter().next().map(|row| row.state))
+                })
+                .await
+                .map_err(ObservationJourneyError::IngestTask)?
+                .map_err(ObservationJourneyError::Journal)?;
+                if let Some(state) = failed {
+                    return Err(ObservationJourneyError::RequiredDeliveryFailed { state });
+                }
+                return Ok(());
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+            else {
+                return Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 });
+            };
+
+            // Register interest before the next snapshot and wake the worker
+            // explicitly. This covers both the no-row readiness case and a
+            // row that startup replay appended just before this check.
+            let mut changed = Box::pin(self.delivery_changed.async_changed.notified());
+            changed.as_mut().enable();
+            self.wake_delivery();
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+                }
+                () = self.stopping.cancelled() => {
+                    return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+                }
+                _ = &mut changed => {}
+                () = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
+            }
+        }
+    }
+
     /// Starts the bounded live replay edge over the canonical registered store.
     ///
     /// The store is the same durable authority used by every session producer.
@@ -7927,6 +8028,7 @@ mod tests {
         observe_calls: AtomicUsize,
         delivered: Mutex<Vec<DeliveredObservation>>,
         handshake_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        observe_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
         health_hook: Mutex<Option<Box<dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync>>>,
     }
 
@@ -7961,6 +8063,7 @@ mod tests {
                 observe_calls: AtomicUsize::new(0),
                 delivered: Mutex::new(Vec::new()),
                 handshake_hook: Mutex::new(None),
+                observe_hook: Mutex::new(None),
                 health_hook: Mutex::new(None),
             }
         }
@@ -7970,6 +8073,13 @@ mod tests {
         /// point inside record admission a test can act from.
         fn on_handshake(&self, hook: impl Fn() + Send + Sync + 'static) {
             *self.handshake_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        /// Holds a provider observation call at the target namespace boundary.
+        /// The publication-barrier regression uses this to distinguish a
+        /// journal append from the provider's durable effect.
+        fn on_observe(&self, hook: impl Fn() + Send + Sync + 'static) {
+            *self.observe_hook.lock().unwrap() = Some(Box::new(hook));
         }
 
         /// Holds or answers a control through the same mounted provider port.
@@ -8026,6 +8136,9 @@ mod tests {
 
         fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
             self.observe_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = self.observe_hook.lock().unwrap().as_ref() {
+                hook();
+            }
             let call = observation.call();
             self.delivered.lock().unwrap().push(DeliveredObservation {
                 bytes: call.payload.bytes.clone(),
@@ -9456,6 +9569,68 @@ mod tests {
             .journey
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
+    }
+
+    /// A required provider's publication barrier waits for the target
+    /// namespace effect, rather than treating the journal append as if the
+    /// provider had already observed it. This is the race that can otherwise
+    /// turn an immediate post-publication recall into a valid empty answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publication_barrier_waits_for_provider_delivery_after_startup_replay() {
+        use tracedecay_memory_conformance::ReleaseLatchV1;
+
+        let temp = TempDir::new().expect("temporary journey root");
+        let fixture = mount_hygiene_fixture(&temp, "project.publication-barrier").await;
+        let entered = ReleaseLatchV1::new();
+        let release = ReleaseLatchV1::new();
+        let entered_by_provider = entered.clone();
+        let release_provider = release.clone();
+        fixture.port.on_observe(move || {
+            entered_by_provider.release();
+            release_provider.wait();
+        });
+        let settled = canonical_observation(
+            &fixture.project_id,
+            &SessionId::new("session.publication-barrier").expect("session id"),
+            "the target namespace must receive this before recall is published",
+        );
+        let records = SettledRecordsPort::single(settled_record(1, settled));
+        let cancellation = HostCancellationToken::new();
+        let pass = run_startup_replay(fixture.journey.as_ref(), &records, &cancellation)
+            .await
+            .expect("startup replay admission");
+        assert_eq!(pass.admitted, 1);
+        entered.wait();
+
+        let refused_while_provider_held = fixture
+            .journey
+            .await_delivery_settled(&cancellation, Duration::from_millis(100))
+            .await
+            .expect_err("publication must stay fenced while the target call is held");
+        assert!(
+            matches!(
+                refused_while_provider_held,
+                ObservationJourneyError::DeadlineExceeded { admitted: 0 }
+            ),
+            "unexpected publication-barrier result: {refused_while_provider_held}"
+        );
+
+        release.release();
+        fixture
+            .journey
+            .await_delivery_settled(&cancellation, Duration::from_secs(5))
+            .await
+            .expect("publication barrier after target delivery");
+        assert_eq!(
+            fixture.port.delivered.lock().unwrap().len(),
+            1,
+            "the publication barrier must wait for the provider effect"
+        );
+        let failures = fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     /// Mounts the production journey against a real registered project store
