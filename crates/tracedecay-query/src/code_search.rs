@@ -387,6 +387,18 @@ pub type CodeIndexSearchFuture =
 pub type CodeIndexSearchExecutor =
     Arc<dyn Fn(CodeIndexSearchRequestV1) -> CodeIndexSearchFuture + Send + Sync + 'static>;
 
+/// The source extent used by the verified shared-code lane.
+///
+/// `WholeBody` is the compatibility default. A selected range is expressed in
+/// the source's canonical normalized token stream; it is never a character or
+/// line range and therefore cannot be confused with a mutable presentation
+/// span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeIndexSimilarSourceExtentV1 {
+    WholeBody,
+    SelectedTokenRange { start: usize, end: usize },
+}
+
 #[derive(Clone, Debug)]
 pub enum CodeIndexSimilarTargetV1 {
     SymbolOccurrence(tracedecay_domain::SymbolOccurrenceId),
@@ -400,6 +412,10 @@ pub enum CodeIndexSimilarTargetV1 {
 pub struct CodeIndexSimilarRequestV1 {
     pub project_root: PathBuf,
     pub target: CodeIndexSimilarTargetV1,
+    /// Which verified source extent to compare. Callers should pass
+    /// [`CodeIndexSimilarSourceExtentV1::WholeBody`] unless a selected token
+    /// range was explicitly requested by the surface contract.
+    pub source_extent: CodeIndexSimilarSourceExtentV1,
     pub match_classes: Vec<tracedecay_code_index::clones::CloneNormalizationClassV1>,
     pub result_limit: usize,
     pub work_limit: usize,
@@ -417,10 +433,28 @@ pub struct CodeIndexSimilarExactGroupV1 {
     pub next_cursor: Option<crate::retrieval::lexical::CloneArtifactCursorV1>,
 }
 
+/// The verified fingerprint read selected by [`CodeIndexSimilarRequestV1`].
+///
+/// The exact digest groups stay in their existing field and shape. This
+/// additive enum lets the serving owner return either the whole-body evidence
+/// already produced by the fingerprint reader or the containment evidence
+/// produced for an explicit selected token range, while retaining a typed
+/// unavailable terminal state for this lane.
+#[derive(Clone, Debug)]
+pub enum CodeIndexSimilarNearReadV1 {
+    WholeBody(crate::retrieval::lexical::CloneFingerprintArtifactReadV1),
+    SelectedTokenRange(crate::retrieval::lexical::CloneSelectedBlockArtifactReadV1),
+    Unavailable(CodeIndexSearchUnavailableReasonV1),
+}
+
 #[derive(Clone, Debug)]
 pub struct CodeIndexSimilarCompletedV1 {
     pub source: tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    /// Existing exact digest groups. Keep this field stable for callers that
+    /// only consume exact groups.
     pub exact_groups: Vec<CodeIndexSimilarExactGroupV1>,
+    /// Additive verified near/contained evidence for the same source.
+    pub near: CodeIndexSimilarNearReadV1,
 }
 
 #[derive(Clone, Debug)]
@@ -735,5 +769,17 @@ mod tests {
         assert_eq!(reason.as_str(), "generation_unverified");
         let coverage = CodeIndexSearchCoverageV1::unavailable(lane_reason::GENERATION_REBUILDING);
         assert_eq!(coverage.degraded_or_fail(reason), Err(reason));
+    }
+
+    #[test]
+    fn similar_source_extent_is_explicit_and_whole_body_is_the_compatibility_default() {
+        assert_eq!(
+            CodeIndexSimilarSourceExtentV1::WholeBody,
+            CodeIndexSimilarSourceExtentV1::WholeBody
+        );
+        assert_eq!(
+            CodeIndexSimilarSourceExtentV1::SelectedTokenRange { start: 3, end: 12 },
+            CodeIndexSimilarSourceExtentV1::SelectedTokenRange { start: 3, end: 12 }
+        );
     }
 }

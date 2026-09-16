@@ -12,9 +12,12 @@ use tracedecay_contracts::retrieval::{
     ContextCodeBlockV1, ContextMemoryContributionV1, ContextModeV1, ContextResultV1,
     ContextSearchMatchV1, ContextSurfaceRequestV1, RedundancyScopeV1, RedundancySurfaceRequestV1,
     RenamePreviewNodeV1, RenamePreviewPrimitiveRequestV1, RenamePreviewPrimitiveResultV1,
-    RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1, SimilarCoverageV1, SimilarFamilyV1,
-    SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1, SimilarSurfaceRequestV1,
-    SimilarTargetV1,
+    RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1, SimilarAlignedDifferenceV1,
+    SimilarAlignmentAnchorV1, SimilarAlignmentV1, SimilarContainmentV1, SimilarCoverageV1,
+    SimilarFamilyV1, SimilarMatchClassV1, SimilarNearCoverageV1, SimilarNearMatchV1,
+    SimilarNearPartialReasonV1, SimilarNearResultV1, SimilarNearUnavailableReasonV1,
+    SimilarOccurrenceV1, SimilarResultV1, SimilarSourceExtentV1, SimilarSurfaceRequestV1,
+    SimilarTargetV1, SimilarTokenSpanV1,
 };
 use tracedecay_domain::ExactClass;
 use tracedecay_domain::errors::{Result, TraceDecayError};
@@ -1068,6 +1071,12 @@ pub async fn handle_find_exact_symbol(
 #[hotpath::measure(label = "mcp.graph.similar.total")]
 pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
     let request: SimilarSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_similar")?;
+    let source_extent =
+        request
+            .validated_source_extent()
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("invalid arguments for tracedecay_similar: {error}"),
+            })?;
     let project_id = request.project_id;
     let repository_id = request.repository_id;
     let target = match request.target {
@@ -1110,6 +1119,7 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
     let similar = match executor(tracedecay_query::code_search::CodeIndexSimilarRequestV1 {
         project_root: ctx.project_root().to_path_buf(),
         target,
+        source_extent: code_index_source_extent(&source_extent)?,
         match_classes,
         result_limit: request.result_limit as usize,
         work_limit: request.work_limit as usize,
@@ -1141,8 +1151,16 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
             detail: "the selected source is outside the authorized repository scope".to_owned(),
         });
     }
+    let (near, near_touched_files) = similar_near_result(
+        &similar.source,
+        source_extent,
+        similar.near,
+        project_id.clone(),
+        repository_id.clone(),
+    )?;
     let source = similar_occurrence(&similar.source.occurrence);
     let mut touched_files = vec![source.path.clone()];
+    touched_files.extend(near_touched_files);
     let mut complete = true;
     let families = similar
         .exact_groups
@@ -1211,10 +1229,360 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
         source,
         families,
         coverage,
+        near: Some(near),
     };
     let value =
         hotpath::measure_block!("mcp.graph.similar.serialize", serde_json::to_value(result)?);
     Ok(generic_tool_result(ctx, &args, &value, touched_files))
+}
+
+fn code_index_source_extent(
+    extent: &SimilarSourceExtentV1,
+) -> Result<tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1> {
+    Ok(match extent {
+        SimilarSourceExtentV1::WholeBody => {
+            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody
+        }
+        SimilarSourceExtentV1::SelectedTokenRange { start, end } => {
+            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
+                start: usize::try_from(*start).map_err(|_| TraceDecayError::Config {
+                    message: "invalid arguments for tracedecay_similar: source token range start is too large"
+                        .to_owned(),
+                })?,
+                end: usize::try_from(*end).map_err(|_| TraceDecayError::Config {
+                    message: "invalid arguments for tracedecay_similar: source token range end is too large"
+                        .to_owned(),
+                })?,
+            }
+        }
+    })
+}
+
+fn similar_near_result(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    extent: SimilarSourceExtentV1,
+    near: tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
+    project_id: tracedecay_domain::ProjectId,
+    repository_id: tracedecay_domain::RepositoryId,
+) -> Result<(SimilarNearResultV1, Vec<String>)> {
+    let mut touched_files = Vec::new();
+    let mut matches = Vec::new();
+    let coverage;
+    let next_cursor;
+    match near {
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
+            if !matches!(&extent, SimilarSourceExtentV1::WholeBody) {
+                return Err(TraceDecayError::Config {
+                    message: "verified similar near read extent does not match its request"
+                        .to_owned(),
+                });
+            }
+            coverage = similar_near_coverage(
+                read.source_eligibility,
+                &read.partial_reasons,
+                read.coverage.unknown > 0 || read.coverage.capped > 0,
+            );
+            next_cursor = encode_similar_cursor(read.page.next_cursor)?;
+            for pair in read.page.members {
+                let match_class = similar_match_class(pair.class);
+                let alignment = SimilarAlignmentV1 {
+                    shared_token_count: pair.shared_ordered_token_count,
+                    anchors: pair
+                        .ordered_anchors
+                        .into_iter()
+                        .map(|anchor| similar_alignment_anchor(anchor, 0))
+                        .collect(),
+                };
+                let differences = pair
+                    .differences
+                    .into_iter()
+                    .map(similar_difference)
+                    .collect::<Vec<_>>();
+                for occurrence in pair.occurrences {
+                    if occurrence.project_id != project_id
+                        || occurrence.repository_id != repository_id
+                    {
+                        continue;
+                    }
+                    touched_files.push(occurrence.path.clone());
+                    matches.push(SimilarNearMatchV1 {
+                        candidate: similar_occurrence(&occurrence),
+                        match_class,
+                        extent: SimilarSourceExtentV1::WholeBody,
+                        source_coverage_millionths: pair.source_coverage_millionths,
+                        candidate_coverage_millionths: pair.candidate_coverage_millionths,
+                        alignment: alignment.clone(),
+                        differences: differences.clone(),
+                        containment: None,
+                    });
+                }
+            }
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
+            coverage = similar_near_coverage(
+                source.occurrence.eligibility,
+                &read.partial_reasons,
+                read.coverage.unknown > 0 || read.coverage.capped > 0,
+            );
+            next_cursor = encode_similar_cursor(read.page.next_cursor)?;
+            let (source_offset, selected_token_count) = match &extent {
+                SimilarSourceExtentV1::WholeBody => {
+                    return Err(TraceDecayError::Config {
+                        message: "verified selected similar near read has no selected token range"
+                            .to_owned(),
+                    });
+                }
+                SimilarSourceExtentV1::SelectedTokenRange { start, end } => {
+                    (*start, u64::from(end.saturating_sub(*start)))
+                }
+            };
+            let match_class = similar_match_class(read.stream.class);
+            for candidate in read.page.members {
+                let containment = similar_containment(candidate.containment);
+                let candidate_token_count = u64::from(candidate.payload.token_count);
+                let shared_token_count = match containment {
+                    SimilarContainmentV1::SelectedRangeContainsCandidate => {
+                        selected_token_count.min(candidate_token_count)
+                    }
+                    SimilarContainmentV1::Equal
+                    | SimilarContainmentV1::CandidateContainsSelectedRange => {
+                        candidate_token_count.min(selected_token_count)
+                    }
+                };
+                let alignment = SimilarAlignmentV1 {
+                    shared_token_count: u32::try_from(shared_token_count).unwrap_or(u32::MAX),
+                    anchors: candidate
+                        .anchors
+                        .iter()
+                        .copied()
+                        .map(|anchor| similar_alignment_anchor(anchor, source_offset))
+                        .collect(),
+                };
+                for occurrence in candidate.occurrences {
+                    if occurrence.project_id != project_id
+                        || occurrence.repository_id != repository_id
+                    {
+                        continue;
+                    }
+                    touched_files.push(occurrence.path.clone());
+                    matches.push(SimilarNearMatchV1 {
+                        candidate: similar_occurrence(&occurrence),
+                        match_class,
+                        extent: extent.clone(),
+                        source_coverage_millionths: directional_coverage(
+                            shared_token_count,
+                            selected_token_count,
+                        ),
+                        candidate_coverage_millionths: directional_coverage(
+                            shared_token_count,
+                            candidate_token_count,
+                        ),
+                        alignment: alignment.clone(),
+                        differences: Vec::new(),
+                        containment: Some(containment),
+                    });
+                }
+            }
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(reason) => {
+            coverage = SimilarNearCoverageV1::Unavailable {
+                reason: similar_unavailable_reason(reason),
+            };
+            next_cursor = None;
+        }
+    }
+    touched_files.sort();
+    touched_files.dedup();
+    Ok((
+        SimilarNearResultV1 {
+            extent,
+            matches,
+            coverage,
+            next_cursor,
+        },
+        touched_files,
+    ))
+}
+
+fn similar_near_coverage(
+    eligibility: tracedecay_code_index::clones::CloneBodyEligibilityV1,
+    partial_reasons: &[tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1],
+    interrupted_or_capped: bool,
+) -> SimilarNearCoverageV1 {
+    match eligibility {
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooSmall {
+            minimum_tokens,
+        } => SimilarNearCoverageV1::ExcludedTooSmall { minimum_tokens },
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
+            SimilarNearCoverageV1::ExcludedIncompleteTokenization
+        }
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
+            if partial_reasons.is_empty() && !interrupted_or_capped =>
+        {
+            SimilarNearCoverageV1::Complete
+        }
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
+            let mut reasons = partial_reasons
+                .iter()
+                .copied()
+                .map(similar_partial_reason)
+                .collect::<Vec<_>>();
+            if reasons.is_empty() {
+                reasons.push(SimilarNearPartialReasonV1::VerificationWorkBudget);
+            }
+            reasons.sort_by_key(|reason| *reason as u8);
+            reasons.dedup();
+            SimilarNearCoverageV1::Partial { reasons }
+        }
+    }
+}
+
+fn similar_match_class(
+    class: tracedecay_code_index::clones::CloneNormalizationClassV1,
+) -> SimilarMatchClassV1 {
+    match class {
+        tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative => {
+            SimilarMatchClassV1::ConservativeExact
+        }
+        tracedecay_code_index::clones::CloneNormalizationClassV1::Rename => {
+            SimilarMatchClassV1::RenameNormalizedExact
+        }
+    }
+}
+
+fn similar_alignment_anchor(
+    anchor: tracedecay_code_index::clones::CloneTokenAnchorV1,
+    source_offset: u32,
+) -> SimilarAlignmentAnchorV1 {
+    SimilarAlignmentAnchorV1 {
+        fingerprint: anchor.fingerprint,
+        source_token_position: anchor.left_token_position.saturating_add(source_offset),
+        candidate_token_position: anchor.right_token_position,
+    }
+}
+
+fn similar_difference(
+    difference: tracedecay_code_index::clones::CloneAlignedDifferenceV1,
+) -> SimilarAlignedDifferenceV1 {
+    SimilarAlignedDifferenceV1 {
+        source_span: SimilarTokenSpanV1 {
+            start: difference.left_span.start,
+            end: difference.left_span.end,
+        },
+        candidate_span: SimilarTokenSpanV1 {
+            start: difference.right_span.start,
+            end: difference.right_span.end,
+        },
+        source_token_count: difference.left_tokens.len().min(u32::MAX as usize) as u32,
+        candidate_token_count: difference.right_tokens.len().min(u32::MAX as usize) as u32,
+    }
+}
+
+fn similar_containment(
+    containment: tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1,
+) -> SimilarContainmentV1 {
+    match containment {
+        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::Equal => {
+            SimilarContainmentV1::Equal
+        }
+        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::CandidateContainsSelectedBlock => {
+            SimilarContainmentV1::CandidateContainsSelectedRange
+        }
+        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::SelectedBlockContainsCandidate => {
+            SimilarContainmentV1::SelectedRangeContainsCandidate
+        }
+    }
+}
+
+fn similar_partial_reason(
+    reason: tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1,
+) -> SimilarNearPartialReasonV1 {
+    match reason {
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::PostingRowBudget => {
+            SimilarNearPartialReasonV1::PostingRowBudget
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::CandidateBodyBudget => {
+            SimilarNearPartialReasonV1::CandidateBodyBudget
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::HotPostings => {
+            SimilarNearPartialReasonV1::HotPostings
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::VerificationBodyBudget => {
+            SimilarNearPartialReasonV1::VerificationBodyBudget
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::VerificationWorkBudget => {
+            SimilarNearPartialReasonV1::VerificationWorkBudget
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::Cancelled => {
+            SimilarNearPartialReasonV1::Cancelled
+        }
+        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::DeadlineExceeded => {
+            SimilarNearPartialReasonV1::DeadlineExceeded
+        }
+    }
+}
+
+fn similar_unavailable_reason(
+    reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1,
+) -> SimilarNearUnavailableReasonV1 {
+    match reason {
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable => {
+            SimilarNearUnavailableReasonV1::CapabilityUnavailable
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable => {
+            SimilarNearUnavailableReasonV1::AuthorityUnavailable
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::LinkedWorktreeDisabled => {
+            SimilarNearUnavailableReasonV1::LinkedWorktreeDisabled
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled => {
+            SimilarNearUnavailableReasonV1::Cancelled
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::TimedOut => {
+            SimilarNearUnavailableReasonV1::TimedOut
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable => {
+            SimilarNearUnavailableReasonV1::CapacityUnavailable
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable => {
+            SimilarNearUnavailableReasonV1::GenerationUnavailable
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified => {
+            SimilarNearUnavailableReasonV1::GenerationUnverified
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest => {
+            SimilarNearUnavailableReasonV1::InvalidRequest
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired => {
+            SimilarNearUnavailableReasonV1::CorruptionResetRequired
+        }
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Internal => {
+            SimilarNearUnavailableReasonV1::Internal
+        }
+    }
+}
+
+fn encode_similar_cursor(
+    cursor: Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+) -> Result<Option<String>> {
+    cursor
+        .as_ref()
+        .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::encode)
+        .transpose()
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("failed to encode tracedecay_similar cursor: {error}"),
+        })
+}
+
+fn directional_coverage(shared: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    shared
+        .saturating_mul(1_000_000)
+        .checked_div(total)
+        .unwrap_or_default()
+        .min(1_000_000) as u32
 }
 
 fn similar_unavailable_error(
@@ -1657,6 +2025,68 @@ mod tests {
         assert_eq!(
             tracedecay_mcp_catalog::SEARCH_MAX_LEXICAL_ANCHOR_BYTES,
             tracedecay_query::retrieval::lexical::MAX_LEXICAL_ANCHOR_BYTES_V1
+        );
+    }
+
+    #[test]
+    fn near_alignment_preserves_direction_and_offsets_selected_source_positions() {
+        let anchor = tracedecay_code_index::clones::CloneTokenAnchorV1 {
+            fingerprint: 17,
+            left_token_position: 2,
+            right_token_position: 9,
+        };
+        assert_eq!(
+            similar_alignment_anchor(anchor, 11),
+            SimilarAlignmentAnchorV1 {
+                fingerprint: 17,
+                source_token_position: 13,
+                candidate_token_position: 9,
+            }
+        );
+        assert_eq!(directional_coverage(7, 10), 700_000);
+        assert_eq!(directional_coverage(10, 0), 0);
+    }
+
+    #[test]
+    fn near_coverage_distinguishes_complete_partial_and_excluded() {
+        use tracedecay_code_index::clones::CloneBodyEligibilityV1;
+        use tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1;
+
+        assert_eq!(
+            similar_near_coverage(CloneBodyEligibilityV1::Eligible, &[], false),
+            SimilarNearCoverageV1::Complete
+        );
+        assert_eq!(
+            similar_near_coverage(
+                CloneBodyEligibilityV1::Eligible,
+                &[CloneFingerprintPartialReasonV1::HotPostings],
+                false,
+            ),
+            SimilarNearCoverageV1::Partial {
+                reasons: vec![SimilarNearPartialReasonV1::HotPostings]
+            }
+        );
+        assert_eq!(
+            similar_near_coverage(
+                CloneBodyEligibilityV1::ExcludedTooSmall { minimum_tokens: 14 },
+                &[],
+                false,
+            ),
+            SimilarNearCoverageV1::ExcludedTooSmall { minimum_tokens: 14 }
+        );
+    }
+
+    #[test]
+    fn near_unavailable_reason_remains_typed_at_the_mcp_boundary() {
+        assert_eq!(
+            similar_unavailable_reason(
+                tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
+            ),
+            SimilarNearUnavailableReasonV1::GenerationUnverified
+        );
+        assert_eq!(
+            similar_match_class(tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,),
+            SimilarMatchClassV1::RenameNormalizedExact
         );
     }
 

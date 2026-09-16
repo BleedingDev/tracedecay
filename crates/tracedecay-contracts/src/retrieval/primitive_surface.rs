@@ -298,6 +298,39 @@ pub enum SimilarMatchClassV1 {
     RenameNormalizedExact,
 }
 
+/// The source extent compared by the verified shared-code lane.
+///
+/// The field on [`SimilarSurfaceRequestV1`] is optional for wire
+/// compatibility; an omitted value means [`Self::WholeBody`]. A selected
+/// extent is measured in the canonical normalized token stream, so mutable
+/// source line numbers never become part of the comparison request.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SimilarSourceExtentV1 {
+    WholeBody,
+    SelectedTokenRange { start: u32, end: u32 },
+}
+
+impl SimilarSourceExtentV1 {
+    /// A missing wire value retains the pre-extent whole-body behavior.
+    pub fn or_whole_body(value: Option<Self>) -> Self {
+        value.unwrap_or(Self::WholeBody)
+    }
+
+    /// Reject an empty or reversed token range before it reaches a serving
+    /// owner. The upper bound is exclusive, matching Rust range semantics.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        if let Self::SelectedTokenRange { start, end } = self
+            && start >= end
+        {
+            return Err(ApplicationContractError::InvalidRange {
+                field: "similar source token range",
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimilarSurfaceRequestV1 {
@@ -308,6 +341,19 @@ pub struct SimilarSurfaceRequestV1 {
     pub result_limit: u32,
     pub work_limit: u32,
     pub cursor: Option<String>,
+    /// Optional source extent. Omitted means the complete verified body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_extent: Option<SimilarSourceExtentV1>,
+}
+
+impl SimilarSurfaceRequestV1 {
+    pub fn validated_source_extent(
+        &self,
+    ) -> Result<SimilarSourceExtentV1, ApplicationContractError> {
+        let extent = SimilarSourceExtentV1::or_whole_body(self.source_extent.clone());
+        extent.validate()?;
+        Ok(extent)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -619,6 +665,115 @@ pub struct SimilarFamilyV1 {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarNearPartialReasonV1 {
+    PostingRowBudget,
+    CandidateBodyBudget,
+    HotPostings,
+    VerificationBodyBudget,
+    VerificationWorkBudget,
+    Cancelled,
+    DeadlineExceeded,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarNearUnavailableReasonV1 {
+    CapabilityUnavailable,
+    AuthorityUnavailable,
+    LinkedWorktreeDisabled,
+    Cancelled,
+    TimedOut,
+    CapacityUnavailable,
+    GenerationUnavailable,
+    GenerationUnverified,
+    InvalidRequest,
+    CorruptionResetRequired,
+    Internal,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SimilarNearCoverageV1 {
+    Complete,
+    Partial {
+        reasons: Vec<SimilarNearPartialReasonV1>,
+    },
+    Unavailable {
+        reason: SimilarNearUnavailableReasonV1,
+    },
+    ExcludedTooSmall {
+        minimum_tokens: u32,
+    },
+    ExcludedIncompleteTokenization,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarTokenSpanV1 {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarAlignmentAnchorV1 {
+    pub fingerprint: u64,
+    pub source_token_position: u32,
+    pub candidate_token_position: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarAlignmentV1 {
+    pub shared_token_count: u32,
+    pub anchors: Vec<SimilarAlignmentAnchorV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarAlignedDifferenceV1 {
+    pub source_span: SimilarTokenSpanV1,
+    pub candidate_span: SimilarTokenSpanV1,
+    pub source_token_count: u32,
+    pub candidate_token_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarContainmentV1 {
+    Equal,
+    CandidateContainsSelectedRange,
+    SelectedRangeContainsCandidate,
+}
+
+/// One candidate supported by verified fingerprint anchors. Directional
+/// coverage is reported separately for source and candidate; no scalar score
+/// is meaningful for a directional code comparison and none is emitted.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarNearMatchV1 {
+    pub candidate: SimilarOccurrenceV1,
+    pub match_class: SimilarMatchClassV1,
+    pub extent: SimilarSourceExtentV1,
+    pub source_coverage_millionths: u32,
+    pub candidate_coverage_millionths: u32,
+    pub alignment: SimilarAlignmentV1,
+    pub differences: Vec<SimilarAlignedDifferenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<SimilarContainmentV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimilarNearResultV1 {
+    pub extent: SimilarSourceExtentV1,
+    pub matches: Vec<SimilarNearMatchV1>,
+    pub coverage: SimilarNearCoverageV1,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SimilarCoverageV1 {
@@ -635,6 +790,10 @@ pub struct SimilarResultV1 {
     pub families: Vec<SimilarFamilyV1>,
     pub source_generation: CodeGenerationId,
     pub coverage: SimilarCoverageV1,
+    /// Additive verified near/contained evidence. `None` is retained for
+    /// callers constructing the exact-family-only compatibility response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<SimilarNearResultV1>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -873,6 +1032,8 @@ mod tests {
         ContextModeV1, ContextResultV1, ContextSurfaceRequestV1, PrimitiveFreshnessStateV1,
         PrimitiveIndexingStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1,
         PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
+        SimilarNearCoverageV1, SimilarNearPartialReasonV1, SimilarNearUnavailableReasonV1,
+        SimilarSourceExtentV1, SimilarSurfaceRequestV1,
     };
     use crate::memory::{FactSearchGraphCoverageV1, FactSearchGraphDegradationV1};
 
@@ -1160,5 +1321,110 @@ mod tests {
                 .is_some_and(|required| required.contains(&Value::String("freshness".to_owned()))),
             "freshness is part of every context result"
         );
+    }
+
+    #[test]
+    fn similar_source_extent_defaults_to_whole_body_and_rejects_empty_ranges() {
+        assert_eq!(
+            SimilarSourceExtentV1::or_whole_body(None),
+            SimilarSourceExtentV1::WholeBody
+        );
+        assert!(SimilarSourceExtentV1::WholeBody.validate().is_ok());
+        assert!(
+            SimilarSourceExtentV1::SelectedTokenRange { start: 4, end: 4 }
+                .validate()
+                .is_err()
+        );
+        assert!(
+            SimilarSourceExtentV1::SelectedTokenRange { start: 5, end: 4 }
+                .validate()
+                .is_err()
+        );
+        assert!(
+            SimilarSourceExtentV1::SelectedTokenRange { start: 4, end: 9 }
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn similar_request_keeps_extent_optional_for_existing_callers() {
+        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
+            "project_id": "project.similar",
+            "repository_id": "repository.similar",
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": "symbol.similar"
+            },
+            "match_classes": ["conservative_exact"],
+            "result_limit": 10,
+            "work_limit": 100,
+            "cursor": null
+        }))
+        .expect("legacy similar request decodes");
+        assert_eq!(request.source_extent, None);
+        assert_eq!(
+            request.validated_source_extent().expect("default extent"),
+            SimilarSourceExtentV1::WholeBody
+        );
+
+        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
+            "project_id": "project.similar",
+            "repository_id": "repository.similar",
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": "symbol.similar"
+            },
+            "match_classes": ["conservative_exact"],
+            "result_limit": 10,
+            "work_limit": 100,
+            "source_extent": {
+                "kind": "selected_token_range",
+                "start": 8,
+                "end": 21
+            }
+        }))
+        .expect("selected extent request decodes");
+        assert_eq!(
+            request.validated_source_extent().expect("selected extent"),
+            SimilarSourceExtentV1::SelectedTokenRange { start: 8, end: 21 }
+        );
+        assert_eq!(
+            serde_json::to_value(&request).expect("request JSON")["source_extent"],
+            json!({"kind": "selected_token_range", "start": 8, "end": 21})
+        );
+    }
+
+    #[test]
+    fn similar_near_coverage_is_typed_and_does_not_expose_a_score() {
+        let partial = serde_json::to_value(SimilarNearCoverageV1::Partial {
+            reasons: vec![SimilarNearPartialReasonV1::VerificationWorkBudget],
+        })
+        .expect("partial near coverage JSON");
+        assert_eq!(
+            partial,
+            json!({
+                "status": "partial",
+                "reasons": ["verification_work_budget"]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SimilarNearCoverageV1::Unavailable {
+                reason: SimilarNearUnavailableReasonV1::GenerationUnverified,
+            })
+            .expect("unavailable near coverage JSON"),
+            json!({"status": "unavailable", "reason": "generation_unverified"})
+        );
+        assert_eq!(
+            serde_json::to_value(SimilarNearCoverageV1::Complete)
+                .expect("complete near coverage JSON"),
+            json!({"status": "complete"})
+        );
+
+        let schema = serde_json::to_value(schema_for!(super::SimilarNearMatchV1))
+            .expect("near match schema");
+        assert!(schema["properties"]["source_coverage_millionths"].is_object());
+        assert!(schema["properties"]["candidate_coverage_millionths"].is_object());
+        assert!(schema["properties"].get("score").is_none());
     }
 }
