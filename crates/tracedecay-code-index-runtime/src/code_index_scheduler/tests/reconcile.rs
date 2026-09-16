@@ -14,8 +14,8 @@ use tracedecay_contracts::{
     callable_code_operation,
 };
 use tracedecay_domain::{
-    CodeGenerationId, CommitId, ProjectId, PublicRetrieverStatus, RefId, RetrieverKind,
-    SensitivityLevelV1, UtcMicros, WorktreeId,
+    CodeGenerationId, CommitId, ProjectId, PublicRetrieverStatus, RefId, RepositoryDirtyStateV1,
+    RetrieverKind, SensitivityLevelV1, UtcMicros, WorktreeId,
 };
 use tracedecay_runtime_core::resident_memory::{
     DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1,
@@ -58,6 +58,72 @@ use crate::{
         },
     },
 };
+
+#[test]
+fn ephemeral_folder_selection_filters_capture_and_keeps_default_cursor_shape() {
+    let fixture = GitFixture::new(&[
+        (".gitignore", "dist/\n"),
+        ("src/lib.rs", "pub fn source() -> u32 { 1 }\n"),
+        ("vendor/lib.rs", "pub fn vendored() -> u32 { 1 }\n"),
+        ("dist/generated.rs", "pub fn generated() -> u32 { 1 }\n"),
+        ("dist/other.rs", "pub fn other() -> u32 { 1 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let options = tracedecay_contracts::CodeIndexReconcileOptionsV1::new(
+        ["vendor".to_owned(), "dist".to_owned()],
+        ["dist/generated".to_owned()],
+    )
+    .expect("valid request-scoped folder selection");
+    scheduler.active_reconcile_options = Some(options);
+
+    let selected = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture selected folders");
+    let selected_paths = selected
+        .snapshot
+        .files
+        .iter()
+        .map(|file| file.logical_path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        selected_paths,
+        BTreeSet::from(["src/lib.rs", "dist/generated.rs"]),
+        "skip folders must filter committed paths while an explicit include admits ignored files"
+    );
+    assert_eq!(
+        selected.repository_parse_identity.dirty,
+        RepositoryDirtyStateV1::Dirty,
+        "an ephemeral selection must never mint a clean durable source cursor"
+    );
+    assert!(
+        selected.snapshot.source_revision.is_none(),
+        "a request-scoped selection must not claim the ordinary HEAD cursor"
+    );
+
+    // The option is one-pass state. Once it is cleared, the default capture
+    // sees the ordinary committed source set and still leaves ignored files
+    // out unless a future request explicitly includes them.
+    scheduler.active_reconcile_options = None;
+    let ordinary = scheduler
+        .capture_authoritative_snapshot_without_active_generation_reuse(None)
+        .expect("capture ordinary folders");
+    let ordinary_paths = ordinary
+        .snapshot
+        .files
+        .iter()
+        .map(|file| file.logical_path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ordinary_paths,
+        BTreeSet::from(["src/lib.rs", "vendor/lib.rs"]),
+        "clearing the request must restore the default Git-admitted source set"
+    );
+}
 
 #[test]
 fn one_file_increment_captures_only_edited_bytes_with_one_thousand_unchanged_files() {
