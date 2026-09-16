@@ -381,6 +381,32 @@ fn maintenance_cursor_rejects_resume_after_generation_advance() {
 }
 
 #[test]
+fn oversized_capsule_returns_typed_capacity_without_repeating_cursor() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "oversized").state_generation;
+    let mut oversized = request("oversized-maintenance", "repair", generation);
+    oversized["maximum_items"] = json!(1);
+    oversized["maximum_bytes"] = json!(1);
+    seal(
+        &mut oversized,
+        "oversized-maintenance",
+        "01993262-4d00-7000-8000-000000000005",
+    );
+
+    let first = invoke(&live, oversized.clone());
+    assert_eq!(first.outcome, Outcome::BudgetExceeded, "{first:?}");
+    assert_eq!(first.state_generation, generation);
+    assert_eq!(first.payload, Value::Null);
+
+    let second = invoke(&live, oversized);
+    assert_eq!(second.outcome, Outcome::BudgetExceeded, "{second:?}");
+    assert_eq!(second.state_generation, generation);
+    assert_eq!(second.payload, Value::Null);
+    assert_eq!(state(&live).state_generation, generation);
+}
+
+#[test]
 fn maintenance_receipt_survives_snapshot_restore_and_privacy_rebuild() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

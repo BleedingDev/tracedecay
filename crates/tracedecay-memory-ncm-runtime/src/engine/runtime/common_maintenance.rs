@@ -388,6 +388,9 @@ impl NcmEngine {
             let size = (capsule.provenance.len()
                 + capsule.key_text.len()
                 + capsule.value_text.len()) as u64;
+            if size > request.maximum_bytes {
+                return EngineReply::new(Outcome::BudgetExceeded, generation, Value::Null);
+            }
             if bytes.saturating_add(size) > request.maximum_bytes {
                 partial = true;
                 break;
