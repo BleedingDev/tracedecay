@@ -359,7 +359,7 @@ async fn validate_workflow_index_schema(
         if actual.len() != expected_columns.len()
             || actual
                 .iter()
-                .zip(expected_columns)
+                .zip(expected_columns.iter())
                 .any(|(actual, expected)| {
                     actual.0 != expected.0
                         || !actual.1.eq_ignore_ascii_case(expected.1)
