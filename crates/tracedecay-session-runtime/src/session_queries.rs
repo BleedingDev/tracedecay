@@ -276,7 +276,9 @@ fn map_git_error(error: GitCorrelationError) -> RetainedSurfaceExecutionErrorV1 
         GitCorrelationError::InvalidArgument(_) | GitCorrelationError::Contract(_) => {
             RetainedSurfaceExecutionErrorV1::InvalidRequest
         }
-        GitCorrelationError::Corrupt(_) => RetainedSurfaceExecutionErrorV1::ProjectResetRequired,
+        GitCorrelationError::Corrupt(_) | GitCorrelationError::ResetRequired { .. } => {
+            RetainedSurfaceExecutionErrorV1::ProjectResetRequired
+        }
         GitCorrelationError::Cancelled => RetainedSurfaceExecutionErrorV1::Cancelled(
             tracedecay_contracts::CancellationStage::DuringRead,
         ),
