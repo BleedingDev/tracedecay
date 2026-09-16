@@ -65,6 +65,54 @@ async fn schema_snapshot(
     snapshot
 }
 
+async fn assert_reset_required_without_mutation(
+    conn: &tracedecay_runtime_core::db::engine::TestConnection,
+) {
+    let before = schema_snapshot(conn).await;
+    let error = ensure_workflow_index_schema(conn)
+        .await
+        .expect_err("drifted workflow schema must require reset");
+    assert!(matches!(
+        error,
+        WorkflowIndexError::ResetRequired {
+            found_version: Some(WORKFLOW_INDEX_SCHEMA_VERSION),
+            required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+        }
+    ));
+    assert_eq!(schema_snapshot(conn).await, before);
+}
+
+async fn recreate_workflow_runs_with_status_check(
+    conn: &tracedecay_runtime_core::db::engine::TestConnection,
+    status_constraint: &str,
+) {
+    conn.execute_batch(
+        "DROP INDEX idx_workflow_runs_parent;
+         DROP TABLE workflow_runs;",
+    )
+    .await
+    .unwrap();
+    let sql = format!(
+        "CREATE TABLE workflow_runs (
+             run_id TEXT PRIMARY KEY,
+             parent_session_id TEXT NOT NULL DEFAULT '',
+             name TEXT,
+             description TEXT,
+             phase_json TEXT,
+             status TEXT NOT NULL DEFAULT 'unknown' {status_constraint},
+             started_ts INTEGER,
+             ended_ts INTEGER,
+             result_summary TEXT,
+             agent_count INTEGER NOT NULL DEFAULT 0,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE INDEX idx_workflow_runs_parent
+             ON workflow_runs(parent_session_id, started_ts);"
+    );
+    conn.execute_batch(&sql).await.unwrap();
+}
+
 #[test]
 fn status_from_disk_folds_known_and_unknown() {
     assert_eq!(
@@ -120,18 +168,117 @@ async fn drifted_workflow_index_requires_reset_without_mutation() {
     )
     .await
     .unwrap();
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn missing_workflow_check_constraint_requires_reset_without_mutation() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    recreate_workflow_runs_with_status_check(&conn, "").await;
+
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn altered_workflow_check_constraint_requires_reset_without_mutation() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    recreate_workflow_runs_with_status_check(&conn, "CHECK(status IN ('running', 'completed'))")
+        .await;
+
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn altered_workflow_strict_and_foreign_key_constraints_require_reset() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_workflow_agents_run;
+         DROP TABLE workflow_agents;
+         CREATE TABLE workflow_agents (
+             run_id TEXT NOT NULL,
+             agent_label TEXT NOT NULL,
+             agent_id TEXT NOT NULL DEFAULT '',
+             phase TEXT,
+             transcript_path TEXT,
+             agent_session_id TEXT,
+             status TEXT NOT NULL DEFAULT 'unknown'
+                 CHECK(status IN ('running', 'completed', 'failed', 'unknown')),
+             model TEXT,
+             tokens INTEGER NOT NULL DEFAULT 0,
+             started_ts INTEGER,
+             ended_ts INTEGER,
+             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             PRIMARY KEY(run_id, agent_label, agent_id),
+             FOREIGN KEY(run_id) REFERENCES workflow_runs(run_id)
+         ) STRICT;
+         CREATE INDEX idx_workflow_agents_run
+             ON workflow_agents(run_id, phase);",
+    )
+    .await
+    .unwrap();
+
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn arbitrary_workflow_objects_and_inert_table_objects_require_reset() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    conn.execute_batch(
+        "CREATE TABLE workflow_auxiliary (id INTEGER);
+         CREATE INDEX inert_workflow_index ON workflow_runs(run_id);
+         CREATE TRIGGER workflow_audit_trigger
+         AFTER INSERT ON workflow_runs
+         BEGIN
+             SELECT 1;
+         END;",
+    )
+    .await
+    .unwrap();
+
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn ensure_workflow_index_schema_is_idempotent_for_current_schema() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
     let before = schema_snapshot(&conn).await;
 
-    let error = require_admissible_workflow_index_schema(&conn)
-        .await
-        .expect_err("an extra workflow-index object must require reset");
-    assert!(matches!(
-        error,
-        WorkflowIndexError::ResetRequired {
-            found_version: Some(WORKFLOW_INDEX_SCHEMA_VERSION),
-            required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
-        }
-    ));
+    assert_eq!(
+        require_admissible_workflow_index_schema(&conn)
+            .await
+            .unwrap(),
+        WorkflowIndexSchemaAdmission::Current
+    );
+    ensure_workflow_index_schema(&conn).await.unwrap();
+
+    assert_eq!(schema_snapshot(&conn).await, before);
+}
+
+#[tokio::test]
+async fn failed_workflow_schema_install_can_be_rolled_back_without_partial_objects() {
+    let (_directory, conn) = test_conn();
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             CHECK(name <> 'workflow_indexing')
+         );",
+    )
+    .await
+    .unwrap();
+    let before = schema_snapshot(&conn).await;
+
+    let transaction = conn.transaction().await.unwrap();
+    assert!(ensure_workflow_index_schema(&transaction).await.is_err());
+    transaction.rollback().await.unwrap();
+
     assert_eq!(schema_snapshot(&conn).await, before);
 }
 
