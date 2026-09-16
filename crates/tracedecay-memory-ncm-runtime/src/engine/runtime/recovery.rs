@@ -92,12 +92,17 @@ pub(super) fn recover_kernel(
             .checked_add(1)
             .ok_or_else(|| corrupt_reply(meta.commit_seq, "event sequence overflow"))?;
         let durable = validate_recovery_event(&event, expected, meta.commit_seq)?;
-        validate_event_payload_digest(&event, &durable, &capsules)?;
+        // Keep revoked capsules in the validation view.  Their retained
+        // inputs are deliberately erased, but the journal still contains the
+        // original observe event and needs the explicit revoked exception in
+        // `validate_event_payload_digest` rather than looking like a missing
+        // capsule.
+        validate_event_payload_digest(&event, &durable, &all_capsules)?;
         replay_event(
             &mut kernel,
             &event,
             &durable.operation,
-            &capsules,
+            &all_capsules,
             meta.commit_seq,
         )?;
         if sha256_hex(&kernel.state_digest()) != durable.state_digest {
@@ -149,15 +154,25 @@ fn validate_checkpoint_chain(
         .events_after(0)
         .map_err(|error| store_reply(error, meta.commit_seq))?;
     let mut expected_seq = 1_u64;
+    let mut expected_tick = 0_u64;
     let mut checkpoint_receipt = None;
+    let mut checkpoint_event_tick = None;
     for event in events {
         if event.seq > checkpoint_seq {
             break;
         }
         let durable = validate_recovery_event(&event, expected_seq, meta.commit_seq)?;
         validate_event_payload_digest(&event, &durable, capsules)?;
+        expected_tick = expected_tick.saturating_add(operation_tick_delta(&durable.operation));
+        if event.created_tick != expected_tick {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "checkpoint journal tick does not match its operation history",
+            ));
+        }
         if event.seq == checkpoint_seq {
             checkpoint_receipt = Some(durable.state_digest);
+            checkpoint_event_tick = Some(event.created_tick);
             break;
         }
         expected_seq = expected_seq
@@ -170,7 +185,9 @@ fn validate_checkpoint_chain(
             "checkpoint journal prefix has a sequence gap",
         ));
     }
-    if checkpoint_receipt.as_deref() != Some(expected_checkpoint_digest.as_str()) {
+    if checkpoint_receipt.as_deref() != Some(expected_checkpoint_digest.as_str())
+        || checkpoint_event_tick != Some(checkpoint_kernel.scheduler.tick.0)
+    {
         return Err(corrupt_reply(
             meta.commit_seq,
             "checkpoint is detached from its journal receipt",
@@ -677,24 +694,47 @@ fn replay_state_digest_prefix(
     let mut expected_seq = applied_seq
         .checked_add(1)
         .ok_or_else(|| corrupt_reply(meta.commit_seq, "fence anchor sequence overflow"))?;
+    let mut expected_tick = kernel.scheduler.tick.0;
+    let mut state_chain_valid = true;
+    let mut erased_suffix_digest = None;
     for event in events {
         if event.seq > target_seq {
             break;
         }
         let durable = validate_recovery_event(&event, expected_seq, target_seq)?;
         validate_event_payload_digest(&event, &durable, capsules)?;
-        replay_event(
-            &mut kernel,
-            &event,
-            &durable.operation,
-            capsules,
-            target_seq,
-        )?;
-        if sha256_hex(&kernel.state_digest()) != durable.state_digest {
+        expected_tick = expected_tick.saturating_add(operation_tick_delta(&durable.operation));
+        if event.created_tick != expected_tick {
             return Err(corrupt_reply(
                 meta.commit_seq,
-                "fence anchor journal state digest mismatch",
+                "fence anchor journal tick does not match its operation history",
             ));
+        }
+        if state_chain_valid {
+            if operation_contains_revoked_observe(&durable.operation, capsules) {
+                state_chain_valid = false;
+                erased_suffix_digest = Some(durable.state_digest.clone());
+            } else {
+                replay_event(
+                    &mut kernel,
+                    &event,
+                    &durable.operation,
+                    capsules,
+                    target_seq,
+                )?;
+                if sha256_hex(&kernel.state_digest()) != durable.state_digest {
+                    return Err(corrupt_reply(
+                        meta.commit_seq,
+                        "fence anchor journal state digest mismatch",
+                    ));
+                }
+            }
+        } else {
+            // Once a revoked observation has been scrubbed, its original
+            // nonlinear state cannot be recomputed.  Keep validating every
+            // envelope, payload, and logical tick, and carry the final
+            // receipt digest as the opaque pre-fence anchor.
+            erased_suffix_digest = Some(durable.state_digest.clone());
         }
         applied_seq = event.seq;
         expected_seq = expected_seq
@@ -707,7 +747,11 @@ fn replay_state_digest_prefix(
             "fence anchor journal prefix is incomplete",
         ));
     }
-    Ok(sha256_hex(&kernel.state_digest()))
+    if let Some(digest) = erased_suffix_digest {
+        Ok(digest)
+    } else {
+        Ok(sha256_hex(&kernel.state_digest()))
+    }
 }
 
 pub(crate) fn replay_event(
@@ -751,6 +795,13 @@ pub(crate) fn replay_event(
                 .iter()
                 .find(|capsule| capsule.record_id == *record_id && capsule.commit_seq == event.seq)
                 .ok_or_else(|| corrupt_reply(commit_seq, "observe capsule is missing"))?;
+            if capsule.status == crate::store::CapsuleStatus::Revoked {
+                // Privacy erasure intentionally removes the embeddings before
+                // ordinary recovery can see this row.  The deleted observe has
+                // no replayable kernel effect; its durable tick/state anchor
+                // is validated by the caller's erased-input path.
+                return Ok(());
+            }
             let report = kernel
                 .observe(
                     &capsule.key_embedding,
@@ -862,6 +913,48 @@ fn valid_source_set(sources: &[SourceId]) -> bool {
         && sources.len() <= 1024
         && sources.iter().all(|source| !source.0.is_empty())
         && sources.windows(2).all(|window| window[0] < window[1])
+}
+
+fn operation_contains_revoked_observe(
+    operation: &DurableOperation,
+    capsules: &[StoredCapsule],
+) -> bool {
+    match operation {
+        DurableOperation::CommonControl { operations } => operations
+            .iter()
+            .any(|operation| operation_contains_revoked_observe(operation, capsules)),
+        DurableOperation::Observe { record_id } => capsules.iter().any(|capsule| {
+            capsule.record_id == *record_id
+                && capsule.status == crate::store::CapsuleStatus::Revoked
+        }),
+        DurableOperation::Feedback { .. }
+        | DurableOperation::Correction { .. }
+        | DurableOperation::Maintenance { .. }
+        | DurableOperation::DeletionFence { .. }
+        | DurableOperation::DeleteBySource { .. } => false,
+    }
+}
+
+fn operation_tick_delta(operation: &DurableOperation) -> u64 {
+    match operation {
+        DurableOperation::CommonControl { operations } => {
+            operations.iter().fold(0_u64, |total, operation| {
+                total.saturating_add(operation_tick_delta(operation))
+            })
+        }
+        DurableOperation::Observe { .. } => 1,
+        DurableOperation::Maintenance { kind } => match kind {
+            MaintenanceKind::Advance { ticks } => u64::from(*ticks),
+            MaintenanceKind::Consolidate
+            | MaintenanceKind::MergePrune
+            | MaintenanceKind::Checkpoint
+            | MaintenanceKind::Compact => 0,
+        },
+        DurableOperation::Feedback { .. }
+        | DurableOperation::Correction { .. }
+        | DurableOperation::DeletionFence { .. }
+        | DurableOperation::DeleteBySource { .. } => 0,
+    }
 }
 
 fn canonical_source_digest(sources: &[SourceId], seq: u64) -> Result<String, EngineReply> {

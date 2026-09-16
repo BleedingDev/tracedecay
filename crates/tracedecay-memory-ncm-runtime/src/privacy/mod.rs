@@ -1,10 +1,10 @@
 //! Source-scoped erasure by durable fencing and deterministic sanitized replay.
 
 use crate::engine::{
-    CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, NamespaceHandle,
-    NcmEngine, Outcome, PendingDeletionFence, RejectReason, durable_integrity_digest,
-    replay_recovery_event, validate_event_payload_digest, validate_pending_deletion_fence,
-    validate_recovery_event,
+    CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, MaintenanceKind,
+    NamespaceHandle, NcmEngine, Outcome, PendingDeletionFence, RejectReason,
+    durable_integrity_digest, replay_recovery_event, validate_event_payload_digest,
+    validate_pending_deletion_fence, validate_recovery_event,
 };
 use crate::ports::Deadline;
 use crate::store::{CapsuleStatus, NamespaceStore, StoreError, StoreMeta, StoredCapsule};
@@ -122,6 +122,18 @@ fn delete_sources_inner(
     let sources = source_set
         .map(|sources| sources.iter().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_else(|| BTreeSet::from([request.source.clone()]));
+    // All durable deletion envelopes use the sorted source set as their
+    // canonical identity.  The common-control caller may provide sources in
+    // any order, so do not let its first element become a second, unstable
+    // source identity in the fence and completion receipts.
+    let Some(canonical_source) = sources.first().cloned() else {
+        return EngineReply::rejected(
+            RejectReason::InvalidRequest("empty deletion source set".to_owned()),
+            0,
+        );
+    };
+    let mut request = request;
+    request.source = canonical_source;
     let payload_sha256 = match canonical_deletion_digest(&sources) {
         Ok(digest) => digest,
         Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
@@ -139,7 +151,19 @@ fn delete_sources_inner(
         return unavailable_rebuilding(handle.commit_seq);
     }
     match lookup_replay(handle, &request.idempotency_key, &payload_sha256) {
-        Ok(Some(reply)) => return reply,
+        Ok(Some(reply)) => {
+            if matches!(reply.outcome, Outcome::Success) {
+                if let Err(reply) = validate_completed_deletion_replay(
+                    handle,
+                    &request.idempotency_key,
+                    &payload_sha256,
+                    &sources,
+                ) {
+                    return reply;
+                }
+            }
+            return reply;
+        }
         Ok(None) => {}
         Err(reply) => return reply,
     }
@@ -573,6 +597,134 @@ struct ReplayResult {
     tick_before: u64,
 }
 
+/// Loads the original validation view from the newest pre-fence checkpoint.
+/// A checkpoint may contain an observation that has since been erased from its
+/// capsule, so it is the only durable state anchor that lets the original
+/// digest chain resume after that erased input.  The sanitized kernel below
+/// is still rebuilt from retained capsules and never publishes this view.
+fn validation_kernel_from_checkpoint(
+    store: &NamespaceStore,
+    config: &NcmConfig,
+    pending: &PendingDeletionFence,
+    projections: &ProjectionBundle,
+    capsules: &[StoredCapsule],
+) -> Result<(NcmKernel, u64), EngineReply> {
+    let meta = store
+        .meta()
+        .map_err(|error| store_reply(error, pending.event_seq))?;
+    let Some(checkpoint) = store
+        .latest_checkpoint()
+        .map_err(|error| store_reply(error, pending.event_seq))?
+    else {
+        let mut kernel = NcmKernel::new(store.identity().seed, config.clone())
+            .map_err(|error| core_reply(error, pending.event_seq))?;
+        kernel.projections = projections.clone();
+        return Ok((kernel, 0));
+    };
+    if checkpoint.seq >= pending.event_seq || checkpoint.epoch != meta.epoch {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "sanitized replay checkpoint is outside the pre-fence generation",
+        ));
+    }
+    let envelope: CheckpointEnvelope =
+        serde_json::from_slice(&checkpoint.state).map_err(|error| {
+            corrupt_reply(
+                pending.event_seq,
+                &format!("decode sanitized replay checkpoint: {error}"),
+            )
+        })?;
+    if envelope.state_digest != sha256_hex(&envelope.kernel.state_digest())
+        || envelope.kernel.config != *config
+    {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "sanitized replay checkpoint digest or config mismatch",
+        ));
+    }
+    let checkpoint_projections =
+        serde_json::to_vec(&envelope.kernel.projections).map_err(|error| {
+            corrupt_reply(
+                pending.event_seq,
+                &format!("serialize sanitized replay projections: {error}"),
+            )
+        })?;
+    if checkpoint_projections != store.identity().projection_bytes {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "sanitized replay checkpoint projection mismatch",
+        ));
+    }
+    validate_checkpoint_anchor(store, checkpoint.seq, &envelope.kernel, &meta, capsules)?;
+    Ok((envelope.kernel, checkpoint.seq))
+}
+
+/// Validates the event envelope at a checkpoint boundary so state validation
+/// can continue from that captured original state even when an earlier source
+/// capsule has already been scrubbed.
+fn validate_checkpoint_anchor(
+    store: &NamespaceStore,
+    checkpoint_seq: u64,
+    checkpoint_kernel: &NcmKernel,
+    meta: &StoreMeta,
+    capsules: &[StoredCapsule],
+) -> Result<(), EngineReply> {
+    let expected_digest = sha256_hex(&checkpoint_kernel.state_digest());
+    let events = store
+        .events_after(0)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let mut expected_seq = 1_u64;
+    let mut checkpoint_receipt = None;
+    let mut checkpoint_event_tick = None;
+    for event in events {
+        if event.seq > checkpoint_seq {
+            break;
+        }
+        let durable = validate_recovery_event(&event, expected_seq, meta.commit_seq)?;
+        validate_event_payload_digest(&event, &durable, capsules)?;
+        if event.seq == checkpoint_seq {
+            checkpoint_receipt = Some(durable.state_digest);
+            checkpoint_event_tick = Some(event.created_tick);
+            break;
+        }
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt_reply(meta.commit_seq, "checkpoint sequence overflow"))?;
+    }
+    if expected_seq != checkpoint_seq
+        || checkpoint_receipt.as_deref() != Some(expected_digest.as_str())
+        || checkpoint_event_tick != Some(checkpoint_kernel.scheduler.tick.0)
+    {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "sanitized replay checkpoint is detached from its journal",
+        ));
+    }
+    Ok(())
+}
+
+fn operation_tick_delta(operation: &DurableOperation) -> u64 {
+    match operation {
+        DurableOperation::CommonControl { operations } => {
+            operations.iter().fold(0_u64, |total, operation| {
+                total.saturating_add(operation_tick_delta(operation))
+            })
+        }
+        DurableOperation::Observe { .. } => 1,
+        DurableOperation::Maintenance { kind } => match kind {
+            MaintenanceKind::Advance { ticks } => u64::from(*ticks),
+            MaintenanceKind::Consolidate
+            | MaintenanceKind::MergePrune
+            | MaintenanceKind::Checkpoint
+            | MaintenanceKind::Compact => 0,
+        },
+        DurableOperation::Feedback { .. }
+        | DurableOperation::Correction { .. }
+        | DurableOperation::DeletionFence { .. }
+        | DurableOperation::DeleteBySource { .. } => 0,
+    }
+}
+
 fn sanitized_replay(
     store: &NamespaceStore,
     config: &NcmConfig,
@@ -600,9 +752,8 @@ fn sanitized_replay(
                 &format!("decode persisted projections: {error}"),
             )
         })?;
-    let mut validation_kernel = NcmKernel::new(store.identity().seed, config.clone())
-        .map_err(|error| core_reply(error, pending.event_seq))?;
-    validation_kernel.projections = projections.clone();
+    let (mut validation_kernel, validation_checkpoint_seq) =
+        validation_kernel_from_checkpoint(store, config, pending, &projections, &capsules)?;
     let mut kernel = NcmKernel::new(store.identity().seed, config.clone())
         .map_err(|error| core_reply(error, pending.event_seq))?;
     kernel.projections = projections;
@@ -621,6 +772,8 @@ fn sanitized_replay(
     .map_err(|_| corrupt_reply(pending.event_seq, "excluded record count overflow"))?;
     let mut expected_seq = 1_u64;
     let mut previous_tick = None;
+    let mut original_tick = 0_u64;
+    let mut sanitized_tick = 0_u64;
     // The original kernel digest chain is independently checkable until the
     // first erased observation.  Once that input is gone, continue validating
     // every retained operation against its capsule and replay the sanitized
@@ -629,6 +782,13 @@ fn sanitized_replay(
     for event in events {
         let durable = validate_recovery_event(&event, expected_seq, pending.event_seq)?;
         validate_event_payload_digest(&event, &durable, &capsules)?;
+        original_tick = original_tick.saturating_add(operation_tick_delta(&durable.operation));
+        if event.created_tick != original_tick {
+            return Err(corrupt_reply(
+                pending.event_seq,
+                "event scheduler tick does not match its durable operation",
+            ));
+        }
         if previous_tick.is_some_and(|tick| event.created_tick < tick) {
             return Err(corrupt_reply(
                 pending.event_seq,
@@ -640,10 +800,11 @@ fn sanitized_replay(
             .checked_add(1)
             .ok_or_else(|| corrupt_reply(pending.event_seq, "event sequence overflow"))?;
         if original_state_chain_valid
+            && event.seq > validation_checkpoint_seq
             && operation_contains_revoked_observe(&durable.operation, &by_record)
         {
             original_state_chain_valid = false;
-        } else if original_state_chain_valid {
+        } else if original_state_chain_valid && event.seq > validation_checkpoint_seq {
             replay_recovery_event(
                 &mut validation_kernel,
                 &event,
@@ -680,6 +841,7 @@ fn sanitized_replay(
                     if capsule.status == CapsuleStatus::Revoked {
                         continue;
                     }
+                    sanitized_tick = sanitized_tick.saturating_add(1);
                     let observed = kernel
                         .observe(
                             &capsule.key_embedding,
@@ -761,6 +923,9 @@ fn sanitized_replay(
                         .map_err(|error| core_reply(error, event.seq))?;
                 }
                 DurableOperation::Maintenance { kind } => {
+                    if let MaintenanceKind::Advance { ticks } = &kind {
+                        sanitized_tick = sanitized_tick.saturating_add(u64::from(*ticks));
+                    }
                     crate::engine::apply_recovery_maintenance(&mut kernel, &kind)
                         .map_err(|error| core_reply(error, event.seq))?;
                 }
@@ -773,6 +938,18 @@ fn sanitized_replay(
         return Err(corrupt_reply(
             pending.event_seq,
             "metadata sequence is not journal-backed",
+        ));
+    }
+    if original_tick != pending.tick_before {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "deletion fence tick does not match its operation history",
+        ));
+    }
+    if kernel.scheduler.tick.0 != sanitized_tick {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "sanitized replay tick does not match its retained history",
         ));
     }
     let next_id = capsules
@@ -974,6 +1151,211 @@ fn lookup_replay(
         object.insert("replayed".to_owned(), Value::Bool(true));
     }
     Ok(Some(reply))
+}
+
+/// Validates the whole two-event deletion record before replaying a completed
+/// request.  Generic idempotency validation proves that a key and payload
+/// digest are present, but it does not prove that the row is the exact
+/// deletion operation that minted the key.  The fence immediately preceding
+/// the completion event is the durable source of truth for that binding.
+fn validate_completed_deletion_replay(
+    handle: &NamespaceHandle,
+    key: &str,
+    payload_sha256: &str,
+    expected_sources: &BTreeSet<SourceId>,
+) -> Result<(), EngineReply> {
+    let meta = handle
+        .store
+        .meta()
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let event = handle
+        .store
+        .event_for_key(key)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+        .ok_or_else(|| corrupt_reply(handle.commit_seq, "completed deletion event is missing"))?;
+    if event.idempotency_key.as_deref() != Some(key)
+        || event.payload_sha256 != payload_sha256
+        || event.seq < 2
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion idempotency envelope is invalid",
+        ));
+    }
+    let capsules = handle
+        .store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let durable: DurableReceipt = serde_json::from_str(&event.receipt)
+        .map_err(|error| corrupt_reply(handle.commit_seq, &format!("decode receipt: {error}")))?;
+    validate_recovery_event(&event, event.seq, meta.commit_seq)?;
+    validate_event_payload_digest(&event, &durable, &capsules)?;
+    let DurableOperation::DeleteBySource {
+        source,
+        sources,
+        target_epoch,
+        deleted_records,
+        deleted_record_ids,
+    } = &durable.operation
+    else {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "idempotency key is not bound to a completed deletion",
+        ));
+    };
+    let canonical_sources = expected_sources.iter().cloned().collect::<Vec<_>>();
+    if sources != &canonical_sources
+        || sources.first() != Some(source)
+        || !valid_deletion_source_set(sources)
+        || durable.reply.outcome != Outcome::Success
+        || durable.reply.state_generation != event.seq
+        || durable.reply.payload["source"] != serde_json::json!(source)
+        || durable.reply.payload["deleted_records"] != serde_json::json!(deleted_records)
+        || durable.reply.payload["epoch"] != serde_json::json!(target_epoch)
+        || durable.reply.payload["replayed"] != false
+        || durable.reply.payload["sanitized_replay"]["tick_after"]
+            != serde_json::json!(event.created_tick)
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion receipt does not match its request",
+        ));
+    }
+    validate_deleted_record_set(
+        deleted_records,
+        deleted_record_ids,
+        &capsules,
+        event.seq - 1,
+        handle.commit_seq,
+    )?;
+
+    let fence_event = handle
+        .store
+        .event(event.seq - 1)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+        .ok_or_else(|| corrupt_reply(handle.commit_seq, "completed deletion fence is missing"))?;
+    let fence: DurableReceipt = serde_json::from_str(&fence_event.receipt).map_err(|error| {
+        corrupt_reply(
+            handle.commit_seq,
+            &format!("decode completed deletion fence receipt: {error}"),
+        )
+    })?;
+    validate_recovery_event(&fence_event, fence_event.seq, meta.commit_seq)?;
+    validate_event_payload_digest(&fence_event, &fence, &capsules)?;
+    let DurableOperation::DeletionFence {
+        source: fence_source,
+        sources: fence_sources,
+        target_epoch: fence_epoch,
+        idempotency_key: fence_key,
+        payload_sha256: fence_payload,
+        deleted_records: fence_deleted_records,
+        deleted_record_ids: fence_deleted_record_ids,
+        pre_fence_state_digest,
+        fatigue,
+        steps_since_consolidation: _,
+    } = &fence.operation
+    else {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion is not preceded by a deletion fence",
+        ));
+    };
+    if fence_event.kind != "deletion_fence"
+        || fence_event.idempotency_key.is_some()
+        || fence_event.seq + 1 != event.seq
+        || fence_source != source
+        || fence_sources != sources
+        || fence_epoch != target_epoch
+        || fence_key != key
+        || fence_payload != payload_sha256
+        || fence_deleted_records != deleted_records
+        || fence_deleted_record_ids != deleted_record_ids
+        || !is_sha256_hex(pre_fence_state_digest)
+        || !fatigue.is_finite()
+        || fence.reply.payload["fenced"] != true
+        || fence.reply.payload["target_epoch"] != serde_json::json!(target_epoch)
+        || fence.reply.state_generation != fence_event.seq
+        || fence.state_digest != *pre_fence_state_digest
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion is not bound to its original fence",
+        ));
+    }
+    let revocations = handle
+        .store
+        .revocations()
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    if fence_sources.iter().any(|source| {
+        !revocations.iter().any(|revocation| {
+            revocation.source_id == *source
+                && revocation.epoch == *target_epoch
+                && revocation.seq == fence_event.seq
+        })
+    }) {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion revocation authority does not match its fence",
+        ));
+    }
+    if *target_epoch > meta.epoch {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion epoch is newer than metadata",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_deleted_record_set(
+    deleted_records: &u64,
+    deleted_record_ids: &[RecordId],
+    capsules: &[StoredCapsule],
+    fence_seq: u64,
+    commit_seq: u64,
+) -> Result<(), EngineReply> {
+    if u64::try_from(deleted_record_ids.len()).ok() != Some(*deleted_records)
+        || deleted_record_ids
+            .windows(2)
+            .any(|window| window[0] >= window[1])
+    {
+        return Err(corrupt_reply(
+            commit_seq,
+            "completed deletion record set is invalid",
+        ));
+    }
+    for record_id in deleted_record_ids {
+        let Some(capsule) = capsules
+            .iter()
+            .find(|capsule| capsule.record_id == *record_id)
+        else {
+            return Err(corrupt_reply(
+                commit_seq,
+                "completed deletion references an unknown record",
+            ));
+        };
+        if capsule.status != CapsuleStatus::Revoked || capsule.commit_seq >= fence_seq {
+            return Err(corrupt_reply(
+                commit_seq,
+                "completed deletion record set is not revoked by its fence",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_deletion_source_set(sources: &[SourceId]) -> bool {
+    !sources.is_empty()
+        && sources.len() <= 1024
+        && sources.iter().all(|source| !source.0.is_empty())
+        && sources.windows(2).all(|window| window[0] < window[1])
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn durable_receipt(
