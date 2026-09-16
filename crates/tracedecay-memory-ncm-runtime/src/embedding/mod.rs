@@ -1113,6 +1113,55 @@ mod tests {
             bytes
         );
     }
+
+    #[cfg(feature = "real-encoder")]
+    #[test]
+    fn user_defined_model_contains_the_verified_bytes() {
+        let root = cache_root();
+        let models = root.path().join("models");
+        let snapshot = cache_snapshot(&models, Some(MODEL_REVISION)).expect("open cache snapshot");
+        fs::create_dir(snapshot.path.join("onnx")).expect("create onnx directory");
+
+        let artifacts = [
+            ("onnx/model.onnx", b"verified onnx bytes".as_slice()),
+            ("tokenizer.json", b"verified tokenizer bytes".as_slice()),
+            ("config.json", b"verified config bytes".as_slice()),
+            (
+                "special_tokens_map.json",
+                b"verified special-token bytes".as_slice(),
+            ),
+            (
+                "tokenizer_config.json",
+                b"verified tokenizer-config bytes".as_slice(),
+            ),
+        ];
+        let files = artifacts
+            .iter()
+            .map(|(relative, bytes)| {
+                let path = snapshot.path.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("create artifact parent");
+                }
+                fs::write(&path, bytes).expect("write artifact");
+                EncoderFile {
+                    path: (*relative).to_owned(),
+                    sha256: digest_bytes(bytes),
+                    bytes: bytes.len() as u64,
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = super::PinnedEncoder::new(MODEL_NAME, files, 128, "mean", true);
+        let model = super::load_verified_model(&models, &manifest).expect("load verified model");
+
+        assert_eq!(model.onnx_file, artifacts[0].1);
+        assert_eq!(model.tokenizer_files.tokenizer_file, artifacts[1].1);
+        assert_eq!(model.tokenizer_files.config_file, artifacts[2].1);
+        assert_eq!(
+            model.tokenizer_files.special_tokens_map_file,
+            artifacts[3].1
+        );
+        assert_eq!(model.tokenizer_files.tokenizer_config_file, artifacts[4].1);
+    }
 }
 
 #[cfg(feature = "real-encoder")]
