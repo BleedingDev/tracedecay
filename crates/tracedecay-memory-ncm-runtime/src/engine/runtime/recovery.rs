@@ -800,6 +800,15 @@ pub(crate) fn replay_event(
                 // ordinary recovery can see this row.  The deleted observe has
                 // no replayable kernel effect; its durable tick/state anchor
                 // is validated by the caller's erased-input path.
+                if event.created_tick
+                    != kernel
+                        .scheduler
+                        .tick
+                        .0
+                        .saturating_add(operation_tick_delta(operation))
+                {
+                    return Err(corrupt_reply(commit_seq, "event logical tick mismatch"));
+                }
                 return Ok(());
             }
             let report = kernel
