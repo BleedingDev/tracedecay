@@ -878,8 +878,8 @@ fn open_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Di
     Ok(Dir::from_std_file(file.into_std()))
 }
 
-fn open_file_nofollow<'a>(
-    parent: &'a Dir,
+fn open_file_nofollow(
+    parent: &Dir,
     name: &OsStr,
     path: &Path,
 ) -> Result<cap_std::fs::File, EncoderError> {
