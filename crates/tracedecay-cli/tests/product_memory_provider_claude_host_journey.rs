@@ -662,6 +662,7 @@ impl ClaudeHostJourney {
         )
         .expect("canonical fixture capture request");
 
+        let expected_observation_id = observation_id.clone();
         let profile = self.profile.clone();
         let project = self.project.clone();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -691,7 +692,7 @@ impl ClaudeHostJourney {
                 CaptureObservationOutcome::Persisted { outcome, .. }
                 | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => assert_eq!(
                     outcome.receipt().observation().observation_id(),
-                    &observation_id,
+                    &expected_observation_id,
                     "canonical producer receipt must retain its derived observation identity"
                 ),
                 CaptureObservationOutcome::Rejected { .. }
