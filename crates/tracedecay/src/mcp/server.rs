@@ -1199,9 +1199,9 @@ impl McpServer {
         canonical_session_id: &str,
     ) -> std::result::Result<
         tracedecay_memory_provider_registry::ProjectCognitiveRecallPortV1,
-        crate::daemon::retained_owner::cognitive_recall::CognitiveRecallMountError,
+        tracedecay_daemon_service::retained_owner::CognitiveRecallMountError,
     > {
-        use crate::daemon::retained_owner::cognitive_recall::CognitiveRecallMountError;
+        use tracedecay_daemon_service::retained_owner::CognitiveRecallMountError;
         match self.cognitive_recall_mount.as_ref() {
             Some(mount) => mount.port_for_session(canonical_session_id),
             None if self
@@ -1528,6 +1528,8 @@ mod application_surface_request_id_tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod work_evidence_mount_tests;
 
+#[cfg(all(test, feature = "memory-provider-host"))]
+mod cognitive_recall_journey_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod lcm_claude_recall_tests;

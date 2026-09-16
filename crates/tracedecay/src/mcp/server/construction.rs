@@ -76,11 +76,11 @@ pub(crate) fn install_retained_project_server_resolver(
 /// lifetime. The concrete type stays behind the opt-in host feature.
 #[cfg(feature = "memory-provider-host")]
 pub(crate) type MemoryProviderHostMount =
-    Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>;
+    Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderHostMountV1>;
 
 #[cfg(feature = "memory-provider-host")]
 pub(crate) type ObservationJourneyMount =
-    Arc<crate::daemon::retained_owner::observation_journey::ProjectObservationJourneyV1>;
+    Arc<tracedecay_daemon_service::retained_owner::ProjectObservationJourneyMountV1>;
 
 /// Existing project control port retained for one project-server lifetime.
 #[cfg(feature = "memory-provider-host")]
@@ -91,7 +91,7 @@ pub(crate) type ProviderControlMount =
 /// session ports are minted from it on demand.
 #[cfg(feature = "memory-provider-host")]
 pub(crate) type CognitiveRecallMount =
-    Arc<crate::daemon::retained_owner::cognitive_recall::ProjectCognitiveRecallMountV1>;
+    Arc<tracedecay_daemon_service::retained_owner::ProjectCognitiveRecallMountV1>;
 
 /// Dashboard admission erases the concrete graph only at its consumer
 /// boundary.

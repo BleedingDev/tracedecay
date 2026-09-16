@@ -17,15 +17,84 @@ use tracedecay_session_runtime::session_temporal_refresh_scheduler::{
 mod code_index_activation;
 #[cfg(test)]
 mod future_size_tests;
+#[cfg(feature = "memory-provider-host")]
+mod ncm_observer;
 mod runtime;
 mod session_database_admission;
 use code_index_activation::{
     CodeIndexActivationMountInputs, code_index_activation_hint_sink, code_index_activation_mount,
     code_index_freshness_probe_sink, code_index_hook_sink, code_index_reconcile_sink,
 };
+#[cfg(feature = "memory-provider-host")]
+pub(super) use ncm_observer::NcmWorkerOwnerSlot;
 pub(in crate::daemon) use runtime::ProductionProjectCompositionRuntime;
 use runtime::bind_verified_project_graph_runtime;
 use session_database_admission::{join_independent_session_opens, log_session_database_admission};
+
+/// Independent provider participation resolved from the pinned project
+/// configuration. The daemon owns the decision; the service crate only
+/// receives the validated value and assembles neutral retained handles.
+#[cfg(feature = "memory-provider-host")]
+pub(super) type ProjectMemoryProviderActivation =
+    tracedecay_domain::configuration::MemoryProviderSelectionV1;
+
+#[cfg(all(test, feature = "memory-provider-host"))]
+pub(super) use tracedecay_daemon_service::retained_owner::NativeApplicationPortInterpositionV1;
+
+/// How one project open obtains its provider participation.
+#[cfg(feature = "memory-provider-host")]
+#[derive(Clone)]
+pub(super) enum ProjectMemoryProviderActivationSelector {
+    /// Read the authoritative runtime configuration for this open.
+    FromRuntimeConfiguration,
+    /// Read the same configuration, then decorate the real Native port in a
+    /// test harness before the service registers it.
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    FromRuntimeConfigurationWithNativePortInterposition(NativeApplicationPortInterpositionV1),
+}
+
+#[cfg(feature = "memory-provider-host")]
+impl std::fmt::Debug for ProjectMemoryProviderActivationSelector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FromRuntimeConfiguration => formatter.write_str("FromRuntimeConfiguration"),
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            Self::FromRuntimeConfigurationWithNativePortInterposition(_) => {
+                formatter.write_str("FromRuntimeConfigurationWithNativePortInterposition(..)")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "memory-provider-host")]
+impl ProjectMemoryProviderActivationSelector {
+    fn resolve(
+        self,
+        runtime_configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
+    ) -> Result<ProjectMemoryProviderActivation> {
+        let config = runtime_configuration.config();
+        tracedecay_domain::configuration::MemoryProviderSelectionV1::resolve(
+            config.memory_provider_native_enabled,
+            &config.memory_provider_ncm_observer,
+            &config.memory_provider_recall_routing,
+        )
+        .map_err(|error| TraceDecayError::Config {
+            message: error.to_string(),
+        })
+    }
+
+    #[cfg(all(test, feature = "memory-provider-host"))]
+    fn native_application_port_interposition(
+        &self,
+    ) -> Option<NativeApplicationPortInterpositionV1> {
+        match self {
+            Self::FromRuntimeConfiguration => None,
+            Self::FromRuntimeConfigurationWithNativePortInterposition(interposition) => {
+                Some(Arc::clone(interposition))
+            }
+        }
+    }
+}
 
 pub(super) struct ProductionProjectComposition {
     #[cfg(unix)]
@@ -249,6 +318,8 @@ struct ProjectOpenInputs<'a> {
     /// Start of this open attempt. `project_open_phase` events report elapsed
     /// time from here unless they name a narrower phase start.
     started: Instant,
+    #[cfg(feature = "memory-provider-host")]
+    activation: ProjectMemoryProviderActivationSelector,
     #[cfg(test)]
     project_open_attempts: Option<&'a Arc<AtomicUsize>>,
 }
@@ -266,7 +337,7 @@ struct ProjectOpenInputs<'a> {
 #[hotpath::measure(label = "daemon.project.compose.server", future = true)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "This composition entry binds route admission, store lifetime, invocation and HTTP owners before publishing a server."
+    reason = "This composition entry delegates to the configured provider selector and project-open state machine."
 )]
 pub(super) async fn production_project_server(
     store_administration: &StoreAdministration,
@@ -279,6 +350,93 @@ pub(super) async fn production_project_server(
     cancellation: &CancellationToken,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
+    #[cfg(feature = "memory-provider-host")]
+    {
+        production_project_server_inner(
+            store_administration,
+            project_open_gates,
+            invocation,
+            http_application_registry,
+            canonical_project_path,
+            handshake,
+            runtime,
+            cancellation,
+            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
+            #[cfg(test)]
+            project_open_attempts,
+        )
+        .await
+    }
+    #[cfg(not(feature = "memory-provider-host"))]
+    {
+        production_project_server_inner(
+            store_administration,
+            project_open_gates,
+            invocation,
+            http_application_registry,
+            canonical_project_path,
+            handshake,
+            runtime,
+            cancellation,
+            #[cfg(test)]
+            project_open_attempts,
+        )
+        .await
+    }
+}
+
+/// Test harness entry that keeps the production configuration decision while
+/// allowing a caller-owned decorator around the real Native application port.
+#[cfg(feature = "memory-provider-host")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The explicit selector is a test-only composition seam matching the production open entry."
+)]
+pub(super) async fn production_project_server_with_activation(
+    store_administration: &StoreAdministration,
+    project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
+    invocation: &DaemonInvocationState,
+    http_application_registry: &http_application::DaemonHttpApplicationRegistry,
+    canonical_project_path: &Path,
+    handshake: &DaemonHandshake,
+    runtime: ProductionProjectCompositionRuntime,
+    cancellation: &CancellationToken,
+    activation: ProjectMemoryProviderActivationSelector,
+    #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
+) -> Result<ProductionProjectComposition> {
+    production_project_server_inner(
+        store_administration,
+        project_open_gates,
+        invocation,
+        http_application_registry,
+        canonical_project_path,
+        handshake,
+        runtime,
+        cancellation,
+        activation,
+        #[cfg(test)]
+        project_open_attempts,
+    )
+    .await
+}
+
+#[hotpath::measure(label = "daemon.project.compose.server", future = true)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "This composition entry binds route admission, store lifetime, invocation and HTTP owners before publishing a server."
+)]
+async fn production_project_server_inner(
+    store_administration: &StoreAdministration,
+    project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
+    invocation: &DaemonInvocationState,
+    http_application_registry: &http_application::DaemonHttpApplicationRegistry,
+    canonical_project_path: &Path,
+    handshake: &DaemonHandshake,
+    runtime: ProductionProjectCompositionRuntime,
+    cancellation: &CancellationToken,
+    #[cfg(feature = "memory-provider-host")] activation: ProjectMemoryProviderActivationSelector,
+    #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
+) -> Result<ProductionProjectComposition> {
     let inputs = ProjectOpenInputs {
         store_administration,
         project_open_gates,
@@ -289,6 +447,8 @@ pub(super) async fn production_project_server(
         runtime: &runtime,
         cancellation,
         started: Instant::now(),
+        #[cfg(feature = "memory-provider-host")]
+        activation,
         #[cfg(test)]
         project_open_attempts,
     };
@@ -315,7 +475,12 @@ pub(super) async fn production_project_server(
         let activation = Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await?;
         let upgrade = match Box::pin(inputs.construct_full_server(&opened, &core, &resolved)).await
         {
-            Ok(PublishedFullServer { server, session_db }) => {
+            Ok(PublishedFullServer {
+                server,
+                session_db,
+                #[cfg(feature = "memory-provider-host")]
+                provider_full_mount,
+            }) => {
                 match Box::pin(inputs.finish_full_server(
                     &opened,
                     &core,
@@ -323,6 +488,8 @@ pub(super) async fn production_project_server(
                     &resolved,
                     &server,
                     session_db,
+                    #[cfg(feature = "memory-provider-host")]
+                    provider_full_mount,
                 ))
                 .await
                 {
@@ -474,6 +641,9 @@ struct ComposedCoreServer {
     graph_runtime: Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>,
     transcript_source_home: Option<PathBuf>,
     code_index_activation: Arc<code_index_scheduler::CodeIndexActivationV1>,
+    #[cfg(feature = "memory-provider-host")]
+    memory_provider_host:
+        Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderHostMountV1>,
     ports: ProjectRoutePorts,
 }
 
@@ -529,6 +699,14 @@ impl ComposedCoreServer {
             ))
             .with_daemon_invocation_service(invocation.service.clone())
             .with_retained_project_server_resolver(Arc::clone(&ports.retained_server_resolver));
+        #[cfg(feature = "memory-provider-host")]
+        {
+            context =
+                context.with_memory_provider_host_mount(Arc::clone(&self.memory_provider_host));
+            if let Some(recall) = self.memory_provider_host.cognitive_recall_mount() {
+                context = context.with_cognitive_recall_mount(recall);
+            }
+        }
         if let Some(reconciler) = ports.automation_scheduler_reconciler.as_ref() {
             context = context.with_automation_scheduler_reconciler(Arc::clone(reconciler));
         }
@@ -566,6 +744,9 @@ struct AdmittedSessionDatabases {
 struct PublishedFullServer {
     server: Arc<crate::mcp::McpServer>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    #[cfg(feature = "memory-provider-host")]
+    provider_full_mount:
+        Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1>,
 }
 
 impl ProjectOpenInputs<'_> {
@@ -780,6 +961,8 @@ impl ProjectOpenInputs<'_> {
             &route_registered,
             *project_database_is_read_only,
         )?;
+        #[cfg(feature = "memory-provider-host")]
+        let memory_provider_activation = self.activation.clone().resolve(runtime_configuration)?;
         let code_index_mount = code_index_activation_mount(CodeIndexActivationMountInputs {
             invocation: self.invocation.clone(),
             project_id: code_index.project_id.clone(),
@@ -842,6 +1025,52 @@ impl ProjectOpenInputs<'_> {
             self.canonical_project_path.to_path_buf(),
             code_index.scope.clone(),
         ));
+        #[cfg(feature = "memory-provider-host")]
+        let ncm_registration_factory: tracedecay_daemon_service::retained_owner::NcmRegistrationFactoryV1 = {
+            let owners = Arc::clone(&self.invocation.ncm_worker_owner);
+            Arc::new(move |profile_id, worker_binary, state_root, registration_revision, mode, authority| {
+                ncm_observer::construct_ncm_registration_with_authority(
+                    &owners,
+                    &profile_id,
+                    worker_binary,
+                    state_root,
+                    registration_revision,
+                    mode,
+                    authority,
+                )
+                .map_err(|error| error.to_string())
+            })
+        };
+        #[cfg(feature = "memory-provider-host")]
+        let memory_provider_host =
+            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_host(
+                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderHostInputsV1 {
+                    activation: memory_provider_activation,
+                    ncm_observer: runtime_configuration
+                        .config()
+                        .memory_provider_ncm_observer
+                        .clone(),
+                    graph: Arc::clone(cg),
+                    canonical_project_path: self.canonical_project_path.to_path_buf(),
+                    profile_id: profile_identity.profile_id().clone(),
+                    scope: code_index.scope.clone(),
+                    authoritative_project_id: code_index.project_id.clone(),
+                    store_data_root: cg.store_layout().data_root.clone(),
+                    recall_routing: runtime_configuration
+                        .config()
+                        .memory_provider_recall_routing
+                        .clone(),
+                    ncm_registration_factory: Some(ncm_registration_factory),
+                    #[cfg(all(test, feature = "memory-provider-host"))]
+                    native_port_interposition: self
+                        .activation
+                        .native_application_port_interposition(),
+                    #[cfg(all(not(test), feature = "memory-provider-host"))]
+                    native_port_interposition: None,
+                },
+            )
+            .await
+            .map_err(|error| TraceDecayError::Config { message: error })?;
         let transcript_source_home = daemon_transcript_source_home(profile_identity.profile_root());
         let core = ComposedCoreServer {
             project_id,
@@ -854,6 +1083,8 @@ impl ProjectOpenInputs<'_> {
             graph_runtime,
             transcript_source_home,
             code_index_activation,
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host,
             ports: ProjectRoutePorts {
                 code_index,
                 dashboard_code_index_freshness_reader: project_dashboard_freshness_reader(
@@ -1134,6 +1365,27 @@ impl ProjectOpenInputs<'_> {
                 *project_database_is_read_only,
             )
             .await?;
+        #[cfg(feature = "memory-provider-host")]
+        let provider_full_mount =
+            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
+                &core.memory_provider_host,
+                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountInputsV1 {
+                    graph: Arc::clone(cg),
+                    canonical_project_path: self.canonical_project_path.to_path_buf(),
+                    profile_id: core.profile_identity.profile_id().clone(),
+                    brain_id: core.profile_identity.brain_id().clone(),
+                    scope: code_index.scope.clone(),
+                    authoritative_project_id: code_index.project_id.clone(),
+                    session_db: session_db.clone(),
+                    configuration_digest: runtime_configuration
+                        .snapshot()
+                        .effective_behavior_digest
+                        .clone(),
+                },
+                self.cancellation,
+            )
+            .await
+            .map_err(|error| TraceDecayError::Config { message: error })?;
         self.invocation
             .service
             .mount_session_holder_databases([
@@ -1335,6 +1587,14 @@ impl ProjectOpenInputs<'_> {
             .with_remote_operational_status(remote_operational_status)
             .with_dashboard_doctor_report_reader(doctor_report_reader)
             .with_startup_catch_up_enabled(self.runtime.startup_catch_up());
+        #[cfg(feature = "memory-provider-host")]
+        let full_context = provider_full_mount
+            .observation_journeys()
+            .into_iter()
+            .fold(full_context, |context, journey| {
+                context.with_observation_journey_mount(journey)
+            })
+            .with_provider_control_mount(provider_full_mount.provider_control_mount());
         project_open_cancellation_checkpoint(self.cancellation)?;
         let full_construction_started = Instant::now();
         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
@@ -1367,6 +1627,8 @@ impl ProjectOpenInputs<'_> {
         Ok(PublishedFullServer {
             server: full_candidate,
             session_db,
+            #[cfg(feature = "memory-provider-host")]
+            provider_full_mount,
         })
     }
 
@@ -1468,16 +1730,24 @@ impl ProjectOpenInputs<'_> {
         resolved: &Arc<crate::mcp::McpServer>,
         full_server: &Arc<crate::mcp::McpServer>,
         session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+        #[cfg(feature = "memory-provider-host")] provider_full_mount: Arc<
+            tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1,
+        >,
     ) -> Result<()> {
         self.log_phase("session_capabilities_published", None, self.started);
         Box::pin(self.mount_full_server_owners(
             opened,
             core,
             full_server.as_ref(),
-            session_db,
+            session_db.clone(),
             activation.core_source_edit_mutation.clone(),
         ))
         .await?;
+        #[cfg(feature = "memory-provider-host")]
+        provider_full_mount
+            .activate_after_publication(session_db.observation_store())
+            .await
+            .map_err(|error| TraceDecayError::Config { message: error })?;
         if *core.current_key.lock().await != opened.key {
             return Err(TraceDecayError::Config {
                 message: "project changed branch during full capability admission".to_owned(),
