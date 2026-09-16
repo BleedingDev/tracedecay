@@ -32,20 +32,18 @@ pub(crate) mod cognitive_recall;
 pub use cognitive_recall::test_context_evidence;
 #[cfg(feature = "memory-provider-host")]
 pub use cognitive_recall::{AdvisoryMemoryContextV1, CognitiveRecallMountError};
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_authority;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_common_factory_tests.rs"]
 mod native_common_factory_tests;
 #[cfg(feature = "memory-provider-host")]
-pub(crate) mod native_authority;
-#[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
-#[cfg(feature = "memory-provider-host")]
-pub(crate) mod native_session_recall;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
 #[cfg(feature = "memory-provider-host")]
-pub(crate) mod native_staged_observations;
+pub(crate) mod native_session_recall;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 #[cfg(feature = "memory-provider-host")]
@@ -678,58 +676,54 @@ pub async fn mount_project_memory_provider_host(
             (ProviderRegistrationV1, ConfiguredObservationProviderMountV1),
             String,
         > = match kind {
-            MemoryProviderKindV1::Native => async {
-                let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&inputs.graph)));
-                let provider_state_root = inputs
-                    .graph
-                    .store_layout()
-                    .data_root
-                    .join(observation_journey::PROVIDER_STATE_DIR_NAME);
-                let port = native_provider::project_native_memory_application_port_with_authority_off_runtime(
-                    graph_cell,
-                    inputs.canonical_project_path.clone(),
-                    inputs.profile_id.clone(),
-                    provider_state_root,
-                    admission_authority,
-                )
-                .await
-                .map_err(|error| format!("could not construct project Native application port: {error}"))?;
-                let port = match inputs.native_port_interposition.as_ref() {
-                    Some(interpose) => interpose(port),
-                    None => port,
-                };
-                let provider =
-                    Arc::new(NativeProvider::new(port).map_err(|error| {
+            MemoryProviderKindV1::Native => {
+                async {
+                    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&inputs.graph)));
+                    let port = native_provider::project_native_memory_application_port_off_runtime(
+                        graph_cell,
+                        inputs.canonical_project_path.clone(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        format!("could not construct project Native application port: {error}")
+                    })?;
+                    let port = match inputs.native_port_interposition.as_ref() {
+                        Some(interpose) => interpose(port),
+                        None => port,
+                    };
+                    let provider = Arc::new(NativeProvider::new(port).map_err(|error| {
                         format!("could not construct Native provider: {error}")
                     })?);
-                let provider_id =
-                    tracedecay_memory_provider_registry::OwnedProviderId::new(kind.provider_id())
-                        .map_err(|error| error.to_string())?;
-                let registration = ProviderRegistrationV1 {
-                    provider_id,
-                    provider,
-                    registration_revision: 1,
-                    mode,
-                    execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
-                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(
-                        NATIVE_RECALL_SCOPE_BINDINGS.iter().copied(),
+                    let provider_id = tracedecay_memory_provider_registry::OwnedProviderId::new(
+                        kind.provider_id(),
                     )
-                    .map_err(|error| error.to_string())?,
-                    lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
-                };
-                let mount = ConfiguredObservationProviderMountV1 {
-                    mount: native_observation_mount(&inputs.graph.store_layout().data_root, 1)
+                    .map_err(|error| error.to_string())?;
+                    let registration = ProviderRegistrationV1 {
+                        provider_id,
+                        provider,
+                        registration_revision: 1,
+                        mode,
+                        execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                        recall_scope_bindings: RecallScopeBindingsV1::from_wire(
+                            NATIVE_RECALL_SCOPE_BINDINGS.iter().copied(),
+                        )
                         .map_err(|error| error.to_string())?,
-                    requirement,
-                    activation: if requirement == ObservationMountRequirementV1::Required {
-                        ObservationMountActivationV1::BeforePublication
-                    } else {
-                        ObservationMountActivationV1::AfterPublication
-                    },
-                };
-                Ok((registration, mount))
+                        lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                    };
+                    let mount = ConfiguredObservationProviderMountV1 {
+                        mount: native_observation_mount(&inputs.graph.store_layout().data_root, 1)
+                            .map_err(|error| error.to_string())?,
+                        requirement,
+                        activation: if requirement == ObservationMountRequirementV1::Required {
+                            ObservationMountActivationV1::BeforePublication
+                        } else {
+                            ObservationMountActivationV1::AfterPublication
+                        },
+                    };
+                    Ok((registration, mount))
+                }
+                .await
             }
-            .await,
             MemoryProviderKindV1::Ncm => {
                 let factory = inputs
                     .ncm_registration_factory

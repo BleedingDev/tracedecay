@@ -87,13 +87,8 @@ fn corpus() -> ScenarioCorpus {
 
 fn native_provider(fixture: &StoreFixture) -> NativeProvider {
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(
-        graph_cell,
-        fixture.project_root.clone(),
-        tracedecay_domain::UserProfileId::new("profile.native-baseline").expect("profile id"),
-        &super::test_provider_state_root(&fixture.project_root),
-    )
-    .expect("construct project Native application port");
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, fixture.project_root.clone())
+        .expect("construct project Native application port");
     NativeProvider::new(Arc::new(port)).expect("construct Native provider")
 }
 

@@ -95,7 +95,6 @@ SERVICE_PROVIDER_FILES = (
     SERVICE_OWNER_ROOT / "native_provider_tests.rs",
     SERVICE_OWNER_ROOT / "native_provider_parity_tests.rs",
     SERVICE_OWNER_ROOT / "native_baseline_tests.rs",
-    SERVICE_OWNER_ROOT / "native_staged_observations.rs",
     SERVICE_OWNER_ROOT / "native_common_tests.rs",
     SERVICE_OWNER_ROOT / "native_common_factory_tests.rs",
     SERVICE_OWNER_ROOT / "claude_host_journey_tests.rs",
@@ -108,7 +107,6 @@ SERVICE_PROVIDER_FILES = (
 SERVICE_MODULE_DECLARATIONS = {
     "cognitive_recall": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod cognitive_recall;',
     "native_provider": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod native_provider;',
-    "native_staged_observations": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod native_staged_observations;',
     "observation_journey": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod observation_journey;',
     "provider_control": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod provider_control;',
     "provider_history": '#[cfg(feature = "memory-provider-host")]\npub(crate) mod provider_history;',
