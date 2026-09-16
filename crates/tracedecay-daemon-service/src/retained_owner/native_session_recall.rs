@@ -596,7 +596,10 @@ fn admit_result(
     let source_anchor = metadata
         .as_ref()
         .and_then(|value| {
-            metadata_string(Some(value), &["source_anchor_id", "source_retrieval_anchor_id"])
+            metadata_string(
+                Some(value),
+                &["source_anchor_id", "source_retrieval_anchor_id"],
+            )
         })
         .and_then(|value| RetrievalAnchorId::new(value.to_owned()).ok())
         .unwrap_or_else(|| observation_anchor.clone());
@@ -999,7 +1002,7 @@ mod tests {
             "recall",
             None,
             mode,
-            RetrievalGrainV1::Message,
+            RetrievalGrainV1::Occurrence,
             16,
             DiversityLimits::unbounded(),
             ContextBudget {
