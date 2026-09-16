@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_code_index::clones::{CloneExactKeyV1, CloneNormalizationClassV1};
 use tracedecay_domain::{
-    AuthorizationRevision, CodeGenerationId, ManifestDigest, PrincipalId, QueryDigest,
-    RetrievalCursorKeyId, RetrievalRequest, SymbolOccurrenceId, UtcMicros, canonical_sha256,
+    canonical_sha256, AuthorizationRevision, CodeGenerationId, ManifestDigest, PrincipalId,
+    QueryDigest, RetrievalCursorKeyId, RetrievalRequest, SymbolOccurrenceId, UtcMicros,
 };
 
 use crate::retrieval::{QueryAuthorityErrorV1, QueryAuthorityV1};
@@ -866,9 +866,9 @@ mod tests {
     use super::*;
     use crate::retrieval::fusion::RetrievalCursorKeyringV1;
     use tracedecay_domain::{
-        CalibrationProfileId, DiversityPolicy, FusionProfile, RetrievalAnchorId, RetrievalBudget,
-        RetrievalScope, RetrievalSnapshot, RetrieverKind, ScoreDomainCalibrationV1,
-        SingleRootScopeV1, TemporalModeV1, VectorWatermark,
+        CalibrationProfileId, DiversityPolicy, FreshnessVectorDigest, FusionProfile,
+        RetrievalAnchorId, RetrievalBudget, RetrievalScope, RetrievalSnapshot, RetrieverKind,
+        ScoreDomainCalibrationV1, SingleRootScopeV1, TemporalModeV1, VectorWatermark,
     };
 
     fn id<T>(value: &str) -> T
@@ -907,7 +907,10 @@ mod tests {
             temporal_mode: TemporalModeV1::Current,
             snapshot: RetrievalSnapshot {
                 watermarks: VectorWatermark::default(),
-                freshness_digest: digest("freshness.clone-cursor"),
+                freshness_digest: FreshnessVectorDigest::new(
+                    digest("freshness.clone-cursor").as_str().to_owned(),
+                )
+                .expect("valid fixture freshness digest"),
                 authorization_revision: id("authorization.clone-cursor.v1"),
                 captured_at: UtcMicros(7),
             },
@@ -1230,9 +1233,9 @@ mod tests {
     fn authenticated_cursor_rejects_tampering_and_preserves_stale_binding_failures() {
         let request = request();
         let authority = authority(&request);
-        let codec = codec(&request, &authority);
+        let cursor_codec = codec(&request, &authority);
         let (artifact, generation, snapshot, descriptor) = artifact_args();
-        let encoded = codec
+        let encoded = cursor_codec
             .issue_artifact(
                 artifact.clone(),
                 generation.clone(),
@@ -1256,7 +1259,7 @@ mod tests {
             hex::encode(serde_json::to_vec(&wire).unwrap())
         );
         assert_eq!(
-            codec.decode_artifact(
+            cursor_codec.decode_artifact(
                 &forged,
                 &artifact,
                 &generation,
@@ -1269,7 +1272,7 @@ mod tests {
 
         let wrong_generation = id("generation.clone-cursor.v2");
         assert_eq!(
-            codec.decode_artifact(
+            cursor_codec.decode_artifact(
                 &encoded,
                 &artifact,
                 &wrong_generation,
@@ -1281,7 +1284,7 @@ mod tests {
         );
         let wrong_descriptor = digest("descriptor.clone-cursor.v2");
         assert_eq!(
-            codec.decode_artifact(
+            cursor_codec.decode_artifact(
                 &encoded,
                 &artifact,
                 &generation,
@@ -1292,7 +1295,7 @@ mod tests {
             Err(CloneCursorErrorV1::Stale)
         );
         assert_eq!(
-            codec.decode_artifact(
+            cursor_codec.decode_artifact(
                 &encoded,
                 &artifact,
                 &generation,
