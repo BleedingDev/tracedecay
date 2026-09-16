@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::embedding::{
-    KEYWORD_AFFECT_SIGNAL_SOURCE, MANIFEST_FILENAME, MAX_INPUT_BYTES, MODEL_NAME, MiniLmEncoder,
-    PinnedEncoder, extract_keyword_affect, install, is_model_cached, offline_probe,
+    KEYWORD_AFFECT_SIGNAL_SOURCE, MANIFEST_FILENAME, MAX_INPUT_BYTES, MODEL_NAME, MODEL_REPOSITORY,
+    MODEL_REVISION, MODEL_REVISION_PROVENANCE, MiniLmEncoder, PinnedEncoder,
+    extract_keyword_affect, install, is_model_cached, offline_probe,
 };
 use tracedecay_memory_ncm_runtime::ports::{Deadline, EncoderError, StateRoot, TextEncoder};
 
@@ -67,6 +68,96 @@ fn hash_encoder_is_rejected_by_real_model_identity_gate() {
 }
 
 #[test]
+fn reference_manifest_binds_the_immutable_xenova_source() {
+    let manifest = PinnedEncoder::reference().expect("checked-in reference manifest");
+    assert_eq!(manifest.repository, MODEL_REPOSITORY);
+    assert_eq!(manifest.revision, MODEL_REVISION);
+    assert_eq!(manifest.revision_provenance, MODEL_REVISION_PROVENANCE);
+    assert_eq!(manifest.revision.len(), 40);
+    assert!(
+        manifest
+            .revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    );
+}
+
+#[test]
+fn offline_open_rejects_ambient_model_overrides_without_mutating_state_root() {
+    const CHILD_ENV: &str = "TRACEDECAY_NCM_MODEL_OVERRIDE_CHILD";
+
+    if let Some(variable) = std::env::var_os(CHILD_ENV) {
+        let directory = tempfile::tempdir().expect("create empty root");
+        let root = StateRoot::new(directory.path()).expect("temporary root is absolute");
+        let expected = PinnedEncoder::reference().expect("checked-in reference manifest");
+        let before = directory_entries(directory.path());
+        let result = MiniLmEncoder::open(&root, &expected);
+        let detail = match result {
+            Err(EncoderError::ArtifactMismatch(detail)) => detail,
+            _ => panic!("ambient override should be rejected"),
+        };
+        assert!(
+            detail.contains(variable.to_string_lossy().as_ref()),
+            "override rejection did not name {variable:?}: {detail}"
+        );
+        assert_eq!(directory_entries(directory.path()), before);
+        assert!(!root.models_dir().exists());
+        assert!(!is_model_cached(&root));
+        let install_result = install(&root, DEADLINE);
+        let install_detail = match install_result {
+            Err(EncoderError::ArtifactMismatch(detail)) => detail,
+            _ => panic!("ambient override should block install before download"),
+        };
+        assert!(
+            install_detail.contains(variable.to_string_lossy().as_ref()),
+            "install override rejection did not name {variable:?}: {install_detail}"
+        );
+        assert_eq!(directory_entries(directory.path()), before);
+        assert!(!root.models_dir().exists());
+        return;
+    }
+
+    let test_binary = std::env::current_exe().expect("current test binary");
+    for (variable, value) in [
+        ("HF_HOME", "/tmp/tracedecay-ncm-ambient-hf-home"),
+        ("HF_ENDPOINT", "https://untrusted.invalid"),
+        (
+            "FASTEMBED_CACHE_DIR",
+            "/tmp/tracedecay-ncm-ambient-fastembed-cache",
+        ),
+    ] {
+        let status = Command::new(&test_binary)
+            .args([
+                "--exact",
+                "offline_open_rejects_ambient_model_overrides_without_mutating_state_root",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, variable)
+            .env(variable, value)
+            .status()
+            .expect("spawn isolated override check");
+        assert!(
+            status.success(),
+            "override check failed for {variable} with {status}"
+        );
+    }
+}
+
+#[test]
+fn offline_probe_rejects_a_manifest_with_unverified_digests() {
+    let directory = tempfile::tempdir().expect("create model root");
+    let root = StateRoot::new(directory.path()).expect("temporary root is absolute");
+    let expected = PinnedEncoder::reference().expect("checked-in reference manifest");
+    fs::create_dir_all(root.models_dir()).expect("create models directory");
+    let mut altered = expected.clone();
+    altered.files[0].sha256 = "0".repeat(64);
+    let bytes = serde_json::to_vec(&altered).expect("serialize altered manifest");
+    fs::write(root.models_dir().join(MANIFEST_FILENAME), bytes).expect("write altered manifest");
+    assert!(!is_model_cached(&root));
+    assert!(!offline_probe(&root));
+}
+
+#[test]
 fn empty_root_is_missing_without_download_or_filesystem_mutation() {
     let directory = tempfile::tempdir().expect("create empty root");
     let root = StateRoot::new(directory.path()).expect("temporary root is absolute");
@@ -110,6 +201,12 @@ fn real_encoder_install_open_and_fixture_behavior() {
     let local_manifest = PinnedEncoder::from_path(root.models_dir().join(MANIFEST_FILENAME))
         .expect("install manifest should be readable");
     assert_eq!(local_manifest, expected);
+    assert_eq!(local_manifest.repository, MODEL_REPOSITORY);
+    assert_eq!(local_manifest.revision, MODEL_REVISION);
+    assert_eq!(
+        local_manifest.revision_provenance,
+        MODEL_REVISION_PROVENANCE
+    );
 
     let rss_before = process_rss_kib();
     let cold_started = Instant::now();
@@ -221,6 +318,8 @@ fn real_encoder_install_open_and_fixture_behavior() {
         MiniLmEncoder::open(&corrupt_root, &expected),
         Err(EncoderError::ArtifactMismatch(_))
     ));
+    assert!(!is_model_cached(&corrupt_root));
+    assert!(!offline_probe(&corrupt_root));
     fs::copy(
         cached_file(&root, "tokenizer.json"),
         &corrupt_tokenizer_path,
@@ -236,6 +335,8 @@ fn real_encoder_install_open_and_fixture_behavior() {
         MiniLmEncoder::open(&corrupt_root, &expected),
         Err(EncoderError::ArtifactMismatch(_))
     ));
+    assert!(!is_model_cached(&corrupt_root));
+    assert!(!offline_probe(&corrupt_root));
 
     compare_optional_oracle(&encoder);
 
@@ -261,6 +362,7 @@ fn directory_entries(path: &Path) -> Vec<String> {
 fn cached_file(root: &StateRoot, relative: &str) -> PathBuf {
     let repository = root.models_dir().join(CACHE_REPOSITORY_DIR);
     let revision = fs::read_to_string(repository.join("refs/main")).expect("read cache revision");
+    assert_eq!(revision.trim(), MODEL_REVISION);
     repository
         .join("snapshots")
         .join(revision.trim())
@@ -273,6 +375,7 @@ fn copy_cached_artifacts(source: &StateRoot, destination: &StateRoot) {
     let revision =
         fs::read_to_string(source_repository.join("refs/main")).expect("read source revision");
     let revision = revision.trim();
+    assert_eq!(revision, MODEL_REVISION);
     let source_snapshot = source_repository.join("snapshots").join(revision);
     let destination_snapshot = destination_repository.join("snapshots").join(revision);
     fs::create_dir_all(&destination_snapshot).expect("create destination snapshot");

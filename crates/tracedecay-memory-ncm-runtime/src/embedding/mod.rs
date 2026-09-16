@@ -25,6 +25,10 @@ use tracedecay_memory_ncm_core::types::AffectVector;
 pub const MODEL_NAME: &str = "paraphrase-multilingual-MiniLM-L12-v2";
 /// Hugging Face repository used by the pinned fastembed model definition.
 pub const MODEL_REPOSITORY: &str = "Xenova/paraphrase-multilingual-MiniLM-L12-v2";
+/// Immutable Xenova snapshot verified by the tracked backend acceptance receipt.
+pub const MODEL_REVISION: &str = "2c4055b12046f11709e9df2c122e59ffbdc2f900";
+/// Tracked evidence for the immutable model revision.
+pub const MODEL_REVISION_PROVENANCE: &str = "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json#/identities/model/revision";
 /// Primary model input limit, including the model's special tokens.
 pub const MAX_LENGTH: usize = 128;
 /// Maximum UTF-8 byte length accepted for one encoder input.
@@ -132,6 +136,7 @@ fn keyword_channel(
 }
 
 const CACHE_REPOSITORY_DIR: &str = "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2";
+const MODEL_OVERRIDE_ENV_VARS: [&str; 3] = ["HF_HOME", "HF_ENDPOINT", "FASTEMBED_CACHE_DIR"];
 const REQUIRED_FILES: [&str; 5] = [
     "onnx/model.onnx",
     "tokenizer.json",
@@ -160,6 +165,12 @@ pub struct EncoderFile {
 pub struct PinnedEncoder {
     /// Short runtime model identity.
     pub model: String,
+    /// Exact model repository used for the runtime artifact.
+    pub repository: String,
+    /// Immutable repository snapshot revision.
+    pub revision: String,
+    /// Repository-local evidence binding the revision to a verified receipt.
+    pub revision_provenance: String,
     /// Files required to construct and tokenize the model.
     pub files: Vec<EncoderFile>,
     /// Maximum tokenizer sequence length.
@@ -182,6 +193,9 @@ impl PinnedEncoder {
     ) -> Self {
         Self {
             model: model.into(),
+            repository: MODEL_REPOSITORY.to_owned(),
+            revision: MODEL_REVISION.to_owned(),
+            revision_provenance: MODEL_REVISION_PROVENANCE.to_owned(),
             files,
             max_length,
             pooling: pooling.into(),
@@ -230,14 +244,15 @@ impl Default for PinnedEncoder {
 /// only reads the cache and never creates directories or contacts the network.
 #[must_use]
 pub fn is_model_cached(root: &StateRoot) -> bool {
-    let models_dir = root.models_dir();
-    let snapshot = match cache_snapshot(&models_dir) {
-        Ok(path) => path,
+    if ensure_authoritative_environment().is_err() {
+        return false;
+    }
+    let expected = match PinnedEncoder::reference() {
+        Ok(expected) => expected,
         Err(_) => return false,
     };
-    REQUIRED_FILES
-        .iter()
-        .all(|relative| snapshot.join(relative).is_file())
+    let models_dir = root.models_dir();
+    verify_cached_state(&models_dir, &expected).is_ok()
 }
 
 /// Alias for [`is_model_cached`] that makes the offline nature explicit.
@@ -256,6 +271,9 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
     if deadline.remaining_ms == 0 {
         return Err(EncoderError::Cancelled);
     }
+    ensure_authoritative_environment()?;
+    let reference = PinnedEncoder::reference()?;
+    ensure_manifest_is_pinned(&reference)?;
 
     #[cfg(feature = "real-encoder")]
     {
@@ -276,7 +294,6 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
         }
 
         let manifest = manifest_from_cache(&models_dir)?;
-        let reference = PinnedEncoder::reference()?;
         ensure_pinned_metadata(&manifest, &reference)?;
         write_manifest(&models_dir, &manifest)?;
         let model = manifest.model.clone();
@@ -320,7 +337,9 @@ impl MiniLmEncoder {
     /// path is the hard deadline for a hung inference; this method only
     /// performs the preflight checks needed to keep opening offline.
     pub fn open(root: &StateRoot, expected: &PinnedEncoder) -> Result<Self, EncoderError> {
+        ensure_authoritative_environment()?;
         let reference = PinnedEncoder::reference()?;
+        ensure_manifest_is_pinned(&reference)?;
         ensure_pinned_metadata(expected, &reference)?;
         ensure_pinned_metadata(&reference, expected)?;
 
@@ -328,7 +347,7 @@ impl MiniLmEncoder {
         let local = read_manifest(&models_dir.join(MANIFEST_FILENAME), true)?;
         ensure_pinned_metadata(&local, expected)?;
         ensure_pinned_metadata(expected, &local)?;
-        verify_local_artifacts(&models_dir, &local)?;
+        verify_local_artifacts(&models_dir, &local, Some(expected.revision.as_str()))?;
         let artifact_sha256 = local.artifact_sha256().ok_or_else(|| {
             EncoderError::ArtifactMismatch("manifest has no ONNX digest".to_owned())
         })?;
@@ -340,14 +359,12 @@ impl MiniLmEncoder {
 
         #[cfg(feature = "real-encoder")]
         {
-            let options =
-                fastembed::TextInitOptions::new(fastembed::EmbeddingModel::ParaphraseMLMiniLML12V2)
-                    .with_cache_dir(models_dir)
-                    .with_max_length(MAX_LENGTH)
-                    .with_show_download_progress(false);
-            let model = fastembed::TextEmbedding::try_new(options).map_err(|error| {
-                EncoderError::Inference(format!("open verified encoder: {error}"))
-            })?;
+            let model = load_verified_model(&models_dir, &local)?;
+            let model = fastembed::TextEmbedding::try_new_from_user_defined(
+                model,
+                fastembed::InitOptionsUserDefined::new().with_max_length(MAX_LENGTH),
+            )
+            .map_err(|error| EncoderError::Inference(format!("open verified encoder: {error}")))?;
             Ok(Self {
                 model: Mutex::new(model),
                 identity,
@@ -553,6 +570,21 @@ fn read_manifest(path: &Path, local: bool) -> Result<PinnedEncoder, EncoderError
     })
 }
 
+fn ensure_authoritative_environment() -> Result<(), EncoderError> {
+    for variable in MODEL_OVERRIDE_ENV_VARS {
+        if std::env::var_os(variable).is_some() {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "ambient {variable} override is forbidden; use the admitted state root"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_manifest_is_pinned(manifest: &PinnedEncoder) -> Result<(), EncoderError> {
+    validate_manifest_shape(manifest)
+}
+
 fn ensure_pinned_metadata(
     actual: &PinnedEncoder,
     expected: &PinnedEncoder,
@@ -560,6 +592,9 @@ fn ensure_pinned_metadata(
     validate_manifest_shape(actual)?;
     validate_manifest_shape(expected)?;
     if actual.model != expected.model
+        || actual.repository != expected.repository
+        || actual.revision != expected.revision
+        || actual.revision_provenance != expected.revision_provenance
         || actual.max_length != expected.max_length
         || actual.pooling != expected.pooling
         || actual.normalize != expected.normalize
@@ -590,15 +625,37 @@ fn ensure_pinned_metadata(
     Ok(())
 }
 
+fn verify_cached_state(models_dir: &Path, expected: &PinnedEncoder) -> Result<(), EncoderError> {
+    ensure_manifest_is_pinned(expected)?;
+    let local = read_manifest(&models_dir.join(MANIFEST_FILENAME), true)?;
+    ensure_pinned_metadata(&local, expected)?;
+    ensure_pinned_metadata(expected, &local)?;
+    verify_local_artifacts(models_dir, &local, Some(expected.revision.as_str()))
+}
+
 fn validate_manifest_shape(manifest: &PinnedEncoder) -> Result<(), EncoderError> {
     if manifest.model != MODEL_NAME
+        || manifest.repository != MODEL_REPOSITORY
+        || manifest.revision != MODEL_REVISION
+        || manifest.revision_provenance != MODEL_REVISION_PROVENANCE
         || manifest.max_length != MAX_LENGTH
         || manifest.pooling != "mean"
         || !manifest.normalize
         || manifest.files.len() != REQUIRED_FILES.len()
     {
         return Err(EncoderError::ArtifactMismatch(
-            "unsupported encoder model, pooling, normalization, or sequence length".to_owned(),
+            "unsupported encoder source, model, pooling, normalization, or sequence length"
+                .to_owned(),
+        ));
+    }
+    if !is_immutable_revision(&manifest.revision) {
+        return Err(EncoderError::ArtifactMismatch(
+            "encoder manifest lacks an immutable Xenova revision".to_owned(),
+        ));
+    }
+    if !is_safe_provenance(&manifest.revision_provenance) {
+        return Err(EncoderError::ArtifactMismatch(
+            "encoder manifest has invalid revision provenance".to_owned(),
         ));
     }
     for required in REQUIRED_FILES {
@@ -630,7 +687,26 @@ fn is_safe_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn cache_snapshot(models_dir: &Path) -> Result<PathBuf, EncoderError> {
+fn is_immutable_revision(revision: &str) -> bool {
+    revision.len() == 40
+        && revision
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_safe_provenance(provenance: &str) -> bool {
+    let candidate = Path::new(provenance);
+    !provenance.is_empty()
+        && !candidate.is_absolute()
+        && candidate
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn cache_snapshot(
+    models_dir: &Path,
+    expected_revision: Option<&str>,
+) -> Result<PathBuf, EncoderError> {
     let repository = models_dir.join(CACHE_REPOSITORY_DIR);
     let revision_path = repository.join("refs").join("main");
     let revision = fs::read_to_string(&revision_path).map_err(|error| {
@@ -641,14 +717,17 @@ fn cache_snapshot(models_dir: &Path) -> Result<PathBuf, EncoderError> {
         }
     })?;
     let revision = revision.trim();
-    if revision.is_empty()
-        || Path::new(revision)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    if !is_immutable_revision(revision) {
         return Err(EncoderError::ArtifactMismatch(
             "invalid cached model revision".to_owned(),
         ));
+    }
+    if let Some(expected_revision) = expected_revision {
+        if revision != expected_revision {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "cached model revision {revision} differs from pinned Xenova revision"
+            )));
+        }
     }
     let snapshot = repository.join("snapshots").join(revision);
     if !snapshot.is_dir() {
@@ -661,7 +740,7 @@ fn cache_snapshot(models_dir: &Path) -> Result<PathBuf, EncoderError> {
 
 #[cfg(feature = "real-encoder")]
 fn manifest_from_cache(models_dir: &Path) -> Result<PinnedEncoder, EncoderError> {
-    let snapshot = cache_snapshot(models_dir)?;
+    let snapshot = cache_snapshot(models_dir, Some(MODEL_REVISION))?;
     let mut files = Vec::with_capacity(REQUIRED_FILES.len());
     for relative in REQUIRED_FILES {
         let path = snapshot.join(relative);
@@ -684,8 +763,12 @@ fn manifest_from_cache(models_dir: &Path) -> Result<PinnedEncoder, EncoderError>
     ))
 }
 
-fn verify_local_artifacts(models_dir: &Path, manifest: &PinnedEncoder) -> Result<(), EncoderError> {
-    let snapshot = cache_snapshot(models_dir)?;
+fn verify_local_artifacts(
+    models_dir: &Path,
+    manifest: &PinnedEncoder,
+    expected_revision: Option<&str>,
+) -> Result<(), EncoderError> {
+    let snapshot = cache_snapshot(models_dir, expected_revision)?;
     for file in &manifest.files {
         let path = snapshot.join(&file.path);
         let metadata = fs::metadata(&path).map_err(|error| {
@@ -710,6 +793,35 @@ fn verify_local_artifacts(models_dir: &Path, manifest: &PinnedEncoder) -> Result
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "real-encoder")]
+fn load_verified_model(
+    models_dir: &Path,
+    manifest: &PinnedEncoder,
+) -> Result<fastembed::UserDefinedEmbeddingModel, EncoderError> {
+    let snapshot = cache_snapshot(models_dir, Some(manifest.revision.as_str()))?;
+    let read_artifact = |relative: &str| {
+        let path = snapshot.join(relative);
+        fs::read(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                EncoderError::ArtifactsMissing(path.display().to_string())
+            } else {
+                EncoderError::ArtifactMismatch(format!("read {}: {error}", relative))
+            }
+        })
+    };
+    let tokenizer_files = fastembed::TokenizerFiles {
+        tokenizer_file: read_artifact("tokenizer.json")?,
+        config_file: read_artifact("config.json")?,
+        special_tokens_map_file: read_artifact("special_tokens_map.json")?,
+        tokenizer_config_file: read_artifact("tokenizer_config.json")?,
+    };
+    Ok(fastembed::UserDefinedEmbeddingModel::new(
+        read_artifact("onnx/model.onnx")?,
+        tokenizer_files,
+    )
+    .with_pooling(fastembed::Pooling::Mean))
 }
 
 fn digest_file(path: &Path) -> Result<String, EncoderError> {

@@ -52,8 +52,10 @@ python3 scripts/product/ncm/check-backend.py \
   --install-model
 ```
 
-The installer publishes `models/ncm-encoder-manifest.json`, resolves the Xenova snapshot under
-`models/models--Xenova--paraphrase-multilingual-MiniLM-L12-v2/`, and verifies every byte:
+The installer publishes `models/ncm-encoder-manifest.json`, resolves the exact Xenova snapshot
+`2c4055b12046f11709e9df2c122e59ffbdc2f900` under
+`models/models--Xenova--paraphrase-multilingual-MiniLM-L12-v2/`, and verifies every byte. The
+revision is backed by the tracked backend receipt referenced by the machine-readable manifest:
 
 | Relative file | Bytes | SHA-256 |
 |---|---:|---|
@@ -64,7 +66,11 @@ The installer publishes `models/ncm-encoder-manifest.json`, resolves the Xenova 
 | `tokenizer_config.json` | 496 | `3f5961b9ac86288cccdb97f32fb848d6187c78e1603958c53f3ea1f296b7d8a2` |
 
 The frozen model profile is `paraphrase-multilingual-MiniLM-L12-v2`, 384 dimensions, 128-token
-maximum, masked mean pooling, and L2 normalization. See
+maximum, masked mean pooling, and L2 normalization. Runtime opening reads the five verified files
+from this exact state root through fastembed's user-defined model API; it never asks fastembed to
+resolve a repository or use ambient caches. `HF_HOME`, `HF_ENDPOINT`, and `FASTEMBED_CACHE_DIR`
+are rejected when the NCM runtime is opened or installed, so an ambient cache or mirror cannot
+silently replace the admitted bytes. See
 `product/ncm/reference/embedding-manifest.json` for the machine-readable pin.
 
 ## Experimental daemon observer

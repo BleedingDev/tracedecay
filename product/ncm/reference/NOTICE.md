@@ -27,5 +27,9 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 
 No CC BY-NC supplementary material (BioCortexAI documentation) is copied into product artifacts.
 The embedding model `paraphrase-multilingual-MiniLM-L12-v2` is Apache-2.0 (sentence-transformers);
-the ONNX export is loaded from the `Xenova` mirror and pinned by digest in `embedding-manifest.json`.
+the ONNX export is loaded from the `Xenova` mirror at immutable revision
+`2c4055b12046f11709e9df2c122e59ffbdc2f900` and pinned by digest in
+`embedding-manifest.json`. The revision is evidenced by the tracked backend receipt named in
+that manifest. Runtime opening consumes the verified state-root bytes directly; ambient
+Hugging Face cache and endpoint overrides are rejected.
 Python remains a reference oracle only and is never shipped.

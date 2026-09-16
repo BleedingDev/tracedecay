@@ -31,9 +31,12 @@
   ],
   "model": {
     "name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    "rust_artifact_source": "Xenova/paraphrase-multilingual-MiniLM-L12-v2 (onnx/model.onnx) via fastembed EmbeddingModel::ParaphraseMLMiniLML12V2",
+    "rust_artifact_source": "Xenova/paraphrase-multilingual-MiniLM-L12-v2 (onnx/model.onnx) via verified local bytes and fastembed UserDefinedEmbeddingModel",
+    "rust_repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
+    "rust_revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+    "rust_revision_provenance": "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json#/identities/model/revision",
     "dim": 384, "max_seq_length": 128, "pooling": "mean", "normalize": true,
-    "artifact_sha256": "blocked_until_ncm-rs-012_downloads_and_pins (see embedding-manifest.json)"
+    "artifact_sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113"
   },
   "source_categories": {
     "mit_reference_code": "Biomem files above; ported algorithm structure, MIT notice preserved in NOTICE.md",
