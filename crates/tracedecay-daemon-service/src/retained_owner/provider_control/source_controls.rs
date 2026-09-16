@@ -18,9 +18,9 @@ use tracedecay_memory_provider_registry::{
 
 use super::super::cognitive_recall::control_attribution::RetainedRecallControlScopeV1;
 use super::super::provider_history::{
-    original_source_fence_digest, resolved_replay_observation, retained_history_source,
+    original_source_fence_digest, retained_history_source, source_attribution_json,
 };
-use super::authority::ProviderSourceIntentActionErrorV1;
+use super::authority::{ProviderSourceIntentActionErrorV1, ResolvedCanonicalControlObservationV1};
 use super::feedback_receipt::{
     AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1, HostSourceCommandErrorV1,
 };
@@ -286,23 +286,14 @@ async fn prepare_correction<'request>(
                 .authority()?
                 .prepare_replacement_observation(&source.authorized, &invocation.control)
                 .await?;
+            validate_replacement_admission(&resolved)?;
             source.authorized = resolved.source;
             port.require_same_state(target_state, &source)?;
             validate_replacement_lineage(original, &source.granted_source()?.attribution)?;
-            let replay = resolved_replay_observation(&resolved.admitted)?;
-            let envelope = replay
-                .get("observation")
-                .ok_or_else(|| binding("resolved canonical replacement envelope"))?;
-            let bytes = tracedecay_domain::canonical_json_bytes(envelope)
-                .map_err(|_| binding("canonical replacement encoding"))?;
-            let digest = tracedecay_domain::canonical_sha256(envelope)
-                .map_err(|_| binding("canonical replacement digest"))?;
-            let observation = CanonicalPayload::new(
-                resolved.admitted.payload.contract_id.clone(),
-                bytes,
-                digest.as_str().trim_start_matches("sha256:"),
-            )
-            .map_err(|_| binding("canonical replacement envelope"))?;
+            // The admitted payload is already sanitized, canonical, and digest
+            // bound. Preserve those exact bytes; replay metadata belongs beside
+            // the payload and must never become replacement content.
+            let observation = resolved.admitted.payload.clone();
             Ok(PreparedCorrectionV1::Replacement {
                 selector: replacement_source,
                 source,
@@ -346,6 +337,50 @@ async fn prepare_correction<'request>(
             })
         }
     }
+}
+
+/// Binds a correction replacement to the exact admitted delivery row that the
+/// host freshly authorized. A replacement may reuse those bytes, but it cannot
+/// be reconstructed from replay metadata or a provider supplied projection.
+fn validate_replacement_admission(
+    resolved: &ResolvedCanonicalControlObservationV1,
+) -> ControlResult<()> {
+    let source = &resolved.source;
+    let admitted = resolved.admitted.as_ref();
+    admitted
+        .validate()
+        .map_err(|_| binding("replacement admitted observation"))?;
+    resolved
+        .receipt
+        .validate()
+        .map_err(|_| binding("replacement delivery receipt"))?;
+    let [granted] = source.grant.sources.as_slice() else {
+        return Err(binding("replacement canonical source grant"));
+    };
+    if source.grant.destination_scope != source.retained.scope.delivery_scope
+        || admitted.target.provider_id != source.retained.scope.provider_id
+        || admitted.target.registration_revision != source.retained.scope.registration_revision
+        || admitted.exact_scope != source.retained.scope.delivery_scope
+        || admitted.source.source_event_id != granted.attribution.source.observation_id
+        || admitted.source.source_sequence.0 != granted.attribution.source_sequence
+        || admitted.source.settled_at_unix_micros.checked_mul(1_000)
+            != Some(granted.attribution.ingested_at_utc_nanos)
+        || resolved.receipt.observation_id != admitted.observation_id
+        || resolved.receipt.idempotency_key != admitted.idempotency_key
+        || resolved.receipt.payload_sha256 != admitted.payload.sha256
+        || resolved.receipt.extensions_digest != admitted.extensions_digest
+        || resolved.receipt.provider_id != admitted.target.provider_id
+        || resolved.receipt.registration_revision != admitted.target.registration_revision
+    {
+        return Err(binding("replacement admitted source or receipt"));
+    }
+    let payload: Value = serde_json::from_slice(&admitted.payload.bytes)
+        .map_err(|_| binding("replacement admitted payload"))?;
+    let expected_original = source_attribution_json(&granted.attribution)?;
+    if payload.pointer("/source_identity/original_source") != Some(&expected_original) {
+        return Err(binding("replacement admitted original source"));
+    }
+    Ok(())
 }
 
 fn validate_replacement_lineage(

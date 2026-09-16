@@ -837,13 +837,24 @@ where
                             .ok_or(AdvisoryAdmissionError::Invalid(
                                 "resolved replay observation",
                             ))?;
-                    let key = observation
+                    let key = item
                         .get("idempotency_key")
                         .and_then(Value::as_str)
                         .ok_or(AdvisoryAdmissionError::Invalid("resolved replay key"))?;
+                    let source_sequence =
+                        item.get("source_sequence").and_then(Value::as_u64).ok_or(
+                            AdvisoryAdmissionError::Invalid("resolved replay source sequence"),
+                        )?;
                     let admitted = self
                         .retained_admission(key, &call.exact_scope, call.registration_revision)
                         .map_err(advisory_error)?;
+                    if admitted.idempotency_key.as_str() != key
+                        || admitted.source.source_sequence.0 != source_sequence
+                    {
+                        return Err(AdvisoryAdmissionError::Denied(
+                            "replay admitted key or source sequence",
+                        ));
+                    }
                     let expected =
                         resolved_replay_observation(&admitted).map_err(advisory_error)?;
                     let receipt = item
@@ -1107,27 +1118,39 @@ fn source_attribution_from_json(value: &Value) -> HistoryResult<SourceAttributio
         .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("source attribution"))
 }
 
-/// Exact replay projection of a retained sanitized admission. The outer replay
-/// metadata is added without rewriting the journal's immutable payload bytes.
+/// Exact replay projection of a retained sanitized admission.
+///
+/// Replay metadata is carried beside the payload so the journal's immutable
+/// payload bytes remain byte-for-byte intact. The metadata is still derived
+/// from that admission and is therefore part of the host-authorized item, not
+/// a provider claim.
 pub(crate) fn resolved_replay_observation(
     admitted: &tracedecay_memory_observation::AdmittedObservationV1,
 ) -> HistoryResult<Value> {
     admitted
         .validate()
         .map_err(|_| ProviderHistoryErrorV1::Unavailable("retained replay admission"))?;
-    let mut observation: Value = serde_json::from_slice(&admitted.payload.bytes)
+    let observation: Value = serde_json::from_slice(&admitted.payload.bytes)
         .map_err(|_| ProviderHistoryErrorV1::Unavailable("retained replay payload"))?;
-    if observation
+    let original = observation
         .pointer("/source_identity/original_source")
-        .is_none()
-    {
-        return Err(ProviderHistoryErrorV1::Ineligible(
+        .ok_or(ProviderHistoryErrorV1::Ineligible(
             "retained replay original source",
+        ))?;
+    let original = source_attribution_from_json(original)?;
+    if admitted.source.source_event_id != original.source.observation_id
+        || admitted.source.source_sequence.0 != original.source_sequence
+    {
+        return Err(ProviderHistoryErrorV1::ClaimMismatch(
+            "retained replay source binding",
         ));
     }
-    observation["idempotency_key"] = json!(admitted.idempotency_key.as_str());
-    observation["source_sequence"] = json!(admitted.source.source_sequence.0);
-    Ok(json!({"receipt_ref":admitted.sanitization.receipt_id,"observation":observation}))
+    Ok(json!({
+        "receipt_ref": admitted.sanitization.receipt_id,
+        "idempotency_key": admitted.idempotency_key.as_str(),
+        "source_sequence": admitted.source.source_sequence.0,
+        "observation": observation,
+    }))
 }
 
 impl<S, D, O> ProviderHistoryReaderV1<'_, S, D, O>
@@ -2163,6 +2186,153 @@ mod tests {
                 TerminalCode::DeadlineExceeded
             ))
         ));
+    }
+
+    fn replay_admitted_fixture() -> tracedecay_memory_observation::AdmittedObservationV1 {
+        use tracedecay_memory_observation::{
+            AdmittedObservationV1, CanonicalSettlementReceiptV1, ForgetSourceKeyV1,
+            ObservationIdV1, ObservationIdempotencyKeyV1, ObservationPrivacyV1,
+            PrivacyClassificationV1, ProvenanceOriginV1, ProviderTargetV1, RetentionClassV1,
+            SanitizationBindingV1, SourceAuthorityV1, SourceSequenceV1, SourceStreamIdV1,
+            extensions_digest,
+        };
+        use tracedecay_memory_provider_registry::{
+            CanonicalPayload, OwnedVersionedId, PayloadSanitizationReceipt,
+            PayloadSanitizationReceiptParts,
+        };
+
+        let scope = OwnedExactScope::new(
+            "profile.fixture",
+            "project.fixture",
+            "repository.fixture",
+            "worktree.fixture",
+            "refs/heads/fixture",
+            "session.fixture",
+            format!("sha256:{}", "1".repeat(64)),
+        )
+        .expect("fixture scope");
+        let attribution = SourceAttribution {
+            source: OriginalSourceIdentity {
+                canonical_provider_id: OwnedProviderId::new("claude").expect("source provider"),
+                canonical_session_id: "session.fixture".to_owned(),
+                source_key: "source.fixture".to_owned(),
+                stable_record_id: None,
+                observation_id: "record.fixture.7".to_owned(),
+                source_revision: Some("revision.7".to_owned()),
+                content_sha256: "a".repeat(64),
+            },
+            origin_scope: OriginScopeEvidence::IngestionOnly,
+            source_sequence: 7,
+            occurred_at_utc_nanos: None,
+            ingested_at_utc_nanos: 1_750_000_000_000_000,
+            validity: RecordedValidity::default(),
+        };
+        let original = source_attribution_json(&attribution).expect("source attribution");
+        let value = json!({
+            "observation_kind": "session.message_committed.v1",
+            "payload_contract": "tracedecay.memory.observation.session-message.v1",
+            "canonical_payload": {"message": "exact fixture bytes"},
+            "source_identity": {"original_source": original},
+        });
+        let bytes = serde_json::to_vec(&value).expect("fixture payload");
+        let payload_sha256 = hex::encode(Sha256::digest(&bytes));
+        let payload = CanonicalPayload::new(
+            OwnedVersionedId::new("tracedecay.memory.observation.session-message.v1")
+                .expect("payload contract"),
+            bytes,
+            payload_sha256,
+        )
+        .expect("canonical payload");
+        let extensions = Vec::new();
+        let extensions_digest = extensions_digest(&extensions).expect("extensions digest");
+        let receipt = PayloadSanitizationReceipt::new(
+            PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
+                "observation-hygiene-policy.v1.3",
+                payload.sha256.clone(),
+                extensions_digest.clone(),
+            ),
+        )
+        .expect("sanitization receipt");
+        let mut admitted = AdmittedObservationV1 {
+            observation_id: ObservationIdV1::from_v7_parts(1_750_000_000_000, [7; 10])
+                .expect("observation id"),
+            idempotency_key: ObservationIdempotencyKeyV1::parse(&"0".repeat(64))
+                .expect("temporary key"),
+            target: ProviderTargetV1 {
+                provider_id: OwnedProviderId::new("tracedecay.native").expect("provider"),
+                provider_instance_id: "native.fixture".to_owned(),
+                registration_revision: 4,
+                ready_receipt_digest: "b".repeat(64),
+            },
+            exact_scope: scope,
+            source: CanonicalSettlementReceiptV1 {
+                source_authority: SourceAuthorityV1::HostSession,
+                commit_point_id: "fixture.commit".to_owned(),
+                source_event_id: "record.fixture.7".to_owned(),
+                source_event_revision: 1,
+                source_event_sha256: "c".repeat(64),
+                source_stream: SourceStreamIdV1::new("fixture.stream").expect("source stream"),
+                source_sequence: SourceSequenceV1(7),
+                settled_at_unix_micros: 1_750_000_000_000,
+                settlement_proof_sha256: "d".repeat(64),
+            },
+            observation_kind: OwnedVersionedId::new("session.message_committed.v1")
+                .expect("observation kind"),
+            payload,
+            extensions,
+            extensions_digest,
+            provenance_origin: ProvenanceOriginV1::Agent,
+            provenance_sha256: "e".repeat(64),
+            privacy: ObservationPrivacyV1 {
+                classification: PrivacyClassificationV1::Internal,
+                retention_class: RetentionClassV1::Project,
+                redaction_revision: 1,
+                content_policy_revision: 1,
+                forget_source_key: ForgetSourceKeyV1::new("forget:source.fixture")
+                    .expect("forget key"),
+                expires_at_unix_micros: 1_750_000_100_000,
+            },
+            sanitization: SanitizationBindingV1 {
+                receipt_id: receipt.receipt_id().to_owned(),
+                sanitizer_revision: receipt.sanitizer_revision().to_owned(),
+                source_payload_sha256: receipt.source_payload_sha256().to_owned(),
+                receipt_json: receipt.to_json(),
+            },
+            occurred_at_unix_micros: 1_749_999_999_000,
+            admitted_at_unix_micros: 1_750_000_000_000,
+            deadline_unix_micros: 1_750_000_100_000,
+            request_id: "fixture.request.7".to_owned(),
+            envelope_sha256: String::new(),
+        };
+        admitted.idempotency_key = admitted.derive_idempotency_key();
+        admitted.envelope_sha256 = admitted.expected_envelope_sha256();
+        admitted.validate().expect("valid admitted fixture");
+        admitted
+    }
+
+    #[test]
+    fn v2_replay_and_correction_keep_admitted_payload_bytes_exact() {
+        let admitted = replay_admitted_fixture();
+        let payload_bytes = admitted.payload.bytes.clone();
+        let payload: Value = serde_json::from_slice(&payload_bytes).expect("fixture JSON");
+        let resolved = resolved_replay_observation(&admitted).expect("replay projection");
+
+        assert_eq!(resolved["observation"], payload);
+        assert_eq!(
+            resolved["idempotency_key"],
+            admitted.idempotency_key.as_str()
+        );
+        assert_eq!(
+            resolved["source_sequence"],
+            admitted.source.source_sequence.0
+        );
+        assert!(payload.get("idempotency_key").is_none());
+        assert!(payload.get("source_sequence").is_none());
+        assert_eq!(admitted.payload.bytes, payload_bytes);
+        assert_eq!(
+            admitted.payload.sha256,
+            hex::encode(Sha256::digest(&payload_bytes))
+        );
     }
 }
 
