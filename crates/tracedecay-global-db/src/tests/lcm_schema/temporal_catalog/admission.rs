@@ -605,7 +605,11 @@ async fn released_v3_temporal_schema_requires_reset_without_mutation() {
     drop(db);
     seed_retained_sessions_and_messages(&db_path).await;
     let retained = retained_sessions_and_messages(&db_path).await;
-    assert_eq!(retained.len(), 5, "the fixture must seed sessions to retain");
+    assert_eq!(
+        retained.len(),
+        5,
+        "the fixture must seed sessions to retain"
+    );
     convert_final_temporal_schema_to_released_v3(&db_path).await;
 
     let before_catalog = temporal_schema_object_catalog(&db_path).await;
@@ -708,7 +712,10 @@ async fn v4_receipts_without_recovery_columns_require_reset_without_mutation() {
     let before_receipts = retained_relation_receipts(&db_path).await;
     let before_effect_journal_count = row_count(&db_path, "session_relation_effect_journal").await;
 
-    assert_eq!(before_columns, SESSION_RELATION_RECEIPT_COLUMNS_WITHOUT_RECOVERY);
+    assert_eq!(
+        before_columns,
+        SESSION_RELATION_RECEIPT_COLUMNS_WITHOUT_RECOVERY
+    );
     assert_eq!(temporal_schema_version(&db_path).await, 4);
 
     let error = match open_global_db(&db_path).await {
@@ -963,7 +970,7 @@ async fn unbound_released_v3_receipts_are_refused_without_fabricated_batch_count
     insert_released_v3_projection_receipts(&db_path, (5, 3, 2)).await;
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("unbound released-v3 receipts must be refused"),
+        Ok(_) => panic!("unbound released-v3 receipts must require reset"),
         Err(error) => error,
     };
     assert_eq!(
@@ -1015,7 +1022,7 @@ async fn valid_watermarks_unbound_released_v3_receipts_require_reset() {
     restore_schema_triggers(&db_path, &triggers).await;
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("unbound v3 duplicate-batch semantics must not be fabricated"),
+        Ok(_) => panic!("unbound v3 duplicate-batch semantics must require reset"),
         Err(error) => error,
     };
     let (authority, reason) = error.reset_required_context().unwrap();
@@ -1056,7 +1063,7 @@ async fn ambiguous_released_v3_refresh_progress_requires_reset() {
     restore_schema_triggers(&db_path, &triggers).await;
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("ambiguous released-v3 refresh progress must be refused"),
+        Ok(_) => panic!("ambiguous released-v3 refresh progress must require reset"),
         Err(error) => error,
     };
     let (authority, reason) = error.reset_required_context().unwrap();
@@ -1088,12 +1095,9 @@ async fn non_monotonic_released_v3_receipts_require_reset() {
     };
     let (authority, reason) = error
         .reset_required_context()
-        .expect("invalid released-v3 progress must return typed reset-required");
+        .expect("released-v3 admission must return typed reset-required");
     assert_eq!(authority, "session temporal");
-    assert!(
-        reason.contains("version 3"),
-        "unexpected reason: {reason}"
-    );
+    assert!(reason.contains("version 3"), "unexpected reason: {reason}");
     assert_eq!(temporal_schema_version(&db_path).await, 3);
     assert_eq!(
         persisted_column_names(&db_path, "session_temporal_projection_receipts").await,
@@ -1145,7 +1149,7 @@ async fn drifted_released_v3_temporal_shape_is_refused_without_mutation() {
     drop(raw_db);
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("drifted v3 receipt storage must not migrate"),
+        Ok(_) => panic!("drifted v3 receipt storage must require reset"),
         Err(error) => error,
     };
     assert_eq!(
@@ -1188,7 +1192,7 @@ async fn drifted_released_v3_temporal_trigger_is_refused_without_repair() {
         normalized_trigger_sql(&db_path, "session_refresh_progress_insert_guard_v1").await;
 
     let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("drifted v3 temporal triggers must not be repaired and migrated"),
+        Ok(_) => panic!("drifted v3 temporal triggers must require reset without repair"),
         Err(error) => error,
     };
     assert_eq!(
