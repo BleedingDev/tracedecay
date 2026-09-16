@@ -161,6 +161,92 @@ impl MemoryCenters {
         weights: CompoundWeights,
         top_k: usize,
     ) -> Result<ReadResult, CoreError> {
+        self.read_compound_internal(
+            query,
+            context,
+            terrain,
+            weights,
+            top_k,
+            top_k,
+            false,
+            |_, _, _| true,
+        )
+    }
+
+    /// Reads a bounded candidate set ordered by intensity-weighted activation.
+    ///
+    /// This is the over-fetch path for record-aware recall. `candidate_k`
+    /// bounds the returned center traces before a downstream record-admission
+    /// step applies its own, usually smaller, result bound. Candidates are ranked by
+    /// `raw_rbf_weight * intensity`, so a lower-RBF center with materially
+    /// higher intensity is not hidden by raw-RBF truncation.
+    pub fn read_compound_with_candidates(
+        &self,
+        query: &[f32],
+        context: Option<&[f32]>,
+        terrain: Option<&[f32]>,
+        weights: CompoundWeights,
+        candidate_k: usize,
+    ) -> Result<ReadResult, CoreError> {
+        self.read_compound_internal(
+            query,
+            context,
+            terrain,
+            weights,
+            candidate_k,
+            candidate_k,
+            true,
+            |_, _, _| true,
+        )
+    }
+
+    /// Reads a bounded, intensity-ranked candidate set with center admission.
+    ///
+    /// `candidate_k` is the maximum number of ranked centers considered. The
+    /// callback runs before the final `top_k` truncation and receives the exact
+    /// slot, the center's retained support IDs, and its raw
+    /// intensity-weighted activation. It is intended for record-aware callers
+    /// that must reject stale, deleted, excluded, or otherwise unadmitted
+    /// support before consuming the result bound.
+    pub fn read_compound_with_admission<F>(
+        &self,
+        query: &[f32],
+        context: Option<&[f32]>,
+        terrain: Option<&[f32]>,
+        weights: CompoundWeights,
+        top_k: usize,
+        candidate_k: usize,
+        admitted: F,
+    ) -> Result<ReadResult, CoreError>
+    where
+        F: FnMut(CenterSlot, &[RecordId], f32) -> bool,
+    {
+        self.read_compound_internal(
+            query,
+            context,
+            terrain,
+            weights,
+            top_k,
+            candidate_k,
+            true,
+            admitted,
+        )
+    }
+
+    fn read_compound_internal<F>(
+        &self,
+        query: &[f32],
+        context: Option<&[f32]>,
+        terrain: Option<&[f32]>,
+        weights: CompoundWeights,
+        top_k: usize,
+        candidate_k: usize,
+        rank_by_activation: bool,
+        mut admitted: F,
+    ) -> Result<ReadResult, CoreError>
+    where
+        F: FnMut(CenterSlot, &[RecordId], f32) -> bool,
+    {
         self.validate_read_layout()?;
         validate_dimension(query, self.config.d_key, "center read query")?;
         validate_finite(query, "center read query")?;
@@ -178,7 +264,7 @@ impl MemoryCenters {
         )?;
 
         let active_indices = self.active_indices();
-        if active_indices.is_empty() || top_k == 0 {
+        if active_indices.is_empty() || top_k == 0 || candidate_k == 0 {
             return self.finish_read(Self::empty_selection(false));
         }
 
@@ -209,8 +295,48 @@ impl MemoryCenters {
             raw_weights.push(raw_weight);
         }
 
-        let selected = top_k_largest(&raw_weights, top_k.min(active_indices.len()))?;
-        let selected_locals: Vec<usize> = selected.iter().map(|(_, local)| *local).collect();
+        let ranking_weights = if rank_by_activation {
+            let intensities: Vec<f32> = active_indices
+                .iter()
+                .map(|index| self.intensity[*index])
+                .collect();
+            validate_finite(&intensities, "center intensity")?;
+            if intensities.iter().any(|intensity| *intensity < 0.0) {
+                return Err(CoreError::InvalidState(
+                    "negative center intensity".to_owned(),
+                ));
+            }
+            raw_weights
+                .iter()
+                .zip(intensities)
+                .map(|(raw, intensity)| {
+                    let activation = *raw * intensity;
+                    if activation.is_finite() {
+                        Ok(activation)
+                    } else {
+                        Err(CoreError::NonFinite("center activation"))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            raw_weights.clone()
+        };
+        let candidate_count = candidate_k.min(active_indices.len());
+        let candidates = top_k_largest(&ranking_weights, candidate_count)?;
+        let mut selected_locals = Vec::with_capacity(top_k.min(candidates.len()));
+        for (_, local) in candidates {
+            let index = active_indices[local];
+            let slot = self.slot(index).ok_or_else(|| {
+                CoreError::InvalidState("center index does not fit CenterSlot".to_owned())
+            })?;
+            let activation = raw_weights[local] * self.intensity[index];
+            if admitted(slot, &self.support[index], activation) {
+                selected_locals.push(local);
+                if selected_locals.len() == top_k {
+                    break;
+                }
+            }
+        }
         let selection = self.build_selection(
             &active_indices,
             &raw_weights,

@@ -443,6 +443,86 @@ fn exact_ties_resolve_by_ascending_center_index() {
 }
 
 #[test]
+fn admitted_candidate_scan_reaches_rank_seventeen_after_ineligible_centers() {
+    let mut centers = small_bank(17, 2);
+    for index in 0..16 {
+        activate(
+            &mut centers,
+            index,
+            &[1.0, 0.0],
+            &[0.0; CONTEXT_DIM],
+            &[0.0; TERRAIN_DIM],
+            index as f32,
+            1.0,
+        );
+    }
+    activate(
+        &mut centers,
+        16,
+        &[0.0, 1.0],
+        &[0.0; CONTEXT_DIM],
+        &[0.0; TERRAIN_DIM],
+        16.0,
+        1.0,
+    );
+    centers.support[16] = vec![RecordId(17)];
+
+    let result = centers
+        .read_compound_with_admission(
+            &[1.0, 0.0],
+            None,
+            None,
+            CompoundWeights::default(),
+            1,
+            17,
+            |slot, support, activation| {
+                slot.index == 16 && !support.is_empty() && activation >= 0.0
+            },
+        )
+        .expect("admitted candidate read should succeed");
+
+    assert_eq!(indices(&result.selection), vec![16]);
+    assert_eq!(result.selection.centers[0].support, vec![RecordId(17)]);
+}
+
+#[test]
+fn candidate_scan_ranks_activation_instead_of_raw_rbf() {
+    let mut centers = small_bank(2, 2);
+    activate(
+        &mut centers,
+        0,
+        &[1.0, 0.0],
+        &[0.0; CONTEXT_DIM],
+        &[0.0; TERRAIN_DIM],
+        0.0,
+        1.0,
+    );
+    activate(
+        &mut centers,
+        1,
+        &[0.8, 0.6],
+        &[0.0; CONTEXT_DIM],
+        &[0.0; TERRAIN_DIM],
+        1.0,
+        10.0,
+    );
+
+    let raw = centers
+        .read_compound(&[1.0, 0.0], None, None, CompoundWeights::default(), 1)
+        .expect("raw compound read should succeed");
+    let activation_ranked = centers
+        .read_compound_with_candidates(&[1.0, 0.0], None, None, CompoundWeights::default(), 1)
+        .expect("activation-ranked read should succeed");
+
+    assert_eq!(indices(&raw.selection), vec![0]);
+    assert_eq!(indices(&activation_ranked.selection), vec![1]);
+    assert!(
+        activation_ranked.selection.centers[0].raw_rbf_weight
+            < raw.selection.centers[0].raw_rbf_weight
+    );
+}
+
+#[test]
 fn rbf_oracle_matches_empty_five_boundary_distant_and_intensity_cases() {
     let fixture: RbfFixture = serde_json::from_str(include_str!(
         "../../../product/ncm/reference/oracle/rbf_read.json"
