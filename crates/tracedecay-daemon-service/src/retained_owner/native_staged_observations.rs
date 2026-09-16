@@ -271,6 +271,41 @@ struct ProviderViewSanitization {
     extensions_digest: String,
 }
 
+/// The immutable host identity that selected one admitted observation.
+///
+/// A provider-local row cannot reconstruct this from its payload: stream
+/// coordinates, settlement proof and provider registration are deliberately
+/// outside the transformed provider view. Keep the complete identity attached
+/// to the projection result while it is being checked so a source-event scan
+/// can never silently choose between two otherwise identical views.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct HostProjectionIdentity {
+    source_authority: String,
+    source_event_id: String,
+    source_event_revision: u64,
+    source_event_sha256: String,
+    source_stream: String,
+    source_sequence: u64,
+    commit_point_id: String,
+    settled_at_unix_micros: i64,
+    settlement_proof_sha256: String,
+    provider_id: String,
+    provider_instance_id: String,
+    registration_revision: u64,
+    ready_receipt_digest: String,
+}
+
+/// One host-authenticated projection and the exact canonical key that named
+/// it. Correction/replay paths may start with a lifecycle key; those paths are
+/// allowed to translate it only after a fresh source admission identifies one
+/// unambiguous host envelope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HostProjection {
+    idempotency_key: String,
+    identity: HostProjectionIdentity,
+    sanitization: ProviderViewSanitization,
+}
+
 /// Why a staging attempt was refused rather than staged or deduplicated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum StagedConflictReason {
@@ -669,9 +704,9 @@ impl StagedObservationStore {
         };
         if let Some(call) = call {
             if let Some(host_projection) =
-                host_projection_for_record(&self.path, &record, Some(call))?
+                host_projection_for_record(&self.path, &record, Some(call), admission)?
             {
-                if host_projection != provider_view {
+                if host_projection.sanitization != provider_view {
                     return Err(StagedStoreError::LifecycleConflict(
                         "host projection lineage",
                     ));
@@ -1096,6 +1131,7 @@ impl StagedObservationStore {
                         receipt_json,
                         extensions_digest,
                         call,
+                        admission,
                     )?;
                 }
                 (None, None) if call.is_none() && !has_host_projection_journal(&self.path) => {}
@@ -2773,17 +2809,21 @@ mod tests {
         offered.source_revision = Some("r1".into());
         offered.sanitized_payload = serde_json::to_vec(&observation).expect("observation bytes");
         let staged = store(&root, 8);
-        let StagedOutcome::Committed(original) =
-            staged.stage_or_duplicate(offered).expect("stage original")
+        let StagedOutcome::Committed(original) = staged
+            .stage_or_duplicate(offered.clone())
+            .expect("stage original")
         else {
             panic!("expected original commit");
         };
+        let source = attributed_source(&observation);
+        install_host_projection(&root, &offered);
+        let locator = "recall-memory-ref-v1:original";
         let target = json!({
             "provider_id":"tracedecay.native", "registration_revision":1,
             "original_scope":observation["source_identity"]["original_source"]["origin_scope"],
             "delivery_scope":scope_json(&origin),
             "source":observation["source_identity"]["original_source"]["source"],
-            "reference":{"kind":"stable_memory_ref","reference":original.provider_reference},
+            "reference":{"kind":"retained_source_locator","reference":locator},
         });
         let feedback = json!({"target":target,"signal":"helpful","weight":"0.5",
             "canonical_outcome_receipt":"fixture.settled","evidence_refs":[],"occurred_at":T1});
@@ -2795,7 +2835,10 @@ mod tests {
             staged.generation().expect("generation"),
             &feedback,
         );
-        let first = staged.control(&call, None).expect("first feedback");
+        let admission = admission_for(&call, std::slice::from_ref(&source));
+        let first = staged
+            .control(&call, Some(&admission))
+            .expect("first feedback");
         let full_digest =
             sha256_hex(&serde_json::to_vec(&target).expect("full admitted target bytes"));
         assert_eq!(first.response["target_digest"], full_digest);
@@ -2805,7 +2848,7 @@ mod tests {
         );
         assert_eq!(
             first.response["applied_effect"]["stable_memory_ref"],
-            original.provider_reference
+            locator
         );
 
         // A fixture in the previous receipt representation keeps exactly its
@@ -2824,7 +2867,9 @@ mod tests {
         ).expect("install previous receipt representation");
         drop(staged);
         let staged = store(&root, 8);
-        let duplicate = staged.control(&call, None).expect("original redelivery");
+        let duplicate = staged
+            .control(&call, Some(&admission))
+            .expect("original redelivery");
         assert!(duplicate.duplicate);
         assert_eq!(duplicate.response.to_string(), original_bytes);
         assert_eq!(duplicate.receipt, first.receipt);
@@ -2845,8 +2890,9 @@ mod tests {
             staged.generation().expect("generation"),
             &later_feedback,
         );
+        let later_admission = admission_for(&later_call, std::slice::from_ref(&source));
         let second = staged
-            .control(&later_call, None)
+            .control(&later_call, Some(&later_admission))
             .expect("later-session feedback");
         assert_eq!(
             second.response["target_digest"],
@@ -2865,8 +2911,9 @@ mod tests {
             staged.generation().expect("generation"),
             &foreign_feedback,
         );
+        let foreign_admission = admission_for(&foreign_call, std::slice::from_ref(&source));
         assert!(matches!(
-            staged.control(&foreign_call, None),
+            staged.control(&foreign_call, Some(&foreign_admission)),
             Err(StagedStoreError::LifecycleConflict("target unknown"))
         ));
 
@@ -2881,13 +2928,19 @@ mod tests {
             staged.generation().expect("generation"),
             &correction,
         );
+        let validity_admission = admission_for(&validity_call, std::slice::from_ref(&source));
         let validity = staged
-            .control(&validity_call, None)
+            .control(&validity_call, Some(&validity_admission))
             .expect("validity correction");
         assert_eq!(validity.response["target_digest"], full_digest);
         correction["correction_kind"] = "replace_content".into();
         correction["replacement"] =
             common_observation(&origin, 1, Some("r2"), "corrected beacon", Some(T2), None);
+        let replacement_observation = correction["replacement"].clone();
+        let replacement_source = attributed_source(&replacement_observation);
+        let replacement_record =
+            attributed_record(&origin, &replacement_observation, "key.replacement");
+        install_host_projection(&root, &replacement_record);
         let replacement_call = lifecycle_call(
             &origin,
             1,
@@ -2896,8 +2949,10 @@ mod tests {
             staged.generation().expect("generation"),
             &correction,
         );
+        let replacement_admission =
+            admission_for(&replacement_call, &[source.clone(), replacement_source]);
         let replacement = staged
-            .control(&replacement_call, None)
+            .control(&replacement_call, Some(&replacement_admission))
             .expect("content correction");
         assert_eq!(replacement.response["target_digest"], full_digest);
         assert_eq!(
@@ -2935,14 +2990,14 @@ mod tests {
         );
         assert_eq!(item["last_feedback_receipt"], second.receipt);
         let repeated = reopened
-            .control(&later_call, None)
+            .control(&later_call, Some(&later_admission))
             .expect("new receipt redelivery");
         assert!(repeated.duplicate);
         assert_eq!(repeated.response, second.response);
         assert_eq!(repeated.receipt, second.receipt);
         assert_eq!(
             reopened
-                .control(&call, None)
+                .control(&call, Some(&admission))
                 .expect("old receipt remains original")
                 .response
                 .to_string(),
@@ -4631,6 +4686,7 @@ mod tests {
                         &invalid,
                         generation + 1,
                         None,
+                        None,
                         staged.path(),
                     ),
                     Err(StagedStoreError::InvalidAdvisory("verification query"))
@@ -4667,29 +4723,20 @@ mod tests {
                 original_rows
             );
         }
-        let deleted = staged.control(&call, None).expect("valid deletion");
+        // A DeleteBySource call without the in-process history claim is a
+        // legacy/source-less control attempt. It must be refused before the
+        // durable operation journal or deletion fence can make it effective.
+        assert!(matches!(
+            staged.control(&call, None),
+            Err(StagedStoreError::LifecycleConflict(
+                "deletion authority unavailable"
+            ))
+        ));
         assert_eq!(
-            deleted.response["postcondition"]["verification_query_digest"],
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(deleted.response["postcondition"]["removed_effects"], 1);
-        assert!(
             staged
                 .recall(&scope, "deletion", 8)
-                .expect("deleted recall")
-                .is_empty()
-        );
-        drop(staged);
-        let reopened = store(&root, 8);
-        let duplicate = reopened.control(&call, None).expect("deletion redelivery");
-        assert!(duplicate.duplicate);
-        assert_eq!(duplicate.response, deleted.response);
-        assert_eq!(duplicate.receipt, deleted.receipt);
-        assert!(
-            reopened
-                .recall(&scope, "deletion", 8)
-                .expect("reopened deletion")
-                .is_empty()
+                .expect("source remains recallable"),
+            original_rows
         );
     }
 
@@ -5638,8 +5685,17 @@ fn claimed_deletion_targets(
     admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> Result<Option<Vec<NativeSourceTarget>>, StagedStoreError> {
     use tracedecay_memory_provider_registry::{OriginScopeEvidence, ProviderOperation};
-    if call.operation != ProviderOperation::DeleteBySource || call.history_grant().is_none() {
+    if call.operation != ProviderOperation::DeleteBySource {
         return Ok(None);
+    }
+    // DeleteBySource is a controlled V2 operation. A broad source-key delete
+    // without the in-process grant would let a caller fall back to Native's
+    // legacy source namespace, so fail before the duplicate operation journal
+    // can answer an earlier success.
+    if call.history_grant().is_none() {
+        return Err(StagedStoreError::LifecycleConflict(
+            "deletion authority unavailable",
+        ));
     }
     let admission = admission.ok_or(StagedStoreError::LifecycleConflict(
         "deletion authority unavailable",
@@ -5927,6 +5983,10 @@ impl StagedObservationStore {
         if let Some(object) = semantic.as_object_mut() {
             object.remove("common_request");
         }
+        // Every V2 mutation that names canonical history must prove its live
+        // authority before the operation journal is consulted. In particular,
+        // a duplicate feedback/correction/delete/replay must not turn an old
+        // success into a capability after revocation or alias replacement.
         let deletion_targets = claimed_deletion_targets(call, &request, admission)?;
         let legacy_digest = sha256_hex(format!("{:?}:{}", call.operation, semantic).as_bytes());
         let digest = if let Some(targets) = &deletion_targets {
@@ -5944,19 +6004,15 @@ impl StagedObservationStore {
         } else {
             legacy_digest
         };
-        // A retained locator is an authority-bearing host claim even when the
-        // semantic operation is an idempotent redelivery. Resolve it against
-        // the fresh admission before consulting the durable response journal;
-        // otherwise a previously accepted response could be replayed after
-        // the source grant disappeared or its live control was revoked.
+        // A lifecycle target is an authority-bearing host claim even when the
+        // semantic operation is an idempotent redelivery. Resolve every target
+        // form against the fresh admission before consulting the durable
+        // response journal. This deliberately rejects legacy stable refs and
+        // source-less claims on the controlled V2 path.
         if matches!(
             call.operation,
             ProviderOperation::Feedback | ProviderOperation::Correction
-        ) && request
-            .pointer("/target/reference/kind")
-            .and_then(Value::as_str)
-            == Some("retained_source_locator")
-        {
+        ) {
             let _ = resolve_target(&transaction, call, &request, admission, false, &self.path)?;
         }
         // Replay is also authority-bearing. Preflight the fresh source
@@ -5964,7 +6020,7 @@ impl StagedObservationStore {
         // duplicate response cannot bypass a later revoke, privacy deletion,
         // redaction, or expiry decision.
         if call.operation == ProviderOperation::Replay {
-            preflight_replay(&transaction, call, &request, admission)?;
+            preflight_replay(&transaction, call, &request, admission, &self.path)?;
         }
         if !read {
             if key.is_empty() {
@@ -6052,6 +6108,7 @@ impl StagedObservationStore {
                 &request,
                 before.saturating_add(1),
                 deletion_targets.as_deref(),
+                admission,
                 &self.path,
             )?,
             ProviderOperation::Maintenance => maintain_advisory(&transaction, call, &request)?,
@@ -6386,6 +6443,7 @@ fn validate_retained_locator_row(
     trusted_attribution: &Value,
     staged_path: Option<&Path>,
     call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> Result<Option<Value>, StagedStoreError> {
     // The source digest is authoritative only as part of this freshly admitted
     // attribution. Validate its shape here; compare the complete attribution
@@ -6595,6 +6653,7 @@ fn validate_retained_locator_row(
                 StagedStoreError::LifecycleConflict("target sanitization extensions"),
             )?,
             call,
+            admission,
         )?;
     }
     let envelope: Value = serde_json::from_slice(payload)
@@ -6718,8 +6777,9 @@ fn validate_payload_source_identity(
 
 /// Resolves a lifecycle target against Native's private row identity.
 ///
-/// Stable references retain their historical provider-local lookup behavior.
-/// A retained source locator is different: it is accepted only with the fresh
+/// Controlled V2 lifecycle operations accept retained source locators only.
+/// Stable references are a legacy provider-local alias and are refused before
+/// any row lookup. A retained source locator is accepted only with the fresh
 /// call-bound admission, where exactly one trusted source and exactly one
 /// Native row agree on observation identity, actual revision, and checkout.
 /// The row's full stored attribution is then checked against the trusted
@@ -6747,6 +6807,15 @@ fn resolve_target(
         .ok_or(StagedStoreError::InvalidAdvisory(
             "target registration revision",
         ))?;
+    // A provider restart may leave an older retained locator valid, but a
+    // target from a future registration is never a valid alias for the
+    // current call. The target's registration is part of its host authority;
+    // accepting a higher value would permit an alias swap across instances.
+    if target_registration_revision > call.registration_revision {
+        return Err(StagedStoreError::LifecycleConflict(
+            "target registration revision",
+        ));
+    }
     let reference = target
         .get("reference")
         .ok_or(StagedStoreError::InvalidAdvisory("target reference"))?;
@@ -6754,69 +6823,14 @@ fn resolve_target(
     let requested_reference = required_text(reference, "reference")?;
 
     if kind == "stable_memory_ref" {
-        if target_registration_revision != call.registration_revision {
-            return Err(StagedStoreError::LifecycleConflict("target attribution"));
-        }
-        let stored: Option<(i64, Option<String>, String, String, f64)> = connection.query_row(
-            "SELECT rowid, original_source, source_event_id, exact_scope_sha256, feedback FROM tdmem_native_staged_observation_v1
-            WHERE provider_reference = ?1 AND profile_id = ?2 AND project_id = ?3 AND repository_identity = ?4
-            AND worktree_identity = ?5 AND branch_identity = ?6 AND tombstone = 0",
-            params![requested_reference, call.exact_scope.profile_id, call.exact_scope.project_id, call.exact_scope.repository_identity,
-                call.exact_scope.worktree_identity, call.exact_scope.branch_identity],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
-        let Some((row_id, attribution, source_event, stored_scope, feedback)) = stored else {
-            return Err(StagedStoreError::LifecycleConflict("target unknown"));
-        };
-        let attribution = attribution
-            .map(|text| {
-                serde_json::from_str::<Value>(&text)
-                    .map_err(|_| StagedStoreError::InvalidAdvisory("target source"))
-            })
-            .transpose()?;
-        if let Some(attribution) = &attribution {
-            if attribution.get("source") != target.get("source")
-                || attribution.get("origin_scope") != target.get("original_scope")
-            {
-                return Err(StagedStoreError::LifecycleConflict("target source"));
-            }
-        } else if stored_scope != call.exact_scope.exact_scope_sha256()
-            || target
-                .pointer("/source/stable_record_id")
-                .and_then(Value::as_str)
-                != Some(source_event.as_str())
-            || target
-                .pointer("/original_scope/state")
-                .and_then(Value::as_str)
-                != Some("unavailable")
-        {
-            return Err(StagedStoreError::LifecycleConflict("legacy target source"));
-        }
-        let source_key = target
-            .pointer("/source/source_key")
-            .and_then(Value::as_str)
-            .ok_or(StagedStoreError::InvalidAdvisory("target source key"))?;
-        if source_deleted(
-            connection,
-            &call.exact_scope,
-            source_key,
-            attribution.as_ref(),
-        )? {
-            return Err(StagedStoreError::PrivacyDeleted);
-        }
-        // Match NCM's digest of the complete admitted target JSON, before any
-        // provider-local reference/source projection.
-        let target_bytes = serde_json::to_vec(target)
-            .map_err(|_| StagedStoreError::InvalidAdvisory("target serialization"))?;
-        return Ok(ResolvedTarget {
-            row_id,
-            provider_reference: requested_reference.to_owned(),
-            outward_reference: requested_reference.to_owned(),
-            retained_source_locator: None,
-            attribution,
-            feedback,
-            tombstone: false,
-            target_digest: sha256_hex(&target_bytes),
-        });
+        // Stable refs were minted from Native's private row identity. They
+        // carry no fresh ProviderHistory authority and can be rebound after a
+        // restart or an alias swap, so controlled feedback/correction must
+        // never resolve them. The inspection surface has its own legacy path;
+        // this resolver is called only by controlled lifecycle mutations.
+        return Err(StagedStoreError::LifecycleConflict(
+            "legacy target reference",
+        ));
     }
 
     if kind != "retained_source_locator" {
@@ -6916,6 +6930,7 @@ fn resolve_target(
             &trusted_attribution,
             Some(staged_path),
             Some(call),
+            Some(admission),
         )?;
         let matches_source = if candidate.tombstone && attribution.is_none() {
             // Privacy scrubbing deliberately removes original_source. The
@@ -7257,7 +7272,7 @@ fn correct_advisory(
         .idempotency_key
         .as_deref()
         .ok_or(StagedStoreError::InvalidAdvisory("correction key"))?;
-    let record = StagedObservationRecord {
+    let mut record = StagedObservationRecord {
         scope: call.exact_scope.clone(),
         idempotency_key: key.to_owned(),
         source_authority: "host_session".to_owned(),
@@ -7270,9 +7285,16 @@ fn correct_advisory(
         request_identity: call.request_id.clone(),
         admitted_at_unix_ms: super::native_provider::unix_millis_now(),
     };
-    let provider_view = host_projection_for_record(staged_path, &record, Some(call))?.unwrap_or(
-        direct_provider_view_sanitization(&record.sanitized_payload)?,
-    );
+    // The command idempotency key identifies this correction operation, not
+    // the replacement observation. Translate it to the exact canonical
+    // observation key only through the fresh source admission and host
+    // journal. A self-minted provider receipt is never a replacement proof.
+    let projection = host_projection_for_record(staged_path, &record, Some(call), admission)?
+        .ok_or(StagedStoreError::LifecycleConflict(
+            "host projection lineage unavailable",
+        ))?;
+    record.idempotency_key = projection.idempotency_key;
+    let provider_view = projection.sanitization;
     let evidence = match stage_in_transaction(
         connection,
         record,
@@ -7363,10 +7385,11 @@ fn validate_resident_original_sources(
     scope: &ExactScopeFields,
     staged_path: &Path,
     call: &tracedecay_memory_provider_registry::ProviderCall,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> Result<(), StagedStoreError> {
     require_host_projection_journal(staged_path)?;
     let mut statement = connection.prepare(
-        "SELECT source_authority, source_event_id, actual_revision, observation_kind,
+        "SELECT idempotency_key, source_authority, source_event_id, actual_revision, observation_kind,
                 payload_contract, sanitized_payload, payload_sha256, original_source,
                 sanitization_receipt_json, sanitization_extensions_digest, tombstone
          FROM tdmem_native_staged_observation_v1
@@ -7381,9 +7404,9 @@ fn validate_resident_original_sources(
         scope.branch_identity,
     ])?;
     while let Some(row) = rows.next()? {
-        if row.get::<_, bool>(10)? {
-            if row.get::<_, Option<String>>(7)?.is_some()
-                || row.get::<_, Option<Vec<u8>>>(5)?.is_some()
+        if row.get::<_, bool>(11)? {
+            if row.get::<_, Option<String>>(8)?.is_some()
+                || row.get::<_, Option<Vec<u8>>>(6)?.is_some()
             {
                 return Err(StagedStoreError::LifecycleConflict(
                     "resident tombstone source",
@@ -7391,19 +7414,20 @@ fn validate_resident_original_sources(
             }
             continue;
         }
-        let source_authority: String = row.get(0)?;
-        let source_event_id: String = row.get(1)?;
-        let source_revision: Option<String> = row.get(2)?;
-        let observation_kind: String = row.get(3)?;
-        let payload_contract: String = row.get(4)?;
+        let idempotency_key: String = row.get(0)?;
+        let source_authority: String = row.get(1)?;
+        let source_event_id: String = row.get(2)?;
+        let source_revision: Option<String> = row.get(3)?;
+        let observation_kind: String = row.get(4)?;
+        let payload_contract: String = row.get(5)?;
         let payload: Vec<u8> =
-            row.get::<_, Option<Vec<u8>>>(5)?
+            row.get::<_, Option<Vec<u8>>>(6)?
                 .ok_or(StagedStoreError::LifecycleConflict(
                     "resident payload unavailable",
                 ))?;
-        let payload_sha256: String = row.get(6)?;
+        let payload_sha256: String = row.get(7)?;
         let original_source: Value = row
-            .get::<_, Option<String>>(7)?
+            .get::<_, Option<String>>(8)?
             .ok_or(StagedStoreError::LifecycleConflict(
                 "resident source unavailable",
             ))
@@ -7418,21 +7442,21 @@ fn validate_resident_original_sources(
             source_revision.as_deref(),
         )?;
         let receipt_json: String =
-            row.get::<_, Option<String>>(8)?
+            row.get::<_, Option<String>>(9)?
                 .ok_or(StagedStoreError::LifecycleConflict(
                     "resident sanitization receipt",
                 ))?;
         let extensions_digest: String =
-            row.get::<_, Option<String>>(9)?
+            row.get::<_, Option<String>>(10)?
                 .ok_or(StagedStoreError::LifecycleConflict(
                     "resident sanitization extensions",
                 ))?;
         validate_host_projection_for_row(
             staged_path,
             scope,
-            // The host lookup uses the source event and exact payload; the
-            // row idempotency key is not needed for this privacy preflight.
-            "privacy-lineage-validation",
+            // Privacy preflight uses the row's canonical observation key. It
+            // must never infer a host envelope from provider-view bytes.
+            &idempotency_key,
             &source_authority,
             &source_event_id,
             source_revision.as_deref(),
@@ -7443,6 +7467,7 @@ fn validate_resident_original_sources(
             &receipt_json,
             &extensions_digest,
             Some(call),
+            admission,
         )?;
     }
     Ok(())
@@ -7665,6 +7690,7 @@ fn delete_advisory(
     request: &Value,
     generation: u64,
     targets: Option<&[NativeSourceTarget]>,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
     staged_path: &Path,
 ) -> Result<(Value, bool), StagedStoreError> {
     let sources = request
@@ -7685,7 +7711,13 @@ fn delete_advisory(
         .get("verification_query")
         .and_then(Value::as_str)
         .ok_or(StagedStoreError::InvalidAdvisory("verification query"))?;
-    validate_resident_original_sources(connection, &call.exact_scope, staged_path, call)?;
+    validate_resident_original_sources(
+        connection,
+        &call.exact_scope,
+        staged_path,
+        call,
+        admission,
+    )?;
     if let Some(targets) = targets {
         preflight_targeted_deletion(connection, call, targets)?;
     }
@@ -8487,21 +8519,279 @@ fn require_host_projection_journal(staged_path: &Path) -> Result<(), StagedStore
     }
 }
 
+/// Converts the immutable journal facts to the identity carried alongside a
+/// host projection. Every field is retained for ambiguity checks; reducing the
+/// match to a receipt or provider-view digest would let two settlements share
+/// one provider alias.
+fn host_projection_identity(admitted: &AdmittedObservationV1) -> HostProjectionIdentity {
+    HostProjectionIdentity {
+        source_authority: admitted.source.source_authority.as_wire().to_owned(),
+        source_event_id: admitted.source.source_event_id.clone(),
+        source_event_revision: admitted.source.source_event_revision,
+        source_event_sha256: admitted.source.source_event_sha256.clone(),
+        source_stream: admitted.source.source_stream.as_str().to_owned(),
+        source_sequence: admitted.source.source_sequence.0,
+        commit_point_id: admitted.source.commit_point_id.clone(),
+        settled_at_unix_micros: admitted.source.settled_at_unix_micros,
+        settlement_proof_sha256: admitted.source.settlement_proof_sha256.clone(),
+        provider_id: admitted.target.provider_id.as_str().to_owned(),
+        provider_instance_id: admitted.target.provider_instance_id.clone(),
+        registration_revision: admitted.target.registration_revision,
+        ready_receipt_digest: admitted.target.ready_receipt_digest.clone(),
+    }
+}
+
+fn host_projection_from_admitted(admitted: &AdmittedObservationV1) -> HostProjection {
+    HostProjection {
+        idempotency_key: admitted.idempotency_key.as_str().to_owned(),
+        identity: host_projection_identity(admitted),
+        sanitization: ProviderViewSanitization {
+            receipt_json: admitted.sanitization.receipt_json.clone(),
+            extensions_digest: admitted.extensions_digest.clone(),
+        },
+    }
+}
+
+/// Checks optional settlement fields copied into a provider envelope. Most
+/// Native observations intentionally carry only source attribution here; the
+/// complete settlement remains in the host journal. When an envelope carries
+/// the typed settlement object, every field is compared without conflating the
+/// original-source digest with the sanitized provider-view digest.
+fn payload_settlement_matches_host(admitted: &AdmittedObservationV1, payload: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(payload) else {
+        return false;
+    };
+    let Some(identity) = envelope.get("source_identity") else {
+        return true;
+    };
+    if let Some(value) = identity.get("source_authority") {
+        if value.as_str() != Some(admitted.source.source_authority.as_wire()) {
+            return false;
+        }
+    }
+    if let Some(value) = identity.get("source_event_id") {
+        if value.as_str() != Some(admitted.source.source_event_id.as_str()) {
+            return false;
+        }
+    }
+    for value in [
+        envelope.get("source_sequence"),
+        identity.get("source_sequence"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.as_u64() != Some(admitted.source.source_sequence.0) {
+            return false;
+        }
+    }
+    if let Some(value) = identity.get("source_stream") {
+        if value.as_str() != Some(admitted.source.source_stream.as_str()) {
+            return false;
+        }
+    }
+    let Some(settlement) = identity
+        .get("canonical_settlement_receipt")
+        .filter(|value| value.is_object())
+    else {
+        // A string receipt in the provider envelope is an application-level
+        // reference. It is intentionally not compared to the journal's
+        // settlement proof or to the sanitized payload digest.
+        return true;
+    };
+    if settlement
+        .get("source_authority")
+        .is_some_and(|value| value.as_str() != Some(admitted.source.source_authority.as_wire()))
+        || settlement
+            .get("commit_point_id")
+            .is_some_and(|value| value.as_str() != Some(admitted.source.commit_point_id.as_str()))
+        || settlement
+            .get("source_event_id")
+            .is_some_and(|value| value.as_str() != Some(admitted.source.source_event_id.as_str()))
+        || settlement
+            .get("source_event_revision")
+            .is_some_and(|value| value.as_u64() != Some(admitted.source.source_event_revision))
+        || settlement.get("source_event_sha256").is_some_and(|value| {
+            value.as_str() != Some(admitted.source.source_event_sha256.as_str())
+        })
+        || settlement
+            .get("source_stream")
+            .is_some_and(|value| value.as_str() != Some(admitted.source.source_stream.as_str()))
+        || settlement
+            .get("source_sequence")
+            .is_some_and(|value| value.as_u64() != Some(admitted.source.source_sequence.0))
+        || settlement
+            .get("settled_at_unix_micros")
+            .is_some_and(|value| value.as_i64() != Some(admitted.source.settled_at_unix_micros))
+        || settlement
+            .get("settlement_proof_sha256")
+            .is_some_and(|value| {
+                value.as_str() != Some(admitted.source.settlement_proof_sha256.as_str())
+            })
+    {
+        return false;
+    }
+    true
+}
+
+/// A lifecycle call may use a retained row from an older registration after a
+/// provider restart. A future registration is never compatible, and a row
+/// admitted under the current registration must carry this call's ready
+/// receipt. Observe/replay are delivery operations and stay pinned exactly to
+/// the call's registration; only lifecycle inspection/mutation can use the
+/// monotonic older-registration policy.
+fn host_target_matches_call(
+    admitted: &AdmittedObservationV1,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+) -> bool {
+    if admitted.target.provider_instance_id != super::native_provider::PROVIDER_INSTANCE_ID {
+        return false;
+    }
+    let Some(call) = call else {
+        return true;
+    };
+    if admitted.target.provider_id != call.provider_id {
+        return false;
+    }
+    use tracedecay_memory_provider_registry::ProviderOperation;
+    match call.operation {
+        ProviderOperation::Observe | ProviderOperation::Replay => {
+            admitted.target.registration_revision == call.registration_revision
+                && admitted.target.ready_receipt_digest == call.ready_receipt_sha256
+        }
+        _ => {
+            admitted.target.registration_revision <= call.registration_revision
+                && (admitted.target.registration_revision != call.registration_revision
+                    || admitted.target.ready_receipt_digest == call.ready_receipt_sha256)
+        }
+    }
+}
+
+fn host_admission_matches_record(
+    admitted: &AdmittedObservationV1,
+    record: &StagedObservationRecord,
+    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    expected_key: Option<&str>,
+) -> bool {
+    if expected_key.is_some_and(|key| admitted.idempotency_key.as_str() != key) {
+        return false;
+    }
+    let scope = &admitted.exact_scope;
+    let scope_matches = scope.exact_scope_sha256() == record.scope.exact_scope_sha256()
+        && scope.profile_id == record.scope.profile_id
+        && scope.project_id == record.scope.project_id
+        && scope.repository_identity == record.scope.repository_identity
+        && scope.worktree_identity == record.scope.worktree_identity
+        && scope.branch_identity == record.scope.branch_identity
+        && scope.agent_session_id == record.scope.agent_session_id
+        && scope.resolved_scope_digest == record.scope.resolved_scope_digest;
+    let payload_matches = admitted.payload.bytes == record.sanitized_payload
+        && admitted.payload.sha256 == sha256_hex(&record.sanitized_payload)
+        && payload_record_identity_matches_record(record)
+        && payload_settlement_matches_host(admitted, &record.sanitized_payload);
+    let target_matches = host_target_matches_call(admitted, call);
+    let observe_binding_matches = call.is_none_or(|call| {
+        call.operation != tracedecay_memory_provider_registry::ProviderOperation::Observe
+            || (call
+                .sanitization()
+                .is_some_and(|receipt| receipt.to_json() == admitted.sanitization.receipt_json)
+                && call.extensions == admitted.extensions)
+    });
+    scope_matches
+        && admitted.source.source_authority.as_wire() == record.source_authority
+        && admitted.source.source_event_id == record.source_event_id
+        && admitted.observation_kind.as_str() == record.observation_kind
+        && admitted.payload.contract_id.as_str() == record.payload_contract
+        && payload_matches
+        && target_matches
+        && observe_binding_matches
+}
+
+/// The provider envelope carries the original source revision as a textual
+/// attribution value (`"r1"`, for example), while the host settlement carries
+/// its independent numeric event revision. Bind the former to the Native row
+/// here, and leave the latter to the canonical key/settlement object so the two
+/// digest and revision domains cannot be accidentally conflated.
+fn payload_record_identity_matches_record(record: &StagedObservationRecord) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(&record.sanitized_payload) else {
+        return false;
+    };
+    let Some(original) = envelope.pointer("/source_identity/original_source") else {
+        return record.source_revision.is_none();
+    };
+    let Some(source) = original.get("source") else {
+        return false;
+    };
+    let payload_revision = match source.get("source_revision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => return false,
+    };
+    source.get("observation_id").and_then(Value::as_str) == Some(record.source_event_id.as_str())
+        && payload_revision == record.source_revision.as_deref()
+}
+
+/// A lifecycle key is not a projection key. Translation is therefore allowed
+/// only when the current host authority supplied a complete source admission;
+/// querying by provider-view bytes or by a private stable ref is never enough.
+fn validate_projection_translation_authority(
+    record: &StagedObservationRecord,
+    call: &tracedecay_memory_provider_registry::ProviderCall,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+) -> Result<(), StagedStoreError> {
+    let admission = admission.ok_or(StagedStoreError::LifecycleConflict(
+        "host projection authority unavailable",
+    ))?;
+    admission
+        .verify_for(call)
+        .map_err(|_| StagedStoreError::LifecycleConflict("host projection authority binding"))?;
+    let envelope: Value = serde_json::from_slice(&record.sanitized_payload)
+        .map_err(|_| StagedStoreError::InvalidAdvisory("host projection envelope"))?;
+    let original = envelope.pointer("/source_identity/original_source").ok_or(
+        StagedStoreError::LifecycleConflict("host projection source authority"),
+    )?;
+    let matches = admission
+        .history_sources
+        .iter()
+        .filter(|source| {
+            super::provider_history::source_attribution_json(&source.attribution)
+                .ok()
+                .is_some_and(|candidate| candidate == *original)
+        })
+        .count();
+    match matches {
+        1 => Ok(()),
+        0 => Err(StagedStoreError::LifecycleConflict(
+            "host projection source authority",
+        )),
+        _ => Err(StagedStoreError::LifecycleConflict(
+            "host projection source authority ambiguous",
+        )),
+    }
+}
+
+fn admitted_source_authority(envelope: &Value) -> String {
+    envelope
+        .pointer("/source_identity/source_authority")
+        .and_then(Value::as_str)
+        .unwrap_or("host_session")
+        .to_owned()
+}
+
 /// Reads the host-authenticated projection for one staged record.
 ///
-/// `PayloadSanitizationReceipt` is intentionally not treated as an authority
-/// here: it is self-consistent but publicly reconstructible. The observation
-/// journal's `AdmittedObservationV1::envelope_sha256` is recomputed by the
-/// host decoder and covers the source settlement, exact provider-view bytes,
-/// extensions, and sanitization binding. Native accepts a record only when
-/// those host-owned bytes and identities agree with the record it is about to
-/// persist. The returned provider-view binding is copied from that validated
-/// host envelope for replay/correction staging.
+/// A canonical observation key is the primary lookup and the only lookup for
+/// ordinary delivery. A lifecycle operation may begin with its own command
+/// key, but it can translate that key only through a fresh ProviderHistory
+/// admission and a unique, fully matching host settlement. The old
+/// `(scope, source_event_id, provider-view bytes)` fallback is intentionally
+/// gone: two settlements can share those bytes.
 fn host_projection_for_record(
     staged_path: &Path,
     record: &StagedObservationRecord,
     call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
-) -> Result<Option<ProviderViewSanitization>, StagedStoreError> {
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+) -> Result<Option<HostProjection>, StagedStoreError> {
     let Some(journal_path) = host_observation_journal_path(staged_path) else {
         return if call.is_some() {
             Err(StagedStoreError::LifecycleConflict(
@@ -8527,14 +8817,39 @@ fn host_projection_for_record(
     )
     .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal unavailable"))?;
 
-    // Normal Observe delivery carries the content-derived journal key. A
-    // correction uses a new lifecycle key, so fall back to the immutable
-    // `(target, scope, source_event_id)` identity for that path. Both sets are
-    // checked against the decoded envelope below; a key alone is never proof.
-    let mut candidate_keys = BTreeSet::new();
-    if let Ok(key) = ObservationIdempotencyKeyV1::parse(&record.idempotency_key) {
-        candidate_keys.insert(key.as_str().to_owned());
+    // First try the exact canonical key. A valid but missing key may only be
+    // translated with fresh source authority; a valid key that names another
+    // envelope is an alias attempt and is refused without a second lookup.
+    let parsed_key = ObservationIdempotencyKeyV1::parse(&record.idempotency_key).ok();
+    if let Some(key) = parsed_key.as_ref() {
+        if let Some(admitted) = journal
+            .read_admitted_observation_by_idempotency(key)
+            .map_err(|_| {
+                StagedStoreError::LifecycleConflict("host projection journal unavailable")
+            })?
+        {
+            if host_admission_matches_record(
+                &admitted,
+                record,
+                call,
+                Some(record.idempotency_key.as_str()),
+            ) {
+                return Ok(Some(host_projection_from_admitted(&admitted)));
+            }
+            return Err(StagedStoreError::LifecycleConflict(
+                "host projection identity mismatch",
+            ));
+        }
     }
+
+    let Some(call) = call else {
+        // Direct pre-V2 callers have no authority with which to translate a
+        // command key. Their legacy store path remains structurally readable,
+        // but never receives a host projection from an inferred match.
+        return Ok(None);
+    };
+    validate_projection_translation_authority(record, call, admission)?;
+
     let host_connection = Connection::open_with_flags(
         &journal_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -8545,32 +8860,24 @@ fn host_projection_for_record(
     let mut statement = host_connection
         .prepare(
             "SELECT idempotency_key FROM tdmem_observation_journal_v1
-             WHERE exact_scope_sha256=?1 AND source_event_id=?2
+             WHERE exact_scope_sha256=?1 AND source_event_id=?2 AND provider_id=?3
                AND payload_bytes IS NOT NULL
-               AND (?3 IS NULL OR provider_id=?3)
-             ORDER BY idempotency_key LIMIT 16",
+             ORDER BY idempotency_key LIMIT 17",
         )
         .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal unavailable"))?;
-    let provider_id = call.map(|call| call.provider_id.as_str());
-    let source_keys = statement
+    let candidate_keys = statement
         .query_map(
             params![
                 record.scope.exact_scope_sha256(),
                 record.source_event_id,
-                provider_id,
+                call.provider_id.as_str(),
             ],
             |row| row.get::<_, String>(0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
-    candidate_keys.extend(source_keys);
-
-    // A restart/re-registration can append another journal envelope for the
-    // same source and provider view. Registration/ready receipt are delivery
-    // facts, so identical stable projection facts are one lineage. Distinct
-    // receipts or extensions remain ambiguous and fail closed below.
-    let mut matches = BTreeSet::new();
-    for key in candidate_keys {
-        let key = ObservationIdempotencyKeyV1::parse(&key)
+    let mut matches = Vec::new();
+    for candidate in candidate_keys {
+        let key = ObservationIdempotencyKeyV1::parse(&candidate)
             .map_err(|_| StagedStoreError::LifecycleConflict("host projection journal key"))?;
         let Some(admitted) = journal
             .read_admitted_observation_by_idempotency(&key)
@@ -8580,62 +8887,36 @@ fn host_projection_for_record(
         else {
             continue;
         };
-        if host_admission_matches_record(&admitted, record, call) {
-            matches.insert((
-                admitted.sanitization.receipt_json.clone(),
-                admitted.extensions_digest.clone(),
-            ));
+        if host_admission_matches_record(&admitted, record, Some(call), None) {
+            matches.push(host_projection_from_admitted(&admitted));
         }
     }
-    let (receipt_json, extensions_digest) = match matches.into_iter().collect::<Vec<_>>().as_slice()
-    {
-        [(receipt_json, extensions_digest)] => (receipt_json.clone(), extensions_digest.clone()),
-        [] => {
-            return Err(StagedStoreError::LifecycleConflict(
-                "host projection lineage",
-            ));
+    match matches.as_slice() {
+        [] => Err(StagedStoreError::LifecycleConflict(
+            "host projection lineage",
+        )),
+        [projection] => Ok(Some(projection.clone())),
+        matches => {
+            // If the current registration has one exact ready receipt, it is
+            // the only unambiguous restart translation. Any remaining pair —
+            // especially differing stream/sequence/settlement proof — fails
+            // closed even when provider-view bytes are identical.
+            let current: Vec<_> = matches
+                .iter()
+                .filter(|projection| {
+                    projection.identity.registration_revision == call.registration_revision
+                        && projection.identity.ready_receipt_digest == call.ready_receipt_sha256
+                })
+                .collect();
+            if let [projection] = current.as_slice() {
+                Ok(Some((*projection).clone()))
+            } else {
+                Err(StagedStoreError::LifecycleConflict(
+                    "host projection lineage ambiguous",
+                ))
+            }
         }
-        _ => {
-            return Err(StagedStoreError::LifecycleConflict(
-                "host projection lineage ambiguous",
-            ));
-        }
-    };
-    Ok(Some(ProviderViewSanitization {
-        receipt_json,
-        extensions_digest,
-    }))
-}
-
-fn host_admission_matches_record(
-    admitted: &AdmittedObservationV1,
-    record: &StagedObservationRecord,
-    call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
-) -> bool {
-    let scope = &admitted.exact_scope;
-    let scope_matches = scope.exact_scope_sha256() == record.scope.exact_scope_sha256()
-        && scope.profile_id == record.scope.profile_id
-        && scope.project_id == record.scope.project_id
-        && scope.repository_identity == record.scope.repository_identity
-        && scope.worktree_identity == record.scope.worktree_identity
-        && scope.branch_identity == record.scope.branch_identity
-        && scope.agent_session_id == record.scope.agent_session_id
-        && scope.resolved_scope_digest == record.scope.resolved_scope_digest;
-    let target_matches = call.is_none_or(|call| {
-        admitted.target.provider_id == call.provider_id
-            && (call.operation != tracedecay_memory_provider_registry::ProviderOperation::Observe
-                || (call.sanitization().is_some_and(|receipt| {
-                    receipt.to_json() == admitted.sanitization.receipt_json
-                }) && call.extensions == admitted.extensions))
-    });
-    scope_matches
-        && admitted.source.source_authority.as_wire() == record.source_authority
-        && admitted.source.source_event_id == record.source_event_id
-        && admitted.observation_kind.as_str() == record.observation_kind
-        && admitted.payload.contract_id.as_str() == record.payload_contract
-        && admitted.payload.bytes == record.sanitized_payload
-        && admitted.payload.sha256 == sha256_hex(&record.sanitized_payload)
-        && target_matches
+    }
 }
 
 /// Binds a provider-view envelope's complete original-source attribution to
@@ -8705,6 +8986,7 @@ fn validate_host_projection_for_row(
     receipt_json: &str,
     extensions_digest: &str,
     call: Option<&tracedecay_memory_provider_registry::ProviderCall>,
+    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
 ) -> Result<(), StagedStoreError> {
     let record = StagedObservationRecord {
         scope: scope.clone(),
@@ -8719,11 +9001,12 @@ fn validate_host_projection_for_row(
         request_identity: "host-lineage-validation".to_owned(),
         admitted_at_unix_ms: 0,
     };
-    let Some(host_projection) = host_projection_for_record(staged_path, &record, call)? else {
+    let Some(host_projection) = host_projection_for_record(staged_path, &record, call, admission)?
+    else {
         return Ok(());
     };
-    if host_projection.receipt_json != receipt_json
-        || host_projection.extensions_digest != extensions_digest
+    if host_projection.sanitization.receipt_json != receipt_json
+        || host_projection.sanitization.extensions_digest != extensions_digest
     {
         return Err(StagedStoreError::LifecycleConflict(
             "host projection lineage",
@@ -9152,7 +9435,13 @@ fn restore_snapshot(
     // host journal before reading any snapshot bytes so a provider-local
     // snapshot cannot mint its own projection lineage.
     require_host_projection_journal(staged_path)?;
-    validate_resident_original_sources(connection, &call.exact_scope, staged_path, call)?;
+    validate_resident_original_sources(
+        connection,
+        &call.exact_scope,
+        staged_path,
+        call,
+        admission,
+    )?;
     let snapshot = request
         .get("snapshot")
         .ok_or(StagedStoreError::InvalidAdvisory("snapshot"))?;
@@ -9565,6 +9854,7 @@ fn restore_snapshot(
                     receipt_json,
                     extensions_digest,
                     Some(call),
+                    admission,
                 )?;
             }
             let mut effective = attribution
@@ -9748,6 +10038,7 @@ fn preflight_replay(
     call: &tracedecay_memory_provider_registry::ProviderCall,
     request: &Value,
     admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
+    staged_path: &Path,
 ) -> Result<(), StagedStoreError> {
     use tracedecay_memory_provider_registry::SourceDisposition;
 
@@ -9769,15 +10060,36 @@ fn preflight_replay(
         .and_then(Value::as_array)
         .filter(|items| !items.is_empty() && items.len() <= 4096)
         .ok_or(StagedStoreError::InvalidAdvisory("replay observations"))?;
+    let refs = request
+        .get("observation_batch_refs")
+        .and_then(Value::as_array)
+        .ok_or(StagedStoreError::InvalidAdvisory(
+            "replay receipt inventory",
+        ))?;
     if grant_sources.len() != items.len() {
         return Err(StagedStoreError::LifecycleConflict(
             "replay source coverage",
         ));
     }
+    if refs.len() != items.len() {
+        return Err(StagedStoreError::LifecycleConflict(
+            "replay receipt coverage",
+        ));
+    }
+    let mut seen_receipts = BTreeSet::new();
+    let mut seen_sources = BTreeSet::new();
     for item in items {
         let envelope = item
             .get("observation")
             .ok_or(StagedStoreError::InvalidAdvisory("replay observation"))?;
+        let receipt = required_text(item, "receipt_ref")?;
+        if !refs.iter().any(|value| value.as_str() == Some(receipt))
+            || !seen_receipts.insert(receipt.to_owned())
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "replay receipt binding",
+            ));
+        }
         let attribution = envelope
             .pointer("/source_identity/original_source")
             .ok_or(StagedStoreError::InvalidAdvisory("replay attribution"))?;
@@ -9821,6 +10133,19 @@ fn preflight_replay(
             ));
         }
         let source_key = required_text(&attribution["source"], "source_key")?;
+        let source_sequence = item
+            .get("source_sequence")
+            .and_then(Value::as_u64)
+            .ok_or(StagedStoreError::InvalidAdvisory("replay source sequence"))?;
+        if attribution["source_sequence"].as_u64() != Some(source_sequence)
+            || envelope["source_sequence"].as_u64() != Some(source_sequence)
+            || !seen_sources
+                .insert(required_text(&attribution["source"], "observation_id")?.to_owned())
+        {
+            return Err(StagedStoreError::LifecycleConflict(
+                "replay source sequence",
+            ));
+        }
         if source_deleted(
             transaction,
             &call.exact_scope,
@@ -9829,6 +10154,40 @@ fn preflight_replay(
         )? {
             return Err(StagedStoreError::PrivacyDeleted);
         }
+        // Replay is a delivery of an already admitted provider view. Before a
+        // duplicate operation receipt can be reused, bind the item's exact
+        // canonical key and all host settlement facts to the sibling journal.
+        // This also rejects source-only replay envelopes that lack the key.
+        let idempotency_key = required_text(item, "idempotency_key")?;
+        ObservationIdempotencyKeyV1::parse(idempotency_key)
+            .map_err(|_| StagedStoreError::LifecycleConflict("replay canonical key"))?;
+        let request_identity = item
+            .get("request_identity")
+            .and_then(Value::as_str)
+            .unwrap_or(call.request_id.as_str());
+        let observation_kind = required_text(envelope, "observation_kind")?;
+        let payload_contract = required_text(envelope, "payload_contract")?;
+        let payload = serde_json::to_vec(envelope)
+            .map_err(|_| StagedStoreError::InvalidAdvisory("replay observation"))?;
+        let record = StagedObservationRecord {
+            scope: call.exact_scope.clone(),
+            idempotency_key: idempotency_key.to_owned(),
+            source_authority: admitted_source_authority(envelope),
+            source_event_id: required_text(&attribution["source"], "observation_id")?.to_owned(),
+            source_revision: attribution["source"]["source_revision"]
+                .as_str()
+                .map(str::to_owned),
+            observation_kind: observation_kind.to_owned(),
+            payload_contract: payload_contract.to_owned(),
+            sanitized_payload: payload,
+            operation_id: call.operation_id.clone(),
+            request_identity: request_identity.to_owned(),
+            admitted_at_unix_ms: super::native_provider::unix_millis_now(),
+        };
+        let _ = host_projection_for_record(staged_path, &record, Some(call), Some(admission))?
+            .ok_or(StagedStoreError::LifecycleConflict(
+                "host projection lineage unavailable",
+            ))?;
     }
     Ok(())
 }
@@ -9938,23 +10297,32 @@ fn replay_advisory(
         if extract_message_text(&bytes).is_none() {
             return Err(StagedStoreError::InvalidAdvisory("replay evidence"));
         }
-        let record = StagedObservationRecord {
+        let mut record = StagedObservationRecord {
             scope: call.exact_scope.clone(),
-            idempotency_key: required_text(envelope, "idempotency_key")?.to_owned(),
-            source_authority: "host_session".to_owned(),
+            // Replay metadata is carried beside the retained observation by
+            // ProviderHistory. The inner observation is intentionally kept
+            // byte-for-byte canonical and does not mint a second key.
+            idempotency_key: required_text(item, "idempotency_key")?.to_owned(),
+            source_authority: admitted_source_authority(envelope),
             source_event_id: required_text(original, "observation_id")?.to_owned(),
             source_revision: original["source_revision"].as_str().map(str::to_owned),
             observation_kind: required_text(envelope, "observation_kind")?.to_owned(),
             payload_contract: required_text(envelope, "payload_contract")?.to_owned(),
             sanitized_payload: bytes,
             operation_id: call.operation_id.clone(),
-            request_identity: required_text(envelope, "request_identity")?.to_owned(),
+            request_identity: item
+                .get("request_identity")
+                .and_then(Value::as_str)
+                .unwrap_or(call.request_id.as_str())
+                .to_owned(),
             admitted_at_unix_ms: super::native_provider::unix_millis_now(),
         };
-        let provider_view = host_projection_for_record(staged_path, &record, Some(call))?
-            .unwrap_or(direct_provider_view_sanitization(
-                &record.sanitized_payload,
-            )?);
+        let projection = host_projection_for_record(staged_path, &record, Some(call), admission)?
+            .ok_or(StagedStoreError::LifecycleConflict(
+            "host projection lineage unavailable",
+        ))?;
+        record.idempotency_key = projection.idempotency_key;
+        let provider_view = projection.sanitization;
         match stage_in_transaction(
             transaction,
             record,
