@@ -439,6 +439,7 @@ impl NcmEngine {
             candidate,
             key,
             &digest,
+            effect_payload,
             operations,
             vec![(target.record_id, provenance)],
             new_capsule,
@@ -848,6 +849,7 @@ pub(super) fn commit_common(
     candidate: NcmKernel,
     key: &str,
     digest: &str,
+    canonical_input: Value,
     operations: Vec<DurableOperation>,
     updates: Vec<(RecordId, Value)>,
     capsule: Option<Capsule>,
@@ -918,8 +920,12 @@ pub(super) fn commit_common(
     }
     let receipt = match durable_receipt(
         &reply,
-        DurableOperation::CommonControl { operations },
+        DurableOperation::CommonControl {
+            operations,
+            canonical_input,
+        },
         &candidate,
+        Some(key),
     ) {
         Ok(value) => value,
         Err(reply) => return reply,

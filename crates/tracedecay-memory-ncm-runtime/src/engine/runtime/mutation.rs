@@ -285,6 +285,7 @@ impl NcmEngine {
                 kind: MaintenanceKind::Compact,
             },
             &candidate,
+            Some(&request.idempotency_key),
         ) {
             Ok(receipt) => receipt,
             Err(reply) => return reply,
@@ -479,7 +480,7 @@ impl NcmEngine {
                 return reply;
             }
         }
-        let receipt = match durable_receipt(&reply, operation, &candidate) {
+        let receipt = match durable_receipt(&reply, operation, &candidate, Some(idempotency_key)) {
             Ok(receipt) => receipt,
             Err(reply) => return reply,
         };

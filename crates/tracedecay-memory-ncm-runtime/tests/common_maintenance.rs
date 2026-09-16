@@ -857,6 +857,57 @@ fn common_maintenance_receipt_integrity_is_verified_on_all_replay_surfaces() {
 }
 
 #[test]
+fn common_maintenance_receipt_idempotency_key_is_bound_to_its_journal_event() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "receipt-key").state_generation;
+    let original = request("receipt-key", "repair", generation);
+    let first = invoke(&live, original.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let key = digest(b"receipt-key");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(receipt["idempotency_key"], json!(key));
+    receipt["idempotency_key"] = json!("different-receipt-key");
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
+            [serde_json::to_string(&receipt).unwrap(), key],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = engine(&directory);
+    assert_eq!(
+        inspect_receipt(&reopened, "receipt-key").outcome,
+        Outcome::Corrupt
+    );
+    let mut retry = original;
+    retry["expected_generation"] = json!(first.state_generation);
+    assert_eq!(invoke(&reopened, retry).outcome, Outcome::Corrupt);
+    assert_eq!(
+        snapshot::export(&reopened, &namespace(), DEADLINE)
+            .unwrap_err()
+            .outcome,
+        Outcome::Corrupt
+    );
+}
+
+#[test]
 fn empty_and_dry_run_maintenance_do_not_invent_retained_effects() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

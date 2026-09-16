@@ -6,7 +6,7 @@
 
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, MaintenanceKind,
-    NamespaceHandle, NcmEngine, Outcome, RejectReason, durable_integrity_digest,
+    NamespaceHandle, NcmEngine, Outcome, RejectReason, canonical_digest, durable_integrity_digest,
     portable_common_maintenance_event, validate_event_payload_digest,
 };
 use crate::ports::{Deadline, StateRoot};
@@ -1002,7 +1002,7 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         let portable_maintenance = portable_common_maintenance_event(&content.namespace, event)
             .map_err(|reason| rejected(&reason))?;
         let portable_control = match &receipt.operation {
-            DurableOperation::CommonControl { operations } => {
+            DurableOperation::CommonControl { operations, .. } => {
                 event.kind == "common_control"
                     && operations.iter().all(|operation| match operation {
                         DurableOperation::Observe { record_id } => {
@@ -1020,7 +1020,7 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         };
         let owns_capsule = match &receipt.operation {
             DurableOperation::Observe { record_id } => content.capsules.iter().filter(|capsule| capsule.commit_seq == event.seq).count() == 1 && content.capsules.iter().any(|capsule| capsule.commit_seq == event.seq && capsule.record_id == *record_id),
-            DurableOperation::CommonControl { operations } => content.capsules.iter().filter(|capsule| capsule.commit_seq == event.seq).all(|capsule| operations.iter().filter(|operation| matches!(operation, DurableOperation::Observe { record_id } if *record_id == capsule.record_id)).count() == 1),
+            DurableOperation::CommonControl { operations, .. } => content.capsules.iter().filter(|capsule| capsule.commit_seq == event.seq).all(|capsule| operations.iter().filter(|operation| matches!(operation, DurableOperation::Observe { record_id } if *record_id == capsule.record_id)).count() == 1),
             _ => false,
         };
         if capsule_sequences.contains(&event.seq) && !owns_capsule {
@@ -1082,6 +1082,21 @@ fn validate_snapshot_event_envelope(
             "snapshot deletion fence unexpectedly has an idempotency key",
         ));
     }
+    if receipt.idempotency_key.as_deref() != event.idempotency_key.as_deref() {
+        return Err(rejected("snapshot event receipt idempotency key mismatch"));
+    }
+    if let DurableOperation::CommonControl {
+        canonical_input, ..
+    } = &receipt.operation
+    {
+        let expected = canonical_digest(canonical_input)
+            .map_err(|reason| rejected(&format!("snapshot common control digest: {reason}")))?;
+        if event.payload_sha256 != expected
+            || receipt.reply.payload["request_semantic_sha256"] != expected
+        {
+            return Err(rejected("snapshot common control semantic digest mismatch"));
+        }
+    }
     let kind_matches = match &receipt.operation {
         DurableOperation::CommonControl { .. } => event.kind == "common_control",
         DurableOperation::Observe { .. } => event.kind == "observe",
@@ -1142,7 +1157,7 @@ fn build_direct_stage(
             "replayed": false
         }),
     );
-    let receipt = restore_receipt(&reply, &snapshot.kernel)?;
+    let receipt = restore_receipt(&reply, &snapshot.kernel, Some(idempotency_key))?;
     let checkpoint = checkpoint_bytes(&snapshot.kernel)?;
     populate_stage(
         db_path,
@@ -1234,6 +1249,7 @@ fn build_sanitized_stage(
         operation: fence_operation,
         state_digest: fence_state_digest,
         integrity_digest: fence_integrity_digest,
+        idempotency_key: None,
     })
     .map_err(|error| {
         corrupt_reply(
@@ -1375,6 +1391,7 @@ fn populate_stage(
             },
             state_digest: String::new(),
             integrity_digest: String::new(),
+            idempotency_key: None,
         })
         .map_err(|error| corrupt_reply(0, &format!("serialize staged observe receipt: {error}")))?;
         let created_tick = kernel
@@ -1502,7 +1519,7 @@ fn replace_restore_receipt(
     reply: &EngineReply,
     kernel: &NcmKernel,
 ) -> Result<(), EngineReply> {
-    let receipt = restore_receipt(reply, kernel)?;
+    let receipt = restore_receipt(reply, kernel, Some(idempotency_key))?;
     let conn = Connection::open(db_path).map_err(|error| {
         unavailable_reply(seq, &format!("open staged restore receipt: {error}"))
     })?;
@@ -1596,7 +1613,11 @@ fn lookup_restore_replay(
     Ok(Some(reply))
 }
 
-fn restore_receipt(reply: &EngineReply, kernel: &NcmKernel) -> Result<String, EngineReply> {
+fn restore_receipt(
+    reply: &EngineReply,
+    kernel: &NcmKernel,
+    idempotency_key: Option<&str>,
+) -> Result<String, EngineReply> {
     let operation = DurableOperation::Maintenance {
         kind: MaintenanceKind::Checkpoint,
     };
@@ -1608,6 +1629,7 @@ fn restore_receipt(reply: &EngineReply, kernel: &NcmKernel) -> Result<String, En
         operation,
         state_digest,
         integrity_digest,
+        idempotency_key: idempotency_key.map(str::to_owned),
     })
     .map_err(|error| {
         corrupt_reply(

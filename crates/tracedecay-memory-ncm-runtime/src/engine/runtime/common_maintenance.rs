@@ -597,7 +597,7 @@ fn checked_event(
     }
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|error| format!("invalid durable maintenance receipt: {error}"))?;
-    validate_durable_receipt(&durable, event.seq)?;
+    validate_durable_receipt(&durable, event.seq, event.idempotency_key.as_deref())?;
     let Some(value) = durable.reply.payload.get("common_maintenance") else {
         return Ok(None);
     };

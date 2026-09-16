@@ -6,6 +6,8 @@
 )]
 #![doc = "Durable public feedback delivery identity and legacy wire compatibility."]
 
+use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -213,4 +215,57 @@ fn legacy_common_feedback_without_capsule_replays_without_inventing_public_ident
     expected.payload["replayed"] = json!(true);
     assert_eq!(replay, expected);
     assert!(replay.payload.get("feedback_delivery_capsule").is_none());
+}
+
+#[test]
+fn common_control_recovery_recomputes_semantics_from_receipt_input() {
+    #[derive(Serialize)]
+    struct IntegrityBasis<'a> {
+        reply: &'a Value,
+        operation: &'a Value,
+        state_digest: &'a str,
+    }
+
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let mut request = feedback(&live, "semantic-recovery-key");
+    seal(&mut request, "semantic-recovery-key", "semantic-recovery");
+    let committed = live.common_control(&namespace(), request.clone(), DEADLINE);
+    assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+    let key = request["idempotency_key"].as_str().unwrap().to_owned();
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    assert!(receipt["operation"]["canonical_input"].is_object());
+    receipt["operation"]["canonical_input"] = json!({"tampered": true});
+    let state_digest = receipt["state_digest"].as_str().unwrap().to_owned();
+    let integrity = IntegrityBasis {
+        reply: &receipt["reply"],
+        operation: &receipt["operation"],
+        state_digest: &state_digest,
+    };
+    receipt["integrity_digest"] = json!(digest(&serde_json::to_vec(&integrity).unwrap()));
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
+            [serde_json::to_string(&receipt).unwrap(), key],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = engine(&directory);
+    assert_eq!(reopened.handshake(&namespace()).outcome, Outcome::Corrupt);
 }

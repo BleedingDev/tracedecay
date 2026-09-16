@@ -1,6 +1,6 @@
 use super::super::*;
 use crate::ports::{Deadline, EncoderError, EncoderIdentity, StateRoot};
-use crate::store::{Mutation, StoreError, StoreIdentity, StoreMeta};
+use crate::store::{Event, Mutation, StoreError, StoreIdentity, StoreMeta};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -52,7 +52,9 @@ pub(super) fn lookup_replay(
         .capsules_in_commit_order(true)
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let durable = validate_recovery_event(&event, seq, handle.commit_seq)?;
-    validate_durable_receipt(&durable, event.seq)
+    validate_durable_receipt(&durable, event.seq, Some(key))
+        .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
+    validate_common_control_digest(&event, &durable)
         .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
     validate_event_payload_digest(&event, &durable, &capsules)?;
     let mut replay = durable.reply;
@@ -119,6 +121,7 @@ pub(super) fn durable_receipt(
     reply: &EngineReply,
     operation: DurableOperation,
     kernel: &NcmKernel,
+    idempotency_key: Option<&str>,
 ) -> Result<String, EngineReply> {
     let state_digest = sha256_hex(&kernel.state_digest());
     let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)
@@ -128,6 +131,7 @@ pub(super) fn durable_receipt(
         operation,
         state_digest,
         integrity_digest,
+        idempotency_key: idempotency_key.map(str::to_owned),
     })
     .map_err(|error| {
         corrupt_reply(
@@ -166,6 +170,7 @@ pub(crate) fn durable_integrity_digest(
 pub(super) fn validate_durable_receipt(
     receipt: &DurableReceipt,
     expected_sequence: u64,
+    expected_idempotency_key: Option<&str>,
 ) -> Result<(), String> {
     if expected_sequence == 0 || receipt.reply.state_generation != expected_sequence {
         return Err("durable receipt generation mismatch".to_owned());
@@ -183,6 +188,32 @@ pub(super) fn validate_durable_receipt(
     }
     if receipt.reply.outcome != Outcome::Success {
         return Err("durable receipt outcome is not success".to_owned());
+    }
+    if receipt.idempotency_key.as_deref() != expected_idempotency_key {
+        return Err("durable receipt idempotency key mismatch".to_owned());
+    }
+    Ok(())
+}
+
+/// Recomputes a common-control event's semantic digest from the canonical
+/// effect input persisted in its durable operation. The reply field is only a
+/// derived projection, so accepting it without this independent input check
+/// would allow a receipt to retain a self-consistent but different request.
+pub(super) fn validate_common_control_digest(
+    event: &Event,
+    receipt: &DurableReceipt,
+) -> Result<(), String> {
+    let DurableOperation::CommonControl {
+        canonical_input, ..
+    } = &receipt.operation
+    else {
+        return Ok(());
+    };
+    let expected = canonical_digest(canonical_input)?;
+    if event.payload_sha256 != expected
+        || receipt.reply.payload["request_semantic_sha256"] != expected
+    {
+        return Err("common control semantic digest mismatch".to_owned());
     }
     Ok(())
 }

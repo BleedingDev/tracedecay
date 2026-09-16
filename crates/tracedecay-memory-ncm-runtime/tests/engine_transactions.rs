@@ -511,6 +511,42 @@ fn recovery_digest_mismatch_fails_closed() {
     assert_eq!(reopened.handshake(&ns).outcome, Outcome::Corrupt);
 }
 
+#[test]
+fn ordinary_replay_receipt_idempotency_key_is_bound_to_the_journal_event() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let root = state_root(&tempdir);
+    let ns = namespace(69);
+    let engine = make_engine(&tempdir);
+    let request = observe_request("bound", "receipt", "ordinary-replay-key");
+    let observed = engine.observe(&ns, request.clone());
+    assert_eq!(observed.outcome, Outcome::Success);
+    drop(engine);
+
+    let path = root.path().join("namespaces").join(&ns).join("ncm.sqlite");
+    let connection = Connection::open(path).expect("store opens for corruption fixture");
+    let receipt: String = connection
+        .query_row("SELECT receipt FROM events WHERE seq = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("receipt reads");
+    let mut receipt_json: Value = serde_json::from_str(&receipt).expect("receipt is JSON");
+    assert_eq!(
+        receipt_json["idempotency_key"],
+        json!("ordinary-replay-key")
+    );
+    receipt_json["idempotency_key"] = json!("different-ordinary-key");
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE seq = 1",
+            [serde_json::to_string(&receipt_json).expect("receipt serializes")],
+        )
+        .expect("receipt corruption writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    assert_eq!(reopened.handshake(&ns).outcome, Outcome::Corrupt);
+}
+
 #[cfg(feature = "real-encoder")]
 #[test]
 fn real_encoder_paraphrase_journey_returns_the_matching_record_first() {
@@ -564,8 +600,7 @@ fn integrity_observation(common: bool) -> ObserveRequest {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        request.provenance["common_capsule"] =
-            json!({"version":1,"sha256":sha256,"bytes":bytes});
+        request.provenance["common_capsule"] = json!({"version":1,"sha256":sha256,"bytes":bytes});
     }
     request.payload_sha256 = request.canonical_payload_sha256().unwrap();
     request

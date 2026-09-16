@@ -334,6 +334,7 @@ impl NcmEngine {
             (*live).clone(),
             &page.key,
             &digest,
+            effect.clone(),
             Vec::new(),
             Vec::new(),
             None,
@@ -481,6 +482,7 @@ impl NcmEngine {
             candidate,
             &item.delivery_key,
             &digest,
+            replay_item_input(item),
             vec![DurableOperation::Observe {
                 record_id: report.record_id,
             }],
@@ -556,6 +558,7 @@ fn existing_item(
         (*live).clone(),
         &item.delivery_key,
         digest,
+        replay_item_input(item),
         Vec::new(),
         Vec::new(),
         None,
@@ -715,9 +718,11 @@ fn classify_replay_item(
 }
 
 fn replay_item_digest(item: &ReplayItem) -> Result<String, String> {
-    canonical_digest(
-        &json!({"sequence":item.sequence,"receipt":item.receipt_digest,"source":item.source,"admitted":item.admitted,"observation":item.observation["payload_sha256"]}),
-    )
+    canonical_digest(&replay_item_input(item))
+}
+
+fn replay_item_input(item: &ReplayItem) -> Value {
+    json!({"sequence":item.sequence,"receipt":item.receipt_digest,"source":item.source,"admitted":item.admitted,"observation":item.observation["payload_sha256"]})
 }
 
 // This read-only path runs with the namespace lock after the page identity,

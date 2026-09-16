@@ -13,7 +13,7 @@ pub(crate) use runtime::recovery::{
     replay_event as replay_recovery_event, validate_event_payload_digest,
     validate_pending_deletion_fence, validate_recovery_event,
 };
-pub(crate) use runtime::durable_integrity_digest;
+pub(crate) use runtime::{canonical_digest, durable_integrity_digest};
 
 use crate::ports::{Deadline, StateRoot, TextEncoder};
 use crate::store::{CommitSeq, NamespaceStore};
@@ -292,6 +292,13 @@ pub(crate) struct DurableReceipt {
     pub(crate) operation: DurableOperation,
     pub(crate) state_digest: String,
     pub(crate) integrity_digest: String,
+    /// The request key that the journal event uses for ordinary replay.
+    ///
+    /// Deletion fences deliberately have no event-level idempotency key, so
+    /// their receipt carries `None` while the fence operation retains its
+    /// private request binding.
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +306,10 @@ pub(crate) struct DurableReceipt {
 pub(crate) enum DurableOperation {
     CommonControl {
         operations: Vec<DurableOperation>,
+        /// Canonical effect input used to derive the event payload digest.
+        /// Keeping it in the receipt lets recovery recompute the semantic
+        /// digest without trusting the reply's derived digest field.
+        canonical_input: Value,
     },
     Observe {
         record_id: RecordId,

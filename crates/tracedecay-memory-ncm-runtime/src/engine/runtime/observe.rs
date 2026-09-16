@@ -173,6 +173,7 @@ impl NcmEngine {
                 record_id: report.record_id,
             },
             &candidate,
+            Some(&request.idempotency_key),
         ) {
             Ok(receipt) => receipt,
             Err(reply) => return reply,

@@ -2,7 +2,10 @@
 
 use super::super::*;
 use super::selection::stable_reference;
-use super::util::{read_live, remaining_deadline, store_reply, unavailable_recovery};
+use super::util::{
+    read_live, remaining_deadline, store_reply, unavailable_recovery,
+    validate_common_control_digest, validate_durable_receipt,
+};
 use crate::store::CapsuleStatus;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -368,13 +371,16 @@ fn delivery_receipt(
         };
         let durable: DurableReceipt =
             serde_json::from_str(&event.receipt).map_err(|_| corrupt())?;
+        validate_durable_receipt(&durable, event.seq, event.idempotency_key.as_deref())
+            .map_err(|_| corrupt())?;
+        validate_common_control_digest(&event, &durable).map_err(|_| corrupt())?;
         let mut records = std::collections::BTreeSet::new();
         let (operation, page_capsule) = match &durable.operation {
             DurableOperation::Observe { record_id } if event.kind == "observe" => {
                 records.insert(*record_id);
                 ("observe", None)
             }
-            DurableOperation::CommonControl { operations }
+            DurableOperation::CommonControl { operations, .. }
                 if event.kind == "common_control"
                     && operations.is_empty()
                     && durable.reply.payload["common_portability"] == "replay" =>
