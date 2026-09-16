@@ -46,7 +46,6 @@
 #![allow(unreachable_pub)]
 #![allow(clippy::large_enum_variant)]
 
-pub mod action_receipt;
 pub mod application_surface;
 pub mod client;
 pub mod client_identity;
