@@ -1163,7 +1163,7 @@ impl ObservationRecentWindowV1 {
         sequences: &[u64],
     ) -> ObservationStoreResult<Option<Self>> {
         if sequences.len() > request.limit() + 1
-            || sequences.iter().any(|sequence| *sequence == 0)
+            || sequences.contains(&0)
             || sequences.windows(2).any(|pair| pair[0] <= pair[1])
         {
             return Err(ObservationStoreError::InvalidRecentWindow);
