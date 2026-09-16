@@ -377,11 +377,9 @@ pub(super) fn read_clone_fingerprint_page(
         if stop {
             break;
         }
-        let discovery_checkpoint = discovery_after
-            .as_ref()
-            .filter(|position| {
-                position.posting_count == posting_count && position.fingerprint == fingerprint
-            });
+        let discovery_checkpoint = discovery_after.as_ref().filter(|position| {
+            position.posting_count == posting_count && position.fingerprint == fingerprint
+        });
         if let Some(checkpoint) = &discovery_after {
             if (posting_count, fingerprint) < (checkpoint.posting_count, checkpoint.fingerprint) {
                 continue;
@@ -405,14 +403,7 @@ pub(super) fn read_clone_fingerprint_page(
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
         }
-        let mut statement = if let Some(checkpoint) = discovery_checkpoint {
-            let occurrence = checkpoint
-                .symbol_occurrence_id
-                .as_ref()
-                .expect("discovery checkpoint with a row has an occurrence");
-            let token_position = checkpoint
-                .token_position
-                .expect("discovery checkpoint with a row has a token position");
+        let mut statement = if discovery_checkpoint.is_some() {
             connection
                 .prepare_cached(
                     "SELECT posting.symbol_occurrence_id, posting.token_position, posting.payload_digest, posting.body_digest, occurrence.occurrence, payload.payload
