@@ -14,14 +14,15 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 plugin_dir = pathlib.Path(sys.argv[1])
 project_root = pathlib.Path(sys.argv[2]).resolve()
 trace_decay_bin = sys.argv[3]
 session_id = "hermes-cli-project-journey"
-fixed_timestamp_ns = 1_710_000_000_000_000_000
-fixed_timestamp = 1_710_000_000.0
+fixed_timestamp_ns = time.time_ns()
+fixed_timestamp = fixed_timestamp_ns / 1_000_000_000
 
 # ``tools.py`` captures this override while the generated package is imported.
 # It keeps the fixture independent of the binary path baked into the install.
