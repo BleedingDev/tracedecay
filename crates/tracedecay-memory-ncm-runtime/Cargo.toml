@@ -16,6 +16,7 @@ name = "ncm_scale"
 harness = false
 
 [dependencies]
+cap-fs-ext = "4.0.2"
 cap-std = "4.0.2"
 tempfile = "3"
 tracedecay-private-fs = { path = "../tracedecay-private-fs" }
@@ -28,6 +29,9 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"
 # Real native inference (contract §9). Keep this synchronized with the
 # published FastEmbed/ORT runtime used by tracedecay-semantic.
 fastembed = { version = "=6.0.3", optional = true, default-features = false, features = ["ort-download-binaries-rustls-tls", "hf-hub-rustls-tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 # Production shape. Lanes that do not touch inference build with `--no-default-features`

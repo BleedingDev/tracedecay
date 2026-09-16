@@ -6788,8 +6788,10 @@ dependencies = [
 name = "tracedecay-memory-ncm-runtime"
 version = "0.1.0-beta.37"
 dependencies = [
+ "cap-fs-ext",
  "cap-std",
  "fastembed",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

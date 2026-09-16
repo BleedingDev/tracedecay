@@ -1,10 +1,10 @@
 //! Bounded single-owner client for the supervised NCM worker process.
 
 use crate::wire::{self, Operation, Reply, Request};
-use crate::worker_artifact::verify_worker_binary;
+use crate::worker_artifact::{VerifiedWorkerArtifact, stage_verified_worker_binary};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -801,12 +801,42 @@ fn owner_loop(
             }
         }
         let result = match process.as_mut() {
-            Some(worker) => worker.execute(
-                &command.request,
-                command.expires,
-                &shutdown,
-                command.cancelled.as_ref(),
-            ),
+            Some(worker) => {
+                let result = if requires_readiness(&command.request) {
+                    worker.ensure_ready(
+                        &command.request.namespace,
+                        command.expires,
+                        &shutdown,
+                        command.cancelled.as_ref(),
+                    )
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| {
+                    worker.execute(
+                        &command.request,
+                        command.expires,
+                        &shutdown,
+                        command.cancelled.as_ref(),
+                    )
+                });
+                if let Ok(reply) = &result
+                    && command.request.op == Operation::Handshake
+                    && reply.outcome == crate::engine::Outcome::Success
+                {
+                    worker.mark_ready(&command.request.namespace);
+                }
+                if let Some(reply) = result.as_ref().ok()
+                    && matches!(
+                        &reply.outcome,
+                        crate::engine::Outcome::Unavailable(_)
+                            | crate::engine::Outcome::Corrupt
+                    )
+                {
+                    worker.invalidate_ready(&command.request.namespace);
+                }
+                result
+            }
             None => Err(ClientError::OwnerStopped),
         };
         let abnormal = matches!(
@@ -840,20 +870,30 @@ enum WriterCommand {
 
 struct WorkerProcess {
     child: Child,
+    _artifact: Option<VerifiedWorkerArtifact>,
     writer: SyncSender<WriterCommand>,
     replies: Receiver<Result<Reply, String>>,
     writer_thread: JoinHandle<()>,
     reader_thread: JoinHandle<()>,
     pid: Arc<AtomicU32>,
+    ready_namespaces: BTreeSet<String>,
 }
 
 impl WorkerProcess {
     fn spawn(launch: &Launch, pid: Arc<AtomicU32>) -> Result<Self, ClientError> {
-        if !launch.test_double {
-            verify_worker_binary(&launch.binary)
-                .map_err(|error| ClientError::Unavailable(error.to_string()))?;
-        }
-        let mut command = ProcessCommand::new(&launch.binary);
+        let artifact = if launch.test_double {
+            None
+        } else {
+            Some(
+                stage_verified_worker_binary(&launch.binary)
+                    .map_err(|error| ClientError::Unavailable(error.to_string()))?,
+            )
+        };
+        let binary = artifact
+            .as_ref()
+            .map(VerifiedWorkerArtifact::path)
+            .unwrap_or(launch.binary.as_path());
+        let mut command = ProcessCommand::new(binary);
         command
             .arg("--state-root")
             .arg(&launch.root)
@@ -916,12 +956,60 @@ impl WorkerProcess {
         pid.store(child.id(), Ordering::Release);
         Ok(Self {
             child,
+            _artifact: artifact,
             writer,
             replies,
             writer_thread,
             reader_thread,
             pid,
+            ready_namespaces: BTreeSet::new(),
         })
+    }
+
+    fn ensure_ready(
+        &mut self,
+        namespace: &str,
+        expires: Instant,
+        shutdown: &AtomicBool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), ClientError> {
+        if self.ready_namespaces.contains(namespace) {
+            return Ok(());
+        }
+        let remaining = remaining(expires).ok_or(ClientError::Cancelled)?;
+        let request = Request::new(
+            0,
+            u64::try_from(remaining.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            Operation::Handshake,
+            namespace,
+            json!({
+                "protocol_version": wire::PROTOCOL_VERSION,
+                "protocol_identity": wire::PROTOCOL_IDENTITY,
+                "algorithm_profile": "ncm-biomem-rs.v1"
+            }),
+        );
+        let reply = self.execute(&request, expires, shutdown, cancelled)?;
+        match reply.outcome {
+            crate::engine::Outcome::Success => {
+                self.ready_namespaces.insert(namespace.to_owned());
+                Ok(())
+            }
+            crate::engine::Outcome::Cancelled => Err(ClientError::Cancelled),
+            crate::engine::Outcome::Unavailable(detail) => Err(ClientError::Unavailable(detail)),
+            outcome => Err(ClientError::Unavailable(format!(
+                "worker readiness refused: {outcome:?}"
+            ))),
+        }
+    }
+
+    fn mark_ready(&mut self, namespace: &str) {
+        self.ready_namespaces.insert(namespace.to_owned());
+    }
+
+    fn invalidate_ready(&mut self, namespace: &str) {
+        self.ready_namespaces.remove(namespace);
     }
 
     fn execute(
@@ -1005,6 +1093,16 @@ impl WorkerProcess {
         drop(self.writer);
         let _ = self.writer_thread.join();
         let _ = self.reader_thread.join();
+    }
+}
+
+fn requires_readiness(request: &Request) -> bool {
+    match request.op {
+        Operation::Handshake => false,
+        Operation::Health => {
+            !request.namespace.is_empty() || request.payload.get("common_control").is_some()
+        }
+        _ => true,
     }
 }
 
