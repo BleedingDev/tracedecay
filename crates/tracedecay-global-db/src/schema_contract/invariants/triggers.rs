@@ -1,6 +1,6 @@
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
 
-use crate::global_db_operation_error;
+use crate::{global_db_operation_error, global_db_operation_message};
 
 use super::{OPERATION, normalize_trigger_sql};
 
@@ -1625,6 +1625,43 @@ pub(super) async fn trigger_contracts_intact(
     for invariant in INVARIANTS {
         for trigger in invariant.triggers {
             if !trigger_matches(conn, trigger).await? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+#[hotpath::measure(
+    future = true,
+    label = "global_db.schema_contract.triggers.released_v3_intact"
+)]
+pub async fn released_v3_invariant_triggers_intact(
+    conn: &impl QueryExecutor,
+) -> tracedecay_domain::errors::Result<bool> {
+    const CURRENT_ACCOUNTING: &str = "AND NEW.committed_records = receipt.committed_item_count";
+    const RELEASED_V3_ACCOUNTING: &str = "AND NEW.committed_records =
+                                receipt.occurrence_count
+                                + receipt.copy_count
+                                + receipt.assertion_count";
+
+    for invariant in INVARIANTS {
+        for trigger in invariant.triggers {
+            if trigger.name == "session_refresh_progress_insert_guard_v1" {
+                let released_sql =
+                    trigger
+                        .create_sql
+                        .replacen(CURRENT_ACCOUNTING, RELEASED_V3_ACCOUNTING, 1);
+                if released_sql == trigger.create_sql {
+                    return Err(global_db_operation_message(
+                        OPERATION,
+                        "released v3 refresh accounting trigger contract is unavailable",
+                    ));
+                }
+                if !trigger_matches_sql(conn, trigger, &released_sql).await? {
+                    return Ok(false);
+                }
+            } else if !trigger_matches(conn, trigger).await? {
                 return Ok(false);
             }
         }
