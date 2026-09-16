@@ -28,10 +28,10 @@ pub use retained_curator::execute_retained_memory_curator;
 
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod cognitive_recall;
-#[cfg(feature = "memory-provider-host")]
-pub use cognitive_recall::CognitiveRecallMountError;
 #[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
 pub use cognitive_recall::test_context_evidence;
+#[cfg(feature = "memory-provider-host")]
+pub use cognitive_recall::{AdvisoryMemoryContextV1, CognitiveRecallMountError};
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_common_factory_tests.rs"]
 mod native_common_factory_tests;
@@ -473,6 +473,67 @@ impl ProjectCognitiveRecallMountV1 {
     pub(crate) fn inner(&self) -> Arc<cognitive_recall::ProjectCognitiveRecallMountV1> {
         Arc::clone(&self.inner)
     }
+}
+
+/// Opaque admission result for the MCP advisory recall lane.
+#[cfg(feature = "memory-provider-host")]
+pub struct ProjectAdvisoryRecallCallV1 {
+    inner: cognitive_recall::AdvisoryRecallCallV1,
+}
+
+#[cfg(feature = "memory-provider-host")]
+impl ProjectAdvisoryRecallCallV1 {
+    /// Returns the host-bound session identity used to mint the recall port.
+    /// An empty value means the call was admitted without a usable binding and
+    /// will receive a typed unavailable lane from the owner.
+    #[must_use]
+    pub fn canonical_session_id(&self) -> &str {
+        self.inner.canonical_session_id()
+    }
+}
+
+/// Admit a transport-neutral context tool call into the provider-owned
+/// advisory lane. The transport crate supplies only the already-routed
+/// arguments and request controls; it never reaches into the retained owner.
+#[cfg(feature = "memory-provider-host")]
+pub fn project_advisory_context_call(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    request_id: Option<&tracedecay_contracts::RequestId>,
+    deadline: Option<&tracedecay_contracts::Deadline>,
+    cancellation: Option<&tracedecay_contracts::CancellationSignal>,
+) -> Option<ProjectAdvisoryRecallCallV1> {
+    cognitive_recall::advisory_context_call(
+        tool_name,
+        arguments,
+        request_id,
+        deadline,
+        cancellation,
+    )
+    .map(|inner| ProjectAdvisoryRecallCallV1 { inner })
+}
+
+/// Execute an admitted provider advisory lane while keeping its child owner
+/// type private to the daemon-service crate.
+#[cfg(feature = "memory-provider-host")]
+pub async fn project_advisory_memory_context_for_call(
+    port: std::result::Result<
+        tracedecay_memory_provider_registry::ProjectCognitiveRecallPortV1,
+        CognitiveRecallMountError,
+    >,
+    mount: Option<&ProjectCognitiveRecallMountV1>,
+    call: ProjectAdvisoryRecallCallV1,
+    context_memory_contribution: Option<
+        &tracedecay_contracts::retrieval::ContextMemoryContributionV1,
+    >,
+) -> Option<AdvisoryMemoryContextV1> {
+    cognitive_recall::advisory_memory_context_for_call(
+        port,
+        mount.map(|mount| mount.inner.as_ref()),
+        call.inner,
+        context_memory_contribution,
+    )
+    .await
 }
 
 /// Inputs needed to mount the full observation and provider-control owners.

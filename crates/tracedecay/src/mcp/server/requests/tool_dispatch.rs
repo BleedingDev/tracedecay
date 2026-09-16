@@ -300,21 +300,22 @@ impl McpServer {
         // Advisory admission reads the arguments before they move; the
         // recall itself runs only after the handler answered.
         #[cfg(feature = "memory-provider-host")]
-        let advisory_call = crate::daemon::retained_owner::cognitive_recall::advisory_context_call(
-            tool_name,
-            // The lane binds to the exact caller session the host routed this
-            // call under, which lives in the preserved identity view whenever
-            // route-only metadata carried it out of the handler arguments.
-            route_identity_arguments
-                .as_ref()
-                .unwrap_or(&handler_arguments),
-            // An ordinary agent call carries no session id in its arguments,
-            // so the lane binds to the connection this request identity was
-            // minted on instead of skipping the call.
-            application_request_id.as_ref(),
-            application_deadline.as_ref(),
-            application_cancellation.as_ref(),
-        );
+        let advisory_call =
+            tracedecay_daemon_service::retained_owner::project_advisory_context_call(
+                tool_name,
+                // The lane binds to the exact caller session the host routed this
+                // call under, which lives in the preserved identity view whenever
+                // route-only metadata carried it out of the handler arguments.
+                route_identity_arguments
+                    .as_ref()
+                    .unwrap_or(&handler_arguments),
+                // An ordinary agent call carries no session id in its arguments,
+                // so the lane binds to the connection this request identity was
+                // minted on instead of skipping the call.
+                application_request_id.as_ref(),
+                application_deadline.as_ref(),
+                application_cancellation.as_ref(),
+            );
         let dispatch: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>,
         > = handle_tool_call_with_registry_options(
@@ -418,7 +419,7 @@ impl McpServer {
         #[cfg(feature = "memory-provider-host")]
         let dispatched = match (dispatched, advisory_call) {
             (Ok(result), Some(call)) => Ok(
-                match crate::daemon::retained_owner::cognitive_recall::advisory_memory_context_for_call(
+                match tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
                     self.cognitive_recall_port_for_session(call.canonical_session_id()),
                     self.cognitive_recall_mount.as_deref(),
                     call,
