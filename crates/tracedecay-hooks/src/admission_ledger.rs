@@ -452,6 +452,9 @@ impl HookAdmissionLedgerV1 {
         observation: Option<HookLiveOriginObservationV1>,
         now: UtcMicros,
     ) -> Result<HookLiveOriginOutcomeV1, HookAdmissionLedgerError> {
+        if envelope.producer != self.host {
+            return Err(HookAdmissionLedgerError::InvalidIdentity);
+        }
         if receipt.decision != HookAdmissionDecisionV1::Admitted {
             return Ok(HookLiveOriginOutcomeV1::Duplicate);
         }
@@ -495,7 +498,9 @@ impl HookAdmissionLedgerV1 {
                 && self.origin_admission_retained(&proof.seal, now)
         });
         let mut outcome = HookLiveOriginOutcomeV1::Unavailable;
-        if let Some(mut observation) = observation.filter(valid_origin_observation) {
+        if let Some(mut observation) =
+            observation.filter(|observation| valid_origin_observation(self.host, observation))
+        {
             let continuous = previous.as_ref().and_then(|baseline| {
                 let mut baseline = baseline.clone();
                 normalize_empty_origin_checkpoint(&mut baseline, &mut observation);
@@ -577,6 +582,9 @@ impl HookAdmissionLedgerV1 {
         envelope: &HookEventEnvelopeV2,
         now: UtcMicros,
     ) -> Result<HookAdmissionLedgerReceiptV1, HookAdmissionLedgerError> {
+        if envelope.producer != self.host {
+            return Err(HookAdmissionLedgerError::InvalidIdentity);
+        }
         let identity = envelope.event_id;
         if identity == [0; IDENTITY_BYTES] {
             return Err(HookAdmissionLedgerError::InvalidIdentity);
@@ -635,6 +643,9 @@ impl HookAdmissionLedgerV1 {
         &mut self,
         envelope: &HookEventEnvelopeV2,
     ) -> Result<bool, HookAdmissionLedgerError> {
+        if envelope.producer != self.host {
+            return Err(HookAdmissionLedgerError::InvalidIdentity);
+        }
         let identity = envelope.event_id;
         let Some(entry) = self.entries.get(&identity) else {
             return Err(HookAdmissionLedgerError::InvalidIdentity);
@@ -745,9 +756,34 @@ impl HookAdmissionLedgerV1 {
     }
 }
 
-fn valid_origin_observation(value: &HookLiveOriginObservationV1) -> bool {
+/// The provider identity in a persisted source observation is derived from the
+/// producing hook host. Cursor's desktop and cloud hook identities are
+/// separate persisted roots, but both are the supported `cursor` source alias.
+/// Keeping this match explicit means a new host needs a deliberate provider
+/// mapping before it can authorize persisted origin metadata.
+fn source_provider_for_host(host: HookHostV1) -> Option<&'static str> {
+    match host {
+        HookHostV1::ClaudeCode => Some("claude"),
+        HookHostV1::Codex => Some("codex"),
+        HookHostV1::CursorDesktop | HookHostV1::CursorCloud => Some("cursor"),
+        HookHostV1::Hermes => Some("hermes"),
+        HookHostV1::Kiro => Some("kiro"),
+        HookHostV1::Cline => Some("cline"),
+        HookHostV1::RooCode => Some("roo-code"),
+        HookHostV1::Kilo => Some("kilo"),
+        HookHostV1::KimiCode => Some("kimi"),
+        HookHostV1::OpenCode => Some("opencode"),
+    }
+}
+
+fn source_provider_matches_host(host: HookHostV1, source: &ObservationSourceIdentityV1) -> bool {
+    source_provider_for_host(host).is_some_and(|expected| expected == source.provider().as_str())
+}
+
+fn valid_origin_observation(host: HookHostV1, value: &HookLiveOriginObservationV1) -> bool {
     let repository = &value.scope.repository;
-    value.source.validate().is_ok()
+    source_provider_matches_host(host, &value.source)
+        && value.source.validate().is_ok()
         && repository.validate().is_ok()
         && repository.project_id().is_some()
         && repository.worktree_id().is_some()
@@ -863,8 +899,11 @@ fn same_live_origin_authority(
         && left.worktree_epoch == right.worktree_epoch
 }
 
+// Validate the persisted host/source pair from the record itself. Read-only
+// callers apply their requested host again when checking retained receipts.
 fn valid_origin_boundary(boundary: &HookLiveOriginBoundaryV1) -> bool {
-    valid_origin_observation(&boundary.observation)
+    boundary.start.admission.host == boundary.admission.host
+        && valid_origin_observation(boundary.admission.host, &boundary.observation)
         && same_live_origin_authority(&boundary.start.admission, &boundary.admission)
         && boundary.start.admission.order <= boundary.admission.order
         && boundary.start.admission.admitted_at.0 <= boundary.admission.admitted_at.0
@@ -1855,6 +1894,164 @@ mod tests {
             read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_source_provider_mapping_accepts_canonical_hook_aliases() {
+        let supported = [
+            (HookHostV1::ClaudeCode, "claude"),
+            (HookHostV1::Codex, "codex"),
+            (HookHostV1::CursorDesktop, "cursor"),
+            (HookHostV1::CursorCloud, "cursor"),
+            (HookHostV1::Hermes, "hermes"),
+            (HookHostV1::Kiro, "kiro"),
+            (HookHostV1::Cline, "cline"),
+            (HookHostV1::RooCode, "roo-code"),
+            (HookHostV1::Kilo, "kilo"),
+            (HookHostV1::KimiCode, "kimi"),
+            (HookHostV1::OpenCode, "opencode"),
+        ];
+        for (host, provider) in supported {
+            assert_eq!(source_provider_for_host(host), Some(provider));
+        }
+
+        let claude_source = origin_observation(100, 100).source;
+        let codex_source = ObservationSourceIdentityV1::for_provider_source(
+            tracedecay_domain::ProviderId::new("codex").unwrap(),
+            claude_source.session_id().clone(),
+            claude_source.source_key().clone(),
+        )
+        .unwrap();
+        assert!(source_provider_matches_host(
+            HookHostV1::ClaudeCode,
+            &claude_source
+        ));
+        assert!(source_provider_matches_host(
+            HookHostV1::Codex,
+            &codex_source
+        ));
+        assert!(!source_provider_matches_host(
+            HookHostV1::ClaudeCode,
+            &codex_source
+        ));
+    }
+
+    #[test]
+    fn cross_host_envelopes_are_rejected_by_the_bound_ledger() {
+        let root = TestDir::new("cross-host-envelope");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        let mut cross_host = envelope(9, 5);
+        cross_host.producer = HookHostV1::Codex;
+
+        assert_eq!(
+            ledger.admit_with_receipt(&cross_host, UtcMicros(2)),
+            Err(HookAdmissionLedgerError::InvalidIdentity)
+        );
+        assert_eq!(ledger.live_records(), 0);
+    }
+
+    #[test]
+    fn cross_host_source_provider_is_discarded_during_live_admission() {
+        let root = TestDir::new("cross-host-live-source");
+        let mut ledger = open(root.path(), UtcMicros(1));
+        let envelope = envelope(9, 5);
+        let receipt = ledger.admit_with_receipt(&envelope, UtcMicros(2)).unwrap();
+        let mut observation = origin_observation(100, 100);
+        let source = observation.source.clone();
+        observation.source = ObservationSourceIdentityV1::for_provider_source(
+            tracedecay_domain::ProviderId::new("codex").unwrap(),
+            source.session_id().clone(),
+            source.source_key().clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ledger.record_live_origin(&envelope, receipt, Some(observation), UtcMicros(2)),
+            Ok(HookLiveOriginOutcomeV1::Unavailable)
+        );
+        assert!(
+            ledger
+                .live_origin_baseline(envelope.protected_session_id, UtcMicros(2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_host_source_provider_metadata_is_rejected_on_reopen() {
+        let root = TestDir::new("cross-host-source-metadata");
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            assert_eq!(
+                record_origin(&mut ledger, 9, Some(origin_observation(100, 100))),
+                HookLiveOriginOutcomeV1::Baseline
+            );
+        }
+
+        let metadata_path = root.path().join(LIVE_ORIGINS_FILE);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["baselines"][0]["observation"]["source"]["provider"] =
+            serde_json::Value::String("codex".to_owned());
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let (ledger, report) = HookAdmissionLedgerV1::open(
+            root.path(),
+            HookHostV1::ClaudeCode,
+            HookAdmissionLedgerLimitsV1::stock(),
+            UtcMicros(10),
+        )
+        .unwrap();
+        assert_eq!(
+            report.live_origin_metadata_error,
+            Some(HookAdmissionLedgerError::RecordUndecodable)
+        );
+        assert!(
+            ledger
+                .live_origin_baseline([7; 32], UtcMicros(10))
+                .is_none()
+        );
+        assert_eq!(
+            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(10)),
+            Err(HookAdmissionLedgerError::RecordUndecodable)
+        );
+    }
+
+    #[test]
+    fn cross_host_admission_metadata_is_rejected_on_reopen() {
+        let root = TestDir::new("cross-host-admission-metadata");
+        {
+            let mut ledger = open(root.path(), UtcMicros(1));
+            assert_eq!(
+                record_origin(&mut ledger, 9, Some(origin_observation(100, 100))),
+                HookLiveOriginOutcomeV1::Baseline
+            );
+        }
+
+        let metadata_path = root.path().join(LIVE_ORIGINS_FILE);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata["baselines"][0]["start"]["admission"]["host"] =
+            serde_json::Value::String("codex".to_owned());
+        metadata["baselines"][0]["admission"]["host"] =
+            serde_json::Value::String("codex".to_owned());
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let (ledger, report) = HookAdmissionLedgerV1::open(
+            root.path(),
+            HookHostV1::ClaudeCode,
+            HookAdmissionLedgerLimitsV1::stock(),
+            UtcMicros(10),
+        )
+        .unwrap();
+        assert_eq!(
+            report.live_origin_metadata_error,
+            Some(HookAdmissionLedgerError::RecordUndecodable)
+        );
+        assert!(
+            ledger
+                .live_origin_baseline([7; 32], UtcMicros(10))
+                .is_none()
         );
     }
 
