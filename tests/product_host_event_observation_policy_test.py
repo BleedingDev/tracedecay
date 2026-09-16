@@ -167,6 +167,26 @@ class HostEventObservationPolicyTest(unittest.TestCase):
                 "source_identity.required_fields",
             )
 
+    def test_dispatch_settlement_uses_current_mcp_authority(self) -> None:
+        events = {
+            row["event_id"]: row
+            for row in self.policy["event_classes"]
+            if row["event_id"]
+            in {
+                "application.tool_execution_settled.v1",
+                "application.source_edit_settled.v1",
+            }
+        }
+        current_authority = "crates/tracedecay-mcp/src/server/settlement.rs"
+        stale_authority = "crates/tracedecay/src/mcp/server/dispatch_settlement.rs"
+        for event_id in (
+            "application.tool_execution_settled.v1",
+            "application.source_edit_settled.v1",
+        ):
+            commit_point = events[event_id]["canonical_commit_point"]
+            self.assertIn(current_authority, commit_point["source_paths"])
+            self.assertNotIn(stale_authority, commit_point["source_paths"])
+
     # -- filesystem grounding for canonical_commit_point -------------------------
 
     def test_every_canonical_commit_point_source_path_exists_on_disk(self) -> None:

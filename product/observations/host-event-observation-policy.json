@@ -457,7 +457,7 @@
         "authority": "TraceDecay application operation owner",
         "settled_state": "DispatchExecutionSettlement joined with a typed terminal outcome and committed-effect state",
         "source_paths": [
-          "crates/tracedecay/src/mcp/server/dispatch_settlement.rs",
+          "crates/tracedecay-mcp/src/server/settlement.rs",
           "crates/tracedecay-usecases/src/observability/delivery_settlement.rs"
         ],
         "receipt_fields": ["operation_id", "terminal_outcome", "committed_effect", "effect_digest", "resolved_scope_digest"],
@@ -515,7 +515,7 @@
         "settled_state": "Atomic publication succeeded and expected file identity/generation was advanced",
         "source_paths": [
           "crates/tracedecay-application/src/work_owner_observation.rs",
-          "crates/tracedecay/src/mcp/server/dispatch_settlement.rs"
+          "crates/tracedecay-mcp/src/server/settlement.rs"
         ],
         "receipt_fields": ["operation_id", "worktree_id", "file_identity", "before_digest", "after_digest", "commit_generation"],
         "ordering_authority": "The source-edit publication generation and after digest, not editor-buffer time.",
