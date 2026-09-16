@@ -646,14 +646,14 @@ pub enum RecallExplainTraceError {
         listed: usize,
     },
     /// The received-identity ledger names one candidate twice.
-    #[error("admission report lists candidate {candidate_id} more than once")]
+    #[error("admission report lists candidate [redacted] more than once")]
     DuplicateCandidate {
         /// The repeated identity.
         candidate_id: String,
     },
     /// A later stage's ledger names a candidate the provider never returned.
     #[error(
-        "the {stage} ledger names candidate {candidate_id}, which the admission report never \
+        "the {stage} ledger names candidate [redacted], which the admission report never \
          received"
     )]
     UnknownCandidate {
@@ -664,7 +664,7 @@ pub enum RecallExplainTraceError {
     },
     /// Two stages both claim the same candidate.
     #[error(
-        "candidate {candidate_id} is accounted for at stage {existing} and again at stage \
+        "candidate [redacted] is accounted for at stage {existing} and again at stage \
          {conflicting}"
     )]
     ConflictingStages {
@@ -676,7 +676,7 @@ pub enum RecallExplainTraceError {
         conflicting: &'static str,
     },
     /// An admitted candidate reached no stage at all.
-    #[error("candidate {candidate_id} was admitted but no stage accounts for it")]
+    #[error("candidate [redacted] was admitted but no stage accounts for it")]
     CandidateUnaccounted {
         /// The unaccounted identity.
         candidate_id: String,
@@ -684,17 +684,14 @@ pub enum RecallExplainTraceError {
     /// The host did not provide the retained identity for one provider
     /// candidate. A trace cannot fall back to the provider bytes because the
     /// candidate id is rendered and retained as metadata.
-    #[error("candidate {candidate_id} has no retained identity alias")]
+    #[error("candidate [redacted] has no retained identity alias")]
     MissingIdentityAlias {
         /// Provider identity that was not mapped to a retained identity.
         candidate_id: String,
     },
     /// Two provider candidates were mapped to one retained identity. The
     /// trace would be ambiguous for both audit lookup and control metadata.
-    #[error(
-        "candidates {candidate_id} and {conflicting_candidate_id} share retained identity \
-         {retained_identity}"
-    )]
+    #[error("candidates [redacted] and [redacted] share retained identity [redacted]")]
     IdentityAliasCollision {
         /// Candidate whose alias was encountered second.
         candidate_id: String,
@@ -705,7 +702,7 @@ pub enum RecallExplainTraceError {
     },
     /// A retained identity contains provider-controlled path, control, or
     /// alias-chain syntax. Such a value cannot be written to the trace.
-    #[error("candidate {candidate_id} has an unsafe retained identity {retained_identity}")]
+    #[error("candidate [redacted] has an unsafe retained identity [redacted]")]
     UnsafeIdentityAlias {
         /// Provider candidate whose projection was unsafe.
         candidate_id: String,

@@ -1453,3 +1453,54 @@ fn retained_trace_sanitizes_host_withholding_detail_and_reason_code() -> Result<
     assert!(!retained.contains(SECRET_DETAIL));
     Ok(())
 }
+
+#[test]
+fn explain_trace_error_display_redacts_provider_identities() {
+    const RAW_CANDIDATE: &str = "source:/private/Authorization-Bearer-SECRET-9a7f";
+    const RAW_OTHER_CANDIDATE: &str = "source:/private/second-secret.txt#L2";
+    const RAW_ALIAS: &str = "alias://provider/private/secret";
+
+    let errors = [
+        RecallExplainTraceError::DuplicateCandidate {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+        },
+        RecallExplainTraceError::UnknownCandidate {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+            stage: "selection",
+        },
+        RecallExplainTraceError::ConflictingStages {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+            existing: "deduplicated",
+            conflicting: "injected",
+        },
+        RecallExplainTraceError::CandidateUnaccounted {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+        },
+        RecallExplainTraceError::MissingIdentityAlias {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+        },
+        RecallExplainTraceError::IdentityAliasCollision {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+            conflicting_candidate_id: RAW_OTHER_CANDIDATE.to_owned(),
+            retained_identity: RAW_ALIAS.to_owned(),
+        },
+        RecallExplainTraceError::UnsafeIdentityAlias {
+            candidate_id: RAW_CANDIDATE.to_owned(),
+            retained_identity: RAW_ALIAS.to_owned(),
+        },
+    ];
+
+    for error in errors {
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("[redacted]"),
+            "identity-bearing error lost its redaction marker: {rendered}"
+        );
+        for raw in [RAW_CANDIDATE, RAW_OTHER_CANDIDATE, RAW_ALIAS] {
+            assert!(
+                !rendered.contains(raw),
+                "provider identity reached public error text: {raw}: {rendered}"
+            );
+        }
+    }
+}
