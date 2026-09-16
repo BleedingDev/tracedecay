@@ -1508,6 +1508,7 @@ fn same_checkout(left: &OwnedExactScope, right: &OwnedExactScope) -> bool {
         && left.repository_identity == right.repository_identity
         && left.worktree_identity == right.worktree_identity
         && left.branch_identity == right.branch_identity
+        && left.agent_session_id == right.agent_session_id
         && left.resolved_scope_digest == right.resolved_scope_digest
 }
 
@@ -1938,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_matches_stable_source_lineage_across_revisions_but_not_origin_or_provider() {
+    fn cleanup_matches_stable_source_lineage_and_exact_session_across_restart() {
         let scope = scope();
         let original = SourceAttribution {
             source: OriginalSourceIdentity {
@@ -1969,6 +1970,21 @@ mod tests {
         newer.validity.valid_from_utc_nanos = Some(2);
         let key = original_source_fence_digest(&newer).unwrap();
         assert!(cleanup_matches(&header, &newer, &scope, &key).unwrap());
+
+        // The header and scope are both reconstructed after a daemon restart;
+        // the persisted session binding must still authorize cleanup for the
+        // producing session.
+        let persisted = encode(&header).unwrap();
+        let reopened_header: ArtifactHeaderV1 = decode(&persisted, "artifact header").unwrap();
+        let reopened_scope = header_scope(&reopened_header).unwrap();
+        assert!(cleanup_matches(&reopened_header, &newer, &reopened_scope, &key).unwrap());
+
+        // A second session in the same checkout must not remove the first
+        // session's snapshot, even when the checkout digest is reused.
+        let mut foreign_session = reopened_scope.clone();
+        foreign_session.delivery_scope.agent_session_id = "other-session".to_owned();
+        assert!(!cleanup_matches(&reopened_header, &newer, &foreign_session, &key).unwrap());
+
         let mut foreign = scope.clone();
         foreign.provider_id = OwnedProviderId::new("ncm").unwrap();
         assert!(!cleanup_matches(&header, &newer, &foreign, &key).unwrap());
