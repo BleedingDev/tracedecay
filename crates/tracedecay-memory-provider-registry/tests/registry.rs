@@ -22,7 +22,7 @@ use tracedecay_memory_provider_native::{
 use tracedecay_memory_provider_registry::{
     EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation, ObserverReceipt,
     ProjectMemoryProviderComposition, ProviderCapabilityAvailability, ProviderMode,
-    ProviderReadiness, ReadinessTargetError, RegistryError,
+    ProviderReadiness, ReadinessTargetError, RegistryError, is_mountable_active_provider,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
