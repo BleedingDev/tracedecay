@@ -346,7 +346,8 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         let (Some(material), Some(delivered_at)) = (delivery_material, current_time()) else {
             return refused("native delivery receipt material unavailable");
         };
-        let Some(settlement) = native_hook_delivery_settlement(source, material, delivered_at) else {
+        let Some(settlement) = native_hook_delivery_settlement(source, material, delivered_at)
+        else {
             return refused("native delivery settlement identity could not be derived");
         };
         let Ok(receipt) = tracedecay_hooks::HookDeliverySourceReceiptV1::new(settlement) else {
