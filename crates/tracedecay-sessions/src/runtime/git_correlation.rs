@@ -12,7 +12,7 @@ use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
     CanonicalGitEvidenceKindV1, CanonicalObservationEnvelopeV1, CanonicalObservationFactV1,
 };
-use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
+use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Value, params};
 
 use super::SessionMessageRecord;
 
@@ -35,6 +35,200 @@ const MESSAGE_WORKTREE_KEYS: [&str; 9] = [
 /// Receipt schema version. This schema owns only convergence receipts and
 /// watermarks; Git evidence itself remains in the verified graph authority.
 pub const GIT_CORRELATION_SCHEMA_VERSION: i64 = 5;
+
+const GIT_CORRELATION_FINAL_TABLES: [&str; 9] = [
+    "git_correlation_meta",
+    "git_evidence_publication_outbox",
+    "git_history_index_progress",
+    "git_history_index_segments",
+    "git_history_index_pending",
+    "git_history_index_seen",
+    "git_history_index_staged_spans",
+    "git_history_index_staged_commits",
+    "git_history_index_failures",
+];
+
+const GIT_CORRELATION_FINAL_SCHEMA_OBJECTS: [(&str, &str, &str); 11] = [
+    ("table", "git_correlation_meta", "git_correlation_meta"),
+    (
+        "table",
+        "git_evidence_publication_outbox",
+        "git_evidence_publication_outbox",
+    ),
+    (
+        "table",
+        "git_history_index_progress",
+        "git_history_index_progress",
+    ),
+    (
+        "table",
+        "git_history_index_segments",
+        "git_history_index_segments",
+    ),
+    (
+        "table",
+        "git_history_index_pending",
+        "git_history_index_pending",
+    ),
+    ("table", "git_history_index_seen", "git_history_index_seen"),
+    (
+        "table",
+        "git_history_index_staged_spans",
+        "git_history_index_staged_spans",
+    ),
+    (
+        "table",
+        "git_history_index_staged_commits",
+        "git_history_index_staged_commits",
+    ),
+    (
+        "table",
+        "git_history_index_failures",
+        "git_history_index_failures",
+    ),
+    (
+        "index",
+        "idx_git_evidence_publication_outbox_pending",
+        "git_evidence_publication_outbox",
+    ),
+    (
+        "trigger",
+        "git_evidence_publication_outbox_immutable",
+        "git_evidence_publication_outbox",
+    ),
+];
+
+// `(name, declared type, not-null flag, default, primary-key ordinal, hidden)`
+// is the part of SQLite's table shape that can be compared without running
+// any write. Constraints remain owned by the installer, while this catches
+// dropped, added, retyped, or re-keyed columns before a final store is used.
+const GIT_CORRELATION_FINAL_TABLE_COLUMNS: &[(
+    &str,
+    &[(&str, &str, i64, Option<&str>, i64, i64)],
+)] = &[
+    (
+        "git_correlation_meta",
+        &[
+            ("key", "TEXT", 0, None, 1, 0),
+            ("value", "INTEGER", 1, None, 0, 0),
+            ("updated_at", "INTEGER", 1, Some("unixepoch()"), 0, 0),
+        ],
+    ),
+    (
+        "git_evidence_publication_outbox",
+        &[
+            ("receipt_id", "TEXT", 0, None, 1, 0),
+            ("publication_prefix", "TEXT", 1, None, 0, 0),
+            ("evidence_json", "TEXT", 1, None, 0, 0),
+            ("created_at", "INTEGER", 1, Some("unixepoch()"), 0, 0),
+        ],
+    ),
+    (
+        "git_history_index_progress",
+        &[
+            ("activity_timestamp", "INTEGER", 1, None, 0, 0),
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("provider", "TEXT", 1, None, 0, 0),
+            ("session_id", "TEXT", 1, None, 0, 0),
+            ("project_path", "TEXT", 1, None, 0, 0),
+            ("window_start", "INTEGER", 1, None, 0, 0),
+            ("window_end", "INTEGER", 1, None, 0, 0),
+            ("worktree", "BLOB", 1, None, 0, 0),
+            ("worktree_identity", "BLOB", 1, None, 0, 0),
+            ("git_dir", "BLOB", 1, None, 0, 0),
+            ("git_dir_identity", "BLOB", 1, None, 0, 0),
+            ("common_dir", "BLOB", 1, None, 0, 0),
+            ("common_dir_identity", "BLOB", 1, None, 0, 0),
+            ("generation", "INTEGER", 1, None, 0, 0),
+            ("scan_mode", "TEXT", 1, None, 0, 0),
+            ("reflog_path", "BLOB", 1, None, 0, 0),
+            ("reflog_byte_offset", "INTEGER", 1, None, 0, 0),
+            ("reflog_byte_length", "INTEGER", 1, None, 0, 0),
+            ("source_generation", "TEXT", 1, None, 0, 0),
+            ("reflog_digest", "TEXT", 1, None, 0, 0),
+            ("capture_target_offset", "INTEGER", 0, None, 0, 0),
+            ("verify_byte_offset", "INTEGER", 1, None, 0, 0),
+            ("verify_digest", "TEXT", 1, None, 0, 0),
+            ("source_head_referent", "BLOB", 0, None, 0, 0),
+            ("source_head_oid", "TEXT", 1, None, 0, 0),
+            ("cursor_head_state", "TEXT", 1, None, 0, 0),
+            ("cursor_head_branch", "TEXT", 0, None, 0, 0),
+            ("cursor_oid", "TEXT", 1, None, 0, 0),
+            ("segment_end", "INTEGER", 1, None, 0, 0),
+            ("segment_tip_oid", "TEXT", 1, None, 0, 0),
+            ("segment_cursor", "INTEGER", 1, None, 0, 0),
+            ("emitted_count", "INTEGER", 1, None, 0, 0),
+            ("consulted_ref_seal_json", "TEXT", 1, None, 0, 0),
+        ],
+    ),
+    (
+        "git_history_index_segments",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("ordinal", "INTEGER", 1, None, 2, 0),
+            ("branch", "TEXT", 0, None, 0, 0),
+            ("start_ts", "INTEGER", 1, None, 0, 0),
+            ("end_ts", "INTEGER", 1, None, 0, 0),
+            ("tip_oid", "TEXT", 1, None, 0, 0),
+            ("applied", "INTEGER", 1, Some("0"), 0, 0),
+            ("completed", "INTEGER", 1, Some("0"), 0, 0),
+        ],
+    ),
+    (
+        "git_history_index_pending",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("segment_ordinal", "INTEGER", 1, None, 2, 0),
+            ("oid", "TEXT", 1, None, 3, 0),
+        ],
+    ),
+    (
+        "git_history_index_seen",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("segment_ordinal", "INTEGER", 1, None, 2, 0),
+            ("oid", "TEXT", 1, None, 3, 0),
+        ],
+    ),
+    (
+        "git_history_index_staged_spans",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("segment_ordinal", "INTEGER", 1, None, 2, 0),
+            ("boundary", "INTEGER", 1, None, 3, 0),
+            ("branch", "TEXT", 0, None, 0, 0),
+            ("timestamp", "INTEGER", 1, None, 0, 0),
+        ],
+    ),
+    (
+        "git_history_index_staged_commits",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("segment_ordinal", "INTEGER", 1, None, 2, 0),
+            ("oid", "TEXT", 1, None, 3, 0),
+            ("branch", "TEXT", 0, None, 0, 0),
+            ("committed_at", "INTEGER", 1, None, 0, 0),
+        ],
+    ),
+    (
+        "git_history_index_failures",
+        &[
+            ("source_rowid", "INTEGER", 1, None, 1, 0),
+            ("activity_timestamp", "INTEGER", 1, None, 0, 0),
+            ("provider", "TEXT", 1, None, 0, 0),
+            ("session_id", "TEXT", 1, None, 0, 0),
+            ("project_path", "TEXT", 1, None, 0, 0),
+            ("window_start", "INTEGER", 1, None, 0, 0),
+            ("window_end", "INTEGER", 1, None, 0, 0),
+            ("reason", "TEXT", 1, None, 0, 0),
+            ("source_generation", "TEXT", 0, None, 0, 0),
+            ("reflog_digest", "TEXT", 0, None, 0, 0),
+        ],
+    ),
+];
+
+const GIT_CORRELATION_FINAL_INDEX_SQL: &str = "CREATE INDEX idx_git_evidence_publication_outbox_pending ON git_evidence_publication_outbox(created_at, receipt_id)";
+const GIT_CORRELATION_FINAL_TRIGGER_SQL: &str = "CREATE TRIGGER git_evidence_publication_outbox_immutable BEFORE UPDATE ON git_evidence_publication_outbox BEGIN SELECT RAISE(ABORT, 'Git evidence publication receipt is immutable'); END";
 /// Projector revision this build publishes. It is part of the generation
 /// identity, so a graph-shape change (index entities, relation keys,
 /// projection metadata) re-publishes an unchanged projection under a distinct
@@ -934,6 +1128,11 @@ fn span_observation_from_metadata(
 pub async fn ensure_git_correlation_receipt_schema_in_transaction(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {
+    match inspect_git_correlation_schema(conn).await? {
+        GitCorrelationSchemaAdmission::Current => return Ok(()),
+        GitCorrelationSchemaAdmission::Fresh => {}
+    }
+
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_schema_migrations (
             name TEXT PRIMARY KEY,
@@ -964,12 +1163,219 @@ pub async fn ensure_git_correlation_receipt_schema_in_transaction(
     backfill::history_failures::install_final_schema(conn).await?;
     conn.execute(
         "INSERT INTO session_schema_migrations(name, version)
-         VALUES (?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET version = excluded.version",
+         VALUES (?1, ?2)",
         params![MIGRATION_NAME, GIT_CORRELATION_SCHEMA_VERSION],
     )
     .await?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitCorrelationSchemaAdmission {
+    Current,
+    Fresh,
+}
+
+fn git_correlation_schema_reset(found_version: Option<i64>) -> GitCorrelationError {
+    GitCorrelationError::ResetRequired {
+        found_version,
+        required_version: GIT_CORRELATION_SCHEMA_VERSION,
+    }
+}
+
+/// Classifies the receipt namespace before the first schema write.
+///
+/// A missing Git marker is fresh only when no Git receipt objects exist. A
+/// marker from a released version, a future marker, or any partial/legacy
+/// namespace is a reset-required store. The read-only probe intentionally
+/// does not create `session_schema_migrations`, so refusal leaves the target
+/// byte-for-byte unchanged.
+async fn inspect_git_correlation_schema(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<GitCorrelationSchemaAdmission, GitCorrelationError> {
+    let Some(found_version) = stored_git_correlation_schema_version(conn).await? else {
+        return if git_correlation_objects(conn).await?.is_empty() {
+            Ok(GitCorrelationSchemaAdmission::Fresh)
+        } else {
+            Err(git_correlation_schema_reset(None))
+        };
+    };
+
+    if found_version != GIT_CORRELATION_SCHEMA_VERSION {
+        return Err(git_correlation_schema_reset(Some(found_version)));
+    }
+
+    if final_git_correlation_schema_is_intact(conn).await? {
+        Ok(GitCorrelationSchemaAdmission::Current)
+    } else {
+        Err(git_correlation_schema_reset(Some(found_version)))
+    }
+}
+
+async fn stored_git_correlation_schema_version(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<Option<i64>, GitCorrelationError> {
+    let mut kind_rows = conn
+        .query(
+            "SELECT type FROM sqlite_master WHERE name = 'session_schema_migrations'",
+            (),
+        )
+        .await?;
+    let Some(kind_row) = kind_rows.next().await? else {
+        return Ok(None);
+    };
+    let kind: String = kind_row.get(0)?;
+    if kind != "table" {
+        return Err(git_correlation_schema_reset(None));
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT version FROM session_schema_migrations WHERE name = ?1",
+            params![MIGRATION_NAME],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    match row.get::<Value>(0)? {
+        Value::Integer(version) => Ok(Some(version)),
+        Value::Null | Value::Real(_) | Value::Text(_) | Value::Blob(_) => {
+            Err(git_correlation_schema_reset(None))
+        }
+    }
+}
+
+async fn git_correlation_objects(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<BTreeSet<(String, String, String)>, GitCorrelationError> {
+    let mut rows = conn
+        .query(
+            "SELECT type, name, tbl_name
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'",
+            (),
+        )
+        .await?;
+    let mut objects = BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        let kind: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let table: String = row.get(2)?;
+        if is_git_correlation_object(&name, &table) {
+            objects.insert((kind.to_ascii_lowercase(), name, table));
+        }
+    }
+    Ok(objects)
+}
+
+fn is_git_correlation_object(name: &str, table: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let table = table.to_ascii_lowercase();
+    GIT_CORRELATION_FINAL_TABLES
+        .iter()
+        .any(|final_table| final_table.eq_ignore_ascii_case(&table))
+        || name.starts_with("git_correlation_")
+        || name.starts_with("git_evidence_")
+        || name.starts_with("git_history_index_")
+        || name.starts_with("idx_git_evidence_")
+        || name.starts_with("idx_git_history_index_")
+        || name.starts_with("idx_session_git_")
+        || name.starts_with("session_git_")
+        || name == "commit_sessions"
+        || name.starts_with("commit_sessions_")
+}
+
+fn expected_git_correlation_objects() -> BTreeSet<(String, String, String)> {
+    GIT_CORRELATION_FINAL_SCHEMA_OBJECTS
+        .iter()
+        .map(|(kind, name, table)| ((*kind).to_owned(), (*name).to_owned(), (*table).to_owned()))
+        .collect()
+}
+
+async fn final_git_correlation_schema_is_intact(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<bool, GitCorrelationError> {
+    if git_correlation_objects(conn).await? != expected_git_correlation_objects() {
+        return Ok(false);
+    }
+
+    for (table, expected_columns) in GIT_CORRELATION_FINAL_TABLE_COLUMNS {
+        let mut rows = conn
+            .query(
+                "SELECT name, type, \"notnull\", dflt_value, pk, hidden
+                 FROM pragma_table_xinfo(?1)
+                 ORDER BY cid",
+                params![*table],
+            )
+            .await?;
+        let mut actual_columns = Vec::new();
+        while let Some(row) = rows.next().await? {
+            actual_columns.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<Option<String>>(3)?,
+                row.get::<i64>(4)?,
+                row.get::<i64>(5)?,
+            ));
+        }
+        let expected_columns = expected_columns
+            .iter()
+            .map(
+                |(name, declared_type, not_null, default_value, primary_key, hidden)| {
+                    (
+                        (*name).to_owned(),
+                        (*declared_type).to_owned(),
+                        *not_null,
+                        (*default_value).map(str::to_owned),
+                        *primary_key,
+                        *hidden,
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        if actual_columns != expected_columns {
+            return Ok(false);
+        }
+    }
+
+    let Some(index_sql) =
+        schema_definition(conn, "index", "idx_git_evidence_publication_outbox_pending").await?
+    else {
+        return Ok(false);
+    };
+    if normalize_schema_sql(&index_sql) != normalize_schema_sql(GIT_CORRELATION_FINAL_INDEX_SQL) {
+        return Ok(false);
+    }
+    let Some(trigger_sql) =
+        schema_definition(conn, "trigger", "git_evidence_publication_outbox_immutable").await?
+    else {
+        return Ok(false);
+    };
+    Ok(normalize_schema_sql(&trigger_sql)
+        == normalize_schema_sql(GIT_CORRELATION_FINAL_TRIGGER_SQL))
+}
+
+async fn schema_definition(
+    conn: &(impl QueryExecutor + ?Sized),
+    kind: &str,
+    name: &str,
+) -> Result<Option<String>, GitCorrelationError> {
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            params![kind, name],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[hotpath::measure(label = "sessions.git_correlation.read_meta", future = true)]

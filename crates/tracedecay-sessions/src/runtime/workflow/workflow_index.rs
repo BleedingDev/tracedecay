@@ -76,6 +76,9 @@ impl From<crate::runtime::git_correlation::GitCorrelationError> for WorkflowInde
             | crate::runtime::git_correlation::GitCorrelationError::Corrupt(message) => {
                 Self::Db(message)
             }
+            crate::runtime::git_correlation::GitCorrelationError::ResetRequired { .. } => {
+                Self::Db("Git correlation receipt schema requires reset".to_owned())
+            }
             crate::runtime::git_correlation::GitCorrelationError::InvalidArgument(message)
             | crate::runtime::git_correlation::GitCorrelationError::Contract(message) => {
                 Self::InvalidArgument(message)

@@ -5,6 +5,7 @@ use tracedecay_graph_db::{
     GraphDbError, GraphGenerationId, GraphIdempotencyKey, GraphNamespace, GraphProjectorRevision,
     NeverCancelled, VerifiedGraphSnapshot,
 };
+use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, TestConnection, params};
 
 use super::test_support::MemoryEvidenceGraphRuntime;
 use super::*;
@@ -216,6 +217,158 @@ fn commit_scope_falls_back_to_observed_when_no_producer_matches() {
         })
         .unwrap();
     assert_eq!(ids, vec![("codex".to_owned(), "session-b".to_owned())]);
+}
+
+async fn schema_snapshot(conn: &TestConnection) -> Vec<(String, String, String, Option<String>)> {
+    let mut rows = conn
+        .query(
+            "SELECT type, name, tbl_name, sql
+             FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%'
+             ORDER BY type, name",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut snapshot = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        snapshot.push((
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get(3).unwrap(),
+        ));
+    }
+    snapshot
+}
+
+async fn git_schema_marker(conn: &TestConnection) -> Option<i64> {
+    let mut rows = conn
+        .query(
+            "SELECT version FROM session_schema_migrations WHERE name = ?1",
+            params![MIGRATION_NAME],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().map(|row| row.get(0).unwrap())
+}
+
+#[tokio::test]
+async fn fresh_git_correlation_schema_installs_the_exact_final_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+
+    ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect("fresh Git correlation schema");
+
+    assert_eq!(
+        git_schema_marker(&conn).await,
+        Some(GIT_CORRELATION_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        git_correlation_objects(&conn).await.unwrap(),
+        expected_git_correlation_objects()
+    );
+    assert!(final_git_correlation_schema_is_intact(&conn).await.unwrap());
+}
+
+#[tokio::test]
+async fn released_git_correlation_schema_is_reset_required_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE TABLE session_git_spans (
+             provider TEXT NOT NULL,
+             session_id TEXT NOT NULL
+         );",
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_schema_migrations(name, version) VALUES (?1, ?2)",
+        params![MIGRATION_NAME, GIT_CORRELATION_SCHEMA_VERSION - 1],
+    )
+    .await
+    .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("released Git correlation schema must require reset");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: Some(GIT_CORRELATION_SCHEMA_VERSION - 1),
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+    assert_eq!(
+        git_schema_marker(&conn).await,
+        Some(GIT_CORRELATION_SCHEMA_VERSION - 1)
+    );
+}
+
+#[tokio::test]
+async fn markerless_git_correlation_receipts_are_reset_required_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE commit_sessions (
+             commit_sha TEXT NOT NULL,
+             session_id TEXT NOT NULL
+         );",
+    )
+    .await
+    .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("markerless Git correlation receipts must require reset");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: None,
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+}
+
+#[tokio::test]
+async fn final_marker_with_a_partial_git_correlation_shape_is_reset_required() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect("fresh Git correlation schema");
+    conn.execute_batch("DROP TABLE git_history_index_pending;")
+        .await
+        .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("partial final Git correlation schema must require reset");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: Some(GIT_CORRELATION_SCHEMA_VERSION),
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+    assert_eq!(
+        git_schema_marker(&conn).await,
+        Some(GIT_CORRELATION_SCHEMA_VERSION)
+    );
 }
 
 #[test]
