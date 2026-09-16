@@ -219,6 +219,36 @@ fn injected_ncm_active_has_actual_metadata_without_a_native_registration() {
 }
 
 #[test]
+fn mountability_queries_follow_registered_identity_and_mode() {
+    let ncm = FixtureProvider::new("ncm", true);
+    let native = FixtureProvider::new(NATIVE_PROVIDER_ID, true);
+    let composition = ProjectMemoryProviderComposition::compose_registered(
+        selection(registration(ncm, EnabledProviderMode::Active)),
+        vec![registration(native, EnabledProviderMode::Observer)],
+    )
+    .unwrap();
+    let registry = composition.registry().unwrap();
+
+    let mounted = mountable_active_provider(registry, "ncm").expect("active NCM registration");
+    assert_eq!(mounted.provider_id.as_str(), "ncm");
+    assert!(is_mountable_active_provider(registry, "ncm"));
+    assert!(registry.is_mountable_active_provider("ncm"));
+
+    // The Native registration is present, but observer mode is a hard gate
+    // for active recall and cannot be promoted by this query.
+    assert!(mountable_active_provider(registry, NATIVE_PROVIDER_ID).is_none());
+    assert!(!is_mountable_active_provider(registry, NATIVE_PROVIDER_ID));
+    assert!(!registry.is_mountable_active_provider(NATIVE_PROVIDER_ID));
+
+    // Invalid and well-formed but unregistered identities both fail closed.
+    for unknown in ["", "vendor.unknown"] {
+        assert!(mountable_active_provider(registry, unknown).is_none());
+        assert!(!is_mountable_active_provider(registry, unknown));
+        assert!(!registry.is_mountable_active_provider(unknown));
+    }
+}
+
+#[test]
 fn injected_compatibility_depends_on_profile_and_identity_not_provider_name() {
     for id in ["ncm", "tracedecay.native", "vendor.compatible"] {
         let incompatible = FixtureProvider::new(id, false);

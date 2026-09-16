@@ -520,6 +520,16 @@ fn enabled_mode_injects_native_with_configured_revision_mode_and_limits()
                 .is_some(),
             mode == EnabledProviderMode::Active
         );
+        assert_eq!(
+            registry
+                .mountable_active_provider(NATIVE_PROVIDER_ID)
+                .map(|registration| registration.provider_id.as_str()),
+            (mode == EnabledProviderMode::Active).then_some(NATIVE_PROVIDER_ID)
+        );
+        assert_eq!(
+            is_mountable_active_provider(&registry, NATIVE_PROVIDER_ID),
+            mode == EnabledProviderMode::Active
+        );
         assert!(port.descriptor_calls.load(Ordering::Relaxed) >= 2);
     }
     Ok(())

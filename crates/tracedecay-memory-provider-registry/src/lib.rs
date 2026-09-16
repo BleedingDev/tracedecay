@@ -226,21 +226,32 @@ impl MountableProviderKindV1 {
     }
 }
 
-/// Maps a configured active-provider name onto the adapter that can serve it.
+/// Maps a configured active-provider name onto its admitted registration.
 ///
-/// `None` means this registry has no adapter for the name and the caller must
+/// The composed registry is the source of truth for mountability. This keeps
+/// the query provider-neutral: injected adapters such as NCM are recognized
+/// from their validated registration, while an observer registration is never
+/// promoted to an active route. `None` means the provider is malformed,
+/// unknown to this registry, or not registered in active mode; callers must
 /// refuse the configuration rather than substituting a provider.
 #[must_use]
-pub fn mountable_active_provider(provider: &str) -> Option<MountableProviderKindV1> {
-    [MountableProviderKindV1::Native]
-        .into_iter()
-        .find(|kind| kind.provider_id() == provider)
+pub fn mountable_active_provider<'a>(
+    registry: &'a ProjectMemoryProviderRegistry,
+    provider: &str,
+) -> Option<&'a ProviderRegistrationMetadataV1> {
+    let provider_id = OwnedProviderId::new(provider).ok()?;
+    registry
+        .registration(&provider_id)
+        .filter(|registration| registration.mode == EnabledProviderMode::Active)
 }
 
-/// Whether this registry can mount `provider` as an *active* recall provider.
+/// Whether `registry` can mount `provider` as an *active* recall provider.
 #[must_use]
-pub fn is_mountable_active_provider(provider: &str) -> bool {
-    mountable_active_provider(provider).is_some()
+pub fn is_mountable_active_provider(
+    registry: &ProjectMemoryProviderRegistry,
+    provider: &str,
+) -> bool {
+    mountable_active_provider(registry, provider).is_some()
 }
 
 /// A non-disabled provider participation mode.
@@ -946,6 +957,28 @@ impl ProjectMemoryProviderRegistry {
         provider_id: &OwnedProviderId,
     ) -> Option<&ProviderRegistrationMetadataV1> {
         self.registrations.get(provider_id)
+    }
+
+    /// Returns the admitted registration for `provider` when it is the active
+    /// route in this registry.
+    ///
+    /// Provider identity is looked up in the registrations captured at
+    /// composition time. An invalid or unknown identity, and every observer
+    /// registration, returns `None` so a caller cannot turn observation into
+    /// active recall by name alone.
+    #[must_use]
+    pub fn mountable_active_provider(
+        &self,
+        provider: &str,
+    ) -> Option<&ProviderRegistrationMetadataV1> {
+        mountable_active_provider(self, provider)
+    }
+
+    /// Whether this registry has an admitted active registration for
+    /// `provider`.
+    #[must_use]
+    pub fn is_mountable_active_provider(&self, provider: &str) -> bool {
+        self.mountable_active_provider(provider).is_some()
     }
 
     /// Returns the selected adapter's admitted execution shape.
