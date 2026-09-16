@@ -164,16 +164,34 @@ fn common_maintenance_control(
     operation_id: &str,
     expected_generation: u64,
 ) -> Value {
+    common_maintenance_control_page(
+        namespace,
+        idempotency_key,
+        operation_id,
+        expected_generation,
+        100,
+        None,
+    )
+}
+
+fn common_maintenance_control_page(
+    namespace: &str,
+    idempotency_key: &str,
+    operation_id: &str,
+    expected_generation: u64,
+    maximum_items: u64,
+    resume_cursor: Option<&str>,
+) -> Value {
     let mut control = json!({
         "action": "maintenance",
         "idempotency_key": idempotency_key,
         "expected_generation": expected_generation,
         "task": "repair",
-        "maximum_items": 100,
+        "maximum_items": maximum_items,
         "maximum_bytes": 1_048_576,
         "maximum_duration_millis": 60_000,
         "dry_run": false,
-        "resume_cursor": null,
+        "resume_cursor": resume_cursor,
         "policy_revision": 1,
         "extensions": [],
     });
@@ -620,6 +638,65 @@ fn observe_killed_after_commit_reconciles_without_second_record() {
 
 #[cfg(unix)]
 #[test]
+fn observe_killed_before_commit_reopens_and_retries_without_replay() {
+    let root = TempDir::new().expect("temp root");
+    let worker = client(&root);
+    let ns = namespace(17);
+    worker
+        .call(
+            Request::new(170, 0, Operation::Handshake, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("namespace handshake succeeds before mutation");
+
+    let key = "observe-before-commit";
+    let mut payload = observe_payload(key, "before commit key", "before commit value");
+    // The delay is before dispatching to the engine. A shorter caller deadline
+    // therefore kills the child while no receipt can have been committed.
+    payload["test_sleep_before_ms"] = json!(1_000);
+    let interrupted = worker.call(
+        Request::new(171, 0, Operation::Observe, &ns, payload.clone()),
+        Duration::from_millis(50),
+    );
+    assert_eq!(
+        interrupted,
+        Err(ClientError::EffectUnknown { op_id: 171 }),
+        "a sent mutating request must be retained for reconciliation"
+    );
+    assert_eq!(worker.pid(), None, "deadline must reap the child process");
+
+    let retried = worker
+        .reconcile_unknown(key)
+        .expect("pre-commit request retries after the child is reopened");
+    assert_eq!(retried.outcome, Outcome::Success, "{retried:?}");
+    assert_eq!(retried.state_generation, 1);
+    assert_eq!(retried.payload.as_ref().unwrap()["replayed"], false);
+
+    drop(worker);
+    let reopened = client(&root);
+    let durable_retry = reopened
+        .call(
+            Request::new(172, 0, Operation::Observe, &ns, payload),
+            CALL_DEADLINE,
+        )
+        .expect("durable retry succeeds after reopening the client");
+    assert_eq!(durable_retry.outcome, Outcome::Success, "{durable_retry:?}");
+    assert_eq!(durable_retry.state_generation, 1);
+    assert_eq!(durable_retry.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = reopened
+        .call(
+            Request::new(173, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after the retry");
+    assert_eq!(inspection.outcome, Outcome::Success);
+    assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
     let root = TempDir::new().expect("temp root");
     let client = client(&root);
@@ -679,6 +756,274 @@ fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
         client.reconcile_unknown(key),
         Err(ClientError::UnknownIdempotencyKey)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn common_maintenance_pages_restart_worker_between_continuations() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(22);
+    for index in 0..3_u64 {
+        let observe = client
+            .call(
+                Request::new(
+                    220 + index,
+                    0,
+                    Operation::Observe,
+                    &ns,
+                    common_observe_payload(
+                        &format!("common-maintenance-page-seed-{index}"),
+                        &format!("page key {index}"),
+                        &format!("page value {index}"),
+                    ),
+                ),
+                CALL_DEADLINE,
+            )
+            .expect("common maintenance page seed succeeds");
+        assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
+    }
+    let generation = 3;
+    let key = "common-maintenance-restart-pages";
+    let operation_id = "01993262-4d00-0000-8000-000000000022";
+    let mut cursor = None;
+
+    for (index, expected_partial) in [(0_u64, true), (1, true), (2, false)] {
+        let control = common_maintenance_control_page(
+            &ns,
+            key,
+            operation_id,
+            generation,
+            1,
+            cursor.as_deref(),
+        );
+        let reply = client
+            .call(
+                Request::new(
+                    230 + index,
+                    0,
+                    Operation::Maintenance,
+                    &ns,
+                    json!({"common_control": control}),
+                ),
+                CALL_DEADLINE,
+            )
+            .expect("maintenance page succeeds after worker start or restart");
+        assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
+        assert_eq!(reply.state_generation, generation);
+        assert_eq!(reply.payload.as_ref().unwrap()["partial"], expected_partial);
+        if expected_partial {
+            assert_eq!(reply.payload.as_ref().unwrap()["scanned_items"], 1);
+            cursor = Some(
+                reply.payload.as_ref().unwrap()["resume_cursor"]
+                    .as_str()
+                    .expect("partial page returns a resume cursor")
+                    .to_owned(),
+            );
+
+            let pid = client.pid().expect("worker pid exists after page");
+            assert!(
+                Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .status()
+                    .expect("kill command runs")
+                    .success()
+            );
+            let dead = client.call(
+                Request::new(240 + index, 0, Operation::Health, "", json!({})),
+                Duration::from_millis(500),
+            );
+            assert!(
+                matches!(
+                    dead,
+                    Err(ClientError::MalformedReply(_))
+                        | Err(ClientError::WorkerExited)
+                        | Err(ClientError::Transport(_))
+                ),
+                "health must observe the killed worker: {dead:?}"
+            );
+            assert_eq!(client.pid(), None, "killed worker must be reaped");
+        } else {
+            assert_eq!(reply.payload.as_ref().unwrap()["scanned_items"], 1);
+            assert_eq!(reply.state_generation, generation + 1);
+        }
+    }
+
+    let replay_control = common_maintenance_control_page(
+        &ns,
+        key,
+        operation_id,
+        generation + 1,
+        1,
+        cursor.as_deref(),
+    );
+    let replay = client
+        .call(
+            Request::new(
+                233,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": replay_control}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("committed page retries after the final restart");
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.state_generation, generation + 1);
+    assert_eq!(replay.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = client
+        .call(
+            Request::new(234, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after paged maintenance");
+    assert_eq!(inspection.outcome, Outcome::Success);
+    assert_eq!(inspection.payload.as_ref().unwrap()["records"], 3);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(23);
+    for index in 0..3_u64 {
+        let observe = client
+            .call(
+                Request::new(
+                    250 + index,
+                    0,
+                    Operation::Observe,
+                    &ns,
+                    common_observe_payload(
+                        &format!("common-maintenance-deadline-seed-{index}"),
+                        &format!("deadline page key {index}"),
+                        &format!("deadline page value {index}"),
+                    ),
+                ),
+                CALL_DEADLINE,
+            )
+            .expect("common maintenance deadline seed succeeds");
+        assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
+    }
+    let generation = 3;
+    let key = "common-maintenance-deadline-page";
+    let operation_id = "01993262-4d00-0000-8000-000000000023";
+
+    let first_control =
+        common_maintenance_control_page(&ns, key, operation_id, generation, 1, None);
+    let first = client
+        .call(
+            Request::new(
+                260,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": first_control}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("first maintenance page succeeds");
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.state_generation, generation);
+    assert_eq!(first.payload.as_ref().unwrap()["partial"], true);
+    let first_cursor = first.payload.as_ref().unwrap()["resume_cursor"]
+        .as_str()
+        .expect("first page returns a resume cursor")
+        .to_owned();
+
+    let second_control =
+        common_maintenance_control_page(&ns, key, operation_id, generation, 1, Some(&first_cursor));
+    let timed = client.call(
+        Request::new(
+            261,
+            0,
+            Operation::Maintenance,
+            &ns,
+            json!({
+                "common_control": second_control,
+                "test_sleep_after_commit_ms": 1_000,
+            }),
+        ),
+        Duration::from_millis(50),
+    );
+    assert_eq!(timed, Err(ClientError::EffectUnknown { op_id: 261 }));
+    assert_eq!(client.pid(), None, "deadline must reap the worker");
+
+    let reconciled = client
+        .reconcile_unknown(key)
+        .expect("partial page reply reconciles after worker restart");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    assert_eq!(reconciled.state_generation, generation);
+    assert_eq!(reconciled.payload.as_ref().unwrap()["partial"], true);
+    assert_eq!(reconciled.payload.as_ref().unwrap()["scanned_items"], 1);
+    let second_cursor = reconciled.payload.as_ref().unwrap()["resume_cursor"]
+        .as_str()
+        .expect("reconciled partial page returns its next cursor")
+        .to_owned();
+
+    let final_control = common_maintenance_control_page(
+        &ns,
+        key,
+        operation_id,
+        generation,
+        1,
+        Some(&second_cursor),
+    );
+    let completed = client
+        .call(
+            Request::new(
+                262,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": final_control}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("final page commits after cursor reconciliation");
+    assert_eq!(completed.outcome, Outcome::Success, "{completed:?}");
+    assert_eq!(completed.state_generation, generation + 1);
+    assert_eq!(completed.payload.as_ref().unwrap()["partial"], false);
+    assert_eq!(completed.payload.as_ref().unwrap()["scanned_items"], 1);
+
+    let retry_control = common_maintenance_control_page(
+        &ns,
+        key,
+        operation_id,
+        generation + 1,
+        1,
+        Some(&second_cursor),
+    );
+    let retry = client
+        .call(
+            Request::new(
+                263,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": retry_control}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("completed page retries as a retained receipt");
+    assert_eq!(retry.outcome, Outcome::Success, "{retry:?}");
+    assert_eq!(retry.state_generation, generation + 1);
+    assert_eq!(retry.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = client
+        .call(
+            Request::new(264, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after deadline resume");
+    assert_eq!(inspection.outcome, Outcome::Success);
+    assert_eq!(inspection.payload.as_ref().unwrap()["records"], 3);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 4);
 }
 
 #[cfg(unix)]
