@@ -82,6 +82,18 @@ no-op blur, constant recall, disabled consolidation, and random projection
 mutants. The replay test must report 10 passing tests; the control test must
 report 9 passing tests.
 
+## Worker platform policy
+
+`../worker-manifest.json` records the executable identity for the one worker target currently
+pinned in this checkout. `../worker-platforms.json` is the release-facing capability descriptor:
+it cross-checks that pin against `.github/release-targets.json`, advertises only
+`aarch64-macos`, and records Native-only fallback for every other release target. Run
+`python3 scripts/product/ncm/check-worker-platform.py` from the repository root before changing
+the worker distribution matrix. A new target is not supported until its actual executable bytes,
+size, digest, manifest entry, and package journey all exist. The policy treats the worker as a
+separate sidecar: standard CLI archives do not include it, and an installed sidecar must carry its
+matching manifest beside the executable.
+
 ## Fixtures
 
 The exporter writes exactly these bounded JSON files under

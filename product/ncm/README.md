@@ -48,6 +48,31 @@ source-tree builds fall back to the checked-in reference manifest. The checked-i
 currently covers `aarch64-apple-darwin`; a platform must have its own built artifact and manifest
 entry before it is advertised as supported.
 
+The machine-readable release policy is
+`product/ncm/reference/worker-platforms.json`. It deliberately advertises the NCM worker only for
+the `aarch64-macos` release target. The regular release matrix also ships `x86_64-linux`,
+`aarch64-linux`, and `x86_64-windows` CLI archives, but those targets are explicitly `native-only`
+for NCM because no worker executable is pinned for them. Building the portable Rust code on one of
+those targets does not establish worker support. The host reports typed NCM unavailability there
+and keeps Native as the fallback.
+
+The policy also records the package boundary: the worker is a separate sidecar, the standard CLI
+archive does not include it, and every installed worker must carry `worker-manifest.json` beside its
+executable. A supported target therefore means that its separately distributed worker identity is
+pinned and admitted; it does not silently turn a CLI-only archive into an NCM bundle.
+
+The policy is checked with:
+
+```bash
+python3 scripts/product/ncm/check-worker-platform.py
+```
+
+Adding another supported target requires the actual worker bytes, their byte count and lowercase
+SHA-256 in `worker-manifest.json`, plus the matching release-target policy entry. No placeholder
+hash or source-only capability is accepted. The standard CLI archives do not acquire an NCM worker
+sidecar implicitly; the policy checker rejects a release matrix that advertises a worker without the
+matching pin and manifest sidecar requirement.
+
 ## Acquire the pinned model locally
 
 The worker never downloads a model. The only permitted download path is

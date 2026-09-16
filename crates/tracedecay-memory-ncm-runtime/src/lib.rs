@@ -10,6 +10,7 @@ pub mod embedding;
 pub mod engine;
 pub mod maintenance;
 pub mod ports;
+pub mod platform;
 pub mod privacy;
 pub mod snapshot;
 mod source_binding;

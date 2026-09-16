@@ -160,6 +160,18 @@ returns typed `Unavailable` and never launches a process. The named
 cannot satisfy production readiness. The existing model manifest and per-file model digest checks
 remain independent and are still required by the real encoder.
 
+The release-facing target policy is a separate checked-in descriptor at
+`product/ncm/reference/worker-platforms.json`. It currently maps only
+`aarch64-apple-darwin` / `aarch64-macos` to an advertised NCM worker capability because that is the
+only target with an evidenced worker pin. Linux, Intel macOS, and Windows release targets are
+explicitly `native-only` until their worker bytes are built, pinned, and packaged. Portable Rust
+compilation alone never widens this matrix. The policy checker must pass before a release can
+publish an NCM worker capability, and unsupported targets remain a typed unavailable outcome with
+Native fallback. The descriptor records that the worker is distributed as a separate sidecar, that
+the standard CLI archive does not include it, and that `worker-manifest.json` is required beside an
+installed worker. A supported release target consequently admits only the separately packaged,
+manifest-bound worker; it does not imply that every CLI archive contains that worker.
+
 Snapshot transport (task 018 finding, 2026-09-06): a one-record `ncm-snapshot.v1` already exceeds the
 1 MiB reply frame, and the frame bound is frozen. Snapshot bytes therefore never travel inside a
 frame: `SnapshotExport` replies with `{snapshot_file, byte_length, content_sha256, state_generation}`

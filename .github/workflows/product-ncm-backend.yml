@@ -47,6 +47,12 @@ jobs:
       - name: Show pinned Rust toolchain
         run: rustc --version --verbose
 
+      - name: Verify NCM worker platform policy
+        run: python3 scripts/product/ncm/check-worker-platform.py
+
+      - name: Test NCM worker platform policy
+        run: python3 scripts/product/ncm/test-worker-platform-policy.py
+
       - name: Discover nonempty backend populations
         shell: bash
         run: |

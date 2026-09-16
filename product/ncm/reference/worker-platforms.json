@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "provider_id": "ncm",
+  "worker": "tracedecay-ncm-worker",
+  "policy": "pinned-artifact-only",
+  "worker_manifest": "product/ncm/reference/worker-manifest.json",
+  "release_target_manifest": ".github/release-targets.json",
+  "fallback": "native-only",
+  "packaging": {
+    "worker_distribution": "separate-sidecar",
+    "standard_cli_archive_includes_worker": false,
+    "manifest_sidecar_required": true
+  },
+  "supported_targets": [
+    {
+      "target": "aarch64-apple-darwin",
+      "release_name": "aarch64-macos",
+      "status": "supported"
+    }
+  ],
+  "unsupported_targets": [
+    {
+      "target": "x86_64-apple-darwin",
+      "reason": "no-pinned-worker-artifact"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "reason": "no-pinned-worker-artifact"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "reason": "no-pinned-worker-artifact"
+    },
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "reason": "no-pinned-worker-artifact"
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "reason": "no-pinned-worker-artifact"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "reason": "no-pinned-worker-artifact"
+    }
+  ],
+  "release_targets": [
+    {
+      "name": "aarch64-macos",
+      "target": "aarch64-apple-darwin",
+      "ncm": "supported"
+    },
+    {
+      "name": "x86_64-linux",
+      "target": "x86_64-unknown-linux-gnu",
+      "ncm": "native-only"
+    },
+    {
+      "name": "aarch64-linux",
+      "target": "aarch64-unknown-linux-gnu",
+      "ncm": "native-only"
+    },
+    {
+      "name": "x86_64-windows",
+      "target": "x86_64-pc-windows-msvc",
+      "ncm": "native-only"
+    }
+  ]
+}
