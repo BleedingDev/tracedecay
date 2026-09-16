@@ -1,12 +1,14 @@
 # TraceDecay Final V2 Operating Model
 
 This is a concise operator and contributor summary of final-V2 storage, scope,
-host ingestion, and retrieval. The
-[V2 roadmap](plans/tracedecay-v2/00-plan-set-index.md) is the sole authority for
-precedence, rejected mechanisms, delivery order, and acceptance; its numbered
-plans own detailed behavior, and
+host ingestion, retrieval, and V1-to-V2 replacement. The
+[V2 roadmap](plans/tracedecay-v2/00-plan-set-index.md) remains the authority for
+general V2 precedence, delivery order, and acceptance; its numbered plans own
+detailed behavior, and
 [`NEXT.md`](plans/tracedecay-v2/NEXT.md) reports current delivery status.
-Runtime status remains the truth for capabilities not yet delivered.
+Plan [12](plans/tracedecay-v2/12-root-compatibility-migration.md) owns the
+explicit replacement contract described below. Runtime status remains the
+truth for capabilities not yet delivered.
 
 ## Authorities
 
@@ -40,16 +42,66 @@ Runtime status remains the truth for capabilities not yet delivered.
 Every database, store, spool, file, journal, checkpoint, receipt, and
 projection admits only its exact final V2 shape. Any other shape returns typed
 `ResetRequired` before decoding, reading, writing, replaying, or projecting.
-The operator may explicitly reset or recreate that exact target; preserved
-bytes are inspection-only.
+The operator may explicitly reset or recreate that exact target. Ordinary V2
+startup, open, read-only inspection, and background maintenance never silently
+migrate a non-final target, infer a version, reset bytes, or fall back to a
+different store.
 
-There is no V1 or earlier-V2 database reader, migration, conversion,
-database-format backfill, census, fallback, shadow read, dual write, staging
-state, cutover receipt, recovery route, or transition dashboard. Historical
-host transcripts, repositories, and other source material remain ordinary V2
-ingress. A released public wire/API contract may delegate to the canonical
-operation only when independent release evidence proves it; it owns no storage
-or lifecycle behavior.
+### V1-to-V2 replacement and cutover
+
+The accepted replacement path is a separate, explicit opt-in operation:
+`storage replace-v1` (visible alias `migrate-v1`) with an approved worker and
+explicit confirmation. `--dry-run` performs no writes. It is the only place
+where a supported V1 profile may be read for replacement; ordinary storage
+open paths stay final-shape-only.
+
+The currently evidenced input is the released `v0.1.0-beta.37` profile,
+including its exact tagged V34 and V35 project-store inventories. Other
+versions, partial or foreign profiles, and drifted inventories return typed
+`ResetRequired` or `Incompatible` and remain untouched until separately
+accepted.
+
+Replacement covers the complete profile authorities: `global.db`,
+`user-sessions.db`, `user-memory.db`, `projects`, `enrollment.json`,
+`config.toml`, `migration-inventory`, and `profile-identity.json`. The
+coordinator quiesces the profile under its exclusive lifecycle fence, creates
+a complete checksummed backup outside the profile root, verifies that backup,
+and rehearses restoration into an isolated rollback tree before changing the
+serving profile.
+
+The worker builds an isolated V2 target and must preserve canonical logical
+data, identities, ownership, provenance, timestamps, receipts, and source
+material for every required authority with pre-publication counts and digest
+checks. Historical transcripts and repositories are replayed through ordinary
+bounded V2 ingress. Rebuildable projections may be recreated; V1-only or
+unsupported records remain in the untouched backup and receive a typed
+disposition. Unless the preflight contract explicitly classifies such a record
+as out of scope and the operator accepts that disposition, it blocks
+publication. It is never silently discarded.
+
+Before cutover, validation checks the exact final V2 shape, namespace and
+identity binding, authority coverage, source and backup tree digests, canonical
+row counts, provenance, replay receipts, and the worker's committed report.
+The journaled cutover quarantines the old root, publishes the verified V2
+target, and synchronizes the publication boundary before post-publish
+verification. The old root, journal, and external backup remain available for
+rollback and inspection until the operator accepts the cutover.
+
+Backup, rehearsal, and publication phases are crash-recoverable. Recovery
+resumes only an idempotent journaled phase or returns a typed
+recovery-required/unavailable outcome while preserving the source, backup,
+and failure evidence. It never guesses at an ambiguous publication or
+silently starts over. Before post-publication verification, rollback restores
+the untouched V1 rehearsal or external backup and quarantines the failed V2
+target. A deliberate binary/service/host rollback after acceptance is
+explicit and restores the preserved V1 profile; a V1 binary never opens
+V2-created bytes.
+
+Historical host transcripts, repositories, and other source material remain
+ordinary V2 ingress outside this explicit replacement. A released public
+wire/API contract may delegate to the canonical operation only when
+independent release evidence proves it; it owns no storage or lifecycle
+behavior.
 
 One daemon authority owns a local mutable store; clients reach it through the
 application boundary. Validation failures leave the prior verified graph
@@ -121,5 +173,17 @@ All runtime validation uses isolated temporary home, profile, project, and
 socket paths. Never install, dogfood, start, restart, or test a V2 daemon
 against an operator's live TraceDecay profile. Acceptance is direct production
 behavior: exact final-store admission, authoritative reset/recreation, bounded
-host ingestion, project-wide fact scope, deterministic lossless retrieval, and
-truthful truncation/omission outcomes.
+host ingestion, project-wide fact scope, deterministic lossless retrieval,
+truthful truncation/omission outcomes, and the explicit replacement contract's
+backup, validation, cutover, crash recovery, and rollback behavior.
+
+The replacement contract is accepted, but its release implementation gate is
+pending. Focused source-shape/transaction rollback coverage, replacement
+dry-run/confirmation checks, and backup-rehearsal scaffolding are present in
+the current branch; they do not close end-to-end qualification. The following
+remain pending in the normal test matrix and a stable aggregate run: a
+first-party worker-backed beta.37 full-profile cutover, preservation checks
+for every authority and typed dispositions for unsupported data,
+fault-injected journal/publication/restart recovery, binary/service/host
+rollback without V2 bytes reaching V1, all supported surface restart paths,
+and reproducible cross-platform packaging and canary/soak evidence.
