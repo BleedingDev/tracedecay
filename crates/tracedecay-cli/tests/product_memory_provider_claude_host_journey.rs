@@ -2811,8 +2811,15 @@ fn capture_revision_fixture_source(
         "the restarted provider must admit the revision fixture exactly once"
     );
     let (_, admitted) = matching.into_iter().next().expect("revision fixture row");
+    admitted
+        .validate()
+        .expect("revision fixture admission validates");
     let payload: Value =
         serde_json::from_slice(&admitted.payload.bytes).expect("revision fixture payload");
+    assert!(
+        payload.get("history_grant").is_none(),
+        "the producer fixture must reach the provider as a live canonical source"
+    );
     let canonical: CanonicalObservationEnvelopeV1 =
         serde_json::from_value(payload["canonical_payload"].clone())
             .expect("revision fixture canonical envelope");
