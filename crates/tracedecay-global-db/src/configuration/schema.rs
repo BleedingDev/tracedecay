@@ -32,10 +32,9 @@ const PRE_RESIDUE_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
 const RELEASED_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:99b8f5f5cebc584ab564181d8a67ee665031c20bbdf63b479c212d16a1c63746";
 /// Tables removed from the current canonical configuration shape. The
-/// beta.25-beta.37 binaries never wrote these tables as part of the stable
-/// configuration surface. Their presence is therefore a known released
-/// shape, while rows in the credential-reference table remain unknown data
-/// that must be preserved for an explicit reset decision.
+/// beta.25-beta.37 binaries exposed these tables, and some released writers
+/// populated them. The migration can therefore remove only an empty table;
+/// any row must remain available for an explicit reset decision.
 const CONVERGE_RELEASED_CONFIGURATION_SQL: &str = "
 DROP TABLE configuration_credential_references;
 DROP TABLE configuration_semantic_retrieval_state_v1;
@@ -44,6 +43,33 @@ DROP TABLE configuration_semantic_retrieval_inventory_v1;
 DROP TABLE configuration_semantic_accepted_profiles_v1;
 DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
 ";
+
+const RELEASED_CONFIGURATION_RETIRED_TABLES: &[(&str, &str)] = &[
+    (
+        "configuration_credential_references",
+        "released configuration store holds credential references with no lossless migration",
+    ),
+    (
+        "configuration_semantic_retrieval_state_v1",
+        "released configuration store holds semantic retrieval state with no lossless migration",
+    ),
+    (
+        "configuration_semantic_retrieval_pending_v1",
+        "released configuration store holds pending semantic retrieval transitions with no lossless migration",
+    ),
+    (
+        "configuration_semantic_retrieval_inventory_v1",
+        "released configuration store holds semantic retrieval inventory with no lossless migration",
+    ),
+    (
+        "configuration_semantic_accepted_profiles_v1",
+        "released configuration store holds accepted semantic profiles with no lossless migration",
+    ),
+    (
+        "configuration_semantic_accepted_profile_receipt_key_v1",
+        "released configuration store holds an accepted profile receipt key with no lossless migration",
+    ),
+];
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {
@@ -484,15 +510,22 @@ async fn validate_configuration_schema(
     Ok(shape)
 }
 
-/// Read-only admission: the exact final shape and the known beta.25-beta.37
-/// shape are admissible. The writer converges the released shape on its next
-/// open; unknown schema drift remains reset-required and untouched.
+/// Read-only admission: the exact final shape and an empty known
+/// beta.25-beta.37 shape are admissible. Released data without a lossless
+/// current-registry mapping is reset-required and untouched.
 pub async fn admit_configuration_schema(
     connection: &impl QueryExecutor,
     fresh_store: Option<&FreshConfigurationStoreEvidence>,
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
-        ConfigurationShape::Final | ConfigurationShape::Released => Ok(()),
+        ConfigurationShape::Final => Ok(()),
+        ConfigurationShape::Released => {
+            if let Some(reason) = released_configuration_data_reset_reason(connection).await? {
+                Err(ConfigurationSchemaError::ResetRequired { reason })
+            } else {
+                Ok(())
+            }
+        }
         shape @ (ConfigurationShape::PriorFinal | ConfigurationShape::PreResidueFinal) => {
             Err(historical_shape_reset(shape))
         }
@@ -538,26 +571,18 @@ pub async fn ensure_configuration_schema(
 /// Converges the known beta.25-beta.37 shape to the current canonical shape.
 ///
 /// Callers run this from the atomic registered-schema transaction. The
-/// credential-reference table had no shipped writer after its introduction;
-/// a row therefore represents data this binary cannot interpret or safely
-/// migrate. Refuse before the first drop so a refused store remains byte-for-
-/// byte available for an explicit reset decision. Supported revision and
-/// setting rows stay in place while the retired empty tables are removed.
+/// released writers populated retired semantic and accepted-profile tables,
+/// and beta37 snapshots can retain setting entries from older registries. No
+/// current registry definition provides a lossless mapping for those values.
+/// Refuse before the first drop so a refused store remains byte-for-byte
+/// available for an explicit reset decision. Supported setting rows stay in
+/// place while the retired empty tables are removed.
 async fn converge_released_configuration(
     connection: &impl Executor,
 ) -> Result<(), ConfigurationSchemaError> {
-    let mut rows = connection
-        .query(
-            "SELECT 1 FROM configuration_credential_references LIMIT 1",
-            (),
-        )
-        .await?;
-    if rows.next().await?.is_some() {
-        return Err(ConfigurationSchemaError::ResetRequired {
-            reason: "released configuration store holds credential references no shipped binary wrote",
-        });
+    if let Some(reason) = released_configuration_data_reset_reason(connection).await? {
+        return Err(ConfigurationSchemaError::ResetRequired { reason });
     }
-    drop(rows);
 
     connection
         .execute_batch(CONVERGE_RELEASED_CONFIGURATION_SQL)
@@ -569,6 +594,41 @@ async fn converge_released_configuration(
             reason: "released configuration store did not converge to the final shape",
         })
     }
+}
+
+/// Inspect every retired data owner before any convergence DDL runs.
+///
+/// The table names are fixed internal constants, so formatting them into the
+/// read-only probes cannot introduce caller SQL. Keeping this check ahead of
+/// the batch is the important safety property: a store with any retired row
+/// is left physically unchanged for an explicit reset decision.
+async fn released_configuration_data_reset_reason(
+    connection: &impl QueryExecutor,
+) -> Result<Option<&'static str>, ConfigurationSchemaError> {
+    for &(table, reason) in RELEASED_CONFIGURATION_RETIRED_TABLES {
+        let sql = format!("SELECT 1 FROM {table} LIMIT 1");
+        let mut rows = connection.query(&sql, ()).await?;
+        if rows.next().await?.is_some() {
+            return Ok(Some(reason));
+        }
+    }
+
+    let mut rows = connection
+        .query(
+            "SELECT key
+             FROM configuration_entries
+             WHERE key IN ('query.default_collection.v1', 'semantic.runtime.v1')
+             LIMIT 1",
+            (),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Ok(Some(
+            "released configuration store holds a retired setting entry with no lossless migration",
+        ));
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
