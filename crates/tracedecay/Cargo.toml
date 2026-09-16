@@ -157,6 +157,7 @@ memory-provider-host = [
     "dep:tracedecay-memory-provider-ncm",
     "dep:tracedecay-memory-observation",
     "dep:tracedecay-memory-hygiene",
+    "tracedecay-daemon-service/memory-provider-host",
 ]
 
 

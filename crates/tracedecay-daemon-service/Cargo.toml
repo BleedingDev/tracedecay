@@ -14,7 +14,22 @@ doctest = false
 # Cross-crate fixture surface for composition-root invocation tests:
 # `DaemonInvocationService::invoke`, publication gates, and test constructors.
 # Production code is never gated by this feature.
-test-helpers = []
+test-helpers = ["tracedecay-memory-provider-ncm?/test-helpers"]
+# The retained provider owner is compiled in this crate after the #707 owner
+# extraction. Keep the complete Native/NCM mount opt-in at the same boundary as
+# the source modules; the composition root forwards its public host feature
+# here. `test-helpers` remains independent so upstream-only builds do not pull
+# provider code or the NCM runtime.
+memory-provider-host = [
+    "dep:chrono",
+    "dep:hmac",
+    "dep:rusqlite",
+    "dep:zeroize",
+    "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-provider-ncm",
+    "dep:tracedecay-memory-observation",
+    "dep:tracedecay-memory-hygiene",
+]
 # Opt-in profiling. Hotpath macros are no-ops until the *binary* selects the
 # `hotpath/hotpath` backend (cargo unifies the proc-macro's features), so this
 # feature exists only for the `cfg(feature = "hotpath")` sites in this crate
@@ -36,14 +51,18 @@ tracedecay-maintenance = { path = "../tracedecay-maintenance", version = "0.1.0"
 tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention", version = "0.1.0" }
 tracedecay-session-runtime = { path = "../tracedecay-session-runtime", version = "0.1.0" }
 axum = "0.8"
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 futures-util = "0.3.33"
 getrandom = "0.2"
 hex = "0.4"
+hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
 hotpath.workspace = true
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 sha2 = "0.11"
+zeroize = { version = "1.9.0", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -64,6 +83,10 @@ tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0" }
 tracedecay-graph-query = { path = "../tracedecay-graph-query", version = "0.1.0" }
 tracedecay-hooks = { path = "../tracedecay-hooks", version = "0.1.0" }
 tracedecay-lsp = { path = "../tracedecay-lsp", version = "0.1.0" }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
+tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
 tracedecay-policy = { path = "../tracedecay-policy", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0" }
