@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 #[cfg(test)]
 use crate::retrieval_content::projected_content_hash;
 #[cfg(test)]
@@ -216,10 +218,292 @@ pub async fn ensure_lcm_schema(conn: &Connection) -> Result<(), LcmError> {
 pub enum LcmSchemaAdmission {
     /// The store already carries the exact current LCM schema.
     Current,
+    /// The store carries the exact LCM schema published by beta.37.
+    ReleasedBeta37,
     /// The store carries no LCM schema and no legacy session content, so the
     /// current schema may be installed.
     Fresh,
 }
+
+const LCM_BETA37_SCHEMA_OBJECTS: &[&str] = &[
+    "idx_lcm_external_payloads_owner",
+    "idx_lcm_maintenance_debt_kind",
+    "idx_lcm_raw_session_id",
+    "idx_lcm_raw_session_order",
+    "idx_lcm_summary_nodes_codex_pending_root_order",
+    "idx_lcm_summary_nodes_codex_pending_session_order",
+    "idx_lcm_summary_nodes_session_depth_time",
+    "idx_lcm_summary_sources_source",
+    "lcm_external_payloads",
+    "lcm_gc_marks",
+    "lcm_gc_meta",
+    "lcm_lifecycle_state",
+    "lcm_maintenance_debt",
+    "lcm_raw_messages",
+    "lcm_raw_messages_fts",
+    "lcm_raw_messages_fts_config",
+    "lcm_raw_messages_fts_data",
+    "lcm_raw_messages_fts_docsize",
+    "lcm_raw_messages_fts_idx",
+    "lcm_raw_messages_fts_delete",
+    "lcm_raw_messages_fts_insert",
+    "lcm_raw_messages_fts_update",
+    "lcm_summary_nodes",
+    "lcm_summary_nodes_fts",
+    "lcm_summary_nodes_fts_config",
+    "lcm_summary_nodes_fts_data",
+    "lcm_summary_nodes_fts_docsize",
+    "lcm_summary_nodes_fts_idx",
+    "lcm_summary_nodes_fts_delete",
+    "lcm_summary_nodes_fts_insert",
+    "lcm_summary_nodes_fts_update",
+    "lcm_summary_sources",
+];
+
+const LCM_CURRENT_SCHEMA_OBJECTS: &[&str] = &[
+    "idx_lcm_external_payloads_owner_bytes",
+    "idx_lcm_maintenance_debt_kind",
+    "idx_lcm_raw_direct_user_candidate",
+    "idx_lcm_raw_legacy_truncated",
+    "idx_lcm_raw_lossy_ingest",
+    "idx_lcm_raw_predecessor_session_to",
+    "idx_lcm_raw_session_id",
+    "idx_lcm_raw_session_order",
+    "idx_lcm_summary_convergence_due",
+    "idx_lcm_summary_nodes_codex_pending_root_order",
+    "idx_lcm_summary_nodes_codex_pending_session_order",
+    "idx_lcm_summary_nodes_depth_tokens",
+    "idx_lcm_summary_nodes_session_depth_time",
+    "idx_lcm_summary_sources_source",
+    "idx_lcm_summary_sources_source_node",
+    "lcm_external_payloads",
+    "lcm_gc_marks",
+    "lcm_gc_meta",
+    "lcm_lifecycle_state",
+    "lcm_maintenance_debt",
+    "lcm_raw_messages",
+    "lcm_raw_messages_fts",
+    "lcm_raw_messages_fts_config",
+    "lcm_raw_messages_fts_data",
+    "lcm_raw_messages_fts_docsize",
+    "lcm_raw_messages_fts_idx",
+    "lcm_raw_messages_fts_delete",
+    "lcm_raw_messages_fts_insert",
+    "lcm_raw_messages_fts_update",
+    "lcm_raw_predecessor_ranges",
+    "lcm_summary_convergence_dirty_raw",
+    "lcm_summary_convergence_invalidation_work",
+    "lcm_summary_convergence_queue",
+    "lcm_summary_nodes",
+    "lcm_summary_nodes_fts",
+    "lcm_summary_nodes_fts_config",
+    "lcm_summary_nodes_fts_data",
+    "lcm_summary_nodes_fts_docsize",
+    "lcm_summary_nodes_fts_idx",
+    "lcm_summary_nodes_fts_delete",
+    "lcm_summary_nodes_fts_insert",
+    "lcm_summary_nodes_fts_update",
+    "lcm_summary_sources",
+    "lcm_summary_convergence_dirty_raw_seed",
+    "lcm_summary_convergence_raw_insert",
+    "lcm_summary_convergence_raw_unprotected_update",
+];
+
+const LCM_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "lcm_raw_messages",
+        &[
+            "provider",
+            "message_id",
+            "session_id",
+            "store_id",
+            "role",
+            "ordinal",
+            "timestamp",
+            "content",
+            "content_hash",
+            "storage_kind",
+            "payload_ref",
+            "snippet_text",
+            "index_text",
+            "legacy_source",
+            "legacy_truncated",
+            "metadata_json",
+        ],
+    ),
+    (
+        "lcm_external_payloads",
+        &[
+            "payload_ref",
+            "provider",
+            "session_id",
+            "message_id",
+            "kind",
+            "content_hash",
+            "byte_count",
+            "char_count",
+            "created_at",
+            "metadata_json",
+        ],
+    ),
+    (
+        "lcm_gc_marks",
+        &["payload_ref", "state", "first_seen_at", "updated_at"],
+    ),
+    ("lcm_gc_meta", &["key", "value"]),
+    (
+        "lcm_summary_nodes",
+        &[
+            "node_id",
+            "provider",
+            "conversation_id",
+            "session_id",
+            "depth",
+            "summary_text",
+            "summary_hash",
+            "summary_token_count",
+            "source_token_count",
+            "source_time_start",
+            "source_time_end",
+            "expand_hint",
+            "metadata_json",
+            "created_at",
+        ],
+    ),
+    (
+        "lcm_summary_sources",
+        &["node_id", "source_kind", "source_id", "ordinal"],
+    ),
+    (
+        "lcm_lifecycle_state",
+        &[
+            "provider",
+            "conversation_id",
+            "current_session_id",
+            "last_finalized_session_id",
+            "current_frontier_store_id",
+            "last_finalized_frontier_store_id",
+            "rollover_at",
+            "reset_at",
+            "maintenance_at",
+            "boundary_skip_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "lcm_maintenance_debt",
+        &[
+            "provider",
+            "conversation_id",
+            "debt_id",
+            "debt_kind",
+            "from_store_id",
+            "to_store_id",
+            "metadata_json",
+            "created_at",
+        ],
+    ),
+];
+
+const LCM_CURRENT_EXTRA_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "lcm_raw_predecessor_ranges",
+        &[
+            "provider",
+            "message_id",
+            "session_id",
+            "from_store_id",
+            "to_store_id",
+        ],
+    ),
+    (
+        "lcm_summary_convergence_queue",
+        &[
+            "queue_id",
+            "provider",
+            "session_id",
+            "newest_raw_store_id",
+            "protection_frontier_store_id",
+            "attempted_raw_store_id",
+            "state",
+            "failure_code",
+            "failure_count",
+            "next_attempt_at_ms",
+            "attempt_generation",
+            "raw_revision_generation",
+            "stale_from_store_id",
+        ],
+    ),
+    (
+        "lcm_summary_convergence_dirty_raw",
+        &[
+            "provider",
+            "session_id",
+            "store_id",
+            "rewind_frontier_store_id",
+        ],
+    ),
+    (
+        "lcm_summary_convergence_invalidation_work",
+        &[
+            "provider",
+            "session_id",
+            "raw_store_id",
+            "source_kind",
+            "source_id",
+            "depth",
+            "after_node_id",
+            "state",
+        ],
+    ),
+];
+
+const LCM_SUMMARY_CONVERGENCE_QUEUE_PREVIOUS_COLUMNS: &[&str] = &[
+    "queue_id",
+    "provider",
+    "session_id",
+    "newest_raw_store_id",
+    "protection_frontier_store_id",
+    "attempted_raw_store_id",
+    "state",
+    "failure_code",
+    "failure_count",
+    "next_attempt_at_ms",
+    "attempt_generation",
+];
+
+const LCM_SUMMARY_CONVERGENCE_DIRTY_RAW_PREVIOUS_COLUMNS: &[&str] =
+    &["provider", "session_id", "store_id"];
+
+const LCM_SUMMARY_CONVERGENCE_INVALIDATION_WORK_PREVIOUS_COLUMNS: &[&str] = &[
+    "provider",
+    "session_id",
+    "raw_store_id",
+    "source_kind",
+    "source_id",
+    "depth",
+    "after_node_id",
+];
+
+const LCM_CURRENT_REPAIRABLE_OBJECTS: &[&str] = &[
+    "idx_lcm_external_payloads_owner_bytes",
+    "idx_lcm_raw_direct_user_candidate",
+    "idx_lcm_raw_legacy_truncated",
+    "idx_lcm_raw_lossy_ingest",
+    "idx_lcm_raw_predecessor_session_to",
+    "idx_lcm_summary_convergence_due",
+    "idx_lcm_summary_nodes_depth_tokens",
+    "idx_lcm_summary_sources_source_node",
+    "lcm_raw_predecessor_ranges",
+    "lcm_summary_convergence_dirty_raw",
+    "lcm_summary_convergence_dirty_raw_seed",
+    "lcm_summary_convergence_invalidation_work",
+    "lcm_summary_convergence_queue",
+    "lcm_summary_convergence_raw_insert",
+    "lcm_summary_convergence_raw_unprotected_update",
+];
+
+const LCM_LEGACY_OWNER_INDEX: &str = "idx_lcm_external_payloads_owner";
 
 /// Read-only classification of a profile store's LCM schema state.
 ///
@@ -232,7 +516,20 @@ pub async fn require_admissible_lcm_schema(
     conn: &(impl QueryExecutor + ?Sized),
 ) -> Result<LcmSchemaAdmission, LcmError> {
     match stored_schema_version(conn).await? {
-        Some(LCM_SCHEMA_VERSION) => Ok(LcmSchemaAdmission::Current),
+        Some(LCM_SCHEMA_VERSION) => {
+            if lcm_schema_matches(conn, LCM_CURRENT_SCHEMA_OBJECTS, true).await? {
+                Ok(LcmSchemaAdmission::Current)
+            } else if lcm_schema_matches(conn, LCM_BETA37_SCHEMA_OBJECTS, false).await? {
+                Ok(LcmSchemaAdmission::ReleasedBeta37)
+            } else if lcm_schema_matches_current_with_known_gaps(conn).await? {
+                Ok(LcmSchemaAdmission::Current)
+            } else {
+                Err(LcmError::ProfileResetRequired {
+                    found_version: Some(LCM_SCHEMA_VERSION),
+                    required_version: LCM_SCHEMA_VERSION,
+                })
+            }
+        }
         Some(found_version) => Err(LcmError::ProfileResetRequired {
             found_version: Some(found_version),
             required_version: LCM_SCHEMA_VERSION,
@@ -257,6 +554,9 @@ pub async fn ensure_lcm_schema_in_transaction(
             ensure_raw_identity_schema(conn).await?;
             super::summary_convergence::ensure_schema(conn).await?;
             return Ok(());
+        }
+        LcmSchemaAdmission::ReleasedBeta37 => {
+            return migrate_released_beta37_lcm_schema(conn).await;
         }
         LcmSchemaAdmission::Fresh => {}
     }
@@ -475,6 +775,239 @@ async fn ensure_raw_identity_schema(conn: &(impl Executor + ?Sized)) -> Result<(
         ",
     )
     .await?;
+    Ok(())
+}
+
+async fn lcm_schema_matches(
+    conn: &(impl QueryExecutor + ?Sized),
+    expected_objects: &[&str],
+    current: bool,
+) -> Result<bool, LcmError> {
+    let actual = lcm_schema_inventory(conn).await?;
+    let expected = expected_objects
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Ok(false);
+    }
+    if raw_fts_structure_is_current(conn).await != Some(true) {
+        return Ok(false);
+    }
+    if !table_columns_match(conn, LCM_TABLE_COLUMNS).await?
+        || (current && !table_columns_match(conn, LCM_CURRENT_EXTRA_TABLE_COLUMNS).await?)
+    {
+        return Ok(false);
+    }
+    summary_fts_structure_is_current(conn).await
+}
+
+/// Existing current stores can be one of the known resumable convergence
+/// boundaries: the status indexes, predecessor-range authority, or summary
+/// convergence objects may not have been built yet. These gaps are repaired
+/// by their owning idempotent stages. Unknown objects, core column drift, and
+/// malformed FTS contracts remain reset-required.
+async fn lcm_schema_matches_current_with_known_gaps(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<bool, LcmError> {
+    let actual = lcm_schema_inventory(conn).await?;
+    let mut allowed = LCM_CURRENT_SCHEMA_OBJECTS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    allowed.insert(LCM_LEGACY_OWNER_INDEX.to_owned());
+    if actual.iter().any(|name| !allowed.contains(name)) {
+        return Ok(false);
+    }
+
+    let required = LCM_CURRENT_SCHEMA_OBJECTS
+        .iter()
+        .filter(|name| !LCM_CURRENT_REPAIRABLE_OBJECTS.contains(name))
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    if required.iter().any(|name| !actual.contains(name)) {
+        return Ok(false);
+    }
+    if !actual.contains("idx_lcm_external_payloads_owner_bytes")
+        && !actual.contains(LCM_LEGACY_OWNER_INDEX)
+    {
+        return Ok(false);
+    }
+    if actual.contains("idx_lcm_external_payloads_owner_bytes")
+        && actual.contains(LCM_LEGACY_OWNER_INDEX)
+    {
+        return Ok(false);
+    }
+    if raw_fts_structure_is_current(conn).await != Some(true)
+        || !table_columns_match(conn, LCM_TABLE_COLUMNS).await?
+        || !summary_fts_structure_is_current(conn).await?
+    {
+        return Ok(false);
+    }
+    for (table, current_columns) in LCM_CURRENT_EXTRA_TABLE_COLUMNS {
+        if !actual.contains(*table) {
+            continue;
+        }
+        let previous_columns = match *table {
+            "lcm_summary_convergence_queue" => LCM_SUMMARY_CONVERGENCE_QUEUE_PREVIOUS_COLUMNS,
+            "lcm_summary_convergence_dirty_raw" => {
+                LCM_SUMMARY_CONVERGENCE_DIRTY_RAW_PREVIOUS_COLUMNS
+            }
+            "lcm_summary_convergence_invalidation_work" => {
+                LCM_SUMMARY_CONVERGENCE_INVALIDATION_WORK_PREVIOUS_COLUMNS
+            }
+            "lcm_raw_predecessor_ranges" => &[],
+            _ => return Ok(false),
+        };
+        if !table_columns_match_any(conn, *table, &[*current_columns, previous_columns]).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn lcm_schema_inventory(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<BTreeSet<String>, LcmError> {
+    let mut rows = conn
+        .query(
+            "SELECT name
+             FROM sqlite_master
+             WHERE name LIKE 'lcm\\_%' ESCAPE '\\'
+                OR name LIKE 'idx_lcm\\_%' ESCAPE '\\'
+             ORDER BY name",
+            (),
+        )
+        .await?;
+    let mut names = BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        names.insert(row.get::<String>(0)?);
+    }
+    Ok(names)
+}
+
+async fn table_columns_match(
+    conn: &(impl QueryExecutor + ?Sized),
+    contracts: &[(&str, &[&str])],
+) -> Result<bool, LcmError> {
+    for (table, expected) in contracts {
+        let mut rows = conn
+            .query(
+                "SELECT name FROM pragma_table_info(?1) ORDER BY cid",
+                params![*table],
+            )
+            .await?;
+        let mut actual = Vec::with_capacity(expected.len());
+        while let Some(row) = rows.next().await? {
+            actual.push(row.get::<String>(0)?);
+        }
+        if actual
+            .iter()
+            .map(String::as_str)
+            .ne(expected.iter().copied())
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn table_columns_match_any(
+    conn: &(impl QueryExecutor + ?Sized),
+    table: &str,
+    contracts: &[&[&str]],
+) -> Result<bool, LcmError> {
+    let mut rows = conn
+        .query(
+            "SELECT name FROM pragma_table_info(?1) ORDER BY cid",
+            params![table],
+        )
+        .await?;
+    let mut actual = Vec::new();
+    while let Some(row) = rows.next().await? {
+        actual.push(row.get::<String>(0)?);
+    }
+    Ok(contracts.iter().any(|expected| {
+        actual
+            .iter()
+            .map(String::as_str)
+            .eq(expected.iter().copied())
+    }))
+}
+
+async fn summary_fts_structure_is_current(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<bool, LcmError> {
+    let expected = [
+        (
+            "lcm_summary_nodes_fts",
+            "table",
+            "usingfts5(summary_text,expand_hint,metadata_json,content='lcm_summary_nodes',content_rowid='rowid')",
+        ),
+        (
+            "lcm_summary_nodes_fts_insert",
+            "trigger",
+            "afterinsertonlcm_summary_nodesbegin",
+        ),
+        (
+            "lcm_summary_nodes_fts_delete",
+            "trigger",
+            "afterdeleteonlcm_summary_nodesbegin",
+        ),
+        (
+            "lcm_summary_nodes_fts_update",
+            "trigger",
+            "afterupdateonlcm_summary_nodesbegin",
+        ),
+    ];
+    for (name, object_type, fragment) in expected {
+        let mut rows = conn
+            .query(
+                "SELECT type, COALESCE(sql, '')
+                 FROM sqlite_master WHERE name = ?1",
+                params![name],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(false);
+        };
+        let actual_type = row.get::<String>(0)?;
+        let sql = compact_sql(&row.get::<String>(1)?);
+        if actual_type != object_type || !sql.contains(fragment) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn migrate_released_beta37_lcm_schema(
+    conn: &(impl Executor + ?Sized),
+) -> Result<(), LcmError> {
+    ensure_raw_identity_schema(conn).await?;
+    super::summary_convergence::ensure_schema(conn).await?;
+    for sql in LCM_STATUS_PERFORMANCE_INDEX_SQL {
+        conn.execute_batch(sql).await?;
+    }
+    let updated = conn
+        .execute(
+            "UPDATE session_schema_migrations
+             SET applied_at = unixepoch()
+             WHERE name = ?1 AND version = ?2",
+            params![MIGRATION_NAME, LCM_SCHEMA_VERSION],
+        )
+        .await?;
+    if updated != 1 {
+        return Err(LcmError::ProfileResetRequired {
+            found_version: Some(LCM_SCHEMA_VERSION),
+            required_version: LCM_SCHEMA_VERSION,
+        });
+    }
+    if !lcm_schema_matches(conn, LCM_CURRENT_SCHEMA_OBJECTS, true).await? {
+        return Err(LcmError::ProfileResetRequired {
+            found_version: Some(LCM_SCHEMA_VERSION),
+            required_version: LCM_SCHEMA_VERSION,
+        });
+    }
     Ok(())
 }
 
