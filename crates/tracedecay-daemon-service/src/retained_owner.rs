@@ -50,6 +50,56 @@ pub(crate) mod provider_history;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) use tracedecay_session_memory::memory_mapping;
 
+/// Builds the host-owned Native observation metadata used by the retained
+/// observation journey and its provider fixtures. This small constructor used
+/// to live in the binary composition root; keeping it beside the Native owner
+/// means the daemon-service crate never has to reach back through the binary
+/// composition root.
+#[cfg(feature = "memory-provider-host")]
+pub(crate) fn native_observation_mount(
+    data_root: &Path,
+    registration_revision: u64,
+) -> tracedecay_domain::errors::Result<
+    tracedecay_memory_provider_registry::ObservationProviderMountV1,
+> {
+    use tracedecay_domain::errors::TraceDecayError;
+    use tracedecay_memory_provider_registry::{
+        NATIVE_PROVIDER_ID, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
+        OwnedProviderId,
+    };
+
+    Ok(ObservationProviderMountV1 {
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).map_err(|error| {
+            TraceDecayError::Config {
+                message: format!("invalid Native observation identity: {error}"),
+            }
+        })?,
+        registration_revision,
+        provider_instance_id: Some(native_provider::PROVIDER_INSTANCE_ID.to_owned()),
+        instance_proof: None,
+        host_limits: native_provider::native_provider_limits(),
+        state_root: data_root.join(observation_journey::PROVIDER_STATE_DIR_NAME),
+        journal_file_name: "memory-observation-journal-v1.sqlite3",
+        state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
+            NATIVE_PROVIDER_ID.to_owned(),
+        ),
+    })
+}
+
+/// Returns the registration revision declared by this daemon-service
+/// composition for a provider. Test evidence uses this declaration only to
+/// build a health request; the observed health reply remains authoritative.
+#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
+pub(crate) fn declared_project_provider_registration_revision_for_test(
+    provider_id: &str,
+) -> Option<u64> {
+    match provider_id {
+        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID => Some(1),
+        tracedecay_memory_provider_ncm::NCM_PROVIDER_ID => Some(1),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod memory_target_journeys;
 #[cfg(test)]

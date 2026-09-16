@@ -1,9 +1,9 @@
 //! Original-source history selection and the existing durable delivery journey.
 use super::*;
-use crate::daemon::retained_owner::cognitive_recall::control_attribution::{
+use crate::retained_owner::cognitive_recall::control_attribution::{
     RecallControlTraceRefV1, RecallLocatorKeyV1, redact_retained_source_attribution,
 };
-use crate::daemon::retained_owner::provider_history::{
+use crate::retained_owner::provider_history::{
     HistoryGrantRevalidationV1, HistoryIdentityBridgeV1, OriginalObservationAuthorityV1,
     ProviderHistoryErrorV1, ProviderHistoryReaderV1, history_grant_from_json, history_grant_json,
     original_source_fence_digest, source_attribution_json,
@@ -682,7 +682,7 @@ async fn history_delivery_wait_requires_receipts_and_rechecks_live_authority() {
         profile_id: fixture.profile.clone(),
         scope: fixture.scope.clone(),
         authoritative_project_id: fixture.project.clone(),
-        provider: crate::daemon::project_composition::native_observation_mount(&journal_root, 1)
+        provider: crate::retained_owner::native_observation_mount(&journal_root, 1)
             .unwrap(),
         store_data_root: journal_root,
         policy: ObservationJourneyPolicyV1::project_default(),
@@ -819,7 +819,7 @@ async fn destination_history_uses_existing_journal_and_resumes_without_recopying
             profile_id: fixture.profile.clone(),
             scope: fixture.scope.clone(),
             authoritative_project_id: fixture.project.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &journal_root,
                 1,
             )
@@ -944,7 +944,7 @@ async fn destination_history_uses_existing_journal_and_resumes_without_recopying
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordinary_admission_without_git_keeps_exact_journal_binding_and_refuses_history() {
-    use crate::daemon::retained_owner::provider_history::ProviderHistoryAuthorityV1;
+    use crate::retained_owner::provider_history::ProviderHistoryAuthorityV1;
     use tracedecay_memory_observation::ObservationIdempotencyKeyV1;
     use tracedecay_memory_provider_registry::{AdvisoryAdmissionAuthority, AdvisoryAdmissionError};
     let temp = TempDir::new().unwrap();
@@ -964,7 +964,7 @@ async fn ordinary_admission_without_git_keeps_exact_journal_binding_and_refuses_
         profile_id: profile.clone(),
         scope: resolved.clone(),
         authoritative_project_id: project.clone(),
-        provider: crate::daemon::project_composition::native_observation_mount(temp.path(), 1)
+        provider: crate::retained_owner::native_observation_mount(temp.path(), 1)
             .unwrap(),
         store_data_root: temp.path().to_path_buf(),
         policy: ObservationJourneyPolicyV1::project_default(),
@@ -1462,7 +1462,7 @@ async fn independently_selected_fresh_grants_preserve_durable_delivery_identity(
         profile_id: fixture.profile.clone(),
         scope: fixture.scope.clone(),
         authoritative_project_id: fixture.project.clone(),
-        provider: crate::daemon::project_composition::native_observation_mount(&journal_root, 1)
+        provider: crate::retained_owner::native_observation_mount(&journal_root, 1)
             .unwrap(),
         store_data_root: journal_root,
         policy: ObservationJourneyPolicyV1::project_default(),

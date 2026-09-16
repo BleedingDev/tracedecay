@@ -29,7 +29,7 @@ use tracedecay_memory_conformance::{
 use tracedecay_memory_provider_registry::{NATIVE_PROVIDER_ID, NativeProvider};
 
 use super::ProjectNativeMemoryApplicationPort;
-use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 /// Project identity of the corpus scope catalog's ledger scopes.
 const CORPUS_PROJECT_ID: &str = "project_ledger_v1";

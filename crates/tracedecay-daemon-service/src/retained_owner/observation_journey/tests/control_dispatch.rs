@@ -1,7 +1,7 @@
 //! Shutdown reaches an actual control through the existing mounted fixture.
 
 use super::*;
-use crate::daemon::retained_owner::observation_journey::control_dispatch::{
+use crate::retained_owner::observation_journey::control_dispatch::{
     JourneyControlDispatchErrorV1, JourneyControlDispatchRequestV1,
 };
 use tracedecay_memory_conformance::ReleaseLatchV1;

@@ -47,8 +47,8 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         provider,
         policy: ObservationJourneyPolicyV1::project_default(),
     };
-    let native_metadata =
-        crate::daemon::project_composition::native_observation_mount(&journal_root, 1).unwrap();
+    let native_metadata = crate::retained_owner::native_observation_mount(&journal_root, 1)
+        .unwrap();
     let native = mount_project_observation_journey(inputs(
         composition(port.clone()),
         native_metadata.clone(),
@@ -359,7 +359,7 @@ async fn unavailable_ncm_observer_preserves_native_canonical_acknowledgement() {
         policy: ObservationJourneyPolicyV1::project_default(),
     };
     let native = mount_project_observation_journey(inputs(
-        crate::daemon::project_composition::native_observation_mount(&root, 1).unwrap(),
+        crate::retained_owner::native_observation_mount(&root, 1).unwrap(),
     ))
     .unwrap();
     let ncm = mount_project_observation_journey(inputs(metadata)).unwrap();

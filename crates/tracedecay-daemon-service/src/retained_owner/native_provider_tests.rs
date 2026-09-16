@@ -37,7 +37,7 @@ use tracedecay_store::{
 };
 
 use super::*;
-use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 fn project_parts(label: &str) -> (ProjectId, FactOwnerV1, FactCommitOwnerV1) {
     let project_id =
@@ -2955,7 +2955,7 @@ async fn facts_and_staged_rows_share_one_candidate_ceiling_with_deterministic_or
 /// can be checked against the row that actually survived.
 fn staged_row_evidence(provider_state_root: &Path) -> Vec<(String, String, String, String)> {
     let connection = rusqlite::Connection::open(
-        crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+        crate::retained_owner::native_staged_observations::staged_store_path(
             provider_state_root,
         ),
     )
@@ -3089,11 +3089,11 @@ async fn a_redelivered_staged_observation_answers_the_committing_rows_own_eviden
 async fn the_composition_root_opens_the_staged_store_off_the_async_runtime() {
     let (_temporary, project_root, graph, _owner, _project_id) = real_project_fixture().await;
     let provider_state_root = test_provider_state_root(&project_root);
-    let store_path = crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+    let store_path = crate::retained_owner::native_staged_observations::staged_store_path(
         &provider_state_root,
     );
     assert_eq!(
-        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&store_path),
+        crate::retained_owner::native_staged_observations::open_thread_id(&store_path),
         None,
         "the fixture must start with this placement unopened"
     );
@@ -3110,7 +3110,7 @@ async fn the_composition_root_opens_the_staged_store_off_the_async_runtime() {
     drop(port);
 
     let opened_on =
-        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&store_path)
+        crate::retained_owner::native_staged_observations::open_thread_id(&store_path)
             .expect("the port construction opened the staged store");
     assert_ne!(
         opened_on, caller_thread,
@@ -3122,7 +3122,7 @@ async fn the_composition_root_opens_the_staged_store_off_the_async_runtime() {
     // can tell the two apart.
     let inline_root = project_root.join("inline-provider-state");
     let inline_path =
-        crate::daemon::retained_owner::native_staged_observations::staged_store_path(&inline_root);
+        crate::retained_owner::native_staged_observations::staged_store_path(&inline_root);
     let inline_port = project_native_memory_application_port(
         Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
         project_root,
@@ -3132,7 +3132,7 @@ async fn the_composition_root_opens_the_staged_store_off_the_async_runtime() {
     .expect("construct project Native application port inline");
     drop(inline_port);
     assert_eq!(
-        crate::daemon::retained_owner::native_staged_observations::open_thread_id(&inline_path),
+        crate::retained_owner::native_staged_observations::open_thread_id(&inline_path),
         Some(caller_thread)
     );
 }

@@ -24,7 +24,7 @@ use tracedecay_store::{
 
 use super::memory_mapping::search_page;
 use super::native_provider::ProjectNativeMemoryApplicationPort;
-use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 const PROJECT_ID: &str = "project.native-provider-parity";
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";

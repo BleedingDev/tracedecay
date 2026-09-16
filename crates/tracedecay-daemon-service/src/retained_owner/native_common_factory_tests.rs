@@ -59,7 +59,7 @@ use super::native_staged_observations::{
     StagedObservationRecord, StagedObservationStore, StagedOutcome, exact_scope_from_value,
     staged_store_path,
 };
-use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 const CHILD_TEST: &str =
     "daemon::retained_owner::native_common_factory_tests::native_common_provider_child";

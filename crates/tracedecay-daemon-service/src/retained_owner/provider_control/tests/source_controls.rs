@@ -39,25 +39,25 @@ use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionCon
 use tracedecay_sessions::runtime::claude::{ClaudeSource, identify_claude_source};
 use tracedecay_sessions::runtime::claude_observation::ingest_source_with_observations_with_admission;
 
-use crate::daemon::retained_owner::cognitive_recall::{
+use crate::retained_owner::cognitive_recall::{
     RecallAdmissionLedgerV1,
     control_attribution::{
         PreparedRecallControlMetadataV1, RecallLocatorKeyV1, RetainedRecallControlBindingV1,
         retained_trace_id_with_key,
     },
 };
-use crate::daemon::retained_owner::observation_journey::ObservationJourneyPolicyV1;
-use crate::daemon::retained_owner::provider_control::ProviderControlMountInputsV1;
-use crate::daemon::retained_owner::provider_control::authority::{
+use crate::retained_owner::observation_journey::ObservationJourneyPolicyV1;
+use crate::retained_owner::provider_control::ProviderControlMountInputsV1;
+use crate::retained_owner::provider_control::authority::{
     ProviderControlAuthorityInputsV1, ProviderControlAuthorityV1,
 };
-use crate::daemon::retained_owner::provider_history::{
+use crate::retained_owner::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
     ProviderHistoryAuthorityV1, ProviderHistoryReaderV1, history_grant_json,
     source_attribution_json,
 };
 use crate::mcp::tools::handlers::hook_runtime::capture_live_origin_for_control_test;
-use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 
 const SESSION: &str = "offline-source-control-session";
 const ORIGINAL_CONTENT: &str =
@@ -399,7 +399,7 @@ impl OfflineSourceFixture {
         let wire: RecallSourceAttributionV1 =
             serde_json::from_value(source_attribution_json(&attribution).unwrap()).unwrap();
         let raw_candidate_id = "candidate.original-source";
-        let retained_candidate_id = crate::daemon::retained_owner::cognitive_recall::control_attribution::retained_candidate_identity_alias_for_context(
+        let retained_candidate_id = crate::retained_owner::cognitive_recall::control_attribution::retained_candidate_identity_alias_for_context(
             &RecallLocatorKeyV1::for_test(),
             &delivery.exact_scope_sha256(),
             "request.retained-source",
@@ -1080,7 +1080,7 @@ fn snapshot_carrier(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reopened_snapshot_cleanup_uses_fresh_grant_when_an_unrelated_file_is_corrupt() {
-    use crate::daemon::retained_owner::provider_control::portability::{
+    use crate::retained_owner::provider_control::portability::{
         read_snapshot_artifact, seed_snapshot_artifact_for_test,
     };
     let fixture = OfflineSourceFixture::new().await;

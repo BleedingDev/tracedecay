@@ -55,7 +55,7 @@ use super::native_staged_observations::{
     StagedOutcome, StagedRow, StagedStoreError, recorded_validity,
 };
 use super::open_project_retained_memory_target;
-use crate::tracedecay::TraceDecay;
+use tracedecay_project::project::TraceDecay;
 
 #[cfg(test)]
 #[path = "native_baseline_tests.rs"]

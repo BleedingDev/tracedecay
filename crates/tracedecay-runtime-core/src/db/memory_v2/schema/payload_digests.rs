@@ -46,16 +46,6 @@ pub(in crate::db) const PAYLOAD_DIGESTS_SCHEMA: &str =
             WHERE payload_rowid = OLD.rowid;
         END;";
 
-/// Names of the objects `PAYLOAD_DIGESTS_SCHEMA` creates, in the order the
-/// final-shape inventory reports them. The v34 → v35 step admits a store
-/// whose inventory is exactly the final shape minus these.
-pub(in crate::db) const PAYLOAD_DIGEST_OBJECTS: &[&str] = &[
-    "memory_v2_assertion_payload_digests",
-    "memory_v2_assertion_payload_digests_lookup",
-    "memory_v2_assertion_payload_digests_no_update",
-    "memory_v2_payloads_digest_delete",
-];
-
 pub(super) async fn install_payload_digests(
     conn: &impl MemoryV2Executor,
     operation: &str,

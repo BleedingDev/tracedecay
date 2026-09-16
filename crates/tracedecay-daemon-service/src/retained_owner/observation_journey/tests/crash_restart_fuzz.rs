@@ -501,7 +501,7 @@ impl FuzzNativePortV1 {
             "crash-fuzz-v1",
             0,
             capabilities,
-            crate::daemon::retained_owner::native_provider::native_provider_limits(),
+            crate::retained_owner::native_provider::native_provider_limits(),
         )
         .expect("provider descriptor");
         Self {
@@ -565,7 +565,7 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
             .expect("handshake terminal"),
             descriptor: Some(self.descriptor.clone()),
             provider_instance_id: Some(
-                crate::daemon::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
+                crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
             ),
             state_namespace: Some("tracedecay.native.crash-fuzz".to_owned()),
             accepted_scope: Some(request.exact_scope.clone()),
@@ -1158,7 +1158,7 @@ async fn mount_life(
             profile_id: UserProfileId::new(PROFILE).expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(paths.root.clone()),
                 REGISTRATION_REVISION,
             )

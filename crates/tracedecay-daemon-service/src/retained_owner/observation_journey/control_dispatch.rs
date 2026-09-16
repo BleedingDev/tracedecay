@@ -441,7 +441,7 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
-    use crate::daemon::retained_owner::observation_journey::CancellationToken;
+    use crate::retained_owner::observation_journey::CancellationToken;
 
     fn request(operation: ProviderOperation) -> JourneyControlDispatchRequestV1 {
         JourneyControlDispatchRequestV1 {

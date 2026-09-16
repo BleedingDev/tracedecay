@@ -5780,7 +5780,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
+    use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
     use tracedecay_global_db::GlobalDbObservationStore;
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -6442,7 +6442,7 @@ mod tests {
                     OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
                     OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
                 ]),
-                crate::daemon::retained_owner::native_provider::native_provider_limits(),
+                crate::retained_owner::native_provider::native_provider_limits(),
             )
             .expect("adversarial descriptor")
         }
@@ -6472,7 +6472,7 @@ mod tests {
             Arc::new(AdversarialProviderV1::new(AdversarialProviderInputsV1 {
                 descriptor: adversarial_descriptor(),
                 provider_instance_id:
-                    crate::daemon::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
+                    crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
                 state_namespace: ADVERSARIAL_STATE_NAMESPACE.to_owned(),
                 ready_receipt_sha256: READY_RECEIPT.to_owned(),
                 handshake_script: AdversarialScriptV1::always(HandshakeMisbehaviourV1::Compliant),
@@ -6576,7 +6576,7 @@ mod tests {
                 profile_id,
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::daemon::project_composition::native_observation_mount(
+                provider: crate::retained_owner::native_observation_mount(
                     &(journal_root),
                     1,
                 )
@@ -8541,7 +8541,7 @@ mod tests {
             profile_id: profile_id.clone(),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root),
                 1,
             )
@@ -8898,7 +8898,7 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-journey").expect("profile id"),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root),
                 1,
             )
@@ -9049,9 +9049,9 @@ mod tests {
         std::fs::create_dir_all(&port_project_root).expect("native project root");
         std::fs::create_dir_all(&port_profile_root).expect("native profile root");
         let graph = Arc::new(
-            crate::tracedecay::TraceDecay::init_with_options(
+            tracedecay_project::project::TraceDecay::init_with_options(
                 &port_project_root,
-                crate::tracedecay::TraceDecayOpenOptions {
+                tracedecay_project::project::TraceDecayOpenOptions {
                     global_db_path: Some(port_profile_root.join("global.db")),
                     profile_root: Some(port_profile_root),
                 },
@@ -9070,7 +9070,7 @@ mod tests {
             .expect("construct the production Native application port"),
         );
         let staged_rows = || -> i64 {
-            let path = crate::daemon::retained_owner::native_staged_observations::staged_store_path(
+            let path = crate::retained_owner::native_staged_observations::staged_store_path(
                 &provider_state_root,
             );
             rusqlite::Connection::open(path)
@@ -9093,7 +9093,7 @@ mod tests {
                 .expect("profile id"),
             scope: resolved_scope,
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root),
                 1,
             )
@@ -9295,7 +9295,7 @@ mod tests {
                 profile_id: profile_id.clone(),
                 scope: resolved_scope.clone(),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::daemon::project_composition::native_observation_mount(
+                provider: crate::retained_owner::native_observation_mount(
                     &(journal_root.clone()),
                     1,
                 )
@@ -9509,7 +9509,7 @@ mod tests {
                 profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
                 scope: scope(self.project_id.clone()),
                 authoritative_project_id: self.project_id.clone(),
-                provider: crate::daemon::project_composition::native_observation_mount(
+                provider: crate::retained_owner::native_observation_mount(
                     &(self.journal_root.clone()),
                     1,
                 )
@@ -9689,7 +9689,7 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root.clone()),
                 1,
             )
@@ -10644,7 +10644,7 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root.clone()),
                 1,
             )
@@ -10812,7 +10812,7 @@ mod tests {
                 .expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root),
                 1,
             )
@@ -11592,7 +11592,7 @@ mod tests {
             profile_id: UserProfileId::new("profile.mount-off-worker").unwrap(),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::daemon::project_composition::native_observation_mount(
+            provider: crate::retained_owner::native_observation_mount(
                 &(journal_root.clone()),
                 1,
             )
@@ -11689,7 +11689,7 @@ mod tests {
                 profile_id: UserProfileId::new("profile.shutdown-off-worker").unwrap(),
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::daemon::project_composition::native_observation_mount(
+                provider: crate::retained_owner::native_observation_mount(
                     &(journal_root.clone()),
                     1,
                 )

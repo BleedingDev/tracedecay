@@ -103,7 +103,7 @@ pub fn production_provider_numeric_declaration_for_test(
         _ => return Ok(None),
     };
     let declared_registration_revision =
-        crate::daemon::project_composition::declared_project_provider_registration_revision_for_test(
+        crate::retained_owner::declared_project_provider_registration_revision_for_test(
             descriptor.provider_id.as_str(),
         ).ok_or(ContextEvidenceReadErrorV1::Invalid("production registration declaration"))?;
     let limits = descriptor.limits;

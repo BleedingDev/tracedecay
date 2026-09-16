@@ -90,6 +90,13 @@ pub(crate) const LEDGER_FILE_NAME: &str = "memory-recall-admission-ledger-v1.sql
 /// Pinned recall policy revision carried in every request.
 const PROJECT_RECALL_POLICY_REVISION: u64 = 1;
 
+// These headings are part of the MCP context wire vocabulary, but the owner
+// crate cannot import the MCP transport crate because that crate depends on
+// this one. Keep the parser keyed to the stable wire strings at this seam;
+// the transport remains responsible for rendering them.
+const CONTEXT_MEMORY_MATCHES_HEADING: &str = "### Memory Matches";
+const CONTEXT_INDEX_COVERAGE_HINT_HEADING: &str = "### Index Coverage Hint";
+
 /// Product-owned per-request recall budgets. These are the budgets the
 /// coding-memory evaluation scenarios declare for a project recall and stay
 /// under the Native provider's negotiated `recall_candidates` limit.
@@ -1503,7 +1510,7 @@ pub(crate) struct CognitiveRecallMountInputsV1 {
     /// The graph handle the host owns its canonical project-memory records
     /// through. Provenance hydration confirms a `record:` claim against this
     /// authority instead of trusting the provider's own reference.
-    pub(crate) graph: Arc<crate::tracedecay::TraceDecay>,
+    pub(crate) graph: Arc<tracedecay_project::project::TraceDecay>,
     /// Host-pinned routing policy built from the configured routing gate.
     pub(crate) routing: ActiveRoutingPolicy,
     /// Host limits the readiness handshake negotiates against.
@@ -1829,7 +1836,7 @@ pub struct ProjectCognitiveRecallMountV1 {
     scope: ResolvedScope,
     ledger: Arc<RecallAdmissionLedgerV1>,
     canonical_project_path: PathBuf,
-    graph: Arc<crate::tracedecay::TraceDecay>,
+    graph: Arc<tracedecay_project::project::TraceDecay>,
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
     locator_key: control_attribution::RecallLocatorKeyV1,
@@ -2445,6 +2452,26 @@ fn mcp_connection_scope(request_id: &tracedecay_contracts::RequestId) -> Option<
     (!scope.is_empty()).then_some(scope)
 }
 
+/// Reads the session identity from the route view already admitted by the
+/// MCP composition root. The daemon-service crate cannot depend on the MCP
+/// transport crate (that crate depends on this one), so the tiny structural
+/// lookup lives at this owner boundary instead of reaching back into the
+/// transport implementation.
+fn mcp_analytics_session_id(arguments: &serde_json::Value) -> Option<String> {
+    [Some(arguments), arguments.get("_meta")]
+        .into_iter()
+        .flatten()
+        .find_map(|value| {
+            ["session_id", "sessionId"].iter().find_map(|key| {
+                value
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+}
+
 /// Binds one dispatched tool call to a canonical host session.
 ///
 /// An explicit structural session identity wins, because it is the exact
@@ -2456,7 +2483,7 @@ fn advisory_session_binding(
     arguments: &serde_json::Value,
     request_id: Option<&tracedecay_contracts::RequestId>,
 ) -> Option<AdvisorySessionBindingV1> {
-    if let Some(session_id) = crate::mcp::project_route::mcp_analytics_session_id(arguments) {
+    if let Some(session_id) = mcp_analytics_session_id(arguments) {
         return Some(AdvisorySessionBindingV1::CallerSession(session_id));
     }
     let scope = mcp_connection_scope(request_id?)?;
@@ -3713,10 +3740,10 @@ fn markdown_block(index: usize, heading: Option<&str>, content: &str) -> HostCon
 /// host's own shared heading table rather than by a local guess.
 fn markdown_block_evidence(heading: Option<&str>) -> (ContextSectionKind, &'static str) {
     match heading {
-        Some(heading) if heading == tracedecay_mcp::CONTEXT_MEMORY_MATCHES_HEADING => {
+        Some(heading) if heading == CONTEXT_MEMORY_MATCHES_HEADING => {
             (ContextSectionKind::NativeFacts, HOST_AUTHORITY_NATIVE_FACTS)
         }
-        Some(heading) if heading == tracedecay_mcp::CONTEXT_INDEX_COVERAGE_HINT_HEADING => (
+        Some(heading) if heading == CONTEXT_INDEX_COVERAGE_HINT_HEADING => (
             ContextSectionKind::SafetyEvidence,
             HOST_AUTHORITY_SAFETY_EVIDENCE,
         ),
@@ -5687,7 +5714,6 @@ mod tests {
         Confidence, FactCategoryV1, FactOwnerV1, ProjectId, RefId, RepositoryId, UserProfileId,
         UtcMicros, WorktreeId,
     };
-    use tracedecay_mcp::JsonRpcRequest;
     use tracedecay_memory_provider_registry::{
         ActiveRoutingPolicy, CognitiveRecallAdmittedOutcomeV1, ContextItemProvenanceV1,
         DegradationCause, DegradationRule, DeniedRecallCandidate, EnabledProviderMode,
@@ -5701,7 +5727,7 @@ mod tests {
     use tracedecay_store::FactWriteControl;
 
     use super::*;
-    use crate::tracedecay::{TraceDecay, TraceDecayOpenOptions};
+    use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
     /// One already-rendered host answer, in the exact `ToolResult` shape the
     /// tool layer produces, so the advisory lane is appended to a real result
@@ -5942,136 +5968,6 @@ mod tests {
         })
         .expect("mounted cognitive recall route");
         (mount, port)
-    }
-
-    /// One registered project server driven through the real MCP request
-    /// path, so a test can ask the production journey the same question an
-    /// agent asks.
-    struct McpJourneyFixture {
-        _temporary: tempfile::TempDir,
-        _pin: crate::config::PinnedUserDataDir,
-        _mount: Option<Arc<ProjectCognitiveRecallMountV1>>,
-        server: Arc<crate::mcp::server::McpServer>,
-    }
-
-    impl McpJourneyFixture {
-        /// Issues one ordinary `tools/call` for `tracedecay_context` and
-        /// returns the exact text the agent receives.
-        ///
-        /// Nothing here is advisory-aware: this is the same JSON-RPC request
-        /// an MCP client sends, dispatched through the same connection state
-        /// the transport builds.
-        async fn call_context(&self, task: &str) -> String {
-            let mut connection = self
-                .server
-                .new_connection_route_state()
-                .expect("connection route state");
-            let request = JsonRpcRequest {
-                jsonrpc: "2.0".to_owned(),
-                id: Some(serde_json::json!(1)),
-                method: "tools/call".to_owned(),
-                params: Some(serde_json::json!({
-                    "name": ADVISORY_RECALL_CONTEXT_TOOL,
-                    "arguments": { "task": task },
-                })),
-            };
-            let response = self
-                .server
-                .handle_request_for_connection(&request, false, &mut connection, false)
-                .await
-                .expect("the context request receives a response");
-            assert!(
-                response.error.is_none(),
-                "the canonical context call must succeed: {:?}",
-                response.error
-            );
-            response
-                .result
-                .as_ref()
-                .and_then(|result| result.pointer("/content/0/text"))
-                .and_then(serde_json::Value::as_str)
-                .expect("the context tool answers with rendered text")
-                .to_owned()
-        }
-    }
-
-    /// Builds a registered project server with a mounted recall route, seeded
-    /// with one project fact the routed provider can recall.
-    async fn mcp_journey_fixture(project: &str) -> McpJourneyFixture {
-        mcp_journey_fixture_inner(project, true).await
-    }
-
-    /// The same registered project server with no recall route mounted: the
-    /// default-build shape.
-    async fn mcp_journey_fixture_unmounted(project: &str) -> McpJourneyFixture {
-        mcp_journey_fixture_inner(project, false).await
-    }
-
-    async fn mcp_journey_fixture_inner(project: &str, mounted: bool) -> McpJourneyFixture {
-        let pin = crate::config::PinnedUserDataDir::new();
-        let temporary = tempfile::tempdir().expect("journey fixture root");
-        let project_root = temporary.path().join("project");
-        let ledger_root = temporary.path().join("ledger");
-        std::fs::create_dir_all(&project_root).expect("project root");
-        std::fs::create_dir_all(project_root.join("src")).expect("project source");
-        std::fs::write(project_root.join("src/a.rs"), "pub fn a() {}\n").expect("project source");
-        std::fs::create_dir_all(&ledger_root).expect("ledger root");
-        let (cg, runtime) =
-            TraceDecay::init_test_fixture_with_registered_runtime(&project_root, project)
-                .await
-                .expect("registered project fixture");
-        let project_id = match cg.project_memory_owner().expect("project memory owner") {
-            FactOwnerV1::Project { project_id } => project_id,
-            owner => panic!("registered fixture must have a project owner: {owner:?}"),
-        };
-        // A second handle on the same registered project: the mount reads the
-        // host's own memory authority, exactly as the daemon's mount does,
-        // while the server owns the graph it dispatches tools against.
-        let mount_graph = Arc::new(
-            runtime
-                .open_project_graph_for_test(
-                    &project_root,
-                    TraceDecayOpenOptions {
-                        profile_root: Some(runtime.profile_root_for_test().to_path_buf()),
-                        global_db_path: None,
-                    },
-                )
-                .await
-                .expect("reopen registered project graph"),
-        );
-        let mount_fixture = StoreFixture {
-            _temporary: tempfile::tempdir().expect("journey mount scratch"),
-            project_root: project_root.clone(),
-            ledger_root,
-            graph: Arc::clone(&mount_graph),
-            project_id,
-        };
-        seed_fixture(&mount_fixture).await;
-        let mount = mounted.then(|| {
-            production_mount(
-                &mount_fixture,
-                EnabledProviderMode::Active,
-                "worktree.advisory-journey",
-            )
-        });
-
-        let mut context = runtime
-            .mcp_server_context_for_test(cg, None)
-            .expect("registered MCP server context");
-        context.startup_catch_up_enabled = false;
-        if let Some(mount) = mount.as_ref() {
-            context = context.with_cognitive_recall_mount(Arc::clone(mount));
-        }
-        let server =
-            crate::mcp::server::McpServer::new_with_registered_test_context(context, Vec::new())
-                .await
-                .expect("registered project server");
-        McpJourneyFixture {
-            _temporary: temporary,
-            _pin: pin,
-            _mount: mount,
-            server,
-        }
     }
 
     /// How a stalling provider's `recall` refuses to return.
@@ -8572,56 +8468,6 @@ mod tests {
         );
     }
 
-    /// The production MCP journey: one ordinary `tools/call` for
-    /// `tracedecay_context`, dispatched through the real request path of a
-    /// project server that has a mounted recall route, comes back carrying
-    /// the routed provider's advisory lane.
-    ///
-    /// Real defect this catches: an advisory lane that only exists when a
-    /// test calls the mount helpers directly. Deleting either half of the
-    /// production seam in
-    /// `crate::mcp::server::requests::tool_dispatch::execute_tool_dispatch`
-    /// -- the `advisory_context_call` admission or the
-    /// `advisory_memory_context_for_call` composition -- fails this test,
-    /// because nothing else in the call chain can put the section there.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_ordinary_mcp_context_call_returns_the_routed_advisory_lane() {
-        let journey = mcp_journey_fixture("project.advisory-journey").await;
-
-        let answered = journey.call_context("cognitive recall ledger").await;
-        assert!(
-            answered.contains(&format!("Provider {NATIVE_PROVIDER_ID}")),
-            "an ordinary MCP context call must carry the routed provider's lane: {answered}"
-        );
-        assert!(
-            answered.contains(SEEDED_CONTENT),
-            "the routed provider's admitted candidate must reach the agent: {answered}"
-        );
-    }
-
-    /// The differential half of the production journey: the identical MCP
-    /// call on a project server with no mounted route renders no advisory
-    /// lane at all.
-    ///
-    /// Real defect this catches: an advisory section that some other stage of
-    /// context assembly could have produced, which would make the mounted
-    /// journey above prove nothing about the recall route. It also pins the
-    /// default build's behaviour: a server without the route says nothing
-    /// about any provider.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_mcp_context_call_on_an_unmounted_server_renders_no_advisory_lane() {
-        let dormant = mcp_journey_fixture_unmounted("project.advisory-journey-dormant").await;
-
-        let unmounted = dormant.call_context("cognitive recall ledger").await;
-        assert!(
-            !unmounted.contains("Provider memory (advisory)"),
-            "a server with no mounted route must render no advisory lane: {unmounted}"
-        );
-        assert!(
-            !unmounted.contains(NATIVE_PROVIDER_ID),
-            "a server with no mounted route must name no provider: {unmounted}"
-        );
-    }
 }
 
 #[cfg(test)]
