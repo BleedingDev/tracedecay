@@ -1233,8 +1233,10 @@ fn feedback_rollback_apply(
 
     let context = tracedecay_agent_hosts::agents::InstallContext {
         home: home.clone(),
-        tracedecay_bin: tracedecay_agent_hosts::agents::which_tracedecay()
-            .unwrap_or_else(|| "tracedecay".to_string()),
+        // Feedback rollback is a lifecycle mutation too: its registration
+        // restore must render hooks/MCP commands from the exact binary that
+        // launched this command, never a different version found on PATH.
+        tracedecay_bin: super::lifecycle_tracedecay_bin()?,
         tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
         project_root: None,
         dashboard: state.dashboard_enabled,
@@ -1588,8 +1590,7 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
     let writer = lifecycle.into_storage();
     let context = tracedecay_agent_hosts::agents::InstallContext {
         home,
-        tracedecay_bin: tracedecay_agent_hosts::agents::which_tracedecay()
-            .unwrap_or_else(|| "tracedecay".to_string()),
+        tracedecay_bin: super::lifecycle_tracedecay_bin()?,
         tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
         project_root: None,
         dashboard: state.dashboard_enabled,
