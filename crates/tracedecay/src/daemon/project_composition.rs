@@ -2388,15 +2388,24 @@ async fn retire_failed_project_open_owner(
             let mut project_roots = std::collections::BTreeSet::new();
             project_roots.insert(canonical_project_path.to_path_buf());
             project_roots.insert(failed_key.project_root.clone());
-            if let Err(error) = invocation
-                .retire_project_runtime_owners(identity.profile_id(), project_id, &project_roots)
+            match invocation
+                .quiesce_project_runtime_owners(identity.profile_id(), project_id, &project_roots)
                 .await
             {
-                tracing::warn!(
-                    project = %canonical_project_path.display(),
-                    %error,
-                    "failed project-open invocation owners did not retire cleanly"
-                );
+                Ok(quiescence) => {
+                    // Failed project publication is retryable. Dropping the
+                    // reopenable quiescence lease after the owner drain
+                    // releases the root fence; terminal retirement would make
+                    // the next open fail before it could rebuild the owners.
+                    drop(quiescence);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        project = %canonical_project_path.display(),
+                        %error,
+                        "failed project-open invocation owners did not quiesce cleanly"
+                    );
+                }
             }
         }
         if let Err(error) = store_administration
