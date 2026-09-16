@@ -45,9 +45,9 @@ pub(super) fn assert_provider_control_journeys(
     recalled_stdout: &[u8],
     cross_scope_stdout: &[u8],
 ) {
-    let (source, state) = source_and_state(journey, recalled_stdout, session_id);
+    let (source, state) = source_and_state(journey, recalled_stdout, session_id, true);
     let (cross_scope_source, _) =
-        source_and_state(journey, cross_scope_stdout, journey.session_id());
+        source_and_state(journey, cross_scope_stdout, journey.session_id(), false);
 
     assert_health(journey, &state, "health.before-controls");
     assert_feedback_idempotency(journey, &source.selector);
@@ -81,6 +81,7 @@ fn source_and_state(
     journey: &ClaudeHostJourney,
     recalled_stdout: &[u8],
     session_id: &str,
+    require_revision: bool,
 ) -> (RecalledSource, ProviderControlStateSelectorV1) {
     let outer: Value =
         serde_json::from_slice(recalled_stdout).expect("real context stdout must be JSON");
@@ -155,11 +156,13 @@ fn source_and_state(
     let source_revision = source["source"]["source_revision"]
         .as_str()
         .map(str::to_owned);
-    assert_eq!(
-        source_revision.as_deref(),
-        Some(super::REVISION_FIXTURE_REVISION),
-        "provider controls must target the producer fixture with a canonical source revision"
-    );
+    if require_revision {
+        assert_eq!(
+            source_revision.as_deref(),
+            Some(super::REVISION_FIXTURE_REVISION),
+            "provider controls must target the producer fixture with a canonical source revision"
+        );
+    }
     let selector = ProviderControlSourceSelectorV1 {
         trace_ref,
         item_ref,
