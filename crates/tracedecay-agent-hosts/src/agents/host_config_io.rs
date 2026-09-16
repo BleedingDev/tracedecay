@@ -835,7 +835,11 @@ fn which_tracedecay_path_from(
     });
     path_match.or_else(|| {
         current_exe
-            .filter(|exe| is_tracedecay_exe(exe))
+            // Keep the same Cargo-target exclusion as the preferred current
+            // executable path above. Without this guard a target/debug
+            // binary was filtered out, then returned by this final fallback
+            // whenever PATH contained no acceptable installed binary.
+            .filter(|exe| is_tracedecay_exe(exe) && !is_cargo_target_binary(exe, cargo_target_dir))
             .and_then(absolute_executable_path)
     })
 }
