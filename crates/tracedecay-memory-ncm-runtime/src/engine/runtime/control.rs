@@ -866,6 +866,7 @@ pub(super) fn commit_common(
         Err(error) => return store_reply(error, handle.commit_seq),
     };
     payload["state_generation_after"] = json!(pending_seq);
+    payload["request_semantic_sha256"] = json!(digest);
     let reply = EngineReply::new(Outcome::Success, pending_seq, payload);
     let mut mutation = match handle.store.begin_mutation() {
         Ok(mutation) => mutation,

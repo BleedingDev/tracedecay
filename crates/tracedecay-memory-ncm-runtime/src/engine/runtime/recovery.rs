@@ -2,6 +2,7 @@ use super::super::*;
 use super::util::{core_reply, corrupt_reply, sha256_hex, store_reply, validate_common_capsule};
 use crate::store::{Event, NamespaceStore, StoreMeta, StoredCapsule};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use tracedecay_memory_ncm_core::kernel::{NcmKernel, NewRecord};
 use tracedecay_memory_ncm_core::types::{CoreError, NcmConfig};
 
@@ -10,11 +11,15 @@ use tracedecay_memory_ncm_core::types::{CoreError, NcmConfig};
 #[derive(Clone, Debug)]
 pub(crate) struct PendingDeletionFence {
     pub(crate) source: SourceId,
+    pub(crate) sources: Vec<SourceId>,
     pub(crate) target_epoch: u64,
     pub(crate) idempotency_key: String,
     pub(crate) payload_sha256: String,
     pub(crate) deleted_records: u64,
+    pub(crate) deleted_record_ids: Vec<RecordId>,
     pub(crate) tick_before: u64,
+    pub(crate) fatigue_before: f32,
+    pub(crate) steps_since_consolidation_before: u64,
     pub(crate) event_seq: u64,
     pub(crate) state_digest: String,
 }
@@ -83,7 +88,7 @@ pub(super) fn recover_kernel(
             .checked_add(1)
             .ok_or_else(|| corrupt_reply(meta.commit_seq, "event sequence overflow"))?;
         let durable = validate_recovery_event(&event, expected, meta.commit_seq)?;
-        validate_event_payload_digest(&event, &durable)?;
+        validate_event_payload_digest(&event, &durable, &capsules)?;
         replay_event(
             &mut kernel,
             &event,
@@ -139,6 +144,20 @@ pub(crate) fn validate_recovery_event(
     if !is_sha256(&durable.state_digest) {
         return Err(corrupt_reply(commit_seq, "receipt state digest is invalid"));
     }
+    if !is_sha256(&durable.integrity_digest)
+        || super::util::durable_integrity_digest(
+            &durable.reply,
+            &durable.operation,
+            &durable.state_digest,
+        )
+        .map_err(|reason| corrupt_reply(commit_seq, &reason))?
+            != durable.integrity_digest
+    {
+        return Err(corrupt_reply(
+            commit_seq,
+            "receipt integrity digest mismatch",
+        ));
+    }
     if durable.reply.outcome != Outcome::Success {
         return Err(corrupt_reply(
             commit_seq,
@@ -181,14 +200,15 @@ pub(crate) fn validate_recovery_event(
     Ok(durable)
 }
 
-/// Verifies payload digests that are reconstructible from the durable operation.
+/// Verifies payload digests against durable operation inputs and retained capsules.
 ///
-/// Observe payloads intentionally remain opaque after source erasure because
-/// the capsule no longer retains their source text/provenance. Their digest is
-/// still required to be a well-formed SHA-256 by [`validate_recovery_event`].
+/// Revoked observe capsules are the one deliberate exception: erasure removes
+/// their source text before a restart can validate the original request. Those
+/// rows remain covered by the fence's pre-fence anchor and journal envelope.
 pub(crate) fn validate_event_payload_digest(
     event: &Event,
     durable: &DurableReceipt,
+    capsules: &[StoredCapsule],
 ) -> Result<(), EngineReply> {
     let expected = match &durable.operation {
         DurableOperation::Feedback { record_ids } => Some(
@@ -232,18 +252,53 @@ pub(crate) fn validate_event_payload_digest(
                 )
             }
         }
-        DurableOperation::DeletionFence { payload_sha256, .. } => {
-            if !is_sha256(payload_sha256) {
+        DurableOperation::DeletionFence { sources, .. } => {
+            if !valid_source_set(sources) {
                 return Err(corrupt_reply(
                     event.seq,
-                    "deletion fence payload digest is invalid",
+                    "deletion fence source set is invalid",
                 ));
             }
-            Some(payload_sha256.clone())
+            Some(canonical_source_digest(sources, event.seq)?)
         }
-        DurableOperation::Observe { .. }
-        | DurableOperation::CommonControl { .. }
-        | DurableOperation::DeleteBySource { .. } => None,
+        DurableOperation::DeleteBySource { sources, .. } => {
+            if !valid_source_set(sources) {
+                return Err(corrupt_reply(event.seq, "deletion source set is invalid"));
+            }
+            Some(canonical_source_digest(sources, event.seq)?)
+        }
+        DurableOperation::Observe { record_id } => {
+            let Some(capsule) = capsules
+                .iter()
+                .find(|capsule| capsule.record_id == *record_id && capsule.commit_seq == event.seq)
+            else {
+                return Err(corrupt_reply(
+                    event.seq,
+                    "observe payload capsule is missing",
+                ));
+            };
+            if capsule.status == crate::store::CapsuleStatus::Revoked {
+                None
+            } else {
+                Some(observe_payload_digest(
+                    capsule,
+                    &event.payload_sha256,
+                    event.seq,
+                )?)
+            }
+        }
+        DurableOperation::CommonControl { .. } => {
+            let digest = durable
+                .reply
+                .payload
+                .get("request_semantic_sha256")
+                .and_then(serde_json::Value::as_str)
+                .filter(|digest| is_sha256(digest))
+                .ok_or_else(|| {
+                    corrupt_reply(event.seq, "common control payload digest is missing")
+                })?;
+            Some(digest.to_owned())
+        }
     };
     if let Some(expected) = expected
         && event.payload_sha256 != expected
@@ -285,7 +340,7 @@ pub(crate) fn validate_pending_deletion_fence(
     let mut validated = Vec::with_capacity(events.len());
     for event in &events {
         let durable = validate_recovery_event(event, expected_seq, meta.commit_seq)?;
-        validate_event_payload_digest(event, &durable)?;
+        validate_event_payload_digest(event, &durable, &capsules)?;
         if previous_tick.is_some_and(|tick| event.created_tick < tick) {
             return Err(corrupt_reply(
                 meta.commit_seq,
@@ -312,10 +367,15 @@ pub(crate) fn validate_pending_deletion_fence(
     };
     let DurableOperation::DeletionFence {
         source,
+        sources,
         target_epoch,
         idempotency_key,
         payload_sha256,
         deleted_records,
+        deleted_record_ids,
+        pre_fence_state_digest,
+        fatigue,
+        steps_since_consolidation,
     } = &durable.operation
     else {
         return Err(corrupt_reply(
@@ -323,7 +383,11 @@ pub(crate) fn validate_pending_deletion_fence(
             "pending deletion fence is not the final journal event",
         ));
     };
-    if event.kind != "deletion_fence"
+    if !is_sha256(pre_fence_state_digest)
+        || sources.is_empty()
+        || sources.first() != Some(source)
+        || sources.windows(2).any(|window| window[0] >= window[1])
+        || event.kind != "deletion_fence"
         || event.seq != meta.commit_seq
         || event.created_tick != meta.tick
         || durable.reply.payload["fenced"] != true
@@ -332,6 +396,8 @@ pub(crate) fn validate_pending_deletion_fence(
         || event.payload_sha256 != *payload_sha256
         || idempotency_key.is_empty()
         || idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES
+        || *fatigue != meta.fatigue
+        || *steps_since_consolidation != meta.steps_since_consolidation
     {
         return Err(corrupt_reply(
             meta.commit_seq,
@@ -347,36 +413,88 @@ pub(crate) fn validate_pending_deletion_fence(
     let revocations = store
         .revocations()
         .map_err(|error| store_reply(error, meta.commit_seq))?;
-    if !revocations
+    let expected_sources = sources.iter().cloned().collect::<BTreeSet<_>>();
+    let actual_sources = revocations
         .iter()
-        .any(|revocation| {
-            revocation.source_id == *source
-                && revocation.epoch == *target_epoch
-                && revocation.seq == event.seq
-        })
+        .filter(|revocation| revocation.epoch == *target_epoch && revocation.seq == event.seq)
+        .map(|revocation| revocation.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_sources != expected_sources {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "pending deletion fence revocations do not match its source set",
+        ));
+    }
+    let deleted_ids = deleted_record_ids.iter().copied().collect::<BTreeSet<_>>();
+    if deleted_ids.len() != deleted_record_ids.len()
+        || u64::try_from(deleted_record_ids.len()).ok() != Some(*deleted_records)
+        || usize::try_from(*deleted_records).is_err()
     {
         return Err(corrupt_reply(
             meta.commit_seq,
-            "pending deletion fence is not bound to revocation metadata",
+            "pending deletion fence record set is invalid",
         ));
     }
-    let revoked_records = capsules
-        .iter()
-        .filter(|capsule| capsule.status == crate::store::CapsuleStatus::Revoked)
-        .count();
-    if usize::try_from(*deleted_records).is_ok_and(|count| count > revoked_records) {
+    for record_id in &deleted_ids {
+        let Some(capsule) = capsules
+            .iter()
+            .find(|capsule| capsule.record_id == *record_id)
+        else {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "pending deletion fence references an unknown record",
+            ));
+        };
+        if capsule.status != crate::store::CapsuleStatus::Revoked
+            || !sources.contains(&capsule.source_id)
+            || capsule.commit_seq >= event.seq
+        {
+            return Err(corrupt_reply(
+                meta.commit_seq,
+                "pending deletion fence record set does not match revoked capsules",
+            ));
+        }
+    }
+
+    let anchor = if event.seq == 1 {
+        // The initial kernel digest is deterministic from the persisted store
+        // identity. A first-event fence therefore still has an independent
+        // anchor instead of trusting the fence receipt's copied digest.
+        let config: NcmConfig =
+            serde_json::from_str(&store.identity().config_json).map_err(|error| {
+                corrupt_reply(meta.commit_seq, &format!("decode store config: {error}"))
+            })?;
+        let kernel = NcmKernel::new(store.identity().seed, config)
+            .map_err(|error| core_reply(error, meta.commit_seq))?;
+        sha256_hex(&kernel.state_digest())
+    } else {
+        let previous = store
+            .event(event.seq - 1)
+            .map_err(|error| store_reply(error, meta.commit_seq))?
+            .ok_or_else(|| {
+                corrupt_reply(meta.commit_seq, "deletion fence anchor event is missing")
+            })?;
+        let previous_receipt = validate_recovery_event(&previous, previous.seq, meta.commit_seq)?;
+        validate_event_payload_digest(&previous, &previous_receipt, &capsules)?;
+        previous_receipt.state_digest
+    };
+    if anchor != *pre_fence_state_digest || anchor != durable.state_digest {
         return Err(corrupt_reply(
             meta.commit_seq,
-            "pending deletion fence record count exceeds revoked capsules",
+            "pending deletion fence pre-fence digest anchor mismatch",
         ));
     }
     Ok(Some(PendingDeletionFence {
         source: source.clone(),
+        sources: sources.clone(),
         target_epoch: *target_epoch,
         idempotency_key: idempotency_key.clone(),
         payload_sha256: payload_sha256.clone(),
         deleted_records: *deleted_records,
+        deleted_record_ids: deleted_record_ids.clone(),
         tick_before: event.created_tick,
+        fatigue_before: *fatigue,
+        steps_since_consolidation_before: *steps_since_consolidation,
         event_seq: event.seq,
         state_digest: durable.state_digest.clone(),
     }))
@@ -527,4 +645,71 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn valid_source_set(sources: &[SourceId]) -> bool {
+    !sources.is_empty()
+        && sources.len() <= 1024
+        && sources.iter().all(|source| !source.0.is_empty())
+        && sources.windows(2).all(|window| window[0] < window[1])
+}
+
+fn canonical_source_digest(sources: &[SourceId], seq: u64) -> Result<String, EngineReply> {
+    super::canonical_digest(sources).map_err(|reason| corrupt_reply(seq, &reason))
+}
+
+fn observe_payload_digest(
+    capsule: &StoredCapsule,
+    expected: &str,
+    seq: u64,
+) -> Result<String, EngineReply> {
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        source: &'a SourceId,
+        key_text: &'a str,
+        value_text: &'a str,
+        affect: &'a Option<ObserveAffect>,
+        surprise: f32,
+        intensity: f32,
+        provenance: &'a serde_json::Value,
+    }
+
+    let mut provenance = serde_json::from_str::<serde_json::Value>(&capsule.provenance)
+        .map_err(|_| corrupt_reply(seq, "observe capsule provenance is invalid"))?;
+    if let Some(object) = provenance.as_object_mut() {
+        object.remove("delivery_capsule");
+    }
+    let mut candidates = vec![None, Some(ObserveAffect::Values(capsule.affect.0))];
+    for name in [
+        "positive",
+        "curious",
+        "negative",
+        "stressed",
+        "social",
+        "dopamin",
+        "serotonin",
+        "kortizol",
+        "oxytocin",
+    ] {
+        candidates.push(Some(ObserveAffect::Preset(name.to_owned())));
+    }
+    for affect in candidates {
+        let digest = super::canonical_digest(&Payload {
+            source: &capsule.source_id,
+            key_text: &capsule.key_text,
+            value_text: &capsule.value_text,
+            affect: &affect,
+            surprise: capsule.surprise,
+            intensity: capsule.intensity,
+            provenance: &provenance,
+        })
+        .map_err(|reason| corrupt_reply(seq, &reason))?;
+        if digest == expected {
+            return Ok(digest);
+        }
+    }
+    Err(corrupt_reply(
+        seq,
+        "observe payload digest cannot be reconstructed",
+    ))
 }

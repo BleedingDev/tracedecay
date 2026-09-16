@@ -6,7 +6,8 @@
 
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, MaintenanceKind,
-    NamespaceHandle, NcmEngine, Outcome, RejectReason, portable_common_maintenance_event,
+    NamespaceHandle, NcmEngine, Outcome, RejectReason, durable_integrity_digest,
+    portable_common_maintenance_event,
 };
 use crate::ports::{Deadline, StateRoot};
 use crate::store::{
@@ -1118,20 +1119,55 @@ fn build_sanitized_stage(
     if target_seq != fence_seq.saturating_add(1) {
         return Err(corrupt_reply(base_seq, "snapshot target sequence mismatch"));
     }
+    let stripped_sources = stripped.iter().cloned().collect::<Vec<_>>();
+    let stripped_record_ids = snapshot
+        .content
+        .capsules
+        .iter()
+        .filter(|capsule| stripped.contains(&capsule.source_id))
+        .map(|capsule| capsule.record_id)
+        .collect::<Vec<_>>();
+    let fence_source = stripped_sources
+        .first()
+        .cloned()
+        .unwrap_or_else(|| SourceId("snapshot-restore".to_owned()));
+    let fence_sources = if stripped_sources.is_empty() {
+        vec![fence_source.clone()]
+    } else {
+        stripped_sources
+    };
+    let fence_reply = EngineReply::new(
+        Outcome::Success,
+        fence_seq,
+        json!({"fenced": true, "target_epoch": target_epoch}),
+    );
+    let fence_operation = DurableOperation::DeletionFence {
+        source: fence_source,
+        sources: fence_sources,
+        target_epoch,
+        idempotency_key: idempotency_key.to_owned(),
+        payload_sha256: payload_sha256.to_owned(),
+        deleted_records: u64::try_from(stripped_record_ids.len()).unwrap_or(u64::MAX),
+        deleted_record_ids: stripped_record_ids,
+        pre_fence_state_digest: sha256_hex(&snapshot.kernel.state_digest()),
+        fatigue: snapshot.kernel.scheduler.fatigue,
+        steps_since_consolidation: snapshot.kernel.scheduler.steps_since_consolidation,
+    };
+    let fence_state_digest = sha256_hex(&snapshot.kernel.state_digest());
+    let fence_integrity_digest =
+        durable_integrity_digest(&fence_reply, &fence_operation, &fence_state_digest).map_err(
+            |error| {
+                corrupt_reply(
+                    base_seq,
+                    &format!("serialize snapshot fence digest: {error}"),
+                )
+            },
+        )?;
     let fence_receipt = serde_json::to_string(&DurableReceipt {
-        reply: EngineReply::new(
-            Outcome::Success,
-            fence_seq,
-            json!({"fenced": true, "target_epoch": target_epoch}),
-        ),
-        operation: DurableOperation::DeletionFence {
-            source: SourceId("snapshot-restore".to_owned()),
-            target_epoch,
-            idempotency_key: idempotency_key.to_owned(),
-            payload_sha256: payload_sha256.to_owned(),
-            deleted_records: u64::try_from(stripped.len()).unwrap_or(u64::MAX),
-        },
-        state_digest: sha256_hex(&snapshot.kernel.state_digest()),
+        reply: fence_reply,
+        operation: fence_operation,
+        state_digest: fence_state_digest,
+        integrity_digest: fence_integrity_digest,
     })
     .map_err(|error| {
         corrupt_reply(
@@ -1272,6 +1308,7 @@ fn populate_stage(
                 record_id: capsule.record_id,
             },
             state_digest: String::new(),
+            integrity_digest: String::new(),
         })
         .map_err(|error| corrupt_reply(0, &format!("serialize staged observe receipt: {error}")))?;
         let created_tick = kernel
@@ -1459,12 +1496,17 @@ fn lookup_restore_replay(
 }
 
 fn restore_receipt(reply: &EngineReply, kernel: &NcmKernel) -> Result<String, EngineReply> {
+    let operation = DurableOperation::Maintenance {
+        kind: MaintenanceKind::Checkpoint,
+    };
+    let state_digest = sha256_hex(&kernel.state_digest());
+    let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)
+        .map_err(|reason| corrupt_reply(reply.state_generation, &reason))?;
     serde_json::to_string(&DurableReceipt {
         reply: reply.clone(),
-        operation: DurableOperation::Maintenance {
-            kind: MaintenanceKind::Checkpoint,
-        },
-        state_digest: sha256_hex(&kernel.state_digest()),
+        operation,
+        state_digest,
+        integrity_digest,
     })
     .map_err(|error| {
         corrupt_reply(

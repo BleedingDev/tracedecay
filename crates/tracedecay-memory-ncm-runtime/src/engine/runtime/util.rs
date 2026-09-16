@@ -33,18 +33,26 @@ pub(super) fn lookup_replay(
             handle.commit_seq,
         )));
     }
-    let durable: DurableReceipt = serde_json::from_str(&receipt_json).map_err(|error| {
-        corrupt_reply(
-            handle.commit_seq,
-            &format!("decode replay receipt: {error}"),
-        )
-    })?;
-    if durable.reply.state_generation != seq {
+    let event = handle
+        .store
+        .event(seq)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+        .ok_or_else(|| corrupt_reply(handle.commit_seq, "idempotency event is missing"))?;
+    if event.idempotency_key.as_deref() != Some(key)
+        || event.payload_sha256 != stored_digest
+        || event.receipt != receipt_json
+    {
         return Err(corrupt_reply(
             handle.commit_seq,
-            "idempotency receipt sequence mismatch",
+            "idempotency envelope does not match its journal row",
         ));
     }
+    let capsules = handle
+        .store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let durable = validate_recovery_event(&event, seq, handle.commit_seq)?;
+    validate_event_payload_digest(&event, &durable, &capsules)?;
     let mut replay = durable.reply;
     attach_observation_delivery(handle, &mut replay)?;
     mark_replayed(&mut replay.payload);
@@ -110,16 +118,38 @@ pub(super) fn durable_receipt(
     operation: DurableOperation,
     kernel: &NcmKernel,
 ) -> Result<String, EngineReply> {
+    let state_digest = sha256_hex(&kernel.state_digest());
+    let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)
+        .map_err(|reason| corrupt_reply(reply.state_generation, &reason))?;
     serde_json::to_string(&DurableReceipt {
         reply: reply.clone(),
         operation,
-        state_digest: sha256_hex(&kernel.state_digest()),
+        state_digest,
+        integrity_digest,
     })
     .map_err(|error| {
         corrupt_reply(
             reply.state_generation,
             &format!("serialize receipt: {error}"),
         )
+    })
+}
+
+pub(crate) fn durable_integrity_digest(
+    reply: &EngineReply,
+    operation: &DurableOperation,
+    state_digest: &str,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Basis<'a> {
+        reply: &'a EngineReply,
+        operation: &'a DurableOperation,
+        state_digest: &'a str,
+    }
+    canonical_digest(&Basis {
+        reply,
+        operation,
+        state_digest,
     })
 }
 

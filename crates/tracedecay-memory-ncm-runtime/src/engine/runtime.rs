@@ -404,6 +404,30 @@ impl NcmEngine {
                         handle.epoch = resumed.meta.epoch;
                         util::publish(handle, resumed.kernel)?;
                         handle.fenced = false;
+                    } else if handle
+                        .store
+                        .fenced()
+                        .map_err(|error| store_reply(error, handle.commit_seq))?
+                        .is_none()
+                    {
+                        // A rebuild can commit and then lose publication. The
+                        // resident handle still carries its pre-commit fence
+                        // bit, while the durable fence has already cleared.
+                        // Reconcile the committed checkpoint before serving it.
+                        let meta = handle
+                            .store
+                            .meta()
+                            .map_err(|error| store_reply(error, handle.commit_seq))?;
+                        let kernel = recover_kernel(
+                            &handle.store,
+                            &self.config,
+                            handle.store.identity().seed,
+                            &meta,
+                        )?;
+                        handle.commit_seq = meta.commit_seq;
+                        handle.epoch = meta.epoch;
+                        util::publish(handle, kernel)?;
+                        handle.fenced = false;
                     }
                 }
                 handle.last_used = use_id;

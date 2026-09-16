@@ -13,6 +13,7 @@ pub(crate) use runtime::recovery::{
     replay_event as replay_recovery_event, validate_event_payload_digest,
     validate_pending_deletion_fence, validate_recovery_event,
 };
+pub(crate) use runtime::util::durable_integrity_digest;
 
 use crate::ports::{Deadline, StateRoot, TextEncoder};
 use crate::store::{CommitSeq, NamespaceStore};
@@ -290,6 +291,7 @@ pub(crate) struct DurableReceipt {
     pub(crate) reply: EngineReply,
     pub(crate) operation: DurableOperation,
     pub(crate) state_digest: String,
+    pub(crate) integrity_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -314,15 +316,22 @@ pub(crate) enum DurableOperation {
     },
     DeletionFence {
         source: SourceId,
+        sources: Vec<SourceId>,
         target_epoch: u64,
         idempotency_key: String,
         payload_sha256: String,
         deleted_records: u64,
+        deleted_record_ids: Vec<RecordId>,
+        pre_fence_state_digest: String,
+        fatigue: f32,
+        steps_since_consolidation: u64,
     },
     DeleteBySource {
         source: SourceId,
+        sources: Vec<SourceId>,
         target_epoch: u64,
         deleted_records: u64,
+        deleted_record_ids: Vec<RecordId>,
     },
 }
 

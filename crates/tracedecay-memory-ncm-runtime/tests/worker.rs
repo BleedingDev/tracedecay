@@ -14,7 +14,9 @@ use tempfile::TempDir;
 use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
 use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient, WorkerOptions};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
-use tracedecay_memory_ncm_runtime::engine::{FaultPoint, NcmEngine, ObserveRequest, Outcome};
+use tracedecay_memory_ncm_runtime::engine::{
+    FaultPoint, NcmEngine, ObserveRequest, Outcome, RejectReason,
+};
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
 use tracedecay_memory_ncm_runtime::wire::{
     self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
@@ -221,6 +223,34 @@ fn handshake_observe_and_recall_round_trip() {
         .expect("recall succeeds");
     assert_eq!(recall.outcome, Outcome::Success);
     assert!(recall.payload.is_some());
+}
+
+#[test]
+fn raw_maintenance_requires_common_control() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let reply = client
+        .call(
+            Request::new(
+                5,
+                0,
+                Operation::Maintenance,
+                &namespace(5),
+                json!({
+                    "idempotency_key": "raw-maintenance",
+                    "kind": {"advance": {"ticks": 1}}
+                }),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("raw maintenance rejection is returned");
+    assert_eq!(
+        reply.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "maintenance requires common control".to_owned()
+        ))
+    );
+    assert_eq!(reply.payload, None);
 }
 
 #[test]

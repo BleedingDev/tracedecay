@@ -1,8 +1,8 @@
 //! Single-owner worker loop joining bounded wire requests to [`NcmEngine`].
 
 use crate::engine::{
-    CorrectionRequest, EngineReply, FeedbackRequest, MaintenanceKind, MaintenanceRequest,
-    NcmEngine, ObserveAffect, ObserveRequest, Outcome, RecallRequest,
+    CorrectionRequest, EngineReply, FeedbackRequest, MaintenanceKind, NcmEngine, ObserveAffect,
+    ObserveRequest, Outcome, RecallRequest,
 };
 use crate::ports::Deadline;
 use crate::wire::{self, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION, Reply, Request};
@@ -248,17 +248,7 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
                 )
             })
         }
-        Operation::Maintenance => parse_payload::<MaintenancePayload>(&request.payload)
-            .map_or_else(rejected, |payload| {
-                engine.maintenance(
-                    &request.namespace,
-                    MaintenanceRequest {
-                        idempotency_key: payload.idempotency_key,
-                        kind: payload.kind,
-                        deadline,
-                    },
-                )
-            }),
+        Operation::Maintenance => rejected("maintenance requires common control".to_owned()),
         Operation::Inspection => engine.inspection(&request.namespace),
         Operation::DeleteBySource => {
             parse_payload::<DeletePayload>(&request.payload).map_or_else(rejected, |payload| {

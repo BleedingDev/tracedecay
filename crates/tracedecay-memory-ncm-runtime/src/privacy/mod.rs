@@ -2,8 +2,9 @@
 
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, NamespaceHandle,
-    NcmEngine, Outcome, PendingDeletionFence, RejectReason, replay_recovery_event,
-    validate_event_payload_digest, validate_pending_deletion_fence, validate_recovery_event,
+    NcmEngine, Outcome, PendingDeletionFence, RejectReason, durable_integrity_digest,
+    replay_recovery_event, validate_event_payload_digest, validate_pending_deletion_fence,
+    validate_recovery_event,
 };
 use crate::ports::Deadline;
 use crate::store::{CapsuleStatus, NamespaceStore, StoreError, StoreMeta, StoredCapsule};
@@ -121,13 +122,7 @@ fn delete_sources_inner(
     let sources = source_set
         .map(|sources| sources.iter().cloned().collect::<BTreeSet<_>>())
         .unwrap_or_else(|| BTreeSet::from([request.source.clone()]));
-    let payload_sha256 = match if source_set.is_some() {
-        serde_json::to_vec(&sources)
-            .map(|bytes| sha256_hex(&bytes))
-            .map_err(|error| error.to_string())
-    } else {
-        canonical_source_digest(&request.source)
-    } {
+    let payload_sha256 = match canonical_deletion_digest(&sources) {
         Ok(digest) => digest,
         Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
     };
@@ -213,6 +208,12 @@ fn delete_sources_inner(
         })
         .map(|capsule| capsule.record_id)
         .collect::<Vec<_>>();
+    let deleted_records = match u64::try_from(revoked_ids.len()) {
+        Ok(count) => count,
+        Err(_) => return corrupt_reply(handle.commit_seq, "deleted record count overflow"),
+    };
+    let persisted_sources = sources.iter().cloned().collect::<Vec<_>>();
+    let pre_fence_state_digest = sha256_hex(&live.state_digest());
     let fence_reply = EngineReply::new(
         Outcome::Success,
         fence_seq,
@@ -222,10 +223,15 @@ fn delete_sources_inner(
         &fence_reply,
         DurableOperation::DeletionFence {
             source: request.source.clone(),
+            sources: persisted_sources.clone(),
             target_epoch,
             idempotency_key: request.idempotency_key.clone(),
             payload_sha256: payload_sha256.clone(),
-            deleted_records: u64::try_from(revoked_ids.len()).unwrap_or(u64::MAX),
+            deleted_records,
+            deleted_record_ids: revoked_ids.clone(),
+            pre_fence_state_digest: pre_fence_state_digest.clone(),
+            fatigue: live.scheduler.fatigue,
+            steps_since_consolidation: live.scheduler.steps_since_consolidation,
         },
         &live,
     ) {
@@ -310,6 +316,8 @@ fn delete_sources_inner(
         Err(reply) => return reply,
     };
     if pending.tick_before != live.scheduler.tick.0
+        || pending.fatigue_before != live.scheduler.fatigue
+        || pending.steps_since_consolidation_before != live.scheduler.steps_since_consolidation
         || pending.state_digest != sha256_hex(&live.state_digest())
     {
         return corrupt_reply(
@@ -333,7 +341,9 @@ fn delete_sources_inner(
         request.idempotency_key,
         payload_sha256,
         report,
-        u64::try_from(revoked_ids.len()).unwrap_or(u64::MAX),
+        deleted_records,
+        persisted_sources,
+        revoked_ids,
         Some(engine),
         request.deadline,
         started,
@@ -365,11 +375,13 @@ pub(crate) fn resume_pending_rebuild(
     let (kernel, meta, _) = finish_store_rebuild(
         store,
         pending.source,
+        pending.sources,
         pending.target_epoch,
         pending.idempotency_key,
         pending.payload_sha256,
         report,
         pending.deleted_records,
+        pending.deleted_record_ids,
     )?;
     Ok(Some(ResumedRebuild { kernel, meta }))
 }
@@ -383,6 +395,8 @@ fn finish_rebuild(
     payload_sha256: String,
     report: ReplayResult,
     deleted_records: u64,
+    sources: Vec<SourceId>,
+    deleted_record_ids: Vec<RecordId>,
     engine: Option<&NcmEngine>,
     deadline: Deadline,
     started: Instant,
@@ -390,11 +404,13 @@ fn finish_rebuild(
     let (kernel, meta, reply) = match finish_store_rebuild(
         &mut handle.store,
         source,
+        sources,
         target_epoch,
         idempotency_key,
         payload_sha256,
         report,
         deleted_records,
+        deleted_record_ids,
     ) {
         Ok(result) => result,
         Err(reply) => return reply,
@@ -439,11 +455,13 @@ fn finish_rebuild(
 fn finish_store_rebuild(
     store: &mut NamespaceStore,
     source: SourceId,
+    sources: Vec<SourceId>,
     target_epoch: u64,
     idempotency_key: String,
     payload_sha256: String,
     report: ReplayResult,
     deleted_records: u64,
+    deleted_record_ids: Vec<RecordId>,
 ) -> Result<(NcmKernel, StoreMeta, EngineReply), EngineReply> {
     store
         .compact(true)
@@ -475,8 +493,10 @@ fn finish_store_rebuild(
         &reply,
         DurableOperation::DeleteBySource {
             source,
+            sources,
             target_epoch,
             deleted_records,
+            deleted_record_ids,
         },
         &report.kernel,
     )?;
@@ -592,7 +612,7 @@ fn sanitized_replay(
     let mut validate_state_digests = true;
     for event in events {
         let durable = validate_recovery_event(&event, expected_seq, pending.event_seq)?;
-        validate_event_payload_digest(&event, &durable)?;
+        validate_event_payload_digest(&event, &durable, &capsules)?;
         if previous_tick.is_some_and(|tick| event.created_tick < tick) {
             return Err(corrupt_reply(
                 pending.event_seq,
@@ -885,10 +905,14 @@ fn durable_receipt(
     operation: DurableOperation,
     kernel: &NcmKernel,
 ) -> Result<String, EngineReply> {
+    let state_digest = sha256_hex(&kernel.state_digest());
+    let integrity_digest = durable_integrity_digest(&reply, &operation, &state_digest)
+        .map_err(|reason| corrupt_reply(reply.state_generation, &reason))?;
     serde_json::to_string(&DurableReceipt {
         reply: reply.clone(),
         operation,
-        state_digest: sha256_hex(&kernel.state_digest()),
+        state_digest,
+        integrity_digest,
     })
     .map_err(|error| {
         corrupt_reply(
@@ -919,8 +943,8 @@ fn validate_request(request: &DeleteRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_source_digest(source: &SourceId) -> Result<String, String> {
-    serde_json::to_vec(source)
+fn canonical_deletion_digest(sources: &BTreeSet<SourceId>) -> Result<String, String> {
+    serde_json::to_vec(sources)
         .map(|bytes| sha256_hex(&bytes))
         .map_err(|error| format!("serialize deletion payload: {error}"))
 }

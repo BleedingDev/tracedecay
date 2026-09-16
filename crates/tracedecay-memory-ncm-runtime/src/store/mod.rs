@@ -597,6 +597,19 @@ impl NamespaceStore {
             .map_err(map_sqlite_error)
     }
 
+    /// Returns the journal event at exactly `seq`, if present.
+    pub(crate) fn event(&self, seq: u64) -> Result<Option<Event>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT seq, kind, idempotency_key, payload_sha256, receipt, created_tick
+                 FROM events WHERE seq = ?1",
+                params![sqlite_i64(seq, "event sequence")?],
+                event_from_row,
+            )
+            .optional()
+            .map_err(map_sqlite_error)
+    }
+
     /// Returns one capsule by its stable record identity.
     pub(crate) fn event_for_key(&self, key: &str) -> Result<Option<Event>, StoreError> {
         self.conn.query_row("SELECT seq, kind, idempotency_key, payload_sha256, receipt, created_tick FROM events WHERE idempotency_key = ?1", params![key], event_from_row).optional().map_err(map_sqlite_error)
