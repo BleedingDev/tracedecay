@@ -52,6 +52,11 @@ const EXCLUSIONS: &[&str] = &[
     "content_sha256",
 ];
 
+/// The NCM worker's bounded recall window. Keep the worker's `top_k` and
+/// selection budget coupled so a small caller budget is never widened at the
+/// adapter boundary.
+const MAX_RECALL_CANDIDATES: u64 = 16;
+
 /// Maximum serialized size of any retained named capsule.
 ///
 /// Projection and reconstruction share this bound. Projection must reject a
@@ -325,8 +330,11 @@ pub(crate) fn project_recall(
         &value["deadline"],
         &["deadline_utc_micros", "remaining_millis"],
     )?;
-    value["deadline"]["deadline_utc_micros"].as_i64()?;
-    if value["deadline"]["remaining_millis"].as_u64()? == 0 {
+    if value["deadline"]["deadline_utc_micros"].as_i64()? != call.control.deadline_utc_micros() {
+        return None;
+    }
+    let remaining_millis = value["deadline"]["remaining_millis"].as_u64()?;
+    if remaining_millis == 0 || remaining_millis != call.control.remaining_millis() {
         return None;
     }
     // Optional extensions remain inert; the outer adapter round-trips them.
@@ -340,6 +348,7 @@ pub(crate) fn project_recall(
     }
     let query = temporal(&value["temporal_query"])?;
     fields(&value["budgets"], BUDGETS)?;
+    let maximum_candidates = value["budgets"]["maximum_candidates"].as_u64()?;
     for field in BUDGETS {
         if value["budgets"][*field].as_u64()? == 0 {
             return None;
@@ -365,14 +374,19 @@ pub(crate) fn project_recall(
                 .collect::<Vec<_>>()
         );
     }
+    // The worker selection schema accepts the candidate cap, temporal query,
+    // and exclusions. Byte/reference/warning/extension budgets remain
+    // enforced while reconstructing the canonical response below; putting
+    // unsupported fields into selection would make the worker reject the
+    // request rather than preserve those host-owned limits.
     Some(json!({
-        "query_text": value["query"], "top_k": 16,
+        "query_text": value["query"], "top_k": maximum_candidates.min(MAX_RECALL_CANDIDATES),
         "selection": {
             "mode": value["temporal_query"]["mode"], "evaluation": query.evaluation_time_utc_nanos,
             "as_of": query.as_of_utc_nanos, "start": query.interval_start_utc_nanos, "end": query.interval_end_utc_nanos,
             "include_superseded": query.include_superseded, "include_revoked": query.include_revoked,
             "unknown_policy": value["temporal_query"]["unknown_validity_policy"], "exclusions": projected_exclusions,
-            "maximum_candidates": value["budgets"]["maximum_candidates"].as_u64()?.min(16),
+            "maximum_candidates": maximum_candidates.min(MAX_RECALL_CANDIDATES),
             "request_token": opaque_surface_id(namespace, b"recall-request", &call.request_id),
         }
     }))
@@ -752,7 +766,9 @@ fn reconstruct_recall_inner(
     let worker: Value = serde_json::from_slice(&reply.payload.as_ref()?.bytes).ok()?;
     let rows = worker["common_recall"]["candidates"].as_array()?;
     let budgets = &request["budgets"];
-    let max_candidates = budgets["maximum_candidates"].as_u64()?.min(16) as usize;
+    let max_candidates = budgets["maximum_candidates"]
+        .as_u64()?
+        .min(MAX_RECALL_CANDIDATES) as usize;
     let max_content = budgets["maximum_candidate_content_bytes"].as_u64()?;
     let max_total = budgets["maximum_total_content_bytes"].as_u64()?;
     if let Some(sink) = diagnostic_sink {
@@ -1607,8 +1623,9 @@ mod recall_diagnostic_tests {
     use std::sync::{Arc, Mutex};
 
     use tracedecay_memory_provider_api::{
-        CancellationToken, OperationControl, OwnedProviderId, OwnedVersionedId, ProviderCallParts,
-        ProviderOperation,
+        CancellationToken, CommittedEffectEvidence, FallbackDirective, OperationControl,
+        OwnedProviderId, OwnedVersionedId, ProviderCallParts, ProviderOperation, ProviderReply,
+        TerminalRecord,
     };
 
     struct RecordingSink(Mutex<Vec<NcmRecallDiagnosticEvent>>);
@@ -1739,6 +1756,326 @@ mod recall_diagnostic_tests {
                 }
             }
         })
+    }
+
+    fn canonical_budgets() -> Value {
+        json!({
+            "maximum_candidates": 8,
+            "maximum_candidate_content_bytes": 8192,
+            "maximum_total_content_bytes": 16384,
+            "maximum_source_refs_per_candidate": 4,
+            "maximum_trace_refs_per_candidate": 4,
+            "maximum_warnings": 4,
+            "maximum_extensions_per_candidate": 4
+        })
+    }
+
+    fn canonical_exclusions() -> Value {
+        json!({
+            "stable_memory_refs": [],
+            "candidate_ids": [],
+            "source_refs": [],
+            "trace_refs": [],
+            "observation_ids": [],
+            "content_sha256": []
+        })
+    }
+
+    fn canonical_temporal(mode: &str) -> Value {
+        match mode {
+            "current" | "history" => json!({
+                "mode": mode,
+                "evaluation_time": "2026-01-02T00:00:00Z",
+                "as_of": null,
+                "interval_start": null,
+                "interval_end": null,
+                "include_superseded": true,
+                "include_revoked": true,
+                "unknown_validity_policy": "degrade"
+            }),
+            "as_of" => json!({
+                "mode": mode,
+                "evaluation_time": "2026-01-02T00:00:00Z",
+                "as_of": "2026-01-01T12:00:00Z",
+                "interval_start": null,
+                "interval_end": null,
+                "include_superseded": true,
+                "include_revoked": true,
+                "unknown_validity_policy": "degrade"
+            }),
+            "interval" => json!({
+                "mode": mode,
+                "evaluation_time": "2026-01-02T00:00:00Z",
+                "as_of": null,
+                "interval_start": "2025-12-31T00:00:00Z",
+                "interval_end": "2026-01-03T00:00:00Z",
+                "include_superseded": true,
+                "include_revoked": true,
+                "unknown_validity_policy": "degrade"
+            }),
+            _ => Value::Null,
+        }
+    }
+
+    fn canonical_request(
+        temporal_query: Value,
+        budgets: Value,
+        exclusions: Value,
+        remaining_millis: u64,
+    ) -> Value {
+        json!({
+            "provider_id": crate::NCM_PROVIDER_ID,
+            "registration_revision": 1,
+            "ready_receipt_digest": "11".repeat(32),
+            "exact_scope_identity": scope_value(&exact_scope()),
+            "request_identity": "canonical-request",
+            "objective": "canonical recall objective",
+            "query": "canonical recall query",
+            "temporal_query": temporal_query,
+            "budgets": budgets,
+            "exclusions": exclusions,
+            "required_capabilities": ["recall.query.v1"],
+            "policy_revision": 3,
+            "extensions": [],
+            "deadline": {
+                "deadline_utc_micros": i64::MAX,
+                "remaining_millis": remaining_millis
+            },
+            "cancellation": "live"
+        })
+    }
+
+    fn canonical_call(request: &Value, remaining_millis: u64) -> ProviderCall {
+        let bytes = serde_json::to_vec(request).unwrap();
+        ProviderCall::new(ProviderCallParts {
+            operation: ProviderOperation::Recall,
+            provider_id: OwnedProviderId::new(crate::NCM_PROVIDER_ID).unwrap(),
+            registration_revision: 1,
+            ready_receipt_sha256: "11".repeat(32),
+            exact_scope: exact_scope(),
+            request_id: "canonical-request".to_owned(),
+            operation_id: "canonical-operation".to_owned(),
+            expected_state_generation: 7,
+            idempotency_key: None,
+            control: OperationControl::new(i64::MAX, remaining_millis, CancellationToken::new()),
+            payload: CanonicalPayload::new(
+                OwnedVersionedId::new("tracedecay.memory.provider.recall.v1").unwrap(),
+                bytes.clone(),
+                hex_digest(&Sha256::digest(&bytes)),
+            )
+            .unwrap(),
+            required_capabilities: vec![OwnedVersionedId::new("recall.query.v1").unwrap()],
+            extensions: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn worker_reply(call: &ProviderCall, worker: &Value) -> ProviderReply {
+        let bytes = serde_json::to_vec(worker).unwrap();
+        let terminal = TerminalRecord::new(
+            ProviderOperation::Recall,
+            call.provider_id.clone(),
+            TerminalCode::Success,
+            CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+            FallbackDirective::forbidden(),
+            &call.operation_id,
+            call.exact_scope.exact_scope_sha256(),
+            None,
+        )
+        .unwrap();
+        ProviderReply {
+            terminal,
+            payload: Some(
+                CanonicalPayload::new(
+                    call.payload.contract_id.clone(),
+                    bytes.clone(),
+                    hex_digest(&Sha256::digest(&bytes)),
+                )
+                .unwrap(),
+            ),
+            warnings: Vec::new(),
+            extensions: Vec::new(),
+            state_generation: call.expected_state_generation,
+        }
+    }
+
+    #[test]
+    fn recall_projection_binds_low_item_byte_and_work_budgets() {
+        let mut budgets = canonical_budgets();
+        budgets["maximum_candidates"] = json!(1);
+        budgets["maximum_candidate_content_bytes"] = json!(1);
+        budgets["maximum_total_content_bytes"] = json!(1);
+        let request = canonical_request(
+            canonical_temporal("current"),
+            budgets,
+            canonical_exclusions(),
+            17,
+        );
+        let call = canonical_call(&request, 17);
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let projected = project_recall(&call, &request, &namespace).expect("projection");
+        assert_eq!(projected["top_k"], json!(1));
+        assert_eq!(projected["selection"]["maximum_candidates"], json!(1));
+
+        let mut widened_deadline = request.clone();
+        widened_deadline["deadline"]["remaining_millis"] = json!(18);
+        assert!(project_recall(&call, &widened_deadline, &namespace).is_none());
+        let mut remapped_request = request;
+        remapped_request["request_identity"] = json!("other-request");
+        assert!(project_recall(&call, &remapped_request, &namespace).is_none());
+    }
+
+    #[test]
+    fn recall_projection_rejects_every_zero_budget_before_worker_dispatch() {
+        for field in BUDGETS {
+            let mut budgets = canonical_budgets();
+            budgets[*field] = json!(0);
+            let request = canonical_request(
+                canonical_temporal("current"),
+                budgets,
+                canonical_exclusions(),
+                60_000,
+            );
+            let call = canonical_call(&request, 60_000);
+            let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+            assert!(
+                project_recall(&call, &request, &namespace).is_none(),
+                "zero budget {field} reached the worker"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_projection_forwards_every_temporal_selector() {
+        for mode in ["current", "as_of", "interval", "history"] {
+            let temporal_query = canonical_temporal(mode);
+            let request = canonical_request(
+                temporal_query.clone(),
+                canonical_budgets(),
+                canonical_exclusions(),
+                60_000,
+            );
+            let call = canonical_call(&request, 60_000);
+            let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+            let projected = project_recall(&call, &request, &namespace).expect("projection");
+            let selection = &projected["selection"];
+            let parsed = temporal(&temporal_query).expect("temporal query");
+            assert_eq!(selection["mode"], json!(mode));
+            assert_eq!(
+                selection["evaluation"],
+                json!(parsed.evaluation_time_utc_nanos)
+            );
+            assert_eq!(
+                selection["as_of"],
+                parsed
+                    .as_of_utc_nanos
+                    .map_or(Value::Null, |value| json!(value))
+            );
+            assert_eq!(
+                selection["start"],
+                parsed
+                    .interval_start_utc_nanos
+                    .map_or(Value::Null, |value| json!(value))
+            );
+            assert_eq!(
+                selection["end"],
+                parsed
+                    .interval_end_utc_nanos
+                    .map_or(Value::Null, |value| json!(value))
+            );
+            assert_eq!(selection["include_superseded"], json!(true));
+            assert_eq!(selection["include_revoked"], json!(true));
+            assert_eq!(selection["unknown_policy"], json!("degrade"));
+        }
+    }
+
+    #[test]
+    fn recall_projection_namespaces_every_exclusion_class() {
+        let content_digest = "ab".repeat(32);
+        let exclusions = json!({
+            "stable_memory_refs": ["stable-ref"],
+            "candidate_ids": ["candidate-id"],
+            "source_refs": ["source-ref"],
+            "trace_refs": ["trace-ref"],
+            "observation_ids": ["observation-id"],
+            "content_sha256": [content_digest.clone()]
+        });
+        let request = canonical_request(
+            canonical_temporal("current"),
+            canonical_budgets(),
+            exclusions,
+            60_000,
+        );
+        let call = canonical_call(&request, 60_000);
+        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let projected = project_recall(&call, &request, &namespace).expect("projection");
+        for (name, value) in [
+            ("stable_memory_refs", "stable-ref"),
+            ("candidate_ids", "candidate-id"),
+            ("source_refs", "source-ref"),
+            ("trace_refs", "trace-ref"),
+            ("observation_ids", "observation-id"),
+            ("content_sha256", content_digest.as_str()),
+        ] {
+            let expected = opaque_surface_id(&namespace, name.as_bytes(), value);
+            assert_eq!(
+                projected["selection"]["exclusions"][name][0],
+                json!(expected),
+                "exclusion class {name} was not bound"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_reconstruction_preserves_provenance_and_explicitly_has_no_cursor() {
+        let mut budgets = canonical_budgets();
+        budgets["maximum_candidate_content_bytes"] = json!(1);
+        budgets["maximum_total_content_bytes"] = json!(1);
+        let request = canonical_request(
+            canonical_temporal("current"),
+            budgets,
+            canonical_exclusions(),
+            60_000,
+        );
+        let call = canonical_call(&request, 60_000);
+        let row = worker_row(&call, 42, "aé", 0.8);
+        let worker = json!({
+            "common_recall": {
+                "candidates": [row],
+                "truncated": false,
+                "unknown_items": 0,
+                "excluded_items": 0,
+                "scanned_items": 1,
+                "score_upper_bound": 1.0
+            }
+        });
+        let mut reply = worker_reply(&call, &worker);
+        reconstruct_recall(&call, "ncm.instance.contract", &mut reply, None)
+            .expect("reconstruction");
+        let output: Value = serde_json::from_slice(&reply.payload.as_ref().unwrap().bytes).unwrap();
+        assert_eq!(output["request_identity"], json!(call.request_id));
+        assert_eq!(
+            output["exact_scope_identity"],
+            scope_value(&call.exact_scope)
+        );
+        assert_eq!(output["coverage"]["next_cursor"], Value::Null);
+        assert_eq!(output["coverage"]["state"], json!("partial"));
+        assert_eq!(output["coverage"]["truncated_items"], json!(1));
+        let candidate = &output["candidates"][0];
+        assert_eq!(candidate["content"], json!("a"));
+        assert_eq!(
+            candidate["content_sha256"],
+            json!(hex_digest(&Sha256::digest(b"a")))
+        );
+        assert_eq!(
+            candidate["provenance"]["original_sources"][0],
+            original_source(&call, 42)
+        );
+        assert_eq!(
+            candidate["provenance"]["source_refs"],
+            json!(["private-ref-42"])
+        );
+        assert_eq!(candidate["trace_refs"].as_array().unwrap().len(), 1);
     }
 
     #[test]
