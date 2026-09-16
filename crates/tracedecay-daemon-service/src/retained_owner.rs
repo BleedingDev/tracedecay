@@ -36,6 +36,8 @@ pub use cognitive_recall::{AdvisoryMemoryContextV1, CognitiveRecallMountError};
 #[path = "retained_owner/native_common_factory_tests.rs"]
 mod native_common_factory_tests;
 #[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_authority;
+#[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
