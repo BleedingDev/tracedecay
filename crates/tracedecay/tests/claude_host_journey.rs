@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
 use tracedecay_domain::configuration::{
@@ -419,6 +420,62 @@ async fn composition_with_memory_provider_host(
         .expect("production composition with the memory provider host mounted")
 }
 
+/// Rebuilds the provider-qualified session identity with the same public
+/// domain-separated framing used by the mounted observation journey.
+fn provider_agent_session_id(
+    profile_id: &UserProfileId,
+    scope: &tracedecay_contracts::ResolvedScope,
+    canonical_session_id: &str,
+) -> String {
+    const DOMAIN: &[u8] = b"tracedecay.memory-provider.agent-session-binding.v1\0";
+    const PREFIX: &str = "tdmem-agent-session.v1.";
+    let mut digest = Sha256::new();
+    digest.update(DOMAIN);
+    for value in [
+        profile_id.as_str().as_bytes(),
+        scope.project_id.as_str().as_bytes(),
+        scope.repository_id.as_str().as_bytes(),
+        scope.worktree_id.as_str().as_bytes(),
+        scope
+            .reference
+            .as_ref()
+            .map_or(&b""[..], |reference| reference.as_str().as_bytes()),
+        scope.scope_digest.as_str().as_bytes(),
+        canonical_session_id.as_bytes(),
+    ] {
+        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(value);
+    }
+    format!("{PREFIX}{}", hex::encode(digest.finalize()))
+}
+
+/// Computes the exact scope digest from the authoritative resolved project
+/// scope and the mounted profile identity. The test may inspect this public
+/// contract, but it never derives scope from a path or from journal storage.
+fn expected_exact_scope_sha256(
+    project: &Path,
+    project_id: &ProjectId,
+    profile_id: &UserProfileId,
+) -> String {
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(project, project_id)
+        .expect("authoritative resolved scope");
+    let reference = scope
+        .reference
+        .as_ref()
+        .expect("authoritative scope reference");
+    tracedecay_memory_provider_registry::OwnedExactScope::new(
+        profile_id.as_str(),
+        scope.project_id.as_str(),
+        scope.repository_id.as_str(),
+        scope.worktree_id.as_str(),
+        reference.as_str(),
+        provider_agent_session_id(profile_id, &scope, CLAUDE_SESSION),
+        scope.scope_digest.as_str(),
+    )
+    .expect("exact scope for the Claude host session")
+    .exact_scope_sha256()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct JourneyJournalRowV1 {
     observation_id: String,
@@ -573,7 +630,7 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
     write_claude_transcript(&transcript_home, &project);
 
     let harness = composition_with_memory_provider_host(isolation.path(), &project).await;
-    let (_project_id, _profile_id) = project_identity(&harness, &project).await;
+    let (project_id, profile_id) = project_identity(&harness, &project).await;
     let data_root = harness
         .project_data_root(&project)
         .await
@@ -610,29 +667,14 @@ async fn a_committed_claude_session_message_settles_once_and_a_later_context_cal
          {:?}",
         journal_digest(&rows)
     );
-    let mut exact_scopes = rows
-        .iter()
-        .map(|row| row.exact_scope_sha256.clone())
-        .collect::<Vec<_>>();
-    exact_scopes.sort();
-    exact_scopes.dedup();
-    assert_eq!(
-        exact_scopes.len(),
-        1,
-        "all deliveries from one Claude session must share one exact scope: {:?}",
-        journal_digest(&rows)
-    );
+    let expected_scope = expected_exact_scope_sha256(&project, &project_id, &profile_id);
     for row in &rows {
         assert_eq!(
             row.observation_kind, SESSION_MESSAGE_OBSERVATION_KIND,
             "the journey admits exactly the session-message observation kind"
         );
-        assert!(
-            !row.exact_scope_sha256.is_empty(),
-            "every journal row must carry a non-empty exact worktree-bound scope"
-        );
         assert_eq!(
-            row.exact_scope_sha256, exact_scopes[0],
+            row.exact_scope_sha256, expected_scope,
             "every journal row must carry this project's exact worktree-bound scope"
         );
         assert_eq!(
