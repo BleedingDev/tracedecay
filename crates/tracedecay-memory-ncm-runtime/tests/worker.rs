@@ -1013,7 +1013,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
                 0,
                 Operation::Recall,
                 &ns,
-                json!({"query_text": "worker restart deleted token", "top_k": 16}),
+                json!({"query_text": "worker restart retained key", "top_k": 16}),
             ),
             CALL_DEADLINE,
         )
