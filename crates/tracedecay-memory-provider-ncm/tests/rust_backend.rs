@@ -214,6 +214,11 @@ mod enabled {
         assert!(owner.worker_pid().is_none());
         assert!(surface.provider_instance_id().unwrap().is_none());
         let declared = surface.descriptor();
+        assert!(
+            declared
+                .state_schema_version
+                .starts_with("ncm-biomem-rs.v2+")
+        );
         assert_eq!(declared.state_generation, 0);
         assert_eq!(
             surface.prove_provider_instance(

@@ -34,7 +34,19 @@ const PREFLIGHT_NAMESPACE: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 const RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.rust-worker-receipt.v1\0";
 const READY_DOMAIN: &[u8] = b"tracedecay.ncm.rust-worker-ready.v1\0";
+const READY_DOMAIN_V2: &[u8] = b"tracedecay.ncm.rust-worker-ready.v2\0";
 const IMPLEMENTATION_DOMAIN: &[u8] = b"tracedecay.ncm.rust-worker-implementation.v1\0";
+const IMPLEMENTATION_DOMAIN_V2: &[u8] = b"tracedecay.ncm.rust-worker-implementation.v2\0";
+const IDENTITY_REVISION_V1: u16 = 1;
+const IDENTITY_REVISION_V2: u16 = 2;
+const WORKER_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/reference/worker-manifest.json"
+));
+const MODEL_REVISION_RECEIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+));
 const DEFAULT_PREFLIGHT_MILLIS: u64 = 5_000;
 
 /// Configuration for the supervised Rust NCM surface.
@@ -74,11 +86,43 @@ impl fmt::Display for RustNcmError {
 impl Error for RustNcmError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerTargetIdentity {
+    triple: String,
+    os: String,
+    arch: String,
+    family: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerIdentity {
+    sha256: String,
+    bytes: u64,
+    target: WorkerTargetIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelArtifactIdentity {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeIdentity {
+    /// Revision of the provider identity wire and digest contract.
+    identity_revision: u16,
     config_sha256: String,
     projection_sha256: String,
+    worker: Option<WorkerIdentity>,
     encoder_model: String,
     encoder_artifact_sha256: String,
+    encoder_repository: Option<String>,
+    encoder_revision: Option<String>,
+    encoder_revision_provenance: Option<String>,
+    encoder_files: Vec<ModelArtifactIdentity>,
+    encoder_max_length: Option<usize>,
+    encoder_pooling: Option<String>,
+    encoder_normalize: Option<bool>,
     epoch: u64,
 }
 
@@ -151,6 +195,7 @@ pub struct RustNcmSurface {
     worker: Arc<RustNcmWorkerOwner>,
     state: Mutex<SurfaceState>,
     fallback_descriptor: ProviderDescriptor,
+    declared_identity: Option<RuntimeIdentity>,
 }
 
 impl RustNcmSurface {
@@ -168,8 +213,10 @@ impl RustNcmSurface {
     /// owner never shares descriptor generation or accepted adapter readiness.
     /// A worker started without its model must be recreated after installation.
     pub fn from_worker(worker: Arc<RustNcmWorkerOwner>) -> Result<Self, RustNcmError> {
-        let fallback_descriptor =
-            descriptor_for(PROVISIONAL_CONFIG_SHA256, "not-ready", "not-ready", 0)?;
+        let fallback_descriptor = descriptor_for(
+            &legacy_identity(PROVISIONAL_CONFIG_SHA256, "not-ready", "not-ready"),
+            0,
+        )?;
         let preflight = Request::new(
             worker.request_id(),
             DEFAULT_PREFLIGHT_MILLIS,
@@ -216,6 +263,7 @@ impl RustNcmSurface {
                 identity,
             }),
             fallback_descriptor,
+            declared_identity: None,
         })
     }
 
@@ -223,20 +271,8 @@ impl RustNcmSurface {
     /// No preflight runs here. The first supervised handshake must prove this
     /// immutable declaration before any instance identity or readiness exists.
     pub fn from_production_worker(worker: Arc<RustNcmWorkerOwner>) -> Result<Self, RustNcmError> {
-        let (algorithm, encoder) =
-            tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
-                .map_err(RustNcmError::HandshakeIdentity)?;
-        if algorithm.profile != ALGORITHM_PROFILE {
-            return Err(RustNcmError::HandshakeIdentity(
-                "production algorithm profile does not match adapter".to_owned(),
-            ));
-        }
-        let descriptor = descriptor_for(
-            &algorithm.config_sha256,
-            &encoder.model,
-            &encoder.artifact_sha256,
-            0,
-        )?;
+        let identity = production_identity()?;
+        let descriptor = descriptor_from_identity(&identity, 0)?;
         Ok(Self {
             worker,
             state: Mutex::new(SurfaceState {
@@ -244,6 +280,7 @@ impl RustNcmSurface {
                 identity: None,
             }),
             fallback_descriptor: descriptor,
+            declared_identity: Some(identity),
         })
     }
 
@@ -273,7 +310,7 @@ impl RustNcmSurface {
             millis,
             Operation::Handshake,
             PREFLIGHT_NAMESPACE,
-            json!({"algorithm_profile": ALGORITHM_PROFILE}),
+            identity_request_payload(self.expected_identity().as_ref()),
         );
         let reply = self
             .worker
@@ -299,7 +336,7 @@ impl RustNcmSurface {
         if !same_immutable_descriptor(&self.descriptor_snapshot(), &candidate) {
             return Err(TerminalCode::StateIncompatible);
         }
-        Ok(Some(implementation_version(&identity.config_sha256)))
+        Ok(Some(implementation_version(&identity)))
     }
 
     /// Instance identity proved by the real preflight, if the worker was ready.
@@ -309,10 +346,7 @@ impl RustNcmSurface {
         let state = self.state.lock().map_err(|_| {
             RustNcmError::HandshakeIdentity("surface identity lock poisoned".to_owned())
         })?;
-        Ok(state
-            .identity
-            .as_ref()
-            .map(|identity| implementation_version(&identity.config_sha256)))
+        Ok(state.identity.as_ref().map(implementation_version))
     }
 
     /// Returns the shared worker process identifier, when the lazy worker is alive.
@@ -326,6 +360,14 @@ impl RustNcmSurface {
             .lock()
             .map(|state| state.descriptor.clone())
             .unwrap_or_else(|_| self.fallback_descriptor.clone())
+    }
+
+    fn expected_identity(&self) -> Option<RuntimeIdentity> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.identity.clone())
+            .or_else(|| self.declared_identity.clone())
     }
 
     fn update_generation(&self, generation: u64) {
@@ -389,21 +431,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 );
             }
         };
-        let expected_model = self.state.lock().ok().and_then(|state| {
-            state
-                .identity
-                .as_ref()
-                .map(|identity| identity.encoder_model.clone())
-        });
-        let mut payload = json!({
-            "protocol_version": 1,
-            "algorithm_profile": ALGORITHM_PROFILE,
-        });
-        if let Some(model) = expected_model
-            && let Some(object) = payload.as_object_mut()
-        {
-            object.insert("model".to_owned(), Value::String(model));
-        }
+        let payload = identity_request_payload(self.expected_identity().as_ref());
         let reply = match self.worker_call(
             Operation::Handshake,
             &request.namespace,
@@ -489,7 +517,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
         }
         let descriptor = self.descriptor_snapshot();
         let ready_receipt = ready_receipt(request.namespace.as_str(), &identity);
-        let instance_id = implementation_version(&identity.config_sha256);
+        let instance_id = implementation_version(&identity);
         let challenge =
             request.expected_challenge_response_sha256(&descriptor, &instance_id, &ready_receipt);
         let terminal = surface_terminal(
@@ -560,18 +588,204 @@ impl NcmCognitiveSurface for RustNcmSurface {
     }
 }
 
-fn descriptor_for(
+fn identity_request_payload(identity: Option<&RuntimeIdentity>) -> Value {
+    let mut payload = json!({
+        "protocol_version": 1,
+        "algorithm_profile": ALGORITHM_PROFILE,
+    });
+    let Some(identity) = identity else {
+        return payload;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object.insert(
+        "model".to_owned(),
+        Value::String(identity.encoder_model.clone()),
+    );
+    payload
+}
+
+fn production_identity() -> Result<RuntimeIdentity, RustNcmError> {
+    let (algorithm, encoder) =
+        tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
+            .map_err(RustNcmError::HandshakeIdentity)?;
+    if algorithm.profile != ALGORITHM_PROFILE {
+        return Err(RustNcmError::HandshakeIdentity(
+            "production algorithm profile does not match adapter".to_owned(),
+        ));
+    }
+    let pinned = tracedecay_memory_ncm_runtime::embedding::PinnedEncoder::reference()
+        .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))?;
+    verify_model_revision_provenance(&pinned)?;
+    let artifact_sha256 = pinned
+        .artifact_sha256()
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity(
+                "reference encoder manifest omitted ONNX digest".to_owned(),
+            )
+        })
+        .map(str::to_owned)?;
+    if encoder.model != pinned.model
+        || encoder.artifact_sha256 != artifact_sha256
+        || encoder.max_length != pinned.max_length
+    {
+        return Err(RustNcmError::HandshakeIdentity(
+            "production encoder declaration differs from the pinned manifest".to_owned(),
+        ));
+    }
+    let encoder_files = pinned
+        .files
+        .iter()
+        .map(|file| ModelArtifactIdentity {
+            path: file.path.clone(),
+            sha256: file.sha256.clone(),
+            bytes: file.bytes,
+        })
+        .collect();
+    Ok(RuntimeIdentity {
+        identity_revision: IDENTITY_REVISION_V2,
+        config_sha256: algorithm.config_sha256,
+        projection_sha256: String::new(),
+        worker: Some(production_worker_identity()?),
+        encoder_model: pinned.model,
+        encoder_artifact_sha256: artifact_sha256,
+        encoder_repository: Some(pinned.repository),
+        encoder_revision: Some(pinned.revision),
+        encoder_revision_provenance: Some(pinned.revision_provenance),
+        encoder_files,
+        encoder_max_length: Some(pinned.max_length),
+        encoder_pooling: Some(pinned.pooling),
+        encoder_normalize: Some(pinned.normalize),
+        epoch: 0,
+    })
+}
+
+fn verify_model_revision_provenance(
+    manifest: &tracedecay_memory_ncm_runtime::embedding::PinnedEncoder,
+) -> Result<(), RustNcmError> {
+    let (path, pointer) = manifest
+        .revision_provenance
+        .split_once('#')
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity(
+                "model revision provenance must include a JSON pointer".to_owned(),
+            )
+        })?;
+    if path != "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json" {
+        return Err(RustNcmError::HandshakeIdentity(
+            "model revision provenance points outside the pinned receipt".to_owned(),
+        ));
+    }
+    let receipt: Value = serde_json::from_str(MODEL_REVISION_RECEIPT).map_err(|error| {
+        RustNcmError::HandshakeIdentity(format!("parse model revision provenance: {error}"))
+    })?;
+    let observed = receipt.pointer(pointer).and_then(Value::as_str);
+    if observed != Some(manifest.revision.as_str()) {
+        return Err(RustNcmError::HandshakeIdentity(
+            "model revision provenance does not attest the pinned revision".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn production_worker_identity() -> Result<WorkerIdentity, RustNcmError> {
+    let manifest: Value = serde_json::from_str(WORKER_MANIFEST).map_err(|error| {
+        RustNcmError::HandshakeIdentity(format!("parse worker manifest: {error}"))
+    })?;
+    let current = current_target_identity();
+    let target = manifest
+        .get("targets")
+        .and_then(Value::as_array)
+        .and_then(|targets| {
+            targets.iter().find(|target| {
+                target.get("triple").and_then(Value::as_str) == Some(current.triple.as_str())
+            })
+        })
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity(format!(
+                "worker manifest has no target {}",
+                current.triple
+            ))
+        })?;
+    let target_os = required_str(target.get("os"), "worker.target.os")?;
+    let target_arch = required_str(target.get("arch"), "worker.target.arch")?;
+    let target_family = required_str(target.get("family"), "worker.target.family")?;
+    if target_os != current.os || target_arch != current.arch || target_family != current.family {
+        return Err(RustNcmError::HandshakeIdentity(
+            "worker manifest target metadata does not match the current target".to_owned(),
+        ));
+    }
+    let bytes = required_nonzero_u64(target.get("bytes"), "worker.bytes")?;
+    let sha256 = required_sha256(target.get("sha256"), "worker.sha256")?;
+    Ok(WorkerIdentity {
+        sha256,
+        bytes,
+        target: WorkerTargetIdentity {
+            triple: current.triple,
+            os: target_os,
+            arch: target_arch,
+            family: target_family,
+        },
+    })
+}
+
+fn current_target_identity() -> WorkerTargetIdentity {
+    WorkerTargetIdentity {
+        triple: option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                let platform = match std::env::consts::OS {
+                    "macos" => "apple-darwin",
+                    "windows" => "pc-windows-msvc",
+                    "linux" => "unknown-linux-gnu",
+                    other => other,
+                };
+                format!("{}-{platform}", std::env::consts::ARCH)
+            }),
+        os: std::env::consts::OS.to_owned(),
+        arch: std::env::consts::ARCH.to_owned(),
+        family: std::env::consts::FAMILY.to_owned(),
+    }
+}
+
+fn legacy_identity(
     config_sha256: &str,
     encoder_model: &str,
     encoder_artifact_sha256: &str,
+) -> RuntimeIdentity {
+    RuntimeIdentity {
+        identity_revision: IDENTITY_REVISION_V1,
+        config_sha256: config_sha256.to_owned(),
+        projection_sha256: String::new(),
+        worker: None,
+        encoder_model: encoder_model.to_owned(),
+        encoder_artifact_sha256: encoder_artifact_sha256.to_owned(),
+        encoder_repository: None,
+        encoder_revision: None,
+        encoder_revision_provenance: None,
+        encoder_files: Vec::new(),
+        encoder_max_length: None,
+        encoder_pooling: None,
+        encoder_normalize: None,
+        epoch: 0,
+    }
+}
+
+fn descriptor_for(
+    identity: &RuntimeIdentity,
     generation: u64,
 ) -> Result<ProviderDescriptor, RustNcmError> {
-    let version = implementation_version(config_sha256);
+    validate_identity(identity)?;
+    let version = implementation_version(identity);
     let mut implementation = Sha256::new();
-    implementation.update(IMPLEMENTATION_DOMAIN);
+    implementation.update(if identity.identity_revision == IDENTITY_REVISION_V2 {
+        IMPLEMENTATION_DOMAIN_V2
+    } else {
+        IMPLEMENTATION_DOMAIN
+    });
     digest_field(&mut implementation, version.as_bytes());
-    digest_field(&mut implementation, encoder_model.as_bytes());
-    digest_field(&mut implementation, encoder_artifact_sha256.as_bytes());
+    digest_identity(&mut implementation, identity);
     let identity_sha256 = hex_digest(&implementation.finalize());
     let provider_id = OwnedProviderId::new(NCM_PROVIDER_ID)
         .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))?;
@@ -598,21 +812,9 @@ fn descriptor_for(
 #[cfg(feature = "test-helpers")]
 pub fn production_provider_declaration_for_test()
 -> Result<(ProviderDescriptor, String, String), RustNcmError> {
-    let (algorithm, encoder) =
-        tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
-            .map_err(RustNcmError::HandshakeIdentity)?;
-    if algorithm.profile != ALGORITHM_PROFILE {
-        return Err(RustNcmError::HandshakeIdentity(
-            "production algorithm profile does not match adapter".to_owned(),
-        ));
-    }
-    let descriptor = descriptor_for(
-        &algorithm.config_sha256,
-        &encoder.model,
-        &encoder.artifact_sha256,
-        0,
-    )?;
-    let instance = implementation_version(&algorithm.config_sha256);
+    let identity = production_identity()?;
+    let descriptor = descriptor_from_identity(&identity, 0)?;
+    let instance = implementation_version(&identity);
     let mut digest = Sha256::new();
     crate::digest_limits(&mut digest, descriptor.limits);
     let limits_digest = hex_digest(&digest.finalize());
@@ -623,17 +825,26 @@ fn descriptor_from_identity(
     identity: &RuntimeIdentity,
     generation: u64,
 ) -> Result<ProviderDescriptor, RustNcmError> {
-    descriptor_for(
-        &identity.config_sha256,
-        &identity.encoder_model,
-        &identity.encoder_artifact_sha256,
-        generation,
-    )
+    descriptor_for(identity, generation)
 }
 
-fn implementation_version(config_sha256: &str) -> String {
-    let prefix = config_sha256.get(..12).unwrap_or(config_sha256);
-    format!("{ALGORITHM_PROFILE}+{prefix}")
+fn implementation_version(identity: &RuntimeIdentity) -> String {
+    let prefix = identity
+        .config_sha256
+        .get(..12)
+        .unwrap_or(&identity.config_sha256);
+    if identity.identity_revision == IDENTITY_REVISION_V1 {
+        return format!("ncm-biomem-rs.v1+{prefix}");
+    }
+    let mut digest = Sha256::new();
+    digest.update(IMPLEMENTATION_DOMAIN_V2);
+    digest_identity(&mut digest, identity);
+    let identity_prefix = hex_digest(&digest.finalize());
+    let identity_prefix = identity_prefix.get(..16).unwrap_or(&identity_prefix);
+    format!(
+        "ncm-biomem-rs.v{}+{prefix}.{identity_prefix}",
+        identity.identity_revision
+    )
 }
 
 fn capability_ids() -> Result<BTreeSet<OwnedVersionedId>, RustNcmError> {
@@ -699,21 +910,279 @@ fn parse_runtime_identity(reply: &Reply) -> Result<RuntimeIdentity, RustNcmError
     )?;
     let projection_sha256 = required_sha256(payload.get("projection_sha256"), "projection_sha256")?;
     let encoder_model = required_str(payload.pointer("/encoder/model"), "encoder.model")?;
-    let encoder_artifact_sha256 = required_str(
-        payload.pointer("/encoder/artifact_sha256"),
-        "encoder.artifact_sha256",
-    )?;
+    let encoder_artifact_sha256 = payload
+        .pointer("/encoder/artifact_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let epoch = payload
         .get("epoch")
         .and_then(Value::as_u64)
         .ok_or_else(|| RustNcmError::HandshakeIdentity("missing epoch".to_owned()))?;
-    Ok(RuntimeIdentity {
+    let identity_revision = match payload.get("identity_revision").and_then(Value::as_u64) {
+        None => IDENTITY_REVISION_V1,
+        Some(revision) => u16::try_from(revision).map_err(|_| {
+            RustNcmError::HandshakeIdentity("identity_revision exceeds u16".to_owned())
+        })?,
+    };
+    if identity_revision == IDENTITY_REVISION_V1 {
+        let encoder_artifact_sha256 = encoder_artifact_sha256.ok_or_else(|| {
+            RustNcmError::HandshakeIdentity("missing encoder.artifact_sha256".to_owned())
+        })?;
+        return Ok(
+            legacy_identity(&config_sha256, &encoder_model, &encoder_artifact_sha256)
+                .with_runtime_state(projection_sha256, epoch),
+        );
+    }
+    if identity_revision != IDENTITY_REVISION_V2 {
+        return Err(RustNcmError::HandshakeIdentity(format!(
+            "unsupported identity revision {identity_revision}"
+        )));
+    }
+    let worker = parse_worker_identity(payload.pointer("/worker"))?;
+    let encoder = payload
+        .pointer("/encoder")
+        .ok_or_else(|| RustNcmError::HandshakeIdentity("missing encoder identity".to_owned()))?;
+    let encoder_repository = required_str(encoder.get("repository"), "encoder.repository")?;
+    let encoder_revision =
+        required_immutable_revision(encoder.get("revision"), "encoder.revision")?;
+    let encoder_revision_provenance = required_str(
+        encoder.get("revision_provenance"),
+        "encoder.revision_provenance",
+    )?;
+    let encoder_max_length = required_nonzero_u64(encoder.get("max_length"), "encoder.max_length")?;
+    let encoder_max_length = usize::try_from(encoder_max_length).map_err(|_| {
+        RustNcmError::HandshakeIdentity("encoder.max_length exceeds usize".to_owned())
+    })?;
+    let encoder_pooling = required_str(encoder.get("pooling"), "encoder.pooling")?;
+    let encoder_normalize = encoder
+        .get("normalize")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| RustNcmError::HandshakeIdentity("missing encoder.normalize".to_owned()))?;
+    let encoder_files = parse_encoder_files(encoder.get("files"))?;
+    let encoder_artifact_sha256 = encoder_artifact_sha256
+        .or_else(|| {
+            encoder
+                .get("artifact_sha256")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            encoder_files
+                .iter()
+                .find(|file| file.path == "onnx/model.onnx")
+                .map(|file| file.sha256.clone())
+        })
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity("missing encoder.artifact_sha256".to_owned())
+        })?;
+    let identity = RuntimeIdentity {
+        identity_revision,
         config_sha256,
         projection_sha256,
+        worker: Some(worker),
         encoder_model,
         encoder_artifact_sha256,
+        encoder_repository: Some(encoder_repository),
+        encoder_revision: Some(encoder_revision),
+        encoder_revision_provenance: Some(encoder_revision_provenance),
+        encoder_files,
+        encoder_max_length: Some(encoder_max_length),
+        encoder_pooling: Some(encoder_pooling),
+        encoder_normalize: Some(encoder_normalize),
         epoch,
-    })
+    };
+    validate_identity(&identity)?;
+    Ok(identity)
+}
+
+impl RuntimeIdentity {
+    fn with_runtime_state(mut self, projection_sha256: String, epoch: u64) -> Self {
+        self.projection_sha256 = projection_sha256;
+        self.epoch = epoch;
+        self
+    }
+}
+
+fn parse_worker_identity(value: Option<&Value>) -> Result<WorkerIdentity, RustNcmError> {
+    let worker = value
+        .ok_or_else(|| RustNcmError::HandshakeIdentity("missing worker identity".to_owned()))?;
+    let target = worker
+        .get("target")
+        .ok_or_else(|| RustNcmError::HandshakeIdentity("missing worker.target".to_owned()))?;
+    let identity = WorkerIdentity {
+        sha256: required_sha256(
+            worker
+                .get("sha256")
+                .or_else(|| worker.get("artifact_sha256")),
+            "worker.sha256",
+        )?,
+        bytes: required_nonzero_u64(
+            worker.get("bytes").or_else(|| worker.get("size")),
+            "worker.bytes",
+        )?,
+        target: WorkerTargetIdentity {
+            triple: required_str(target.get("triple"), "worker.target.triple")?,
+            os: required_str(target.get("os"), "worker.target.os")?,
+            arch: required_str(target.get("arch"), "worker.target.arch")?,
+            family: required_str(target.get("family"), "worker.target.family")?,
+        },
+    };
+    Ok(identity)
+}
+
+fn parse_encoder_files(value: Option<&Value>) -> Result<Vec<ModelArtifactIdentity>, RustNcmError> {
+    let files = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| RustNcmError::HandshakeIdentity("missing encoder.files".to_owned()))?;
+    if files.len() != 5 {
+        return Err(RustNcmError::HandshakeIdentity(
+            "encoder.files must contain exactly five artifacts".to_owned(),
+        ));
+    }
+    let parsed = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            Ok(ModelArtifactIdentity {
+                path: required_str(file.get("path"), &format!("encoder.files[{index}].path"))?,
+                sha256: required_sha256(
+                    file.get("sha256"),
+                    &format!("encoder.files[{index}].sha256"),
+                )?,
+                bytes: required_nonzero_u64(
+                    file.get("bytes").or_else(|| file.get("size")),
+                    &format!("encoder.files[{index}].bytes"),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, RustNcmError>>()?;
+    let paths = parsed
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = [
+        "onnx/model.onnx",
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if paths != expected {
+        return Err(RustNcmError::HandshakeIdentity(
+            "encoder.files must identify the five pinned model artifacts".to_owned(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_identity(identity: &RuntimeIdentity) -> Result<(), RustNcmError> {
+    if identity.identity_revision == IDENTITY_REVISION_V1 {
+        return Ok(());
+    }
+    if identity.identity_revision != IDENTITY_REVISION_V2 {
+        return Err(RustNcmError::HandshakeIdentity(format!(
+            "unsupported identity revision {}",
+            identity.identity_revision
+        )));
+    }
+    let worker = identity.worker.as_ref().ok_or_else(|| {
+        RustNcmError::HandshakeIdentity("revision 2 identity omitted worker".to_owned())
+    })?;
+    if !valid_sha256(&worker.sha256) || worker.bytes == 0 {
+        return Err(RustNcmError::HandshakeIdentity(
+            "revision 2 worker identity is invalid".to_owned(),
+        ));
+    }
+    if worker.target.triple.is_empty()
+        || worker.target.os.is_empty()
+        || worker.target.arch.is_empty()
+        || worker.target.family.is_empty()
+    {
+        return Err(RustNcmError::HandshakeIdentity(
+            "revision 2 worker target is incomplete".to_owned(),
+        ));
+    }
+    let repository = identity.encoder_repository.as_deref().ok_or_else(|| {
+        RustNcmError::HandshakeIdentity("revision 2 encoder repository is missing".to_owned())
+    })?;
+    let revision = identity.encoder_revision.as_deref().ok_or_else(|| {
+        RustNcmError::HandshakeIdentity("revision 2 encoder revision is missing".to_owned())
+    })?;
+    let provenance = identity
+        .encoder_revision_provenance
+        .as_deref()
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity(
+                "revision 2 encoder revision provenance is missing".to_owned(),
+            )
+        })?;
+    if repository.is_empty()
+        || !is_immutable_revision(revision)
+        || provenance.is_empty()
+        || identity.encoder_files.len() != 5
+        || identity.encoder_max_length.is_none()
+        || identity
+            .encoder_pooling
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || identity.encoder_normalize.is_none()
+    {
+        return Err(RustNcmError::HandshakeIdentity(
+            "revision 2 encoder identity is incomplete".to_owned(),
+        ));
+    }
+    if identity
+        .encoder_files
+        .iter()
+        .any(|file| file.path.is_empty() || !valid_sha256(&file.sha256) || file.bytes == 0)
+    {
+        return Err(RustNcmError::HandshakeIdentity(
+            "revision 2 encoder artifact identity is invalid".to_owned(),
+        ));
+    }
+    let onnx = identity
+        .encoder_files
+        .iter()
+        .find(|file| file.path == "onnx/model.onnx")
+        .ok_or_else(|| {
+            RustNcmError::HandshakeIdentity(
+                "revision 2 encoder files omitted onnx/model.onnx".to_owned(),
+            )
+        })?;
+    if onnx.sha256 != identity.encoder_artifact_sha256 {
+        return Err(RustNcmError::HandshakeIdentity(
+            "encoder artifact digest does not match its ONNX file".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_immutable_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn required_immutable_revision(value: Option<&Value>, field: &str) -> Result<String, RustNcmError> {
+    let revision = required_str(value, field)?;
+    if is_immutable_revision(&revision) {
+        Ok(revision)
+    } else {
+        Err(RustNcmError::HandshakeIdentity(format!("invalid {field}")))
+    }
+}
+
+fn required_nonzero_u64(value: Option<&Value>, field: &str) -> Result<u64, RustNcmError> {
+    let value = value
+        .and_then(Value::as_u64)
+        .filter(|value| *value != 0)
+        .ok_or_else(|| RustNcmError::HandshakeIdentity(format!("missing or empty {field}")))?;
+    Ok(value)
 }
 
 fn required_str(value: Option<&Value>, field: &str) -> Result<String, RustNcmError> {
@@ -740,15 +1209,84 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn digest_identity(digest: &mut Sha256, identity: &RuntimeIdentity) {
+    digest.update(identity.identity_revision.to_be_bytes());
+    digest_field(digest, identity.config_sha256.as_bytes());
+    if identity.identity_revision == IDENTITY_REVISION_V1 {
+        digest_field(digest, identity.encoder_model.as_bytes());
+        digest_field(digest, identity.encoder_artifact_sha256.as_bytes());
+        return;
+    }
+    if let Some(worker) = identity.worker.as_ref() {
+        digest_field(digest, worker.sha256.as_bytes());
+        digest.update(worker.bytes.to_be_bytes());
+        digest_field(digest, worker.target.triple.as_bytes());
+        digest_field(digest, worker.target.os.as_bytes());
+        digest_field(digest, worker.target.arch.as_bytes());
+        digest_field(digest, worker.target.family.as_bytes());
+    }
+    digest_field(digest, identity.encoder_model.as_bytes());
+    digest_field(
+        digest,
+        identity
+            .encoder_repository
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest_field(
+        digest,
+        identity
+            .encoder_revision
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest_field(
+        digest,
+        identity
+            .encoder_revision_provenance
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.update(
+        u64::try_from(identity.encoder_files.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for file in &identity.encoder_files {
+        digest_field(digest, file.path.as_bytes());
+        digest.update(file.bytes.to_be_bytes());
+        digest_field(digest, file.sha256.as_bytes());
+    }
+    digest.update(
+        u64::try_from(identity.encoder_max_length.unwrap_or_default())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest_field(
+        digest,
+        identity
+            .encoder_pooling
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.update([u8::from(identity.encoder_normalize.unwrap_or(false))]);
+}
+
 fn ready_receipt(namespace: &str, identity: &RuntimeIdentity) -> String {
     let mut digest = Sha256::new();
-    digest.update(READY_DOMAIN);
+    digest.update(if identity.identity_revision == IDENTITY_REVISION_V2 {
+        READY_DOMAIN_V2
+    } else {
+        READY_DOMAIN
+    });
     digest_field(&mut digest, namespace.as_bytes());
     digest_field(&mut digest, ALGORITHM_PROFILE.as_bytes());
-    digest_field(&mut digest, identity.config_sha256.as_bytes());
+    digest_identity(&mut digest, identity);
     digest_field(&mut digest, identity.projection_sha256.as_bytes());
-    digest_field(&mut digest, identity.encoder_model.as_bytes());
-    digest_field(&mut digest, identity.encoder_artifact_sha256.as_bytes());
     digest.update(identity.epoch.to_be_bytes());
     hex_digest(&digest.finalize())
 }
@@ -1715,5 +2253,202 @@ mod failed_handshake_generation_tests {
             assert!(response.ready_receipt_sha256.is_none());
             assert!(response.challenge_response_sha256.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod identity_revision_tests {
+    use super::*;
+
+    fn identity() -> RuntimeIdentity {
+        RuntimeIdentity {
+            identity_revision: IDENTITY_REVISION_V2,
+            config_sha256: "a".repeat(64),
+            projection_sha256: "b".repeat(64),
+            worker: Some(WorkerIdentity {
+                sha256: "c".repeat(64),
+                bytes: 38_396_840,
+                target: WorkerTargetIdentity {
+                    triple: "aarch64-apple-darwin".to_owned(),
+                    os: "macos".to_owned(),
+                    arch: "aarch64".to_owned(),
+                    family: "unix".to_owned(),
+                },
+            }),
+            encoder_model: "paraphrase-multilingual-MiniLM-L12-v2".to_owned(),
+            encoder_artifact_sha256: "d".repeat(64),
+            encoder_repository: Some("Xenova/paraphrase-multilingual-MiniLM-L12-v2".to_owned()),
+            encoder_revision: Some("e".repeat(40)),
+            encoder_revision_provenance: Some(
+                "product/ncm/receipts/backend/receipt.json#/identities/model/revision".to_owned(),
+            ),
+            encoder_files: [
+                ("onnx/model.onnx", "d", 470_268_510),
+                ("tokenizer.json", "f", 17_082_913),
+                ("config.json", "1", 673),
+                ("special_tokens_map.json", "2", 280),
+                ("tokenizer_config.json", "3", 496),
+            ]
+            .into_iter()
+            .map(|(path, sha, bytes)| ModelArtifactIdentity {
+                path: path.to_owned(),
+                sha256: sha.repeat(64),
+                bytes,
+            })
+            .collect(),
+            encoder_max_length: Some(128),
+            encoder_pooling: Some("mean".to_owned()),
+            encoder_normalize: Some(true),
+            epoch: 7,
+        }
+    }
+
+    fn descriptor_digest(identity: &RuntimeIdentity) -> String {
+        descriptor_for(identity, 0)
+            .expect("identity fixture is valid")
+            .implementation_identity_sha256
+    }
+
+    #[test]
+    fn revision_two_descriptor_binds_worker_and_encoder_identity_fields() {
+        let baseline = descriptor_digest(&identity());
+        let mut worker_sha = identity();
+        worker_sha.worker.as_mut().expect("worker").sha256 = "f".repeat(64);
+        assert_ne!(descriptor_digest(&worker_sha), baseline);
+        let mut worker_bytes = identity();
+        worker_bytes.worker.as_mut().expect("worker").bytes += 1;
+        assert_ne!(descriptor_digest(&worker_bytes), baseline);
+        for field in ["triple", "os", "arch", "family"] {
+            let mut changed = identity();
+            let target = &mut changed.worker.as_mut().expect("worker").target;
+            match field {
+                "triple" => target.triple.push('x'),
+                "os" => target.os.push('x'),
+                "arch" => target.arch.push('x'),
+                "family" => target.family.push('x'),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                descriptor_digest(&changed),
+                baseline,
+                "worker target {field}"
+            );
+        }
+        for index in 0..5 {
+            let mut changed = identity();
+            changed.encoder_files[index].sha256 = "f".repeat(64);
+            if index == 0 {
+                changed.encoder_artifact_sha256 = "f".repeat(64);
+            }
+            assert_ne!(
+                descriptor_digest(&changed),
+                baseline,
+                "model file {index} sha256"
+            );
+            let mut changed = identity();
+            changed.encoder_files[index].bytes += 1;
+            assert_ne!(
+                descriptor_digest(&changed),
+                baseline,
+                "model file {index} bytes"
+            );
+        }
+        let mut model_revision = identity();
+        model_revision.encoder_revision = Some("f".repeat(40));
+        assert_ne!(descriptor_digest(&model_revision), baseline);
+        let mut repository = identity();
+        repository.encoder_repository = Some("other/model".to_owned());
+        assert_ne!(descriptor_digest(&repository), baseline);
+        let mut provenance = identity();
+        provenance.encoder_revision_provenance = Some("receipt.json#/revision".to_owned());
+        assert_ne!(descriptor_digest(&provenance), baseline);
+        let mut max_length = identity();
+        max_length.encoder_max_length = Some(256);
+        assert_ne!(descriptor_digest(&max_length), baseline);
+        let mut pooling = identity();
+        pooling.encoder_pooling = Some("cls".to_owned());
+        assert_ne!(descriptor_digest(&pooling), baseline);
+        let mut normalize = identity();
+        normalize.encoder_normalize = Some(false);
+        assert_ne!(descriptor_digest(&normalize), baseline);
+    }
+
+    #[test]
+    fn revision_two_ready_receipt_binds_worker_and_model_digest_values() {
+        let baseline = ready_receipt("1".repeat(64).as_str(), &identity());
+        let mut changed = identity();
+        changed.worker.as_mut().expect("worker").bytes += 1;
+        assert_ne!(ready_receipt("1".repeat(64).as_str(), &changed), baseline);
+        let mut changed = identity();
+        changed.encoder_files[4].sha256 = "f".repeat(64);
+        assert_ne!(ready_receipt("1".repeat(64).as_str(), &changed), baseline);
+    }
+
+    #[test]
+    fn revision_two_wire_identity_round_trips_and_rejects_missing_artifacts() {
+        let expected = identity();
+        let mut payload = identity_request_payload(Some(&expected));
+        payload["identity_revision"] = Value::from(u64::from(IDENTITY_REVISION_V2));
+        let worker = expected.worker.as_ref().expect("worker");
+        payload["worker"] = json!({
+            "sha256": worker.sha256,
+            "bytes": worker.bytes,
+            "target": {
+                "triple": worker.target.triple,
+                "os": worker.target.os,
+                "arch": worker.target.arch,
+                "family": worker.target.family,
+            },
+        });
+        payload["encoder"] = json!({
+            "model": expected.encoder_model,
+            "artifact_sha256": expected.encoder_artifact_sha256,
+            "repository": expected.encoder_repository,
+            "revision": expected.encoder_revision,
+            "revision_provenance": expected.encoder_revision_provenance,
+            "files": expected
+                .encoder_files
+                .iter()
+                .map(|file| json!({
+                    "path": file.path,
+                    "sha256": file.sha256,
+                    "bytes": file.bytes,
+                }))
+                .collect::<Vec<_>>(),
+            "max_length": expected.encoder_max_length,
+            "pooling": expected.encoder_pooling,
+            "normalize": expected.encoder_normalize,
+        });
+        let reply = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(payload.clone()),
+            error: None,
+        };
+        assert_eq!(
+            parse_runtime_identity(&reply).expect("v2 identity"),
+            expected
+        );
+        let mut missing = payload;
+        missing["encoder"]["files"] = Value::Array(Vec::new());
+        let reply = Reply {
+            payload: Some(missing),
+            ..reply
+        };
+        assert!(parse_runtime_identity(&reply).is_err());
+    }
+
+    #[test]
+    fn model_revision_provenance_is_read_from_the_pinned_receipt() {
+        let manifest = tracedecay_memory_ncm_runtime::embedding::PinnedEncoder::reference()
+            .expect("checked-in model manifest");
+        assert!(verify_model_revision_provenance(&manifest).is_ok());
+        let mut altered = manifest;
+        altered.revision_provenance =
+            "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json#/identities/model/model"
+                .to_owned();
+        assert!(verify_model_revision_provenance(&altered).is_err());
     }
 }

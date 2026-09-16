@@ -61,8 +61,10 @@ pub const NCM_PROVIDER_ID: &str = "ncm";
 pub const NCM_RECALL_SCOPE_BINDINGS: &[&str] = &["exact_coding_scope"];
 const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.scope.v1\0";
 const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
+const CHALLENGE_DOMAIN_V2: &[u8] = b"tracedecay.ncm.handshake-proof.v2\0";
 const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
 const READY_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-ready-receipt.v1\0";
+const READY_RECEIPT_DOMAIN_V2: &[u8] = b"tracedecay.ncm.adapter-ready-receipt.v2\0";
 const UNKNOWN_EFFECT_RECEIPT_DOMAIN: &[u8] = b"tracedecay.ncm.adapter-unknown-effect-receipt.v1\0";
 /// Adapter-owned reconciliation procedure for a surface dispatch whose
 /// returned envelope cannot be trusted; the suffix binds the witness receipt.
@@ -179,7 +181,16 @@ impl NcmSurfaceHandshakeRequest {
         ready_receipt_sha256: &str,
     ) -> String {
         let mut digest = Sha256::new();
-        digest.update(CHALLENGE_DOMAIN);
+        digest.update(
+            if descriptor
+                .state_schema_version
+                .starts_with("ncm-biomem-rs.v2+")
+            {
+                CHALLENGE_DOMAIN_V2
+            } else {
+                CHALLENGE_DOMAIN
+            },
+        );
         digest_field(&mut digest, self.namespace.as_str().as_bytes());
         digest_field(&mut digest, self.request_id.as_bytes());
         digest.update(self.registration_revision.to_be_bytes());
@@ -1723,7 +1734,16 @@ fn adapter_ready_receipt(
     effective_limits: ProviderLimits,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(READY_RECEIPT_DOMAIN);
+    digest.update(
+        if descriptor
+            .state_schema_version
+            .starts_with("ncm-biomem-rs.v2+")
+        {
+            READY_RECEIPT_DOMAIN_V2
+        } else {
+            READY_RECEIPT_DOMAIN
+        },
+    );
     digest.update(epoch.to_be_bytes());
     digest.update(request.registration_revision.to_be_bytes());
     digest_field(&mut digest, namespace.as_str().as_bytes());
