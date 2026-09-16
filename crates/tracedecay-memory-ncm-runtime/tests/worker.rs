@@ -461,7 +461,7 @@ fn common_replay_killed_after_commit_reconciles_the_nested_delivery_key() {
         affect: None,
         surprise: 0.4,
         intensity: 1.0,
-        provenance: json!({"common_capsule":{"version":1,"bytes":[],"sha256":"21".repeat(32)},"selection":{"observation_identity":"22".repeat(32),"revision_digest":"23".repeat(32)}}),
+        provenance: json!({"common_capsule":{"version":1,"bytes":[],"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"selection":{"observation_identity":"22".repeat(32),"revision_digest":"23".repeat(32)}}),
         deadline: Deadline {
             remaining_ms: u64::MAX,
         },
