@@ -1411,15 +1411,7 @@ where
         let execution_admission = Arc::clone(&execution_admission);
         Box::pin(async move {
             let unavailable = |reason| code_search::CodeIndexSimilarOutcomeV1::Unavailable(reason);
-            if request.result_limit == 0
-                || request.result_limit
-                    > tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1
-                || request.work_limit < 2
-                || request.work_limit
-                    > tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1 + 1
-                || request.match_classes.is_empty()
-                || (request.cursor.is_some() && request.match_classes.len() != 1)
-            {
+            if !similar_request_is_valid(&request) {
                 return unavailable(
                     code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest,
                 );
@@ -1642,6 +1634,24 @@ where
     })
 }
 
+/// Validate the portion of a similar request that can be checked before a
+/// generation is admitted. A cursor is an authenticated lane position, so its
+/// presence does not narrow the request to one match class; the continuation
+/// must retain the complete class set used by its first page.
+fn similar_request_is_valid(request: &code_search::CodeIndexSimilarRequestV1) -> bool {
+    request.result_limit > 0
+        && request.result_limit
+            <= tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1
+        && request.work_limit >= 2
+        && request.work_limit
+            <= tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1 + 1
+        && !request.match_classes.is_empty()
+        && request
+            .cursor
+            .as_deref()
+            .is_none_or(|cursor| !cursor.trim().is_empty())
+}
+
 /// Preserve the typed terminal state emitted by the verified similarity lane.
 ///
 /// Similarity is a blocking read, so the executor owns the translation from
@@ -1850,7 +1860,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
 
@@ -1858,7 +1868,7 @@ mod tests {
     use tracedecay_domain::{AuthorizationRevision, PrincipalId, ProjectId};
     use tracedecay_query::code_search::{
         CodeIndexSearchAuthorityV1, CodeIndexSearchOutcomeV1, CodeIndexSearchRequestV1,
-        CodeIndexSearchUnavailableReasonV1,
+        CodeIndexSearchUnavailableReasonV1, CodeIndexSimilarRequestV1, CodeIndexSimilarTargetV1,
     };
     use tracedecay_runtime_core::cancellation::CancellationToken;
 
@@ -1933,6 +1943,44 @@ mod tests {
         );
     }
 
+    fn similar_page_request(cursor: Option<&str>) -> CodeIndexSimilarRequestV1 {
+        CodeIndexSimilarRequestV1 {
+            project_root: PathBuf::from("/repo"),
+            target: CodeIndexSimilarTargetV1::SymbolOccurrence(
+                tracedecay_domain::SymbolOccurrenceId::new("symbol.similar")
+                    .expect("symbol occurrence id"),
+            ),
+            source_extent: tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
+            match_classes: vec![
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
+                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
+            ],
+            result_limit: 2,
+            work_limit: 3,
+            cursor: cursor.map(str::to_owned),
+            authority: None,
+            deadline: None,
+            cancellation: None,
+        }
+    }
+
+    #[test]
+    fn similar_first_page_accepts_exact_and_near_match_classes() {
+        assert!(similar_request_is_valid(&similar_page_request(None)));
+    }
+
+    #[test]
+    fn similar_second_page_keeps_all_match_classes_with_a_cursor() {
+        let request = similar_page_request(Some("ccclone2.authenticated"));
+        assert!(similar_request_is_valid(&request));
+        assert_eq!(request.match_classes.len(), 2);
+    }
+
+    #[test]
+    fn similar_empty_cursor_is_rejected_before_generation_admission() {
+        assert!(!similar_request_is_valid(&similar_page_request(Some(" "))));
+    }
+
     #[test]
     fn similar_stale_generation_is_retryable_generation_unavailable() {
         for error in [
@@ -1957,17 +2005,23 @@ mod tests {
     }
 
     #[test]
-    fn similar_invalid_continuation_is_invalid_request() {
-        for detail in [
-            "clone cursor position does not match an exact read",
-            "clone exact cursor does not match its artifact, key, or authority",
-            "invalid clone cursor encoding",
-        ] {
-            assert_eq!(
-                map_similar_retrieval_error(RetrievalPortError::Contract(detail.to_owned())),
-                CodeIndexSearchUnavailableReasonV1::InvalidRequest
-            );
-        }
+    fn similar_tampered_cursor_is_invalid_request() {
+        assert_eq!(
+            map_similar_retrieval_error(RetrievalPortError::Contract(
+                "clone cursor authentication failed".to_owned(),
+            )),
+            CodeIndexSearchUnavailableReasonV1::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn similar_cursor_query_mismatch_is_invalid_request() {
+        assert_eq!(
+            map_similar_retrieval_error(RetrievalPortError::Contract(
+                "clone exact cursor does not match its artifact, key, or authority".to_owned(),
+            )),
+            CodeIndexSearchUnavailableReasonV1::InvalidRequest
+        );
     }
 
     #[test]

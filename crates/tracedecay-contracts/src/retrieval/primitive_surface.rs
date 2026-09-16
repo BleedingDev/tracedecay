@@ -337,9 +337,16 @@ pub struct SimilarSurfaceRequestV1 {
     pub project_id: ProjectId,
     pub repository_id: RepositoryId,
     pub target: SimilarTargetV1,
+    /// Verified exact/near classes requested by this read. A continuation
+    /// keeps the complete class set from the first page; the authenticated
+    /// cursor selects the lane position, so a cursor is valid even when this
+    /// vector contains both classes.
     pub match_classes: Vec<SimilarMatchClassV1>,
     pub result_limit: u32,
     pub work_limit: u32,
+    /// Opaque authenticated lane continuation. The serving owner authenticates
+    /// and binds it to the admitted request; this contract only rejects an
+    /// empty token before it reaches the owner.
     pub cursor: Option<String>,
     /// Optional source extent. Omitted means the complete verified body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,9 +354,34 @@ pub struct SimilarSurfaceRequestV1 {
 }
 
 impl SimilarSurfaceRequestV1 {
+    /// Validate request fields that are independent of a mounted generation.
+    ///
+    /// The class list is intentionally allowed to contain both exact classes
+    /// on a continuation. The cursor carries the authenticated lane position;
+    /// requiring a single class here would reject a valid second page after
+    /// an initial request that asked for exact and near evidence together.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        if self.match_classes.is_empty() {
+            return Err(ApplicationContractError::ZeroValue {
+                field: "similar match classes",
+            });
+        }
+        if self
+            .cursor
+            .as_deref()
+            .is_some_and(|cursor| cursor.trim().is_empty())
+        {
+            return Err(ApplicationContractError::InvalidIdentifier {
+                field: "similar cursor",
+            });
+        }
+        Ok(())
+    }
+
     pub fn validated_source_extent(
         &self,
     ) -> Result<SimilarSourceExtentV1, ApplicationContractError> {
+        self.validate()?;
         let extent = SimilarSourceExtentV1::or_whole_body(self.source_extent.clone());
         extent.validate()?;
         Ok(extent)
@@ -1393,6 +1425,49 @@ mod tests {
             serde_json::to_value(&request).expect("request JSON")["source_extent"],
             json!({"kind": "selected_token_range", "start": 8, "end": 21})
         );
+    }
+
+    #[test]
+    fn similar_continuation_preserves_multiple_match_classes() {
+        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
+            "project_id": "project.similar",
+            "repository_id": "repository.similar",
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": "symbol.similar"
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 1,
+            "work_limit": 2,
+            "cursor": "ccclone2.authenticated"
+        }))
+        .expect("multi-class continuation decodes");
+
+        request
+            .validate()
+            .expect("multi-class continuation is a valid request shape");
+        request
+            .validated_source_extent()
+            .expect("multi-class continuation keeps the default extent");
+    }
+
+    #[test]
+    fn similar_request_rejects_empty_continuation_before_serving() {
+        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
+            "project_id": "project.similar",
+            "repository_id": "repository.similar",
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": "symbol.similar"
+            },
+            "match_classes": ["conservative_exact"],
+            "result_limit": 1,
+            "work_limit": 2,
+            "cursor": ""
+        }))
+        .expect("empty continuation decodes as opaque wire input");
+
+        assert!(request.validate().is_err());
     }
 
     #[test]
