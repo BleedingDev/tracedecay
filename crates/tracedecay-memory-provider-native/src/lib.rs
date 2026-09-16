@@ -15,9 +15,9 @@
 //! It owns no database, index, scoring, curation, privacy, graph, or persistence
 //! state. A future composition mount supplies the existing owner-bound Native
 //! application port. The adapter validates the stable Native provider identity,
-//! routes provider operations to narrow port methods, preserves canonical call
-//! bytes and exact scope unchanged, and rejects undeclared optional operations
-//! locally before contacting Native operation authority.
+//! projects the port's descriptor to the capabilities it can map losslessly,
+//! preserves canonical call bytes and exact scope unchanged, and rejects
+//! unsupported operations locally before contacting Native operation authority.
 //!
 //! Observation classification happens here — an admitted envelope is parsed
 //! into one typed [`NativeObservation`] variant — but the durable consequence
@@ -39,6 +39,19 @@ use tracedecay_memory_provider_api::{
 
 /// Stable logical provider identity for TraceDecay Native memory.
 pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
+
+/// Capability IDs the generic Native adapter can currently map without
+/// fabricating a provider-local authority.
+///
+/// The application port may expose additional typed Native routes, but those
+/// routes are not generic provider capabilities. In particular, the adapter
+/// does not advertise temporal recall, lifecycle controls, snapshots, replay,
+/// or canonical fact writes until each has an exact provider-local mapping.
+pub const NATIVE_PROVIDER_CAPABILITY_IDS: &[&str] = &[
+    "provider.health.v1",
+    "observation.accept.v1",
+    "recall.query.v1",
+];
 
 /// Recall candidate scope bindings the host authorizes Native to attest, in
 /// the wire vocabulary of `tracedecay.memory.provider.recall.v1`
@@ -276,28 +289,32 @@ pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// evidence, temporal state, and provenance in the canonical payload.
     fn recall(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Records one declared optional Native feedback operation.
+    /// Records one typed Native feedback operation.
+    ///
+    /// This port method is intentionally broader than the current generic
+    /// adapter projection. The adapter does not invoke it until a lossless
+    /// provider-local mapping is declared.
     fn feedback(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Runs one declared optional Native maintenance operation.
+    /// Runs one typed Native maintenance operation.
     fn maintenance(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Performs one declared optional redacted Native inspection.
+    /// Performs one typed redacted Native inspection.
     fn inspection(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Applies one declared optional Native correction.
+    /// Applies one typed Native correction.
     fn correction(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Deletes Native memory admitted under one declared source identity.
+    /// Deletes Native memory admitted under one typed source identity.
     fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Exports one declared optional Native snapshot.
+    /// Exports one typed Native snapshot.
     fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Restores one declared optional Native snapshot.
+    /// Restores one typed Native snapshot.
     fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Applies one declared optional deterministic Native replay.
+    /// Applies one typed deterministic Native replay.
     fn replay(&self, call: &ProviderCall) -> ProviderReply;
 }
 
@@ -314,16 +331,20 @@ impl NativeProvider {
     /// Constructs a Native provider only when the supplied port declares the
     /// stable Native identity and the mandatory provider capabilities.
     pub fn new(port: Arc<dyn NativeMemoryApplicationPort>) -> Result<Self, NativeAdapterError> {
-        let descriptor = port.descriptor();
+        let port_descriptor = port.descriptor();
+        port_descriptor
+            .validate()
+            .map_err(NativeAdapterError::InvalidDescriptor)?;
+        if port_descriptor.provider_id.as_str() != NATIVE_PROVIDER_ID {
+            return Err(NativeAdapterError::ProviderIdMismatch {
+                expected: NATIVE_PROVIDER_ID,
+                declared: port_descriptor.provider_id.as_str().to_owned(),
+            });
+        }
+        let descriptor = project_descriptor(port_descriptor);
         descriptor
             .validate()
             .map_err(NativeAdapterError::InvalidDescriptor)?;
-        if descriptor.provider_id.as_str() != NATIVE_PROVIDER_ID {
-            return Err(NativeAdapterError::ProviderIdMismatch {
-                expected: NATIVE_PROVIDER_ID,
-                declared: descriptor.provider_id.as_str().to_owned(),
-            });
-        }
         let state_generation = AtomicU64::new(descriptor.state_generation);
         Ok(Self {
             port,
@@ -343,9 +364,13 @@ impl NativeProvider {
         if self.descriptor_drifted.load(Ordering::Acquire) {
             return None;
         }
-        let candidate = self.port.descriptor();
-        if candidate.validate().is_err() || !same_immutable_descriptor(&self.descriptor, &candidate)
-        {
+        let port_candidate = self.port.descriptor();
+        if port_candidate.validate().is_err() {
+            self.descriptor_drifted.store(true, Ordering::Release);
+            return None;
+        }
+        let candidate = project_descriptor(port_candidate);
+        if !same_immutable_descriptor(&self.descriptor, &candidate) {
             self.descriptor_drifted.store(true, Ordering::Release);
             return None;
         }
@@ -469,21 +494,13 @@ impl NativeProvider {
         if payload_contract != expected_payload_contract {
             return Err(ObservationParseError::KindContractMismatch);
         }
-        // Common structured observations require retained original-source
-        // attribution and use the staged projection. Legacy session messages
-        // and canonical fact promotion retain their existing distinct variants.
+        // Only the session message has a provider-local staged projection.
+        // Fact promotion remains verification-only. Structured common
+        // observations need a distinct Native authority and stay unsupported
+        // until that mapping is implemented.
         let staged = match observation_kind.as_str() {
             NATIVE_FACT_PROMOTION_OBSERVATION_KIND => false,
             NATIVE_STAGED_SESSION_OBSERVATION_KIND => true,
-            "source.edit_settled.v1"
-            | "test.execution_settled.v1"
-            | "feedback.outcome_settled.v1"
-                if envelope
-                    .pointer("/source_identity/original_source")
-                    .is_some() =>
-            {
-                true
-            }
             _ => return Err(ObservationParseError::UnsupportedKind),
         };
         let envelope = NativeObservationEnvelope {
@@ -570,7 +587,26 @@ impl MemoryProvider for NativeProvider {
                 "native.descriptor_drift",
             );
         }
-        self.port.handshake(request)
+        let mut response = self.port.handshake(request);
+        if let Some(descriptor) = response.descriptor.take() {
+            if descriptor.validate().is_err() {
+                return self.reject_handshake(
+                    request,
+                    TerminalCode::ContractViolation,
+                    "native.handshake_descriptor_invalid",
+                );
+            }
+            let projected = project_descriptor(descriptor);
+            if !same_immutable_descriptor(&self.descriptor, &projected) {
+                return self.reject_handshake(
+                    request,
+                    TerminalCode::ContractViolation,
+                    "native.handshake_descriptor_drift",
+                );
+            }
+            response.descriptor = Some(projected);
+        }
+        response
     }
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
@@ -658,6 +694,15 @@ impl MemoryProvider for NativeProvider {
             ),
         }
     }
+}
+
+fn project_descriptor(mut descriptor: ProviderDescriptor) -> ProviderDescriptor {
+    descriptor.capabilities.retain(|capability| {
+        NATIVE_PROVIDER_CAPABILITY_IDS
+            .iter()
+            .any(|supported| *supported == capability.as_str())
+    });
+    descriptor
 }
 
 fn same_immutable_descriptor(left: &ProviderDescriptor, right: &ProviderDescriptor) -> bool {

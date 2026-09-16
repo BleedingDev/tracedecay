@@ -18,7 +18,7 @@ use tracedecay_memory_provider_api::{
 };
 use tracedecay_memory_provider_native::{
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+    NATIVE_PROVIDER_CAPABILITY_IDS, NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
     NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeAdapterError, NativeMemoryApplicationPort,
     NativeObservation, NativeProvider, OBSERVATION_CONTRACT_ID,
 };
@@ -518,16 +518,13 @@ fn descriptor_generation_advances_without_changing_immutable_fields() {
 
     let descriptor = provider.descriptor();
     assert_eq!(descriptor.state_generation, 8);
-    assert!(descriptor.supports("feedback.record.v1"));
+    assert!(!descriptor.supports("feedback.record.v1"));
     assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 2);
 
-    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+    let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
     let reply = provider.invoke(&request);
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(
-        port.counters.operation_calls(ProviderOperation::Feedback),
-        1
-    );
+    assert_eq!(port.counters.operation_calls(ProviderOperation::Health), 1);
     assert_eq!(port.counters.descriptor.load(Ordering::Relaxed), 3);
 }
 
@@ -540,7 +537,7 @@ fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
         if drift == "capability" {
             drifted
                 .capabilities
-                .retain(|capability| capability.as_str() != "feedback.record.v1");
+                .retain(|capability| capability.as_str() != "recall.query.v1");
         } else {
             drifted.provider_id = OwnedProviderId::new("vendor.memory").expect("drifted id");
         }
@@ -554,9 +551,9 @@ fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
         let descriptor = provider.descriptor();
         assert_eq!(descriptor.provider_id.as_str(), NATIVE_PROVIDER_ID);
         assert_eq!(descriptor.state_generation, 7);
-        assert!(descriptor.supports("feedback.record.v1"));
+        assert!(!descriptor.supports("feedback.record.v1"));
 
-        let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Feedback);
+        let request = call(NATIVE_PROVIDER_ID, ProviderOperation::Health);
         let reply = provider.invoke(&request);
         assert_eq!(
             reply.terminal.terminal_code(),
@@ -567,7 +564,7 @@ fn descriptor_immutable_drift_is_blocked_before_operation_dispatch() {
             Some("native.descriptor_drift")
         );
         assert_eq!(
-            port.counters.operation_calls(ProviderOperation::Feedback),
+            port.counters.operation_calls(ProviderOperation::Health),
             0
         );
     }
@@ -642,16 +639,30 @@ fn descriptor_drift_remains_latched_after_the_port_recovers() {
 fn descriptor_is_owned_by_the_application_port() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
     let provider = NativeProvider::new(port).expect("adapter");
+    let descriptor = provider.descriptor();
+    assert_eq!(descriptor.provider_id.as_str(), NATIVE_PROVIDER_ID);
+    assert_eq!(descriptor.implementation_identity_sha256, ZERO_SHA);
+    assert!(descriptor.supports("provider.health.v1"));
     assert_eq!(
-        provider.descriptor().provider_id.as_str(),
-        NATIVE_PROVIDER_ID
+        descriptor
+            .capabilities
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<BTreeSet<_>>(),
+        NATIVE_PROVIDER_CAPABILITY_IDS.iter().copied().collect()
     );
-    assert!(provider.descriptor().supports("provider.health.v1"));
 }
 
 #[test]
 fn handshake_preserves_exact_scope_and_request_identity() {
-    let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &[]));
+    let optional_capabilities = optional_provider_operations()
+        .iter()
+        .map(|(_, capability)| *capability)
+        .collect::<Vec<_>>();
+    let port = Arc::new(MockNativePort::new(
+        NATIVE_PROVIDER_ID,
+        &optional_capabilities,
+    ));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
     let request = handshake(NATIVE_PROVIDER_ID);
     let response = provider.handshake(&request);
@@ -685,6 +696,16 @@ fn handshake_preserves_exact_scope_and_request_identity() {
         request.exact_scope.exact_scope_sha256()
     );
     assert_eq!(response.accepted_scope, Some(request.exact_scope.clone()));
+    let response_descriptor = response.descriptor.expect("projected descriptor");
+    let response_capabilities = response_descriptor
+        .capabilities
+        .iter()
+        .map(|value| value.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        response_capabilities,
+        NATIVE_PROVIDER_CAPABILITY_IDS.iter().copied().collect()
+    );
     assert_eq!(port.counters.handshake.load(Ordering::Relaxed), 1);
     let recorded = port
         .last_handshake
@@ -869,8 +890,7 @@ fn mutated_operation_envelopes_fail_before_all_native_contact() {
 
 #[test]
 fn wrong_payload_contract_for_every_invokable_operation_is_invalid_without_port_contact() {
-    let optional_operations = optional_provider_operations();
-    let capabilities = optional_operations
+    let capabilities = optional_provider_operations()
         .iter()
         .map(|(_, capability)| *capability)
         .collect::<Vec<_>>();
@@ -878,10 +898,11 @@ fn wrong_payload_contract_for_every_invokable_operation_is_invalid_without_port_
     let provider = NativeProvider::new(port.clone()).expect("adapter");
     let descriptor_calls = port.counters.descriptor.load(Ordering::Relaxed);
 
-    for operation in all_provider_operations()
-        .into_iter()
-        .filter(|operation| *operation != ProviderOperation::Handshake)
-    {
+    for operation in [
+        ProviderOperation::Health,
+        ProviderOperation::Observe,
+        ProviderOperation::Recall,
+    ] {
         let mut request = call(NATIVE_PROVIDER_ID, operation);
         let wrong_contract_id =
             if operation_contract_id(operation) == "tracedecay.memory.provider.recall.v1" {
@@ -998,7 +1019,7 @@ fn supported_mandatory_operations_route_without_payload_transformation() {
 }
 
 #[test]
-fn declared_optional_operations_route_only_to_their_dedicated_ports() {
+fn port_declared_optional_operations_remain_hidden_without_lossless_mapping() {
     let optional_operations = optional_provider_operations();
     let capabilities = optional_operations
         .iter()
@@ -1007,33 +1028,13 @@ fn declared_optional_operations_route_only_to_their_dedicated_ports() {
     let port = Arc::new(MockNativePort::new(NATIVE_PROVIDER_ID, &capabilities));
     let provider = NativeProvider::new(port.clone()).expect("adapter");
 
-    for (operation_index, (operation, _)) in optional_operations.into_iter().enumerate() {
+    for (operation, capability) in optional_operations {
         let request = call(NATIVE_PROVIDER_ID, operation);
         let reply = provider.invoke(&request);
         assert_eq!(reply.terminal.operation(), request.operation);
         assert_eq!(reply.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
-        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-        if operation.mutates_provider_state() {
-            assert_eq!(
-                reply.terminal.committed_effect().state(),
-                CommittedEffectState::Committed
-            );
-            assert_eq!(
-                reply.terminal.committed_effect().state_generation_after(),
-                Some(request.expected_state_generation + 1)
-            );
-            assert_eq!(reply.terminal.provider_receipt_sha256(), Some(ONE_SHA));
-        } else {
-            assert_eq!(
-                reply.terminal.committed_effect().state(),
-                CommittedEffectState::None
-            );
-            assert_eq!(
-                reply.terminal.committed_effect().state_generation_after(),
-                Some(request.expected_state_generation)
-            );
-            assert_eq!(reply.terminal.provider_receipt_sha256(), None);
-        }
+        assert_eq!(reply.terminal.terminal_code(), TerminalCode::CapabilityUnsupported);
+        assert!(!provider.descriptor().supports(capability));
         assert_eq!(
             reply.terminal.committed_effect().state_generation_before(),
             Some(request.expected_state_generation)
@@ -1042,16 +1043,11 @@ fn declared_optional_operations_route_only_to_their_dedicated_ports() {
             reply.terminal.fallback().eligibility(),
             FallbackEligibility::Forbidden
         );
+        assert_eq!(reply.terminal.diagnostic_id(), Some("native.capability_unsupported"));
+    }
 
-        for (counter_index, (routed_operation, _)) in
-            optional_provider_operations().into_iter().enumerate()
-        {
-            assert_eq!(
-                port.counters.operation_calls(routed_operation),
-                usize::from(counter_index <= operation_index),
-                "{operation:?} reached the wrong application-port method"
-            );
-        }
+    for operation in optional_provider_operations().map(|(operation, _)| operation) {
+        assert_eq!(port.counters.operation_calls(operation), 0);
     }
 }
 
@@ -1305,7 +1301,7 @@ fn known_unaccepted_observation_kinds_are_refused_without_native_contact() {
         (
             "source.edit_settled.v1",
             "tracedecay.memory.observation.source-edit.v1",
-            "e89eeb143ab42fbd4d1c6af64581bf4081fec37445c631abb2285ddede317fea",
+            "9360d2374c774069b1bf681a6eca31d17e15cee4c52d5374029f8f7c4bb7507e",
         ),
         (
             "test.execution_settled.v1",
@@ -1335,9 +1331,15 @@ fn known_unaccepted_observation_kinds_are_refused_without_native_contact() {
     ];
 
     for (kind, payload_contract, payload_sha256) in cases {
-        let json = format!(
-            "{{\"canonical_payload\":{{\"event\":\"staged\"}},\"observation_kind\":\"{kind}\",\"payload_contract\":\"{payload_contract}\"}}"
-        );
+        let json = if kind == "source.edit_settled.v1" {
+            format!(
+                "{{\"canonical_payload\":{{\"event\":\"staged\"}},\"observation_kind\":\"{kind}\",\"payload_contract\":\"{payload_contract}\",\"source_identity\":{{\"original_source\":\"source-a\"}}}}"
+            )
+        } else {
+            format!(
+                "{{\"canonical_payload\":{{\"event\":\"staged\"}},\"observation_kind\":\"{kind}\",\"payload_contract\":\"{payload_contract}\"}}"
+            )
+        };
         let reply = provider.invoke(&observation_call(&json, payload_sha256));
         assert_eq!(
             reply.terminal.terminal_code(),
@@ -1591,6 +1593,8 @@ fn descriptor_capabilities_are_deterministically_ordered() {
         .iter()
         .map(|value| value.as_str())
         .collect::<BTreeSet<_>>();
-    assert!(capabilities.contains("feedback.record.v1"));
-    assert!(capabilities.contains("snapshot.export.v1"));
+    assert_eq!(
+        capabilities,
+        NATIVE_PROVIDER_CAPABILITY_IDS.iter().copied().collect()
+    );
 }
