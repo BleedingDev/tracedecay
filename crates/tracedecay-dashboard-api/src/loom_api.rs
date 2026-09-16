@@ -378,7 +378,8 @@ async fn read_temporal(
 
     let generation_sql = format!(
         "{PAGE_CTE}
-         SELECT COUNT(*) AS active_generations, MAX(generation.activated_at) AS latest_activated_at
+         SELECT COUNT(DISTINCT generation.session_id) AS active_generations,
+                MAX(generation.activated_at) AS latest_activated_at
          FROM session_temporal_generations generation
          JOIN page p ON p.session_id = generation.session_id
          WHERE generation.state = 'active'"
@@ -806,8 +807,12 @@ fn providers(rows: &[Value]) -> Vec<String> {
 
 fn matched_sessions(rows: &[Value]) -> u64 {
     rows.iter()
-        .filter_map(|row| row.get("session_id").and_then(Value::as_str))
-        .map(str::to_string)
+        .filter_map(|row| {
+            Some((
+                row.get("provider").and_then(Value::as_str)?,
+                row.get("session_id").and_then(Value::as_str)?,
+            ))
+        })
         .collect::<BTreeSet<_>>()
         .len() as u64
 }
@@ -1042,6 +1047,74 @@ mod tests {
                 .is_some_and(|reason| reason.contains("session-git-evidence:test")),
             "the serving generation must be named: {:?}",
             sources.branch_worktree.reason
+        );
+    }
+
+    #[test]
+    fn matched_sessions_deduplicates_by_provider_and_session_id() {
+        let rows = vec![
+            json!({"provider": "cursor", "session_id": "shared"}),
+            json!({"provider": "claude", "session_id": "shared"}),
+            json!({"provider": "cursor", "session_id": "shared"}),
+        ];
+
+        assert_eq!(matched_sessions(&rows), 2);
+    }
+
+    #[tokio::test]
+    async fn temporal_generation_count_deduplicates_shared_session_ids_across_providers() {
+        let directory = tempfile::tempdir().expect("create Loom test directory");
+        let conn = tracedecay_runtime_core::db::engine::TestConnection::open(
+            &directory.path().join("sessions.db"),
+        );
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                title TEXT,
+                started_at INTEGER,
+                ended_at INTEGER,
+                is_subagent INTEGER NOT NULL,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY(provider, session_id)
+             );
+             CREATE TABLE session_messages (
+                provider TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp INTEGER,
+                model TEXT,
+                PRIMARY KEY(provider, message_id)
+             );
+             CREATE TABLE session_temporal_generations (
+                session_id TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                activated_at INTEGER
+             );
+             INSERT INTO sessions(
+                provider, session_id, title, started_at, ended_at,
+                is_subagent, metadata_json
+             ) VALUES
+                ('cursor', 'shared', 'Cursor session', 2, NULL, 0, '{}'),
+                ('claude', 'shared', 'Claude session', 1, NULL, 0, '{}');
+             INSERT INTO session_temporal_generations(
+                session_id, generation, state, activated_at
+             ) VALUES ('shared', 1, 'active', 3);",
+        )
+        .await
+        .expect("seed Loom temporal fixture");
+
+        let read = read_temporal(&conn, DEFAULT_LIMIT, 0, GitCorrelationSourceReadV1::Absent)
+            .await
+            .expect("read Loom temporal fixture");
+
+        assert_eq!(read.examined_sessions, 2);
+        assert_eq!(read.payload.temporal_refresh.active_generations, 1);
+        assert_eq!(
+            read.payload.temporal_refresh.state,
+            DashboardDomainStateV1::Partial,
+            "one global generation should not satisfy both provider-scoped page rows"
         );
     }
 }
