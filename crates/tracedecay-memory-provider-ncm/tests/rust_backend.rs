@@ -2117,13 +2117,19 @@ mod enabled {
         );
         assert_eq!(correction.terminal.terminal_code(), TerminalCode::Success);
 
-        let maintenance = invoke_after_handshake(
+        let maintenance = adapter.invoke(&canonical_lifecycle_call(
             &adapter,
             &exact_scope,
             ProviderOperation::Maintenance,
             Some("maintenance-checkpoint"),
-            json!({"kind": "checkpoint"}),
-        );
+            json!({
+                "task": "consolidate",
+                "maximum_items": 64,
+                "maximum_bytes": 65_536,
+                "maximum_duration_millis": 1_000,
+                "dry_run": false
+            }),
+        ));
         assert_eq!(maintenance.terminal.terminal_code(), TerminalCode::Success);
 
         let inspection = invoke_after_handshake(

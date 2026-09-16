@@ -4,7 +4,7 @@ mod control;
 mod mutation;
 mod observe;
 mod portability;
-mod recovery;
+pub(crate) mod recovery;
 mod selection;
 mod util;
 

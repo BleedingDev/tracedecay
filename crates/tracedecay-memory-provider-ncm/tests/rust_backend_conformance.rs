@@ -150,10 +150,7 @@ mod enabled {
             self.inner.descriptor()
         }
 
-        fn handshake(
-            &self,
-            request: &NcmSurfaceHandshakeRequest,
-        ) -> NcmSurfaceHandshakeResponse {
+        fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
             self.inner.handshake(request)
         }
 
@@ -375,6 +372,87 @@ mod enabled {
             CancellationToken::new(),
             10_000,
         )
+    }
+
+    fn scope_value(exact_scope: &OwnedExactScope) -> Value {
+        json!({
+            "profile_id": exact_scope.profile_id,
+            "project_id": exact_scope.project_id,
+            "repository_identity": exact_scope.repository_identity,
+            "worktree_identity": exact_scope.worktree_identity,
+            "branch_identity": exact_scope.branch_identity,
+            "agent_session_id": exact_scope.agent_session_id,
+            "resolved_scope_digest": exact_scope.resolved_scope_digest,
+        })
+    }
+
+    fn common_maintenance_call(
+        exact_scope: &OwnedExactScope,
+        receipt: &str,
+        generation: u64,
+        idempotency_key: &str,
+        task: &str,
+        maximum_items: u64,
+        resume_cursor: Option<&str>,
+    ) -> ProviderCall {
+        let mut call = call(
+            ProviderOperation::Maintenance,
+            exact_scope,
+            receipt,
+            generation,
+            Some(idempotency_key),
+            json!({}),
+        );
+        let common_request = json!({
+            "provider_id": NCM_PROVIDER_ID,
+            "registration_revision": REGISTRATION_REVISION,
+            "ready_receipt_digest": receipt,
+            "exact_scope_identity": scope_value(exact_scope),
+            "operation_id": call.operation_id,
+            "idempotency_key": idempotency_key,
+            "expected_state_generation": generation,
+            "request_identity": call.request_id,
+            "policy_revision": 1,
+            "deadline": {
+                "deadline_utc_micros": i64::MAX,
+                "remaining_millis": 10_000,
+            },
+            "cancellation": "live",
+            "extensions": [],
+        });
+        call.payload = canonical_payload(
+            operation_contract(ProviderOperation::Maintenance),
+            json!({
+                "common_request": common_request,
+                "task": task,
+                "maximum_items": maximum_items,
+                "maximum_bytes": 1_048_576,
+                "maximum_duration_millis": 60_000,
+                "dry_run": false,
+                "resume_cursor": resume_cursor,
+            }),
+        );
+        call
+    }
+
+    fn invoke_common_maintenance(
+        provider: &dyn MemoryProvider,
+        exact_scope: &OwnedExactScope,
+        idempotency_key: &str,
+        task: &str,
+        maximum_items: u64,
+        resume_cursor: Option<&str>,
+    ) -> ProviderReply {
+        let (receipt, generation) = ready_parts(provider, exact_scope);
+        provider.invoke(&common_maintenance_call(
+            exact_scope,
+            &receipt,
+            generation,
+            idempotency_key,
+            task,
+            maximum_items,
+            resume_cursor,
+        ))
     }
 
     fn admit_observation(call: ProviderCall) -> ProviderCall {
@@ -731,6 +809,107 @@ mod enabled {
     }
 
     #[test]
+    fn common_maintenance_pages_preserve_cursor_until_final_commit() {
+        let root = TestRoot::new("maintenance-pages");
+        let provider = adapter(&root);
+        let exact_scope = scope("project-maintenance-pages");
+        for number in 1..=3 {
+            let observed = invoke_ready(
+                provider.as_ref(),
+                &exact_scope,
+                ProviderOperation::Observe,
+                Some(&format!("maintenance-observe-{number}")),
+                observe_value(
+                    "source-maintenance-pages",
+                    &format!("maintenance key {number}"),
+                    "maintenance value",
+                ),
+            );
+            assert_eq!(observed.terminal.terminal_code(), TerminalCode::Success);
+        }
+
+        let (receipt, generation) = ready_parts(provider.as_ref(), &exact_scope);
+        let direct = provider.invoke(&call(
+            ProviderOperation::Maintenance,
+            &exact_scope,
+            &receipt,
+            generation,
+            Some("direct-maintenance-bypass"),
+            json!({"kind": "checkpoint"}),
+        ));
+        assert_eq!(
+            direct.terminal.terminal_code(),
+            TerminalCode::InvalidRequest
+        );
+        assert_eq!(
+            direct.terminal.diagnostic_id(),
+            Some("ncm.rust.maintenance_requires_common_control")
+        );
+        assert!(direct.payload.is_none());
+
+        let first = invoke_common_maintenance(
+            provider.as_ref(),
+            &exact_scope,
+            "paged-maintenance",
+            "repair",
+            1,
+            None,
+        );
+        assert_eq!(first.terminal.terminal_code(), TerminalCode::Partial);
+        assert_eq!(
+            first.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        let first_payload = response_json(&first);
+        assert_eq!(first_payload["partial"], true);
+        assert!(first_payload.get("no_change").is_none());
+        let first_cursor = first_payload["resume_cursor"]
+            .as_str()
+            .expect("first maintenance cursor")
+            .to_owned();
+
+        let second = invoke_common_maintenance(
+            provider.as_ref(),
+            &exact_scope,
+            "paged-maintenance",
+            "repair",
+            1,
+            Some(&first_cursor),
+        );
+        assert_eq!(second.terminal.terminal_code(), TerminalCode::Partial);
+        assert_eq!(
+            second.terminal.committed_effect().state(),
+            CommittedEffectState::None
+        );
+        let second_payload = response_json(&second);
+        assert_eq!(second_payload["partial"], true);
+        let second_cursor = second_payload["resume_cursor"]
+            .as_str()
+            .expect("second maintenance cursor")
+            .to_owned();
+        assert_ne!(second_cursor, first_cursor);
+
+        let completed = invoke_common_maintenance(
+            provider.as_ref(),
+            &exact_scope,
+            "paged-maintenance",
+            "repair",
+            1,
+            Some(&second_cursor),
+        );
+        assert_eq!(completed.terminal.terminal_code(), TerminalCode::Success);
+        assert_eq!(
+            completed.terminal.committed_effect().state(),
+            CommittedEffectState::Committed
+        );
+        let completed_payload = response_json(&completed);
+        assert_eq!(completed_payload["partial"], false);
+        assert!(completed_payload["resume_cursor"].is_null());
+        assert_eq!(completed_payload["state_generation_before"], generation);
+        assert_eq!(completed_payload["state_generation_after"], generation + 1);
+    }
+
+    #[test]
     fn cancelled_calls_never_return_success_and_committed_observe_reconciles_once() {
         let root = TestRoot::new("cancel");
         let provider = cancel_after_commit_adapter(&root);
@@ -876,13 +1055,8 @@ mod enabled {
             ("privacy-merge", "merge_prune"),
             ("privacy-checkpoint", "checkpoint"),
         ] {
-            let reply = invoke_ready(
-                provider.as_ref(),
-                &exact_scope,
-                ProviderOperation::Maintenance,
-                Some(key),
-                json!({"kind": kind}),
-            );
+            let reply =
+                invoke_common_maintenance(provider.as_ref(), &exact_scope, key, kind, 100, None);
             assert_eq!(
                 reply.terminal.terminal_code(),
                 TerminalCode::Success,

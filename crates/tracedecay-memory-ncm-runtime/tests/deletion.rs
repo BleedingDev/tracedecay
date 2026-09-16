@@ -617,6 +617,52 @@ fn interrupted_deletion_resumes_before_serving_and_bumps_epoch_once() {
 }
 
 #[test]
+fn corrupted_pending_rebuild_journal_fails_closed_without_publishing_recallable_state() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(
+        &engine, &namespace, "source-a", "retained", "value", "retained",
+    );
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("fault arms");
+    let interrupted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "corrupt-pending-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+    drop(engine);
+
+    let connection = Connection::open(sqlite_path(&tempdir, &namespace))
+        .expect("store opens for corruption fixture");
+    connection
+        .execute(
+            "UPDATE events SET payload_sha256 = ?1 WHERE kind = 'deletion_fence'",
+            ["00".repeat(32)],
+        )
+        .expect("fence payload corruption writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let handshake = reopened.handshake(&namespace);
+    assert_eq!(handshake.outcome, Outcome::Corrupt, "{handshake:?}");
+    let recalled = reopened.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(!matches!(recalled.outcome, Outcome::Success));
+    assert_eq!(recalled.payload, Value::Null);
+}
+
+#[test]
 fn deleting_an_unknown_source_is_successful_and_idempotent() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();

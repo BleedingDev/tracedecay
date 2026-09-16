@@ -886,8 +886,18 @@ fn worker_reply(provider: &OwnedProviderId, call: &NcmSurfaceCall, reply: Reply)
             .payload
             .as_ref()
             .is_some_and(|payload| payload["partial"] == true);
+    let maintenance_partial = call.operation == ProviderOperation::Maintenance
+        && reply.outcome == Outcome::Success
+        && reply.payload.as_ref().is_some_and(|payload| {
+            payload["common_control"] == "maintenance" && payload["partial"] == true
+        });
     let terminal_code = if replay_partial {
         TerminalCode::PartialEffect
+    } else if maintenance_partial {
+        // Common maintenance may have scanned only one bounded page.  This is
+        // degraded coverage with a resumable cursor, not a committed partial
+        // mutation and not a terminal no-op success.
+        TerminalCode::Partial
     } else {
         outcome_terminal_code(&reply.outcome)
     };
@@ -1056,6 +1066,11 @@ fn translate_payload(call: &NcmSurfaceCall) -> Result<Value, &'static str> {
     let value: Value =
         serde_json::from_slice(&call.payload.bytes).map_err(|_| "ncm.rust.payload_invalid_json")?;
     let object = value.as_object().ok_or("ncm.rust.payload_not_object")?;
+    if call.operation == ProviderOperation::Maintenance
+        && (object.get("common_control").is_none() || object.get("common_portability").is_some())
+    {
+        return Err("ncm.rust.maintenance_requires_common_control");
+    }
     if let Some(common) = object.get("common_portability") {
         let mut common = common.clone();
         if call.operation.mutates_provider_state() {
@@ -1128,8 +1143,10 @@ fn translate_payload(call: &NcmSurfaceCall) -> Result<Value, &'static str> {
                 .ok_or("ncm.rust.correction_evidence_missing")?
         })),
         ProviderOperation::Maintenance => {
-            let kind = maintenance_kind(object)?;
-            Ok(json!({"idempotency_key": required_key(call)?, "kind": kind}))
+            // Maintenance is admitted by the common-control projector.  A raw
+            // operation payload would bypass its admission capsule, cursor
+            // binding, and expected-generation fence.
+            Err("ncm.rust.maintenance_requires_common_control")
         }
         ProviderOperation::DeleteBySource => Ok(json!({
             "idempotency_key": required_key(call)?,
@@ -1334,23 +1351,6 @@ fn observe_digest(
         "{{\"source\":{source},\"key_text\":{key_text},\"value_text\":{value_text},\"affect\":{affect},\"surprise\":{surprise},\"intensity\":{intensity},\"provenance\":{provenance}}}"
     );
     Ok(hex_digest(&Sha256::digest(bytes.as_bytes())))
-}
-
-fn maintenance_kind(object: &Map<String, Value>) -> Result<Value, &'static str> {
-    let kind = object
-        .get("kind")
-        .ok_or("ncm.rust.maintenance_kind_missing")?;
-    if kind.is_object() {
-        return Ok(kind.clone());
-    }
-    let name = kind.as_str().ok_or("ncm.rust.maintenance_kind_invalid")?;
-    match name {
-        "advance" => Ok(json!({"advance": {"ticks": u64_at(object, &["ticks"]).unwrap_or(1)}})),
-        "consolidate" | "merge_prune" | "checkpoint" | "compact" => {
-            Ok(Value::String(name.to_owned()))
-        }
-        _ => Err("ncm.rust.maintenance_kind_unsupported"),
-    }
 }
 
 fn required_key(call: &NcmSurfaceCall) -> Result<&str, &'static str> {

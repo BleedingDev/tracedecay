@@ -347,6 +347,40 @@ fn maintenance_cursor_retries_reconcile_before_stale_generation_checks() {
 }
 
 #[test]
+fn maintenance_cursor_rejects_resume_after_generation_advance() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    let generation = seed(&live, "beta").state_generation;
+    let mut page = request("stale-maintenance", "repair", generation);
+    page["maximum_items"] = json!(1);
+    seal(
+        &mut page,
+        "stale-maintenance",
+        "01993262-4d00-7000-8000-000000000003",
+    );
+    let partial = invoke(&live, page.clone());
+    assert_eq!(partial.outcome, Outcome::Success, "{partial:?}");
+    assert_eq!(partial.payload["partial"], true);
+    page["resume_cursor"] = partial.payload["resume_cursor"].clone();
+
+    let advanced = seed(&live, "gamma").state_generation;
+    assert_eq!(advanced, generation + 1);
+    seal(
+        &mut page,
+        "stale-maintenance",
+        "01993262-4d00-7000-8000-000000000004",
+    );
+    let stale = invoke(&live, page);
+    assert_eq!(
+        stale.outcome,
+        Outcome::Rejected(RejectReason::IdempotencyConflict)
+    );
+    assert_eq!(stale.state_generation, advanced);
+    assert_eq!(state(&live).state_generation, advanced);
+}
+
+#[test]
 fn maintenance_receipt_survives_snapshot_restore_and_privacy_rebuild() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

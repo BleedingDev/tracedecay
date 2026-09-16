@@ -720,6 +720,66 @@ impl NcmProviderAdapter {
         )
     }
 
+    fn valid_maintenance_partial_payload(reply: &ProviderReply) -> bool {
+        reply
+            .payload
+            .as_ref()
+            .and_then(|payload| serde_json::from_slice::<Value>(&payload.bytes).ok())
+            .is_some_and(|payload| {
+                payload["common_control"].as_str() == Some("maintenance")
+                    && payload["no_change"] == true
+                    && payload["partial"] == true
+                    && payload["state_generation_before"]
+                        .as_u64()
+                        .is_some_and(|generation| generation == reply.state_generation)
+                    && payload["state_generation_after"]
+                        .as_u64()
+                        .is_some_and(|generation| generation == reply.state_generation)
+                    && payload["resume_cursor"]
+                        .as_str()
+                        .is_some_and(|cursor| !cursor.is_empty())
+            })
+    }
+
+    fn valid_maintenance_partial_cursor(payload: &Value, surface_call: &NcmSurfaceCall) -> bool {
+        let Some(cursor) = payload["resume_cursor"].as_str() else {
+            return false;
+        };
+        if cursor.is_empty() || cursor.len() > 1024 {
+            return false;
+        }
+        let prefix = format!("ncm-maintenance:{}:", surface_call.namespace.as_str());
+        let Some(remainder) = cursor.strip_prefix(&prefix) else {
+            return false;
+        };
+        let mut parts = remainder.split(':');
+        let Some(task) = parts.next() else {
+            return false;
+        };
+        if !matches!(
+            task,
+            "consolidate" | "decay" | "prune_expired" | "validate_state" | "repair" | "compact"
+        ) {
+            return false;
+        }
+        let Some(generation_text) = parts.next() else {
+            return false;
+        };
+        let Some(after_text) = parts.next() else {
+            return false;
+        };
+        let Some(generation) = generation_text.parse::<u64>().ok() else {
+            return false;
+        };
+        let Some(after) = after_text.parse::<u64>().ok() else {
+            return false;
+        };
+        generation.to_string() == generation_text
+            && after <= i64::MAX as u64
+            && after.to_string() == after_text
+            && parts.next().is_none()
+    }
+
     fn valid_terminal_semantics(
         call: &ProviderCall,
         surface_call: &NcmSurfaceCall,
@@ -761,11 +821,15 @@ impl NcmProviderAdapter {
                     TerminalCode::PartialEffect | TerminalCode::EffectUnknown
                 );
         }
-        if matches!(
-            terminal_code,
-            TerminalCode::SuccessZeroResults | TerminalCode::Partial
-        ) {
+        if terminal_code == TerminalCode::SuccessZeroResults {
             return false;
+        }
+        if terminal_code == TerminalCode::Partial {
+            return call.operation == ProviderOperation::Maintenance
+                && reply.state_generation == call.expected_state_generation
+                && committed_effect.state() == CommittedEffectState::None
+                && committed_effect.provider_receipt_sha256().is_none()
+                && Self::valid_maintenance_partial_payload(reply);
         }
         match committed_effect.state() {
             CommittedEffectState::None => {
@@ -1042,7 +1106,15 @@ impl NcmProviderAdapter {
             && reply.payload.as_ref().is_none_or(|payload| {
                 Self::valid_payload(payload, response_limit)
                     && payload.contract_id == surface_call.payload.contract_id
-                    && serde_json::from_slice::<Value>(&payload.bytes).is_ok_and(|value| {
+                    && serde_json::from_slice::<Value>(&payload.bytes).is_ok_and(|mut value| {
+                        if call.operation == ProviderOperation::Maintenance
+                            && Self::valid_maintenance_partial_payload(reply)
+                            && Self::valid_maintenance_partial_cursor(&value, surface_call)
+                        {
+                            if let Some(object) = value.as_object_mut() {
+                                object.remove("resume_cursor");
+                            }
+                        }
                         value.is_object()
                             && !json_has_exact_scope_identity(&value)
                             && !json_contains_scope_component(&value, &call.exact_scope)
@@ -1551,7 +1623,9 @@ impl MemoryProvider for NcmProviderAdapter {
                     | ProviderOperation::Correction
             ) && serde_json::from_slice::<Value>(&call.payload.bytes)
                 .is_ok_and(|value| value.get("common_request").is_some())
-                && reply.terminal.terminal_code() == TerminalCode::Success
+                && (reply.terminal.terminal_code() == TerminalCode::Success
+                    || (call.operation == ProviderOperation::Maintenance
+                        && reply.terminal.terminal_code() == TerminalCode::Partial))
                 && common::reconstruct_lifecycle(call, &mut reply, readiness).is_none()
             {
                 return Self::surface_contract_failure(call, &surface_call, &reply);

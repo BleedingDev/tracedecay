@@ -1,8 +1,9 @@
 //! Source-scoped erasure by durable fencing and deterministic sanitized replay.
 
 use crate::engine::{
-    CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, MaintenanceKind,
-    NamespaceHandle, NcmEngine, Outcome, RejectReason,
+    CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, NamespaceHandle,
+    NcmEngine, Outcome, PendingDeletionFence, RejectReason, replay_recovery_event,
+    validate_event_payload_digest, validate_pending_deletion_fence, validate_recovery_event,
 };
 use crate::ports::Deadline;
 use crate::store::{CapsuleStatus, NamespaceStore, StoreError, StoreMeta, StoredCapsule};
@@ -303,7 +304,25 @@ fn delete_sources_inner(
             json!({"rebuilding": true, "target_epoch": target_epoch}),
         );
     }
-    let report = match sanitized_replay(&handle.store, &engine.config, live.scheduler.tick.0) {
+    let pending = match validate_pending_deletion_fence(&handle.store) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return corrupt_reply(handle.commit_seq, "deletion fence disappeared"),
+        Err(reply) => return reply,
+    };
+    if pending.tick_before != live.scheduler.tick.0
+        || pending.state_digest != sha256_hex(&live.state_digest())
+    {
+        return corrupt_reply(
+            handle.commit_seq,
+            "deletion fence does not match the pre-fence scheduler state",
+        );
+    }
+    let report = match sanitized_replay(
+        &handle.store,
+        &engine.config,
+        &pending,
+        Some(&pending.state_digest),
+    ) {
         Ok(result) => result,
         Err(reply) => return reply,
     };
@@ -339,52 +358,18 @@ pub(crate) fn resume_pending_rebuild(
     store: &mut NamespaceStore,
     config: &NcmConfig,
 ) -> Result<Option<ResumedRebuild>, EngineReply> {
-    if store
-        .fenced()
-        .map_err(|error| store_reply(error, 0))?
-        .is_none()
-    {
-        return Ok(None);
-    }
-    let meta = store.meta().map_err(|error| store_reply(error, 0))?;
-    let events = store
-        .events_after(0)
-        .map_err(|error| store_reply(error, meta.commit_seq))?;
-    let pending = events.iter().rev().find_map(|event| {
-        serde_json::from_str::<DurableReceipt>(&event.receipt)
-            .ok()
-            .and_then(|receipt| match receipt.operation {
-                DurableOperation::DeletionFence {
-                    source,
-                    target_epoch,
-                    idempotency_key,
-                    payload_sha256,
-                    deleted_records,
-                } => Some((
-                    source,
-                    target_epoch,
-                    idempotency_key,
-                    payload_sha256,
-                    deleted_records,
-                    event.created_tick,
-                )),
-                _ => None,
-            })
-    });
-    let Some((source, target_epoch, idempotency_key, payload_sha256, deleted_records, tick_before)) =
-        pending
-    else {
+    let Some(pending) = validate_pending_deletion_fence(store)? else {
         return Ok(None);
     };
-    let report = sanitized_replay(store, config, tick_before)?;
+    let report = sanitized_replay(store, config, &pending, None)?;
     let (kernel, meta, _) = finish_store_rebuild(
         store,
-        source,
-        target_epoch,
-        idempotency_key,
-        payload_sha256,
+        pending.source,
+        pending.target_epoch,
+        pending.idempotency_key,
+        pending.payload_sha256,
         report,
-        deleted_records,
+        pending.deleted_records,
     )?;
     Ok(Some(ResumedRebuild { kernel, meta }))
 }
@@ -559,18 +544,35 @@ struct ReplayResult {
 fn sanitized_replay(
     store: &NamespaceStore,
     config: &NcmConfig,
-    tick_before: u64,
+    pending: &PendingDeletionFence,
+    expected_fence_state_digest: Option<&str>,
 ) -> Result<ReplayResult, EngineReply> {
+    if let Some(expected) = expected_fence_state_digest
+        && pending.state_digest != expected
+    {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "deletion fence state digest does not match the pre-fence kernel",
+        ));
+    }
     let capsules = store
         .capsules_in_commit_order(true)
-        .map_err(|error| store_reply(error, 0))?;
+        .map_err(|error| store_reply(error, pending.event_seq))?;
     let events = store
         .events_after(0)
-        .map_err(|error| store_reply(error, 0))?;
+        .map_err(|error| store_reply(error, pending.event_seq))?;
     let projections: ProjectionBundle = serde_json::from_slice(&store.identity().projection_bytes)
-        .map_err(|error| corrupt_reply(0, &format!("decode persisted projections: {error}")))?;
+        .map_err(|error| {
+            corrupt_reply(
+                pending.event_seq,
+                &format!("decode persisted projections: {error}"),
+            )
+        })?;
+    let mut validation_kernel = NcmKernel::new(store.identity().seed, config.clone())
+        .map_err(|error| core_reply(error, pending.event_seq))?;
+    validation_kernel.projections = projections.clone();
     let mut kernel = NcmKernel::new(store.identity().seed, config.clone())
-        .map_err(|error| core_reply(error, 0))?;
+        .map_err(|error| core_reply(error, pending.event_seq))?;
     kernel.projections = projections;
     let by_record = capsules
         .iter()
@@ -585,9 +587,41 @@ fn sanitized_replay(
             .count(),
     )
     .unwrap_or(u64::MAX);
+    let mut expected_seq = 1_u64;
+    let mut previous_tick = None;
+    let mut validate_state_digests = true;
     for event in events {
-        let durable: DurableReceipt = serde_json::from_str(&event.receipt)
-            .map_err(|error| corrupt_reply(event.seq, &format!("decode receipt: {error}")))?;
+        let durable = validate_recovery_event(&event, expected_seq, pending.event_seq)?;
+        validate_event_payload_digest(&event, &durable)?;
+        if previous_tick.is_some_and(|tick| event.created_tick < tick) {
+            return Err(corrupt_reply(
+                pending.event_seq,
+                "event scheduler ticks are not monotonic",
+            ));
+        }
+        previous_tick = Some(event.created_tick);
+        expected_seq = expected_seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt_reply(pending.event_seq, "event sequence overflow"))?;
+        if validate_state_digests {
+            if operation_contains_revoked_observe(&durable.operation, &by_record) {
+                validate_state_digests = false;
+            } else {
+                replay_recovery_event(
+                    &mut validation_kernel,
+                    &event,
+                    &durable.operation,
+                    &capsules,
+                    pending.event_seq,
+                )?;
+                if sha256_hex(&validation_kernel.state_digest()) != durable.state_digest {
+                    return Err(corrupt_reply(
+                        pending.event_seq,
+                        "replayed state digest mismatch",
+                    ));
+                }
+            }
+        }
         let operations = match durable.operation {
             DurableOperation::CommonControl { operations } => operations,
             operation => vec![operation],
@@ -647,13 +681,19 @@ fn sanitized_replay(
                     }
                 }
                 DurableOperation::Maintenance { kind } => {
-                    apply_maintenance(&mut kernel, &kind)
+                    crate::engine::apply_recovery_maintenance(&mut kernel, &kind)
                         .map_err(|error| core_reply(error, event.seq))?;
                 }
                 DurableOperation::DeletionFence { .. }
                 | DurableOperation::DeleteBySource { .. } => {}
             }
         }
+    }
+    if expected_seq != pending.event_seq.saturating_add(1) {
+        return Err(corrupt_reply(
+            pending.event_seq,
+            "metadata sequence is not journal-backed",
+        ));
     }
     let next_id = capsules
         .iter()
@@ -672,24 +712,27 @@ fn sanitized_replay(
         kernel,
         replayed_records,
         excluded_records,
-        tick_before,
+        tick_before: pending.tick_before,
     })
 }
 
-fn apply_maintenance(kernel: &mut NcmKernel, kind: &MaintenanceKind) -> Result<(), CoreError> {
-    match kind {
-        MaintenanceKind::Advance { ticks } => {
-            kernel.advance(*ticks)?;
-        }
-        MaintenanceKind::Consolidate => {
-            kernel.consolidate()?;
-        }
-        MaintenanceKind::MergePrune => {
-            kernel.merge_prune()?;
-        }
-        MaintenanceKind::Checkpoint | MaintenanceKind::Compact => {}
+fn operation_contains_revoked_observe(
+    operation: &DurableOperation,
+    by_record: &BTreeMap<RecordId, &StoredCapsule>,
+) -> bool {
+    match operation {
+        DurableOperation::CommonControl { operations } => operations
+            .iter()
+            .any(|operation| operation_contains_revoked_observe(operation, by_record)),
+        DurableOperation::Observe { record_id } => by_record
+            .get(record_id)
+            .is_some_and(|capsule| capsule.status == CapsuleStatus::Revoked),
+        DurableOperation::Feedback { .. }
+        | DurableOperation::Correction { .. }
+        | DurableOperation::Maintenance { .. }
+        | DurableOperation::DeletionFence { .. }
+        | DurableOperation::DeleteBySource { .. } => false,
     }
-    Ok(())
 }
 
 fn remap_record_ids(

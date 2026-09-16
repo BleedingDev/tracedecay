@@ -8,6 +8,11 @@
 mod runtime;
 
 pub(crate) use runtime::common_maintenance::portable_event as portable_common_maintenance_event;
+pub(crate) use runtime::recovery::{
+    PendingDeletionFence, apply_maintenance as apply_recovery_maintenance,
+    replay_event as replay_recovery_event, validate_event_payload_digest,
+    validate_pending_deletion_fence, validate_recovery_event,
+};
 
 use crate::ports::{Deadline, StateRoot, TextEncoder};
 use crate::store::{CommitSeq, NamespaceStore};
