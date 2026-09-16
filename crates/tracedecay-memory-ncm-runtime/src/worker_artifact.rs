@@ -183,7 +183,10 @@ fn stage_verified_file(
 
     let staging =
         TempDir::new().map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
-    tracedecay_private_fs::validate_private_directory(staging.path())
+    // `TempDir` honors the process umask and can therefore be group/world
+    // readable. Tighten the exact directory handle before creating the
+    // staged worker so the artifact remains owner-private for its lifetime.
+    tracedecay_private_fs::make_private_directory(staging.path())
         .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
     let staged_path = staging.path().join(WORKER_NAME);
     let mut staged = tracedecay_private_fs::create_private_file(&staged_path)
