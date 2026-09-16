@@ -12,8 +12,15 @@
 //! the production model gate.
 
 use crate::ports::{Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::ffi::OsStr;
+#[cfg(feature = "real-encoder")]
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -293,7 +300,11 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
             return Err(EncoderError::Cancelled);
         }
 
-        let manifest = manifest_from_cache(&models_dir)?;
+        // The manifest is derived from the cache after fastembed has proved
+        // that it can construct the model. Release the ORT session before
+        // reading the large ONNX buffer for the digest.
+        drop(_model);
+        let manifest = manifest_from_cache(&models_dir, &reference)?;
         ensure_pinned_metadata(&manifest, &reference)?;
         write_manifest(&models_dir, &manifest)?;
         let model = manifest.model.clone();
@@ -347,7 +358,6 @@ impl MiniLmEncoder {
         let local = read_manifest(&models_dir.join(MANIFEST_FILENAME), true)?;
         ensure_pinned_metadata(&local, expected)?;
         ensure_pinned_metadata(expected, &local)?;
-        verify_local_artifacts(&models_dir, &local, Some(expected.revision.as_str()))?;
         let artifact_sha256 = local.artifact_sha256().ok_or_else(|| {
             EncoderError::ArtifactMismatch("manifest has no ONNX digest".to_owned())
         })?;
@@ -359,6 +369,11 @@ impl MiniLmEncoder {
 
         #[cfg(feature = "real-encoder")]
         {
+            // `load_verified_model` reads and verifies each artifact once and
+            // passes those exact buffers to fastembed. Keeping verification
+            // and construction in one operation closes the verify-then-reopen
+            // window that could otherwise load bytes different from the ones
+            // that were hashed.
             let model = load_verified_model(&models_dir, &local)?;
             let model = fastembed::TextEmbedding::try_new_from_user_defined(
                 model,
@@ -373,6 +388,7 @@ impl MiniLmEncoder {
 
         #[cfg(not(feature = "real-encoder"))]
         {
+            verify_local_artifacts(&models_dir, &local, Some(expected.revision.as_str()))?;
             let _ = identity;
             Err(EncoderError::ArtifactsMissing(
                 "real-encoder feature is disabled".to_owned(),
@@ -470,7 +486,7 @@ impl TextEncoder for MiniLmEncoder {
 /// Named deterministic test doubles for runtime tests that do not need ORT.
 pub mod doubles {
     use super::{
-        Deadline, Embedding, EncoderError, EncoderIdentity, Sha256, TextEncoder, validate_input,
+        validate_input, Deadline, Embedding, EncoderError, EncoderIdentity, Sha256, TextEncoder,
     };
     use sha2::Digest;
     use tracedecay_memory_ncm_core::types::EMBEDDING_DIM;
@@ -558,13 +574,7 @@ fn parse_manifest(contents: &str, source: &str) -> Result<PinnedEncoder, Encoder
 }
 
 fn read_manifest(path: &Path, local: bool) -> Result<PinnedEncoder, EncoderError> {
-    let bytes = fs::read(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound && local {
-            EncoderError::ArtifactsMissing(path.display().to_string())
-        } else {
-            EncoderError::ArtifactMismatch(format!("read manifest {}: {error}", path.display()))
-        }
-    })?;
+    let bytes = read_path_file(path, local, 16 * 1024 * 1024)?;
     serde_json::from_slice(&bytes).map_err(|error| {
         EncoderError::ArtifactMismatch(format!("parse manifest {}: {error}", path.display()))
     })
@@ -703,18 +713,32 @@ fn is_safe_provenance(provenance: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+#[derive(Debug)]
+struct CacheSnapshot {
+    path: PathBuf,
+    directory: Dir,
+}
+
 fn cache_snapshot(
     models_dir: &Path,
     expected_revision: Option<&str>,
-) -> Result<PathBuf, EncoderError> {
-    let repository = models_dir.join(CACHE_REPOSITORY_DIR);
-    let revision_path = repository.join("refs").join("main");
-    let revision = fs::read_to_string(&revision_path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            EncoderError::ArtifactsMissing(revision_path.display().to_string())
-        } else {
-            EncoderError::ArtifactMismatch(format!("read cache revision: {error}"))
-        }
+) -> Result<CacheSnapshot, EncoderError> {
+    let model_directory = open_model_directory(models_dir)?;
+    let repository_path = models_dir.join(CACHE_REPOSITORY_DIR);
+    let repository = open_directory_nofollow(
+        &model_directory,
+        OsStr::new(CACHE_REPOSITORY_DIR),
+        &repository_path,
+    )?;
+    let refs_path = repository_path.join("refs");
+    let refs = open_directory_nofollow(&repository, OsStr::new("refs"), &refs_path)?;
+    let revision_path = refs_path.join("main");
+    let revision_bytes = read_file_nofollow(&refs, OsStr::new("main"), &revision_path, 256)?;
+    let revision = std::str::from_utf8(&revision_bytes).map_err(|error| {
+        EncoderError::ArtifactMismatch(format!(
+            "read cache revision {}: {error}",
+            revision_path.display()
+        ))
     })?;
     let revision = revision.trim();
     if !is_immutable_revision(revision) {
@@ -729,33 +753,36 @@ fn cache_snapshot(
             )));
         }
     }
-    let snapshot = repository.join("snapshots").join(revision);
-    if !snapshot.is_dir() {
-        return Err(EncoderError::ArtifactsMissing(
-            snapshot.display().to_string(),
-        ));
-    }
-    Ok(snapshot)
+    let snapshots_path = repository_path.join("snapshots");
+    let snapshots = open_directory_nofollow(&repository, OsStr::new("snapshots"), &snapshots_path)?;
+    let snapshot_path = snapshots_path.join(revision);
+    let directory = open_directory_nofollow(&snapshots, OsStr::new(revision), &snapshot_path)?;
+    Ok(CacheSnapshot {
+        path: snapshot_path,
+        directory,
+    })
 }
 
 #[cfg(feature = "real-encoder")]
-fn manifest_from_cache(models_dir: &Path) -> Result<PinnedEncoder, EncoderError> {
+fn manifest_from_cache(
+    models_dir: &Path,
+    expected: &PinnedEncoder,
+) -> Result<PinnedEncoder, EncoderError> {
     let snapshot = cache_snapshot(models_dir, Some(MODEL_REVISION))?;
     let mut files = Vec::with_capacity(REQUIRED_FILES.len());
     for relative in REQUIRED_FILES {
-        let path = snapshot.join(relative);
-        let metadata = fs::metadata(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                EncoderError::ArtifactsMissing(path.display().to_string())
-            } else {
-                EncoderError::Inference(format!("inspect downloaded artifact: {error}"))
-            }
-        })?;
-        let digest = digest_file(&path)?;
+        let expected_file = expected
+            .files
+            .iter()
+            .find(|file| file.path == relative)
+            .ok_or_else(|| {
+                EncoderError::ArtifactMismatch(format!("pinned manifest lacks {relative}"))
+            })?;
+        let bytes = read_snapshot_file(&snapshot, relative, expected_file.bytes)?;
         files.push(EncoderFile {
             path: relative.to_owned(),
-            sha256: digest,
-            bytes: metadata.len(),
+            sha256: digest_bytes(&bytes),
+            bytes: bytes.len() as u64,
         });
     }
     Ok(PinnedEncoder::new(
@@ -770,27 +797,7 @@ fn verify_local_artifacts(
 ) -> Result<(), EncoderError> {
     let snapshot = cache_snapshot(models_dir, expected_revision)?;
     for file in &manifest.files {
-        let path = snapshot.join(&file.path);
-        let metadata = fs::metadata(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                EncoderError::ArtifactsMissing(path.display().to_string())
-            } else {
-                EncoderError::ArtifactMismatch(format!("inspect {}: {error}", file.path))
-            }
-        })?;
-        if metadata.len() != file.bytes {
-            return Err(EncoderError::ArtifactMismatch(format!(
-                "size differs for {}",
-                file.path
-            )));
-        }
-        let digest = digest_file(&path)?;
-        if digest != file.sha256 {
-            return Err(EncoderError::ArtifactMismatch(format!(
-                "sha256 differs for {}",
-                file.path
-            )));
-        }
+        let _ = read_verified_artifact(&snapshot, file)?;
     }
     Ok(())
 }
@@ -802,14 +809,12 @@ fn load_verified_model(
 ) -> Result<fastembed::UserDefinedEmbeddingModel, EncoderError> {
     let snapshot = cache_snapshot(models_dir, Some(manifest.revision.as_str()))?;
     let read_artifact = |relative: &str| {
-        let path = snapshot.join(relative);
-        fs::read(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                EncoderError::ArtifactsMissing(path.display().to_string())
-            } else {
-                EncoderError::ArtifactMismatch(format!("read {}: {error}", relative))
-            }
-        })
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == relative)
+            .ok_or_else(|| EncoderError::ArtifactMismatch(format!("manifest lacks {relative}")))?;
+        read_verified_artifact(&snapshot, file)
     };
     let tokenizer_files = fastembed::TokenizerFiles {
         tokenizer_file: read_artifact("tokenizer.json")?,
@@ -824,28 +829,290 @@ fn load_verified_model(
     .with_pooling(fastembed::Pooling::Mean))
 }
 
-fn digest_file(path: &Path) -> Result<String, EncoderError> {
-    let mut file = fs::File::open(path).map_err(|error| {
-        EncoderError::ArtifactMismatch(format!("open {}: {error}", path.display()))
+fn open_model_directory(models_dir: &Path) -> Result<Dir, EncoderError> {
+    let parent = models_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = models_dir.file_name().ok_or_else(|| {
+        EncoderError::ArtifactMismatch(format!(
+            "model cache has no directory name: {}",
+            models_dir.display()
+        ))
     })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer).map_err(|error| {
+    let parent_directory = Dir::open_ambient_dir(parent, ambient_authority()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EncoderError::ArtifactsMissing(models_dir.display().to_string())
+        } else {
+            EncoderError::ArtifactMismatch(format!(
+                "open model cache parent {}: {error}",
+                parent.display()
+            ))
+        }
+    })?;
+    open_directory_nofollow(&parent_directory, name, models_dir)
+}
+
+fn open_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Dir, EncoderError> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EncoderError::ArtifactsMissing(path.display().to_string())
+        } else {
+            EncoderError::ArtifactMismatch(format!(
+                "open directory {} without following symlinks: {error}",
+                path.display()
+            ))
+        }
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        EncoderError::ArtifactMismatch(format!("inspect directory {}: {error}", path.display()))
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "cache component {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(Dir::from_std_file(file.into_std()))
+}
+
+fn open_file_nofollow<'a>(
+    parent: &'a Dir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<cap_std::fs::File, EncoderError> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EncoderError::ArtifactsMissing(path.display().to_string())
+        } else {
+            EncoderError::ArtifactMismatch(format!(
+                "open artifact {} without following symlinks: {error}",
+                path.display()
+            ))
+        }
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        EncoderError::ArtifactMismatch(format!("inspect artifact {}: {error}", path.display()))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "artifact {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn read_file_nofollow(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, EncoderError> {
+    let file = open_file_nofollow(parent, name, path)?;
+    let mut bytes = Vec::new();
+    file.take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
             EncoderError::ArtifactMismatch(format!("read {}: {error}", path.display()))
         })?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "artifact {} exceeds the admitted byte bound",
+            path.display()
+        )));
     }
+    Ok(bytes)
+}
+
+fn read_path_file(path: &Path, local: bool, maximum_bytes: u64) -> Result<Vec<u8>, EncoderError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        EncoderError::ArtifactMismatch(format!("path has no file name: {}", path.display()))
+    })?;
+    let parent_directory = Dir::open_ambient_dir(parent, ambient_authority()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound && local {
+            EncoderError::ArtifactsMissing(path.display().to_string())
+        } else {
+            EncoderError::ArtifactMismatch(format!(
+                "open manifest parent {}: {error}",
+                parent.display()
+            ))
+        }
+    })?;
+    match open_file_nofollow(&parent_directory, name, path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(maximum_bytes.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| {
+                    EncoderError::ArtifactMismatch(format!("read {}: {error}", path.display()))
+                })?;
+            if bytes.len() as u64 > maximum_bytes {
+                return Err(EncoderError::ArtifactMismatch(format!(
+                    "file {} exceeds the admitted byte bound",
+                    path.display()
+                )));
+            }
+            Ok(bytes)
+        }
+        Err(EncoderError::ArtifactsMissing(_)) if local => {
+            Err(EncoderError::ArtifactsMissing(path.display().to_string()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_snapshot_file(
+    snapshot: &CacheSnapshot,
+    relative: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, EncoderError> {
+    let mut components = Path::new(relative).components().peekable();
+    let mut directory = snapshot.directory.try_clone().map_err(|error| {
+        EncoderError::ArtifactMismatch(format!(
+            "clone snapshot directory {}: {error}",
+            snapshot.path.display()
+        ))
+    })?;
+    let mut path = snapshot.path.clone();
+    let file_name = loop {
+        let component = components.next().ok_or_else(|| {
+            EncoderError::ArtifactMismatch(format!(
+                "artifact path is empty in {}",
+                snapshot.path.display()
+            ))
+        })?;
+        let Component::Normal(name) = component else {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "artifact path {relative} is not safely relative"
+            )));
+        };
+        path.push(name);
+        if components.peek().is_some() {
+            directory = open_directory_nofollow(&directory, name, &path)?;
+        } else {
+            break name;
+        }
+    };
+    read_file_nofollow(&directory, file_name, &path, maximum_bytes)
+}
+
+fn read_verified_artifact(
+    snapshot: &CacheSnapshot,
+    file: &EncoderFile,
+) -> Result<Vec<u8>, EncoderError> {
+    let bytes = read_snapshot_file(snapshot, &file.path, file.bytes)?;
+    if bytes.len() as u64 != file.bytes {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "size differs for {}",
+            file.path
+        )));
+    }
+    if digest_bytes(&bytes) != file.sha256 {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "sha256 differs for {}",
+            file.path
+        )));
+    }
+    Ok(bytes)
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
     let digest = hasher.finalize();
     let mut output = String::with_capacity(digest.len() * 2);
     for byte in digest {
         output.push(char::from(b"0123456789abcdef"[(byte >> 4) as usize]));
         output.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
     }
-    Ok(output)
+    output
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{
+        cache_snapshot, digest_bytes, read_snapshot_file, read_verified_artifact, EncoderFile,
+        CACHE_REPOSITORY_DIR, MODEL_REVISION,
+    };
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn cache_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("create model cache root");
+        let snapshot = root
+            .path()
+            .join("models")
+            .join(CACHE_REPOSITORY_DIR)
+            .join("snapshots")
+            .join(MODEL_REVISION);
+        fs::create_dir_all(&snapshot).expect("create model snapshot");
+        let refs = root
+            .path()
+            .join("models")
+            .join(CACHE_REPOSITORY_DIR)
+            .join("refs");
+        fs::create_dir_all(&refs).expect("create model refs");
+        fs::write(refs.join("main"), MODEL_REVISION).expect("write model revision");
+        root
+    }
+
+    #[test]
+    fn cache_snapshot_refuses_symlinked_repository_components() {
+        let root = tempfile::tempdir().expect("create model cache root");
+        let models = root.path().join("models");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&models).expect("create models directory");
+        fs::create_dir_all(outside.join("refs")).expect("create outside refs");
+        fs::write(outside.join("refs/main"), MODEL_REVISION).expect("write outside revision");
+        symlink(&outside, models.join(CACHE_REPOSITORY_DIR)).expect("create repository symlink");
+
+        let error = cache_snapshot(&models, Some(MODEL_REVISION))
+            .expect_err("a symlinked repository must be rejected");
+        assert!(matches!(error, super::EncoderError::ArtifactMismatch(_)));
+    }
+
+    #[test]
+    fn snapshot_file_refuses_symlinked_artifacts() {
+        let root = cache_root();
+        let models = root.path().join("models");
+        let snapshot = cache_snapshot(&models, Some(MODEL_REVISION)).expect("open cache snapshot");
+        let outside = root.path().join("outside-tokenizer.json");
+        fs::write(&outside, b"verified bytes").expect("write outside artifact");
+        symlink(&outside, snapshot.path.join("tokenizer.json")).expect("create artifact symlink");
+
+        let error = read_snapshot_file(&snapshot, "tokenizer.json", 64)
+            .expect_err("a symlinked artifact must be rejected");
+        assert!(matches!(error, super::EncoderError::ArtifactMismatch(_)));
+    }
+
+    #[test]
+    fn verified_artifact_hashes_the_same_bytes_that_are_returned() {
+        let root = cache_root();
+        let models = root.path().join("models");
+        let snapshot = cache_snapshot(&models, Some(MODEL_REVISION)).expect("open cache snapshot");
+        let bytes = b"verified bytes";
+        let path = snapshot.path.join("tokenizer.json");
+        fs::write(&path, bytes).expect("write artifact");
+        let file = EncoderFile {
+            path: "tokenizer.json".to_owned(),
+            sha256: digest_bytes(bytes),
+            bytes: bytes.len() as u64,
+        };
+
+        assert_eq!(
+            read_verified_artifact(&snapshot, &file).expect("verify artifact"),
+            bytes
+        );
+    }
 }
 
 #[cfg(feature = "real-encoder")]
