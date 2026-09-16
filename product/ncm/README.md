@@ -39,6 +39,15 @@ Do not pass `--no-default-features`: the default `real-encoder` feature is the p
 `--test-double` is test transport only and identifies itself with the literal `test-double/hash`;
 it cannot satisfy backend acceptance.
 
+Production launch verifies the executable against the offline
+`product/ncm/reference/worker-manifest.json` before creating a child process. The manifest pins the
+worker name, protocol version and identity, target triple metadata, byte length, and SHA-256. A
+missing, unsupported, or mismatched artifact returns typed worker-unavailable state and performs no
+download or replacement. For an installed bundle, ship `worker-manifest.json` beside the worker;
+source-tree builds fall back to the checked-in reference manifest. The checked-in artifact pin
+currently covers `aarch64-apple-darwin`; a platform must have its own built artifact and manifest
+entry before it is advertised as supported.
+
 ## Acquire the pinned model locally
 
 The worker never downloads a model. The only permitted download path is

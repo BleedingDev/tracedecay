@@ -5,7 +5,7 @@ use crate::engine::{
     NcmEngine, ObserveAffect, ObserveRequest, Outcome, RecallRequest,
 };
 use crate::ports::Deadline;
-use crate::wire::{self, Operation, PROTOCOL_VERSION, Reply, Request};
+use crate::wire::{self, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION, Reply, Request};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -343,6 +343,11 @@ fn dispatch_handshake(engine: &NcmEngine, namespace: &str, payload: &Value) -> E
     {
         return incompatible("handshake protocol identity mismatch");
     }
+    if let Some(identity) = expected.protocol_identity.as_deref()
+        && identity != PROTOCOL_IDENTITY
+    {
+        return incompatible("handshake protocol identity mismatch");
+    }
     let reply = engine.handshake(namespace);
     if reply.outcome != Outcome::Success {
         return reply;
@@ -404,6 +409,7 @@ fn apply_delay(payload: &Value, field: &str) {
 #[serde(default, deny_unknown_fields)]
 struct HandshakePayload {
     protocol_version: Option<u16>,
+    protocol_identity: Option<String>,
     algorithm_profile: Option<String>,
     model: Option<String>,
     epoch: Option<u64>,

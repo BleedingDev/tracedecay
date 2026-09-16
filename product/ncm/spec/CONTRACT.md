@@ -151,6 +151,15 @@ mutations become `effect-unknown` (resolved by idempotent replay). Worker valida
 before allocation. No model download inside the worker; `embedding::install` is an explicit
 separate step.
 
+Before a production child is spawned, the client verifies the configured executable against the
+offline `worker-manifest.json` shipped beside an installed worker, or the checked-in reference
+manifest for a source-tree build: worker name, protocol version and identity, current target
+metadata, byte length, and SHA-256 must all match. A missing, unsupported, or mismatched artifact
+returns typed `Unavailable` and never launches a process. The named
+`--test-double` mode bypasses this production artifact admission only for transport tests; it
+cannot satisfy production readiness. The existing model manifest and per-file model digest checks
+remain independent and are still required by the real encoder.
+
 Snapshot transport (task 018 finding, 2026-09-06): a one-record `ncm-snapshot.v1` already exceeds the
 1 MiB reply frame, and the frame bound is frozen. Snapshot bytes therefore never travel inside a
 frame: `SnapshotExport` replies with `{snapshot_file, byte_length, content_sha256, state_generation}`

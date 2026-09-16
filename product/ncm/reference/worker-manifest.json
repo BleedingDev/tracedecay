@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "worker": "tracedecay-ncm-worker",
+  "protocol_version": 1,
+  "protocol_identity": "tracedecay.ncm.worker.v1",
+  "targets": [
+    {
+      "triple": "aarch64-apple-darwin",
+      "os": "macos",
+      "arch": "aarch64",
+      "family": "unix",
+      "bytes": 38395336,
+      "sha256": "52cf290c581efcaa210d631984bc84b7f853d703e579dbe6dec42987a87bfd86"
+    }
+  ]
+}

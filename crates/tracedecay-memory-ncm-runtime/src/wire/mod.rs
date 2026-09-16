@@ -11,6 +11,8 @@ use std::io::{self, Read, Write};
 
 /// Current local worker protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Stable identity for the current local worker protocol implementation.
+pub const PROTOCOL_IDENTITY: &str = "tracedecay.ncm.worker.v1";
 /// Largest accepted request JSON payload.
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 /// Largest emitted or accepted reply JSON payload.

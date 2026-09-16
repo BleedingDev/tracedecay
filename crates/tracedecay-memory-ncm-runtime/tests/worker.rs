@@ -16,7 +16,8 @@ use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient, WorkerOpt
 use tracedecay_memory_ncm_runtime::engine::{ObserveRequest, Outcome};
 use tracedecay_memory_ncm_runtime::ports::Deadline;
 use tracedecay_memory_ncm_runtime::wire::{
-    self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_VERSION, Reply, Request,
+    self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
+    Reply, Request,
 };
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tracedecay-ncm-worker");
@@ -666,6 +667,34 @@ fn protocol_and_handshake_identity_mismatches_fail_closed() {
         .expect("typed model mismatch reply");
     assert_eq!(model.outcome, Outcome::Incompatible);
 
+    let protocol_identity = client
+        .call(
+            Request::new(
+                204,
+                0,
+                Operation::Handshake,
+                namespace(7),
+                json!({"protocol_identity": "wrong-worker"}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("typed protocol identity reply");
+    assert_eq!(protocol_identity.outcome, Outcome::Incompatible);
+
+    let protocol_identity = client
+        .call(
+            Request::new(
+                205,
+                0,
+                Operation::Handshake,
+                namespace(8),
+                json!({"protocol_identity": PROTOCOL_IDENTITY}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("matching protocol identity reply");
+    assert_eq!(protocol_identity.outcome, Outcome::Success);
+
     let epoch = client
         .call(
             Request::new(
@@ -679,6 +708,43 @@ fn protocol_and_handshake_identity_mismatches_fail_closed() {
         )
         .expect("typed epoch mismatch reply");
     assert_eq!(epoch.outcome, Outcome::Incompatible);
+}
+
+#[test]
+fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
+    let root = TempDir::new().expect("temp root");
+    let tampered = root.path().join("tampered-worker");
+    fs::copy(BINARY, &tampered).expect("copy worker for tampering");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(&tampered)
+        .expect("open copied worker");
+    file.write_all(b"tampered").expect("tamper worker bytes");
+
+    let client = WorkerClient::spawn(&tampered, root.path(), WorkerOptions::default())
+        .expect("client owner starts lazily");
+    let result = client.call(
+        Request::new(206, 0, Operation::Health, "", json!({})),
+        CALL_DEADLINE,
+    );
+    assert!(
+        matches!(result, Err(ClientError::Unavailable(detail)) if detail.contains("mismatch")),
+        "unexpected result: {result:?}"
+    );
+    assert_eq!(client.pid(), None);
+}
+
+#[test]
+fn production_worker_digest_pin_allows_the_current_artifact() {
+    let root = TempDir::new().expect("temp root");
+    let client = WorkerClient::spawn(BINARY, root.path(), WorkerOptions::default())
+        .expect("client owner starts lazily");
+    let result = client.call(
+        Request::new(207, 0, Operation::Health, "", json!({})),
+        CALL_DEADLINE,
+    );
+    assert!(matches!(result, Ok(reply) if reply.outcome == Outcome::Success));
+    assert!(client.pid().is_some());
 }
 
 #[test]

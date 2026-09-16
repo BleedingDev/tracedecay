@@ -16,3 +16,4 @@ mod source_binding;
 pub mod store;
 pub mod wire;
 pub mod worker;
+pub(crate) mod worker_artifact;

@@ -1,6 +1,7 @@
 //! Bounded single-owner client for the supervised NCM worker process.
 
 use crate::wire::{self, Operation, Reply, Request};
+use crate::worker_artifact::verify_worker_binary;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -69,6 +70,8 @@ pub enum ClientError {
     RequestTooLarge,
     /// Worker process creation failed.
     Spawn(String),
+    /// The configured worker is not an admitted local artifact.
+    Unavailable(String),
     /// Consecutive process creation failures exhausted the configured budget.
     RestartExhausted,
     /// Pipe I/O failed.
@@ -94,6 +97,7 @@ impl fmt::Display for ClientError {
             }
             Self::RequestTooLarge => formatter.write_str("worker request exceeds 256 KiB"),
             Self::Spawn(detail) => write!(formatter, "spawn worker: {detail}"),
+            Self::Unavailable(detail) => write!(formatter, "worker unavailable: {detail}"),
             Self::RestartExhausted => formatter.write_str("worker restart budget exhausted"),
             Self::Transport(detail) => write!(formatter, "worker transport: {detail}"),
             Self::MalformedReply(detail) => write!(formatter, "malformed worker reply: {detail}"),
@@ -339,7 +343,11 @@ impl WorkerClient {
             remaining.as_millis().try_into().unwrap_or(u64::MAX),
             Operation::Handshake,
             "0000000000000000000000000000000000000000000000000000000000000000",
-            json!({"algorithm_profile": "ncm-biomem-rs.v1"}),
+            json!({
+                "protocol_version": wire::PROTOCOL_VERSION,
+                "protocol_identity": wire::PROTOCOL_IDENTITY,
+                "algorithm_profile": "ncm-biomem-rs.v1"
+            }),
         );
         let reply = self.call(request, remaining)?;
         if reply.outcome == crate::engine::Outcome::Success && self.pid().is_some() {
@@ -777,6 +785,10 @@ fn owner_loop(
             match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
                 Ok(worker) => process = Some(worker),
                 Err(error) => {
+                    if matches!(&error, ClientError::Unavailable(_)) {
+                        let _ = command.response.send(Err(error));
+                        continue;
+                    }
                     restart_failures = restart_failures.saturating_add(1);
                     let reported = if restart_failures > launch.max_restart_attempts {
                         ClientError::RestartExhausted
@@ -837,6 +849,10 @@ struct WorkerProcess {
 
 impl WorkerProcess {
     fn spawn(launch: &Launch, pid: Arc<AtomicU32>) -> Result<Self, ClientError> {
+        if !launch.test_double {
+            verify_worker_binary(&launch.binary)
+                .map_err(|error| ClientError::Unavailable(error.to_string()))?;
+        }
         let mut command = ProcessCommand::new(&launch.binary);
         command
             .arg("--state-root")
