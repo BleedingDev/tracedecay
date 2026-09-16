@@ -698,11 +698,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     }
                 }
             }
-            Some(matching_key.ok_or_else(|| {
-                RetrievalPortError::Contract(
-                    "clone exact cursor does not match a requested key".to_owned(),
-                )
-            })?)
+            Some(matching_key.ok_or_else(|| RetrievalPortError::StaleEvidence)?)
         } else {
             None
         };
