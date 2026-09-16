@@ -162,10 +162,10 @@ pub use tracedecay_memory_provider_api::contract::{
     UnknownValidityPolicy as CommonUnknownValidityPolicy,
 };
 pub use tracedecay_memory_provider_api::{
-    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, ApiError, CancellationToken,
-    CanonicalPayload, CommittedEffectEvidence, CurrentAdvisoryAdmission, CurrentRestoreAdmission,
-    CurrentSourceDisposition, FallbackDirective, GrantedHistorySource, HandshakeRequest,
-    HandshakeRequestParts, HandshakeResponse, HistoryGrant, LifecycleTarget,
+    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, AdvisoryContractError, ApiError,
+    CancellationToken, CanonicalPayload, CommittedEffectEvidence, CurrentAdvisoryAdmission,
+    CurrentRestoreAdmission, CurrentSourceDisposition, FallbackDirective, GrantedHistorySource,
+    HandshakeRequest, HandshakeRequestParts, HandshakeResponse, HistoryGrant, LifecycleTarget,
     LifecycleTargetReference, MAX_ADVISORY_ADMISSION_SOURCES, MemoryProvider as MemoryProviderV1,
     OperationControl, OriginScopeEvidence, OriginalSourceIdentity, OwnedExactScope,
     OwnedProviderId, OwnedRecallExclusions, OwnedTemporalQuery, OwnedVersionedId,

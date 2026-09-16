@@ -632,7 +632,7 @@ fn admit_result(
         provider: message.provider.clone(),
         session_id: message.session_id.clone(),
         message_id: message.message_id.clone(),
-        source_observation_id: source_observation_id.clone(),
+        source_observation_id: source_observation_id.map(str::to_owned),
     };
 
     CandidateAdmission::Accept {

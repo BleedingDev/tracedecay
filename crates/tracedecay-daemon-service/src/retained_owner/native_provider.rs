@@ -329,7 +329,7 @@ impl NativeMemoryApplicationPort for ProjectNativeMemoryApplicationPort {
     }
 
     fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        let call = observation.call;
+        let call = observation.call();
         if let Err(failure) = control_failure(&call.control) {
             return self.observe_failure(call, failure);
         }
@@ -419,17 +419,21 @@ fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
         STATE_SCHEMA_VERSION,
         0,
         capabilities,
-        ProviderLimits {
-            request_bytes: 4_096,
-            response_bytes: 8_192,
-            observation_batch_items: 16,
-            recall_candidates: 32,
-            concurrent_operations: 4,
-            operation_millis: NATIVE_OPERATION_MILLIS,
-            snapshot_bytes: 65_536,
-            inspection_items: 64,
-        },
+        native_provider_limits(),
     )
+}
+
+pub(crate) fn native_provider_limits() -> ProviderLimits {
+    ProviderLimits {
+        request_bytes: 4_096,
+        response_bytes: 8_192,
+        observation_batch_items: 16,
+        recall_candidates: 32,
+        concurrent_operations: 4,
+        operation_millis: NATIVE_OPERATION_MILLIS,
+        snapshot_bytes: 65_536,
+        inspection_items: 64,
+    }
 }
 
 fn request_scope_digest(request: &HandshakeRequest) -> String {
@@ -514,12 +518,12 @@ fn self_descriptor_identity() -> &'static [u8] {
 }
 
 fn observation_matches_call(observation: &NativeObservation<'_>) -> bool {
-    let call = observation.call;
+    let call = observation.call();
     if call.operation != ProviderOperation::Observe
         || call.provider_id.as_str() != NATIVE_PROVIDER_ID
         || call.payload.contract_id.as_str() != OBSERVATION_CONTRACT_ID
-        || observation.observation_kind != NATIVE_FACT_PROMOTION_OBSERVATION_KIND
-        || observation.payload_contract != NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
+        || observation.observation_kind() != NATIVE_FACT_PROMOTION_OBSERVATION_KIND
+        || observation.payload_contract() != NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
     {
         return false;
     }
@@ -531,10 +535,10 @@ fn observation_matches_call(observation: &NativeObservation<'_>) -> bool {
     };
     object.len() == 3
         && object.get("observation_kind")
-            == Some(&Value::String(observation.observation_kind.clone()))
+            == Some(&Value::String(observation.observation_kind().to_owned()))
         && object.get("payload_contract")
-            == Some(&Value::String(observation.payload_contract.clone()))
-        && object.get("canonical_payload") == Some(&observation.canonical_payload)
+            == Some(&Value::String(observation.payload_contract().to_owned()))
+        && object.get("canonical_payload") == Some(observation.canonical_payload())
 }
 
 /// The strict, provider-neutral request envelope understood by the Native
@@ -570,7 +574,7 @@ struct NativeRecallScopeV1 {
     worktree_identity: String,
     branch_identity: String,
     agent_session_id: String,
-    scope_revision: u64,
+    resolved_scope_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -657,7 +661,7 @@ fn native_recall_scope(call: &ProviderCall) -> NativeRecallScopeV1 {
         worktree_identity: call.exact_scope.worktree_identity.clone(),
         branch_identity: call.exact_scope.branch_identity.clone(),
         agent_session_id: call.exact_scope.agent_session_id.clone(),
-        scope_revision: call.exact_scope.scope_revision,
+        resolved_scope_digest: call.exact_scope.resolved_scope_digest.clone(),
     }
 }
 
@@ -960,12 +964,12 @@ fn parse_settled_native_fact(
     observation: &NativeObservation<'_>,
 ) -> Result<SettledNativeFactWriteV1, NativeReadFailure> {
     let payload =
-        serde_json::from_value::<SettledNativeFactWriteV1>(observation.canonical_payload.clone())
+        serde_json::from_value::<SettledNativeFactWriteV1>(observation.canonical_payload().clone())
             .map_err(|_| NativeReadFailure::InvalidPayload)?;
     if payload.kind != "settled_native_fact_write" {
         return Err(NativeReadFailure::InvalidPayload);
     }
-    validate_settled_native_fact(observation.call, &payload)?;
+    validate_settled_native_fact(observation.call(), &payload)?;
     Ok(payload)
 }
 
@@ -1638,7 +1642,7 @@ fn exact_scope_value(call: &ProviderCall) -> Value {
         "worktree_identity": call.exact_scope.worktree_identity,
         "branch_identity": call.exact_scope.branch_identity,
         "agent_session_id": call.exact_scope.agent_session_id,
-        "scope_revision": call.exact_scope.scope_revision,
+        "resolved_scope_digest": call.exact_scope.resolved_scope_digest,
     })
 }
 
@@ -1960,7 +1964,7 @@ fn map_retained_error(error: RetainedSurfaceExecutionErrorV1) -> NativeReadFailu
         | RetainedSurfaceExecutionErrorV1::Stale
         | RetainedSurfaceExecutionErrorV1::Unsupported
         | RetainedSurfaceExecutionErrorV1::Saturated
-        | RetainedSurfaceExecutionErrorV1::Unavailable
+        | RetainedSurfaceExecutionErrorV1::Unavailable { detail: _ }
         | RetainedSurfaceExecutionErrorV1::ProfileResetRequired
         | RetainedSurfaceExecutionErrorV1::ProjectResetRequired => {
             NativeReadFailure::ProviderUnavailable

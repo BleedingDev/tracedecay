@@ -401,7 +401,7 @@ fn recall_scope_value(project_id: &str) -> Value {
         "worktree_identity": "worktree.native-bridge-recall",
         "branch_identity": "branch.native-bridge-recall",
         "agent_session_id": "agent.native-bridge-recall",
-        "scope_revision": 1,
+        "resolved_scope_digest": SCOPE_DIGEST,
     })
 }
 

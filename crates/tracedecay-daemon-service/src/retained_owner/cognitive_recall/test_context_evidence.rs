@@ -167,8 +167,8 @@ type Result<T> = std::result::Result<T, ContextEvidenceReadErrorV1>;
 ///
 /// The returned mount uses the same Native adapter and active routing policy
 /// as production. `store_data_root` is the canonical project data root for
-/// the test fixture; provider-local state and the recall ledger are placed
-/// beneath it exactly as they are during project open.
+/// the test fixture; the host-owned recall ledger is placed beneath it exactly
+/// as it is during project open.
 pub fn native_cognitive_recall_mount_for_test(
     graph: Arc<tracedecay_project::project::TraceDecay>,
     profile_id: UserProfileId,
@@ -177,15 +177,11 @@ pub fn native_cognitive_recall_mount_for_test(
 ) -> std::result::Result<Arc<super::super::ProjectCognitiveRecallMountV1>, String> {
     let store_data_root = store_data_root.into();
     let project_root = graph.project_root().to_path_buf();
-    let provider_state_root =
-        store_data_root.join(super::super::observation_journey::PROVIDER_STATE_DIR_NAME);
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
     let native_port = Arc::new(
         super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
             graph_cell,
             project_root.clone(),
-            profile_id.clone(),
-            &provider_state_root,
         )
         .map_err(|error| format!("construct Native test port: {error}"))?,
     );

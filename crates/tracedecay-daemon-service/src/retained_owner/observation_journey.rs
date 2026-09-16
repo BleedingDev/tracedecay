@@ -5780,8 +5780,8 @@ mod tests {
     };
 
     use super::*;
-    use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
     use tracedecay_global_db::GlobalDbObservationStore;
+    use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const PROVIDER_RECEIPT: &str =
@@ -6471,8 +6471,8 @@ mod tests {
         ) -> Arc<AdversarialProviderV1> {
             Arc::new(AdversarialProviderV1::new(AdversarialProviderInputsV1 {
                 descriptor: adversarial_descriptor(),
-                provider_instance_id:
-                    crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
+                provider_instance_id: crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID
+                    .to_owned(),
                 state_namespace: ADVERSARIAL_STATE_NAMESPACE.to_owned(),
                 ready_receipt_sha256: READY_RECEIPT.to_owned(),
                 handshake_script: AdversarialScriptV1::always(HandshakeMisbehaviourV1::Compliant),
@@ -6576,11 +6576,8 @@ mod tests {
                 profile_id,
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
-                    &(journal_root),
-                    1,
-                )
-                .expect("native mount metadata"),
+                provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
+                    .expect("native mount metadata"),
                 store_data_root: journal_root,
                 policy,
             })
@@ -8541,11 +8538,8 @@ mod tests {
             profile_id: profile_id.clone(),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -8898,11 +8892,8 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-journey").expect("profile id"),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -9007,202 +8998,6 @@ mod tests {
             assert_eq!(effect, "applied");
             assert_eq!(outcome, "applied");
             assert_eq!(receipt_digest, PROVIDER_RECEIPT);
-        }
-
-        journey
-            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
-            .await;
-    }
-
-    /// The real Native port on the mounted journey, with a durability fault
-    /// injected between the staged insert and its commit.
-    ///
-    /// The real defect this catches is a lost observation: a staged commit
-    /// that fails must leave the delivery *redeliverable* and stage nothing,
-    /// and the journey's own dispatcher — not a hand-written second call —
-    /// must bring it back and settle it once. The port under test is the
-    /// production `ProjectNativeMemoryApplicationPort`, so the staged store,
-    /// the terminal it answers, the journal's retry classification, and the
-    /// dispatcher's redelivery are all the real ones.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_staged_commit_fault_is_redelivered_by_the_journey_and_settles_once() {
-        let temp = TempDir::new().expect("temporary journey root");
-        let project_id = ProjectId::new("project.observation-journey-fault").expect("project id");
-        let runtime = HostAdmissionTestRuntimeV1::project(
-            &temp.path().join("profile"),
-            &temp.path().join("project"),
-            project_id.clone(),
-        )
-        .await
-        .expect("registered project database");
-        let store = runtime
-            .registered_database_arc(HostAdmissionScope::Project)
-            .expect("project database")
-            .observation_store();
-
-        // The production Native port. Its graph is a real project fixture of
-        // its own; the staged path never consults it, and what matters here is
-        // the provider-local staged store the port opens under the
-        // host-granted provider-state root.
-        let port_project_root = temp.path().join("native-project");
-        let port_profile_root = temp.path().join("native-profile");
-        std::fs::create_dir_all(&port_project_root).expect("native project root");
-        std::fs::create_dir_all(&port_profile_root).expect("native profile root");
-        let graph = Arc::new(
-            tracedecay_project::project::TraceDecay::init_with_options(
-                &port_project_root,
-                tracedecay_project::project::TraceDecayOpenOptions {
-                    global_db_path: Some(port_profile_root.join("global.db")),
-                    profile_root: Some(port_profile_root),
-                },
-            )
-            .await
-            .expect("initialize the Native port graph"),
-        );
-        let provider_state_root = temp.path().join("provider-state");
-        let port = Arc::new(
-            super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
-                Arc::new(tokio::sync::RwLock::new(graph)),
-                port_project_root,
-                UserProfileId::new("profile.observation-journey-fault").expect("profile id"),
-                &provider_state_root,
-            )
-            .expect("construct the production Native application port"),
-        );
-        let staged_rows = || -> i64 {
-            let path = crate::retained_owner::native_staged_observations::staged_store_path(
-                &provider_state_root,
-            );
-            rusqlite::Connection::open(path)
-                .expect("staged observation store")
-                .query_row(
-                    "SELECT COUNT(*) FROM tdmem_native_staged_observation_v1",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("staged row count")
-        };
-
-        let resolved_scope = scope(project_id.clone());
-        let journal_root = temp.path().join("journey");
-        std::fs::create_dir_all(&journal_root).expect("journal root");
-        let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
-            profile_id: UserProfileId::new("profile.observation-journey-fault")
-                .expect("profile id"),
-            scope: resolved_scope,
-            authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root),
-                1,
-            )
-            .expect("native mount metadata"),
-            store_data_root: journal_root,
-            policy: ObservationJourneyPolicyV1::project_default(),
-        })
-        .expect("mounted journey");
-        journey
-            .start_live_replay(store.clone())
-            .expect("live replay task");
-
-        // Arm the fault before the record exists, so the first delivery the
-        // dispatcher makes is the one that cannot commit.
-        port.staged_store().fail_next_commit();
-
-        let session_id = SessionId::new("session.observation-journey-fault").expect("session id");
-        let observation = canonical_observation(&project_id, &session_id, "faulted journey text");
-        store
-            .persist_observation(anchored_write(observation))
-            .await
-            .expect("canonical observation commit");
-
-        // The first attempt: a retryable refusal that stages nothing and
-        // leaves the delivery deliverable.
-        let first_attempt = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let connection =
-                    rusqlite::Connection::open(journey.journal_path()).expect("journal");
-                let row = connection
-                    .query_row(
-                        "SELECT state, attempt_number, last_outcome \
-                         FROM tdmem_observation_delivery_v1",
-                        [],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                            ))
-                        },
-                    )
-                    .ok();
-                match row {
-                    Some((state, attempts, outcome))
-                        if attempts >= 1 && outcome == "provider_unavailable" =>
-                    {
-                        return (state, attempts, staged_rows());
-                    }
-                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "the faulted delivery never reported a retryable outcome; {}",
-                journal_snapshot(journey.journal_path())
-            )
-        });
-        let (first_state, first_attempts, staged_after_fault) = first_attempt;
-        assert_eq!(first_attempts, 1);
-        assert!(
-            first_state == "pending" || first_state == "leased",
-            "a retryable refusal must leave the delivery deliverable, found {first_state}"
-        );
-        assert_eq!(
-            staged_after_fault, 0,
-            "the rolled-back transaction left a staged row behind"
-        );
-
-        // The dispatcher's own redelivery settles it, once.
-        let (state, attempts) = wait_for_settlement(journey.journal_path()).await;
-        assert_eq!(
-            (state.as_str(), attempts),
-            ("acknowledged", 2),
-            "{}",
-            journal_snapshot(journey.journal_path())
-        );
-        assert_eq!(
-            staged_rows(),
-            1,
-            "the redelivery staged a second row instead of committing exactly one"
-        );
-
-        // Both attempts are on the record, in order, with the committed effect
-        // claimed only by the one that actually committed.
-        {
-            let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
-            let mut statement = connection
-                .prepare(
-                    "SELECT outcome, committed_effect FROM tdmem_observation_receipt_v1 \
-                     ORDER BY attempt_number",
-                )
-                .unwrap();
-            let receipts: Vec<(String, String)> = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .map(|row| row.unwrap())
-                .collect();
-            assert_eq!(
-                receipts,
-                vec![
-                    ("provider_unavailable".to_owned(), "none".to_owned()),
-                    ("applied".to_owned(), "applied".to_owned()),
-                ],
-                "{}",
-                journal_snapshot(journey.journal_path())
-            );
         }
 
         journey
@@ -9689,11 +9484,8 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root.clone()),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -10644,11 +10436,8 @@ mod tests {
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root.clone()),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
@@ -10812,11 +10601,8 @@ mod tests {
                 .expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         }
@@ -11592,11 +11378,8 @@ mod tests {
             profile_id: UserProfileId::new("profile.mount-off-worker").unwrap(),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &(journal_root.clone()),
-                1,
-            )
-            .expect("native mount metadata"),
+            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
+                .expect("native mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
