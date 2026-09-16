@@ -986,6 +986,7 @@ assert compress_args["messages"] == [{"role": "user", "content": "turn"}]
 assert compress_args["current_tokens"] == 95
 assert compress_args["focus_topic"] == "typed lifecycle"
 assert compress_args["summarizer"] == {"mode": "hermes_auxiliary"}
+assert compress_args["ignore_message_patterns"] == ["heartbeat"]
 assert compress_args["response_handle_project_root"] == "/tmp/project"
 assert "summary_text" not in json.dumps(compress_args)
 assert "storage_scope" not in compress_args
