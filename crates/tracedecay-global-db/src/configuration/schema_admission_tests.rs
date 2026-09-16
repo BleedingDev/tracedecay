@@ -184,8 +184,8 @@ async fn sqlite_objects(
 }
 
 /// Every release from beta.25 through beta.37 published the fixture's exact
-/// shape. The writer removes its retired tables, retains supported rows, and
-/// refuses credential rows that no shipped binary wrote.
+/// shape. It remains a reset-required historical shape, and admission must
+/// leave every object and row untouched.
 const RELEASED_BETA37_CONFIGURATION_SQL: &str =
     include_str!("../../tests/fixtures/configuration-released-beta37.sql");
 
@@ -253,7 +253,7 @@ async fn count(connection: &impl QueryExecutor, sql: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn released_configuration_shape_is_admitted_and_converged_with_rows_intact() {
+async fn released_configuration_shape_requires_reset_without_mutation() {
     let (_directory, connection) = released_connection().await;
     assert_eq!(
         count(
@@ -265,24 +265,11 @@ async fn released_configuration_shape_is_admitted_and_converged_with_rows_intact
         "fixture carries the shipped table"
     );
 
-    super::admit_configuration_schema(&*connection, None)
-        .await
-        .expect("a shipped shape is admissible read-only");
-    ensure_configuration_schema(&*connection, None)
-        .await
-        .expect("a shipped shape converges instead of demanding a reset");
+    let before = sqlite_objects(&connection).await;
+    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
+    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
 
-    assert_eq!(
-        count(
-            &*connection,
-            "SELECT COUNT(*) FROM sqlite_master
-             WHERE name LIKE 'configuration_credential_references%'
-                OR name LIKE 'configuration_semantic_%'"
-        )
-        .await,
-        0,
-        "retired schema objects are gone"
-    );
     let mut rows = connection
         .query(
             "SELECT typed_value FROM configuration_entries WHERE revision_id = 'revision.1'",
@@ -299,31 +286,24 @@ async fn released_configuration_shape_is_admitted_and_converged_with_rows_intact
             .unwrap(),
         "{\"kept\":true}"
     );
-    drop(rows);
-    ensure_configuration_schema(&*connection, None)
-        .await
-        .expect("the converged store is the exact final shape");
 }
 
 #[tokio::test]
-async fn prior_final_configuration_shape_drops_accepted_profiles_and_preserves_configuration_rows()
-{
+async fn prior_final_configuration_shape_requires_reset_without_mutation() {
     let (_directory, connection) = prior_final_connection().await;
-    super::admit_configuration_schema(&*connection, None)
-        .await
-        .expect("the prior tip shape is admissible read-only");
-    ensure_configuration_schema(&*connection, None)
-        .await
-        .expect("the prior tip shape converges");
+    let before = sqlite_objects(&connection).await;
+    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
+    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
 
     assert_eq!(
         count(
             &*connection,
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'configuration_semantic_%'"
+            "SELECT COUNT(*) FROM configuration_semantic_accepted_profiles_v1"
         )
         .await,
-        0,
-        "retired semantic schema objects are gone"
+        1,
+        "retired rows remain available for an explicit reset"
     );
     assert_eq!(
         count(
@@ -337,23 +317,21 @@ async fn prior_final_configuration_shape_drops_accepted_profiles_and_preserves_c
 }
 
 #[tokio::test]
-async fn pre_residue_final_configuration_shape_drops_all_semantic_tables() {
+async fn pre_residue_final_configuration_shape_requires_reset_without_mutation() {
     let (_directory, connection) = pre_residue_final_connection().await;
-    super::admit_configuration_schema(&*connection, None)
-        .await
-        .expect("the pre-residue tip shape is admissible read-only");
-    ensure_configuration_schema(&*connection, None)
-        .await
-        .expect("the pre-residue tip shape converges");
+    let before = sqlite_objects(&connection).await;
+    assert_reset_required(super::admit_configuration_schema(&*connection, None).await);
+    assert_reset_required(ensure_configuration_schema(&*connection, None).await);
+    assert_eq!(sqlite_objects(&connection).await, before);
 
     assert_eq!(
         count(
             &*connection,
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'configuration_semantic_%'"
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'configuration_credential_references'"
         )
         .await,
-        0,
-        "retired semantic schema objects are gone"
+        1,
+        "released credential table remains available for an explicit reset"
     );
     assert_eq!(
         count(

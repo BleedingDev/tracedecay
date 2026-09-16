@@ -14,39 +14,23 @@ pub const CONFIGURATION_FORMAT_REVISION: i64 = 1;
 const FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:8ed9dff8077f0cd9a8c62588ef1fe1a7a1e9caed6a433a4fa0c4a57e65d63beb";
 /// Tip shape that retired semantic-retrieval state but still carried the
-/// accepted-profile tables. Converges by dropping those accepted-profile
-/// tables only.
+/// accepted-profile tables. It is recognized so the caller receives a typed
+/// reset outcome without mutating the store.
 const PRIOR_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:14cfab8b33e57816605c7275e7f3140d6755c933a84239b1608dbdf653b56a1b";
 /// Campaign tip before #1303 residue deletion: credential-free but still
 /// carried the three semantic-retrieval tables (and accepted-profile tables).
-/// Converges by dropping all five semantic tables.
+/// It is recognized so the caller receives a typed reset outcome without
+/// mutating the store.
 const PRE_RESIDUE_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:c79fac916ce535c2b90bd46af0fec9dcd80bdb85ae7e226879dd6eb765e6ca63";
 /// The configuration shape every release from v0.1.0-beta.25 through
 /// v0.1.0-beta.37 published. It includes the inert credential-reference table
 /// and the retired semantic-retrieval and accepted-profile tables.
+/// It is recognized so the caller receives a typed reset outcome without
+/// mutating the store.
 const RELEASED_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:99b8f5f5cebc584ab564181d8a67ee665031c20bbdf63b479c212d16a1c63746";
-const CONVERGE_RELEASED_CONFIGURATION_SQL: &str = "
-DROP TABLE configuration_credential_references;
-DROP TABLE configuration_semantic_retrieval_state_v1;
-DROP TABLE configuration_semantic_retrieval_pending_v1;
-DROP TABLE configuration_semantic_retrieval_inventory_v1;
-DROP TABLE configuration_semantic_accepted_profiles_v1;
-DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
-";
-const CONVERGE_PRIOR_FINAL_CONFIGURATION_SQL: &str = "
-DROP TABLE configuration_semantic_accepted_profiles_v1;
-DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
-";
-const CONVERGE_PRE_RESIDUE_FINAL_CONFIGURATION_SQL: &str = "
-DROP TABLE configuration_semantic_retrieval_state_v1;
-DROP TABLE configuration_semantic_retrieval_pending_v1;
-DROP TABLE configuration_semantic_retrieval_inventory_v1;
-DROP TABLE configuration_semantic_accepted_profiles_v1;
-DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
-";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {
@@ -419,12 +403,30 @@ BEGIN SELECT RAISE(ABORT, 'configuration component activation events are immutab
 enum ConfigurationShape {
     Absent,
     Final,
-    /// Tip shape before accepted-profile table retirement.
+    /// Recognized historical shape before accepted-profile table retirement.
     PriorFinal,
-    /// Tip shape before #1303 semantic-retrieval residue deletion.
+    /// Recognized historical shape before #1303 semantic-retrieval residue deletion.
     PreResidueFinal,
-    /// The exact shape shipped by beta.25 through beta.37.
+    /// Recognized historical shape shipped by beta.25 through beta.37.
     Released,
+}
+
+fn historical_shape_reset(shape: ConfigurationShape) -> ConfigurationSchemaError {
+    let reason = match shape {
+        ConfigurationShape::PriorFinal => {
+            "recognized prior-final configuration schema requires an explicit reset"
+        }
+        ConfigurationShape::PreResidueFinal => {
+            "recognized pre-residue configuration schema requires an explicit reset"
+        }
+        ConfigurationShape::Released => {
+            "recognized released configuration schema requires an explicit reset"
+        }
+        ConfigurationShape::Absent | ConfigurationShape::Final => {
+            "configuration schema is not a historical shape requiring reset"
+        }
+    };
+    ConfigurationSchemaError::ResetRequired { reason }
 }
 
 async fn validate_configuration_schema(
@@ -469,17 +471,19 @@ async fn validate_configuration_schema(
     Ok(shape)
 }
 
-/// Read-only admission: the final shape and convergeable prior shapes are
-/// admissible; the writer converges prior shapes on its next open.
+/// Read-only admission: only the exact final shape is admissible for an
+/// existing store. Recognized historical shapes are reported as typed reset
+/// outcomes so no migration or cleanup can run before the operator explicitly
+/// replaces the store.
 pub async fn admit_configuration_schema(
     connection: &impl QueryExecutor,
     fresh_store: Option<&FreshConfigurationStoreEvidence>,
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
-        ConfigurationShape::Final
-        | ConfigurationShape::PriorFinal
+        ConfigurationShape::Final => Ok(()),
+        shape @ (ConfigurationShape::PriorFinal
         | ConfigurationShape::PreResidueFinal
-        | ConfigurationShape::Released => Ok(()),
+        | ConfigurationShape::Released) => Err(historical_shape_reset(shape)),
         ConfigurationShape::Absent if fresh_store.is_some() => Ok(()),
         ConfigurationShape::Absent => Err(ConfigurationSchemaError::ResetRequired {
             reason: "configuration schema is missing from a non-fresh registered store",
@@ -493,15 +497,9 @@ pub async fn ensure_configuration_schema(
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
         ConfigurationShape::Final => return Ok(()),
-        ConfigurationShape::PriorFinal => {
-            return converge_prior_final_configuration(connection).await;
-        }
-        ConfigurationShape::PreResidueFinal => {
-            return converge_pre_residue_final_configuration(connection).await;
-        }
-        ConfigurationShape::Released => {
-            return converge_released_configuration(connection).await;
-        }
+        shape @ (ConfigurationShape::PriorFinal
+        | ConfigurationShape::PreResidueFinal
+        | ConfigurationShape::Released) => return Err(historical_shape_reset(shape)),
         ConfigurationShape::Absent => {}
     }
     if fresh_store.is_none() {
@@ -520,67 +518,6 @@ pub async fn ensure_configuration_schema(
     } else {
         Err(ConfigurationSchemaError::ResetRequired {
             reason: "fresh configuration schema publication was incomplete",
-        })
-    }
-}
-
-/// Converges a shipped store to the final shape. The credential table never
-/// had a writer, while semantic-retrieval rows have no remaining consumer.
-async fn converge_released_configuration(
-    connection: &impl Executor,
-) -> Result<(), ConfigurationSchemaError> {
-    let mut rows = connection
-        .query(
-            "SELECT 1 FROM configuration_credential_references LIMIT 1",
-            (),
-        )
-        .await?;
-    if rows.next().await?.is_some() {
-        return Err(ConfigurationSchemaError::ResetRequired {
-            reason: "released configuration store holds credential references no shipped binary wrote",
-        });
-    }
-    drop(rows);
-    connection
-        .execute_batch(CONVERGE_RELEASED_CONFIGURATION_SQL)
-        .await?;
-    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
-        Ok(())
-    } else {
-        Err(ConfigurationSchemaError::ResetRequired {
-            reason: "released configuration store did not converge to the final shape",
-        })
-    }
-}
-
-/// Converges a tip store that still carries retired accepted-profile tables.
-async fn converge_prior_final_configuration(
-    connection: &impl Executor,
-) -> Result<(), ConfigurationSchemaError> {
-    connection
-        .execute_batch(CONVERGE_PRIOR_FINAL_CONFIGURATION_SQL)
-        .await?;
-    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
-        Ok(())
-    } else {
-        Err(ConfigurationSchemaError::ResetRequired {
-            reason: "prior-final configuration store did not converge to the final shape",
-        })
-    }
-}
-
-/// Converges a pre-#1303 tip store that still carries retrieval + accepted-profile tables.
-async fn converge_pre_residue_final_configuration(
-    connection: &impl Executor,
-) -> Result<(), ConfigurationSchemaError> {
-    connection
-        .execute_batch(CONVERGE_PRE_RESIDUE_FINAL_CONFIGURATION_SQL)
-        .await?;
-    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
-        Ok(())
-    } else {
-        Err(ConfigurationSchemaError::ResetRequired {
-            reason: "pre-residue-final configuration store did not converge to the final shape",
         })
     }
 }
