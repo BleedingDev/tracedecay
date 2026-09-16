@@ -2252,8 +2252,9 @@ class TraceDecayContextEngine(ContextEngine):
             "provider": STANDARD_HERMES_LCM_PROVIDER,
             "session_id": self.active_session_id,
             "messages": list(messages or []),
-            "current_tokens": current_tokens,
         })
+        if current_tokens is not None:
+            args["current_tokens"] = current_tokens
         _apply_lcm_option_overrides(args, kwargs, (
             "threshold_tokens",
             "max_assembly_tokens",
