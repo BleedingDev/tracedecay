@@ -53,10 +53,11 @@ use tracedecay_query::retrieval::exact::{
 use tracedecay_query::retrieval::lexical::{
     CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_MAXIMUM_PAGE_RETAINED_BYTES_V1,
-    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintCancellationPointV1,
-    CloneFingerprintPartialReasonV1, CloneNearMatchExtentV1, CloneSelectedBlockContainmentClassV1,
-    CloneSelectedBlockV1, CodeLexicalArtifactBatchLimitV1, CodeLexicalArtifactBuilderV1,
-    CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1,
+    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneArtifactCursorV1,
+    CloneFingerprintCancellationPointV1, CloneFingerprintPartialReasonV1, CloneNearMatchExtentV1,
+    CloneSelectedBlockContainmentClassV1, CloneSelectedBlockV1, CodeLexicalArtifactBatchLimitV1,
+    CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
+    CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1,
     CodeLexicalArtifactWriterRevisionV1, CodeLexicalCloneSuccessorV1,
     CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1, CodeLexicalProjectionBuildV1,
     CodeLexicalProjectionMetadataV1, LexicalFieldFilterV1, LexicalFieldV1, LexicalLane,
@@ -2226,6 +2227,122 @@ fn fingerprint_candidate_and_posting_budgets_report_partial_coverage() {
     );
     assert_eq!(posting_page.accounting.posting_rows_examined, 16_384);
     assert_eq!(posting_page.accounting.hot_postings_skipped, 0);
+}
+
+#[test]
+fn fingerprint_discovery_replays_candidates_and_occurrences_after_posting_budget() {
+    // Keep each posting below the hot-posting threshold while making the
+    // source stream large enough to cross the bounded discovery sentinel.
+    // There are several payload keys, and each key has many occurrences, so a
+    // correct continuation must retain both a candidate discovered after the
+    // first sentinel and occurrences discovered after an earlier anchor.
+    let shared = (0..80)
+        .map(|ordinal| format!("shared_{ordinal}(); "))
+        .collect::<String>();
+    let mut source_text = String::new();
+    for candidate in 0..10 {
+        for occurrence in 0..100 {
+            writeln!(
+                source_text,
+                "export function discovery_{candidate}_{occurrence}() {{ {shared} variant_{candidate}(); }}"
+            )
+            .expect("write discovery source");
+        }
+    }
+    let fixture = real_lexical_source_fixture_from_sources(vec![(
+        "file.clone.discovery-budget".to_owned(),
+        "src/discovery-budget.ts".to_owned(),
+        source_text.into_bytes(),
+    )]);
+    let (_directory, pages, reader) = build_clone_artifact(&fixture);
+    let source = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .next()
+        .expect("discovery source body");
+    let expected_payloads = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .filter(|body| {
+            body.occurrence.symbol_occurrence_id != source.occurrence.symbol_occurrence_id
+        })
+        .map(|body| body.payload.payload_digest.clone())
+        .collect::<BTreeSet<_>>();
+    let expected_occurrences = pages
+        .iter()
+        .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
+        .filter(|body| {
+            body.occurrence.symbol_occurrence_id != source.occurrence.symbol_occurrence_id
+        })
+        .map(|body| body.occurrence.symbol_occurrence_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected_payloads.len(),
+        10,
+        "fixture has ten candidate payloads"
+    );
+    assert_eq!(
+        expected_occurrences.len(),
+        999,
+        "source occurrence is excluded"
+    );
+
+    let control = ArtifactControl { cancelled: false };
+    let mut cursor: Option<CloneArtifactCursorV1> = None;
+    let mut cursor_encodings = BTreeSet::new();
+    let mut seen_payloads = BTreeSet::new();
+    let mut seen_occurrences = BTreeSet::new();
+    let mut discovery_pages = 0;
+    for page_number in 0..32 {
+        let read = reader
+            .clone_fingerprint_page(
+                &source.occurrence,
+                &source.payload,
+                cursor.as_ref(),
+                256,
+                &control,
+            )
+            .expect("paged discovery read");
+        if read
+            .partial_reasons
+            .contains(&CloneFingerprintPartialReasonV1::PostingRowBudget)
+        {
+            discovery_pages += 1;
+            assert!(
+                read.page.members.is_empty(),
+                "bounded discovery must defer comparison output"
+            );
+        }
+        for member in &read.page.members {
+            seen_payloads.insert(member.payload.payload_digest.clone());
+            seen_occurrences.extend(
+                member
+                    .occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.symbol_occurrence_id.clone()),
+            );
+        }
+        let Some(next) = read.page.next_cursor else {
+            assert!(
+                page_number > 0,
+                "the oversized discovery stream must yield a continuation"
+            );
+            break;
+        };
+        let encoded = next.encode().expect("encode progress cursor");
+        assert!(
+            cursor_encodings.insert(encoded),
+            "every resumable discovery stop must advance"
+        );
+        cursor = Some(next);
+        assert!(page_number < 31, "discovery pagination did not terminate");
+    }
+    assert!(
+        discovery_pages > 0,
+        "fixture must cross the posting-row budget"
+    );
+    assert_eq!(seen_payloads, expected_payloads);
+    assert_eq!(seen_occurrences, expected_occurrences);
 }
 
 #[test]

@@ -439,6 +439,7 @@ pub(super) fn read_clone_fingerprint_page(
                 .map_err(sqlite_error)?
         };
         let read_limit = remaining.min(posting_count);
+        let mut rows_read_for_list = 0_u64;
         let mut rows = if let Some(checkpoint) = discovery_checkpoint {
             let occurrence = checkpoint
                 .symbol_occurrence_id
@@ -470,6 +471,7 @@ pub(super) fn read_clone_fingerprint_page(
                 .map_err(sqlite_error)?
         };
         while let Some(row) = rows.next().map_err(sqlite_error)? {
+            rows_read_for_list = rows_read_for_list.saturating_add(1);
             accounting.posting_rows_examined = accounting.posting_rows_examined.saturating_add(1);
             if interrupt(
                 control,
@@ -553,20 +555,24 @@ pub(super) fn read_clone_fingerprint_page(
             }
             let key = (payload.body_digest.clone(), payload.payload_digest.clone());
             if !candidates.contains_key(&key) {
-                if !discovery_complete_resume
-                    && candidates.len() == CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1
-                {
-                    partial_reasons.insert(CloneFingerprintPartialReasonV1::CandidateBodyBudget);
-                    stop = true;
-                    break;
-                }
                 let selected_positions = payload
                     .fingerprint_positions(occurrence.eligibility)
                     .map_err(CodeLexicalArtifactErrorV1::Contract)?
                     .into_iter()
                     .map(|position| (position.fingerprint, position.token_position))
                     .collect();
-                accounting.candidates_admitted = accounting.candidates_admitted.saturating_add(1);
+                if accounting.candidates_admitted
+                    < CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1 as u64
+                {
+                    accounting.candidates_admitted =
+                        accounting.candidates_admitted.saturating_add(1);
+                } else {
+                    // The accumulator retains the complete discovered key set
+                    // so the later B-tree comparison order is stable. The
+                    // body budget caps expensive comparisons, rather than
+                    // dropping an unresolved candidate from the continuation.
+                    partial_reasons.insert(CloneFingerprintPartialReasonV1::CandidateBodyBudget);
+                }
                 candidates.insert(
                     key.clone(),
                     CandidateAccumulatorV1 {
@@ -651,7 +657,10 @@ pub(super) fn read_clone_fingerprint_page(
                     .insert(occurrence.symbol_occurrence_id.clone(), occurrence);
             }
         }
-        if !discovery_complete_resume && read_limit < posting_count {
+        if !discovery_complete_resume
+            && read_limit < posting_count
+            && rows_read_for_list == read_limit
+        {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
         }
@@ -661,14 +670,12 @@ pub(super) fn read_clone_fingerprint_page(
     // only a local probe and cannot represent postings already consumed on an
     // earlier page. Defer the comparison pass until a completed-discovery
     // cursor asks us to replay the immutable stream from its beginning.
-    let discovery_partial = stop
-        || partial_reasons.iter().any(|reason| {
-            matches!(
-                reason,
-                CloneFingerprintPartialReasonV1::PostingRowBudget
-                    | CloneFingerprintPartialReasonV1::CandidateBodyBudget
-            )
-        });
+    let posting_discovery_partial = partial_reasons
+        .iter()
+        .any(|reason| matches!(reason, CloneFingerprintPartialReasonV1::PostingRowBudget));
+    let resumed_discovery = discovery_after.is_some();
+    let completed_discovery_replay = resumed_discovery && !stop && !posting_discovery_partial;
+    let discovery_partial = stop || posting_discovery_partial || resumed_discovery;
     let candidates = if discovery_partial {
         Vec::new()
     } else {
@@ -713,6 +720,11 @@ pub(super) fn read_clone_fingerprint_page(
         let selected_block_containment =
             selected_block.and_then(|block| containment_class(block.tokens(), candidate_tokens));
         if selected_block.is_some() && selected_block_containment.is_none() {
+            // A containment rejection is a completed comparison for paging
+            // purposes. Advancing before the next budget check prevents the
+            // same rejected candidate from being replayed forever when the
+            // comparison cap is reached.
+            last_compared = Some(key);
             continue;
         }
         let remaining_work =
@@ -788,7 +800,7 @@ pub(super) fn read_clone_fingerprint_page(
     // In that case `last_compared` is still the incoming comparison position,
     // so retain the discovery frontier as the resumable source of progress.
     let discovery_frontier = last_discovered.or_else(|| discovery_after.clone());
-    let next_cursor = if discovery_partial {
+    let next_cursor = if discovery_partial && !completed_discovery_replay {
         discovery_frontier.map(|mut discovery| {
             discovery.complete = false;
             CloneArtifactCursorV1 {
@@ -797,12 +809,18 @@ pub(super) fn read_clone_fingerprint_page(
                 request_digest: request_digest.clone(),
                 after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
                     discovery,
-                    comparison_body_digest: None,
-                    comparison_payload_digest: None,
+                    comparison_body_digest: last_compared
+                        .as_ref()
+                        .map(|(body_digest, _)| body_digest.clone()),
+                    comparison_payload_digest: last_compared
+                        .as_ref()
+                        .map(|(_, payload_digest)| payload_digest.clone()),
                 },
             }
         })
-    } else if has_more && last_compared.is_none() && discovery_frontier.is_some() {
+    } else if (completed_discovery_replay || (has_more && last_compared.is_none()))
+        && discovery_frontier.is_some()
+    {
         discovery_frontier.map(|mut discovery| {
             discovery.complete = true;
             CloneArtifactCursorV1 {
@@ -811,8 +829,12 @@ pub(super) fn read_clone_fingerprint_page(
                 request_digest: request_digest.clone(),
                 after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
                     discovery,
-                    comparison_body_digest: None,
-                    comparison_payload_digest: None,
+                    comparison_body_digest: last_compared
+                        .as_ref()
+                        .map(|(body_digest, _)| body_digest.clone()),
+                    comparison_payload_digest: last_compared
+                        .as_ref()
+                        .map(|(_, payload_digest)| payload_digest.clone()),
                 },
             }
         })

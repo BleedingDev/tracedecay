@@ -13,19 +13,52 @@ SCRIPT = Path(__file__).with_name("plan-release-recovery.py")
 TARGETS = {
     "include": [
         {
+            "name": "aarch64-macos",
+            "runner": "macos-14",
+            "target": "aarch64-apple-darwin",
+            "archive": "tar.gz",
+            "ncm": "supported",
+            "sidecar": {
+                "worker": "tracedecay-ncm-worker",
+                "archive": "tar.gz",
+                "manifest": "worker-manifest.json",
+                "checksum": "sha256",
+            },
+        },
+        {
             "name": "linux",
             "runner": "ubuntu",
             "target": "x86_64-linux",
             "archive": "tar.gz",
-        },
-        {
-            "name": "windows",
-            "runner": "windows",
-            "target": "x86_64-windows",
-            "archive": "zip",
+            "ncm": "native-only",
         },
     ]
 }
+POLICY = {
+    "schema_version": 1,
+    "provider_id": "ncm",
+    "worker": "tracedecay-ncm-worker",
+    "packaging": {
+        "worker_distribution": "separate-sidecar",
+        "standard_cli_archive_includes_worker": False,
+        "manifest_sidecar_required": True,
+    },
+    "release_targets": [
+        {
+            "name": "aarch64-macos",
+            "target": "aarch64-apple-darwin",
+            "ncm": "supported",
+        },
+        {"name": "linux", "target": "x86_64-linux", "ncm": "native-only"},
+    ],
+}
+
+ARM_BINARY = "tracedecay-v1.2.3-aarch64-macos.tar.gz"
+ARM_MCPB = "tracedecay-v1.2.3-aarch64-macos.mcpb"
+ARM_SIDECAR = "tracedecay-ncm-worker-v1.2.3-aarch64-macos.tar.gz"
+ARM_SIDECAR_CHECKSUM = f"{ARM_SIDECAR}.sha256"
+LINUX_BINARY = "tracedecay-v1.2.3-linux.tar.gz"
+LINUX_MCPB = "tracedecay-v1.2.3-linux.mcpb"
 
 
 def run(
@@ -43,6 +76,8 @@ def run(
             str(SCRIPT),
             "--manifest",
             str(root / "targets.json"),
+            "--worker-platforms",
+            str(root / "worker-platforms.json"),
             "--tag",
             "v1.2.3",
             "--profile",
@@ -75,46 +110,48 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         (root / "targets.json").write_text(json.dumps(TARGETS), encoding="utf-8")
+        (root / "worker-platforms.json").write_text(json.dumps(POLICY), encoding="utf-8")
 
         matrix, retained = run(root, ())
         assert matrix == TARGETS
         assert retained == []
 
-        linux_binary = "tracedecay-v1.2.3-linux.tar.gz"
-        linux_mcpb = "tracedecay-v1.2.3-linux.mcpb"
-        matrix, retained = run(root, (linux_binary,))
+        matrix, retained = run(root, (ARM_BINARY,))
         assert matrix == TARGETS
-        assert retained == [linux_binary]
+        assert retained == [ARM_BINARY]
 
-        matrix, retained = run(root, (linux_binary, linux_mcpb))
-        assert matrix == {"include": [TARGETS["include"][1]]}
-        assert retained == sorted((linux_binary, linux_mcpb))
+        matrix, retained = run(root, (ARM_BINARY, ARM_MCPB, ARM_SIDECAR))
+        assert matrix == {"include": [TARGETS["include"][0], TARGETS["include"][1]]}
+        assert retained == sorted((ARM_BINARY, ARM_MCPB, ARM_SIDECAR))
 
-        stable_assets = (
-            linux_binary,
-            linux_mcpb,
-            "tracedecay-v1.2.3-windows.zip",
-            "tracedecay-v1.2.3-windows.mcpb",
+        complete_assets = (
+            ARM_BINARY,
+            ARM_MCPB,
+            ARM_SIDECAR,
+            ARM_SIDECAR_CHECKSUM,
+            LINUX_BINARY,
+            LINUX_MCPB,
             "SHA256SUMS",
             "install.sh",
         )
-        matrix, retained = run(root, stable_assets)
+        matrix, retained = run(root, complete_assets)
         assert matrix == {"include": []}
-        assert len(retained) == 4
+        assert retained == sorted(complete_assets[:6])
 
-        run(root, (linux_binary, "SHA256SUMS"), success=False)
-        run(root, (linux_binary, "install.sh"), success=False)
-        run(root, ("unexpected.tar.gz",), success=False)
+        run(root, (ARM_BINARY, "SHA256SUMS"), success=False)
+        run(root, (ARM_BINARY, "install.sh"), success=False)
+        run(root, ("tracedecay-ncm-worker-v1.2.3-linux.tar.gz",), success=False)
 
-        beta_linux = "tracedecay-beta-v1.2.3-linux.tar.gz"
-        beta_linux_mcpb = "tracedecay-beta-v1.2.3-linux.mcpb"
+        beta_arm = "tracedecay-beta-v1.2.3-aarch64-macos.tar.gz"
+        beta_sidecar = "tracedecay-ncm-worker-beta-v1.2.3-aarch64-macos.tar.gz"
+        beta_sidecar_checksum = f"{beta_sidecar}.sha256"
         matrix, retained = run(
             root,
-            (beta_linux, beta_linux_mcpb),
+            (beta_arm, beta_sidecar, beta_sidecar_checksum),
             profile="beta",
         )
-        assert matrix == {"include": [TARGETS["include"][1]]}
-        assert retained == sorted((beta_linux, beta_linux_mcpb))
+        assert matrix == {"include": [TARGETS["include"][0], TARGETS["include"][1]]}
+        assert retained == sorted((beta_arm, beta_sidecar, beta_sidecar_checksum))
 
     print("release recovery planner tests passed")
 

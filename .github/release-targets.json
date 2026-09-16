@@ -4,25 +4,35 @@
       "name": "aarch64-macos",
       "runner": "macos-14",
       "target": "aarch64-apple-darwin",
-      "archive": "tar.gz"
+      "archive": "tar.gz",
+      "ncm": "supported",
+      "sidecar": {
+        "worker": "tracedecay-ncm-worker",
+        "archive": "tar.gz",
+        "manifest": "worker-manifest.json",
+        "checksum": "sha256"
+      }
     },
     {
       "name": "x86_64-linux",
       "runner": "ubuntu-22.04",
       "target": "x86_64-unknown-linux-gnu",
-      "archive": "tar.gz"
+      "archive": "tar.gz",
+      "ncm": "native-only"
     },
     {
       "name": "aarch64-linux",
       "runner": "ubuntu-22.04-arm",
       "target": "aarch64-unknown-linux-gnu",
-      "archive": "tar.gz"
+      "archive": "tar.gz",
+      "ncm": "native-only"
     },
     {
       "name": "x86_64-windows",
       "runner": "windows-latest",
       "target": "x86_64-pc-windows-msvc",
-      "archive": "zip"
+      "archive": "zip",
+      "ncm": "native-only"
     }
   ]
 }
