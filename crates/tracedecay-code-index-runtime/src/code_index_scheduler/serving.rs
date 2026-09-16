@@ -915,8 +915,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 Ok(tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read))
             }
             tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-                start,
-                end,
+                ..
             } => {
                 if source.occurrence.eligibility
                     != tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
@@ -1095,6 +1094,8 @@ impl ProductionCodeIndexQueryOwnersV1 {
                             fingerprint: 0,
                             symbol_occurrence_id: None,
                             token_position: None,
+                            pending_comparison_body_digest: None,
+                            pending_comparison_payload_digest: None,
                             complete: true,
                         },
                     comparison_body_digest: None,
