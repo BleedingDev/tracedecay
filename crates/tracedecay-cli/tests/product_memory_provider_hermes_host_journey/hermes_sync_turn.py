@@ -20,8 +20,11 @@ import time
 plugin_dir = pathlib.Path(sys.argv[1])
 project_root = pathlib.Path(sys.argv[2]).resolve()
 trace_decay_bin = sys.argv[3]
+mode = sys.argv[4] if len(sys.argv) > 4 else "original"
 session_id = "hermes-cli-project-journey"
-fixed_timestamp_ns = time.time_ns()
+fixed_timestamp_ns = int(
+    os.environ.get("TRACEDECAY_HERMES_REPLAY_TIMESTAMP_NS", time.time_ns())
+)
 fixed_timestamp = fixed_timestamp_ns / 1_000_000_000
 
 # ``tools.py`` captures this override while the generated package is imported.
@@ -164,8 +167,16 @@ provider.initialize(
     project_root=str(project_root),
 )
 assert provider.project_root == str(project_root), provider.project_root
-_sync_turn(provider)
-plugin._join_host_receipts()
+if mode == "original":
+    _sync_turn(provider)
+    plugin._join_host_receipts()
+elif mode == "replay":
+    # The replay uses a new host process and a new provider object. The shared
+    # timestamp supplied by Rust makes its generated message IDs byte-for-byte
+    # identical to the original process's IDs.
+    pass
+else:
+    raise AssertionError(f"unknown fixture mode: {mode!r}")
 
 # A real Hermes post-tool callback is content-free and carries the project
 # route plus receipt identity. Exercise the registered wrapper, then join its
@@ -184,19 +195,20 @@ ctx.hooks["post_tool_call"](
 )
 plugin._join_host_receipts()
 
-# Re-run the same turn with a fresh provider object and the same deterministic
-# timestamp. sync_turn therefore emits the exact original message IDs and
-# calls the daemon's admission boundary again; no new observation row is
-# allowed to result from this replay.
-fresh_provider = plugin.TracedecayMemoryProvider()
-fresh_provider.initialize(
-    session_id=session_id,
-    hermes_home=ctx.hermes_home,
-    project_root=str(project_root),
-)
-assert fresh_provider.project_root == provider.project_root
-_sync_turn(fresh_provider)
-plugin._join_host_receipts()
+fresh_provider = None
+if mode == "replay":
+    # Re-run the same turn with a fresh provider object and the same timestamp.
+    # sync_turn therefore emits the exact original message IDs and calls the
+    # daemon's admission boundary again; no new observation row may result.
+    fresh_provider = plugin.TracedecayMemoryProvider()
+    fresh_provider.initialize(
+        session_id=session_id,
+        hermes_home=ctx.hermes_home,
+        project_root=str(project_root),
+    )
+    assert fresh_provider.project_root == provider.project_root
+    _sync_turn(fresh_provider)
+    plugin._join_host_receipts()
 
 # Hermes selects this engine after register(ctx). Invoke a read through the
 # public callback with a paraphrased query, proving the installed context
@@ -239,8 +251,8 @@ print(
             "host_boundary": "register_ctx_fixture",
             "context_engine_callback": "complete",
             "replay": {
-                "mode": "exact",
-                "fresh_provider": True,
+                "mode": "exact" if mode == "replay" else "original",
+                "fresh_provider": mode == "replay",
                 "message_ids": [
                     f"tracedecay_sync_1_{fixed_timestamp_ns}_0_user",
                     f"tracedecay_sync_1_{fixed_timestamp_ns}_1_assistant",

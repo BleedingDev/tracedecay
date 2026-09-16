@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -380,7 +380,7 @@ impl HermesJourney {
         }
     }
 
-    fn run_provider_fixture(&self) -> Value {
+    fn run_provider_fixture(&self, mode: &str, timestamp_ns: u128) -> Value {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py");
         let plugin = self.home.path().join(".hermes/plugins/tracedecay");
@@ -389,6 +389,7 @@ impl HermesJourney {
             .arg(plugin)
             .arg(&self.project)
             .arg(env!("CARGO_BIN_EXE_tracedecay"))
+            .arg(mode)
             .current_dir(&self.project)
             .env("HOME", self.home.path())
             .env("USERPROFILE", self.home.path())
@@ -396,6 +397,10 @@ impl HermesJourney {
             .env("TRACEDECAY_DATA_DIR", &self.profile)
             .env("TRACEDECAY_GLOBAL_DB", self.profile.join("global.db"))
             .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
+            .env(
+                "TRACEDECAY_HERMES_REPLAY_TIMESTAMP_NS",
+                timestamp_ns.to_string(),
+            )
             .output()
             .expect("Hermes Python fixture runs");
         assert!(
@@ -415,8 +420,6 @@ impl HermesJourney {
             "the fixture must state that it exercised register(ctx) without stock Hermes"
         );
         assert_eq!(result["context_engine_callback"], "complete");
-        assert_eq!(result["replay"]["mode"], "exact");
-        assert_eq!(result["replay"]["fresh_provider"], true);
         result
     }
 
@@ -534,8 +537,9 @@ fn unavailable_ncm_hermes_provider_refuses_then_recovers() {
     journey.init_project_at(&journey.foreign_project);
 
     journey.assert_baseline();
-    let fixture = journey.run_provider_fixture();
-    assert_fixture_replay(&fixture);
+    let timestamp_ns = replay_timestamp_ns();
+    let original = journey.run_provider_fixture("original", timestamp_ns);
+    assert_original_fixture(&original);
     let rows = journey.await_settled_rows();
     assert_settled_rows(&rows, journey.active_provider);
     let original_admissions = capture_admissions(journey.journal().expect("NCM journal"), &rows);
@@ -543,6 +547,19 @@ fn unavailable_ncm_hermes_provider_refuses_then_recovers() {
         journey.journal().expect("NCM journal"),
         &rows,
         journey.active_provider,
+    );
+
+    let replay = journey.run_provider_fixture("replay", timestamp_ns);
+    assert_fixture_replay(&replay);
+    let replayed_rows = journey.await_settled_rows();
+    assert_eq!(
+        journal_identities(&replayed_rows),
+        journal_identities(&rows)
+    );
+    assert_eq!(
+        capture_admissions(journey.journal().expect("NCM journal"), &replayed_rows),
+        original_admissions,
+        "exact provider replay must preserve the original admitted envelope"
     );
 
     journey.stop_daemon();
@@ -586,8 +603,9 @@ fn assert_hermes_provider_journey(active_provider: ActiveProvider) {
     journey.init_project_at(&journey.foreign_project);
 
     journey.assert_baseline();
-    let fixture = journey.run_provider_fixture();
-    assert_fixture_replay(&fixture);
+    let timestamp_ns = replay_timestamp_ns();
+    let original = journey.run_provider_fixture("original", timestamp_ns);
+    assert_original_fixture(&original);
     let rows = journey.await_settled_rows();
     assert_settled_rows(&rows, active_provider);
     let original_admissions =
@@ -598,18 +616,18 @@ fn assert_hermes_provider_journey(active_provider: ActiveProvider) {
         active_provider,
     );
 
-    // The fixture has already replayed the same deterministic admission with
-    // a fresh provider instance. Compare the full row identity and the
-    // immutable admitted envelope, not just a row count.
+    // Replay the same deterministic admission in a new host process and with
+    // a fresh provider instance. Compare the full row identity and immutable
+    // admitted envelope before and after the replay, not just a row count.
+    let replay = journey.run_provider_fixture("replay", timestamp_ns);
+    assert_fixture_replay(&replay);
+    let replayed_rows = journey.await_settled_rows();
     assert_eq!(
-        journal_identities(&journey.journal_rows()),
+        journal_identities(&replayed_rows),
         journal_identities(&rows)
     );
     assert_eq!(
-        capture_admissions(
-            journey.journal().expect("provider journal"),
-            &journey.journal_rows()
-        ),
+        capture_admissions(journey.journal().expect("provider journal"), &replayed_rows),
         original_admissions,
         "exact provider replay must preserve the original admitted envelope"
     );
@@ -683,9 +701,28 @@ impl HermesJourney {
     }
 }
 
+fn replay_timestamp_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos()
+}
+
+fn assert_original_fixture(fixture: &Value) {
+    assert_eq!(fixture["replay"]["mode"], "original");
+    assert_eq!(fixture["replay"]["fresh_provider"], false);
+    assert_eq!(fixture["context_engine_callback"], "complete");
+    let ids = fixture["replay"]["message_ids"]
+        .as_array()
+        .expect("fixture reports original message ids");
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().all(Value::is_string));
+}
+
 fn assert_fixture_replay(fixture: &Value) {
     assert_eq!(fixture["replay"]["mode"], "exact");
     assert_eq!(fixture["replay"]["fresh_provider"], true);
+    assert_eq!(fixture["context_engine_callback"], "complete");
     let ids = fixture["replay"]["message_ids"]
         .as_array()
         .expect("fixture reports exact original message ids");
