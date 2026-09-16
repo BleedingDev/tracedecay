@@ -263,7 +263,7 @@ fn deploy_is_a_clean_replace_dropping_stale_files() {
     // A stale skill dir the current bundle does not ship.
     let stale = deploy_dir.join("skills/totally-retired-skill");
     std::fs::create_dir_all(&stale).unwrap();
-    std::fs::write(stale.join("SKILL.md"), "stale skill").unwrap();
+    std::fs::write(stale.join("SKILL.md"), "name: tracedecay:totally-retired\n").unwrap();
 
     // Redeploy (the install/update path).
     deploy_plugin_bundle(home.path(), "/bin/tracedecay").unwrap();
@@ -302,6 +302,91 @@ fn deploy_refuses_to_replace_non_tracedecay_dir() {
     assert!(
         deploy_dir.join("user-file.txt").exists(),
         "an unowned dir must be left untouched"
+    );
+}
+
+#[test]
+fn old_owned_marketplace_update_and_uninstall_preserve_foreign_files() {
+    let home = tempfile::tempdir().unwrap();
+    let tracedecay_bin = "/bin/tracedecay";
+    let deploy_dir = deploy_plugin_bundle(home.path(), tracedecay_bin).unwrap();
+
+    // Model a receiptless install produced by an older TraceDecay release.
+    let plugin_manifest = deploy_dir.join(".claude-plugin/plugin.json");
+    let mut plugin = load_json_file_strict(&plugin_manifest).unwrap();
+    plugin["version"] = json!("0.0.0-old");
+    safe_write_json_file(&plugin_manifest, &plugin, None).unwrap();
+
+    let foreign_file = deploy_dir.join("user-file.txt");
+    std::fs::write(&foreign_file, "keep me").unwrap();
+    let foreign_skill = deploy_dir.join("skills/my-private-workflow/SKILL.md");
+    std::fs::create_dir_all(foreign_skill.parent().unwrap()).unwrap();
+    std::fs::write(&foreign_skill, "name: my-private-workflow\n").unwrap();
+    let retired_skill = deploy_dir.join("skills/tracedecay-retired/SKILL.md");
+    std::fs::create_dir_all(retired_skill.parent().unwrap()).unwrap();
+    std::fs::write(&retired_skill, "name: tracedecay:retired\n").unwrap();
+
+    let ctx = InstallContext {
+        home: home.path().to_path_buf(),
+        tracedecay_bin: tracedecay_bin.to_string(),
+        tool_permissions: Vec::new(),
+        project_root: None,
+        dashboard: true,
+    };
+    assert!(matches!(
+        ClaudeIntegration.update_plugin(&ctx).unwrap(),
+        UpdatePluginOutcome::DeferredUserAction(_)
+    ));
+    assert_eq!(std::fs::read(&foreign_file).unwrap(), b"keep me");
+    assert_eq!(
+        std::fs::read(&foreign_skill).unwrap(),
+        b"name: my-private-workflow\n"
+    );
+    assert!(!retired_skill.exists());
+    assert_eq!(
+        load_json_file_strict(&plugin_manifest).unwrap()["version"],
+        crate::PRODUCT_VERSION
+    );
+
+    remove_deployed_bundle(home.path()).unwrap();
+    assert_eq!(std::fs::read(&foreign_file).unwrap(), b"keep me");
+    assert_eq!(
+        std::fs::read(&foreign_skill).unwrap(),
+        b"name: my-private-workflow\n"
+    );
+    assert!(deploy_dir.exists());
+    assert!(!plugin_manifest.exists());
+}
+
+#[test]
+fn lifecycle_rejects_unowned_marketplace_dir_before_removal() {
+    use crate::agents::AgentIntegration;
+    use crate::agents::host_bundle::{HostBundleComponentV1, HostBundleRegistrationStateV1};
+
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let deploy_dir = plugin_deploy_dir(home.path());
+    std::fs::create_dir_all(deploy_dir.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        deploy_dir.join(".claude-plugin/plugin.json"),
+        r#"{"name":"someone-elses-plugin"}"#,
+    )
+    .unwrap();
+    std::fs::write(deploy_dir.join("user-file.txt"), "keep me").unwrap();
+
+    let state = ClaudeIntegration.host_component_registration(
+        HostBundleComponentV1::Core,
+        &HealthcheckContext {
+            home: home.path().to_path_buf(),
+            project_path: project.path().to_path_buf(),
+        },
+    );
+    assert_eq!(state, HostBundleRegistrationStateV1::Corrupt);
+    let error = remove_deployed_bundle(home.path()).unwrap_err();
+    assert!(error.to_string().contains("non-tracedecay"));
+    assert_eq!(
+        std::fs::read(deploy_dir.join("user-file.txt")).unwrap(),
+        b"keep me"
     );
 }
 

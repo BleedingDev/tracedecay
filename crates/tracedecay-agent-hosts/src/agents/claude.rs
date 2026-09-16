@@ -23,7 +23,9 @@ pub(super) use super::plugin_bundle::TRACEDECAY_BIN_PLACEHOLDER;
 use super::{
     AgentIntegration, DeferredUserAction, DoctorCounters, HealthcheckContext, InstallContext,
     JsonConfigDialect, JsonConfigMutation, NonInteractiveInstallOutcome, UpdatePluginOutcome,
-    expected_tool_perms, load_json_file, safe_write_text_file, update_json_config_transactionally,
+    collect_regular_files, expected_tool_perms, is_auto_discovered_entrypoint, load_json_file,
+    safe_remove_host_file, safe_write_text_file, skill_contents_have_tracedecay_marker,
+    update_json_config_transactionally,
 };
 
 pub struct ClaudeIntegration;
@@ -113,15 +115,39 @@ impl AgentIntegration for ClaudeIntegration {
     }
 
     fn deactivate_deployed_host_registration(&self, ctx: &InstallContext) -> Result<()> {
+        let deploy_dir = plugin_deploy_dir(&ctx.home);
+        let source_owned = deploy_dir_is_tracedecay(&deploy_dir);
+        // A component-set uninstall removes receipt-owned source files before
+        // this registration boundary runs. If a legacy receiptless install is
+        // still present, however, its manifest is the only ownership proof we
+        // have before cleaning that source. A foreign manifest must stop the
+        // lifecycle before Claude's native removal command is invoked.
+        if deploy_dir_has_manifest(&deploy_dir) && !source_owned {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "refusing to remove non-tracedecay plugin directory {}",
+                    deploy_dir.display()
+                ),
+            });
+        }
         if !claude_plugin_registration_is_active(&ctx.home)? {
-            return Ok(());
+            return source_owned
+                .then(|| remove_deployed_bundle(&ctx.home))
+                .unwrap_or(Ok(()));
         }
         let claude = require_claude_cli()?;
-        claude_plugin_deactivate_with(&claude, &ctx.home)
+        claude_plugin_deactivate_with(&claude, &ctx.home)?;
+        if source_owned {
+            remove_deployed_bundle(&ctx.home)?;
+        }
+        Ok(())
     }
 
     fn update_plugin(&self, ctx: &InstallContext) -> Result<UpdatePluginOutcome> {
-        if !plugin_marketplace_manifest_path(&ctx.home).exists() {
+        // The source directory is a mutable path under the user's Claude
+        // profile. Presence alone is not evidence that TraceDecay owns it:
+        // reject a foreign or malformed marketplace before staging an update.
+        if !ensure_owned_deploy_dir(&plugin_deploy_dir(&ctx.home))? {
             return Ok(UpdatePluginOutcome::NotInstalled);
         }
 
@@ -164,7 +190,15 @@ impl AgentIntegration for ClaudeIntegration {
             Ok(None) => json!({}),
             Err(()) => return State::Corrupt,
         };
-        let marketplace_residue = marketplace.get("tracedecay").is_some();
+        let deploy_dir = plugin_deploy_dir(&ctx.home);
+        // The source itself is a receiptless-install signal. It also gives
+        // uninstall a chance to clean a prior native-plugin install after the
+        // host registration was manually removed.
+        if deploy_dir_is_present(&deploy_dir) && !deploy_dir_is_tracedecay(&deploy_dir) {
+            return State::Corrupt;
+        }
+        let marketplace_residue =
+            marketplace.get("tracedecay").is_some() || deploy_dir_is_tracedecay(&deploy_dir);
         let settings_residue = settings
             .pointer("/enabledPlugins/tracedecay@tracedecay")
             .is_some()
@@ -274,7 +308,7 @@ impl AgentIntegration for ClaudeIntegration {
     }
 
     fn has_tracedecay(&self, home: &Path) -> bool {
-        plugin_marketplace_manifest_path(home).exists()
+        deploy_dir_is_tracedecay(&plugin_deploy_dir(home))
     }
 }
 
@@ -583,11 +617,46 @@ pub(crate) fn rendered_plugin_files(tracedecay_bin: &str) -> Result<Vec<(&'stati
         .collect()
 }
 
+/// Return whether the path itself exists, including a broken symlink or another
+/// unreadable entry. A failed metadata lookup is treated as present so callers
+/// that classify read-only host state fail closed as `Corrupt`.
+fn deploy_dir_is_present(deploy_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(deploy_dir) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Return whether either durable manifest is present at the deploy root.
+/// Manifest presence is used only to distinguish a post-transaction foreign
+/// file tree from an old receiptless install during native deactivation.
+fn deploy_dir_has_manifest(deploy_dir: &Path) -> bool {
+    [
+        ".claude-plugin/plugin.json",
+        ".claude-plugin/marketplace.json",
+    ]
+    .iter()
+    .any(|relative| std::fs::symlink_metadata(deploy_dir.join(relative)).is_ok())
+}
+
 /// True when a deployed marketplace dir is tracedecay-owned: its plugin or
-/// marketplace manifest names the tracedecay plugin. A fresh (missing) dir is
-/// trivially safe to write into.
+/// marketplace manifest names the tracedecay plugin. Ownership requires a real
+/// directory and a regular, non-symlink manifest, so a foreign path cannot
+/// redirect lifecycle writes through an apparently valid manifest.
 fn deploy_dir_is_tracedecay(deploy_dir: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(deploy_dir) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
     let names_tracedecay = |manifest: &Path| {
+        let Ok(metadata) = std::fs::symlink_metadata(manifest) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return false;
+        }
         load_json_file(manifest)
             .get("name")
             .and_then(|v| v.as_str())
@@ -597,12 +666,29 @@ fn deploy_dir_is_tracedecay(deploy_dir: &Path) -> bool {
         || names_tracedecay(&deploy_dir.join(".claude-plugin/marketplace.json"))
 }
 
-/// Remove the tracedecay-owned deploy dir so the next write is a clean replace.
-/// No-op when the dir is missing. Refuses (errors) when the dir exists but is
-/// not tracedecay-owned, so an unrelated directory is never deleted.
-fn clean_replace_owned_deploy_dir(deploy_dir: &Path) -> Result<()> {
-    if !deploy_dir.exists() {
-        return Ok(());
+/// Validate an existing deploy path before a lifecycle operation. A missing
+/// path is a normal first install; every other existing path must be a real
+/// directory carrying TraceDecay's manifest ownership proof.
+fn ensure_owned_deploy_dir(deploy_dir: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(deploy_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "failed to inspect Claude plugin directory {}: {error}",
+                    deploy_dir.display()
+                ),
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "refusing to replace non-tracedecay plugin directory {}",
+                deploy_dir.display()
+            ),
+        });
     }
     if !deploy_dir_is_tracedecay(deploy_dir) {
         return Err(TraceDecayError::Config {
@@ -612,9 +698,190 @@ fn clean_replace_owned_deploy_dir(deploy_dir: &Path) -> Result<()> {
             ),
         });
     }
-    std::fs::remove_dir_all(deploy_dir).map_err(|e| TraceDecayError::Config {
-        message: format!("failed to remove {}: {e}", deploy_dir.display()),
-    })
+    Ok(true)
+}
+
+/// Remove every managed file from an owned deploy root while preserving
+/// user-created files, directories, and symlinks. Retired auto-discovered
+/// entrypoints are removed only when their own contents carry a TraceDecay
+/// marker; a same-name user workflow therefore stays intact.
+fn remove_deployed_bundle(home: &Path) -> Result<()> {
+    let deploy_dir = plugin_deploy_dir(home);
+    if !ensure_owned_deploy_dir(&deploy_dir)? {
+        return Ok(());
+    }
+    remove_managed_deploy_files(&deploy_dir)
+}
+
+fn remove_managed_deploy_files(deploy_dir: &Path) -> Result<()> {
+    let managed = claude_embedded_plugin_files()
+        .into_iter()
+        .map(|(relative, _)| deploy_dir.join(relative))
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in &managed {
+        remove_managed_deploy_file(path)?;
+    }
+    sweep_retired_deploy_files(deploy_dir, &managed)?;
+    prune_empty_deploy_dirs(deploy_dir)
+}
+
+fn remove_managed_deploy_file(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "failed to inspect Claude plugin file {}: {error}",
+                    path.display()
+                ),
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || metadata.is_dir() || !metadata.is_file() {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "refusing to remove unsafe Claude plugin file {}",
+                path.display()
+            ),
+        });
+    }
+    match safe_remove_host_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(TraceDecayError::Config {
+            message: format!(
+                "failed to remove Claude plugin file {}: {error}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn sweep_retired_deploy_files(
+    deploy_dir: &Path,
+    managed: &std::collections::BTreeSet<PathBuf>,
+) -> Result<()> {
+    for relative_root in ["agents", "commands", "skills"] {
+        let root = deploy_dir.join(relative_root);
+        let metadata = match std::fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "failed to inspect retired Claude plugin files under {}: {error}",
+                        root.display()
+                    ),
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let mut files = collect_regular_files(&root).map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inventory retired Claude plugin files under {}: {error}",
+                root.display()
+            ),
+        })?;
+        files.sort();
+        for file in files {
+            if managed.contains(&file) {
+                continue;
+            }
+            let Some(relative) = file
+                .strip_prefix(deploy_dir)
+                .ok()
+                .and_then(Path::to_str)
+                .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
+            else {
+                continue;
+            };
+            if !is_auto_discovered_entrypoint(&relative) {
+                continue;
+            }
+            let contents =
+                std::fs::read_to_string(&file).map_err(|error| TraceDecayError::Config {
+                    message: format!(
+                        "failed to read retired Claude plugin file {}: {error}",
+                        file.display()
+                    ),
+                })?;
+            if !skill_contents_have_tracedecay_marker(&contents) {
+                continue;
+            }
+            remove_managed_deploy_file(&file)?;
+        }
+        prune_empty_deploy_dirs(&root)?;
+    }
+    Ok(())
+}
+
+fn prune_empty_deploy_dirs(root: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "failed to inspect Claude plugin directory {}: {error}",
+                    root.display()
+                ),
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inspect Claude plugin directory {}: {error}",
+                root.display()
+            ),
+        })?;
+        let metadata = entry.file_type().map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inspect Claude plugin path {}: {error}",
+                entry.path().display()
+            ),
+        })?;
+        if metadata.is_dir() && !metadata.is_symlink() {
+            prune_empty_deploy_dirs(&entry.path())?;
+        }
+    }
+    let empty = std::fs::read_dir(root)
+        .map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to inspect Claude plugin directory {}: {error}",
+                root.display()
+            ),
+        })?
+        .next()
+        .is_none();
+    if empty {
+        match std::fs::remove_dir(root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(TraceDecayError::Config {
+                    message: format!(
+                        "failed to remove empty Claude plugin directory {}: {error}",
+                        root.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the managed files from an owned deploy dir so the next write is a
+/// clean replacement of TraceDecay's bundle. Foreign files remain available
+/// to the marketplace owner and are never removed by this lifecycle.
+fn clean_replace_owned_deploy_dir(deploy_dir: &Path) -> Result<()> {
+    if !ensure_owned_deploy_dir(deploy_dir)? {
+        return Ok(());
+    }
+    remove_managed_deploy_files(deploy_dir)
 }
 
 /// Apply per-file deploy-time substitutions:
