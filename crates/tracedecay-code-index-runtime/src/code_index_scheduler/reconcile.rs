@@ -2366,6 +2366,15 @@ impl CodeIndexWorktreeSchedulerV1 {
             .map(|pointer| pointer.generation_id)
     }
 
+    /// Set the transient folder policy used by a direct capture in tests.
+    #[cfg(test)]
+    pub(super) fn set_active_reconcile_options_for_test(
+        &mut self,
+        options: Option<CodeIndexReconcileOptionsV1>,
+    ) {
+        self.active_reconcile_options = options;
+    }
+
     /// Install a deterministic reconcile fault for one mounted worktree so a
     /// test can drive the real background worker loop over a pass that panics
     /// or fails, and count the attempts the loop actually makes.

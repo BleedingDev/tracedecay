@@ -79,7 +79,7 @@ fn ephemeral_folder_selection_filters_capture_and_keeps_default_cursor_shape() {
         ["dist/generated".to_owned()],
     )
     .expect("valid request-scoped folder selection");
-    scheduler.active_reconcile_options = Some(options);
+    scheduler.set_active_reconcile_options_for_test(Some(options));
 
     let selected = scheduler
         .capture_authoritative_snapshot_without_active_generation_reuse(None)
@@ -108,7 +108,7 @@ fn ephemeral_folder_selection_filters_capture_and_keeps_default_cursor_shape() {
     // The option is one-pass state. Once it is cleared, the default capture
     // sees the ordinary committed source set and still leaves ignored files
     // out unless a future request explicitly includes them.
-    scheduler.active_reconcile_options = None;
+    scheduler.set_active_reconcile_options_for_test(None);
     let ordinary = scheduler
         .capture_authoritative_snapshot_without_active_generation_reuse(None)
         .expect("capture ordinary folders");
