@@ -1000,24 +1000,10 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
             .expect("kill command runs")
             .success()
     );
-    let failed_health = client.call(
-        Request::new(261, 0, Operation::Health, "", json!({})),
-        Duration::from_millis(500),
-    );
-    assert!(
-        matches!(
-            failed_health,
-            Err(ClientError::MalformedReply(_))
-                | Err(ClientError::WorkerExited)
-                | Err(ClientError::Transport(_))
-        ),
-        "dead worker must invalidate the current process: {failed_health:?}"
-    );
-
     let recovered = client
         .call(
             Request::new(
-                262,
+                261,
                 0,
                 Operation::Recall,
                 &ns,
@@ -1040,7 +1026,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
 
     let inspection = client
         .call(
-            Request::new(263, 0, Operation::Inspection, &ns, json!({})),
+            Request::new(262, 0, Operation::Inspection, &ns, json!({})),
             CALL_DEADLINE,
         )
         .expect("recovered namespace can be inspected");

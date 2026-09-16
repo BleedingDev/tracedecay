@@ -800,46 +800,47 @@ fn owner_loop(
                 }
             }
         }
-        let result = match process.as_mut() {
-            Some(worker) => {
-                let result = if requires_readiness(&command.request) {
-                    worker.ensure_ready(
-                        &command.request.namespace,
-                        command.expires,
-                        &shutdown,
-                        command.cancelled.as_ref(),
-                    )
-                } else {
-                    Ok(())
-                }
-                .and_then(|()| {
-                    worker.execute(
-                        &command.request,
-                        command.expires,
-                        &shutdown,
-                        command.cancelled.as_ref(),
-                    )
-                });
-                if let Ok(reply) = &result
-                    && command.request.op == Operation::Handshake
-                    && reply.outcome == crate::engine::Outcome::Success
-                {
-                    worker.mark_ready(&command.request.namespace);
-                }
-                if let Some(reply) = result.as_ref().ok()
-                    && matches!(
-                        &reply.outcome,
-                        crate::engine::Outcome::Unavailable(_) | crate::engine::Outcome::Corrupt
-                    )
-                {
-                    worker.invalidate_ready(&command.request.namespace);
-                }
-                result
-            }
+        let mut restart_failure_recorded = false;
+        let mut result = match process.as_mut() {
+            Some(worker) => execute_owner_command(worker, &command, &shutdown),
             None => Err(ClientError::OwnerStopped),
         };
+        // A killed worker can be discovered by the first namespace operation
+        // rather than by a separate health probe. Read-only operations are
+        // safe to retry after the dead process is reaped; the replacement's
+        // empty readiness set forces a real namespace handshake before recall.
+        if should_retry_after_worker_loss(&command.request, &result) {
+            if let Some(worker) = process.take() {
+                worker.terminate(false);
+            }
+            if !shutdown.load(Ordering::Acquire)
+                && !(command.cancelled)()
+                && remaining(command.expires).is_some()
+            {
+                match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
+                    Ok(worker) => {
+                        process = Some(worker);
+                        result = match process.as_mut() {
+                            Some(worker) => execute_owner_command(worker, &command, &shutdown),
+                            None => Err(ClientError::OwnerStopped),
+                        };
+                    }
+                    Err(error) => {
+                        if !matches!(&error, ClientError::Unavailable(_)) {
+                            restart_failures = restart_failures.saturating_add(1);
+                            restart_failure_recorded = true;
+                        }
+                        result = Err(if restart_failures > launch.max_restart_attempts {
+                            ClientError::RestartExhausted
+                        } else {
+                            error
+                        });
+                    }
+                }
+            }
+        }
         let abnormal = matches!(
-            result,
+            &result,
             Err(ClientError::Cancelled)
                 | Err(ClientError::EffectUnknown { .. })
                 | Err(ClientError::Transport(_))
@@ -849,7 +850,7 @@ fn owner_loop(
         if abnormal && let Some(worker) = process.take() {
             worker.terminate(false);
         }
-        if abnormal && !(command.cancelled)() {
+        if abnormal && !(command.cancelled)() && !restart_failure_recorded {
             restart_failures = restart_failures.saturating_add(1);
         } else if result.is_ok() {
             restart_failures = 0;
@@ -860,6 +861,58 @@ fn owner_loop(
         worker.terminate(true);
     }
     pid.store(0, Ordering::Release);
+}
+
+fn execute_owner_command(
+    worker: &mut WorkerProcess,
+    command: &OwnerCommand,
+    shutdown: &AtomicBool,
+) -> Result<Reply, ClientError> {
+    let result = if requires_readiness(&command.request) {
+        worker.ensure_ready(
+            &command.request.namespace,
+            command.expires,
+            shutdown,
+            command.cancelled.as_ref(),
+        )
+    } else {
+        Ok(())
+    }
+    .and_then(|()| {
+        worker.execute(
+            &command.request,
+            command.expires,
+            shutdown,
+            command.cancelled.as_ref(),
+        )
+    });
+    if let Ok(reply) = &result
+        && command.request.op == Operation::Handshake
+        && reply.outcome == crate::engine::Outcome::Success
+    {
+        worker.mark_ready(&command.request.namespace);
+    }
+    if let Some(reply) = result.as_ref().ok()
+        && matches!(
+            &reply.outcome,
+            crate::engine::Outcome::Unavailable(_) | crate::engine::Outcome::Corrupt
+        )
+    {
+        worker.invalidate_ready(&command.request.namespace);
+    }
+    result
+}
+
+fn should_retry_after_worker_loss(request: &Request, result: &Result<Reply, ClientError>) -> bool {
+    if matches!(request.op, Operation::Health) || request.op.is_mutating() {
+        return false;
+    }
+    matches!(
+        result,
+        Err(ClientError::MalformedReply(_))
+            | Err(ClientError::Transport(_))
+            | Err(ClientError::WorkerExited)
+    )
 }
 
 enum WriterCommand {
