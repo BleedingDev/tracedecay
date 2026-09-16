@@ -518,10 +518,10 @@ async fn failed_full_publication_unwinds_every_owner_before_retry() {
     super::super::project_composition::fail_project_open_after(
         super::super::project_composition::ProjectOpenFailurePhase::DependentOwners,
     );
-    let failure = engine
-        .project_server(&handshake)
-        .await
-        .expect_err("injected dependent-owner failure");
+    let failure = match engine.project_server(&handshake).await {
+        Ok(_) => panic!("injected dependent-owner failure must reject the open"),
+        Err(error) => error,
+    };
     assert!(
         failure
             .to_string()
