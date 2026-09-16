@@ -236,7 +236,11 @@ fn assert_success(result: &ProviderControlResultV1, operation: &str) {
     );
 }
 
-fn assert_health(journey: &ClaudeHostJourney, state: &ProviderControlStateSelectorV1, label: &str) {
+fn assert_health(
+    journey: &ClaudeHostJourney,
+    state: &ProviderControlStateSelectorV1,
+    label: &str,
+) -> u64 {
     let response = invoke(
         journey,
         &format!("host-provider-control.{label}"),
@@ -264,6 +268,7 @@ fn assert_health(journey: &ClaudeHostJourney, state: &ProviderControlStateSelect
         tracedecay_contracts::retained_surfaces::ProviderControlReadinessV1::Ready,
         "{label} must report a ready provider: {health:?}"
     );
+    health.state_generation
 }
 
 fn assert_maintenance(journey: &ClaudeHostJourney, state: &ProviderControlStateSelectorV1) {
@@ -344,6 +349,11 @@ fn assert_maintenance(journey: &ClaudeHostJourney, state: &ProviderControlStateS
     assert_eq!(
         result.effect.provider_receipt_digest.as_deref(),
         Some(maintenance.receipt.provider_receipt_digest.as_str())
+    );
+    assert_eq!(
+        assert_health(journey, state, "health.after-maintenance"),
+        maintenance.receipt.state_generation_after,
+        "maintenance receipt must match the provider's post-maintenance health generation"
     );
 }
 
