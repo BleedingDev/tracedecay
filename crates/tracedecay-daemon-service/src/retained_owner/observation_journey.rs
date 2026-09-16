@@ -4484,6 +4484,9 @@ impl ProjectObservationJourneyV1 {
                 if let Some(state) = failed {
                     return Err(ObservationJourneyError::RequiredDeliveryFailed { state });
                 }
+                if cancellation.is_cancelled() || self.stopping.is_cancelled() {
+                    return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+                }
                 return Ok(());
             }
 
@@ -9613,6 +9616,25 @@ mod tests {
                 ObservationJourneyError::DeadlineExceeded { admitted: 0 }
             ),
             "unexpected publication-barrier result: {refused_while_provider_held}"
+        );
+
+        let barrier_cancellation = HostCancellationToken::new();
+        let cancel = barrier_cancellation.clone();
+        let cancellation_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let unwound = fixture
+            .journey
+            .await_delivery_settled(&barrier_cancellation, Duration::from_secs(1))
+            .await
+            .expect_err("cancellation must unwind the publication barrier");
+        cancellation_task
+            .await
+            .expect("publication-barrier cancellation task");
+        assert!(
+            matches!(unwound, ObservationJourneyError::Cancelled { admitted: 0 }),
+            "unexpected cancellation result: {unwound}"
         );
 
         release.release();

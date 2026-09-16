@@ -268,23 +268,30 @@ fn common_control_recovery_recomputes_semantics_from_receipt_input() {
         .unwrap();
     let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
     assert!(receipt["operation"]["common_control"]["canonical_input"].is_object());
-    receipt["operation"]["common_control"]["canonical_input"] = json!({"tampered": true});
     let state_digest = receipt["state_digest"].as_str().unwrap().to_owned();
-    let integrity = IntegrityBasis {
-        reply: ReplyIntegrityBasis {
-            outcome: &receipt["reply"]["outcome"],
-            state_generation: &receipt["reply"]["state_generation"],
-            payload: &receipt["reply"]["payload"],
-        },
-        operation: OperationIntegrityBasis {
-            common_control: CommonControlIntegrityBasis {
-                operations: &receipt["operation"]["common_control"]["operations"],
-                canonical_input: &receipt["operation"]["common_control"]["canonical_input"],
+    let integrity_digest = |receipt: &Value| {
+        let integrity = IntegrityBasis {
+            reply: ReplyIntegrityBasis {
+                outcome: &receipt["reply"]["outcome"],
+                state_generation: &receipt["reply"]["state_generation"],
+                payload: &receipt["reply"]["payload"],
             },
-        },
-        state_digest: &state_digest,
+            operation: OperationIntegrityBasis {
+                common_control: CommonControlIntegrityBasis {
+                    operations: &receipt["operation"]["common_control"]["operations"],
+                    canonical_input: &receipt["operation"]["common_control"]["canonical_input"],
+                },
+            },
+            state_digest: &state_digest,
+        };
+        digest(&serde_json::to_vec(&integrity).unwrap())
     };
-    receipt["integrity_digest"] = json!(digest(&serde_json::to_vec(&integrity).unwrap()));
+    assert_eq!(
+        integrity_digest(&receipt),
+        receipt["integrity_digest"].as_str().unwrap()
+    );
+    receipt["operation"]["common_control"]["canonical_input"] = json!({"tampered": true});
+    receipt["integrity_digest"] = json!(integrity_digest(&receipt));
     connection
         .execute(
             "UPDATE events SET receipt = ?1 WHERE idempotency_key = ?2",
