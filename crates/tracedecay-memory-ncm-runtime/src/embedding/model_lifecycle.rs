@@ -217,7 +217,6 @@ fn install_or_update(
                 &journal_path,
                 journal,
                 &staging_path,
-                &candidate_models,
                 &backup_name,
                 &manifest,
             )?;
@@ -246,7 +245,6 @@ fn publish_candidate(
     journal_path: &Path,
     mut journal: LifecycleJournal,
     staging_path: &Path,
-    candidate_models: &Path,
     backup_name: &str,
     manifest: &PinnedEncoder,
 ) -> Result<(), EncoderError> {
