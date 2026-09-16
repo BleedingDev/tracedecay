@@ -219,7 +219,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 family: SimilarFamilyV1 {
                     match_class,
                     normalization_revision: candidate.key.normalization_revision,
-                    family_digest: candidate.key.digest,
+                    family_digest: candidate.key.digest.clone(),
                     representative_payload_digest: source.payload.payload_digest.clone(),
                     member_count: members.len(),
                     members,
