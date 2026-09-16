@@ -506,7 +506,6 @@ fn assert_provider_unavailable_fallback_and_recovery(
     journey.stop_daemon();
     fs::remove_file(&journal).expect("remove invalid Native journal");
     fs::rename(&backup, &journal).expect("restore Native journal after fault");
-    journey.start_daemon();
     let recovered = restart_and_recall(journey, session_id);
     let lane = assert_answered_lane(&recovered, CONFIGURED_PROVIDER_ID);
     assert_eq!(lane["state"], "answered");
