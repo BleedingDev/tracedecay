@@ -125,6 +125,19 @@ def main() -> int:
             expect=2,
         )
 
+        worker_value["targets"] = worker_value["targets"][:1]
+        worker_value["targets"][0]["bytes"] = 0
+        worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
+        run_checker(
+            "--policy",
+            str(policy_path),
+            "--worker-manifest",
+            str(worker_path),
+            "--release-targets",
+            str(release_path),
+            expect=2,
+        )
+
         worker_path.write_text(
             WORKER_MANIFEST.read_text(encoding="utf-8"), encoding="utf-8"
         )

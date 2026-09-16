@@ -27,6 +27,12 @@ def _required_string(value: Any, label: str) -> str:
     return value
 
 
+def _required_positive_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise WorkerPlatformPolicyError(f"{label} must be a positive integer")
+    return value
+
+
 def _entries(value: Any, label: str) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise WorkerPlatformPolicyError(f"{label} must be a non-empty list")
@@ -129,7 +135,28 @@ def validate_worker_platform_policy(
         raise WorkerPlatformPolicyError(
             "worker platform policy.worker does not match worker manifest.worker"
         )
+    if worker_manifest.get("schema_version") != 1:
+        raise WorkerPlatformPolicyError("worker manifest schema_version must be 1")
+    if worker_manifest.get("protocol_version") != 1:
+        raise WorkerPlatformPolicyError("worker manifest protocol_version must be 1")
+    if worker_manifest.get("protocol_identity") != "tracedecay.ncm.worker.v1":
+        raise WorkerPlatformPolicyError(
+            "worker manifest protocol_identity must be 'tracedecay.ncm.worker.v1'"
+        )
     worker_targets = _entries(worker_manifest.get("targets"), "worker manifest.targets")
+    for index, entry in enumerate(worker_targets):
+        _required_string(entry.get("triple"), f"worker manifest.targets[{index}].triple")
+        _required_string(entry.get("os"), f"worker manifest.targets[{index}].os")
+        _required_string(entry.get("arch"), f"worker manifest.targets[{index}].arch")
+        _required_string(entry.get("family"), f"worker manifest.targets[{index}].family")
+        _required_positive_int(entry.get("bytes"), f"worker manifest.targets[{index}].bytes")
+        digest = _required_string(
+            entry.get("sha256"), f"worker manifest.targets[{index}].sha256"
+        )
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise WorkerPlatformPolicyError(
+                f"worker manifest.targets[{index}].sha256 must be lowercase hexadecimal"
+            )
     worker_target_triples = _unique_targets(
         worker_targets, "worker manifest.targets", field="triple"
     )
