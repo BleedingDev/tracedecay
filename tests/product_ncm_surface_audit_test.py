@@ -44,20 +44,31 @@ def valid_audit(registry: dict[str, Any]) -> dict[str, Any]:
             "provider.health.v1": "adaptable",
             "observation.accept.v1": "blocking",
             "recall.query.v1": "adaptable",
+            "memory.advisory_common.v1": "blocking",
         }.get(capability_id, "unsupported")
+        row = {
+            "capability_id": capability_id,
+            "requirement": requirement,
+            "classification": classification,
+            "evidence_ids": {
+                "provider.health.v1": ["source-health"],
+                "observation.accept.v1": ["source-observe"],
+                "recall.query.v1": ["source-search"],
+                "memory.advisory_common.v1": [
+                    "source-health",
+                    "source-observe",
+                    "source-search",
+                ],
+            }.get(capability_id, []),
+            "adapter_requirements": [],
+            "ncm_change_required": capability_id == "observation.accept.v1",
+        }
+        if capability_id == "memory.advisory_common.v1":
+            row["adapter_requirements"] = ["complete the common advisory profile"]
+            row["ncm_change_required"] = True
+            row["blockers"] = [{"owner_boundary": "biomem", "reason": "required profile operations are incomplete"}]
         matrix.append(
-            {
-                "capability_id": capability_id,
-                "requirement": requirement,
-                "classification": classification,
-                "evidence_ids": {
-                    "provider.health.v1": ["source-health"],
-                    "observation.accept.v1": ["source-observe"],
-                    "recall.query.v1": ["source-search"],
-                }.get(capability_id, []),
-                "adapter_requirements": [],
-                "ncm_change_required": capability_id == "observation.accept.v1",
-            }
+            row
         )
     return {
         "schema_version": 1,
@@ -300,7 +311,17 @@ class NcmSurfaceAuditTest(unittest.TestCase):
     def test_complete_substantive_fixture_passes(self) -> None:
         result = self.run_checker(copy.deepcopy(self.fixture))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("15 capabilities", result.stdout)
+        self.assertIn("16 capabilities", result.stdout)
+
+    def test_common_advisory_profile_is_blocked_by_required_surface_gaps(self) -> None:
+        row = self.capability(self.fixture, "memory.advisory_common.v1")
+        self.assertEqual(row["requirement"], "optional")
+        self.assertEqual(row["classification"], "blocking")
+        self.assertTrue(row["evidence_ids"])
+        self.assertTrue(row["adapter_requirements"])
+        self.assertTrue(row["blockers"])
+        result = self.run_checker(copy.deepcopy(self.fixture))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_checked_in_audit_passes(self) -> None:
         result = subprocess.run(

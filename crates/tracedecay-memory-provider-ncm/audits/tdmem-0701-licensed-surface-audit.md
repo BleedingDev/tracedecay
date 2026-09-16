@@ -25,6 +25,16 @@ TraceDecay provider**:
 | `observation.accept.v1` | **blocking** | `store_record` | A retry reinforces memory again; there is no durable idempotency ledger, payload-conflict check, server cancellation, effect reconciliation, or crash-safe commit. Mandatory observation conformance cannot be supplied by envelope translation alone. | [O1] [O2] [O3] [S1] [P3] |
 | `recall.query.v1` | **adaptable** | `search`, explicitly **not** `retrieve` | `search` is bounded and returns stable IDs, native scores, content, and provenance without recall-stat mutation. The adapter must add exact scope, validity, provenance state, exclusions, coverage, deterministic ties, terminal/deadline mapping, and response budgets. | [R1] [R2] [R3] |
 
+The optional `memory.advisory_common.v1` profile is **blocking**. The profile
+requires every operation in its canonical required-capability list, including
+temporal recall, feedback, maintenance, inspection, correction, source
+deletion, snapshot export/restore, and replay. The audited surface has no
+temporal-recall or feedback primitive, and its related lifecycle primitives do
+not carry the required provider scope, identity, receipt, budget, cancellation,
+or postcondition semantics. The profile therefore cannot be claimed from the
+three usable mandatory primitives or from the presence of similarly named
+commands. [CP1] [A1] [A2] [M1] [I1]
+
 The overall production gate is therefore **blocked** on four irreducible
 conditions: verified state readiness, exact-scope isolation, server-side
 cancellation/effect reconciliation, and crash-safe persistence. Durable
@@ -38,7 +48,7 @@ evidence before the adapter may report ready. [H1] [H2] [S2]
 
 The machine-readable companion is
 [`tdmem-0701-capability-matrix.json`](tdmem-0701-capability-matrix.json). It
-classifies all 15 registry capabilities exactly once and separates adapter work
+classifies all 16 registry capabilities exactly once and separates adapter work
 from changes required in Biomem.
 
 ## Mandatory operation analysis
@@ -365,6 +375,10 @@ TraceDecay contract evidence:
 - **[R1]** `product/contracts/memory-provider-v1/provider-recall-contract.json`
   `/recall_request`, `/provider_candidate`, `/recall_response`, `/coverage`,
   `/validity`, `/provenance`, and invariants.
+- **[CP1]** `product/contracts/memory-provider-v1/provider-registry-contract.json`
+  `/common_advisory_profile.profile_id` and
+  `/common_advisory_profile.required_capabilities`; the profile is explicit,
+  opt-in, and requires every listed capability.
 
 Exact Biomem revision source evidence:
 

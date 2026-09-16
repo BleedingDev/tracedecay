@@ -259,6 +259,33 @@
       "adapter_requirements": ["add scoped views, redaction policy, byte/item bounds, stable cursors, coverage, and generation"],
       "ncm_change_required": true,
       "blockers": [{"owner_boundary": "biomem", "reason": "available status/list/graph primitives do not cover required views and list materializes an effectively unbounded scan"}]
+    },
+    {
+      "capability_id": "memory.advisory_common.v1",
+      "requirement": "optional",
+      "classification": "blocking",
+      "evidence_ids": [
+        "contract-common-profile",
+        "biomem-command-catalog",
+        "biomem-maintenance",
+        "biomem-inspection",
+        "biomem-search-core",
+        "biomem-mcp-surface"
+      ],
+      "adapter_requirements": [
+        "map every required common-profile operation through canonical scope, identity, lifecycle, provenance, budget, and terminal semantics"
+      ],
+      "ncm_change_required": true,
+      "blockers": [
+        {
+          "owner_boundary": "biomem",
+          "reason": "the required profile includes unsupported temporal recall and feedback, while related maintenance and inspection primitives lack the required provider semantics"
+        },
+        {
+          "owner_boundary": "adapter",
+          "reason": "complete common-profile admission and canonical operation/result mapping are not implemented"
+        }
+      ]
     }
   ],
   "callable_surface": [
@@ -553,6 +580,13 @@
       "repository": "tracedecay worktree",
       "path": "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
       "symbol": "/capability_gating, /maintenance, /inspection, /correction, /deletion_by_source, /snapshot, /replay"
+    },
+    {
+      "id": "contract-common-profile",
+      "kind": "source_symbol",
+      "repository": "tracedecay worktree",
+      "path": "product/contracts/memory-provider-v1/provider-registry-contract.json",
+      "symbol": "/common_advisory_profile.profile_id, /common_advisory_profile.required_capabilities"
     },
     {
       "id": "biomem-mcp-surface",
