@@ -427,7 +427,19 @@ impl McpServer {
                 )
                 .await
                 {
-                    Some(advisory) => advisory.appended_to(result),
+                    Some(advisory) => {
+                        let mut result = result;
+                        if let Some(text) = result
+                            .value
+                            .pointer("/content/0/text")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            && let Some(slot) = result.value.pointer_mut("/content/0/text")
+                        {
+                            *slot = Value::String(advisory.appended_text(&text));
+                        }
+                        result
+                    }
                     None => result,
                 },
             ),
