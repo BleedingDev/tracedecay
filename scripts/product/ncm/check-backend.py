@@ -29,6 +29,23 @@ from typing import Any, Iterable
 BASE_COMMIT = "25778c7443cd0cfe257da363da01a56ea1d45d3f"
 TASK_ID = "ncm-rs-022"
 MODEL_CACHE_REPOSITORY = "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_REPOSITORY = "Xenova/paraphrase-multilingual-MiniLM-L12-v2"
+MODEL_REVISION = "2c4055b12046f11709e9df2c122e59ffbdc2f900"
+MODEL_REVISION_PROVENANCE = (
+    "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+    "#/identities/model/revision"
+)
+MODEL_MAX_LENGTH = 128
+MODEL_POOLING = "mean"
+MODEL_NORMALIZE = True
+MODEL_REQUIRED_FILES = (
+    "onnx/model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+)
 TEST_DOUBLE_MARKER = b"test-double/hash"
 REAL_ARTIFACT_MARKERS = (b"fastembed", b"onnxruntime")
 WORKER_MANIFEST_SCHEMA_VERSION = 1
@@ -237,21 +254,61 @@ def _open_regular_no_follow(path: Path, *, label: str) -> int:
     return descriptor
 
 
-def _read_regular_no_follow(path: Path, *, label: str) -> bytes:
+def _read_regular_no_follow(
+    path: Path, *, label: str, maximum_bytes: int | None = None
+) -> bytes:
     """Read one exact regular-file handle, rejecting symlink substitution."""
     descriptor = _open_regular_no_follow(path, label=label)
     try:
         chunks: list[bytes] = []
+        bytes_read = 0
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
+            bytes_read += len(chunk)
+            if maximum_bytes is not None and bytes_read > maximum_bytes:
+                raise GateFailure(f"{label} exceeds the admitted byte bound: {path}")
             chunks.append(chunk)
         return b"".join(chunks)
     except OSError as error:
         raise GateFailure(f"read {label} {path}: {error}") from error
     finally:
         os.close(descriptor)
+
+
+def _regular_file_digest_no_follow(path: Path, *, label: str) -> tuple[int, str]:
+    """Hash one exact regular-file descriptor and return its size and digest."""
+    descriptor = _open_regular_no_follow(path, label=label)
+    digest = hashlib.sha256()
+    bytes_read = 0
+    try:
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            digest.update(chunk)
+    except OSError as error:
+        raise GateFailure(f"read {label} {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+    return bytes_read, digest.hexdigest()
+
+
+def _directory_no_follow(path: Path, *, label: str) -> Path:
+    """Require one existing directory entry without accepting symlinks."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise GateFailure(f"{label} is missing: {path}") from error
+    except OSError as error:
+        raise GateFailure(f"inspect {label} {path}: {error}") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise GateFailure(f"{label} must not be a symlink: {path}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise GateFailure(f"{label} must be a directory: {path}")
+    return path
 
 
 def _read_worker_manifest(path: Path, *, label: str) -> tuple[dict[str, Any], bytes]:
@@ -572,43 +629,144 @@ def verify_worker_artifact(path: Path, *, repo: Path) -> VerifiedWorkerArtifact:
 
 
 def model_snapshot(model_root: Path, manifest: dict[str, Any]) -> tuple[Path, str]:
-    """Resolve the installed fastembed snapshot pinned by the local ref."""
-    repository = model_root / "models" / MODEL_CACHE_REPOSITORY
-    revision_file = repository / "refs" / "main"
-    require(revision_file.is_file(), f"pinned model ref missing: {revision_file}")
-    revision = revision_file.read_text(encoding="utf-8").strip()
-    require(bool(revision), "pinned model revision is empty")
-    snapshot = repository / "snapshots" / revision
-    require(snapshot.is_dir(), f"pinned model snapshot missing: {snapshot}")
-    require(bool(manifest.get("files")), "embedding manifest has no files")
+    """Resolve the installed snapshot using Rust's exact pinned no-follow rules."""
+    require(isinstance(manifest, dict), "embedding manifest is not an object")
+    require(manifest.get("model") == MODEL_NAME, "embedding manifest model is not pinned")
+    require(
+        manifest.get("repository") == MODEL_REPOSITORY,
+        "embedding manifest repository is not pinned",
+    )
+    require(
+        manifest.get("revision") == MODEL_REVISION,
+        "embedding manifest revision is not the pinned Xenova revision",
+    )
+    require(
+        manifest.get("revision_provenance") == MODEL_REVISION_PROVENANCE,
+        "embedding manifest revision provenance is not pinned",
+    )
+    require(
+        manifest.get("max_length") == MODEL_MAX_LENGTH,
+        "embedding manifest max length is not pinned",
+    )
+    require(manifest.get("pooling") == MODEL_POOLING, "embedding manifest pooling is not pinned")
+    require(
+        manifest.get("normalize") is MODEL_NORMALIZE,
+        "embedding manifest normalization is not pinned",
+    )
+    files = manifest.get("files")
+    require(isinstance(files, list), "embedding manifest files are not a list")
+    require(len(files) == len(MODEL_REQUIRED_FILES), "embedding manifest has the wrong file count")
+    seen: set[str] = set()
+    for item in files:
+        require(isinstance(item, dict), "embedding manifest file is not an object")
+        require(
+            set(item) == {"path", "sha256", "bytes"},
+            "embedding manifest file has unexpected or missing fields",
+        )
+        relative = item["path"]
+        require(
+            isinstance(relative, str) and relative in MODEL_REQUIRED_FILES,
+            f"embedding manifest has an unsafe or unexpected path: {relative}",
+        )
+        require(relative not in seen, f"embedding manifest repeats {relative}")
+        seen.add(relative)
+        digest = item["sha256"]
+        require(
+            isinstance(digest, str)
+            and len(digest) == 64
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+            f"embedding manifest has an invalid digest for {relative}",
+        )
+        require(
+            isinstance(item["bytes"], int)
+            and not isinstance(item["bytes"], bool)
+            and item["bytes"] > 0,
+            f"embedding manifest has an invalid size for {relative}",
+        )
+    require(set(seen) == set(MODEL_REQUIRED_FILES), "embedding manifest does not pin all model files")
+
+    models = _directory_no_follow(model_root / "models", label="model cache directory")
+    repository = _directory_no_follow(
+        models / MODEL_CACHE_REPOSITORY,
+        label="model cache repository",
+    )
+    refs = _directory_no_follow(repository / "refs", label="model cache refs directory")
+    revision_file = refs / "main"
+    revision_bytes = _read_regular_no_follow(
+        revision_file,
+        label="pinned model ref",
+        maximum_bytes=256,
+    )
+    try:
+        revision = revision_bytes.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise GateFailure(f"pinned model ref is not UTF-8: {revision_file}") from error
+    require(
+        revision == MODEL_REVISION,
+        f"pinned model ref is {revision}, expected {MODEL_REVISION}",
+    )
+    snapshots = _directory_no_follow(
+        repository / "snapshots",
+        label="model cache snapshots directory",
+    )
+    snapshot = _directory_no_follow(
+        snapshots / MODEL_REVISION,
+        label="pinned model snapshot",
+    )
     return snapshot, revision
 
 
 def verify_model(model_root: Path, manifest_path: Path) -> dict[str, Any]:
     """Verify every pinned model byte count, digest, and local manifest."""
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_bytes = _read_regular_no_follow(
+        manifest_path,
+        label="checked-in embedding manifest",
+        maximum_bytes=16 * 1024 * 1024,
+    )
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateFailure(f"read checked-in embedding manifest {manifest_path}: {error}") from error
     snapshot, revision = model_snapshot(model_root, manifest)
     checked = []
     for item in manifest["files"]:
-        path = snapshot / item["path"]
-        require(path.is_file(), f"pinned model file missing: {item['path']}")
-        actual_bytes = path.stat().st_size
-        actual_sha256 = file_sha256(path)
+        relative = item["path"]
+        parent = snapshot
+        if relative == "onnx/model.onnx":
+            parent = _directory_no_follow(snapshot / "onnx", label="pinned model ONNX directory")
+            path = parent / "model.onnx"
+        else:
+            path = snapshot / relative
+        actual_bytes, actual_sha256 = _regular_file_digest_no_follow(
+            path,
+            label=f"pinned model file {relative}",
+        )
         require(actual_bytes == item["bytes"], f"model size mismatch: {item['path']}")
         require(actual_sha256 == item["sha256"], f"model digest mismatch: {item['path']}")
         checked.append({"path": item["path"], "bytes": actual_bytes, "sha256": actual_sha256})
     local_manifest = model_root / "models" / "ncm-encoder-manifest.json"
-    require(local_manifest.is_file(), "runtime model manifest is absent")
+    local_manifest_bytes = _read_regular_no_follow(
+        local_manifest,
+        label="runtime model manifest",
+        maximum_bytes=16 * 1024 * 1024,
+    )
+    try:
+        local_manifest_value = json.loads(local_manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GateFailure(f"read runtime model manifest {local_manifest}: {error}") from error
     require(
-        json.loads(local_manifest.read_text(encoding="utf-8")) == manifest,
+        local_manifest_value == manifest,
         "runtime model manifest differs from checked-in pin",
+    )
+    onnx_manifest_file = next(
+        item for item in manifest["files"] if item["path"] == "onnx/model.onnx"
     )
     return {
         "root": str(model_root),
         "model": manifest["model"],
-        "artifact_sha256": manifest["files"][0]["sha256"],
+        "artifact_sha256": onnx_manifest_file["sha256"],
         "revision": revision,
-        "manifest_sha256": file_sha256(manifest_path),
+        "manifest_sha256": sha256_bytes(manifest_bytes),
         "files": checked,
     }
 
@@ -741,19 +899,15 @@ def worker_identity(binary: Path, state_root: Path, empty_path: Path, *, test_do
 
 
 def prepare_isolated_root(model_root: Path, journey_root: Path) -> None:
-    """Create a fresh namespace root sharing only the verified model cache."""
+    """Create a fresh namespace root containing an owned model cache copy."""
     require(journey_root.is_absolute(), "journey state root must be absolute")
     if journey_root.exists():
         require(not any(journey_root.iterdir()), f"journey state root is not fresh: {journey_root}")
     else:
         journey_root.mkdir(parents=True)
-    source_models = model_root / "models"
-    require(source_models.is_dir(), "verified model directory is absent")
+    source_models = _directory_no_follow(model_root / "models", label="verified model directory")
     destination = journey_root / "models"
-    try:
-        destination.symlink_to(source_models, target_is_directory=True)
-    except OSError:
-        shutil.copytree(source_models, destination)
+    shutil.copytree(source_models, destination, symlinks=False)
 
 
 def harness_source(repo: Path) -> str:
@@ -1177,7 +1331,7 @@ def main() -> int:
         arguments.model_root
         or (Path(environment["TRACEDECAY_NCM_REAL_MODEL_ROOT"]) if environment.get("TRACEDECAY_NCM_REAL_MODEL_ROOT") else None)
         or (target_dir(repo, environment) / "ncm-backend-model-root")
-    ).resolve()
+    ).absolute()
     journey_root = (
         arguments.state_root
         or (target_dir(repo, environment) / "test-profile" / f"ncm-backend-{os.getpid()}-{time.time_ns()}")
@@ -1253,7 +1407,11 @@ def main() -> int:
             populations.append({"name": name, "command": command, "status": "blocked", "error": str(error)})
 
     manifest_path = repo / "product/ncm/reference/embedding-manifest.json"
-    model_root.mkdir(parents=True, exist_ok=True)
+    if model_root.exists() or model_root.is_symlink():
+        _directory_no_follow(model_root, label="model state root")
+    else:
+        model_root.mkdir(parents=True)
+        _directory_no_follow(model_root, label="model state root")
     try:
         model = verify_model(model_root, manifest_path)
     except GateFailure as error:

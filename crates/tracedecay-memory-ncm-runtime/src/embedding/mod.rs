@@ -286,13 +286,38 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
 
     #[cfg(feature = "real-encoder")]
     {
-        let models_dir = root.models_dir();
-        fs::create_dir_all(&models_dir)
-            .map_err(|error| EncoderError::Inference(format!("create model directory: {error}")))?;
+        let (models_dir, models_directory) = prepare_model_cache(root)?;
 
+        // A previous interrupted download may already contain the pinned
+        // snapshot. Verify and materialize it before invoking FastEmbed so a
+        // cache hit stays offline and no downloader is given an admitted
+        // state path to mutate.
+        match materialize_verified_snapshot(&models_dir, &reference) {
+            Ok(manifest) => {
+                validate_materialized_encoder(&models_dir, &manifest)?;
+                ensure_pinned_metadata(&manifest, &reference)?;
+                write_manifest(&models_dir, &manifest)?;
+                return encoder_identity(&manifest);
+            }
+            Err(EncoderError::ArtifactsMissing(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        // FastEmbed's Hugging Face cache uses symlinks in snapshots and its
+        // downloader accepts only a path. Keep that mutable path in a private
+        // mode-700 temporary directory; the admitted root is populated only
+        // after the complete snapshot has been read, hashed, and materialized.
+        let staging = tempfile::Builder::new()
+            .prefix("tracedecay-ncm-install-")
+            .tempdir()
+            .map_err(|error| EncoderError::Inference(format!("create model staging: {error}")))?;
+        let staging_models = staging.path().join("models");
+        fs::create_dir(&staging_models).map_err(|error| {
+            EncoderError::Inference(format!("create model staging directory: {error}"))
+        })?;
         let options =
             fastembed::TextInitOptions::new(fastembed::EmbeddingModel::ParaphraseMLMiniLML12V2)
-                .with_cache_dir(models_dir.clone())
+                .with_cache_dir(staging_models.clone())
                 .with_max_length(MAX_LENGTH)
                 .with_show_download_progress(false);
         let _model = fastembed::TextEmbedding::try_new(options)
@@ -302,22 +327,16 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
             return Err(EncoderError::Cancelled);
         }
 
-        // The manifest is derived from the cache after fastembed has proved
-        // that it can construct the model. Release the ORT session before
-        // reading the large ONNX buffer for the digest.
+        // Release the ORT session before reading the large ONNX buffer for the
+        // digest. The user-defined validation below then constructs inference
+        // from those exact verified buffers.
         drop(_model);
-        let manifest = materialize_verified_snapshot(&models_dir, &reference)?;
+        let manifest = materialize_verified_snapshot(&staging_models, &reference)?;
         ensure_pinned_metadata(&manifest, &reference)?;
+        validate_materialized_encoder(&staging_models, &manifest)?;
+        publish_materialized_snapshot(&staging_models, &models_dir, &models_directory, &manifest)?;
         write_manifest(&models_dir, &manifest)?;
-        let model = manifest.model.clone();
-        let artifact_sha256 = manifest.artifact_sha256().ok_or_else(|| {
-            EncoderError::ArtifactMismatch("manifest has no ONNX digest".to_owned())
-        })?;
-        Ok(EncoderIdentity {
-            model,
-            artifact_sha256: artifact_sha256.to_owned(),
-            max_length: manifest.max_length,
-        })
+        encoder_identity(&manifest)
     }
 
     #[cfg(not(feature = "real-encoder"))]
@@ -645,6 +664,174 @@ fn verify_cached_state(models_dir: &Path, expected: &PinnedEncoder) -> Result<()
     verify_local_artifacts(models_dir, &local, Some(expected.revision.as_str()))
 }
 
+#[cfg(feature = "real-encoder")]
+fn prepare_model_cache(root: &StateRoot) -> Result<(PathBuf, Dir), EncoderError> {
+    let models_dir = root.models_dir();
+    let models_name = models_dir.file_name().ok_or_else(|| {
+        EncoderError::ArtifactMismatch(format!(
+            "model cache has no directory name: {}",
+            models_dir.display()
+        ))
+    })?;
+    let root_directory =
+        Dir::open_ambient_dir(root.path(), ambient_authority()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                EncoderError::ArtifactsMissing(root.path().display().to_string())
+            } else {
+                EncoderError::ArtifactMismatch(format!(
+                    "open state root for model install {}: {error}",
+                    root.path().display()
+                ))
+            }
+        })?;
+    match root_directory.create_dir(models_name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(EncoderError::Inference(format!(
+                "create model directory {}: {error}",
+                models_dir.display()
+            )));
+        }
+    }
+    let models_directory = open_directory_nofollow(&root_directory, models_name, &models_dir)?;
+    preflight_existing_model_cache(&models_directory, &models_dir)?;
+    Ok((models_dir, models_directory))
+}
+
+#[cfg(feature = "real-encoder")]
+fn preflight_existing_model_cache(
+    models_directory: &Dir,
+    models_dir: &Path,
+) -> Result<(), EncoderError> {
+    reject_symlink_entries(models_directory, models_dir)?;
+
+    let repository_path = models_dir.join(CACHE_REPOSITORY_DIR);
+    let Some(repository) = open_optional_directory_nofollow(
+        models_directory,
+        OsStr::new(CACHE_REPOSITORY_DIR),
+        &repository_path,
+    )?
+    else {
+        return Ok(());
+    };
+    reject_symlink_entries(&repository, &repository_path)?;
+
+    let blobs_path = repository_path.join("blobs");
+    if let Some(blobs) =
+        open_optional_directory_nofollow(&repository, OsStr::new("blobs"), &blobs_path)?
+    {
+        reject_symlink_entries(&blobs, &blobs_path)?;
+    }
+
+    let refs_path = repository_path.join("refs");
+    let revision = if let Some(refs) =
+        open_optional_directory_nofollow(&repository, OsStr::new("refs"), &refs_path)?
+    {
+        reject_symlink_entries(&refs, &refs_path)?;
+        let revision_path = refs_path.join("main");
+        match open_file_nofollow(&refs, OsStr::new("main"), &revision_path) {
+            Ok(file) => {
+                let bytes = read_open_file(file, &revision_path, 256)?;
+                let revision = std::str::from_utf8(&bytes).map_err(|error| {
+                    EncoderError::ArtifactMismatch(format!(
+                        "read cache revision {}: {error}",
+                        revision_path.display()
+                    ))
+                })?;
+                let revision = revision.trim();
+                if revision != MODEL_REVISION {
+                    return Err(EncoderError::ArtifactMismatch(format!(
+                        "cached model revision {revision} differs from pinned Xenova revision"
+                    )));
+                }
+                Some(revision.to_owned())
+            }
+            Err(EncoderError::ArtifactsMissing(_)) => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+
+    let snapshots_path = repository_path.join("snapshots");
+    if let Some(snapshots) =
+        open_optional_directory_nofollow(&repository, OsStr::new("snapshots"), &snapshots_path)?
+    {
+        reject_symlink_entries(&snapshots, &snapshots_path)?;
+        if let Some(revision) = revision {
+            let snapshot_path = snapshots_path.join(&revision);
+            if let Some(snapshot) =
+                open_optional_directory_nofollow(&snapshots, OsStr::new(&revision), &snapshot_path)?
+            {
+                let onnx_path = snapshot_path.join("onnx");
+                let _ =
+                    open_optional_directory_nofollow(&snapshot, OsStr::new("onnx"), &onnx_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "real-encoder")]
+fn ensure_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Dir, EncoderError> {
+    match parent.create_dir(name) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(EncoderError::Inference(format!(
+                "create model cache directory {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    open_directory_nofollow(parent, name, path)
+}
+
+#[cfg(feature = "real-encoder")]
+fn open_optional_directory_nofollow(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<Option<Dir>, EncoderError> {
+    match open_directory_nofollow(parent, name, path) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(EncoderError::ArtifactsMissing(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "real-encoder")]
+fn reject_symlink_entries(directory: &Dir, path: &Path) -> Result<(), EncoderError> {
+    let entries = directory.read_dir(".").map_err(|error| {
+        EncoderError::ArtifactMismatch(format!(
+            "list model cache directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            EncoderError::ArtifactMismatch(format!(
+                "read model cache directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            EncoderError::ArtifactMismatch(format!(
+                "inspect model cache entry in {}: {error}",
+                path.display()
+            ))
+        })?;
+        if file_type.is_symlink() {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "model cache entry {} is a symlink",
+                path.join(entry.file_name()).display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest_shape(manifest: &PinnedEncoder) -> Result<(), EncoderError> {
     if manifest.model != MODEL_NAME
         || manifest.repository != MODEL_REPOSITORY
@@ -817,6 +1004,76 @@ fn materialize_verified_snapshot(
     let manifest = manifest_from_snapshot(&snapshot, expected)?;
     ensure_pinned_metadata(&manifest, expected)?;
     Ok(manifest)
+}
+
+#[cfg(feature = "real-encoder")]
+fn validate_materialized_encoder(
+    models_dir: &Path,
+    manifest: &PinnedEncoder,
+) -> Result<(), EncoderError> {
+    let model = load_verified_model(models_dir, manifest)?;
+    fastembed::TextEmbedding::try_new_from_user_defined(
+        model,
+        fastembed::InitOptionsUserDefined::new().with_max_length(MAX_LENGTH),
+    )
+    .map(|_| ())
+    .map_err(|error| EncoderError::Inference(format!("validate verified encoder: {error}")))
+}
+
+#[cfg(feature = "real-encoder")]
+fn encoder_identity(manifest: &PinnedEncoder) -> Result<EncoderIdentity, EncoderError> {
+    let artifact_sha256 = manifest
+        .artifact_sha256()
+        .ok_or_else(|| EncoderError::ArtifactMismatch("manifest has no ONNX digest".to_owned()))?;
+    Ok(EncoderIdentity {
+        model: manifest.model.clone(),
+        artifact_sha256: artifact_sha256.to_owned(),
+        max_length: manifest.max_length,
+    })
+}
+
+#[cfg(feature = "real-encoder")]
+fn publish_materialized_snapshot(
+    staging_models: &Path,
+    models_dir: &Path,
+    models_directory: &Dir,
+    manifest: &PinnedEncoder,
+) -> Result<(), EncoderError> {
+    let source = cache_snapshot(staging_models, Some(manifest.revision.as_str()))?;
+    let repository_path = models_dir.join(CACHE_REPOSITORY_DIR);
+    let repository = ensure_directory_nofollow(
+        models_directory,
+        OsStr::new(CACHE_REPOSITORY_DIR),
+        &repository_path,
+    )?;
+    let refs_path = repository_path.join("refs");
+    let refs = ensure_directory_nofollow(&repository, OsStr::new("refs"), &refs_path)?;
+    let snapshots_path = repository_path.join("snapshots");
+    let snapshots =
+        ensure_directory_nofollow(&repository, OsStr::new("snapshots"), &snapshots_path)?;
+    let snapshot_path = snapshots_path.join(&manifest.revision);
+    let snapshot =
+        ensure_directory_nofollow(&snapshots, OsStr::new(&manifest.revision), &snapshot_path)?;
+    let onnx_path = snapshot_path.join("onnx");
+    let _onnx = ensure_directory_nofollow(&snapshot, OsStr::new("onnx"), &onnx_path)?;
+    let destination = CacheSnapshot {
+        path: snapshot_path,
+        directory: snapshot,
+    };
+
+    for file in &manifest.files {
+        let bytes = read_verified_artifact(&source, file)?;
+        let (directory, file_name, path) = snapshot_file_parent(&destination, &file.path)?;
+        atomically_replace_file(&directory, &file_name, &path, &bytes)?;
+    }
+
+    atomically_replace_file(
+        &refs,
+        OsStr::new("main"),
+        &refs_path.join("main"),
+        manifest.revision.as_bytes(),
+    )?;
+    Ok(())
 }
 
 fn verify_local_artifacts(
@@ -1100,6 +1357,16 @@ fn atomically_replace_snapshot_file(
     bytes: &[u8],
 ) -> Result<(), EncoderError> {
     let (directory, file_name, path) = snapshot_file_parent(snapshot, relative)?;
+    atomically_replace_file(&directory, &file_name, &path, bytes)
+}
+
+#[cfg(feature = "real-encoder")]
+fn atomically_replace_file(
+    directory: &Dir,
+    file_name: &OsStr,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), EncoderError> {
     let file_stem = file_name.to_string_lossy();
     for attempt in 0..32_u32 {
         let temporary_name = OsString::from(format!(
@@ -1208,6 +1475,66 @@ mod tests {
         fs::create_dir_all(&refs).expect("create model refs");
         fs::write(refs.join("main"), MODEL_REVISION).expect("write model revision");
         root
+    }
+
+    #[cfg(feature = "real-encoder")]
+    #[test]
+    fn installer_preflight_refuses_symlinked_state_model_directory() {
+        let root = tempfile::tempdir().expect("create state root");
+        let outside = tempfile::tempdir().expect("create outside model root");
+        symlink(outside.path(), root.path().join("models")).expect("create models symlink");
+        let state_root = crate::ports::StateRoot::new(root.path()).expect("absolute state root");
+
+        let error = super::prepare_model_cache(&state_root)
+            .expect_err("installer must reject a symlinked models directory");
+        assert!(matches!(error, super::EncoderError::ArtifactMismatch(_)));
+        assert!(
+            outside
+                .path()
+                .read_dir()
+                .expect("inspect outside root")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "real-encoder")]
+    #[test]
+    fn installer_preflight_refuses_symlinked_repository_directory() {
+        let root = tempfile::tempdir().expect("create state root");
+        let outside = tempfile::tempdir().expect("create outside repository");
+        let models = root.path().join("models");
+        fs::create_dir(&models).expect("create models directory");
+        symlink(outside.path(), models.join(CACHE_REPOSITORY_DIR))
+            .expect("create repository symlink");
+        let state_root = crate::ports::StateRoot::new(root.path()).expect("absolute state root");
+
+        let error = super::prepare_model_cache(&state_root)
+            .expect_err("installer must reject a symlinked repository directory");
+        assert!(matches!(error, super::EncoderError::ArtifactMismatch(_)));
+        assert!(
+            outside
+                .path()
+                .read_dir()
+                .expect("inspect outside root")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "real-encoder")]
+    #[test]
+    fn installer_preflight_refuses_wrong_main_revision() {
+        let root = tempfile::tempdir().expect("create state root");
+        let models = root.path().join("models");
+        let refs = models.join(CACHE_REPOSITORY_DIR).join("refs");
+        fs::create_dir_all(&refs).expect("create model refs");
+        fs::write(refs.join("main"), "0".repeat(40)).expect("write wrong revision");
+        let state_root = crate::ports::StateRoot::new(root.path()).expect("absolute state root");
+
+        let error = super::prepare_model_cache(&state_root)
+            .expect_err("installer must reject a wrong model revision");
+        assert!(matches!(error, super::EncoderError::ArtifactMismatch(_)));
     }
 
     #[test]
@@ -1373,43 +1700,10 @@ fn write_manifest(models_dir: &Path, manifest: &PinnedEncoder) -> Result<(), Enc
         .map_err(|error| EncoderError::Inference(format!("serialize encoder manifest: {error}")))?;
     let directory = open_model_directory(models_dir)?;
     let file_name = OsStr::new(MANIFEST_FILENAME);
-    for attempt in 0..32_u32 {
-        let temporary_name = OsString::from(format!(
-            ".{MANIFEST_FILENAME}.{}-{attempt}.tmp",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            .follow(FollowSymlinks::No);
-        let mut temporary = match directory.open_with(&temporary_name, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(EncoderError::Inference(format!(
-                    "create encoder manifest temporary file: {error}"
-                )));
-            }
-        };
-        let write_result = temporary
-            .write_all(&bytes)
-            .and_then(|()| temporary.sync_all());
-        drop(temporary);
-        if let Err(error) = write_result {
-            let _ = directory.remove_file(&temporary_name);
-            return Err(EncoderError::Inference(format!(
-                "write encoder manifest: {error}"
-            )));
-        }
-        return directory
-            .rename(&temporary_name, &directory, file_name)
-            .map_err(|error| {
-                let _ = directory.remove_file(&temporary_name);
-                EncoderError::Inference(format!("publish encoder manifest: {error}"))
-            });
-    }
-    Err(EncoderError::Inference(
-        "unable to allocate encoder manifest temporary file".to_owned(),
-    ))
+    atomically_replace_file(
+        &directory,
+        file_name,
+        &models_dir.join(MANIFEST_FILENAME),
+        &bytes,
+    )
 }
