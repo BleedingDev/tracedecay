@@ -281,28 +281,34 @@ fn tamper_snapshot_selection(
     tamper_snapshot_selections(engine, &[(capsule_index, fields)])
 }
 
-fn tamper_snapshot_selections(
-    engine: &NcmEngine,
-    rows: &[(usize, &[(&str, &str)])],
-) -> Vec<u8> {
+fn tamper_snapshot<F>(engine: &NcmEngine, mutate: F) -> Vec<u8>
+where
+    F: FnOnce(&mut Value),
+{
     let mut envelope: Value = serde_json::from_slice(&export(engine)).unwrap();
-    for (capsule_index, fields) in rows {
-        let provenance = envelope["capsules"][*capsule_index]["provenance"]
-            .as_str()
-            .unwrap();
-        let mut provenance: Value = serde_json::from_str(provenance).unwrap();
-        for (field, value) in *fields {
-            provenance["selection"][*field] = json!(value);
-        }
-        envelope["capsules"][*capsule_index]["provenance"] =
-            json!(serde_json::to_string(&provenance).unwrap());
-    }
+    mutate(&mut envelope);
 
     let mut content = envelope.clone();
     content.as_object_mut().unwrap().remove("content_sha256");
     let content: SnapshotContentForTampering = serde_json::from_value(content).unwrap();
     envelope["content_sha256"] = json!(digest(&serde_json::to_vec(&content).unwrap()));
     serde_json::to_vec(&envelope).unwrap()
+}
+
+fn tamper_snapshot_selections(engine: &NcmEngine, rows: &[(usize, &[(&str, &str)])]) -> Vec<u8> {
+    tamper_snapshot(engine, |envelope| {
+        for (capsule_index, fields) in rows {
+            let provenance = envelope["capsules"][*capsule_index]["provenance"]
+                .as_str()
+                .unwrap();
+            let mut provenance: Value = serde_json::from_str(provenance).unwrap();
+            for (field, value) in *fields {
+                provenance["selection"][*field] = json!(value);
+            }
+            envelope["capsules"][*capsule_index]["provenance"] =
+                json!(serde_json::to_string(&provenance).unwrap());
+        }
+    })
 }
 
 fn record_ids(engine: &NcmEngine) -> Vec<u64> {
@@ -1046,25 +1052,20 @@ fn retained_source_locator_rejects_ambiguous_active_capsules_after_provenance_ta
 
     // Restore accepts the durable capsule after the provenance field is
     // changed, but the runtime must fail closed when the locator now names two
-    // active rows with the same canonical observation identity and binding.
-    let tampered = tamper_snapshot_selection(
-        &live,
-        1,
-        &[
-            (
-                "observation_identity",
-                first.provenance["selection"]["observation_identity"]
-                    .as_str()
-                    .unwrap(),
-            ),
-            (
-                "source_identity_sha256",
-                first.provenance["selection"]["source_identity_sha256"]
-                    .as_str()
-                    .unwrap(),
-            ),
-        ],
-    );
+    // active rows with the same authenticated original and derived identities.
+    let tampered = tamper_snapshot(&live, |envelope| {
+        let first_provenance: Value =
+            serde_json::from_str(envelope["capsules"][0]["provenance"].as_str().unwrap()).unwrap();
+        let mut second_provenance: Value =
+            serde_json::from_str(envelope["capsules"][1]["provenance"].as_str().unwrap()).unwrap();
+        second_provenance["common_capsule"] = first_provenance["common_capsule"].clone();
+        second_provenance["selection"]["observation_identity"] =
+            first_provenance["selection"]["observation_identity"].clone();
+        second_provenance["selection"]["source_identity_sha256"] =
+            first_provenance["selection"]["source_identity_sha256"].clone();
+        envelope["capsules"][1]["provenance"] =
+            json!(serde_json::to_string(&second_provenance).unwrap());
+    });
     let restored = snapshot::restore(
         &live,
         &namespace(),
@@ -1089,7 +1090,7 @@ fn retained_source_locator_rejects_ambiguous_active_capsules_after_provenance_ta
     assert_eq!(
         rejected.outcome,
         Outcome::Rejected(RejectReason::InvalidRequest(
-            "retained observation identity differs".to_owned()
+            "retained source locator is ambiguous".to_owned()
         ))
     );
     assert_eq!(rejected.state_generation, before.state_generation);
