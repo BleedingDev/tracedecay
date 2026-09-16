@@ -117,6 +117,7 @@ pub struct CloneFingerprintDiscoveryPositionV2 {
     /// page must retry this candidate before advancing past it.
     #[serde(default)]
     pub pending_comparison_body_digest: Option<ManifestDigest>,
+    /// Payload digest paired with `pending_comparison_body_digest`.
     #[serde(default)]
     pub pending_comparison_payload_digest: Option<ManifestDigest>,
     /// Marks the boundary between bounded posting discovery and the later
