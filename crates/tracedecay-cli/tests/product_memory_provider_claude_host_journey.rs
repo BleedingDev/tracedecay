@@ -2270,8 +2270,10 @@ fn assert_host_memory_journey_with_provider(
         original.2, recalled.2,
         "each session's recall must have a fresh recall trace"
     );
-    if active_provider == ActiveProvider::Native && !ncm_observer {
+    if active_provider == ActiveProvider::Native {
         assert_canonical_fact_feedback_journey(&mut journey, next_session);
+    }
+    if !ncm_observer {
         #[cfg(unix)]
         provider_control_journeys::assert_provider_control_journeys(
             &mut journey,

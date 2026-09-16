@@ -469,6 +469,9 @@ fn assert_provider_unavailable_fallback_and_recovery(
     journey: &mut ClaudeHostJourney,
     session_id: &str,
 ) {
+    if journey.active_provider.is_ncm() {
+        return assert_ncm_unavailable_fallback_and_recovery(journey, session_id);
+    }
     // The provider journal is the required Native observation mount. Renaming
     // its main file while the daemon is stopped makes only the next full
     // provider mount fail; the published core route still owns the cognitive
@@ -500,14 +503,78 @@ fn assert_provider_unavailable_fallback_and_recovery(
         lane["state"], "unavailable",
         "typed unavailable lane: {lane}"
     );
-    assert_eq!(lane["provider_id"], CONFIGURED_PROVIDER_ID);
+    assert_eq!(lane["provider_id"], journey.active_provider.id());
     assert_eq!(lane["registration_revision"], 1);
 
     journey.stop_daemon();
     fs::remove_file(&journal).expect("remove invalid Native journal");
     fs::rename(&backup, &journal).expect("restore Native journal after fault");
     let recovered = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&recovered, CONFIGURED_PROVIDER_ID);
+    let lane = assert_answered_lane(&recovered, journey.active_provider.id());
+    assert_eq!(lane["state"], "answered");
+}
+
+fn assert_ncm_unavailable_fallback_and_recovery(journey: &mut ClaudeHostJourney, session_id: &str) {
+    let worker = PathBuf::from(
+        std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
+    )
+    .canonicalize()
+    .expect("canonical NCM worker binary");
+    let daemon_pid = journey.daemon.as_ref().expect("running NCM daemon").id();
+    let listing = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .expect("ps must enumerate the real NCM worker");
+    let worker_pid = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line
+                .splitn(3, char::is_whitespace)
+                .filter(|field| !field.is_empty());
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let ppid = fields.next()?.parse::<u32>().ok()?;
+            let command = fields.next()?.trim();
+            (ppid == daemon_pid && command.starts_with(worker.to_string_lossy().as_ref()))
+                .then_some(pid)
+        })
+        .find(|pid| *pid != std::process::id())
+        .expect("the daemon must own the real NCM worker child");
+    let status = Command::new("kill")
+        .args(["-TERM", &worker_pid.to_string()])
+        .status()
+        .expect("kill must signal only the discovered NCM worker");
+    assert!(status.success(), "NCM worker termination must be delivered");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let probe = Command::new("kill")
+            .args(["-0", &worker_pid.to_string()])
+            .status()
+            .expect("kill -0 must probe worker state");
+        if !probe.success() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let unavailable = journey.tool(
+        "tracedecay_context",
+        &json!({
+            "task": format!("what does the {JOURNEY_TERM} transport probe record?"),
+            "format": "json",
+            "_meta": { "session_id": session_id },
+        }),
+    );
+    let lane =
+        super::advisory_lane(&unavailable).expect("NCM worker loss must retain advisory lane");
+    assert_eq!(
+        lane["state"], "unavailable",
+        "typed NCM unavailable lane: {lane}"
+    );
+    assert_eq!(lane["provider_id"], journey.active_provider.id());
+    assert_eq!(lane["registration_revision"], 1);
+
+    let recovered = restart_and_recall(journey, session_id);
+    let lane = assert_answered_lane(&recovered, journey.active_provider.id());
     assert_eq!(lane["state"], "answered");
 }
 
@@ -535,7 +602,7 @@ fn assert_delete_by_source_non_resurrection(
     assert_eq!(&deletion.source, selector);
 
     let after_delete = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&after_delete, CONFIGURED_PROVIDER_ID);
+    let lane = assert_answered_lane(&after_delete, journey.active_provider.id());
     let candidates = lane["candidates"]
         .as_array()
         .expect("post-delete candidates");
@@ -553,7 +620,7 @@ fn assert_delete_by_source_non_resurrection(
     );
 
     let after_second_restart = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&after_second_restart, CONFIGURED_PROVIDER_ID);
+    let lane = assert_answered_lane(&after_second_restart, journey.active_provider.id());
     let candidates = lane["candidates"]
         .as_array()
         .expect("second post-delete candidates");
