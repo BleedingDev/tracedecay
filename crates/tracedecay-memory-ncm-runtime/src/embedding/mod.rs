@@ -19,10 +19,12 @@ use cap_std::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(feature = "real-encoder")]
 use std::fs;
 use std::io::Read;
+#[cfg(feature = "real-encoder")]
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "real-encoder")]
 use std::sync::Mutex;
@@ -304,7 +306,7 @@ pub fn install(root: &StateRoot, deadline: Deadline) -> Result<EncoderIdentity, 
         // that it can construct the model. Release the ORT session before
         // reading the large ONNX buffer for the digest.
         drop(_model);
-        let manifest = manifest_from_cache(&models_dir, &reference)?;
+        let manifest = materialize_verified_snapshot(&models_dir, &reference)?;
         ensure_pinned_metadata(&manifest, &reference)?;
         write_manifest(&models_dir, &manifest)?;
         let model = manifest.model.clone();
@@ -764,11 +766,10 @@ fn cache_snapshot(
 }
 
 #[cfg(feature = "real-encoder")]
-fn manifest_from_cache(
-    models_dir: &Path,
+fn manifest_from_snapshot(
+    snapshot: &CacheSnapshot,
     expected: &PinnedEncoder,
 ) -> Result<PinnedEncoder, EncoderError> {
-    let snapshot = cache_snapshot(models_dir, Some(MODEL_REVISION))?;
     let mut files = Vec::with_capacity(REQUIRED_FILES.len());
     for relative in REQUIRED_FILES {
         let expected_file = expected
@@ -788,6 +789,34 @@ fn manifest_from_cache(
     Ok(PinnedEncoder::new(
         MODEL_NAME, files, MAX_LENGTH, "mean", true,
     ))
+}
+
+#[cfg(feature = "real-encoder")]
+fn materialize_verified_snapshot(
+    models_dir: &Path,
+    expected: &PinnedEncoder,
+) -> Result<PinnedEncoder, EncoderError> {
+    ensure_manifest_is_pinned(expected)?;
+    let snapshot = cache_snapshot(models_dir, Some(expected.revision.as_str()))?;
+    for file in &expected.files {
+        let bytes = read_snapshot_file_following(&snapshot, &file.path, file.bytes)?;
+        if bytes.len() as u64 != file.bytes {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "size differs for {}",
+                file.path
+            )));
+        }
+        if digest_bytes(&bytes) != file.sha256 {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "sha256 differs for {}",
+                file.path
+            )));
+        }
+        atomically_replace_snapshot_file(&snapshot, &file.path, &bytes)?;
+    }
+    let manifest = manifest_from_snapshot(&snapshot, expected)?;
+    ensure_pinned_metadata(&manifest, expected)?;
+    Ok(manifest)
 }
 
 fn verify_local_artifacts(
@@ -914,6 +943,14 @@ fn read_file_nofollow(
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, EncoderError> {
     let file = open_file_nofollow(parent, name, path)?;
+    read_open_file(file, path, maximum_bytes)
+}
+
+fn read_open_file(
+    mut file: cap_std::fs::File,
+    path: &Path,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, EncoderError> {
     let mut bytes = Vec::new();
     file.take(maximum_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
@@ -927,6 +964,38 @@ fn read_file_nofollow(
         )));
     }
     Ok(bytes)
+}
+
+#[cfg(feature = "real-encoder")]
+fn open_file_following(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<cap_std::fs::File, EncoderError> {
+    let options = OpenOptions::new().read(true);
+    let file = parent.open_with(name, &options).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            EncoderError::ArtifactsMissing(path.display().to_string())
+        } else {
+            EncoderError::ArtifactMismatch(format!(
+                "open installer source artifact {}: {error}",
+                path.display()
+            ))
+        }
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        EncoderError::ArtifactMismatch(format!(
+            "inspect installer source artifact {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "installer source {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn read_path_file(path: &Path, local: bool, maximum_bytes: u64) -> Result<Vec<u8>, EncoderError> {
@@ -975,6 +1044,25 @@ fn read_snapshot_file(
     relative: &str,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, EncoderError> {
+    let (directory, file_name, path) = snapshot_file_parent(snapshot, relative)?;
+    read_file_nofollow(&directory, &file_name, &path, maximum_bytes)
+}
+
+#[cfg(feature = "real-encoder")]
+fn read_snapshot_file_following(
+    snapshot: &CacheSnapshot,
+    relative: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, EncoderError> {
+    let (directory, file_name, path) = snapshot_file_parent(snapshot, relative)?;
+    let file = open_file_following(&directory, &file_name, &path)?;
+    read_open_file(file, &path, maximum_bytes)
+}
+
+fn snapshot_file_parent(
+    snapshot: &CacheSnapshot,
+    relative: &str,
+) -> Result<(Dir, OsString, PathBuf), EncoderError> {
     let mut components = Path::new(relative).components().peekable();
     let mut directory = snapshot.directory.try_clone().map_err(|error| {
         EncoderError::ArtifactMismatch(format!(
@@ -983,7 +1071,7 @@ fn read_snapshot_file(
         ))
     })?;
     let mut path = snapshot.path.clone();
-    let file_name = loop {
+    loop {
         let component = components.next().ok_or_else(|| {
             EncoderError::ArtifactMismatch(format!(
                 "artifact path is empty in {}",
@@ -999,10 +1087,64 @@ fn read_snapshot_file(
         if components.peek().is_some() {
             directory = open_directory_nofollow(&directory, name, &path)?;
         } else {
-            break name;
+            return Ok((directory, name.to_os_string(), path));
         }
-    };
-    read_file_nofollow(&directory, file_name, &path, maximum_bytes)
+    }
+}
+
+#[cfg(feature = "real-encoder")]
+fn atomically_replace_snapshot_file(
+    snapshot: &CacheSnapshot,
+    relative: &str,
+    bytes: &[u8],
+) -> Result<(), EncoderError> {
+    let (directory, file_name, path) = snapshot_file_parent(snapshot, relative)?;
+    let file_stem = file_name.to_string_lossy();
+    for attempt in 0..32_u32 {
+        let temporary_name = OsString::from(format!(
+            ".ncm-materialize-{file_stem}-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut temporary = match directory.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(EncoderError::Inference(format!(
+                    "create materialized artifact temporary file for {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let write_result = temporary
+            .write_all(bytes)
+            .and_then(|()| temporary.sync_all());
+        drop(temporary);
+        if let Err(error) = write_result {
+            let _ = directory.remove_file(&temporary_name);
+            return Err(EncoderError::Inference(format!(
+                "write materialized artifact {}: {error}",
+                path.display()
+            )));
+        }
+        return directory
+            .rename(&temporary_name, &directory, &file_name)
+            .map_err(|error| {
+                let _ = directory.remove_file(&temporary_name);
+                EncoderError::Inference(format!(
+                    "publish materialized artifact {}: {error}",
+                    path.display()
+                ))
+            });
+    }
+    Err(EncoderError::Inference(format!(
+        "unable to allocate materialized artifact temporary file for {}",
+        path.display()
+    )))
 }
 
 fn read_verified_artifact(
@@ -1041,7 +1183,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         cache_snapshot, digest_bytes, read_snapshot_file, read_verified_artifact, EncoderFile,
-        CACHE_REPOSITORY_DIR, MODEL_NAME, MODEL_REVISION,
+        CACHE_REPOSITORY_DIR, MAX_LENGTH, MODEL_NAME, MODEL_REVISION,
     };
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -1150,7 +1292,7 @@ mod tests {
                 }
             })
             .collect::<Vec<_>>();
-        let manifest = super::PinnedEncoder::new(MODEL_NAME, files, 128, "mean", true);
+        let manifest = super::PinnedEncoder::new(MODEL_NAME, files, MAX_LENGTH, "mean", true);
         let model = super::load_verified_model(&models, &manifest).expect("load verified model");
 
         assert_eq!(model.onnx_file, artifacts[0].1);
@@ -1162,16 +1304,109 @@ mod tests {
         );
         assert_eq!(model.tokenizer_files.tokenizer_config_file, artifacts[4].1);
     }
+
+    #[cfg(feature = "real-encoder")]
+    #[test]
+    fn installer_materializes_fastembed_symlinks_into_regular_files() {
+        let root = cache_root();
+        let models = root.path().join("models");
+        let snapshot = cache_snapshot(&models, Some(MODEL_REVISION)).expect("open cache snapshot");
+        let blobs = models.join(CACHE_REPOSITORY_DIR).join("blobs");
+        fs::create_dir_all(&blobs).expect("create fastembed blob directory");
+
+        let artifacts = [
+            ("onnx/model.onnx", b"installer onnx bytes".as_slice()),
+            ("tokenizer.json", b"installer tokenizer bytes".as_slice()),
+            ("config.json", b"installer config bytes".as_slice()),
+            (
+                "special_tokens_map.json",
+                b"installer special-token bytes".as_slice(),
+            ),
+            (
+                "tokenizer_config.json",
+                b"installer tokenizer-config bytes".as_slice(),
+            ),
+        ];
+        let files = artifacts
+            .iter()
+            .map(|(relative, bytes)| {
+                let digest = digest_bytes(bytes);
+                fs::write(blobs.join(&digest), bytes).expect("write fastembed blob");
+                let path = snapshot.path.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("create snapshot artifact parent");
+                }
+                let target = if relative.starts_with("onnx/") {
+                    format!("../../../blobs/{digest}")
+                } else {
+                    format!("../../blobs/{digest}")
+                };
+                symlink(target, &path).expect("create fastembed snapshot symlink");
+                EncoderFile {
+                    path: (*relative).to_owned(),
+                    sha256: digest,
+                    bytes: bytes.len() as u64,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = super::PinnedEncoder::new(MODEL_NAME, files, MAX_LENGTH, "mean", true);
+        let manifest = super::materialize_verified_snapshot(&models, &expected)
+            .expect("materialize and verify installer snapshot");
+        assert_eq!(manifest, expected);
+
+        for (relative, bytes) in artifacts {
+            let path = snapshot.path.join(relative);
+            let metadata = fs::symlink_metadata(&path).expect("inspect materialized artifact");
+            assert!(metadata.file_type().is_file());
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(fs::read(path).expect("read materialized artifact"), bytes);
+        }
+    }
 }
 
 #[cfg(feature = "real-encoder")]
 fn write_manifest(models_dir: &Path, manifest: &PinnedEncoder) -> Result<(), EncoderError> {
-    let path = models_dir.join(MANIFEST_FILENAME);
-    let temporary = models_dir.join(format!(".{MANIFEST_FILENAME}.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec_pretty(manifest)
         .map_err(|error| EncoderError::Inference(format!("serialize encoder manifest: {error}")))?;
-    fs::write(&temporary, bytes)
-        .map_err(|error| EncoderError::Inference(format!("write encoder manifest: {error}")))?;
-    fs::rename(&temporary, &path)
-        .map_err(|error| EncoderError::Inference(format!("publish encoder manifest: {error}")))
+    let directory = open_model_directory(models_dir)?;
+    let file_name = OsStr::new(MANIFEST_FILENAME);
+    for attempt in 0..32_u32 {
+        let temporary_name = OsString::from(format!(
+            ".{MANIFEST_FILENAME}.{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let mut temporary = match directory.open_with(&temporary_name, &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(EncoderError::Inference(format!(
+                    "create encoder manifest temporary file: {error}"
+                )));
+            }
+        };
+        let write_result = temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.sync_all());
+        drop(temporary);
+        if let Err(error) = write_result {
+            let _ = directory.remove_file(&temporary_name);
+            return Err(EncoderError::Inference(format!(
+                "write encoder manifest: {error}"
+            )));
+        }
+        return directory
+            .rename(&temporary_name, &directory, file_name)
+            .map_err(|error| {
+                let _ = directory.remove_file(&temporary_name);
+                EncoderError::Inference(format!("publish encoder manifest: {error}"))
+            });
+    }
+    Err(EncoderError::Inference(
+        "unable to allocate encoder manifest temporary file".to_owned(),
+    ))
 }
