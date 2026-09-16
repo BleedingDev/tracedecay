@@ -747,6 +747,10 @@ async fn daemon_http_route_block_drops_an_in_flight_cold_resolution() {
         resolving
     };
     registry.block_project_route(PROJECT_ID).await;
+    assert!(
+        !registry.remove_project_route(PROJECT_ID).await,
+        "removing an absent route must leave the transaction block intact"
+    );
     release.notify_waiters();
 
     assert!(
