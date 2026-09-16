@@ -39,13 +39,14 @@ use session_database_admission::{join_independent_session_opens, log_session_dat
 pub(super) enum ProjectOpenFailurePhase {
     SessionDatabases = 1,
     ProviderMount = 2,
-    GitTransactions = 3,
-    IndependentOwners = 4,
-    DependentOwners = 5,
-    ProviderActivated = 6,
-    RuntimeReady = 7,
-    RegistryPublished = 8,
-    HttpMounted = 9,
+    McpConstructed = 3,
+    GitTransactions = 4,
+    IndependentOwners = 5,
+    DependentOwners = 6,
+    ProviderActivated = 7,
+    RuntimeReady = 8,
+    RegistryPublished = 9,
+    HttpMounted = 10,
 }
 
 #[cfg(test)]
@@ -1670,6 +1671,10 @@ impl ProjectOpenInputs<'_> {
                 message: "full MCP generation census authority was already installed".to_owned(),
             })?;
         self.log_phase("mcp_full_constructed", None, full_construction_started);
+        if let Err(error) = self.phase_checkpoint(ProjectOpenFailurePhase::McpConstructed) {
+            full_candidate.shutdown().await;
+            return Err(error);
+        }
         if *core.current_key.lock().await != *key {
             full_candidate.shutdown().await;
             return Err(TraceDecayError::Config {
@@ -1766,9 +1771,9 @@ impl ProjectOpenInputs<'_> {
         Ok(())
     }
 
-    /// The full server is live in the registry: mount its dependent owners,
-    /// commit the runtime publication, drain and retire the displaced core,
-    /// and start code indexing.
+    /// Mount full owners, then atomically commit runtime, MCP-registry, and
+    /// HTTP reachability. The displaced core is retired only after that commit
+    /// succeeds.
     #[hotpath::measure(label = "daemon.project.compose.publish_full", future = true)]
     async fn finish_full_server(
         &self,
