@@ -1910,9 +1910,10 @@ async fn dispatch_diagnostics_command(command: Commands) -> tracedecay_domain::e
         Commands::Cost {
             range,
             by_model,
+            by_task,
             export,
         } => {
-            cost_cmd::handle_cost(range, by_model, export).await?;
+            cost_cmd::handle_cost_with_task(range, by_model, by_task, export).await?;
         }
         Commands::Bench {
             queries,

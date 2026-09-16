@@ -12,6 +12,54 @@ fn strings(values: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn cost_command_parses_task_model_and_export_selectors() {
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "cost",
+        "30d",
+        "--by-model",
+        "--by-task",
+        "--export",
+        "csv",
+    ])
+    .expect("cost task grouping should parse alongside model grouping and export");
+
+    let Some(Commands::Cost {
+        range,
+        by_model,
+        by_task,
+        export,
+    }) = cli.command
+    else {
+        panic!("unexpected cost command variant");
+    };
+    assert_eq!(range, "30d");
+    assert!(by_model);
+    assert!(by_task);
+    assert_eq!(export.as_deref(), Some("csv"));
+}
+
+#[test]
+fn cost_command_defaults_to_total_summary_without_grouping() {
+    let cli = Cli::try_parse_from(["tracedecay", "cost"])
+        .expect("cost command should parse with its default range");
+
+    let Some(Commands::Cost {
+        range,
+        by_model,
+        by_task,
+        export,
+    }) = cli.command
+    else {
+        panic!("unexpected cost command variant");
+    };
+    assert_eq!(range, "7d");
+    assert!(!by_model);
+    assert!(!by_task);
+    assert!(export.is_none());
+}
+
+#[test]
 fn hidden_scoop_package_hook_contract_parses_both_operations() {
     for operation in ["prepare", "restore"] {
         let cli = Cli::try_parse_from([

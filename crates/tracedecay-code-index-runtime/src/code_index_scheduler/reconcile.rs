@@ -2482,7 +2482,8 @@ impl CodeIndexWorktreeSchedulerV1 {
                 }
                 return Err(cancelled_code_index_reconcile());
             };
-            self.active_reconcile_options = drained_hints.options().cloned();
+            let reconcile_options = drained_hints.options().cloned();
+            self.active_reconcile_options = reconcile_options.clone();
             let mut captured = match capture(self, &control) {
                 Ok(captured) => captured,
                 Err(CodeIndexSchedulerErrorV1::Production(
@@ -2492,11 +2493,16 @@ impl CodeIndexWorktreeSchedulerV1 {
                 )) if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
                     && !self.shutting_down.load(Ordering::Acquire) =>
                 {
+                    self.active_reconcile_options = None;
                     std::thread::sleep(SUPERSEDED_RECONCILE_RETRY_BACKOFF);
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.active_reconcile_options = None;
+                    return Err(error);
+                }
             };
+            self.active_reconcile_options = None;
             overflow_reconciled |= drained_hints.overflow();
             let active_generation = self
                 .publication
@@ -2541,7 +2547,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 self._retained_snapshot_memory =
                     std::mem::take(&mut captured.retained_reservations);
                 self.latest_content_identity = Some(captured.snapshot.content_identity.clone());
-                if self.active_reconcile_options.is_some() {
+                if reconcile_options.is_some() {
                     self.finish_ephemeral_reconcile();
                 } else {
                     self.mark_reconciled(SourceContentManifestV1::for_snapshot(&captured.snapshot));
@@ -2582,8 +2588,11 @@ impl CodeIndexWorktreeSchedulerV1 {
                 tracing::warn!(
                     "code-index incremental build missing captured file bytes; retrying without active-generation reuse"
                 );
-                captured =
-                    self.capture_authoritative_snapshot_without_active_generation_reuse(None)?;
+                self.active_reconcile_options = reconcile_options.clone();
+                let fallback_capture =
+                    self.capture_authoritative_snapshot_without_active_generation_reuse(None);
+                self.active_reconcile_options = None;
+                captured = fallback_capture?;
                 snapshot_content_identity = captured.snapshot.content_identity.clone();
                 source_manifest = SourceContentManifestV1::for_snapshot(&captured.snapshot);
                 reextracted_files = captured.changed_paths.len();
@@ -2619,7 +2628,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                     self._retained_snapshot_memory =
                         std::mem::take(&mut captured.retained_reservations);
                     self.latest_content_identity = Some(snapshot_content_identity.clone());
-                    if self.active_reconcile_options.is_some() {
+                    if reconcile_options.is_some() {
                         self.finish_ephemeral_reconcile();
                     } else {
                         self.mark_reconciled(source_manifest);
@@ -2643,7 +2652,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             self.retained_snapshot_bytes = std::mem::take(&mut captured.retained_bytes);
             self._retained_snapshot_memory = std::mem::take(&mut captured.retained_reservations);
             self.latest_content_identity = Some(snapshot_content_identity);
-            if self.active_reconcile_options.is_some() {
+            if reconcile_options.is_some() {
                 self.finish_ephemeral_reconcile();
             } else {
                 self.mark_reconciled(source_manifest);
@@ -2710,6 +2719,10 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// project configuration's default folder policy.
     fn finish_ephemeral_reconcile(&mut self) {
         self.active_reconcile_options = None;
+        *self
+            .active_snapshot_changed_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.request_background_reconcile();
     }
 
