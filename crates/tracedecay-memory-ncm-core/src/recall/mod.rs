@@ -1,7 +1,7 @@
 //! Read-only, record-aware recall with explicit provenance and admission policy.
 
-use crate::centers::MemoryCenters;
 use crate::centers::read::{CompoundWeights, ReadResult};
+use crate::centers::MemoryCenters;
 use crate::numeric::{minkowski, validate_finite};
 use crate::records::{Record, RecordState, RecordTable, Support};
 use crate::types::{CenterSlot, CoreError, RecordId, SourceId};
@@ -10,6 +10,13 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 const MAX_RECALL_TOP_K: usize = 16;
+/// Bounded center over-fetch reserved for records rejected during admission.
+///
+/// Record-aware recall cannot stop at the requested center `top_k`: deleted,
+/// excluded, stale, and below-floor supports must not consume the final record
+/// bound. One additional maximum result window is enough to retain a bounded
+/// recovery window while keeping center work finite.
+const RECALL_ADMISSION_OVERFETCH: usize = MAX_RECALL_TOP_K;
 const DEFAULT_MIN_ACTIVATION: f32 = 0.03;
 
 /// Layer membership of a deduplicated record candidate.
@@ -170,12 +177,55 @@ pub fn recall(
         return Ok(RecallOutput::Empty);
     }
 
+    // The caller's top-k and the policy ceiling are both independently
+    // meaningful. The smaller value is the final record bound; center reads
+    // over-fetch from that bound so record admission happens before truncation.
+    let count_limit = top_k.min(policy.max_candidates);
+    if count_limit == 0 {
+        return Ok(RecallOutput::Empty);
+    }
+    let center_candidate_limit = count_limit.saturating_add(RECALL_ADMISSION_OVERFETCH);
+
     let weights = CompoundWeights {
         terrain: terrain_part,
         ..CompoundWeights::default()
     };
-    let stm_read = stm.read_compound(query_key_stm, Some(query_ctx), None, weights, top_k)?;
-    let ltm_read = ltm.read_compound(query_key_ltm, Some(query_ctx), None, weights, top_k)?;
+    let stm_read = stm.read_compound_with_admission(
+        query_key_stm,
+        Some(query_ctx),
+        None,
+        weights,
+        center_candidate_limit,
+        center_candidate_limit,
+        |slot, center_support, activation| {
+            admits_center(
+                slot,
+                center_support,
+                activation,
+                records,
+                support,
+                policy.min_activation,
+            )
+        },
+    )?;
+    let ltm_read = ltm.read_compound_with_admission(
+        query_key_ltm,
+        Some(query_ctx),
+        None,
+        weights,
+        center_candidate_limit,
+        center_candidate_limit,
+        |slot, center_support, activation| {
+            admits_center(
+                slot,
+                center_support,
+                activation,
+                records,
+                support,
+                policy.min_activation,
+            )
+        },
+    )?;
     let stm_mass = total_intensity_mass(stm)?;
     let ltm_mass = total_intensity_mass(ltm)?;
 
@@ -219,8 +269,9 @@ pub fn recall(
         ranked[0].peak_activation
     };
     let margin_satisfied = margin >= policy.min_margin;
-    let count_limit = policy.max_candidates.min(ranked.len());
-    let mut truncated = count_limit < ranked.len();
+    let mut truncated = count_limit < ranked.len()
+        || stm.n_active() > center_candidate_limit
+        || ltm.n_active() > center_candidate_limit;
     let mut selected = Vec::with_capacity(count_limit);
     let mut text_bytes = 0_usize;
     for candidate in ranked.into_iter() {
@@ -254,6 +305,33 @@ pub fn recall(
         candidates: selected,
         truncated,
         margin_satisfied,
+    })
+}
+
+/// Applies all request-local record gates while the bounded center candidate
+/// window is still being selected. `Support` is the authoritative, incarnation
+/// checked view used by host exclusions; the center's support list is retained
+/// as a second membership check so a stale or forged side table cannot admit a
+/// record on its own.
+fn admits_center(
+    slot: CenterSlot,
+    center_support: &[RecordId],
+    activation: f32,
+    records: &RecordTable,
+    support: &Support,
+    min_activation: f32,
+) -> bool {
+    if !activation.is_finite() || activation < min_activation {
+        return false;
+    }
+    let Ok(tracked) = support.support_for(slot) else {
+        return false;
+    };
+    center_support.iter().any(|record_id| {
+        tracked.contains(record_id)
+            && records
+                .get(*record_id)
+                .is_some_and(|record| !matches!(record.state, RecordState::Deleted { .. }))
     })
 }
 

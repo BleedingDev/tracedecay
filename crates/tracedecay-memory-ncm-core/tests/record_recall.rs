@@ -1,11 +1,11 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 //! Acceptance coverage for stable records, correction lineage, and read-only recall.
 
-use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::centers::read::CompoundWeights;
 use tracedecay_memory_ncm_core::centers::write::{WriteInput, WriteOutcome, WriteParams};
+use tracedecay_memory_ncm_core::centers::MemoryCenters;
 use tracedecay_memory_ncm_core::recall::{
-    RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy, recall,
+    recall, RecallCandidate, RecallConfidence, RecallLayer, RecallOutput, RecallPolicy,
 };
 use tracedecay_memory_ncm_core::records::{RecordInput, RecordState, RecordTable, Support};
 use tracedecay_memory_ncm_core::{
@@ -82,6 +82,35 @@ fn write_record(
             panic!("fixture write did not create support")
         }
     }
+}
+
+fn activate_record(
+    centers: &mut MemoryCenters,
+    key: &[f32],
+    ltm_key: &[f32],
+    record: RecordId,
+    intensity: f32,
+    support: &mut Support,
+) -> CenterSlot {
+    let input = WriteInput {
+        key,
+        ltm_key: as_array(ltm_key),
+        value: [0.25; VALUE_DIM],
+        affect: AffectVector::neutral(),
+        intensity,
+        context: as_array(&unit(CONTEXT_DIM, 0, 1.0)),
+        terrain: [0.0; 3],
+        record,
+        age: 0,
+    };
+    let index = centers.first_free_slot().expect("free center slot");
+    let slot = centers
+        .activate_slot(index, &input)
+        .expect("center activation");
+    support
+        .set_support(slot, &[record])
+        .expect("support snapshot");
+    slot
 }
 
 fn candidates(output: RecallOutput) -> (Vec<RecallCandidate>, bool, bool) {
@@ -619,11 +648,101 @@ fn recall_budget_skips_oversized_ranked_candidate_and_keeps_later_fits() {
             .sum::<usize>(),
         config.max_recall_bytes
     );
-    assert!(
-        !found
-            .iter()
-            .any(|candidate| candidate.record_id == oversized)
+    assert!(!found
+        .iter()
+        .any(|candidate| candidate.record_id == oversized));
+}
+
+#[test]
+fn admission_overfetch_keeps_seventeenth_record_and_orders_by_intensity() {
+    let mut config = config();
+    config.stm.n_centers = 18;
+    let mut records = RecordTable::new(&config);
+    let ids = (0..18)
+        .map(|index| {
+            records
+                .insert(record_input(
+                    if index < 16 { "deleted" } else { "live" },
+                    &format!("key-{index}"),
+                    &format!("value-{index}"),
+                    0,
+                ))
+                .expect("record")
+        })
+        .collect::<Vec<_>>();
+    let mut stm = MemoryCenters::new(config.stm.clone(), 57).expect("STM");
+    let ltm = MemoryCenters::new(config.ltm.clone(), 58).expect("LTM");
+    let mut support = Support::new(&config);
+    let key = unit(STM_DIM, 0, 1.0);
+    let ltm_key = unit(LTM_DIM, 0, 1.0);
+    let slots = ids
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            activate_record(
+                &mut stm,
+                &key,
+                &ltm_key,
+                *record,
+                if index < 16 { 3.0 } else { (18 - index) as f32 },
+                &mut support,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(records.mark_deleted(&SourceId("deleted".to_owned()), 9), 16);
+    // Simulate the request-local exclusion view for the middle eight records;
+    // their center support remains present, but the authoritative support map
+    // no longer admits those records.
+    for slot in &slots[8..16] {
+        support.set_support(*slot, &[]).expect("exclude support");
+    }
+
+    let (found, truncated, _) = candidates(
+        recall(
+            &key,
+            &ltm_key,
+            &unit(CONTEXT_DIM, 0, 1.0),
+            &stm,
+            &ltm,
+            0.0,
+            &records,
+            &support,
+            &RecallPolicy::default(),
+            2,
+        )
+        .expect("recall"),
     );
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        found
+            .iter()
+            .map(|candidate| candidate.record_id)
+            .collect::<Vec<_>>(),
+        vec![ids[16], ids[17]],
+        "eligible records must be ranked by intensity after admission",
+    );
+    assert_eq!(found[0].value_text, "value-16");
+    assert_eq!(found[1].value_text, "value-17");
+    assert!(!truncated);
+
+    let (top_one, _, _) = candidates(
+        recall(
+            &key,
+            &ltm_key,
+            &unit(CONTEXT_DIM, 0, 1.0),
+            &stm,
+            &ltm,
+            0.0,
+            &records,
+            &support,
+            &RecallPolicy::default(),
+            1,
+        )
+        .expect("bounded recall"),
+    );
+    assert_eq!(top_one.len(), 1);
+    assert_eq!(top_one[0].record_id, ids[16]);
 }
 
 #[test]
