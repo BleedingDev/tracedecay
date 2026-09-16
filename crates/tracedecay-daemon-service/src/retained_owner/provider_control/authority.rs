@@ -775,6 +775,7 @@ fn existing_regular_file(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retained_owner::observation_journey::ObservationJourneyPolicyV1;
 
     #[test]
     fn existing_store_constructors_fail_without_creating_missing_files() {
