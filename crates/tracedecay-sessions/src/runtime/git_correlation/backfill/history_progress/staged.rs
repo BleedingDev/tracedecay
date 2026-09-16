@@ -4,6 +4,17 @@ use super::{GitCorrelationError, GitHistoryProgressKey};
 
 pub(in super::super) const MAX_STAGED_PAGE_ROWS: usize = 128;
 
+const STAGED_SPANS_SCHEMA_SQL: &str = "CREATE TABLE git_history_index_staged_spans (source_rowid INTEGER NOT NULL, segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0), boundary INTEGER NOT NULL CHECK(boundary IN (0, 1)), branch TEXT, timestamp INTEGER NOT NULL, PRIMARY KEY(source_rowid, segment_ordinal, boundary), FOREIGN KEY(source_rowid, segment_ordinal) REFERENCES git_history_index_segments(source_rowid, ordinal) ON DELETE CASCADE)";
+const STAGED_COMMITS_SCHEMA_SQL: &str = "CREATE TABLE git_history_index_staged_commits (source_rowid INTEGER NOT NULL, segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0), oid TEXT NOT NULL, branch TEXT, committed_at INTEGER NOT NULL, PRIMARY KEY(source_rowid, segment_ordinal, oid), FOREIGN KEY(source_rowid, segment_ordinal) REFERENCES git_history_index_segments(source_rowid, ordinal) ON DELETE CASCADE)";
+
+pub(super) fn canonical_table_schema_sql(table: &str) -> Option<&'static str> {
+    match table {
+        "git_history_index_staged_spans" => Some(STAGED_SPANS_SCHEMA_SQL),
+        "git_history_index_staged_commits" => Some(STAGED_COMMITS_SCHEMA_SQL),
+        _ => None,
+    }
+}
+
 pub(super) async fn install_schema(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {

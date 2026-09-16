@@ -371,6 +371,188 @@ async fn final_marker_with_a_partial_git_correlation_shape_is_reset_required() {
     );
 }
 
+#[tokio::test]
+async fn an_empty_shared_schema_marker_is_reset_required_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );",
+    )
+    .await
+    .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("an empty shared schema marker must not be treated as fresh");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: None,
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+}
+
+#[tokio::test]
+async fn a_valid_shared_marker_without_git_row_is_fresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         INSERT INTO session_schema_migrations(name, version)
+         VALUES ('lcm', 10);",
+    )
+    .await
+    .unwrap();
+
+    ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect("a valid shared marker without Git receipts is fresh");
+    assert_eq!(
+        git_schema_marker(&conn).await,
+        Some(GIT_CORRELATION_SCHEMA_VERSION)
+    );
+    let mut rows = conn
+        .query(
+            "SELECT version FROM session_schema_migrations WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        10
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_shared_schema_marker_row_is_reset_required_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version INTEGER NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         INSERT INTO session_schema_migrations(name, version)
+         VALUES ('retired_git_receipts', 4);",
+    )
+    .await
+    .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("unknown shared marker rows must not be admitted");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: None,
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+}
+
+#[tokio::test]
+async fn a_malformed_shared_schema_marker_is_reset_required_without_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    conn.execute_batch(
+        "CREATE TABLE session_schema_migrations (
+             name TEXT PRIMARY KEY,
+             version TEXT NOT NULL,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         INSERT INTO session_schema_migrations(name, version)
+         VALUES ('git_correlation', '5');",
+    )
+    .await
+    .unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("a malformed shared marker shape must not be admitted");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: None,
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+}
+
+async fn assert_pending_constraint_drift_requires_reset(pending_schema: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&directory.path().join("sessions.db"));
+    ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect("fresh Git correlation schema");
+    conn.execute_batch("DROP TABLE git_history_index_pending;")
+        .await
+        .unwrap();
+    conn.execute_batch(pending_schema).await.unwrap();
+
+    let before = schema_snapshot(&conn).await;
+    let error = ensure_git_correlation_receipt_schema_in_transaction(&conn)
+        .await
+        .expect_err("Git table constraint drift must require reset");
+    assert_eq!(
+        error,
+        GitCorrelationError::ResetRequired {
+            found_version: Some(GIT_CORRELATION_SCHEMA_VERSION),
+            required_version: GIT_CORRELATION_SCHEMA_VERSION,
+        }
+    );
+    assert_eq!(schema_snapshot(&conn).await, before);
+    assert_eq!(
+        git_schema_marker(&conn).await,
+        Some(GIT_CORRELATION_SCHEMA_VERSION)
+    );
+}
+
+#[tokio::test]
+async fn final_git_table_check_constraint_drift_is_reset_required_without_mutation() {
+    assert_pending_constraint_drift_requires_reset(
+        "CREATE TABLE git_history_index_pending (
+             source_rowid INTEGER NOT NULL,
+             segment_ordinal INTEGER NOT NULL,
+             oid TEXT NOT NULL,
+             PRIMARY KEY(source_rowid, segment_ordinal, oid),
+             FOREIGN KEY(source_rowid, segment_ordinal)
+                 REFERENCES git_history_index_segments(source_rowid, ordinal)
+                 ON DELETE CASCADE
+         );",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_git_table_foreign_key_drift_is_reset_required_without_mutation() {
+    assert_pending_constraint_drift_requires_reset(
+        "CREATE TABLE git_history_index_pending (
+             source_rowid INTEGER NOT NULL,
+             segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
+             oid TEXT NOT NULL,
+             PRIMARY KEY(source_rowid, segment_ordinal, oid)
+         );",
+    )
+    .await;
+}
+
 #[test]
 fn manifest_encodes_sessions_spans_commits_and_evidence_relations() {
     let projection = projection();

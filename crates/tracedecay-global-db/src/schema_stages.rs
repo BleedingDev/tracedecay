@@ -883,7 +883,18 @@ async fn install_registered_schema_stage_sequence(
             transaction,
         )
         .await
-        .map_err(|error| global_db_operation_error("initialize git correlation schema", error))?;
+        .map_err(|error| match error {
+            tracedecay_sessions::runtime::git_correlation::GitCorrelationError::ResetRequired {
+                found_version,
+                required_version,
+            } => tracedecay_domain::errors::TraceDecayError::reset_required(
+                "git correlation",
+                format!(
+                    "Git correlation receipt schema {found_version:?} is incompatible with required schema {required_version}; reset the store"
+                ),
+            ),
+            error => global_db_operation_error("initialize git correlation schema", error),
+        })?;
     tracedecay_sessions::runtime::workflow_index::ensure_workflow_index_schema(transaction)
         .await
         .map_err(|error| global_db_operation_error("initialize workflow index schema", error))?;

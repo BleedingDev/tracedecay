@@ -99,9 +99,10 @@ const GIT_CORRELATION_FINAL_SCHEMA_OBJECTS: [(&str, &str, &str); 11] = [
 ];
 
 // `(name, declared type, not-null flag, default, primary-key ordinal, hidden)`
-// is the part of SQLite's table shape that can be compared without running
-// any write. Constraints remain owned by the installer, while this catches
-// dropped, added, retyped, or re-keyed columns before a final store is used.
+// and the canonical sqlite_master SQL together describe each final table
+// without running any write. The SQL comparison covers CHECK and FOREIGN KEY
+// constraints in addition to catching dropped, added, retyped, or re-keyed
+// columns before a final store is used.
 const GIT_CORRELATION_FINAL_TABLE_COLUMNS: &[(
     &str,
     &[(&str, &str, i64, Option<&str>, i64, i64)],
@@ -229,6 +230,10 @@ const GIT_CORRELATION_FINAL_TABLE_COLUMNS: &[(
 
 const GIT_CORRELATION_FINAL_INDEX_SQL: &str = "CREATE INDEX idx_git_evidence_publication_outbox_pending ON git_evidence_publication_outbox(created_at, receipt_id)";
 const GIT_CORRELATION_FINAL_TRIGGER_SQL: &str = "CREATE TRIGGER git_evidence_publication_outbox_immutable BEFORE UPDATE ON git_evidence_publication_outbox BEGIN SELECT RAISE(ABORT, 'Git evidence publication receipt is immutable'); END";
+const SESSION_SCHEMA_MIGRATIONS_SCHEMA_SQL: &str = "CREATE TABLE session_schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL DEFAULT (unixepoch()))";
+const GIT_CORRELATION_META_SCHEMA_SQL: &str = "CREATE TABLE git_correlation_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()))";
+const GIT_EVIDENCE_PUBLICATION_OUTBOX_SCHEMA_SQL: &str = "CREATE TABLE git_evidence_publication_outbox (receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) > 0), publication_prefix TEXT NOT NULL CHECK(length(publication_prefix) > 0), evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0), created_at INTEGER NOT NULL DEFAULT (unixepoch()))";
+const SESSION_SCHEMA_MIGRATION_NAMES: [&str; 3] = ["git_correlation", "lcm", "workflow_indexing"];
 /// Projector revision this build publishes. It is part of the generation
 /// identity, so a graph-shape change (index entities, relation keys,
 /// projection metadata) re-publishes an unchanged projection under a distinct
@@ -1171,6 +1176,14 @@ pub async fn ensure_git_correlation_receipt_schema_in_transaction(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitCorrelationSchemaMarker {
+    TableAbsent,
+    GitMarkerAbsent,
+    Empty,
+    Present(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GitCorrelationSchemaAdmission {
     Current,
     Fresh,
@@ -1193,12 +1206,19 @@ fn git_correlation_schema_reset(found_version: Option<i64>) -> GitCorrelationErr
 async fn inspect_git_correlation_schema(
     conn: &(impl QueryExecutor + ?Sized),
 ) -> Result<GitCorrelationSchemaAdmission, GitCorrelationError> {
-    let Some(found_version) = stored_git_correlation_schema_version(conn).await? else {
-        return if git_correlation_objects(conn).await?.is_empty() {
-            Ok(GitCorrelationSchemaAdmission::Fresh)
-        } else {
-            Err(git_correlation_schema_reset(None))
-        };
+    let marker = stored_git_correlation_schema_version(conn).await?;
+    let found_version = match marker {
+        GitCorrelationSchemaMarker::TableAbsent | GitCorrelationSchemaMarker::GitMarkerAbsent => {
+            return if git_correlation_objects(conn).await?.is_empty() {
+                Ok(GitCorrelationSchemaAdmission::Fresh)
+            } else {
+                Err(git_correlation_schema_reset(None))
+            };
+        }
+        GitCorrelationSchemaMarker::Empty => {
+            return Err(git_correlation_schema_reset(None));
+        }
+        GitCorrelationSchemaMarker::Present(version) => version,
     };
 
     if found_version != GIT_CORRELATION_SCHEMA_VERSION {
@@ -1214,36 +1234,107 @@ async fn inspect_git_correlation_schema(
 
 async fn stored_git_correlation_schema_version(
     conn: &(impl QueryExecutor + ?Sized),
-) -> Result<Option<i64>, GitCorrelationError> {
+) -> Result<GitCorrelationSchemaMarker, GitCorrelationError> {
     let mut kind_rows = conn
         .query(
-            "SELECT type FROM sqlite_master WHERE name = 'session_schema_migrations'",
+            "SELECT type, sql FROM sqlite_master WHERE name = 'session_schema_migrations'",
             (),
         )
         .await?;
     let Some(kind_row) = kind_rows.next().await? else {
-        return Ok(None);
+        return Ok(GitCorrelationSchemaMarker::TableAbsent);
     };
-    let kind: String = kind_row.get(0)?;
-    if kind != "table" {
+    let kind = match kind_row.get::<Value>(0)? {
+        Value::Text(kind) => kind,
+        Value::Null | Value::Integer(_) | Value::Real(_) | Value::Blob(_) => {
+            return Err(git_correlation_schema_reset(None));
+        }
+    };
+    let schema = match kind_row.get::<Value>(1)? {
+        Value::Text(schema) => schema,
+        Value::Null | Value::Integer(_) | Value::Real(_) | Value::Blob(_) => {
+            return Err(git_correlation_schema_reset(None));
+        }
+    };
+    if kind != "table"
+        || normalize_schema_sql(&schema)
+            != normalize_schema_sql(SESSION_SCHEMA_MIGRATIONS_SCHEMA_SQL)
+        || !session_schema_migrations_objects_are_intact(conn).await?
+    {
         return Err(git_correlation_schema_reset(None));
     }
 
     let mut rows = conn
         .query(
-            "SELECT version FROM session_schema_migrations WHERE name = ?1",
-            params![MIGRATION_NAME],
+            "SELECT name, version, applied_at
+             FROM session_schema_migrations
+             ORDER BY name",
+            (),
         )
         .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    match row.get::<Value>(0)? {
-        Value::Integer(version) => Ok(Some(version)),
-        Value::Null | Value::Real(_) | Value::Text(_) | Value::Blob(_) => {
-            Err(git_correlation_schema_reset(None))
+    let mut row_count = 0;
+    let mut git_marker = None;
+    while let Some(row) = rows.next().await? {
+        row_count += 1;
+        let name = match row.get::<Value>(0)? {
+            Value::Text(name) if SESSION_SCHEMA_MIGRATION_NAMES.contains(&name.as_str()) => name,
+            Value::Null | Value::Integer(_) | Value::Real(_) | Value::Blob(_) => {
+                return Err(git_correlation_schema_reset(None));
+            }
+            Value::Text(_) => return Err(git_correlation_schema_reset(None)),
+        };
+        let version = match row.get::<Value>(1)? {
+            Value::Integer(version) => version,
+            Value::Null | Value::Real(_) | Value::Text(_) | Value::Blob(_) => {
+                return Err(git_correlation_schema_reset(None));
+            }
+        };
+        match row.get::<Value>(2)? {
+            Value::Integer(_) => {}
+            Value::Null | Value::Real(_) | Value::Text(_) | Value::Blob(_) => {
+                return Err(git_correlation_schema_reset(None));
+            }
+        }
+        if name == MIGRATION_NAME {
+            git_marker = Some(version);
         }
     }
+    if row_count == 0 {
+        return Ok(GitCorrelationSchemaMarker::Empty);
+    }
+    Ok(git_marker.map_or(
+        GitCorrelationSchemaMarker::GitMarkerAbsent,
+        GitCorrelationSchemaMarker::Present,
+    ))
+}
+
+async fn session_schema_migrations_objects_are_intact(
+    conn: &(impl QueryExecutor + ?Sized),
+) -> Result<bool, GitCorrelationError> {
+    let mut rows = conn
+        .query(
+            "SELECT type, name, tbl_name
+             FROM sqlite_master
+             WHERE tbl_name = 'session_schema_migrations'
+               AND name NOT LIKE 'sqlite_autoindex_%'
+             ORDER BY type, name",
+            (),
+        )
+        .await?;
+    let mut objects = BTreeSet::new();
+    while let Some(row) = rows.next().await? {
+        objects.insert((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<String>(2)?,
+        ));
+    }
+    Ok(objects
+        == BTreeSet::from([(
+            "table".to_owned(),
+            "session_schema_migrations".to_owned(),
+            "session_schema_migrations".to_owned(),
+        )]))
 }
 
 async fn git_correlation_objects(
@@ -1301,6 +1392,16 @@ async fn final_git_correlation_schema_is_intact(
     }
 
     for (table, expected_columns) in GIT_CORRELATION_FINAL_TABLE_COLUMNS {
+        let Some(expected_sql) = expected_git_correlation_table_schema_sql(table) else {
+            return Ok(false);
+        };
+        let Some(actual_sql) = schema_definition(conn, "table", table).await? else {
+            return Ok(false);
+        };
+        if normalize_schema_sql(&actual_sql) != normalize_schema_sql(&expected_sql) {
+            return Ok(false);
+        }
+
         let mut rows = conn
             .query(
                 "SELECT name, type, \"notnull\", dflt_value, pk, hidden
@@ -1357,6 +1458,27 @@ async fn final_git_correlation_schema_is_intact(
         == normalize_schema_sql(GIT_CORRELATION_FINAL_TRIGGER_SQL))
 }
 
+fn expected_git_correlation_table_schema_sql(table: &str) -> Option<String> {
+    match table {
+        "git_correlation_meta" => Some(GIT_CORRELATION_META_SCHEMA_SQL.to_owned()),
+        "git_evidence_publication_outbox" => {
+            Some(GIT_EVIDENCE_PUBLICATION_OUTBOX_SCHEMA_SQL.to_owned())
+        }
+        "git_history_index_progress"
+        | "git_history_index_segments"
+        | "git_history_index_pending"
+        | "git_history_index_seen"
+        | "git_history_index_staged_spans"
+        | "git_history_index_staged_commits" => {
+            backfill::history_progress::canonical_table_schema_sql(table)
+        }
+        "git_history_index_failures" => {
+            Some(backfill::history_failures::canonical_table_schema_sql().to_owned())
+        }
+        _ => None,
+    }
+}
+
 async fn schema_definition(
     conn: &(impl QueryExecutor + ?Sized),
     kind: &str,
@@ -1375,7 +1497,10 @@ async fn schema_definition(
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    sql.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 #[hotpath::measure(label = "sessions.git_correlation.read_meta", future = true)]

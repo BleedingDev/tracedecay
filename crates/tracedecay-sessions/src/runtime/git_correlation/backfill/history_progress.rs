@@ -21,124 +21,148 @@ pub(super) const fn initial_reflog_content_chain() -> &'static str {
     INITIAL_REFLOG_CONTENT_CHAIN
 }
 
+pub(in super::super) fn canonical_table_schema_sql(table: &str) -> Option<String> {
+    final_table_schema_sql(table, false)
+        .or_else(|| staged::canonical_table_schema_sql(table).map(str::to_owned))
+}
+
+fn final_table_schema_sql(table: &str, if_not_exists: bool) -> Option<String> {
+    let create_table = if if_not_exists {
+        "CREATE TABLE IF NOT EXISTS"
+    } else {
+        "CREATE TABLE"
+    };
+    match table {
+        "git_history_index_progress" => Some(format!(
+            r#"{create_table} git_history_index_progress (
+                activity_timestamp INTEGER NOT NULL,
+                source_rowid INTEGER NOT NULL PRIMARY KEY,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                project_path TEXT NOT NULL,
+                window_start INTEGER NOT NULL,
+                window_end INTEGER NOT NULL,
+                worktree BLOB NOT NULL,
+                worktree_identity BLOB NOT NULL,
+                git_dir BLOB NOT NULL,
+                git_dir_identity BLOB NOT NULL,
+                common_dir BLOB NOT NULL,
+                common_dir_identity BLOB NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation >= 0),
+                scan_mode TEXT NOT NULL
+                    CHECK(scan_mode IN (
+                        'reflog_capture', 'reflog_verify', 'graph', 'publish_verify', 'publish'
+                    )),
+                reflog_path BLOB NOT NULL,
+                reflog_byte_offset INTEGER NOT NULL CHECK(reflog_byte_offset >= 0),
+                reflog_byte_length INTEGER NOT NULL CHECK(reflog_byte_length >= 0),
+                source_generation TEXT NOT NULL,
+                reflog_digest TEXT NOT NULL,
+                capture_target_offset INTEGER CHECK(capture_target_offset >= 0),
+                verify_byte_offset INTEGER NOT NULL CHECK(verify_byte_offset >= 0),
+                verify_digest TEXT NOT NULL,
+                source_head_referent BLOB,
+                source_head_oid TEXT NOT NULL,
+                cursor_head_state TEXT NOT NULL
+                    CHECK(cursor_head_state IN ('local_branch', 'detached')),
+                cursor_head_branch TEXT,
+                cursor_oid TEXT NOT NULL,
+                segment_end INTEGER NOT NULL,
+                segment_tip_oid TEXT NOT NULL,
+                segment_cursor INTEGER NOT NULL CHECK(segment_cursor >= 0),
+                emitted_count INTEGER NOT NULL CHECK(emitted_count >= 0),
+                consulted_ref_seal_json TEXT NOT NULL
+                    CHECK(length(consulted_ref_seal_json) <= {max_ref_seal_bytes}),
+                CHECK(window_start <= window_end),
+                CHECK(reflog_byte_offset <= reflog_byte_length),
+                CHECK(capture_target_offset IS NULL OR capture_target_offset <= reflog_byte_length),
+                CHECK(verify_byte_offset <= reflog_byte_length),
+                CHECK(segment_end BETWEEN window_start AND window_end),
+                CHECK(length(reflog_digest) > 0 AND length(verify_digest) > 0),
+                CHECK(
+                    (
+                        scan_mode = 'reflog_capture'
+                        AND capture_target_offset IS NULL
+                        AND verify_byte_offset = reflog_byte_length
+                        AND verify_digest = '{initial}'
+                        AND emitted_count = 0
+                    )
+                    OR
+                    (
+                        scan_mode = 'reflog_verify'
+                        AND capture_target_offset IS NOT NULL
+                        AND reflog_byte_offset = capture_target_offset
+                        AND verify_byte_offset >= capture_target_offset
+                        AND emitted_count = 0
+                    )
+                    OR
+                    (
+                        scan_mode IN ('graph', 'publish_verify', 'publish')
+                        AND capture_target_offset IS NOT NULL
+                        AND reflog_byte_offset = capture_target_offset
+                        AND verify_byte_offset = capture_target_offset
+                        AND verify_digest = reflog_digest
+                    )
+                ),
+                CHECK(
+                    (cursor_head_state = 'local_branch' AND cursor_head_branch IS NOT NULL)
+                    OR
+                    (cursor_head_state = 'detached' AND cursor_head_branch IS NULL)
+                )
+            )"#,
+            initial = INITIAL_REFLOG_CONTENT_CHAIN,
+            max_ref_seal_bytes = MAX_CONSULTED_REF_SEAL_JSON_BYTES,
+        )),
+        "git_history_index_segments" => Some(format!(
+            r#"{create_table} git_history_index_segments (
+                source_rowid INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                branch TEXT,
+                start_ts INTEGER NOT NULL,
+                end_ts INTEGER NOT NULL,
+                tip_oid TEXT NOT NULL,
+                applied INTEGER NOT NULL DEFAULT 0 CHECK(applied IN (0, 1)),
+                completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                PRIMARY KEY(source_rowid, ordinal),
+                FOREIGN KEY(source_rowid)
+                    REFERENCES git_history_index_progress(source_rowid)
+                    ON DELETE CASCADE,
+                CHECK(start_ts <= end_ts),
+                CHECK(completed = 0 OR applied = 1)
+            )"#,
+        )),
+        "git_history_index_pending" | "git_history_index_seen" => Some(format!(
+            r#"{create_table} {table} (
+                source_rowid INTEGER NOT NULL,
+                segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
+                oid TEXT NOT NULL,
+                PRIMARY KEY(source_rowid, segment_ordinal, oid),
+                FOREIGN KEY(source_rowid, segment_ordinal)
+                    REFERENCES git_history_index_segments(source_rowid, ordinal)
+                    ON DELETE CASCADE
+            )"#,
+        )),
+        _ => None,
+    }
+}
+
 #[hotpath::measure(label = "sessions.git_correlation.history_schema", future = true)]
 pub(in super::super) async fn install_final_schema(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {
-    let schema = format!(
-        r#"CREATE TABLE IF NOT EXISTS git_history_index_progress (
-            activity_timestamp INTEGER NOT NULL,
-            source_rowid INTEGER NOT NULL PRIMARY KEY,
-            provider TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            project_path TEXT NOT NULL,
-            window_start INTEGER NOT NULL,
-            window_end INTEGER NOT NULL,
-            worktree BLOB NOT NULL,
-            worktree_identity BLOB NOT NULL,
-            git_dir BLOB NOT NULL,
-            git_dir_identity BLOB NOT NULL,
-            common_dir BLOB NOT NULL,
-            common_dir_identity BLOB NOT NULL,
-            generation INTEGER NOT NULL CHECK(generation >= 0),
-            scan_mode TEXT NOT NULL
-                CHECK(scan_mode IN (
-                    'reflog_capture', 'reflog_verify', 'graph', 'publish_verify', 'publish'
-                )),
-            reflog_path BLOB NOT NULL,
-            reflog_byte_offset INTEGER NOT NULL CHECK(reflog_byte_offset >= 0),
-            reflog_byte_length INTEGER NOT NULL CHECK(reflog_byte_length >= 0),
-            source_generation TEXT NOT NULL,
-            reflog_digest TEXT NOT NULL,
-            capture_target_offset INTEGER CHECK(capture_target_offset >= 0),
-            verify_byte_offset INTEGER NOT NULL CHECK(verify_byte_offset >= 0),
-            verify_digest TEXT NOT NULL,
-            source_head_referent BLOB,
-            source_head_oid TEXT NOT NULL,
-            cursor_head_state TEXT NOT NULL
-                CHECK(cursor_head_state IN ('local_branch', 'detached')),
-            cursor_head_branch TEXT,
-            cursor_oid TEXT NOT NULL,
-            segment_end INTEGER NOT NULL,
-            segment_tip_oid TEXT NOT NULL,
-            segment_cursor INTEGER NOT NULL CHECK(segment_cursor >= 0),
-            emitted_count INTEGER NOT NULL CHECK(emitted_count >= 0),
-            consulted_ref_seal_json TEXT NOT NULL
-                CHECK(length(consulted_ref_seal_json) <= {max_ref_seal_bytes}),
-            CHECK(window_start <= window_end),
-            CHECK(reflog_byte_offset <= reflog_byte_length),
-            CHECK(capture_target_offset IS NULL OR capture_target_offset <= reflog_byte_length),
-            CHECK(verify_byte_offset <= reflog_byte_length),
-            CHECK(segment_end BETWEEN window_start AND window_end),
-            CHECK(length(reflog_digest) > 0 AND length(verify_digest) > 0),
-            CHECK(
-                (
-                    scan_mode = 'reflog_capture'
-                    AND capture_target_offset IS NULL
-                    AND verify_byte_offset = reflog_byte_length
-                    AND verify_digest = '{initial}'
-                    AND emitted_count = 0
-                )
-                OR
-                (
-                    scan_mode = 'reflog_verify'
-                    AND capture_target_offset IS NOT NULL
-                    AND reflog_byte_offset = capture_target_offset
-                    AND verify_byte_offset >= capture_target_offset
-                    AND emitted_count = 0
-                )
-                OR
-                (
-                    scan_mode IN ('graph', 'publish_verify', 'publish')
-                    AND capture_target_offset IS NOT NULL
-                    AND reflog_byte_offset = capture_target_offset
-                    AND verify_byte_offset = capture_target_offset
-                    AND verify_digest = reflog_digest
-                )
-            ),
-            CHECK(
-                (cursor_head_state = 'local_branch' AND cursor_head_branch IS NOT NULL)
-                OR
-                (cursor_head_state = 'detached' AND cursor_head_branch IS NULL)
-            )
-        );
-        CREATE TABLE IF NOT EXISTS git_history_index_segments (
-            source_rowid INTEGER NOT NULL,
-            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-            branch TEXT,
-            start_ts INTEGER NOT NULL,
-            end_ts INTEGER NOT NULL,
-            tip_oid TEXT NOT NULL,
-            applied INTEGER NOT NULL DEFAULT 0 CHECK(applied IN (0, 1)),
-            completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
-            PRIMARY KEY(source_rowid, ordinal),
-            FOREIGN KEY(source_rowid)
-                REFERENCES git_history_index_progress(source_rowid)
-                ON DELETE CASCADE,
-            CHECK(start_ts <= end_ts),
-            CHECK(completed = 0 OR applied = 1)
-        );
-        CREATE TABLE IF NOT EXISTS git_history_index_pending (
-            source_rowid INTEGER NOT NULL,
-            segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
-            oid TEXT NOT NULL,
-            PRIMARY KEY(source_rowid, segment_ordinal, oid),
-            FOREIGN KEY(source_rowid, segment_ordinal)
-                REFERENCES git_history_index_segments(source_rowid, ordinal)
-                ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS git_history_index_seen (
-            source_rowid INTEGER NOT NULL,
-            segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
-            oid TEXT NOT NULL,
-            PRIMARY KEY(source_rowid, segment_ordinal, oid),
-            FOREIGN KEY(source_rowid, segment_ordinal)
-                REFERENCES git_history_index_segments(source_rowid, ordinal)
-                ON DELETE CASCADE
-        );"#,
-        initial = INITIAL_REFLOG_CONTENT_CHAIN,
-        max_ref_seal_bytes = MAX_CONSULTED_REF_SEAL_JSON_BYTES,
-    );
+    let schema = [
+        "git_history_index_progress",
+        "git_history_index_segments",
+        "git_history_index_pending",
+        "git_history_index_seen",
+    ]
+    .into_iter()
+    .map(|table| {
+        final_table_schema_sql(table, true)
+            .expect("canonical Git history schema table must be installable")
+    })
+    .collect::<Vec<_>>()
+    .join(";\n");
     conn.execute_batch(&schema).await?;
     staged::install_schema(conn).await?;
     Ok(())

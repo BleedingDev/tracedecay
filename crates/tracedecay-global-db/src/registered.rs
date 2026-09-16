@@ -940,6 +940,10 @@ fn engine_error(error: TraceDecayError) -> tracedecay_runtime_core::db::engine::
 mod workflow_schema_tests;
 
 #[cfg(test)]
+#[path = "registered/git_correlation_schema_tests.rs"]
+mod git_correlation_schema_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, atomic::AtomicBool};
