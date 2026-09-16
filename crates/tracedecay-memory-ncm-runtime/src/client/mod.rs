@@ -829,8 +829,7 @@ fn owner_loop(
                 if let Some(reply) = result.as_ref().ok()
                     && matches!(
                         &reply.outcome,
-                        crate::engine::Outcome::Unavailable(_)
-                            | crate::engine::Outcome::Corrupt
+                        crate::engine::Outcome::Unavailable(_) | crate::engine::Outcome::Corrupt
                     )
                 {
                     worker.invalidate_ready(&command.request.namespace);
@@ -1097,6 +1096,9 @@ impl WorkerProcess {
 }
 
 fn requires_readiness(request: &Request) -> bool {
+    if !is_sha256_hex(&request.namespace) {
+        return false;
+    }
     match request.op {
         Operation::Handshake => false,
         Operation::Health => {

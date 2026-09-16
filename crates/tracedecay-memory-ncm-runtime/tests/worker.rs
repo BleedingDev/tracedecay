@@ -11,10 +11,11 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tracedecay_memory_ncm_core::types::SourceId;
+use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
 use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient, WorkerOptions};
-use tracedecay_memory_ncm_runtime::engine::{ObserveRequest, Outcome};
-use tracedecay_memory_ncm_runtime::ports::Deadline;
+use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
+use tracedecay_memory_ncm_runtime::engine::{FaultPoint, NcmEngine, ObserveRequest, Outcome};
+use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
 use tracedecay_memory_ncm_runtime::wire::{
     self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
     Reply, Request,
@@ -22,6 +23,10 @@ use tracedecay_memory_ncm_runtime::wire::{
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tracedecay-ncm-worker");
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
+const REFERENCE_WORKER_MANIFEST_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/reference/worker-manifest.json"
+);
 
 fn namespace(index: u8) -> String {
     format!("{index:02x}{}", "0".repeat(62))
@@ -37,6 +42,49 @@ fn options() -> WorkerOptions {
 
 fn client(root: &TempDir) -> WorkerClient {
     WorkerClient::spawn(BINARY, root.path(), options()).expect("worker client starts")
+}
+
+fn test_config() -> NcmConfig {
+    let mut config = NcmConfig {
+        terrain_resolution: 3,
+        ..NcmConfig::default()
+    };
+    config.stm.n_centers = 8;
+    config.stm.top_k_read = 8;
+    config.stm.top_k_write = 8;
+    config.ltm.n_centers = 8;
+    config.ltm.top_k_read = 8;
+    config.ltm.top_k_write = 8;
+    config.hybrid_candidates = 8;
+    config
+}
+
+fn direct_observe(
+    engine: &NcmEngine,
+    namespace: &str,
+    source: &str,
+    key: &str,
+    value: &str,
+    idempotency_key: &str,
+) {
+    let mut request = ObserveRequest {
+        idempotency_key: idempotency_key.to_owned(),
+        payload_sha256: String::new(),
+        source: SourceId(source.to_owned()),
+        key_text: key.to_owned(),
+        value_text: value.to_owned(),
+        affect: None,
+        surprise: 0.4,
+        intensity: 1.0,
+        provenance: json!({"origin": "worker-restart-test"}),
+        deadline: Deadline {
+            remaining_ms: u64::MAX,
+        },
+    };
+    request.payload_sha256 = request
+        .canonical_payload_sha256()
+        .expect("direct observe payload serializes");
+    assert_eq!(engine.observe(namespace, request).outcome, Outcome::Success);
 }
 
 fn observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
@@ -107,6 +155,18 @@ fn process_exists(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn reference_worker_manifest() -> &'static Path {
+    Path::new(REFERENCE_WORKER_MANIFEST_PATH)
+}
+
+fn install_reference_worker_manifest(binary: &Path) {
+    let destination = binary
+        .parent()
+        .expect("worker fixture has a parent")
+        .join("worker-manifest.json");
+    fs::copy(reference_worker_manifest(), destination).expect("copy trusted worker manifest");
 }
 
 #[test]
@@ -715,6 +775,7 @@ fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
     let root = TempDir::new().expect("temp root");
     let tampered = root.path().join("tampered-worker");
     fs::copy(BINARY, &tampered).expect("copy worker for tampering");
+    install_reference_worker_manifest(&tampered);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(&tampered)
@@ -735,6 +796,68 @@ fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
 }
 
 #[test]
+fn installed_worker_manifest_must_be_sibling_and_ancestor_manifest_is_ignored() {
+    let root = TempDir::new().expect("temp root");
+    let bundle = root.path().join("bundle");
+    let bin = bundle.join("bin").join("tracedecay-ncm-worker");
+    fs::create_dir_all(bundle.join("product/ncm/reference")).expect("create ancestor fixture");
+    fs::create_dir_all(bin.parent().expect("fixture bin parent")).expect("create bin fixture");
+    fs::copy(BINARY, &bin).expect("copy worker fixture");
+    fs::copy(
+        reference_worker_manifest(),
+        bundle.join("product/ncm/reference/worker-manifest.json"),
+    )
+    .expect("copy decoy ancestor manifest");
+
+    let client = WorkerClient::spawn(&bin, root.path(), WorkerOptions::default())
+        .expect("client owner starts lazily");
+    let result = client.call(
+        Request::new(208, 0, Operation::Health, "", json!({})),
+        CALL_DEADLINE,
+    );
+    assert!(
+        matches!(result, Err(ClientError::Unavailable(ref detail)) if detail.contains("beside the worker")),
+        "unexpected result: {result:?}"
+    );
+    assert_eq!(client.pid(), None);
+}
+
+#[test]
+fn installed_worker_manifest_stale_pin_is_unavailable_before_spawn() {
+    let root = TempDir::new().expect("temp root");
+    let binary = root.path().join("tracedecay-ncm-worker");
+    fs::copy(BINARY, &binary).expect("copy worker fixture");
+    install_reference_worker_manifest(&binary);
+    let manifest_path = binary
+        .parent()
+        .expect("worker fixture has a parent")
+        .join("worker-manifest.json");
+    let mut manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read worker fixture manifest"),
+    )
+    .expect("decode worker fixture manifest");
+    manifest["targets"][0]["sha256"] = json!("0".repeat(64));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode stale worker manifest"),
+    )
+    .expect("write stale worker manifest");
+
+    let client = WorkerClient::spawn(&binary, root.path(), WorkerOptions::default())
+        .expect("client owner starts lazily");
+    let result = client.call(
+        Request::new(209, 0, Operation::Health, "", json!({})),
+        CALL_DEADLINE,
+    );
+    assert!(
+        matches!(result, Err(ClientError::Unavailable(ref detail)) if detail.contains("stale")),
+        "unexpected result: {result:?}"
+    );
+    assert_eq!(client.pid(), None);
+}
+
+#[test]
+#[cfg(feature = "real-encoder")]
 fn production_worker_digest_pin_allows_the_current_artifact() {
     let root = TempDir::new().expect("temp root");
     let client = WorkerClient::spawn(BINARY, root.path(), WorkerOptions::default())
@@ -819,6 +942,112 @@ fn process_death_is_detected_then_lazily_restarted() {
         .expect("worker restarts on following call");
     assert_eq!(restarted.outcome, Outcome::Success);
     assert_ne!(client.pid(), Some(first_pid));
+}
+
+#[cfg(unix)]
+#[test]
+fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
+    let root = TempDir::new().expect("temp root");
+    let ns = namespace(28);
+    let engine = NcmEngine::new(
+        StateRoot::new(root.path()).expect("state root is absolute"),
+        Arc::new(HashEncoder::new()),
+        test_config(),
+    );
+    direct_observe(
+        &engine,
+        &ns,
+        "worker-restart-kept",
+        "worker restart retained key",
+        "worker restart retained value",
+        "worker-restart-kept-write",
+    );
+    direct_observe(
+        &engine,
+        &ns,
+        "worker-restart-deleted",
+        "worker restart deleted token",
+        "worker restart deleted value",
+        "worker-restart-deleted-write",
+    );
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("arm deletion fence fault");
+    let fenced = engine.delete_by_source(
+        &ns,
+        &SourceId("worker-restart-deleted".to_owned()),
+        "worker-restart-delete",
+        Deadline {
+            remaining_ms: u64::MAX,
+        },
+    );
+    assert_eq!(fenced.outcome, Outcome::EffectUnknown);
+    drop(engine);
+
+    let client = client(&root);
+    client
+        .call(
+            Request::new(260, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("initial health starts worker");
+    let first_pid = client.pid().expect("initial worker pid exists");
+    assert!(
+        Command::new("kill")
+            .arg("-9")
+            .arg(first_pid.to_string())
+            .status()
+            .expect("kill command runs")
+            .success()
+    );
+    let failed_health = client.call(
+        Request::new(261, 0, Operation::Health, "", json!({})),
+        Duration::from_millis(500),
+    );
+    assert!(
+        matches!(
+            failed_health,
+            Err(ClientError::MalformedReply(_))
+                | Err(ClientError::WorkerExited)
+                | Err(ClientError::Transport(_))
+        ),
+        "dead worker must invalidate the current process: {failed_health:?}"
+    );
+
+    let recovered = client
+        .call(
+            Request::new(
+                262,
+                0,
+                Operation::Recall,
+                &ns,
+                json!({"query_text": "worker restart deleted token", "top_k": 16}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("recall restarts worker and recovers privacy fence");
+    assert_eq!(recovered.outcome, Outcome::Success, "{recovered:?}");
+    let payload = recovered.payload.expect("recall payload").to_string();
+    assert!(
+        !payload.contains("worker restart deleted token")
+            && !payload.contains("worker restart deleted value"),
+        "deleted source must not resurrect after restart recovery: {payload}"
+    );
+    assert!(
+        payload.contains("worker restart retained value"),
+        "retained source must remain recallable after recovery: {payload}"
+    );
+
+    let inspection = client
+        .call(
+            Request::new(263, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("recovered namespace can be inspected");
+    assert_eq!(inspection.outcome, Outcome::Success);
+    let inspection = inspection.payload.expect("inspection payload");
+    assert_eq!(inspection["records"], 1);
+    assert_eq!(inspection["epoch"], 2);
 }
 
 #[test]
