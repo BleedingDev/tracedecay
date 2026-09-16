@@ -173,7 +173,9 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
         {
             return rejected("common control operation mismatch".to_owned());
         }
-        return engine.common_control(&request.namespace, control.clone(), deadline);
+        let result = engine.common_control(&request.namespace, control.clone(), deadline);
+        hold_committed_reply(&request, &result, options);
+        return result;
     }
     let result = match request.op {
         Operation::Handshake => {

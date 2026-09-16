@@ -131,7 +131,7 @@ impl Request {
                 (Some(generation), after)
             }
         };
-        let request_semantic_sha256 = canonical_digest(&json!({
+        let semantics = json!({
             "action": "maintenance",
             "task": self.task,
             "dry_run": self.dry_run,
@@ -141,7 +141,13 @@ impl Request {
             "resume_cursor": self.resume_cursor,
             "policy_revision": self.policy_revision,
             "extensions": self.extensions,
-        }))?;
+        });
+        let request_semantic_sha256 = canonical_digest(&semantics)?;
+        // Continuation cursors are bearer values, but the bounds and policy
+        // that produced them must remain stable when the cursor changes.
+        let mut cursor_semantics = semantics;
+        cursor_semantics["resume_cursor"] = Value::Null;
+        let cursor_semantic_sha256 = canonical_digest(&cursor_semantics)?;
         let admission = self.maintenance_capsule.decode()?;
         if admission.namespace != namespace
             || admission.request_semantic_sha256 != request_semantic_sha256
@@ -152,10 +158,13 @@ impl Request {
             admission: self.maintenance_capsule.clone(),
             request_idempotency_key: self.idempotency_key.clone(),
             public_idempotency_key: admission.idempotency_key,
+            operation_id: admission.operation_id,
             request_semantic_sha256,
+            cursor_semantic_sha256,
             expected_generation: self.expected_generation,
             cursor_generation,
             after,
+            resume_cursor: self.resume_cursor.clone(),
             task: self.task,
             scanned_items: 0,
         })
@@ -204,10 +213,13 @@ pub(super) struct CommonMaintenanceContext {
     admission: EncodedAdmission,
     request_idempotency_key: String,
     public_idempotency_key: String,
+    operation_id: String,
     pub(super) request_semantic_sha256: String,
+    cursor_semantic_sha256: String,
     expected_generation: u64,
     cursor_generation: Option<u64>,
     after: u64,
+    resume_cursor: Option<String>,
     task: Task,
     scanned_items: u64,
 }
@@ -353,6 +365,9 @@ impl NcmEngine {
                 if let Err(reply) = context.check_generation(0) {
                     return reply;
                 }
+                if context.resume_cursor.is_some() {
+                    return invalid("maintenance cursor was not issued for this operation", 0);
+                }
                 return no_change_reply(&request, namespace, 0, 0, false, 0);
             }
             Err(reply) => return reply,
@@ -373,6 +388,23 @@ impl NcmEngine {
             return reply;
         }
         let generation = handle.commit_seq;
+        if let Some(cursor) = context.resume_cursor.as_deref() {
+            let issued = match handle.store.has_maintenance_cursor(
+                cursor,
+                &context.public_idempotency_key,
+                &context.operation_id,
+                &context.cursor_semantic_sha256,
+            ) {
+                Ok(issued) => issued,
+                Err(error) => return store_reply(error, generation),
+            };
+            if !issued {
+                return invalid(
+                    "maintenance cursor was not issued for this operation",
+                    generation,
+                );
+            }
+        }
         let capsules =
             match handle
                 .store
@@ -415,7 +447,7 @@ impl NcmEngine {
             }
         }
         if request.dry_run || request.task == Task::ValidateState || partial {
-            return no_change_reply(
+            let reply = no_change_reply(
                 &request,
                 namespace,
                 generation,
@@ -423,6 +455,18 @@ impl NcmEngine {
                 partial,
                 cursor,
             );
+            if partial
+                && let Some(cursor) = reply.payload["resume_cursor"].as_str()
+                && let Err(error) = handle.store.issue_maintenance_cursor(
+                    cursor,
+                    &context.public_idempotency_key,
+                    &context.operation_id,
+                    &context.cursor_semantic_sha256,
+                )
+            {
+                return store_reply(error, generation);
+            }
+            return reply;
         }
         let Some(kind) = request.task.kind() else {
             return invalid("maintenance task has no mutation", generation);

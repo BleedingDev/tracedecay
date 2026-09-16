@@ -407,6 +407,162 @@ fn oversized_capsule_returns_typed_capacity_without_repeating_cursor() {
 }
 
 #[test]
+fn maintenance_cursor_rejects_unissued_current_generation() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    let generation = seed(&live, "beta").state_generation;
+    let mut forged = request("forged-maintenance-cursor", "repair", generation);
+    forged["maximum_items"] = json!(1);
+    forged["resume_cursor"] = json!(format!(
+        "ncm-maintenance:{}:repair:{generation}:2",
+        namespace()
+    ));
+    seal(
+        &mut forged,
+        "forged-maintenance-cursor",
+        "01993262-4d00-7000-8000-000000000006",
+    );
+
+    let reply = invoke(&live, forged);
+    assert_eq!(
+        reply.outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "maintenance cursor was not issued for this operation".to_owned()
+        ))
+    );
+    assert_eq!(state(&live).state_generation, generation);
+}
+
+#[test]
+fn maintenance_cursor_survives_restart_before_resume_and_commits_once() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    seed(&live, "beta");
+    let generation = seed(&live, "gamma").state_generation;
+    let key = "restart-paged-maintenance";
+    let operation_id = "01993262-4d00-7000-8000-000000000007";
+    let mut page = request(key, "repair", generation);
+    page["maximum_items"] = json!(1);
+    seal(&mut page, key, operation_id);
+    let first = invoke(&live, page.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.payload["partial"], true);
+    assert_eq!(first.state_generation, generation);
+    let first_cursor = first.payload["resume_cursor"].clone();
+    drop(live);
+
+    let reopened = engine(&directory);
+    page["resume_cursor"] = first_cursor;
+    seal(&mut page, key, operation_id);
+    let second = invoke(&reopened, page.clone());
+    assert_eq!(second.outcome, Outcome::Success, "{second:?}");
+    assert_eq!(second.payload["partial"], true);
+    assert_eq!(second.state_generation, generation);
+    assert_eq!(second.payload["scanned_items"], 1);
+
+    page["resume_cursor"] = second.payload["resume_cursor"].clone();
+    seal(&mut page, key, operation_id);
+    let committed = invoke(&reopened, page.clone());
+    assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+    assert_eq!(committed.payload["partial"], false);
+    assert_eq!(committed.payload["scanned_items"], 1);
+    assert_eq!(committed.state_generation, generation + 1);
+
+    page["expected_generation"] = json!(committed.state_generation);
+    seal(&mut page, key, operation_id);
+    let replay = invoke(&reopened, page);
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(replay.state_generation, committed.state_generation);
+}
+
+#[test]
+fn deadline_after_partial_page_can_resume_without_a_second_commit() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    seed(&live, "beta");
+    let generation = seed(&live, "gamma").state_generation;
+    let key = "deadline-paged-maintenance";
+    let operation_id = "01993262-4d00-0000-8000-000000000008";
+    let mut page = request(key, "repair", generation);
+    page["maximum_items"] = json!(2);
+    seal(&mut page, key, operation_id);
+    let first = invoke(&live, page.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.payload["partial"], true);
+    page["resume_cursor"] = first.payload["resume_cursor"].clone();
+
+    seal(&mut page, key, operation_id);
+    let interrupted = live.common_control(&namespace(), page.clone(), Deadline { remaining_ms: 0 });
+    assert_eq!(interrupted.outcome, Outcome::Cancelled);
+    assert_eq!(state(&live).state_generation, generation);
+
+    let resumed = invoke(&live, page);
+    assert_eq!(resumed.outcome, Outcome::Success, "{resumed:?}");
+    assert_eq!(resumed.payload["partial"], false);
+    assert_eq!(resumed.state_generation, generation + 1);
+    assert_eq!(state(&live).state_generation, generation + 1);
+}
+
+#[test]
+fn paged_consolidate_and_merge_prune_receipts_validate_global_effects() {
+    for (task, key, operation_id) in [
+        (
+            "consolidate",
+            "paged-consolidate-receipt",
+            "01993262-4d00-0000-8000-000000000009",
+        ),
+        (
+            "prune_expired",
+            "paged-prune-receipt",
+            "01993262-4d00-0000-8000-000000000010",
+        ),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let live = engine(&directory);
+        seed(&live, "alpha");
+        seed(&live, "beta");
+        let generation = seed(&live, "gamma").state_generation;
+        let mut page = request(key, task, generation);
+        page["maximum_items"] = json!(1);
+        loop {
+            seal(&mut page, key, operation_id);
+            let reply = invoke(&live, page.clone());
+            assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
+            if reply.payload["partial"] == true {
+                page["resume_cursor"] = reply.payload["resume_cursor"].clone();
+                continue;
+            }
+            assert_eq!(reply.payload["scanned_items"], 1);
+            assert!(reply.payload["_retained_receipt"].is_object());
+            let receipt = receipt_item(&live, key);
+            let outcome = &receipt["maintenance_receipt"]["outcome"];
+            assert_eq!(outcome["scanned_items"], 1);
+            assert!(
+                outcome["changed_items"].as_u64().unwrap()
+                    + outcome["removed_items"].as_u64().unwrap()
+                    <= outcome["scanned_items"].as_u64().unwrap()
+            );
+            assert!(outcome["partial"] == false);
+            let committed_generation = reply.state_generation;
+            drop(live);
+            let reopened = engine(&directory);
+            page["expected_generation"] = json!(committed_generation);
+            seal(&mut page, key, operation_id);
+            let replay = invoke(&reopened, page);
+            assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+            assert_eq!(replay.payload["replayed"], true);
+            assert_eq!(replay.state_generation, committed_generation);
+            assert!(snapshot::export(&reopened, &namespace(), DEADLINE).is_ok());
+            break;
+        }
+    }
+}
+
+#[test]
 fn maintenance_receipt_survives_snapshot_restore_and_privacy_rebuild() {
     let directory = TempDir::new().unwrap();
     let live = engine(&directory);

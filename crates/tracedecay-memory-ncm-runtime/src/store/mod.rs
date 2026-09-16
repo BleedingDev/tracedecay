@@ -43,6 +43,9 @@ const META_FATIGUE: &str = "fatigue";
 const META_STEPS_SINCE_CONSOLIDATION: &str = "steps_since_consolidation";
 const META_LAST_MAINTENANCE: &str = "last_maintenance";
 const META_NEXT_RECORD_ID: &str = "next_record_id";
+const META_MAINTENANCE_CURSOR_GRANTS: &str = "maintenance_cursor_grants";
+const MAX_MAINTENANCE_CURSOR_GRANTS: usize = 256;
+const MAX_MAINTENANCE_CURSOR_GRANT_BYTES: usize = 512 * 1024;
 
 const TABLE_NAMES: [&str; 6] = [
     "capsules",
@@ -268,6 +271,14 @@ pub struct Event {
     pub receipt: String,
     /// Logical tick at which the event was created.
     pub created_tick: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MaintenanceCursorGrant {
+    cursor: String,
+    idempotency_key: String,
+    operation_id: String,
+    request_semantic_sha256: String,
 }
 
 /// A serialized kernel checkpoint.
@@ -737,6 +748,69 @@ impl NamespaceStore {
     /// Returns persisted scheduler and generation metadata.
     pub fn meta(&self) -> Result<StoreMeta, StoreError> {
         read_store_meta(&self.conn)
+    }
+
+    /// Persists a cursor returned by common maintenance without advancing the
+    /// state generation or adding a replayable event. The grant binds the
+    /// bearer cursor to the admitted operation that produced it.
+    pub(crate) fn issue_maintenance_cursor(
+        &mut self,
+        cursor: &str,
+        idempotency_key: &str,
+        operation_id: &str,
+        request_semantic_sha256: &str,
+    ) -> Result<(), StoreError> {
+        let mut grants = read_maintenance_cursor_grants(&self.conn)?;
+        let grant = MaintenanceCursorGrant {
+            cursor: cursor.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
+            operation_id: operation_id.to_owned(),
+            request_semantic_sha256: request_semantic_sha256.to_owned(),
+        };
+        if let Some(existing) = grants.iter_mut().find(|existing| existing.cursor == cursor) {
+            *existing = grant;
+        } else {
+            grants.push(grant);
+        }
+        if grants.len() > MAX_MAINTENANCE_CURSOR_GRANTS {
+            let excess = grants.len() - MAX_MAINTENANCE_CURSOR_GRANTS;
+            grants.drain(..excess);
+        }
+        let encoded = serde_json::to_vec(&grants).map_err(|error| {
+            StoreError::Corrupt(format!("encode maintenance cursor grants: {error}"))
+        })?;
+        if encoded.len() > MAX_MAINTENANCE_CURSOR_GRANT_BYTES {
+            return Err(StoreError::BudgetExceeded);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_MAINTENANCE_CURSOR_GRANTS, encoded],
+        )
+        .map_err(map_sqlite_error)?;
+        tx.commit().map_err(map_sqlite_error)
+    }
+
+    /// Checks that a resume cursor was issued for this exact admitted run.
+    pub(crate) fn has_maintenance_cursor(
+        &self,
+        cursor: &str,
+        idempotency_key: &str,
+        operation_id: &str,
+        request_semantic_sha256: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(read_maintenance_cursor_grants(&self.conn)?
+            .iter()
+            .any(|grant| {
+                grant.cursor == cursor
+                    && grant.idempotency_key == idempotency_key
+                    && grant.operation_id == operation_id
+                    && grant.request_semantic_sha256 == request_semantic_sha256
+            }))
     }
 
     /// Returns the durable allocation floor, including IDs retired by restore.
@@ -1657,6 +1731,21 @@ fn get_meta_value(conn: &Connection, key: &str) -> Result<Option<Vec<u8>>, Store
     .optional()
     .map(|value| value.flatten())
     .map_err(map_sqlite_error)
+}
+
+fn read_maintenance_cursor_grants(
+    conn: &Connection,
+) -> Result<Vec<MaintenanceCursorGrant>, StoreError> {
+    let Some(bytes) = get_meta_value(conn, META_MAINTENANCE_CURSOR_GRANTS)? else {
+        return Ok(Vec::new());
+    };
+    if bytes.len() > MAX_MAINTENANCE_CURSOR_GRANT_BYTES {
+        return Err(StoreError::Corrupt(
+            "maintenance cursor grants exceed their bound".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| StoreError::Corrupt(format!("decode maintenance cursor grants: {error}")))
 }
 
 fn set_meta_value(conn: &Connection, key: &str, value: &[u8]) -> Result<(), StoreError> {
