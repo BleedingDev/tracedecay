@@ -665,6 +665,64 @@ impl ProjectProviderControlPortV1 {
         Ok(AuthorizedControlSourceV1 { authorized, target })
     }
 
+    /// Resolve a source for a control that will use the mounted provider.
+    ///
+    /// Source-only public requests carry no namespace selector. Bind the
+    /// freshly authorized source grant to the host's current exact session
+    /// before the caller can accept a feedback/deletion command or dispatch a
+    /// provider operation. The untrusted selector, retained locator and
+    /// provider reply never choose this namespace.
+    pub(super) async fn resolve_source_for_invocation(
+        &self,
+        selector: &ProviderControlSourceSelectorV1,
+        include_unavailable: bool,
+        invocation: &ControlInvocationV1<'_, '_>,
+    ) -> ControlResult<AuthorizedControlSourceV1> {
+        self.validate_invocation(invocation)?;
+        let source = self
+            .resolve_source(selector, include_unavailable, &invocation.control)
+            .await?;
+        let granted = source.granted_source()?;
+        let retained_attribution = source
+            .authorized
+            .retained
+            .original_source
+            .to_owned_attribution()
+            .map_err(|_| {
+                ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
+                    "retained source attribution",
+                ))
+            })?;
+        if source.authorized.grant.destination_scope
+            != source.authorized.retained.scope.delivery_scope
+            || source.target.provider_id != source.authorized.retained.scope.provider_id
+            || source.target.registration_revision
+                != source.authorized.retained.scope.registration_revision
+            || source.target.delivery_scope != source.authorized.retained.scope.delivery_scope
+            || source.target.original_scope != granted.attribution.origin_scope
+            || source.target.source != granted.attribution.source
+            || retained_attribution != granted.attribution
+        {
+            return Err(ControlFailureV1::new(
+                ControlFailureStageV1::InvalidBinding("source grant at use"),
+            ));
+        }
+        let current_scope = self
+            .authority()?
+            .current_destination_scope(
+                granted.attribution.source.canonical_provider_id.as_str(),
+                &invocation.control,
+            )
+            .await?;
+        if current_scope != source.authorized.grant.destination_scope {
+            return Err(ControlFailureV1::new(
+                ControlFailureStageV1::InvalidBinding("current source delivery scope"),
+            ));
+        }
+        invocation.check()?;
+        Ok(source)
+    }
+
     pub(super) fn require_same_state(
         &self,
         expected: &ResolvedControlStateV1,

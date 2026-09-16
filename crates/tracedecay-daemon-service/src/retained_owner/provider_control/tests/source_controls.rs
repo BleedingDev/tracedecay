@@ -122,12 +122,12 @@ fn transcript_line(root: &Path, message: &str, content: &str) -> String {
     )
 }
 
-fn hook_envelope(event: u8, now: UtcMicros) -> HookEventEnvelopeV2 {
+fn hook_envelope(event: u8, session: &str, now: UtcMicros) -> HookEventEnvelopeV2 {
     HookEventEnvelopeV2 {
         schema_version: HOOK_EVENT_SCHEMA_VERSION,
         event_id: [event; 16],
         producer: HookHostV1::ClaudeCode,
-        protected_session_id: tracedecay_agent_hosts::hooks::protected_native_session_id(SESSION),
+        protected_session_id: tracedecay_agent_hosts::hooks::protected_native_session_id(session),
         project_id: [1; 16],
         repository_id: [2; 16],
         worktree_id: [3; 16],
@@ -569,7 +569,7 @@ impl OfflineSourceFixture {
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
-        let envelope = hook_envelope(10, baseline_now);
+        let envelope = hook_envelope(10, SESSION, baseline_now);
         let receipt = hook_ledger
             .admit_with_receipt(&envelope, baseline_now)
             .unwrap();
@@ -606,7 +606,7 @@ impl OfflineSourceFixture {
         )
         .unwrap();
         assert_eq!(appended.frames.len(), 1);
-        let envelope = hook_envelope(11, appended_now);
+        let envelope = hook_envelope(11, SESSION, appended_now);
         let receipt = hook_ledger
             .admit_with_receipt(&envelope, appended_now)
             .unwrap();
@@ -856,6 +856,70 @@ impl OfflineSourceFixture {
             .unwrap(),
             CancellationSignal::active("cancel.offline-source").unwrap(),
         )
+    }
+
+    /// Add a second host-admitted live session after the source selector has
+    /// been retained. This keeps the fixture's first selector in scope A while
+    /// the daemon's current-session authority observes scope B.
+    async fn admit_current_session_boundary(&self, session: &str) {
+        assert_ne!(session, SESSION);
+        let data_root = self._temporary.path().join("provider-data");
+        let project_root = self.port.inputs.project_root.clone();
+        let profile = self.port.inputs.profile_id.clone();
+        let brain = self
+            .port
+            .inputs
+            .canonical_session_db
+            .binding()
+            .shard_id
+            .brain_id
+            .clone();
+        let transcript = self
+            ._temporary
+            .path()
+            .join("host/.claude/projects/control-fixture")
+            .join(format!("{session}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, b"").unwrap();
+        let identity = identify_claude_source(&transcript).unwrap();
+        let source = ObservationSourceIdentityV1::for_provider_source(
+            ProviderId::new("claude").unwrap(),
+            SessionId::new(identity.session_id).unwrap(),
+            SessionId::new(identity.source_id).unwrap(),
+        )
+        .unwrap();
+        let now = tracedecay_contracts::now_micros();
+        let observation = capture_live_origin_with_test_authorities(
+            project_root.clone(),
+            self.port.inputs.mounted_scope.project_id.clone(),
+            brain,
+            profile,
+            transcript,
+            source,
+            None,
+            now,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let hook_root = data_root
+            .join("hook-v2-admissions")
+            .join(HookHostV1::ClaudeCode.hook_key());
+        let mut ledger = HookAdmissionLedgerV1::open(
+            &hook_root,
+            HookHostV1::ClaudeCode,
+            HookAdmissionLedgerLimitsV1::stock(),
+            now,
+        )
+        .unwrap()
+        .0;
+        let envelope = hook_envelope(12, session, now);
+        let receipt = ledger.admit_with_receipt(&envelope, now).unwrap();
+        assert_eq!(
+            ledger
+                .record_live_origin(&envelope, receipt, Some(observation), now)
+                .unwrap(),
+            HookLiveOriginOutcomeV1::Baseline
+        );
     }
 
     async fn execute(
@@ -1575,6 +1639,43 @@ async fn source_controls_refuse_foreign_scope_provider_and_reused_replacement_be
         json!([fixture.attribution.source.source_key])
     );
     assert!(body.get("retention_lock_blocked").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_selector_from_previous_session_cannot_accept_a_command_in_current_session() {
+    let fixture = OfflineSourceFixture::new().await;
+    // The retained selector belongs to the first live session (A). A later
+    // host-admitted baseline makes B the current session on the same project,
+    // repository and worktree. The source-only request has no public state
+    // selector, so the daemon must bind its fresh grant to B before accepting
+    // the deletion command.
+    fixture
+        .admit_current_session_boundary("current-source-control-session")
+        .await;
+    let request = fixture.request();
+    let (context, cancellation) = fixture.context(&request, "request.previous-session-source");
+    assert!(matches!(
+        fixture.execute(&request, &context, &cancellation).await,
+        Err(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized)
+    ));
+    assert!(
+        fixture
+            .journal
+            .read_provider_source_fence(
+                fixture.provider_id.as_str(),
+                &original_source_fence_digest(&fixture.attribution).unwrap(),
+            )
+            .unwrap()
+            .is_none(),
+        "cross-session selector must be refused before the host deletion fence"
+    );
+    assert!(
+        fixture
+            .ledger
+            .retained_deletion_command(&operation_control())
+            .is_err(),
+        "cross-session selector must not leave an accepted command receipt"
+    );
 }
 
 fn authority_payload(value: &Value) -> CanonicalPayload {

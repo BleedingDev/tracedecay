@@ -16,7 +16,7 @@ use tracedecay_memory_observation::{
     RecoveryTimeBudgetV1, SqliteObservationJournal,
 };
 use tracedecay_memory_provider_registry::{
-    HistoryGrant, OperationControl, OwnedProviderId, TerminalCode,
+    HistoryGrant, OperationControl, OwnedExactScope, OwnedProviderId, TerminalCode,
 };
 use tracedecay_runtime_core::db::Database;
 
@@ -591,6 +591,73 @@ impl ProviderControlAuthorityV1 {
             })
         });
         bounded_read(control, work, "retained control source worker").await?
+    }
+
+    /// Resolves the host's latest live destination for the source's canonical
+    /// provider. Source-only controls have no public state selector, so their
+    /// namespace must be bound to the session that is currently live on the
+    /// mounted checkout before any accepted command or provider call.
+    ///
+    /// Live-origin baselines are the existing host admission authority. The
+    /// latest retained admission order is used when several sessions have
+    /// lived in one checkout; an old selector therefore cannot silently pick
+    /// its own delivery namespace. The returned value is a complete exact
+    /// scope, including profile, project, repository, worktree, branch and
+    /// provider-qualified session identity.
+    pub(crate) async fn current_destination_scope(
+        self: &Arc<Self>,
+        canonical_provider_id: &str,
+        control: &OperationControl,
+    ) -> Result<OwnedExactScope> {
+        check(control)?;
+        if canonical_provider_id.is_empty()
+            || canonical_provider_id.len() > 1024
+            || canonical_provider_id.chars().any(char::is_control)
+            || canonical_provider_id.trim() != canonical_provider_id
+        {
+            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+                "canonical source provider",
+            ));
+        }
+        let authority = Arc::clone(self);
+        let canonical_provider_id = canonical_provider_id.to_owned();
+        let operation = control.clone();
+        let work =
+            tokio::task::spawn_blocking(move || {
+                check(&operation)?;
+                let bridge = &authority.original_authority.bridge;
+                let mut latest: Option<(u64, OwnedExactScope)> = None;
+                for boundary in authority.original_authority.reader.live_boundaries()? {
+                    check(&operation)?;
+                    let source = &boundary.observation.source;
+                    if source.provider().as_str() != canonical_provider_id {
+                        continue;
+                    }
+                    let session_id = source.session_id().as_str();
+                    let destination = bridge.destination(session_id)?;
+                    // Revalidate the complete checkout identity and the source /
+                    // destination session admission before considering this
+                    // boundary current. A structurally valid baseline is not
+                    // itself a namespace grant.
+                    bridge.authorize_control_scope(&destination, &operation)?;
+                    if !authority
+                        .original_authority
+                        .authorizes_session(session_id, &destination)?
+                    {
+                        continue;
+                    }
+                    if latest
+                        .as_ref()
+                        .is_none_or(|(order, _)| boundary.admission.order > *order)
+                    {
+                        latest = Some((boundary.admission.order, destination));
+                    }
+                }
+                latest.map(|(_, destination)| destination).ok_or(
+                    ProviderHistoryErrorV1::Ineligible("current canonical session boundary"),
+                )
+            });
+        bounded_read(control, work, "current control session worker").await?
     }
 }
 

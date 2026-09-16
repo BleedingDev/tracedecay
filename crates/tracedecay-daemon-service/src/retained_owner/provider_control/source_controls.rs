@@ -45,7 +45,7 @@ pub(super) async fn feedback(
     request: &ProviderFeedbackRequestV1,
 ) -> ControlResult<CompletedProviderControlV1> {
     let source = port
-        .resolve_source(&request.source, false, &invocation.control)
+        .resolve_source_for_invocation(&request.source, false, invocation)
         .await?;
     let accepted = accept_feedback(port, invocation, request, &source).await?;
     let identity = feedback_identity(&accepted);
@@ -124,7 +124,7 @@ pub(super) async fn correction(
     request: &ProviderCorrectionRequestV1,
 ) -> ControlResult<CompletedProviderControlV1> {
     let source = port
-        .resolve_source(&request.source, false, &invocation.control)
+        .resolve_source_for_invocation(&request.source, false, invocation)
         .await?;
     source
         .target
@@ -276,7 +276,7 @@ async fn prepare_correction<'request>(
         ProviderControlCorrectionV1::Supersede { replacement_source }
         | ProviderControlCorrectionV1::ReplaceContent { replacement_source } => {
             let mut source = port
-                .resolve_source(replacement_source, false, &invocation.control)
+                .resolve_source_for_invocation(replacement_source, false, invocation)
                 .await?;
             // A replacement is an already admitted envelope in the same exact
             // producing namespace. This path never retargets or enqueues it.
@@ -433,7 +433,7 @@ pub(super) async fn delete_by_source(
 ) -> ControlResult<CompletedProviderControlV1> {
     // Existing unavailable canonical sources may still require provider cleanup.
     let source = port
-        .resolve_source(&request.source, true, &invocation.control)
+        .resolve_source_for_invocation(&request.source, true, invocation)
         .await?;
     let accepted = accept_deletion(port, invocation, request, &source).await?;
     let identity = deletion_identity(&accepted);
@@ -809,7 +809,7 @@ async fn refresh_source(
     include_unavailable: bool,
 ) -> ControlResult<AuthorizedControlSourceV1> {
     let fresh = port
-        .resolve_source(selector, include_unavailable, &invocation.control)
+        .resolve_source_for_invocation(selector, include_unavailable, invocation)
         .await?;
     if previous.target != fresh.target
         || previous.authorized.retained.scope != fresh.authorized.retained.scope
