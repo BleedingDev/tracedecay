@@ -4,7 +4,7 @@ overview: Reconcile the single pluggable-memory branch with the exact latest rev
 todos:
   - id: quiesce-current-writers
     content: "Finish, freeze, or explicitly stop every active writer to the shared worktree, account for Cargo Hauler readers and queued tests, record exact file ownership, and refuse cleanup while any change remains unclassified or agent-owned."
-    status: pending
+    status: completed
   - id: checkpoint-accounted-work
     content: "Create recoverable exact-path commits on feat/pluggable-memory-providers-v2 for every coherent current change, including useful superseded work before its later deletion, review each diff, and push each checkpoint so no merge or cleanup can erase the only copy."
     status: pending
