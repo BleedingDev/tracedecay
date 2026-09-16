@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::common::{self, canonical_existing_path, tracedecay_command_with_home};
@@ -36,6 +37,62 @@ fn run_tool(project: &Path, home: &Path, args: &[&str]) -> std::process::Output 
         .args(args)
         .output()
         .expect("tracedecay tool should run")
+}
+
+fn try_search_payload(output: &std::process::Output) -> Option<Value> {
+    let envelope: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let text = envelope
+        .get("content")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()?;
+    serde_json::from_str(text).ok()
+}
+
+fn search_payload(output: &std::process::Output) -> Value {
+    try_search_payload(output).unwrap_or_else(|| {
+        panic!(
+            "expected a JSON search payload; status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn run_search(project: &Path, home: &Path, args: Value) -> std::process::Output {
+    let project_arg = project.to_string_lossy().to_string();
+    let args_json = serde_json::to_string(&args).expect("serialize search arguments");
+    run_tool(
+        project,
+        home,
+        &[
+            "--project",
+            project_arg.as_str(),
+            "search",
+            "--json",
+            "--args",
+            args_json.as_str(),
+        ],
+    )
+}
+
+fn assert_search_refused(output: &std::process::Output, description: &str) {
+    let payload = search_payload(output);
+    assert_eq!(
+        payload["status"], "unavailable",
+        "{description} should return an unavailable search payload: {payload}"
+    );
+    assert_eq!(
+        payload["reason"], "search_failed",
+        "{description} should be refused by cursor validation: {payload}"
+    );
+    assert_eq!(
+        payload["results"].as_array().map(Vec::len),
+        Some(0),
+        "{description} should not return search results: {payload}"
+    );
 }
 
 fn setup_daemon_project(
@@ -81,6 +138,136 @@ fn daemon_tool_searches_the_active_project() {
         String::from_utf8_lossy(&output.stdout).contains("findable_symbol"),
         "daemon-owned search must return the indexed symbol"
     );
+}
+
+#[test]
+fn daemon_tool_search_paginates_authenticated_cursor_over_cli_transport() {
+    let source = r#"
+        /// The alpha primary cursor fixture has repeated cursor and fixture evidence.
+        pub fn alpha_cursor_fixture_primary() -> u32 {
+            let alpha_cursor_fixture_primary_value = 1;
+            alpha_cursor_fixture_primary_value
+        }
+
+        /// The secondary cursor fixture has alpha cursor and fixture evidence.
+        pub fn fixture_secondary() -> u32 {
+            let alpha_cursor_fixture_secondary_value = 2;
+            alpha_cursor_fixture_secondary_value
+        }
+
+        /// This alpha cursor fixture is a lower-ranked distractor.
+        pub fn fixture_distractor() -> u32 {
+            3
+        }
+    "#;
+    let (_home, _project, home_path, project_path) = setup_daemon_project(source);
+    let query = "alpha cursor fixture";
+
+    let first = common::poll_until(
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_millis(100),
+        || {
+            let output = run_search(
+                &project_path,
+                &home_path,
+                json!({"query": query, "limit": 1, "format": "json"}),
+            );
+            let Some(payload) = try_search_payload(&output) else {
+                return None;
+            };
+            let has_one_result = payload["results"]
+                .as_array()
+                .is_some_and(|results| results.len() == 1);
+            let has_cursor = payload["next_cursor"]
+                .as_str()
+                .is_some_and(|cursor| !cursor.is_empty());
+            let is_ready = output.status.success()
+                && payload["coverage"]["recall"] == "full"
+                && has_one_result
+                && has_cursor;
+            is_ready.then_some(output)
+        },
+        || format!("search did not produce a paginated first page for {query}"),
+    );
+    let first_payload = search_payload(&first);
+    let first_results = first_payload["results"]
+        .as_array()
+        .expect("first search page results");
+    assert_eq!(first_results.len(), 1, "first page={first_payload}");
+    let first_anchor = first_results[0]["candidate"]["anchor_id"]
+        .as_str()
+        .expect("first result anchor")
+        .to_owned();
+    let first_cursor = first_payload["next_cursor"]
+        .as_str()
+        .expect("first page next_cursor")
+        .to_owned();
+    let cursor_object: Value =
+        serde_json::from_str(&first_cursor).expect("opaque cursor JSON object");
+    assert!(
+        cursor_object["signature"].as_str().is_some(),
+        "cursor={first_cursor}"
+    );
+    assert_eq!(
+        cursor_object["next_ordinal"],
+        json!(1),
+        "cursor={first_cursor}"
+    );
+
+    let second = run_search(
+        &project_path,
+        &home_path,
+        json!({
+            "query": query,
+            "limit": 1,
+            "cursor": first_cursor.clone(),
+            "format": "json"
+        }),
+    );
+    assert!(
+        second.status.success(),
+        "second search page failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_payload = search_payload(&second);
+    let second_results = second_payload["results"]
+        .as_array()
+        .expect("second search page results");
+    assert_eq!(second_results.len(), 1, "second page={second_payload}");
+    let second_anchor = second_results[0]["candidate"]["anchor_id"]
+        .as_str()
+        .expect("second result anchor");
+    assert_ne!(
+        first_anchor, second_anchor,
+        "the continuation page repeated the first result: first={first_payload}, second={second_payload}"
+    );
+
+    let mut tampered_cursor = cursor_object;
+    tampered_cursor["signature"] = json!(format!("hmac-sha256:{}", "0".repeat(64)));
+    let tampered = run_search(
+        &project_path,
+        &home_path,
+        json!({
+            "query": query,
+            "limit": 1,
+            "cursor": serde_json::to_string(&tampered_cursor).expect("serialize tampered cursor"),
+            "format": "json"
+        }),
+    );
+    assert_search_refused(&tampered, "tampered cursor");
+
+    let mismatched_query = run_search(
+        &project_path,
+        &home_path,
+        json!({
+            "query": "different cursor fixture",
+            "limit": 1,
+            "cursor": first_cursor,
+            "format": "json"
+        }),
+    );
+    assert_search_refused(&mismatched_query, "query-mismatched cursor");
 }
 
 #[test]
