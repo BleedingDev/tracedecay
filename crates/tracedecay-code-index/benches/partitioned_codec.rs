@@ -133,20 +133,6 @@ impl CodeChunkProjectionSink for ApplyingProjection {
                         output_digest: None,
                     }),
             )
-            .chain(
-                request
-                    .changes
-                    .reused
-                    .iter()
-                    .map(|change| ChunkProjectionDecisionV1 {
-                        chunk_id: change.chunk_id.clone(),
-                        prior_chunk_digest: change.prior_digest.clone(),
-                        current_chunk_digest: change.current_digest.clone(),
-                        operation: ProjectionOperationV1::Reused,
-                        outcome: ProjectionOutcomeV1::Reused,
-                        output_digest: None,
-                    }),
-            )
             .collect::<Vec<_>>();
         receipt_builder
             .build(&decisions)
@@ -519,7 +505,7 @@ fn open_lexical(
         Cursor::new(Vec::<u8>::new()),
         &fixture.manifest,
         source_digest,
-        move |digest, _, buffer| {
+        move |digest, _, buffer, _control| {
             let bytes = segments.get(digest.as_str()).ok_or_else(|| {
                 CodeIndexProductionErrorV1::Contract("benchmark segment is missing".to_owned())
             })?;

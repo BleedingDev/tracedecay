@@ -8,8 +8,9 @@ use tracedecay_contracts::code_index_freshness::{
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
 use super::super::branch_publication::{
-    BranchPublicationContextV1, branch_generation_work_is_active,
+    BranchPublicationContextV1, branch_generation_work_is_active, branch_refresh_admission_error,
 };
+use super::super::demand_admission::{CodeIndexDemandAdmissionV1, CodeIndexDemandUnavailableV1};
 use super::{ALPHA_LIB_V1, CodeIndexSchedulerRegistryV1, GitFixture, test_project_id};
 
 async fn mounted_registry(fixture: &GitFixture, store: &TempDir) -> CodeIndexSchedulerRegistryV1 {
@@ -42,6 +43,28 @@ fn branch_publication_requires_authoritative_project_identity() {
             false,
             "branch graph publication requires an authoritative project identity",
         ))
+    );
+}
+
+#[test]
+fn admitted_generation_ignores_a_supplementary_not_applicable_overflow() {
+    let root = std::path::Path::new("/tmp/not-a-repository");
+    assert!(
+        branch_refresh_admission_error(&CodeIndexDemandAdmissionV1::NotApplicable, root).is_none(),
+        "the already-admitted complete-generation request owns the wake"
+    );
+    assert!(
+        branch_refresh_admission_error(&CodeIndexDemandAdmissionV1::Queued, root).is_none(),
+        "a queued overflow also permits the generation wait"
+    );
+    let unavailable = branch_refresh_admission_error(
+        &CodeIndexDemandAdmissionV1::Unavailable(CodeIndexDemandUnavailableV1::SchedulerUnmounted),
+        root,
+    )
+    .expect("unavailability stays a typed refusal");
+    assert_eq!(
+        unavailable.project_route_context().map(|context| context.0),
+        Some("code_index_scheduler_unavailable")
     );
 }
 
@@ -200,7 +223,10 @@ async fn transient_serving_claim_does_not_erase_pending_branch_tracking() {
     .expect("pending branch metadata becomes visible");
 
     drop(held);
-    assert!(registry.notify_hook_overflow(fixture.path()).await);
+    assert!(matches!(
+        registry.notify_hook_overflow(fixture.path()).await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     assert_eq!(
         publication
             .await
@@ -213,6 +239,87 @@ async fn transient_serving_claim_does_not_erase_pending_branch_tracking() {
             .is_some_and(|meta| meta.is_query_eligible("feature/replay")),
         "a transient serving handoff must preserve and finish pending branch tracking"
     );
+    registry.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_wait_branch_publication_surfaces_terminal_publication_park() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let project_id = test_project_id();
+    let registry = mounted_registry(&fixture, &store).await;
+    let generation = registry
+        .serving_code_scope(fixture.path())
+        .await
+        .and_then(|scope| scope.serving_generation)
+        .expect("ready serving generation");
+    let super::super::ServingGenerationInstallationOutcomeV1::Installed(held) = registry
+        .install_exact_serving_generation(fixture.path(), &generation)
+        .await
+    else {
+        panic!("fixture must hold the serving claim")
+    };
+    let context =
+        BranchPublicationContextV1::new(Some(project_id.as_str()), fixture.path(), store.path())
+            .expect("branch publication context");
+    let cancellation = CancellationToken::new();
+    let publication_registry = registry.clone();
+    let project_root = fixture.path().to_path_buf();
+    let worktree_root = project_root.clone();
+    let publication = tokio::spawn(async move {
+        context
+            .track_exact_worktree_branch(
+                &publication_registry,
+                &project_root,
+                &worktree_root,
+                "feature/mid-wait-park",
+                &cancellation,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if tracedecay_runtime_core::branch_meta::load_branch_meta(store.path())
+                .is_some_and(|meta| meta.is_tracked("feature/mid-wait-park"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending branch metadata becomes visible while waiting");
+
+    assert!(
+        registry
+            .plant_terminal_publication_authority_park_for_test(
+                fixture.path(),
+                "mid-wait injected publication corruption",
+            )
+            .await,
+        "mid-wait fixture must stamp the terminal park on the mounted owner"
+    );
+
+    let error = publication
+        .await
+        .expect("publication task joins")
+        .expect_err("mid-wait terminal park must fail closed");
+    let context = error
+        .project_route_context()
+        .expect("typed publication corruption route");
+    assert_eq!(
+        context.0,
+        tracedecay_contracts::code_index_freshness::CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT
+    );
+    assert!(!context.1, "terminal corruption is non-retryable");
+    assert!(
+        context
+            .2
+            .contains("mid-wait injected publication corruption"),
+        "detail must retain the parked reason: {}",
+        context.2
+    );
+    drop(held);
     registry.shutdown().await;
 }
 

@@ -12,7 +12,9 @@
 
 use axum::Json;
 use axum::extract::State;
-use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessPayloadV1;
+use tracedecay_contracts::code_index_freshness::{
+    CodeIndexFreshnessCoverageV1, CodeIndexFreshnessPayloadV1, CodeIndexStalenessStateV1,
+};
 
 use super::DashboardState;
 use super::read_model::{
@@ -39,7 +41,20 @@ async fn project_code_index_freshness(
     let authority_attached = state.code_index_freshness_reader.is_some();
     let read = match &state.code_index_freshness_reader {
         Some(reader) => reader(state.project_root.clone()).await,
-        None => None,
+        None => Ok(None),
+    };
+    let read = match read {
+        Err(_) => {
+            return DashboardEnvelopeV1::unavailable(
+                scope_from_state(state),
+                CodeIndexFreshnessPayloadV1 {
+                    worktrees: Vec::new(),
+                    note: "code-index freshness read failed".to_owned(),
+                },
+                "code-index freshness read failed",
+            );
+        }
+        Ok(read) => read,
     };
     let live = read.as_ref();
     let payload = match (authority_attached, read.clone()) {
@@ -52,8 +67,8 @@ async fn project_code_index_freshness(
     match live {
         Some(worktree)
             if worktree.latest_generation_id.is_some()
-                && worktree.coverage == "complete"
-                && worktree.staleness_state.as_deref() == Some("fresh") =>
+                && worktree.coverage == CodeIndexFreshnessCoverageV1::Complete
+                && worktree.staleness_state == Some(CodeIndexStalenessStateV1::Fresh) =>
         {
             DashboardEnvelopeV1::ready(
                 scope_from_state(state),
@@ -85,7 +100,7 @@ async fn project_code_index_freshness(
         }
         Some(worktree) if worktree.latest_generation_id.is_none() => DashboardEnvelopeV1::new(
             scope_from_state(state),
-            if worktree.staleness_state.as_deref() == Some("indexing") {
+            if worktree.staleness_state == Some(CodeIndexStalenessStateV1::Indexing) {
                 DashboardDomainStateV1::Loading
             } else {
                 DashboardDomainStateV1::Unknown
@@ -94,18 +109,29 @@ async fn project_code_index_freshness(
             DashboardFreshnessV1::unknown(),
             payload,
         ),
-        Some(_) => DashboardEnvelopeV1::new(
-            scope_from_state(state),
-            DashboardDomainStateV1::Partial,
-            DashboardCoverageV1::partial(
-                1,
-                0,
-                "mounted_worktree",
-                vec!["scheduler freshness coverage is incomplete".to_owned()],
-            ),
-            DashboardFreshnessV1::unknown(),
-            payload,
-        ),
+        Some(worktree) => {
+            let omission = if worktree.staleness_state == Some(CodeIndexStalenessStateV1::Fresh) {
+                format!(
+                    "scheduler freshness is fresh but coverage is {}; complete coverage is required",
+                    worktree.coverage
+                )
+            } else {
+                format!(
+                    "scheduler freshness state is {}; only fresh serves as current",
+                    worktree.staleness_state.map_or(
+                        "unreported",
+                        CodeIndexStalenessStateV1::as_str,
+                    )
+                )
+            };
+            DashboardEnvelopeV1::new(
+                scope_from_state(state),
+                DashboardDomainStateV1::Partial,
+                DashboardCoverageV1::partial(1, 0, "mounted_worktree", vec![omission]),
+                DashboardFreshnessV1::unknown(),
+                payload,
+            )
+        }
         None if authority_attached => DashboardEnvelopeV1::new(
             scope_from_state(state),
             DashboardDomainStateV1::Unknown,
@@ -133,7 +159,8 @@ mod tests {
     use super::*;
     use crate::read_model::DashboardDomainStateV1;
     use tracedecay_contracts::code_index_freshness::{
-        CodeGraphServingReadinessV1, CodeIndexWorktreeFreshnessV1,
+        CodeGraphServingReadinessV1, CodeIndexFreshnessCoverageV1, CodeIndexStalenessStateV1,
+        CodeIndexWorktreeFreshnessV1,
     };
 
     async fn state_for_test() -> (tempfile::TempDir, DashboardState) {
@@ -158,7 +185,7 @@ mod tests {
         let (_project, mut state) = state_for_test().await;
         state.code_index_freshness_reader = Some(Arc::new(|root| {
             Box::pin(async move {
-                Some(CodeIndexWorktreeFreshnessV1 {
+                Ok(Some(CodeIndexWorktreeFreshnessV1 {
                     worktree_root: root.display().to_string(),
                     repository_id: None,
                     worktree_id: None,
@@ -172,14 +199,14 @@ mod tests {
                     snapshot_content_identity: None,
                     sealed_at_micros: None,
                     last_reconcile_micros: Some(42),
-                    staleness_state: Some("indexing".to_owned()),
+                    staleness_state: Some(CodeIndexStalenessStateV1::Indexing),
                     rebuild_in_flight: false,
                     hook_hint_count: Some(0),
-                    coverage: "complete".to_owned(),
+                    coverage: CodeIndexFreshnessCoverageV1::Complete,
                     progress: None,
                     parked: None,
                     generation_recovery: None,
-                })
+                }))
             })
         }));
 
@@ -193,11 +220,76 @@ mod tests {
     async fn attached_registry_without_a_mount_is_unknown_not_unsupported() {
         let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
         let (_project, mut state) = state_for_test().await;
-        state.code_index_freshness_reader = Some(Arc::new(|_| Box::pin(async { None })));
+        state.code_index_freshness_reader = Some(Arc::new(|_| Box::pin(async { Ok(None) })));
 
         let Json(envelope) = freshness(State(state)).await;
 
         assert_eq!(envelope.domain_state, DashboardDomainStateV1::Unknown);
         assert_eq!(envelope.freshness.state, DashboardFreshnessStateV1::Absent);
+    }
+
+    #[tokio::test]
+    async fn complete_generation_reports_its_noncurrent_freshness_state() {
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
+        for staleness in [
+            CodeIndexStalenessStateV1::Stale,
+            CodeIndexStalenessStateV1::Verifying,
+        ] {
+            let (_project, mut state) = state_for_test().await;
+            state.code_index_freshness_reader = Some(Arc::new(move |root| {
+                Box::pin(async move {
+                    Ok(Some(CodeIndexWorktreeFreshnessV1 {
+                        worktree_root: root.display().to_string(),
+                        latest_generation_id: Some("generation.fixture".to_owned()),
+                        staleness_state: Some(staleness),
+                        coverage: CodeIndexFreshnessCoverageV1::Complete,
+                        hook_hint_count: Some(1),
+                        ..Default::default()
+                    }))
+                })
+            }));
+
+            let Json(envelope) = freshness(State(state)).await;
+
+            assert_eq!(envelope.domain_state, DashboardDomainStateV1::Partial);
+            assert_eq!(
+                envelope.payload.worktrees[0].coverage,
+                CodeIndexFreshnessCoverageV1::Complete
+            );
+            assert_eq!(
+                envelope.coverage.omission_reasons,
+                vec![format!(
+                    "scheduler freshness state is {staleness}; only fresh serves as current"
+                )]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_generation_reports_incomplete_coverage_without_noncurrent_guidance() {
+        let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
+        let (_project, mut state) = state_for_test().await;
+        state.code_index_freshness_reader = Some(Arc::new(|root| {
+            Box::pin(async move {
+                Ok(Some(CodeIndexWorktreeFreshnessV1 {
+                    worktree_root: root.display().to_string(),
+                    latest_generation_id: Some("generation.fixture".to_owned()),
+                    staleness_state: Some(CodeIndexStalenessStateV1::Fresh),
+                    coverage: CodeIndexFreshnessCoverageV1::PartialHookHintOverflow,
+                    ..Default::default()
+                }))
+            })
+        }));
+
+        let Json(envelope) = freshness(State(state)).await;
+
+        assert_eq!(envelope.domain_state, DashboardDomainStateV1::Partial);
+        assert_eq!(
+            envelope.coverage.omission_reasons,
+            vec![
+                "scheduler freshness is fresh but coverage is partial_hook_hint_overflow; complete coverage is required"
+                    .to_owned()
+            ]
+        );
     }
 }

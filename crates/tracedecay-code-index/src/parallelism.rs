@@ -7,10 +7,7 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracedecay_domain::configuration::{
     CodeIndexWorkerLimitingReasonV1, CodeIndexWorkerSelectionV1, CodeIndexWorkerStatusV1,
@@ -184,8 +181,11 @@ impl InstalledCodeIndexWorkerRuntimeV1 {
         }
     }
 
-    /// Run a fan-out on the pool, yielding this thread's permits while it
-    /// waits so admitted units inside the fan-out can use them.
+    /// Run a fan-out on the pool.
+    ///
+    /// This is the pool boundary: the caller is not a leaf waiting on stolen
+    /// children. Yielding here moves the caller's units to the leaves for the
+    /// join. A leaf that already holds a permit must not start another join.
     fn install<R, F>(&self, operation: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -547,14 +547,23 @@ impl fmt::Display for CodeIndexParallelismErrorV1 {
 
 impl std::error::Error for CodeIndexParallelismErrorV1 {}
 
-/// 0 means "use the configured host width".
-static FORCED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Test-only worker width. Thread-scoped so one equivalence or batching
+    /// test cannot change a sibling test's scheduling policy.
+    static FORCED_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Test-only: force [`install`] on this thread to return
+    /// [`CodeIndexParallelismErrorV1::PoolBuild`]. Thread-scoped so a fault
+    /// test cannot leak into sibling tests running in the same process.
+    /// Visible to integration tests; production callers leave it false.
+    static FORCE_INSTALL_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Indexing width callers should fan out to. A width below 2 means "run
 /// inline".
 #[must_use]
 pub fn indexing_workers() -> usize {
-    match FORCED_WORKERS.load(Ordering::Relaxed) {
+    match FORCED_WORKERS.with(std::cell::Cell::get) {
         0 => WORKER_RUNTIME.get().map_or_else(
             || indexing_worker_target(detected_cores()),
             |runtime| runtime.plan.effective_workers,
@@ -572,13 +581,20 @@ pub fn indexing_workers() -> usize {
 /// comes from [`indexing_workers`].
 #[doc(hidden)]
 pub fn force_indexing_workers_for_test(workers: usize) {
-    FORCED_WORKERS.store(workers.max(1), Ordering::Relaxed);
+    FORCED_WORKERS.with(|forced| forced.set(workers.max(1)));
 }
 
 /// Restore production sizing after [`force_indexing_workers_for_test`].
 #[doc(hidden)]
 pub fn clear_forced_indexing_workers_for_test() {
-    FORCED_WORKERS.store(0, Ordering::Relaxed);
+    FORCED_WORKERS.with(|forced| forced.set(0));
+}
+
+/// Force [`install`] to fail so callers can assert operational pool errors stay
+/// typed as parallelism failures instead of identity corruption.
+#[doc(hidden)]
+pub fn force_install_failure_for_test(force: bool) {
+    FORCE_INSTALL_FAILURE.with(|flag| flag.set(force));
 }
 
 /// Run one active work unit under the installed worker runtime's background
@@ -601,6 +617,10 @@ pub fn with_background_cpu_permit<R>(operation: impl FnOnce() -> R) -> R {
 /// CPU admission happens inside each active parallel work unit through
 /// [`with_background_cpu_permit`] or [`with_background_cpu_permits`], allowing
 /// indexing, semantic inference, and session preparation to share idle width.
+/// [`install`] yields the caller's units for this join only. A leaf that
+/// already holds a permit must not start another pool join: returning that
+/// unit around a nested join is what assigned the same parent the CPU role on
+/// every batch, and the wrap was dropped by merge more than once.
 /// A standalone caller without registration shares one process-wide automatic
 /// pool. Building one all-core pool per request oversubscribes concurrent
 /// tests and profiling harnesses, which can turn bounded parser work into
@@ -612,6 +632,11 @@ where
     R: Send,
 {
     hotpath::gauge!("code_index_worker_count").set(indexing_workers());
+    if FORCE_INSTALL_FAILURE.with(std::cell::Cell::get) {
+        return Err(CodeIndexParallelismErrorV1::PoolBuild {
+            message: "forced code-index worker pool failure for test".to_owned(),
+        });
+    }
     if let Some(runtime) = WORKER_RUNTIME.get() {
         return Ok(runtime.install(operation));
     }

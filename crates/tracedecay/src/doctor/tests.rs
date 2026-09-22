@@ -410,15 +410,14 @@ fn doctor_result_treats_unavailable_canonical_report_as_unknown() {
     .unwrap();
 }
 
+/// The canonical, plainly spelled identity of a fixture path.
+///
+/// Canonicalizing on every host is what keeps the fixture and the production
+/// resolver naming one directory; spelling the result plainly is what lets it
+/// still be handed to `git`, which refuses the `\\?\` form `canonicalize`
+/// returns on Windows.
 fn canonical_temp_path(path: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        path.to_path_buf()
-    }
-    #[cfg(not(windows))]
-    {
-        path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-    }
+    tracedecay_runtime_core::path_safety::canonical_root_identity(path)
 }
 
 #[tokio::test]
@@ -431,7 +430,9 @@ async fn store_layout_resolution_surfaces_split_identity_conflict()
     let project_root = canonical_temp_path(&project_root);
     let status = std::process::Command::new("git")
         .args(["init", "--quiet"])
-        .current_dir(&project_root)
+        .current_dir(tracedecay_runtime_core::path_safety::plain_host_path(
+            &project_root,
+        ))
         .status()?;
     assert!(status.success());
 
@@ -495,15 +496,18 @@ async fn store_layout_resolution_surfaces_split_identity_conflict()
 #[test]
 fn doctor_warns_for_intentionally_held_service_states_without_activation_advice() {
     use super::{DaemonServiceDoctorVerdict, daemon_service_doctor_verdict};
-    use tracedecay_daemon_control::DaemonServiceState;
+    use tracedecay_daemon_control::{DaemonProcessProofV1, DaemonServiceState};
 
+    let unproven = DaemonProcessProofV1::Unproven {
+        detail: "not probed".to_owned(),
+    };
     for state in [
         DaemonServiceState::StoppedEnabled,
         DaemonServiceState::StoppedDisabled,
         DaemonServiceState::Masked,
     ] {
         assert_eq!(
-            daemon_service_doctor_verdict(state),
+            daemon_service_doctor_verdict(state, &unproven),
             DaemonServiceDoctorVerdict::Warn,
             "{state:?} may be an intentional hold and must be a Doctor warning"
         );
@@ -532,20 +536,41 @@ fn doctor_warns_for_intentionally_held_service_states_without_activation_advice(
 
 #[test]
 fn doctor_warns_on_missing_or_running_disabled_units() {
-    use super::{DaemonServiceDoctorVerdict, daemon_service_doctor_verdict};
-    use tracedecay_daemon_control::DaemonServiceState;
+    use super::{
+        DaemonServiceDoctorVerdict, daemon_service_doctor_message, daemon_service_doctor_verdict,
+    };
+    use tracedecay_daemon_control::{DaemonProcessProofV1, DaemonServiceState};
 
+    let unproven = DaemonProcessProofV1::Unproven {
+        detail: "initialize timed out".to_owned(),
+    };
+    let ready = DaemonProcessProofV1::Ready;
     assert_eq!(
-        daemon_service_doctor_verdict(DaemonServiceState::Missing),
+        daemon_service_doctor_verdict(DaemonServiceState::Missing, &unproven),
         DaemonServiceDoctorVerdict::Warn
     );
     assert_eq!(
-        daemon_service_doctor_verdict(DaemonServiceState::RunningDisabled),
+        daemon_service_doctor_verdict(DaemonServiceState::RunningDisabled, &ready),
         DaemonServiceDoctorVerdict::Warn
     );
     assert_eq!(
-        daemon_service_doctor_verdict(DaemonServiceState::RunningEnabled),
+        daemon_service_doctor_verdict(DaemonServiceState::RunningEnabled, &ready),
         DaemonServiceDoctorVerdict::Pass
+    );
+    assert_eq!(
+        daemon_service_doctor_verdict(DaemonServiceState::RunningEnabled, &unproven),
+        DaemonServiceDoctorVerdict::Warn,
+        "an active unit that did not answer initialize must not pass"
+    );
+    let active_without_process =
+        daemon_service_doctor_message(DaemonServiceState::RunningEnabled, &unproven);
+    assert!(
+        active_without_process.contains("did not answer initialize"),
+        "{active_without_process}"
+    );
+    assert!(
+        !active_without_process.contains("enabled, and running"),
+        "an unproven unit must not be reported as a running daemon: {active_without_process}"
     );
     let missing = DaemonServiceState::Missing.lifecycle_operator_advice();
     assert!(
@@ -556,4 +581,66 @@ fn doctor_warns_on_missing_or_running_disabled_units() {
         missing.contains("only if you want a managed daemon"),
         "missing-unit advice must make installation intentional, got: {missing}"
     );
+}
+
+#[test]
+fn schema_convergence_severity_tracks_typed_state() {
+    for (state, issues, warnings) in [
+        (SchemaConvergenceStateV1::PendingSchemaMigration, 0, 1),
+        (
+            SchemaConvergenceStateV1::ReleasedShapeConvergenceInProgress,
+            0,
+            1,
+        ),
+        (SchemaConvergenceStateV1::Degraded, 1, 0),
+        (SchemaConvergenceStateV1::Completed, 0, 0),
+    ] {
+        let status = serde_json::json!({"doctor_report": {"schema_convergences": [{
+            "store": "profile-sessions", "stage": "registered_schema", "state": state,
+            "progress": {"unit": "pages", "done": 4, "remaining": 7},
+            "started_at_micros": 42, "degraded_row": "observation_id=obs-7"
+        }]}});
+        let mut counters = DoctorCounters::new();
+        render_schema_convergences(&mut counters, &status).unwrap();
+        assert_eq!((counters.issues, counters.warnings), (issues, warnings));
+    }
+    assert!(
+        render_schema_convergences(
+            &mut DoctorCounters::new(),
+            &serde_json::json!({"doctor_report": {"schema_convergences": [{}]}})
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn project_open_severity_tracks_typed_state() {
+    for (state, reason, issues, warnings) in [
+        (
+            ProjectOpenStatusStateV1::Completed,
+            ProjectOpenStatusReasonV1::Ready,
+            0,
+            0,
+        ),
+        (
+            ProjectOpenStatusStateV1::Converging,
+            ProjectOpenStatusReasonV1::Converging,
+            0,
+            1,
+        ),
+        (
+            ProjectOpenStatusStateV1::Stalled,
+            ProjectOpenStatusReasonV1::UnrepairableVerdict,
+            1,
+            0,
+        ),
+    ] {
+        let status = serde_json::json!({"project_open": {
+            "state": state, "reason": reason, "retry_after_ms": null,
+            "detail": "project authority verdict"
+        }});
+        let mut counters = DoctorCounters::new();
+        render_project_open_status(&mut counters, &status).unwrap();
+        assert_eq!((counters.issues, counters.warnings), (issues, warnings));
+    }
 }

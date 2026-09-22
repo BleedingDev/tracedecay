@@ -487,10 +487,18 @@ function memoryEntities(): Record<string, unknown>[] {
   }));
 }
 
-function memoryPayload(query = ''): Record<string, unknown> {
-  const facts = memoryFacts();
-  const entities = memoryEntities();
-  const graphNodes = facts.map((fact) => ({
+/**
+ * The verified memory topology the overview serves beside its fact rows
+ * (memory_service/graph.rs `graph_payload`): fact roots, the entity nodes
+ * they mention, and typed fact-to-fact relations. Wired deterministically off
+ * the fixture indices so the constellation draws the same picture every run:
+ * each fact mentions one entity (its index modulo the entity list), every
+ * third fact supports the next, one pair contradicts, one supersedes, and one
+ * edge names a root this bounded slice did not include — the dangling case
+ * the drawing must count rather than draw.
+ */
+function memoryGraph(facts: ReturnType<typeof memoryFacts>): Record<string, unknown> {
+  const factNodes = facts.map((fact) => ({
     id: `fact:${fact.fact_id}`,
     kind: 'fact',
     label: fact.content,
@@ -503,6 +511,59 @@ function memoryPayload(query = ''): Record<string, unknown> {
     retrieval_count: fact.retrieval_count,
     helpful_count: fact.helpful_count,
   }));
+  const entityNodes = ENTITY_NAMES.map(([name]) => ({
+    id: `entity:${name}`,
+    kind: 'entity',
+    entity_id: name,
+    label: name,
+  }));
+  const edges: Record<string, unknown>[] = [];
+  facts.forEach((fact, index) => {
+    const entity = ENTITY_NAMES[index % ENTITY_NAMES.length]![0];
+    edges.push({ kind: 'mentions', source: `fact:${fact.fact_id}`, target: `entity:${entity}` });
+    if (index % 3 === 0 && index + 1 < facts.length) {
+      edges.push({
+        kind: 'supports',
+        source: `fact:${fact.fact_id}`,
+        target: `fact:${facts[index + 1]!.fact_id}`,
+      });
+    }
+  });
+  edges.push({ kind: 'contradicts', source: `fact:${facts[6]!.fact_id}`, target: `fact:${facts[7]!.fact_id}` });
+  edges.push({ kind: 'supersedes', source: `fact:${facts[1]!.fact_id}`, target: `fact:${facts[12]!.fact_id}` });
+  edges.push({ kind: 'derived_from', source: `fact:${facts[4]!.fact_id}`, target: `fact:${facts[9]!.fact_id}` });
+  edges.push({
+    kind: 'mentions',
+    source: `fact:fact.${'a'.repeat(64)}.${'f'.repeat(64)}`,
+    target: `entity:${ENTITY_NAMES[0]![0]}`,
+  });
+  return {
+    nodes: [...factNodes, ...entityNodes],
+    edges,
+    coverage: {
+      completeness: 'unknown',
+      eligible: null,
+      examined: null,
+      matched: null,
+      excluded: null,
+      omitted: null,
+      unknown: null,
+      denominator: null,
+      unit: null,
+      omission_reasons: ['fact_universe_bounded'],
+    },
+    fact_universe_count: 4128,
+    fact_candidates_examined: facts.length,
+    unavailable_fact_candidates: 0,
+    root_count: facts.length,
+    relation_limit: 100,
+    relation_count: edges.length,
+  };
+}
+
+function memoryPayload(query = ''): Record<string, unknown> {
+  const facts = memoryFacts();
+  const entities = memoryEntities();
   return {
     providers: {
       memory_provider: 'tracedecay',
@@ -541,34 +602,15 @@ function memoryPayload(query = ''): Record<string, unknown> {
       },
       facts,
       entities,
-      graph: {
-        nodes: graphNodes,
-        edges: [],
-        coverage: {
-          completeness: 'unknown',
-          eligible: null,
-          examined: null,
-          matched: null,
-          excluded: null,
-          omitted: null,
-          unknown: null,
-          denominator: null,
-          unit: null,
-          omission_reasons: ['fact_universe_bounded'],
-        },
-        fact_universe_count: 4128,
-        fact_candidates_examined: facts.length,
-        unavailable_fact_candidates: 0,
-        root_count: facts.length,
-        relation_limit: 100,
-        relation_count: 0,
-      },
+      graph: memoryGraph(facts),
       // Per-read outcome, seeded `pending` and overwritten as each of the three
-      // reads lands (memory_api.rs::overview). All three succeeded here.
+      // reads lands (memory_api.rs::overview). Facts and entities landed
+      // whole; the graph landed bounded, which `graph_read_status` reports as
+      // `partial` with its code.
       reads: {
         facts: { state: 'ready' },
         entities: { state: 'ready' },
-        graph: { state: 'ready' },
+        graph: { state: 'partial', code: 'graph_coverage_incomplete' },
       },
       // The fixture carries only a bounded projection of the eligible facts,
       // so the current coverage contract reports that partial observation.
@@ -580,6 +622,90 @@ function memoryPayload(query = ''): Record<string, unknown> {
       },
       error: '',
     },
+  };
+}
+
+/**
+ * `GET /api/plugins/holographic/fact/{id}` (memory_api.rs `fact_detail`): the
+ * complete canonical row plus its linked entities, for a fact this fixture
+ * store holds; `complete_zero_findings` with a null payload for one it does
+ * not, which is the envelope the daemon answers for an unknown identity.
+ */
+function memoryFactDetailEnvelope(factId: string): Record<string, unknown> {
+  const facts = memoryFacts();
+  const index = facts.findIndex((fact) => fact.fact_id === factId);
+  const fact = facts[index];
+  if (fact === undefined) {
+    return {
+      ...envelope(null, 'complete_zero_findings', []),
+      coverage: {
+        completeness: 'complete',
+        eligible: 1,
+        examined: 1,
+        matched: 0,
+        excluded: 0,
+        omitted: 0,
+        unknown: 0,
+        denominator: 1,
+        unit: 'facts',
+        omission_reasons: [],
+      },
+    };
+  }
+  const [entityName, entityFacts] = ENTITY_NAMES[index % ENTITY_NAMES.length]!;
+  return envelope({
+    fact: {
+      ...fact,
+      // The list route truncates content to 200 characters; the detail route
+      // carries the whole row, which for this fixture is the same sentence
+      // plus the provenance the summary never attaches.
+      linked_entities: [{ entity_id: entityName, name: entityName, fact_count: entityFacts }],
+      metadata: { recorded_by: 'story-fixture', session: `sess-${index.toString(16).padStart(4, '0')}` },
+    },
+    error: '',
+  });
+}
+
+/**
+ * `GET /api/plugins/holographic/fact/{id}/trust-history` (memory_api.rs
+ * `fact_trust_history`): bare JSON, newest last. Enough events to draw a
+ * trace, with one detail withheld and one whose availability was never
+ * recorded, so both supplied-backend chip states are reachable in the audit.
+ */
+function memoryTrustHistoryPayload(factId: string): Record<string, unknown> {
+  const facts = memoryFacts();
+  const index = facts.findIndex((fact) => fact.fact_id === factId);
+  if (index < 0) {
+    return { fact_id: factId, trust_history: [], limit: 300, completeness: 'complete', next_after: null, error: '' };
+  }
+  const closing = facts[index]!.trust_score;
+  const steps = [0.12, -0.05, 0.09, 0.07, -0.03, 0.06];
+  const opening = Math.max(0.05, closing - steps.reduce((sum, step) => sum + step, 0));
+  let trust = opening;
+  const events = steps.map((step, position) => {
+    const oldTrust = trust;
+    trust = Math.max(0, Math.min(1, trust + step));
+    const availability = position === 2 ? 'redacted' : position === 4 ? 'unknown' : 'available';
+    return {
+      event_id: `event-${index}-${position}`,
+      timestamp: nowMicros - (steps.length - position) * 3 * DAY * 1_000_000,
+      action: step >= 0 ? 'helpful' : 'unhelpful',
+      old_trust: oldTrust,
+      new_trust: trust,
+      delta: trust - oldTrust,
+      details_availability: availability,
+      ...(availability === 'available'
+        ? { source: position % 2 === 0 ? 'codex' : 'claude-code', note: 'confirmed against the running daemon' }
+        : {}),
+    };
+  });
+  return {
+    fact_id: factId,
+    trust_history: events,
+    limit: 300,
+    completeness: 'complete',
+    next_after: null,
+    error: '',
   };
 }
 
@@ -1417,7 +1543,9 @@ function savingsPayload(): Record<string, unknown> {
     },
     provider_usage: {
       available: true,
-      status: null,
+      // `savings_api::provider_usage_overview` always names the aggregate's
+      // coverage; a priced complete total is only served with `complete`.
+      status: 'complete',
       error: null,
       usage_event_count: 57_704,
       total_cost_usd: 8148.9744974,
@@ -1432,6 +1560,240 @@ function savingsPayload(): Record<string, unknown> {
       model_count: 214,
     },
     costs: costsReadModel(),
+  };
+}
+
+/* ==========================================================================
+ * /api/plugins/savings/models?range= (savings_api.rs::models). Consumed by
+ * CostsPage (SavingsModelsPayloadV1Schema) for provider spend attribution.
+ *
+ * The pricing classes are the point of this fixture. On a real profile the
+ * bundled table prices the Anthropic and OpenAI models exactly, leaves one
+ * Codex model slug it has never heard of unpriced, and cannot price Cursor
+ * usage at all — Cursor observations name no model. So the four providers
+ * below are one fully priced, one partially priced, one unpriced with null
+ * identity, and one priced provider that only appears in the long range,
+ * which is the combination every Costs plate has to keep apart.
+ * ========================================================================== */
+
+interface SavingsProviderSeed {
+  provider: string;
+  /** `[model, priced-per-event dollars or null, events per day]`. */
+  models: ReadonlyArray<readonly [string | null, number | null, number]>;
+  sessions: number;
+  /** First day (inclusive, counting back from today) this provider appears. */
+  firstDayBack: number;
+  /** Events with no native timestamp, attributed but not dated. */
+  undated: number;
+}
+
+const SAVINGS_PROVIDER_SEEDS: readonly SavingsProviderSeed[] = [
+  {
+    provider: 'claude',
+    models: [
+      ['claude-opus-4.6', 0.412, 148],
+      ['claude-sonnet-4.5', 0.061, 402],
+      ['claude-haiku-4.5', 0.004, 96],
+    ],
+    sessions: 1_842,
+    firstDayBack: 120,
+    undated: 0,
+  },
+  {
+    provider: 'codex',
+    models: [
+      ['gpt-5.4', 0.187, 121],
+      ['gpt-5.3-codex-high', null, 88],
+    ],
+    sessions: 731,
+    firstDayBack: 120,
+    undated: 14,
+  },
+  {
+    provider: 'cursor',
+    models: [[null, null, 260]],
+    sessions: 3_119,
+    firstDayBack: 120,
+    undated: 3_119,
+  },
+  {
+    provider: 'gemini',
+    models: [['gemini-2.5-pro', 0.094, 33]],
+    sessions: 88,
+    firstDayBack: 120,
+    undated: 0,
+  },
+];
+
+const SAVINGS_RANGE_DAYS: Readonly<Record<string, number>> = {
+  today: 1,
+  '7d': 7,
+  '30d': 30,
+  month: 30,
+  all: 120,
+};
+
+function tokenActual(events: number, seed: number) {
+  return {
+    input_tokens: events * (18_400 + seed * 37),
+    output_tokens: events * (2_150 + seed * 11),
+    cache_read_tokens: events * (91_000 + seed * 101),
+    cache_write_tokens: events * (1_200 + seed * 3),
+  };
+}
+
+/** Day-to-day variation that is deterministic in the day index. */
+function dailyWeight(dayBack: number, provider: number): number {
+  return 0.55 + ((dayBack * 7 + provider * 13) % 10) / 10;
+}
+
+function savingsModelsPayload(range: string): Record<string, unknown> {
+  const days = SAVINGS_RANGE_DAYS[range] ?? SAVINGS_RANGE_DAYS['all']!;
+  const todayStart = nowSecs - (nowSecs % DAY);
+  const since = range === 'all' ? 0 : todayStart - (days - 1) * DAY;
+  const byModel: Record<string, unknown>[] = [];
+  const byProvider: Record<string, unknown>[] = [];
+  const byProviderDay: Record<string, unknown>[] = [];
+  const dayTotals = new Map<number, { events: number; cost: number; complete: boolean; tokens: number }>();
+  let undatedTotal = 0;
+
+  SAVINGS_PROVIDER_SEEDS.forEach((seed, providerIndex) => {
+    const activeDays = Math.min(days, seed.firstDayBack);
+    let providerEvents = 0;
+    let providerPriced = 0;
+    let providerUnpriced = 0;
+    let providerCost = 0;
+    let providerTokens = 0;
+    const actual = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const undated = range === 'all' ? seed.undated : 0;
+
+    seed.models.forEach(([model, perEvent, perDay], modelIndex) => {
+      let events = 0;
+      let cost = 0;
+      for (let dayBack = 0; dayBack < activeDays; dayBack += 1) {
+        const dayEvents = Math.round(perDay * dailyWeight(dayBack, providerIndex));
+        events += dayEvents;
+        if (perEvent !== null) cost += dayEvents * perEvent;
+      }
+      // Undated events land on the null-identity or first model row.
+      if (modelIndex === 0) events += undated;
+      const tokens = tokenActual(events, providerIndex * 4 + modelIndex);
+      actual.input_tokens += tokens.input_tokens;
+      actual.output_tokens += tokens.output_tokens;
+      actual.cache_read_tokens += tokens.cache_read_tokens;
+      actual.cache_write_tokens += tokens.cache_write_tokens;
+      providerEvents += events;
+      providerTokens += tokens.input_tokens + tokens.output_tokens;
+      if (perEvent === null) providerUnpriced += events;
+      else {
+        providerPriced += events;
+        providerCost += cost;
+      }
+      byModel.push({
+        provider: seed.provider,
+        model,
+        usage_events: events,
+        cost_usd: perEvent === null ? null : cost,
+        total_tokens: tokens.input_tokens + tokens.output_tokens,
+        cost_basis: perEvent === null ? 'provider_reported_unpriced' : 'provider_reported_priced',
+        provider_actual: tokens,
+      });
+    });
+
+    for (let dayBack = 0; dayBack < activeDays; dayBack += 1) {
+      const day = todayStart - dayBack * DAY;
+      let dayEvents = 0;
+      let dayPriced = 0;
+      let dayUnpriced = 0;
+      let dayCost = 0;
+      seed.models.forEach(([, perEvent, perDay]) => {
+        const events = Math.round(perDay * dailyWeight(dayBack, providerIndex));
+        dayEvents += events;
+        if (perEvent === null) dayUnpriced += events;
+        else {
+          dayPriced += events;
+          dayCost += events * perEvent;
+        }
+      });
+      const dayTokens = dayEvents * 20_500;
+      byProviderDay.push({
+        day,
+        provider: seed.provider,
+        usage_events: dayEvents,
+        priced_events: dayPriced,
+        unpriced_events: dayUnpriced,
+        priced_cost_usd: dayPriced > 0 ? dayCost : null,
+        total_cost_usd: dayUnpriced === 0 && dayPriced > 0 ? dayCost : null,
+        total_tokens: dayTokens,
+      });
+      const total = dayTotals.get(day) ?? { events: 0, cost: 0, complete: true, tokens: 0 };
+      total.events += dayEvents;
+      total.cost += dayCost;
+      total.tokens += dayTokens;
+      if (dayUnpriced > 0) total.complete = false;
+      dayTotals.set(day, total);
+    }
+
+    undatedTotal += undated;
+    const pricing =
+      providerUnpriced === 0 && providerEvents > 0
+        ? 'priced'
+        : providerPriced > 0
+          ? 'partial'
+          : 'unpriced';
+    byProvider.push({
+      provider: seed.provider,
+      pricing,
+      usage_events: providerEvents,
+      priced_events: providerPriced,
+      unpriced_events: providerUnpriced,
+      unknown_model_events: seed.models.some(([model]) => model === null) ? providerEvents : 0,
+      undated_events: undated,
+      models: seed.models.length,
+      priced_models: seed.models.filter(([, perEvent]) => perEvent !== null).length,
+      unpriced_models: seed.models.filter(([, perEvent]) => perEvent === null).length,
+      sessions: seed.sessions,
+      priced_cost_usd: providerPriced > 0 ? providerCost : null,
+      total_cost_usd: pricing === 'priced' ? providerCost : null,
+      total_tokens: providerTokens,
+      provider_actual: actual,
+    });
+  });
+
+  byProviderDay.sort((a, b) =>
+    (a['day'] as number) - (b['day'] as number) ||
+    String(a['provider']).localeCompare(String(b['provider'])),
+  );
+
+  return {
+    available: true,
+    status: null,
+    error: null,
+    range,
+    since,
+    // The content-side aggregates are the Sessions workspace's concern; the
+    // Costs plates read the provider-usage block, so the fixture keeps these
+    // present and shaped but does not elaborate them.
+    models: [],
+    daily: [],
+    provider_usage_coverage: 'complete',
+    provider_usage: {
+      available: true,
+      pricing_revision: 'sha256:fixture-pricing',
+      undated_events: undatedTotal,
+      by_model: byModel,
+      by_day: [...dayTotals.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([day, total]) => ({
+          day,
+          usage_events: total.events,
+          cost_usd: total.complete ? total.cost : null,
+          total_tokens: total.tokens,
+          provider_actual: null,
+        })),
+      by_provider: byProvider,
+      by_provider_day: byProviderDay,
+    },
   };
 }
 
@@ -1727,9 +2089,28 @@ function schedulerStatusPayload(): Record<string, unknown> {
     configuration_revision_id: 'configuration.revision.automation.fixture',
     control_path: '/fast/projects/tracedecay/.tracedecay/automation.control.json',
     tasks: [
-      { task: 'memory_curator', due: false, skip_reason: 'cooldown', last_scheduler_run: null },
+      {
+        task: 'memory_curator',
+        due: false,
+        skip_reason: 'scheduler_cooldown_active',
+        // The scheduler attaches its most recent scheduler-triggered ledger
+        // record verbatim; this is the same row the run ledger serves.
+        last_scheduler_run: {
+          schema_version: 2,
+          run_id: 'run-20260805-193042-memory-curator',
+          trigger: 'scheduler',
+          task: 'memory_curator',
+          task_key: 'memory_curator',
+          backend: 'claude',
+          status: 'succeeded',
+          accepted_count: 4,
+          rejected_count: 2,
+          started_at: String(nowSecs - 2 * DAY),
+          completed_at: String(nowSecs - 2 * DAY + 240),
+        },
+      },
       { task: 'session_reflector', due: true, skip_reason: null, last_scheduler_run: null },
-      { task: 'skill_writer', due: false, skip_reason: 'no_new_sessions', last_scheduler_run: null },
+      { task: 'skill_writer', due: false, skip_reason: 'no_new_session_activity', last_scheduler_run: null },
     ],
   };
 }
@@ -1752,8 +2133,9 @@ function jobsPayload(): Record<string, unknown> {
     ...job,
     prompt: `Run the ${job['name']} automation task.`,
     cooldown_secs: 1800,
-    skill_ids: [],
-    delivery: { kind: 'none' },
+    skill_ids: job['id'] === 'nightly-health' ? ['code-slop-cleanup'] : [],
+    // `JobDelivery` is `#[serde(tag = "mode")]`: `file` or `webhook`.
+    delivery: { mode: 'file' },
     created_at: nowSecs - 30 * DAY,
     updated_at: nowSecs - 2 * DAY,
   }));
@@ -1766,8 +2148,29 @@ function jobsPayload(): Record<string, unknown> {
 function automationRunsPayload(): Record<string, unknown> {
   const runs = [
     {
+      run_id: 'run-20260806-021500-nightly-health',
+      task: 'user_job',
+      task_key: 'user_job:nightly-health',
+      trigger: 'scheduler',
+      backend: 'codex_app_server',
+      model: 'gpt-5.6',
+      status: 'running',
+      reviewed_count: 0,
+      accepted_count: 0,
+      rejected_count: 0,
+      skipped_count: 0,
+      error: null,
+      error_classification: null,
+      error_retryable: null,
+      backend_attempt_count: 1,
+      started_at: String(nowSecs - 90),
+      completed_at: '',
+      artifact_kinds: [],
+    },
+    {
       run_id: 'run-20260805-193042-memory-curator',
       task: 'memory_curator',
+      task_key: 'memory_curator',
       trigger: 'scheduler',
       backend: 'claude',
       model: 'claude-sonnet-5',
@@ -1777,13 +2180,37 @@ function automationRunsPayload(): Record<string, unknown> {
       rejected_count: 2,
       skipped_count: 0,
       error: null,
+      error_classification: null,
+      error_retryable: null,
+      backend_attempt_count: 1,
       started_at: String(nowSecs - 2 * DAY),
       completed_at: String(nowSecs - 2 * DAY + 240),
       artifact_kinds: ['traces', 'feedback', 'validation_gate'],
     },
     {
+      run_id: 'run-20260805-120000-session-reflector',
+      task: 'session_reflector',
+      task_key: 'session_reflector',
+      trigger: 'scheduler',
+      backend: 'claude',
+      model: 'claude-sonnet-5',
+      status: 'skipped',
+      reviewed_count: 0,
+      accepted_count: 0,
+      rejected_count: 0,
+      skipped_count: 1,
+      error: 'no_new_session_activity',
+      error_classification: null,
+      error_retryable: null,
+      backend_attempt_count: 0,
+      started_at: String(nowSecs - 2 * DAY - 7 * 3600),
+      completed_at: String(nowSecs - 2 * DAY - 7 * 3600),
+      artifact_kinds: [],
+    },
+    {
       run_id: 'run-20260804-071133-skill-writing',
-      task: 'skill_writing',
+      task: 'skill_writer',
+      task_key: 'skill_writer',
       trigger: 'manual_cli',
       backend: 'codex',
       model: null,
@@ -1793,6 +2220,9 @@ function automationRunsPayload(): Record<string, unknown> {
       rejected_count: 0,
       skipped_count: 0,
       error: 'the backend refused the run: model quota exhausted',
+      error_classification: 'retryable',
+      error_retryable: true,
+      backend_attempt_count: 3,
       started_at: String(nowSecs - 3 * DAY),
       completed_at: String(nowSecs - 3 * DAY + 31),
       artifact_kinds: [],
@@ -1913,7 +2343,9 @@ function automaticFactReceiptsPayload(): Record<string, unknown> {
   const receipts = Array.from({ length: 3 }, (_, i) => ({
     schema_version: 1,
     apply_id: `apply-2026-07-${String(20 + i).padStart(2, '0')}-${i}`,
-    run_id: `session-reflector-${i}`,
+    // Two receipts name the memory-curator run the ledger serves, so the run
+    // ledger can file them under it; the third names a run outside the page.
+    run_id: i === 2 ? 'run-20260720-090000-session-reflector' : 'run-20260805-193042-memory-curator',
     state: i === 2 ? 'quarantined' : 'applied',
     add_fact_request: {
       content: FACT_CONTENTS[i % FACT_CONTENTS.length],
@@ -2193,7 +2625,6 @@ const storageTelemetry = envelope({
       // Shared store file: graph + project memory, budget within its soft
       // limit. A dashboard status read does not create a growth baseline.
       store: 'graph.db',
-      role: 'graph',
       roles: ['graph', 'memory'],
       path: '/fast/projects/tracedecay/.tracedecay/graph.db',
       read: {
@@ -2224,7 +2655,6 @@ const storageTelemetry = envelope({
     {
       // Over its owner-configured soft limit, with a real overage.
       store: 'lcm.db',
-      role: 'lcm',
       roles: ['lcm'],
       path: '/home/zack/.tracedecay/lcm.db',
       read: {
@@ -2256,7 +2686,6 @@ const storageTelemetry = envelope({
     {
       // No owner entry: a missing *setting*, never a fabricated pass.
       store: 'savings.db',
-      role: 'savings',
       roles: ['savings'],
       path: '/home/zack/.tracedecay/savings.db',
       read: {
@@ -2283,7 +2712,6 @@ const storageTelemetry = envelope({
       // The configured budget is unreadable, so the budget is unknown — the
       // dashboard never renders that as "within budget".
       store: 'sessions.db',
-      role: 'sessions',
       roles: ['sessions'],
       path: '/home/zack/.tracedecay/sessions.db',
       read: {
@@ -2310,7 +2738,6 @@ const storageTelemetry = envelope({
       // The pragma read failed: sizes stay null and both dimensions are typed
       // unknown rather than collapsing to zero.
       store: 'incident.db',
-      role: 'incident',
       roles: ['incident'],
       path: '/home/zack/.tracedecay/incident.db',
       read: { kind: 'unknown', store: 'incident.db' },
@@ -2846,6 +3273,19 @@ function loomTemporalPayload(): Record<string, unknown> {
     is_subagent: row['is_subagent'],
     edited_files_recorded: i % 3 !== 2,
   }));
+  // Vocabulary is the daemon's own (`git_correlation::{CommitRelation,
+  // CommitEvidence, SpanOverlapKind}`, snake_case on the wire): a produced
+  // commit recorded by its tool result, one seen as HEAD during the session,
+  // and correlations by reflog or time overlap, so the surface exercises every
+  // evidence grade it can print.
+  const COMMIT_EVIDENCE = [
+    ['produced', 'tool_result', 'direct'],
+    ['observed', 'head_observation', 'within_span'],
+    ['produced', 'host_event', 'direct'],
+    ['observed', 'reflog_overlap', 'reflog'],
+    ['observed', 'time_overlap', 'extended_window'],
+    ['produced', 'tool_result', 'within_span'],
+  ] as const;
   const commits = sessions.slice(0, 6).map((session, i) => ({
     session_id: session.session_id,
     provider: session.provider,
@@ -2853,9 +3293,9 @@ function loomTemporalPayload(): Record<string, unknown> {
     committed_at: (session.started_at as number) + 1_800 + i * 240,
     branch: i % 2 === 0 ? 'master' : `feat/branch-${i}`,
     worktree: i % 3 === 0 ? '/fast/projects/tracedecay' : null,
-    relation: i % 2 === 0 ? 'authored_during' : 'observed_near',
-    evidence: 'session_span_overlap',
-    span_overlap_kind: i % 2 === 0 ? 'contained' : 'adjacent',
+    relation: COMMIT_EVIDENCE[i]![0],
+    evidence: COMMIT_EVIDENCE[i]![1],
+    span_overlap_kind: COMMIT_EVIDENCE[i]![2],
     confidence: 0.92 - i * 0.07,
   }));
   const editedFiles = sessions.slice(0, 5).flatMap((session, i) => [
@@ -2892,54 +3332,51 @@ function loomTemporalPayload(): Record<string, unknown> {
     commits,
     edited_files: editedFiles,
     branch_spans: branchSpans,
+    // The three source ids, labels, authorities and granularities the route
+    // emits (`loom_api.rs` `ready_git_status` / the `session_file` status), so
+    // a surface that keys on them finds them.
     source_statuses: [
       {
-        id: 'sessions',
-        label: 'Sessions',
+        id: 'session_commit',
+        label: 'Session ↔ commit',
         state: 'ready',
-        granularity: 'session',
-        authority: 'session_store',
+        granularity: 'commit attribution',
+        authority: 'verified session-git-evidence graph projection',
         required_authority: null,
-        providers: [...LOOM_PROVIDERS],
-        item_count: sessions.length,
-        reason: null,
-        coverage: coverage(sessions.length, sessions.length, 'sessions', 'every eligible session was read'),
-      },
-      {
-        id: 'commits',
-        label: 'Commit attributions',
-        state: 'ready',
-        granularity: 'commit',
-        authority: 'git_watch',
-        required_authority: null,
-        providers: ['codex', 'claude'],
+        providers: ['claude', 'codex', 'cursor'],
         item_count: commits.length,
-        reason: null,
-        coverage: coverage(commits.length, commits.length, 'commits', 'every attributed commit was read'),
+        reason: 'recovered from the verified Git evidence generation gen-42',
+        coverage: coverage(6, sessions.length, 'displayed sessions', 'recovered from the verified Git evidence generation gen-42'),
       },
       {
-        id: 'edited_files',
-        label: 'Edited files',
+        id: 'session_file',
+        label: 'Session → edited file',
         state: 'partial',
-        granularity: 'file',
-        authority: 'session_store',
+        granularity: 'recorded file rollup',
+        authority: 'sessions.metadata_json $.edited_files[]',
         required_authority: null,
-        providers: ['codex'],
+        providers: ['claude', 'codex'],
         item_count: editedFiles.length,
-        reason: 'two providers record no per-file edit evidence',
-        coverage: coverage(editedFiles.length, editedFiles.length + 4, 'files', 'two providers record no per-file edit evidence'),
+        reason:
+          'edited-file coverage is provider-native metadata; sessions without an edited_files array are omitted, never treated as no edits',
+        coverage: coverage(
+          editedFiles.length,
+          sessions.length,
+          'displayed sessions',
+          'only sessions carrying a recorded edited_files array are examined',
+        ),
       },
       {
-        id: 'branch_spans',
-        label: 'Branch spans',
+        id: 'branch_worktree',
+        label: 'Branch & worktree spans',
         state: 'ready',
-        granularity: 'span',
-        authority: 'git_watch',
+        granularity: 'coalesced activity span',
+        authority: 'verified session-git-evidence graph projection',
         required_authority: null,
         providers: [...LOOM_PROVIDERS],
         item_count: branchSpans.length,
-        reason: null,
-        coverage: coverage(branchSpans.length, branchSpans.length, 'spans', 'every recorded span was read'),
+        reason: 'recovered from the verified Git evidence generation gen-42',
+        coverage: coverage(4, sessions.length, 'displayed sessions', 'recovered from the verified Git evidence generation gen-42'),
       },
     ],
     temporal_refresh: {
@@ -2950,6 +3387,51 @@ function loomTemporalPayload(): Record<string, unknown> {
     },
     total: 6_053,
   };
+}
+
+/**
+ * One `limit`/`offset` page of the Loom temporal fixture, with the route's own
+ * coverage arithmetic: `complete` only when offset 0 covers the whole store,
+ * otherwise `partial` with the route's verbatim reason. Relations are cut to
+ * the page's `(provider, session_id)` keys exactly as `read_temporal` does.
+ * The route clamps `limit` to 1..=500 and floors `offset` at 0.
+ */
+function loomTemporalPageEnvelope(rawLimit: string | null, rawOffset: string | null): Record<string, unknown> {
+  const full = loomTemporalPayload();
+  const parsedLimit = Number(rawLimit);
+  const limit = Number.isFinite(parsedLimit) && rawLimit !== null ? Math.min(500, Math.max(1, Math.trunc(parsedLimit))) : 200;
+  const parsedOffset = Number(rawOffset);
+  const offset = Number.isFinite(parsedOffset) && rawOffset !== null ? Math.max(0, Math.trunc(parsedOffset)) : 0;
+  const sessions = (full['sessions'] as Record<string, unknown>[]).slice(offset, offset + limit);
+  const keys = new Set(sessions.map((row) => `${String(row['provider'])}\u0000${String(row['session_id'])}`));
+  const onPage = (record: Record<string, unknown>) =>
+    keys.has(`${String(record['provider'])}\u0000${String(record['session_id'])}`);
+  const total = full['total'] as number;
+  const examined = sessions.length;
+  const complete = offset === 0 && examined === total;
+  const wire = envelope(
+    {
+      ...full,
+      sessions,
+      commits: (full['commits'] as Record<string, unknown>[]).filter(onPage),
+      edited_files: (full['edited_files'] as Record<string, unknown>[]).filter(onPage),
+      branch_spans: (full['branch_spans'] as Record<string, unknown>[]).filter(onPage),
+    },
+    'partial',
+  );
+  wire['coverage'] = {
+    completeness: complete ? 'complete' : 'partial',
+    eligible: total,
+    examined,
+    matched: examined,
+    excluded: 0,
+    omitted: total - examined,
+    unknown: 0,
+    denominator: total,
+    unit: 'sessions',
+    omission_reasons: complete ? [] : ['the requested session page does not cover the full store'],
+  };
+  return wire;
 }
 
 /* ==========================================================================
@@ -3013,6 +3495,198 @@ function deliveryOverviewPayload(): Record<string, unknown> {
     ci_checks: notPublished('ci_provider_read_authority'),
     releases: notPublished('github_read_authority'),
     failure_localization: notPublished('ci_provider_read_authority'),
+  };
+}
+
+/* ==========================================================================
+ * GET /api/delivery/inbox (delivery_api.rs::inbox) — the registry-admitted,
+ * indexed-head-joined pull request inbox across projects. Three registered
+ * projects in three provider states, five admitted PRs, and membership edges
+ * that include the correlating bases the daemon MAY serve (shared Work
+ * objective, session–Git relation, shared agent), so the umbrella field and
+ * the cross-project rail render in the audit. Production inboxes today serve
+ * only the branch reference; the dashboard renders that as "correlation
+ * unavailable" rather than an empty graph.
+ * ========================================================================== */
+
+const INBOX_HEADS = {
+  tracedecay: '7f3a1c9e'.padEnd(40, '4'),
+  rspack: 'b81d2e07'.padEnd(40, '9'),
+  'module-federation': 'c4e9a022'.padEnd(40, '1'),
+} as const;
+
+function inboxProject(
+  projectId: keyof typeof INBOX_HEADS,
+  branch: string,
+  providerState: string,
+): Record<string, unknown> {
+  return {
+    project_id: projectId,
+    label: projectId,
+    project_root: `/fast/projects/${projectId}`,
+    git_common_dir: `/fast/projects/${projectId}/.git`,
+    repository_id: `repository.${projectId}`,
+    worktree_id: `worktree.${projectId}`,
+    branch_ref: `refs/heads/${branch}`,
+    indexed_head_commit_id: INBOX_HEADS[projectId],
+    indexed_generation: `generation.${projectId}.2026-09-16.001`,
+    provider_state: providerState,
+  };
+}
+
+function inboxPullRequest(
+  projectId: keyof typeof INBOX_HEADS,
+  branch: string,
+  number: string,
+  title: string,
+  options: {
+    state?: string;
+    draft?: boolean;
+    prState?: string;
+    attention?: ReadonlyArray<Record<string, unknown>>;
+    sizes?: readonly [number, number, number];
+    fetchedAgoHours?: number;
+  } = {},
+): Record<string, unknown> {
+  const head = INBOX_HEADS[projectId];
+  const [additions, deletions, files] = options.sizes ?? [512, 87, 12];
+  const fetched = nowMicros - (options.fetchedAgoHours ?? 2) * 3_600_000_000;
+  return {
+    id: `${projectId}:github:${number}`,
+    project_id: projectId,
+    repository_id: `repository.${projectId}`,
+    worktree_id: `worktree.${projectId}`,
+    branch_ref: `refs/heads/${branch}`,
+    indexed_head_commit_id: head,
+    indexed_generation: `generation.${projectId}.2026-09-16.001`,
+    state: options.state ?? 'current',
+    pull_request: {
+      id: `github:${number}`,
+      label: `Pull request #${number} — ${title}`,
+      provider: 'github',
+      pull_request_id: number,
+      identity: {
+        title,
+        state: options.prState ?? 'open',
+        draft: options.draft ?? false,
+        additions,
+        deletions,
+        changed_files: files,
+      },
+      operations: ['pull_request', 'reviews', 'review_comments', 'review_threads'].map(
+        (operation) => ({
+          operation,
+          last_complete: {
+            coverage: 'complete',
+            fetched_at_micros: fetched,
+            merge_base_commit_id: '3e6167b2'.padEnd(40, '0'),
+            outcome: options.state === 'stale' ? 'stale' : 'complete',
+            provider_base_commit_id: 'dfc669d9'.padEnd(40, '0'),
+            provider_head_commit_id: head,
+          },
+          latest_attempt: null,
+        }),
+      ),
+    },
+    attention: (options.attention ?? []).map((item, index) => ({
+      id: `${projectId}:${number}:${String(item['source'])}:${index}`,
+      project_id: projectId,
+      pull_request_id: number,
+      state: 'active',
+      coverage: 'complete',
+      observed_at_micros: fetched,
+      ...item,
+    })),
+    shared_code: [
+      {
+        kind: 'shared_code',
+        state: 'requires_selection',
+        href: '/code?view=shared-code',
+        source_generation: `generation.${projectId}.2026-09-16.001`,
+      },
+      {
+        kind: 'compare',
+        state: 'requires_selection',
+        href: '/code?view=compare',
+        source_generation: `generation.${projectId}.2026-09-16.001`,
+      },
+    ],
+  };
+}
+
+function inboxEdge(
+  projectId: keyof typeof INBOX_HEADS,
+  number: string,
+  basis: Record<string, unknown>,
+  index: number,
+): Record<string, unknown> {
+  return {
+    id: `${projectId}:${number}:${String(basis['kind'])}:${index}`,
+    project_id: projectId,
+    pull_request_id: number,
+    basis,
+  };
+}
+
+function deliveryInboxPayload(): Record<string, unknown> {
+  const branchRef = (projectId: keyof typeof INBOX_HEADS, branch: string) => ({
+    kind: 'branch_pull_request_reference',
+    branch_ref: `refs/heads/${branch}`,
+    head_commit_id: INBOX_HEADS[projectId],
+  });
+  return {
+    registry_state: 'ready',
+    projects: [
+      inboxProject('module-federation', 'feat/runtime-plugin-hooks', 'not_published'),
+      inboxProject('rspack', 'perf/persistent-cache-v2', 'stale'),
+      inboxProject('tracedecay', 'codex/tracedecay-total-redesign-plan', 'ready'),
+    ],
+    pull_requests: [
+      inboxPullRequest('rspack', 'perf/persistent-cache-v2', '10337', 'perf: persistent caching v2', {
+        state: 'stale',
+        sizes: [4_812, 1_206, 58],
+        fetchedAgoHours: 9,
+        attention: [
+          { source: 'stale_provider_state', evidence: [{ kind: 'provider_operation', operation: 'pull_request', fetched_at_micros: nowMicros - 9 * 3_600_000_000 }] },
+        ],
+      }),
+      inboxPullRequest('rspack', 'perf/persistent-cache-v2', '10315', 'feat: emit perf graph leak diagnostics', {
+        state: 'stale',
+        sizes: [143, 32, 6],
+        fetchedAgoHours: 9,
+      }),
+      inboxPullRequest('tracedecay', 'codex/tracedecay-total-redesign-plan', '707', 'feat: restore TraceDecay V2 review head', {
+        sizes: [78_341, 21_904, 1_840],
+        attention: [
+          { source: 'unresolved_review', evidence: [{ kind: 'review_comment', comment_id: 'r1234567890', path: 'dashboard/src/workspaces/delivery/DeliveryPage.tsx' }] },
+          { source: 'ci_failure', evidence: [{ kind: 'ci_failure', failure_anchor: 'ci:integration-tests:cargo-test' }] },
+        ],
+      }),
+      inboxPullRequest('tracedecay', 'codex/tracedecay-total-redesign-plan', '694', 'fix: tag jitter on retries', {
+        draft: true,
+        sizes: [76, 12, 3],
+      }),
+      inboxPullRequest('tracedecay', 'codex/tracedecay-total-redesign-plan', '681', 'docs: delivery lookbook authority', {
+        prState: 'merged',
+        sizes: [1_204, 0, 14],
+        fetchedAgoHours: 30,
+      }),
+    ],
+    membership_edges: [
+      inboxEdge('rspack', '10337', branchRef('rspack', 'perf/persistent-cache-v2'), 0),
+      inboxEdge('rspack', '10337', { kind: 'shared_work_objective', work_item_id: 'work.v2-code-intelligence-release' }, 1),
+      inboxEdge('rspack', '10337', { kind: 'shared_agent', agent_id: 'agent.claude-code' }, 2),
+      inboxEdge('rspack', '10315', branchRef('rspack', 'perf/persistent-cache-v2'), 0),
+      inboxEdge('rspack', '10315', { kind: 'shared_agent', agent_id: 'agent.claude-code' }, 1),
+      inboxEdge('tracedecay', '707', branchRef('tracedecay', 'codex/tracedecay-total-redesign-plan'), 0),
+      inboxEdge('tracedecay', '707', { kind: 'shared_work_objective', work_item_id: 'work.v2-code-intelligence-release' }, 1),
+      inboxEdge('tracedecay', '707', { kind: 'session_git_relation', session_id: loomSessionId(0), commit_id: INBOX_HEADS.tracedecay }, 2),
+      inboxEdge('tracedecay', '694', branchRef('tracedecay', 'codex/tracedecay-total-redesign-plan'), 0),
+      inboxEdge('tracedecay', '694', { kind: 'shared_agent', agent_id: 'agent.claude-code' }, 1),
+      inboxEdge('tracedecay', '681', branchRef('tracedecay', 'codex/tracedecay-total-redesign-plan'), 0),
+    ],
+    omitted_projects: 1,
+    excluded_pull_requests: 23,
   };
 }
 
@@ -3297,9 +3971,15 @@ export const FIXTURES: Readonly<Record<string, unknown>> = {
   // Delivery's pipeline overview: local git stages measured, forge-authority
   // stages explicitly not_published.
   '/api/delivery/overview': envelope(deliveryOverviewPayload()),
+  // Delivery's registry-admitted inbox: one omitted project keeps the
+  // envelope honest about partial coverage.
+  '/api/delivery/inbox': envelope(deliveryInboxPayload(), 'partial'),
   // Savings. `sessions` is the Loom weave's thread source, not a costs route.
   '/api/plugins/savings/overview': envelope(savingsPayload()),
   '/api/plugins/savings/sessions': loomSessionsPayload(),
+  // The bare-path entry is the parse gate's; `resolveFixture` answers the
+  // route itself range-by-range above.
+  '/api/plugins/savings/models': savingsModelsPayload('all'),
   // Canonical memory status (memory_api.rs::status) — the scoped Brain's fact and
   // entity readouts. Distinct from the overview payload above.
   '/api/plugins/holographic/status': envelope(memoryStatusPayload()),
@@ -3340,6 +4020,16 @@ export const FIXTURES: Readonly<Record<string, unknown>> = {
   // The Workflows workspace's standing read (`operation.workflow.
   // list_definitions`), through the same application envelope walker.
   '/api/application/workflow/list-definitions': workEnvelope(workflowDefinitionsPayload()),
+  // The selected identity's version track (`operation.workflow.
+  // definition_history`). Fixtures resolve by path alone, so this answers the
+  // `workflow.review-sweep` track whichever identity the page asks for; the
+  // page marks rows naming another identity as ambiguous rather than folding
+  // them in.
+  '/api/application/workflow/definition-history': workEnvelope(workflowHistoryPayload()),
+  // One exact run (`operation.workflow.get_run`) pinned to review-sweep v3,
+  // mid-flight: the journal carries admission and the first two steps so the
+  // lookup renders an elapsed figure, never a duration.
+  '/api/application/workflow/get-run': workEnvelope(workflowRunPayload()),
   // Agents token frontier (`operation.handoff.list_task_handoffs`). Same
   // application envelope as Work/Workflow reads; payload is the generated
   // `ListTaskHandoffsResultV1`.
@@ -3415,6 +4105,117 @@ function workflowDefinitionsPayload(): Record<string, unknown>[] {
       ],
     },
   ];
+}
+
+/** The three immutable versions of `workflow.review-sweep`, ascending. v3 is
+ * the registry's copy; v1 and v2 differ from it in exactly the ways the
+ * version track columns report — v2 re-pinned the policy digest, v3 added the
+ * synthesize step — so the pin-delta cells exercise `first`, `same` and
+ * `changed` in one shot. */
+function workflowHistoryPayload(): Record<string, unknown>[] {
+  const [v3] = workflowDefinitionsPayload();
+  const digest = (label: string): string =>
+    `sha256:${label.padEnd(8, '0')}${'0'.repeat(56)}`.slice(0, 71);
+  const steps = v3!['steps'] as Record<string, unknown>[];
+  const v1 = {
+    ...v3,
+    definition_version: 1,
+    pinned_policy_digest: digest('policy0'),
+    steps: steps.slice(0, 2),
+  };
+  const v2 = { ...v3, definition_version: 2, steps: steps.slice(0, 2) };
+  return [v1, v2, v3!];
+}
+
+/** A `workflow.review-sweep` v3 run mid-flight. Timing is carried entirely by
+ * the journal — admitted, first step started and completed, second step
+ * started — because that is where the page reads it from. */
+function workflowRunPayload(): Record<string, unknown> {
+  const [pinned] = workflowDefinitionsPayload();
+  const digest = (label: string): string =>
+    `sha256:${label.padEnd(8, '0')}${'0'.repeat(56)}`.slice(0, 71);
+  const runId = 'run.review-sweep.2026-07-25T21:07:20Z';
+  const admittedAt = 1_753_477_640_000_000;
+  const placement = (stepId: string) => ({
+    backend: 'codex_cli',
+    configuration_digest: digest('config'),
+    model: 'gpt-5-codex',
+    placement_digest: digest(`place-${stepId}`),
+    provider_registry_digest: digest('provider'),
+    route: { provider_id: 'provider.codex', route_id: 'route.default' },
+    run_id: runId,
+    step_id: stepId,
+    topology_digest: digest('topology'),
+    worktree_placement: { kind: 'repository_local_root' },
+  });
+  const effect = (stepId: string) => ({
+    effect_digest: digest(`effect-${stepId}`),
+    outcome: 'completed',
+    output_set_digest: digest(`outputs-${stepId}`),
+    placement_digest: digest(`place-${stepId}`),
+    receipt_digest: digest(`receipt-${stepId}`),
+    run_id: runId,
+    step_id: stepId,
+  });
+  const event = (sequence: number, offsetMicros: number, kind: Record<string, unknown>) => ({
+    run_id: runId,
+    sequence,
+    command_id: `workflow-command:${sequence}`,
+    input_digest: digest(`input-${sequence}`),
+    occurred_at: admittedAt + offsetMicros,
+    event: kind,
+  });
+  return {
+    run_id: runId,
+    definition: pinned,
+    pinned_topology_digest: digest('topology'),
+    pinned_provider_registry_digest: digest('provider'),
+    status: 'running',
+    sequence: 4,
+    steps: {
+      'collect-diff': {
+        status: 'succeeded',
+        outputs: { diff: { output_name: 'diff', artifacts: [] } },
+        placement_receipt: placement('collect-diff'),
+        effect_receipt: effect('collect-diff'),
+      },
+      'review-fanout': {
+        status: 'running',
+        outputs: {},
+        placement_receipt: placement('review-fanout'),
+        effect_receipt: null,
+      },
+      synthesize: { status: 'blocked', outputs: {}, placement_receipt: null, effect_receipt: null },
+    },
+    fan_out_plans: {},
+    released_fan_out_attempts: [],
+    settled_fan_out_attempts: [],
+    history: [
+      event(1, 0, {
+        type: 'admitted',
+        definition: pinned,
+        pinned_topology_digest: digest('topology'),
+        pinned_provider_registry_digest: digest('provider'),
+        fan_out_plans: [],
+      }),
+      event(2, 12_000_000, {
+        type: 'step_started',
+        step_id: 'collect-diff',
+        placement: placement('collect-diff'),
+      }),
+      event(3, 41_000_000, {
+        type: 'step_completed',
+        step_id: 'collect-diff',
+        outputs: [],
+        effect_receipt: effect('collect-diff'),
+      }),
+      event(4, 47_000_000, {
+        type: 'step_started',
+        step_id: 'review-fanout',
+        placement: placement('review-fanout'),
+      }),
+    ],
+  };
 }
 
 /** Outstanding and dropped tokens for the newest tree session the Agents
@@ -4507,6 +5308,11 @@ export function resolveFixture(pathname: string, search = ''): unknown {
     const nodeId = new URLSearchParams(search).get('node_id');
     return envelope(subgraphPayload(nodeId));
   }
+  // Range-keyed: the daemon attributes the requested window, so the fixture
+  // does too, or the range control would appear to do nothing.
+  if (pathname === '/api/plugins/savings/models') {
+    return savingsModelsPayload(new URLSearchParams(search).get('range') ?? 'all');
+  }
   // Must also precede the prefix sweep: the family read is keyed by match class
   // and cursor, and each class is a separate digest group on the wire.
   if (pathname === '/api/plugins/graph/shared-code/family') {
@@ -4530,6 +5336,23 @@ export function resolveFixture(pathname: string, search = ''): unknown {
     const raw = Number(new URLSearchParams(search).get('limit'));
     const limit = Number.isFinite(raw) && raw > 0 ? Math.min(200, Math.trunc(raw)) : 50;
     return envelope(neighborsPayload(decodeURIComponent(neighbors[1]!), limit));
+  }
+  // Dynamic memory reads, ahead of the `/api/plugins/holographic` prefix: the
+  // prefix serves the OVERVIEW envelope, which the detail and audit schemas
+  // reject, so without these the inspector would be audited against
+  // `unsupported_schema` for every selected fact.
+  const trustHistory = /^\/api\/plugins\/holographic\/fact\/([^/]+)\/trust-history$/.exec(pathname);
+  if (trustHistory) return memoryTrustHistoryPayload(decodeURIComponent(trustHistory[1]!));
+  const factDetail = /^\/api\/plugins\/holographic\/fact\/([^/]+)$/.exec(pathname);
+  if (factDetail) return memoryFactDetailEnvelope(decodeURIComponent(factDetail[1]!));
+  // The Loom temporal read is a real `limit`/`offset` page over the session
+  // store (loom_api.rs `PAGE_CTE`), and the Sessions index pages it. Serving
+  // the whole fixture population for every page would audit a 25-row page
+  // against 34 rows, so the fixture performs the same slice and reports the
+  // same coverage the route does.
+  if (pathname === '/api/loom/temporal') {
+    const params = new URLSearchParams(search);
+    return loomTemporalPageEnvelope(params.get('limit'), params.get('offset'));
   }
   if (pathname in FIXTURES) return FIXTURES[pathname];
   for (const [prefix, payload] of FIXTURE_PREFIXES) {

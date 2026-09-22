@@ -234,7 +234,7 @@ pub struct CodeIndexPublishEvidenceV1 {
     pub file_occurrence_ids: Vec<FileOccurrenceId>,
     pub reextracted_files: usize,
     pub changed_chunks: usize,
-    pub reused_chunks: usize,
+    pub reused_chunks: u64,
     pub clone_payloads_reused: Option<u64>,
     pub clone_stale_invalidations: Option<u64>,
     pub clone_body_changes_observed: Option<bool>,
@@ -1539,29 +1539,34 @@ impl CodeIndexWorktreeSchedulerV1 {
         } else {
             false
         };
-        // A quiet stat sweep is only the negative cache. With the generation
-        // already decoded its sealed file digests settle the question here;
-        // without one the follow-up pass settles it, and this seat never
-        // claims currency either way.
-        let quietly_current = self
-            .retained_frontier_stat_sweep(&pointer)
-            .is_some_and(|sweep| {
-                decoded.as_ref().is_none_or(|generation| {
+        // Equal metadata is not currency. A quiet Noop is only honest when
+        // this pass decoded the generation and re-derived every sealed digest.
+        // Otherwise return None so the caller runs the content proof now;
+        // a later wake is not a substitute, because this empty-slot seat is
+        // the first branch and would keep swallowing the pass.
+        let content_matches = decoded.as_ref().is_some_and(|generation| {
+            self.retained_frontier_stat_sweep(&pointer)
+                .is_some_and(|sweep| {
                     sweep.content_matches(
                         &self.project_root,
                         &SourceContentManifestV1::for_snapshot(generation.snapshot()),
                         &self.shutting_down,
                     )
                 })
-            });
+        });
+        if !retained_empty_seat_settles_source(decoded.is_some(), content_matches) {
+            return Ok(None);
+        }
+        let Some(generation) = decoded else {
+            return Ok(None);
+        };
         let dirty = {
             let hints = self
                 .hints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             hints.overflow || !hints.paths.is_empty() || hints.reconcile_options.is_some()
-        } || configuration_changed
-            || !quietly_current;
+        } || configuration_changed;
         if dirty {
             self.request_background_reconcile();
         }
@@ -1569,13 +1574,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         // `load_active_shared` here parked remount on the publication
         // barrier while activation owned it, so the seated event never
         // published and the dirty successor extract never started.
-        let snapshot_content_identity = if let Some(generation) = decoded {
-            self.adopt_ignored_source_roster(&generation);
-            generation.snapshot().content_identity.clone()
-        } else {
-            ContentDigest::new(pointer.snapshot_content_identity.clone())
-                .map_err(|error| CodeIndexSchedulerErrorV1::Identity(error.to_string()))?
-        };
+        self.adopt_ignored_source_roster(&generation);
+        let snapshot_content_identity = generation.snapshot().content_identity.clone();
         self.latest_content_identity = Some(snapshot_content_identity.clone());
         Ok(Some(CodeIndexReconcileOutcomeV1::Noop(
             CodeIndexNoopEvidenceV1 {
@@ -1756,7 +1756,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 .collect(),
             reextracted_files: 0,
             changed_chunks: changes.added_or_changed.len() + changes.deleted.len(),
-            reused_chunks: changes.reused.len(),
+            reused_chunks: changes.reused_count,
             clone_payloads_reused: Some(clone_payloads_reused),
             clone_stale_invalidations: Some(clone_stale_invalidations),
             clone_body_changes_observed: Some(clone_body_changes_observed),
@@ -2052,7 +2052,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                     .collect(),
                 reextracted_files,
                 changed_chunks: changes.added_or_changed.len() + changes.deleted.len(),
-                reused_chunks: changes.reused.len(),
+                reused_chunks: changes.reused_count,
                 clone_payloads_reused: Some(clone_payloads_reused),
                 clone_stale_invalidations: Some(clone_stale_invalidations),
                 clone_body_changes_observed: Some(clone_body_changes_observed),
@@ -2696,7 +2696,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                         .collect(),
                     reextracted_files,
                     changed_chunks: changes.added_or_changed.len() + changes.deleted.len(),
-                    reused_chunks: changes.reused.len(),
+                    reused_chunks: changes.reused_count,
                     clone_payloads_reused: Some(clone_payloads_reused),
                     clone_stale_invalidations: Some(clone_stale_invalidations),
                     clone_body_changes_observed: Some(clone_body_changes_observed),
@@ -3964,6 +3964,18 @@ fn changed_paths_between_trees(
     (!invalid_path).then_some(paths)
 }
 
+/// A quiet empty-slot seat may end the pass only when the generation was
+/// decoded and its sealed file digests still match the bytes on disk.
+///
+/// Equal stat metadata with no decoded generation is not currency. Callers
+/// that treat `false` as a settled Noop will skip the content proof.
+pub(crate) fn retained_empty_seat_settles_source(
+    generation_decoded: bool,
+    content_matches: bool,
+) -> bool {
+    generation_decoded && content_matches
+}
+
 pub(super) fn cancelled_code_index_reconcile() -> CodeIndexSchedulerErrorV1 {
     CodeIndexProductionErrorV1::Interrupted(
         crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
@@ -3974,5 +3986,21 @@ pub(super) fn cancelled_code_index_reconcile() -> CodeIndexSchedulerErrorV1 {
 impl Drop for CodeIndexWorktreeSchedulerV1 {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod retained_empty_seat_tests {
+    use super::retained_empty_seat_settles_source;
+
+    #[test]
+    fn equal_metadata_without_a_decoded_generation_does_not_settle_the_seat() {
+        assert!(
+            !retained_empty_seat_settles_source(false, true),
+            "a matching stat sweep is not a content proof"
+        );
+        assert!(!retained_empty_seat_settles_source(true, false));
+        assert!(!retained_empty_seat_settles_source(false, false));
+        assert!(retained_empty_seat_settles_source(true, true));
     }
 }

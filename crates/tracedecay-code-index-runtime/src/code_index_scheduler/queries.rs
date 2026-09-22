@@ -1266,8 +1266,6 @@ impl NativeRecordReadPortV1 for LatestCompleteCodeIndexV1 {
                 },
                 |chunk| chunk.anchor.source_span,
             ),
-            start_line_zero_based: lineage.start_line,
-            end_line_zero_based,
             line,
             end_line,
             signature: lineage.signature.clone(),
@@ -1317,8 +1315,6 @@ fn graph_projection_symbol_record(
         kind: metadata.kind,
         path,
         span,
-        start_line_zero_based: metadata.start_line,
-        end_line_zero_based,
         line: metadata
             .start_line
             .checked_add(1)
@@ -1420,8 +1416,6 @@ fn application_symbol_record(record: NativeSymbolRecordV1) -> SymbolPrimitiveRec
         qualified_name: record.qualified_name,
         kind: record.kind,
         file: record.path,
-        start_line_zero_based: record.start_line_zero_based,
-        end_line_zero_based: record.end_line_zero_based,
         line: record.line,
         end_line: record.end_line,
         signature: record.signature,
@@ -2830,28 +2824,30 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let lane_request = LexicalLaneRequest {
                 query_view: &request.query,
                 generation: served_generation.clone(),
-                whole_terms: parts.whole_terms,
-                subtokens: parts.subtokens,
-                phrases: parts.phrases,
-                proximities: Vec::new(),
-                field_filters: request
-                    .field_filters
-                    .iter()
-                    .map(|filter| LexicalFieldFilterV1 {
-                        field: match filter.field {
-                            CodeLexicalField::SymbolName => LexicalFieldV1::SymbolName,
-                            CodeLexicalField::QualifiedName => LexicalFieldV1::QualifiedName,
-                            CodeLexicalField::Path => LexicalFieldV1::Path,
-                            CodeLexicalField::Signature => LexicalFieldV1::Signature,
-                            CodeLexicalField::Documentation => LexicalFieldV1::Documentation,
-                            CodeLexicalField::BodyText => LexicalFieldV1::BodyText,
-                            CodeLexicalField::PreambleText => LexicalFieldV1::PreambleText,
-                            CodeLexicalField::ExactTerm => LexicalFieldV1::ExactTerm,
-                            CodeLexicalField::Subtoken => LexicalFieldV1::Subtoken,
-                        },
-                        include: filter.include,
-                    })
-                    .collect(),
+                whole_terms: std::borrow::Cow::Owned(parts.whole_terms),
+                subtokens: std::borrow::Cow::Owned(parts.subtokens),
+                phrases: std::borrow::Cow::Owned(parts.phrases),
+                proximities: std::borrow::Cow::Owned(Vec::new()),
+                field_filters: std::borrow::Cow::Owned(
+                    request
+                        .field_filters
+                        .iter()
+                        .map(|filter| LexicalFieldFilterV1 {
+                            field: match filter.field {
+                                CodeLexicalField::SymbolName => LexicalFieldV1::SymbolName,
+                                CodeLexicalField::QualifiedName => LexicalFieldV1::QualifiedName,
+                                CodeLexicalField::Path => LexicalFieldV1::Path,
+                                CodeLexicalField::Signature => LexicalFieldV1::Signature,
+                                CodeLexicalField::Documentation => LexicalFieldV1::Documentation,
+                                CodeLexicalField::BodyText => LexicalFieldV1::BodyText,
+                                CodeLexicalField::PreambleText => LexicalFieldV1::PreambleText,
+                                CodeLexicalField::ExactTerm => LexicalFieldV1::ExactTerm,
+                                CodeLexicalField::Subtoken => LexicalFieldV1::Subtoken,
+                            },
+                            include: filter.include,
+                        })
+                        .collect(),
+                ),
                 fuzzy_budget: request.fuzzy_budget,
                 lexical_profile_revision: ComponentRevision::new(
                     tracedecay_query::retrieval::QUERY_LEXICAL_PROFILE_REVISION_V1,

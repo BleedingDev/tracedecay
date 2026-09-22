@@ -83,10 +83,11 @@ impl RemoteBrainTlsConfig {
 mod service;
 
 pub use service::{
-    DaemonServiceSpec, DaemonServiceState, MaintenanceWindowOutcome, QuiescedDaemonLifecycle,
-    SERVICE_NAMESPACE_ENV, ServiceNamespace, daemon_reachable, default_socket_path,
-    install_service, install_service_under_lease, installed_service_socket_path,
-    installed_service_state, prepare_scoop_package_service, quiesce_installed_service_before_lease,
+    DaemonProcessProofV1, DaemonServiceSpec, DaemonServiceState, MaintenanceWindowOutcome,
+    QuiescedDaemonLifecycle, SERVICE_NAMESPACE_ENV, ServiceNamespace, daemon_reachable,
+    default_socket_path, install_service, install_service_under_lease,
+    installed_service_process_proof, installed_service_socket_path, installed_service_state,
+    prepare_scoop_package_service, quiesce_installed_service_before_lease,
     refresh_installed_service_under_lease_with_state,
     refresh_installed_service_under_lease_with_state_for_namespace,
     restore_installed_service_after_update, restore_scoop_package_service, service_namespace,

@@ -464,7 +464,6 @@ impl PartitionedCompactGenerationEvidenceV1 {
             .added_or_changed
             .iter()
             .chain(&changes.deleted)
-            .chain(&changes.reused)
             .map(|change| {
                 (
                     &change.chunk_id,
@@ -2532,8 +2531,13 @@ fn snapshot_file_keys<'a>(
     Ok(keys)
 }
 
-type LexicalSegmentReaderV1 =
-    dyn FnMut(&ManifestDigest, u64, &mut Vec<u8>) -> Result<(), CodeIndexProductionErrorV1> + Send;
+type LexicalSegmentReaderV1 = dyn FnMut(
+        &ManifestDigest,
+        u64,
+        &mut Vec<u8>,
+        &dyn CodeIndexExecutionControlV1,
+    ) -> Result<(), CodeIndexProductionErrorV1>
+    + Send;
 
 pub(super) struct PartitionedLexicalFileSourceV1 {
     generation_id: CodeGenerationId,
@@ -2652,6 +2656,7 @@ impl PartitionedLexicalFileSourceV1 {
                     &descriptor.segment_digest,
                     descriptor.segment_size_bytes,
                     segment,
+                    control,
                 )?;
                 checkpoint(control)
             },
@@ -2740,6 +2745,7 @@ impl<R: Read + Seek> VerifiedSealedLexicalPageSourceV1<R> {
             &ManifestDigest,
             u64,
             &mut Vec<u8>,
+            &dyn CodeIndexExecutionControlV1,
         ) -> Result<(), CodeIndexProductionErrorV1>
         + Send
         + 'static,
@@ -2982,6 +2988,18 @@ impl CodeIndexPublishedGenerationV1 {
     /// once: one reusable segment buffer per indexing worker. Its file
     /// allocation is therefore bounded by this many buffers, each no larger
     /// than the largest file segment it read.
+    ///
+    /// Left at bare `workers` rather than the restore-window multiplier used
+    /// by `fill_admitted_window`/`read_window`
+    /// (`LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1`): this function only
+    /// bounds `decode_partitioned_sealed`'s monolithic in-memory rehydration
+    /// path, which no measured hotpath drives through the drain-window
+    /// fan-out that motivated the multiplier (`index-bench` reaches the
+    /// lazy `VerifiedSealedLexicalPageSourceV1` restore paths, never this
+    /// one). Widening it here would only grow buffer-pool memory without
+    /// cutting any observed `install()` call count, and it would silently
+    /// disable the cross-window buffer-reuse coverage this function's
+    /// callers test against fixed small fixtures.
     #[must_use]
     pub fn partitioned_decode_window_files() -> usize {
         crate::parallelism::indexing_workers().max(1)

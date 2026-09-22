@@ -46,8 +46,8 @@ use tracedecay_memory_provider_registry::{
     PinnedDegradationPolicy, ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition,
     ProviderInvocationBoundaryV1, ProviderInvocationLimitsV1, ProviderWorkV1,
     ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
-    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_PAYLOAD_CONTRACT_ID,
-    RECALL_QUERY_CAPABILITY_ID, RecallAdmissionAuditError, RecallAdmissionObserver,
+    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_QUERY_CAPABILITY_ID,
+    RECALL_RESULT_CONTRACT_ID, RecallAdmissionAuditError, RecallAdmissionObserver,
     RecallAdmissionReport, RecallBudgetsV1,
 };
 
@@ -289,7 +289,7 @@ impl AdversarialPayloadSourceV1 for AdversarialRecallPayloadsV1 {
                 .map_err(|error| error.to_string())?
         };
         let sha256 = sha256_hex(&bytes);
-        let contract_id = OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)
+        let contract_id = OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)
             .map_err(|error| format!("{error:?}"))?;
         CanonicalPayload::new(contract_id, bytes, sha256)
             .map(Some)

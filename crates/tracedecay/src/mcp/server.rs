@@ -13,6 +13,12 @@ use crate::mcp::project_route::{
     HookProjectRouteCache, SharedHookProjectRouteCache, mcp_analytics_session_id,
 };
 use crate::project::TraceDecay;
+pub(crate) use tracedecay_code_index_runtime::code_index_scheduler::{
+    CodeIndexDemandAdmissionV1, CodeIndexDemandUnavailableV1, CodeIndexDemandV1,
+};
+use tracedecay_contracts::code_index_freshness::{
+    CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT, CodeIndexConvergenceParkedV1,
+};
 use tracedecay_contracts::request_identity::McpConnectionIdentityAuthority;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -30,7 +36,7 @@ use tracedecay_session_runtime::session_retrieval::{
     DaemonSessionRetrievalRoot, DaemonSessionRetrievalService, SessionApplicationRetrievalPortV1,
     SessionRetrievalServingIdentityV1, UnavailableSessionApplicationRetrievalV1,
 };
-use tracedecay_sessions::admission::{HostAdmissionOutcome, HostAdmissionStatus};
+use tracedecay_sessions::admission::HostAdmissionOutcome;
 use tracedecay_sessions::runtime::git_correlation::{
     self as git_correlation, DEFAULT_SPAN_MERGE_GAP_SECS, DEFAULT_SPAN_OBSERVATION_DEBOUNCE_SECS,
     SpanObservation, SpanSource,
@@ -117,41 +123,122 @@ impl ServerStats {
     }
 }
 
-/// Admission preserves policy refusal separately from scheduler availability.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CodeIndexAdmission {
-    Accepted,
-    LinkedWorktreeDisabled,
-    Unavailable,
+pub(crate) const CODE_INDEX_LINKED_WORKTREE_DISABLED: &str = "linked_worktree_disabled";
+
+pub(crate) const CODE_INDEX_SCHEDULER_UNAVAILABLE: &str = "code_index_scheduler_unavailable";
+
+pub(crate) const CODE_INDEX_ROUTE_RETIRED: &str = "code_index_route_retired";
+
+pub(crate) const CODE_INDEX_FOREIGN_ROOT: &str = "code_index_foreign_root";
+
+pub(crate) const CODE_INDEX_NO_PROVEN_CHANGE: &str = "code_index_no_proven_change";
+pub(crate) const CODE_INDEX_NOT_APPLICABLE: &str = "code_index_not_applicable";
+pub(crate) const CODE_INDEX_IDENTITY_UNRESOLVED: &str = "code_index_identity_unresolved";
+
+pub(crate) fn code_index_publication_corrupt(
+    parked: CodeIndexConvergenceParkedV1,
+) -> TraceDecayError {
+    TraceDecayError::project_route(
+        CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT,
+        false,
+        format!("{}; {}", parked.reason, parked.remediation),
+    )
 }
 
-impl CodeIndexAdmission {
-    pub(crate) fn host_outcome(self) -> HostAdmissionOutcome {
-        match self {
-            Self::Accepted => HostAdmissionOutcome::replay_completed(true, false),
-            Self::LinkedWorktreeDisabled => {
-                HostAdmissionOutcome::degraded("linked_worktree_disabled")
-            }
-            Self::Unavailable => {
-                HostAdmissionOutcome::retained_unavailable("code_index_scheduler_unavailable")
-            }
+pub(crate) fn code_index_linked_worktree_disabled() -> TraceDecayError {
+    TraceDecayError::project_route(
+        CODE_INDEX_LINKED_WORKTREE_DISABLED,
+        false,
+        "linked worktree indexing is disabled by sync.watch_linked_worktrees",
+    )
+}
+
+/// Wire one typed unavailable cause without collapsing siblings into scheduler
+/// pressure. Only a missing mount invites a retry; foreign-root, retired-route,
+/// and no-proven-change refusals stay non-retryable.
+pub(crate) fn code_index_unavailable_host_outcome(
+    cause: CodeIndexDemandUnavailableV1,
+) -> HostAdmissionOutcome {
+    match cause {
+        CodeIndexDemandUnavailableV1::SchedulerUnmounted => {
+            HostAdmissionOutcome::retained_unavailable(CODE_INDEX_SCHEDULER_UNAVAILABLE)
+        }
+        CodeIndexDemandUnavailableV1::RouteRetired => {
+            HostAdmissionOutcome::terminal_unavailable(CODE_INDEX_ROUTE_RETIRED)
+        }
+        CodeIndexDemandUnavailableV1::ForeignRoot => {
+            HostAdmissionOutcome::terminal_unavailable(CODE_INDEX_FOREIGN_ROOT)
+        }
+        CodeIndexDemandUnavailableV1::NoProvenChange => {
+            HostAdmissionOutcome::terminal_unavailable(CODE_INDEX_NO_PROVEN_CHANGE)
+        }
+        CodeIndexDemandUnavailableV1::IdentityUnresolved => {
+            HostAdmissionOutcome::retained_unavailable(CODE_INDEX_IDENTITY_UNRESOLVED)
         }
     }
 }
 
-impl From<bool> for CodeIndexAdmission {
-    fn from(accepted: bool) -> Self {
-        if accepted {
-            Self::Accepted
-        } else {
-            Self::Unavailable
+pub(crate) fn code_index_unavailable_error(cause: CodeIndexDemandUnavailableV1) -> TraceDecayError {
+    match cause {
+        CodeIndexDemandUnavailableV1::SchedulerUnmounted => TraceDecayError::project_route(
+            CODE_INDEX_SCHEDULER_UNAVAILABLE,
+            true,
+            "code-index scheduler is not mounted for this route",
+        ),
+        CodeIndexDemandUnavailableV1::RouteRetired => TraceDecayError::project_route(
+            CODE_INDEX_ROUTE_RETIRED,
+            false,
+            "code-index route was retired before the demand could be admitted",
+        ),
+        CodeIndexDemandUnavailableV1::ForeignRoot => TraceDecayError::project_route(
+            CODE_INDEX_FOREIGN_ROOT,
+            false,
+            "code-index demand named a root this activation does not own",
+        ),
+        CodeIndexDemandUnavailableV1::NoProvenChange => TraceDecayError::project_route(
+            CODE_INDEX_NO_PROVEN_CHANGE,
+            false,
+            "code-index demand carried no proven change to admit",
+        ),
+        CodeIndexDemandUnavailableV1::IdentityUnresolved => TraceDecayError::project_route(
+            CODE_INDEX_IDENTITY_UNRESOLVED,
+            true,
+            "code-index repository identity could not be decided",
+        ),
+    }
+}
+
+/// Report one code-index demand verdict to the host-admission boundary.
+///
+/// The mapping is the whole reason the verdict is typed: a terminal park is
+/// unavailable and non-retryable, a watcher-policy refusal is a decision (not
+/// pressure), and each unavailable cause keeps its own pinned reason so a
+/// foreign-root or no-proven-change refusal cannot look like scheduler
+/// pressure.
+pub(crate) fn code_index_host_outcome(
+    admission: &CodeIndexDemandAdmissionV1,
+) -> HostAdmissionOutcome {
+    match admission {
+        CodeIndexDemandAdmissionV1::Queued => HostAdmissionOutcome::replay_completed(true, false),
+        CodeIndexDemandAdmissionV1::NotApplicable => {
+            HostAdmissionOutcome::not_applicable(CODE_INDEX_NOT_APPLICABLE)
+        }
+        CodeIndexDemandAdmissionV1::RefusedByPolicy => {
+            HostAdmissionOutcome::degraded(CODE_INDEX_LINKED_WORKTREE_DISABLED)
+        }
+        CodeIndexDemandAdmissionV1::Terminal(_) => {
+            HostAdmissionOutcome::terminal_unavailable(CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT)
+        }
+        CodeIndexDemandAdmissionV1::Unavailable(cause) => {
+            code_index_unavailable_host_outcome(*cause)
         }
     }
 }
 
 /// Future returned by a [`CodeIndexHookSink`] invocation.
-pub(crate) type CodeIndexHookNotifyFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = CodeIndexAdmission> + Send + 'static>>;
+pub(crate) type CodeIndexHookNotifyFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = CodeIndexDemandAdmissionV1> + Send + 'static>,
+>;
 
 /// Type-erased bridge from the MCP hook boundary to the daemon-owned code-index
 /// scheduler registry. The daemon constructs this closing over its cloneable
@@ -162,35 +249,12 @@ pub(crate) type CodeIndexHookNotifyFuture =
 pub(crate) type CodeIndexHookSink =
     Arc<dyn Fn(PathBuf, Vec<String>) -> CodeIndexHookNotifyFuture + Send + Sync + 'static>;
 
-/// Who is asking for a whole-worktree reconciliation through a
-/// [`CodeIndexReconcileSink`].
-///
-/// `sync.watch_linked_worktrees` (default off) decides whether the daemon may
-/// start indexing a linked worktree *on its own*. Everything the daemon does
-/// without an operator naming the route is `Automatic` and stays behind that
-/// gate: host lifecycle hooks (`workspaceOpen`, `sessionStart`, debounced
-/// incremental syncs) and the server's own startup catch-up. Only a
-/// reconciliation the operator asked for by name — `tracedecay init` /
-/// `tracedecay sync` through `tracedecay_admin_sync` — is `Explicit` and may
-/// index a route the watcher policy keeps quiet. A request with folder flags
-/// uses `ExplicitWithOptions`; its options apply to one pass only.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CodeIndexReconcileDemandV1 {
-    Automatic,
-    Explicit,
-    ExplicitWithOptions(tracedecay_contracts::CodeIndexReconcileOptionsV1),
-}
-
 /// Non-blocking bridge for hook/admin requests that require one authoritative
 /// worktree reconciliation but do not carry exact touched paths. A successful
 /// future means the bounded daemon scheduler accepted the overflow signal; it
 /// never means indexing has completed.
-pub(crate) type CodeIndexReconcileSink = Arc<
-    dyn Fn(PathBuf, CodeIndexReconcileDemandV1) -> CodeIndexHookNotifyFuture
-        + Send
-        + Sync
-        + 'static,
->;
+pub(crate) type CodeIndexReconcileSink =
+    Arc<dyn Fn(PathBuf, CodeIndexDemandV1) -> CodeIndexHookNotifyFuture + Send + Sync + 'static>;
 
 /// Non-blocking bridge for ordinary reads to run the scheduler's cheap
 /// Git/stat freshness ladder. A successful future means the mounted scheduler
@@ -282,9 +346,9 @@ pub struct McpServer {
     /// prepares under; daemon-owned servers carry the bootstrap worker plan's.
     background_cpu: Option<Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>>,
     project_session_refresh_wake:
-        Option<Arc<dyn tracedecay_contracts::SessionTemporalRefreshWakePort>>,
+        Option<Arc<dyn tracedecay_sessions::serving::SessionRefreshWorkerPort>>,
     user_session_refresh_wake:
-        Option<Arc<dyn tracedecay_contracts::SessionTemporalRefreshWakePort>>,
+        Option<Arc<dyn tracedecay_sessions::serving::SessionRefreshWorkerPort>>,
     project_session_refresh_service: Option<Arc<dyn SessionRefreshServicePort>>,
     /// Daemon-wide profile session refresh service shared with the projectless
     /// route, so a handle begun on either connection resolves on the other.
@@ -777,7 +841,6 @@ impl McpServer {
             project_session_refresh_wake,
             user_session_refresh_wake,
             profile_session_refresh,
-            project_session_refresh_serving,
             own_project_host_admission_replay,
             startup_catch_up_enabled,
             automation_scheduler_reconciler,
@@ -954,7 +1017,8 @@ impl McpServer {
             .map(|((database, wake), project_id)| {
                 Arc::new(DaemonSessionRefreshService::new(
                     database.clone(),
-                    Arc::clone(wake),
+                    Arc::clone(wake)
+                        as Arc<dyn tracedecay_contracts::SessionTemporalRefreshWakePort>,
                     Some(project_id),
                 )) as Arc<dyn SessionRefreshServicePort>
             });
@@ -967,10 +1031,15 @@ impl McpServer {
             .zip(project_session_retrieval_root.clone())
             .and_then(|(database, root)| {
                 let identity = root.identity().clone();
+                // A direct or core server mounts no project refresh worker;
+                // its retrieval says so instead of serving `RequireFresh`.
                 let service = DaemonSessionRetrievalService::new_with_serving_port(
                     database.clone(),
                     root,
-                    project_session_refresh_serving.clone(),
+                    project_session_refresh_wake.as_ref().map_or_else(
+                        || Arc::new(tracedecay_sessions::serving::RefreshWorkerMissing),
+                        construction::refresh_worker_serving_port,
+                    ),
                 )?;
                 Some(MountedProjectApplicationRetrievalV1 {
                     identity,

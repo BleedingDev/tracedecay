@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::time::Instant;
+use tracedecay_contracts::code_index_freshness::CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT;
 use tracedecay_contracts::code_index_freshness::{
     CodeGraphServingReadinessV1, CodeIndexWorktreeFreshnessV1,
 };
@@ -20,7 +21,7 @@ use tracedecay_runtime_core::cancellation::CancellationToken;
 
 use super::registry::{CodeIndexServingScopeV1, ServingGenerationInstallationV1};
 use super::{
-    CodeIndexPublishedGenerationV1, CodeIndexSchedulerRegistryV1,
+    CodeIndexDemandAdmissionV1, CodeIndexPublishedGenerationV1, CodeIndexSchedulerRegistryV1,
     ServingGenerationInstallationOutcomeV1, ServingGenerationRollbackOutcomeV1,
 };
 
@@ -31,6 +32,34 @@ const GIT_SNAPSHOT_UNAVAILABLE: &str = "git_snapshot_unavailable";
 const BRANCH_TRACKING_FAILED: &str = "branch_tracking_failed";
 const BRANCH_GENERATION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 const BRANCH_GENERATION_HARD_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Immediate refusal for the overflow wake after complete-generation demand.
+///
+/// `request_complete_generation` has already admitted and woken the mounted
+/// worktree. The overflow hint is supplementary, so its `NotApplicable`
+/// disposition does not cancel that admitted generation request.
+pub(super) fn branch_refresh_admission_error(
+    admission: &CodeIndexDemandAdmissionV1,
+    canonical_worktree_root: &Path,
+) -> Option<TraceDecayError> {
+    match admission {
+        CodeIndexDemandAdmissionV1::Queued | CodeIndexDemandAdmissionV1::NotApplicable => None,
+        CodeIndexDemandAdmissionV1::Terminal(parked) => Some(TraceDecayError::project_route(
+            CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT,
+            false,
+            format!("{}; {}", parked.reason, parked.remediation),
+        )),
+        CodeIndexDemandAdmissionV1::RefusedByPolicy
+        | CodeIndexDemandAdmissionV1::Unavailable(_) => Some(TraceDecayError::project_route(
+            CODE_INDEX_SCHEDULER_UNAVAILABLE,
+            true,
+            format!(
+                "code-index scheduler rejected refresh for branch worktree '{}'",
+                canonical_worktree_root.display()
+            ),
+        )),
+    }
+}
 
 fn branch_publication_cancelled_error(branch: &str) -> TraceDecayError {
     TraceDecayError::project_route(
@@ -443,24 +472,27 @@ impl BranchPublicationContextV1 {
                 ),
             ));
         }
-        if !schedulers
+        let admission = schedulers
             .notify_hook_overflow(canonical_worktree_root)
-            .await
-        {
-            return Err(TraceDecayError::project_route(
-                CODE_INDEX_SCHEDULER_UNAVAILABLE,
-                true,
-                format!(
-                    "code-index scheduler rejected refresh for branch worktree '{}'",
-                    canonical_worktree_root.display()
-                ),
-            ));
+            .await;
+        if let Some(error) = branch_refresh_admission_error(&admission, canonical_worktree_root) {
+            return Err(error);
         }
         let hard_deadline = Instant::now() + BRANCH_GENERATION_HARD_TIMEOUT;
         let mut idle_deadline = Instant::now() + BRANCH_GENERATION_IDLE_TIMEOUT;
         loop {
             if cancellation.is_cancelled() {
                 return Err(branch_publication_cancelled_error(&source.reference));
+            }
+            if let Some(parked) = schedulers
+                .publication_authority_corruption(canonical_worktree_root)
+                .await
+            {
+                return Err(TraceDecayError::project_route(
+                    CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT,
+                    false,
+                    format!("{}; {}", parked.reason, parked.remediation),
+                ));
             }
             let scope = schedulers
                 .serving_code_scope(canonical_worktree_root)

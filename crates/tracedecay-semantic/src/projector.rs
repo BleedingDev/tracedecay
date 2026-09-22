@@ -13,7 +13,7 @@ use tracedecay_domain::{
     AdmittedEmbeddingProjectionKeyV1, ChangedCodeChunkSetV1, ChangedCodeChunkV1, CodeGenerationId,
     CodeSearchChunkId, CodeSearchChunkV1, ContentDigest, EmbeddingProjectionKeyV1, ManifestDigest,
     ProjectionBatchReceiptV1, ProjectionBatchRequestV1, ProjectionKeyV1, ProjectionOperationV1,
-    ProjectionOutcomeV1, ProjectionReplayReasonV1,
+    ProjectionOutcomeV1,
 };
 
 use tracedecay_code_index::projection::{
@@ -208,11 +208,11 @@ pub struct PreparedVectorGenerationV1 {
     pub tombstones: Vec<VectorTombstoneV1>,
 }
 
-/// Project one bounded request from canonical chunks. Only
-/// `added_or_changed` chunks are supplied to the encoder. A projection-profile
-/// change also embeds content-identical `reused` chunks into the new profile's
-/// generation. Deleted chunks become tombstones; ordinary reused chunks remain
-/// receipt-only so the store can copy their compatible prior vectors.
+/// Project one bounded request from canonical chunks. Only explicit
+/// `added_or_changed` chunks are supplied to the encoder. Projection-profile
+/// changes arrive pre-expanded with every current chunk in that partition and
+/// an empty reused complement. Deleted chunks become tombstones; ordinary
+/// reused chunks remain authenticated by the compact request seal.
 #[hotpath::measure(label = "semantic.projector.prepare")]
 pub fn prepare_vector_generation<E: CanonicalChunkVectorEncoderV1>(
     admitted_projection: &AdmittedEmbeddingProjectionKeyV1,
@@ -236,22 +236,14 @@ pub fn prepare_vector_generation<E: CanonicalChunkVectorEncoderV1>(
         .map_err(|error| SemanticProjectionErrorV1::Contract(error.to_string()))?;
     let projection_changed =
         request.previous_projection_key.as_ref() != Some(&request.target_projection_key);
-    let reembed_reused = projection_changed
-        && request.replay_reason == ProjectionReplayReasonV1::ProjectionProfileChange;
-    if projection_changed && !request.changes.reused.is_empty() && !reembed_reused {
+    if projection_changed && request.changes.reused_count > 0 {
         return Err(SemanticProjectionErrorV1::KeyReplayRequiresExplicitEmbeds);
     }
 
-    let reembedded_changes = if reembed_reused {
-        request.changes.reused.as_slice()
-    } else {
-        &[]
-    };
     let expected_chunks = request
         .changes
         .added_or_changed
         .iter()
-        .chain(reembedded_changes)
         .map(|change| (change.chunk_id.clone(), change.current_digest.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut chunks = BTreeMap::new();
@@ -281,24 +273,14 @@ pub fn prepare_vector_generation<E: CanonicalChunkVectorEncoderV1>(
         .keys()
         .find(|chunk_id| !chunks.contains_key(*chunk_id))
     {
-        if reembedded_changes
-            .iter()
-            .any(|change| &change.chunk_id == missing)
-        {
-            return Err(SemanticProjectionErrorV1::KeyReplayRequiresExplicitEmbeds);
-        }
         return Err(SemanticProjectionErrorV1::CanonicalChunkSetMismatch(
             missing.clone(),
         ));
     }
 
-    let mut vectors =
-        Vec::with_capacity(request.changes.added_or_changed.len() + reembedded_changes.len());
-    let mut decisions = Vec::with_capacity(
-        request.changes.added_or_changed.len()
-            + request.changes.deleted.len()
-            + request.changes.reused.len(),
-    );
+    let mut vectors = Vec::with_capacity(request.changes.added_or_changed.len());
+    let mut decisions =
+        Vec::with_capacity(request.changes.added_or_changed.len() + request.changes.deleted.len());
     encode_changes_windowed(
         encoder,
         embedding_key,
@@ -351,47 +333,6 @@ pub fn prepare_vector_generation<E: CanonicalChunkVectorEncoderV1>(
             output_digest: None,
         });
     }
-    for change in &request.changes.reused {
-        if reembed_reused {
-            continue;
-        }
-        decisions.push(ChunkProjectionDecisionV1 {
-            chunk_id: change.chunk_id.clone(),
-            prior_chunk_digest: change.prior_digest.clone(),
-            current_chunk_digest: change.current_digest.clone(),
-            operation: ProjectionOperationV1::Reused,
-            outcome: ProjectionOutcomeV1::Reused,
-            output_digest: None,
-        });
-    }
-    encode_changes_windowed(
-        encoder,
-        embedding_key,
-        reembedded_changes,
-        &chunks,
-        |_chunk_id| SemanticProjectionErrorV1::KeyReplayRequiresExplicitEmbeds,
-        |change, chunk, values| {
-            let vector = ProjectedChunkVectorV1::new(
-                target_key.clone(),
-                request.changes.to_generation.clone(),
-                request.changes.manifest_digest.clone(),
-                chunk,
-                values,
-                embedding_key.dimensions,
-            )?;
-            decisions.push(ChunkProjectionDecisionV1 {
-                chunk_id: change.chunk_id.clone(),
-                prior_chunk_digest: change.prior_digest.clone(),
-                current_chunk_digest: change.current_digest.clone(),
-                operation: ProjectionOperationV1::Updated,
-                outcome: ProjectionOutcomeV1::Applied,
-                output_digest: Some(vector.output_digest.clone()),
-            });
-            vectors.push(vector);
-            Ok(())
-        },
-    )?;
-
     let receipt = build_batch_receipt(&request, &decisions)?;
     verify_batch_receipt(&request, &receipt)?;
     Ok(PreparedVectorGenerationV1 {
@@ -447,11 +388,11 @@ enum CanonicalGroupLengthsV1<'a> {
 ///   model sees therefore does not change when a whole request is paged.
 /// - `added_or_changed` is split only between complete groups from its
 ///   already-canonical list, so each batch's partition is canonical too.
-/// - Deletions and ordinary reuse are receipt-only decisions with no encoder
-///   work, so they may fill page capacity without moving an encoder boundary.
-/// - Re-embedded reuse is encoded by its own windowed pass. Profile-change
-///   pages finish the added/deleted lane before beginning that reuse lane, so
-///   no residual added or deleted change can shift a reused encoder group.
+/// - Deletions have no encoder work, so they may fill page capacity without
+///   moving an encoder boundary.
+/// - Compact reuse is retained on exactly one page. Other pages carry the
+///   canonical empty seal, so paging never expands or duplicates unchanged
+///   rows.
 ///
 /// What legitimately does change is execution evidence: the run produces one
 /// receipt per batch instead of one for the corpus, each with its own request
@@ -517,9 +458,7 @@ fn split_request(
     };
     let projection_changed =
         request.previous_projection_key.as_ref() != Some(&request.target_projection_key);
-    let reembed_reused = projection_changed
-        && request.replay_reason == ProjectionReplayReasonV1::ProjectionProfileChange;
-    if projection_changed && !request.changes.reused.is_empty() && !reembed_reused {
+    if projection_changed && request.changes.reused_count > 0 {
         return unsplit();
     }
     let inference_batch_size = admitted_usize(key.inference_batch_size, "inference batch size")?;
@@ -531,8 +470,7 @@ fn split_request(
         .changes
         .added_or_changed
         .len()
-        .saturating_add(request.changes.deleted.len())
-        .saturating_add(request.changes.reused.len());
+        .saturating_add(request.changes.deleted.len());
     if total_changes <= window {
         return unsplit();
     }
@@ -551,63 +489,35 @@ fn split_request(
         Ok(group_lengths) => group_lengths,
         Err(_) => return unsplit(),
     };
-    let reused_groups = if reembed_reused {
-        match canonical_encoder_groups(
-            &request.changes.reused,
-            &chunks_by_id,
-            key,
-            group_lengths(&mut lengths),
-            |_chunk_id| SemanticProjectionErrorV1::KeyReplayRequiresExplicitEmbeds,
-        ) {
-            Ok(group_lengths) => group_lengths,
-            Err(_) => return unsplit(),
-        }
-    } else {
-        Vec::new()
-    };
     let mut deleted = request.changes.deleted.as_slice();
-    let mut reused = request.changes.reused.as_slice();
     let mut next_added_group = 0;
-    let mut next_reused_group = 0;
     let mut batches = Vec::new();
-    while next_added_group < added_groups.len()
-        || !deleted.is_empty()
-        || (reembed_reused && next_reused_group < reused_groups.len())
-        || (!reembed_reused && !reused.is_empty())
-    {
-        // A profile change has two encoder lanes: added/changed chunks and
-        // reembedded reuse. `prepare_vector_generation` encodes those lanes
-        // separately, so co-filling a page with both would create a boundary
-        // the whole request never had. Finish added/deleted pages first; once
-        // they drain, reuse pages retain their full inference groups.
-        let added_or_deleted_pending = next_added_group < added_groups.len() || !deleted.is_empty();
+    let (empty_reused_count, empty_reused_digest) =
+        ChangedCodeChunkSetV1::seal_reused_partition(&[])
+            .map_err(|error| SemanticProjectionErrorV1::Contract(error.to_string()))?;
+    while next_added_group < added_groups.len() || !deleted.is_empty() {
         let mut room = window;
         let mut embeds = take_full_encoder_groups(&added_groups, &mut next_added_group, &mut room);
         embeds.sort_by(|left, right| left.chunk_id.cmp(&right.chunk_id));
         let take_deleted = deleted.len().min(room);
         let page_deleted = &deleted[..take_deleted];
         deleted = &deleted[take_deleted..];
-        room -= take_deleted;
-        let mut page_reused = if reembed_reused {
-            if added_or_deleted_pending {
-                Vec::new()
-            } else {
-                take_full_encoder_groups(&reused_groups, &mut next_reused_group, &mut room)
-            }
+        let (reused_count, reused_digest) = if batches.is_empty() {
+            (
+                request.changes.reused_count,
+                request.changes.reused_digest.clone(),
+            )
         } else {
-            let take_reused = reused.len().min(room);
-            let page_reused = reused[..take_reused].iter().collect::<Vec<_>>();
-            reused = &reused[take_reused..];
-            page_reused
+            (empty_reused_count, empty_reused_digest.clone())
         };
-        page_reused.sort_by(|left, right| left.chunk_id.cmp(&right.chunk_id));
         let mut changes = ChangedCodeChunkSetV1 {
             from_generation: request.changes.from_generation.clone(),
             to_generation: request.changes.to_generation.clone(),
             manifest_digest: request.changes.manifest_digest.clone(),
             added_or_changed: embeds.iter().map(|change| (*change).clone()).collect(),
             deleted: page_deleted.to_vec(),
-            reused: page_reused.iter().map(|change| (*change).clone()).collect(),
+            reused_count,
+            reused_digest,
         };
         changes.manifest_digest = changes
             .compute_digest()
@@ -623,13 +533,10 @@ fn split_request(
             .map_err(|error| SemanticProjectionErrorV1::Contract(error.to_string()))?;
         // The projector rejects a canonical chunk it did not ask for, so each
         // batch carries exactly the chunks its own embeds name.
-        let mut wanted = embeds
+        let wanted = embeds
             .iter()
             .map(|change| &change.chunk_id)
             .collect::<BTreeSet<_>>();
-        if reembed_reused {
-            wanted.extend(page_reused.iter().map(|change| &change.chunk_id));
-        }
         let batch_chunks = wanted
             .into_iter()
             .filter_map(|chunk_id| chunks_by_id.get(chunk_id).map(|chunk| (*chunk).clone()))
@@ -1046,8 +953,8 @@ mod encoder_group_tests {
         EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1, EmbeddingExecutionProviderV1,
         EmbeddingMetricV1, EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1,
         EmbeddingTruncationSideV1, FileOccurrenceId, LanguageDescriptorRevision, ManifestDigest,
-        PolicyRevisionId, PrivacyDomainId, SanitizerRevision, SensitivityDecision,
-        SensitivityLevelV1, SourceSpan,
+        PolicyRevisionId, PrivacyDomainId, ProjectionReplayReasonV1, SanitizerRevision,
+        SensitivityDecision, SensitivityLevelV1, SourceSpan,
     };
 
     const BATCH_SIZE: u32 = 32;
@@ -1198,6 +1105,216 @@ mod encoder_group_tests {
 
     fn group_sizes(chunks: &[Arc<CodeSearchChunkV1>]) -> Vec<usize> {
         encoder_groups(chunks).iter().map(Vec::len).collect()
+    }
+
+    fn content_digest(seed: char) -> ContentDigest {
+        ContentDigest::new(format!("sha256:{}", seed.to_string().repeat(64)))
+            .expect("content digest fixture")
+    }
+
+    fn generation(value: &str) -> CodeGenerationId {
+        CodeGenerationId::new(value.to_owned()).expect("generation fixture")
+    }
+
+    fn request_with(
+        added_or_changed: Vec<ChangedCodeChunkV1>,
+        reused: Vec<(CodeSearchChunkId, ContentDigest)>,
+        previous_projection_key: Option<ProjectionKeyV1>,
+        target_projection_key: ProjectionKeyV1,
+        replay_reason: ProjectionReplayReasonV1,
+    ) -> ProjectionBatchRequestV1 {
+        let (reused_count, reused_digest) =
+            ChangedCodeChunkSetV1::seal_reused_partition(&reused).expect("reused seal fixture");
+        let mut changes = ChangedCodeChunkSetV1 {
+            from_generation: Some(generation("grouping.previous")),
+            to_generation: generation("grouping.generation"),
+            manifest_digest: digest('0'),
+            added_or_changed,
+            deleted: Vec::new(),
+            reused_count,
+            reused_digest,
+        };
+        changes.manifest_digest = changes.compute_digest().expect("changes digest fixture");
+        let mut request = ProjectionBatchRequestV1 {
+            request_digest: digest('0'),
+            changes,
+            previous_projection_key,
+            target_projection_key,
+            replay_reason,
+        };
+        request.request_digest = expected_request_digest(&request).expect("request digest fixture");
+        request
+    }
+
+    #[derive(Default)]
+    struct CountingEncoderV1 {
+        encoded: usize,
+    }
+
+    impl CanonicalChunkTokenLengthsV1 for CountingEncoderV1 {
+        fn document_token_lengths(
+            &mut self,
+            _key: &EmbeddingProjectionKeyV1,
+            chunks: &[&CodeSearchChunkV1],
+        ) -> Result<Vec<usize>, String> {
+            Ok(vec![1; chunks.len()])
+        }
+    }
+
+    impl CanonicalChunkVectorEncoderV1 for CountingEncoderV1 {
+        fn encode(
+            &mut self,
+            key: &EmbeddingProjectionKeyV1,
+            _chunk: &CodeSearchChunkV1,
+        ) -> Result<Vec<f32>, String> {
+            self.encoded += 1;
+            Ok(vec![0.0; key.dimensions as usize])
+        }
+    }
+
+    #[test]
+    fn compact_reuse_only_produces_zero_work_receipt_without_encoding() {
+        let admitted = embedding_key()
+            .admit()
+            .expect("admitted projection fixture");
+        let request = request_with(
+            Vec::new(),
+            vec![(
+                CodeSearchChunkId::new("grouping.chunk.reused").expect("reused chunk fixture"),
+                content_digest('e'),
+            )],
+            Some(admitted.projection_key().clone()),
+            admitted.projection_key().clone(),
+            ProjectionReplayReasonV1::SourceEdit,
+        );
+        let mut encoder = CountingEncoderV1::default();
+
+        let prepared = prepare_vector_generation(&admitted, request, &[], &mut encoder)
+            .expect("compact reuse projection");
+
+        assert_eq!(encoder.encoded, 0);
+        assert!(prepared.vectors.is_empty());
+        assert!(prepared.tombstones.is_empty());
+        assert!(prepared.receipt.receipts.is_empty());
+        assert_eq!(prepared.receipt.reused_count, 1);
+    }
+
+    #[test]
+    fn projection_change_rejects_compact_reuse_before_encoding() {
+        let admitted = embedding_key()
+            .admit()
+            .expect("admitted projection fixture");
+        let mut previous = embedding_key();
+        previous.config_digest = digest('d');
+        let previous = previous.admit().expect("previous projection fixture");
+        let request = request_with(
+            Vec::new(),
+            vec![(
+                CodeSearchChunkId::new("grouping.chunk.reused").expect("reused chunk fixture"),
+                content_digest('e'),
+            )],
+            Some(previous.projection_key().clone()),
+            admitted.projection_key().clone(),
+            ProjectionReplayReasonV1::ProjectionProfileChange,
+        );
+        let mut encoder = CountingEncoderV1::default();
+
+        assert_eq!(
+            prepare_vector_generation(&admitted, request, &[], &mut encoder),
+            Err(SemanticProjectionErrorV1::KeyReplayRequiresExplicitEmbeds)
+        );
+        assert_eq!(encoder.encoded, 0);
+    }
+
+    #[test]
+    fn split_request_preserves_compact_reuse_seal_on_exactly_one_page() {
+        let admitted = embedding_key()
+            .admit()
+            .expect("admitted projection fixture");
+        let chunks = (0..40_u32)
+            .map(|ordinal| chunk(&format!("page{ordinal:03}"), 0))
+            .collect::<Vec<_>>();
+        let changes = chunks
+            .iter()
+            .map(|chunk| ChangedCodeChunkV1 {
+                chunk_id: chunk.id.clone(),
+                prior_digest: None,
+                current_digest: Some(chunk.content_digest.clone()),
+            })
+            .collect::<Vec<_>>();
+        let request = request_with(
+            changes,
+            vec![
+                (
+                    CodeSearchChunkId::new("grouping.chunk.reused.0")
+                        .expect("reused chunk fixture"),
+                    content_digest('e'),
+                ),
+                (
+                    CodeSearchChunkId::new("grouping.chunk.reused.1")
+                        .expect("reused chunk fixture"),
+                    content_digest('f'),
+                ),
+            ],
+            Some(admitted.projection_key().clone()),
+            admitted.projection_key().clone(),
+            ProjectionReplayReasonV1::SourceEdit,
+        );
+        let expected_reused_count = request.changes.reused_count;
+        let expected_reused_digest = request.changes.reused_digest.clone();
+        let (empty_reused_count, empty_reused_digest) =
+            ChangedCodeChunkSetV1::seal_reused_partition(&[]).expect("empty reused seal");
+
+        let pages = split_projection_request(
+            &request,
+            &chunks,
+            BATCH_SIZE as usize,
+            admitted.embedding_key(),
+            &mut WordTokenLengthsV1,
+        )
+        .expect("split projection request");
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages
+                .iter()
+                .filter(|page| page.request.changes.reused_count > 0)
+                .count(),
+            1
+        );
+        assert_eq!(pages[0].request.changes.reused_count, expected_reused_count);
+        assert_eq!(
+            pages[0].request.changes.reused_digest,
+            expected_reused_digest
+        );
+        assert_eq!(pages[1].request.changes.reused_count, empty_reused_count);
+        assert_eq!(pages[1].request.changes.reused_digest, empty_reused_digest);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.request.changes.added_or_changed.len())
+                .sum::<usize>(),
+            chunks.len()
+        );
+        for page in &pages {
+            page.request.changes.validate().expect("valid page changes");
+            assert_eq!(
+                page.request.request_digest,
+                expected_request_digest(&page.request).expect("valid page request")
+            );
+            assert_eq!(
+                page.canonical_chunks
+                    .iter()
+                    .map(|chunk| &chunk.id)
+                    .collect::<BTreeSet<_>>(),
+                page.request
+                    .changes
+                    .added_or_changed
+                    .iter()
+                    .map(|change| &change.chunk_id)
+                    .collect::<BTreeSet<_>>()
+            );
+        }
     }
 
     #[test]

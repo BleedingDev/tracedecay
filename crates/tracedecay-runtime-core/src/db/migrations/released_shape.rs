@@ -1,553 +1,281 @@
-//! The one in-place upgrade path for project stores written by beta.37.
+//! Convergence for a v34-stamped project store whose inventory is free of
+//! retired projections.
 //!
-//! The beta.37 binary stamped its project store `user_version = 34`.  The
-//! current binary creates the v36 shape, so a released store needs a
-//! deliberately bounded bridge.  This module is intentionally separate from
-//! the ordinary exact-shape admission path: the source inventory is checked
-//! against the released fixture before any write is issued, and the whole
-//! bridge runs in one caller-owned transaction.
+//! Every release from v0.1.0-beta.25 through v0.1.0-beta.37 created one
+//! byte-identical `tracedecay.db` stamped `user_version` 34 — the exact SQL
+//! lives in `tests/fixtures/project-store-released-v34.sql`, whose header
+//! carries the tag-to-inventory table. The current contract differs from it in
+//! objects that hold no data of their own (two absent indexes, a renamed
+//! external-source mutation family, the runtime-writer ledger) and in two
+//! diagnostics tables that gained a `publication_revision` column and a wider
+//! primary key. Those differences are convergeable and are converged here.
+//!
+//! Released dense-staging objects remain untouched under exact inventory
+//! admission. Removing dense retrieval must not discard unrelated durable
+//! project data or the historical publication receipts sharing its store.
 
-use std::{collections::BTreeMap, sync::LazyLock};
-
-use crate::db::engine::{Executor, QueryExecutor, params};
-use crate::db::{evidence_assembly, external_source, memory_v2};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
-const OPERATION: &str = "migrate released project schema";
-const RELEASED_V34_STAMP: u32 = 34;
-const RELEASED_V35_STAMP: u32 = 35;
+use crate::db::engine::{Executor, QueryExecutor, params};
 
-/// The complete v35 project-store DDL snapshot. This is an immutable
-/// admission boundary: changes to the current schema installers must never
-/// change which historical store is accepted as v35.
-const RELEASED_V35_PROJECT_STORE_SQL: &str =
-    include_str!("../../../tests/fixtures/project-store-released-v35-semantic.sql");
+const OPERATION: &str = "converge released project schema";
 
-/// v35 was the last pre-v36 shape. A few stores can also carry the shipped
-/// v35 alias trigger, whose broad update guard is admitted as a separate
-/// exact inventory and repaired as part of the same transaction.
-const SHIPPED_V35_ALIAS_UPDATE_TRIGGER: &str = "
-    CREATE TRIGGER retrieval_anchor_aliases_immutable_update
-    BEFORE UPDATE ON retrieval_anchor_aliases BEGIN
-        SELECT RAISE(ABORT, 'retrieval anchor aliases are immutable');
-    END;
-";
-
-/// The payload-digest objects that were introduced by the known v35 step.
-/// Keeping this copy next to the source-shape fixture makes the accepted v35
-/// inventory explicit.  The current memory schema installs the same DDL.
-const PAYLOAD_DIGESTS_SCHEMA: &str =
-    "CREATE TABLE IF NOT EXISTS memory_v2_assertion_payload_digests (
-            payload_rowid INTEGER PRIMARY KEY,
-            assertion_id TEXT NOT NULL,
-            fact_id TEXT NOT NULL,
-            owner_kind TEXT NOT NULL,
-            project_id TEXT NOT NULL,
-            content_digest TEXT NOT NULL CHECK(
-                length(content_digest) = 71 AND content_digest LIKE 'sha256:%'
-            ),
-            UNIQUE(assertion_id, fact_id, owner_kind, project_id),
-            FOREIGN KEY(payload_rowid)
-                REFERENCES memory_v2_assertion_payloads(rowid)
-        );
-
-        CREATE INDEX IF NOT EXISTS memory_v2_assertion_payload_digests_lookup
-            ON memory_v2_assertion_payload_digests(
-                owner_kind, project_id, content_digest, fact_id
-            );
-
-        CREATE TRIGGER IF NOT EXISTS memory_v2_assertion_payload_digests_no_update
-        BEFORE UPDATE ON memory_v2_assertion_payload_digests BEGIN
-            SELECT RAISE(ABORT, 'memory_v2 assertion payload digests are immutable');
-        END;
-        CREATE TRIGGER IF NOT EXISTS memory_v2_payloads_digest_delete
-        AFTER DELETE ON memory_v2_assertion_payloads BEGIN
-            DELETE FROM memory_v2_assertion_payload_digests
-            WHERE payload_rowid = OLD.rowid;
-        END;";
-
-/// The semantic-vector staging family was retired in v36. It is a derived
-/// projection with no lossless representation in the final store, so a
-/// released store carrying rows there is unsupported and must be reset rather
-/// than silently deleting durable-looking work.
-const RETIRED_SEMANTIC_TABLES: &[&str] = &[
-    "semantic_vector_stage_chunk_receipts",
-    "semantic_vector_stage_graph_effects",
-    "semantic_vector_stage_batches",
-    "semantic_vector_source_scope_bindings",
-    "semantic_vector_stage_adoption_authority",
-    "semantic_vector_stage_census_authority",
-    "semantic_vector_retirement_cleanup",
-    "semantic_vector_stages",
-];
-
-/// The fixture is assembled from the tagged beta.37 DDL, rather than from
-/// this binary's current schema.  Embedding it in the migration keeps source
-/// admission independent from any future final-shape changes.
-const RELEASED_V34_PROJECT_STORE_SQL: &str =
-    include_str!("../../../tests/fixtures/project-store-released-v34.sql");
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SchemaObject {
-    object_type: String,
-    table: String,
-    sql: String,
+/// One table the released shape carries in a form `SQLite` cannot alter in
+/// place: widening a primary key, adding a `NOT NULL` column with no default,
+/// and relaxing a `CHECK` all require a rebuild.
+///
+/// A table is rebuilt when its stored DDL differs from the one the current
+/// contract expects, so this list needs no record of which release changed
+/// what — [`super::final_shape`] stays the single authority on the expected
+/// shape.
+struct ReleasedTableRebuild {
+    table: &'static str,
+    /// The columns the released table carried, written verbatim into the
+    /// canonical table so the rebuild is a copy rather than a re-derivation.
+    released_columns: &'static str,
+    /// The column the canonical shape added, with the value every released
+    /// row takes. `None` when only a constraint changed.
+    added_column: Option<(&'static str, &'static str)>,
 }
 
-type SchemaInventory = BTreeMap<String, SchemaObject>;
-
-struct ReleasedShapes {
-    v34: SchemaInventory,
-    v35_legacy: SchemaInventory,
-    v35: SchemaInventory,
-    v35_shipped_alias: SchemaInventory,
+/// A canonical DDL batch and every released table it recreates.
+///
+/// The batch owns the table's indexes and triggers too, which the rebuild's
+/// `DROP TABLE` removes, so each group drops all of its tables before
+/// replaying the batch once.
+struct ReleasedRebuildGroup {
+    canonical: &'static str,
+    tables: &'static [ReleasedTableRebuild],
 }
 
-static RELEASED_SHAPES: LazyLock<std::result::Result<ReleasedShapes, String>> =
-    LazyLock::new(build_released_shapes);
+/// Diagnostics rows published before revisions existed are the first revision
+/// of their generation.
+const RELEASED_V34_REBUILDS: &[ReleasedRebuildGroup] = &[ReleasedRebuildGroup {
+    canonical: tracedecay_store::GENERATION_DIAGNOSTICS_SCHEMA_DDL,
+    tables: &[
+        ReleasedTableRebuild {
+            table: "diagnostic_generation_publications",
+            released_columns: "generation_id, record_state, state_generation, published_at",
+            added_column: Some(("publication_revision", "1")),
+        },
+        ReleasedTableRebuild {
+            table: "generation_diagnostics",
+            released_columns: "diagnostic_anchor, generation_id, repository, worktree, \
+                               reference, source_revision, file_occurrence_id, \
+                               content_digest, symbol_occurrence_id, span_start, span_end, \
+                               code, severity, message, message_digest, producer_kind, \
+                               producer, analyzer_revision, configuration_revision, \
+                               sanitization_receipt, evidence_class, collected_at, \
+                               record_state, state_generation, persisted_at",
+            added_column: Some(("publication_revision", "1")),
+        },
+    ],
+}];
 
-fn build_released_shapes() -> std::result::Result<ReleasedShapes, String> {
-    let connection = rusqlite::Connection::open_in_memory()
-        .map_err(|error| format!("failed to open released-shape fixture: {error}"))?;
-    connection
-        .execute_batch(RELEASED_V34_PROJECT_STORE_SQL)
-        .map_err(|error| format!("failed to install released-v34 fixture: {error}"))?;
-    let v34 = read_rusqlite_inventory(&connection)?;
-    connection
-        .execute_batch(PAYLOAD_DIGESTS_SCHEMA)
-        .map_err(|error| format!("failed to install released-v35 payload objects: {error}"))?;
-    let v35_legacy = read_rusqlite_inventory(&connection)?;
-
-    let canonical = rusqlite::Connection::open_in_memory()
-        .map_err(|error| format!("failed to open canonical released-v35 fixture: {error}"))?;
-    canonical
-        .execute_batch(RELEASED_V35_PROJECT_STORE_SQL)
-        .map_err(|error| format!("failed to install released-v35 fixture: {error}"))?;
-    let v35 = read_rusqlite_inventory(&canonical)?;
-    canonical
-        .execute_batch(
-            "DROP TRIGGER retrieval_anchor_aliases_immutable_update;
-             ",
-        )
-        .map_err(|error| format!("failed to prepare shipped-v35 trigger fixture: {error}"))?;
-    canonical
-        .execute_batch(SHIPPED_V35_ALIAS_UPDATE_TRIGGER)
-        .map_err(|error| format!("failed to install shipped-v35 trigger fixture: {error}"))?;
-    let v35_shipped_alias = read_rusqlite_inventory(&canonical)?;
-
-    Ok(ReleasedShapes {
-        v34,
-        v35_legacy,
-        v35,
-        v35_shipped_alias,
-    })
-}
-
-fn failure(message: impl Into<String>) -> TraceDecayError {
+fn failure(message: String) -> TraceDecayError {
     TraceDecayError::Database {
-        message: message.into(),
+        message,
         operation: OPERATION.to_owned(),
     }
 }
 
-fn reset_required(message: impl Into<String>) -> TraceDecayError {
-    TraceDecayError::reset_required(
-        "SQLite store",
-        format!(
-            "{}; run `tracedecay storage reset-project-store` with this store's \
-             `--project-root` or `--project-id`, then let this binary create the exact final shape",
-            message.into()
-        ),
-    )
-}
-
-fn read_rusqlite_inventory(
-    connection: &rusqlite::Connection,
-) -> std::result::Result<SchemaInventory, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT type, name, tbl_name, COALESCE(sql, '')
-             FROM sqlite_master
-             WHERE type IN ('table', 'index', 'trigger', 'view')
-               AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-        )
-        .map_err(|error| format!("failed to prepare released schema inventory: {error}"))?;
-    let rows = statement
-        .query_map((), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|error| format!("failed to query released schema inventory: {error}"))?;
-    let mut inventory = SchemaInventory::new();
-    for row in rows {
-        let (object_type, name, table, sql) =
-            row.map_err(|error| format!("failed to read released schema object: {error}"))?;
-        if inventory
-            .insert(
-                name.clone(),
-                SchemaObject {
-                    object_type,
-                    table,
-                    sql,
-                },
-            )
-            .is_some()
-        {
-            return Err(format!("released schema repeats object '{name}'"));
-        }
-    }
-    Ok(inventory)
-}
-
-async fn read_inventory(conn: &impl QueryExecutor) -> Result<SchemaInventory> {
-    let mut rows = conn
-        .query(
-            "SELECT type, name, tbl_name, COALESCE(sql, '')
-             FROM sqlite_master
-             WHERE type IN ('table', 'index', 'trigger', 'view')
-               AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-            (),
-        )
-        .await
-        .map_err(|error| failure(format!("failed to query source schema inventory: {error}")))?;
-    let mut inventory = SchemaInventory::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| failure(format!("failed to read source schema inventory: {error}")))?
+/// Converges a store stamped with the released version to the shape this
+/// binary creates, carrying every row forward.
+///
+/// A store still carrying a retired projection is refused first, inside the
+/// caller's transaction, so the refusal leaves the store byte-identical.
+/// Runs before the payload-digest step, whose own admission check requires the
+/// current shape everywhere but the digest objects. Idempotent by
+/// construction: the rebuilds are selected by the released column being
+/// absent, the schema installs are `CREATE ... IF NOT EXISTS`, and the row
+/// moves are the same resumable statements the registered stores converge
+/// with.
+pub(super) async fn converge_released_project_schema(conn: &(impl Executor + Sync)) -> Result<()> {
+    super::require_no_retired_sqlite_projection_object(conn).await?;
+    let source_version = super::get_version(conn).await?;
+    if stored_object_sql(conn, "memory_v2_assertion_payload_digests")
+        .await?
+        .is_some()
     {
-        let object_type = row
-            .get::<String>(0)
-            .map_err(|error| failure(format!("failed to decode source object type: {error}")))?;
-        let name = row
-            .get::<String>(1)
-            .map_err(|error| failure(format!("failed to decode source object name: {error}")))?;
-        let table = row
-            .get::<String>(2)
-            .map_err(|error| failure(format!("failed to decode source object table: {error}")))?;
-        let sql = row
-            .get::<String>(3)
-            .map_err(|error| failure(format!("failed to decode source object SQL: {error}")))?;
-        if inventory
-            .insert(
-                name.clone(),
-                SchemaObject {
-                    object_type,
-                    table,
-                    sql,
-                },
-            )
-            .is_some()
-        {
-            return Err(failure(format!("source schema repeats object '{name}'")));
-        }
-    }
-    Ok(inventory)
-}
-
-fn shape_difference(actual: &SchemaInventory, expected: &SchemaInventory) -> Option<String> {
-    for (name, expected_object) in expected {
-        let Some(actual_object) = actual.get(name) else {
-            return Some(format!(
-                "source schema is missing released {} '{name}'",
-                expected_object.object_type
-            ));
-        };
-        if actual_object != expected_object {
-            return Some(format!(
-                "source schema has incompatible released {} '{name}'",
-                expected_object.object_type
-            ));
-        }
-    }
-    actual
-        .iter()
-        .find(|(name, _)| !expected.contains_key(*name))
-        .map(|(name, object)| {
-            format!(
-                "source schema contains unexpected {} '{name}'",
-                object.object_type
-            )
-        })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SourceShape {
-    V34,
-    V35Legacy,
-    V35LegacyWithPayloadDigests,
-    V35Current,
-    V35CurrentShippedAlias,
-}
-
-impl SourceShape {
-    fn has_payload_digests(self) -> bool {
-        matches!(
-            self,
-            Self::V35LegacyWithPayloadDigests | Self::V35Current | Self::V35CurrentShippedAlias
-        )
-    }
-
-    fn uses_legacy_external_copies(self) -> bool {
-        matches!(
-            self,
-            Self::V34 | Self::V35Legacy | Self::V35LegacyWithPayloadDigests
-        )
-    }
-}
-
-/// Checks the exact source inventory before any migration write.
-/// Each accepted inventory maps to a bounded conversion branch; no unknown
-/// drift is repaired by guessing which release produced it.
-pub(super) async fn require_exact_source_shape(
-    conn: &impl QueryExecutor,
-    stamp: u32,
-) -> Result<SourceShape> {
-    let actual = read_inventory(conn).await?;
-    let shapes = RELEASED_SHAPES
-        .as_ref()
-        .map_err(|error| failure(format!("failed to build released source shape: {error}")))?;
-    if stamp == RELEASED_V34_STAMP && actual == shapes.v34 {
-        return Ok(SourceShape::V34);
-    }
-    if stamp == RELEASED_V35_STAMP {
-        if actual == shapes.v35 {
-            return Ok(SourceShape::V35Current);
-        }
-        if actual == shapes.v35_shipped_alias {
-            return Ok(SourceShape::V35CurrentShippedAlias);
-        }
-        // A v35 stamp can be left behind before its first payload object is
-        // created.  It is still the same known released inventory, and the
-        // bridge fills the objects atomically below.
-        if actual == shapes.v35_legacy {
-            return Ok(SourceShape::V35LegacyWithPayloadDigests);
-        }
-        if actual == shapes.v34 {
-            return Ok(SourceShape::V35Legacy);
-        }
-    }
-    let reason = if stamp != RELEASED_V34_STAMP && stamp != RELEASED_V35_STAMP {
-        format!("schema stamp v{stamp} is not a supported released project-store stamp")
-    } else if stamp == RELEASED_V34_STAMP {
-        shape_difference(&actual, &shapes.v34)
-            .unwrap_or_else(|| "source schema does not match the released v34 inventory".into())
-    } else {
-        shape_difference(&actual, &shapes.v35)
-            .or_else(|| shape_difference(&actual, &shapes.v35_shipped_alias))
-            .or_else(|| shape_difference(&actual, &shapes.v35_legacy))
-            .or_else(|| shape_difference(&actual, &shapes.v34))
-            .unwrap_or_else(|| "source schema does not match a released inventory".into())
-    };
-    Err(reset_required(reason))
-}
-
-/// Runs the released-to-v36 conversion. The caller owns the transaction and
-/// rolls it back if any step fails; this function never commits or changes the
-/// schema stamp until the exact final inventory has passed.
-pub(super) async fn migrate_released_project_schema(
-    conn: &(impl Executor + Sync),
-    stamp: u32,
-) -> Result<()> {
-    let source_shape = require_exact_source_shape(conn, stamp).await?;
-    validate_retired_semantic_projection(conn).await?;
-    if source_shape.has_payload_digests() {
         validate_payload_digest_rows(conn).await?;
     }
-    if source_shape.uses_legacy_external_copies() {
+    let has_retired_external_sources = stored_object_sql(conn, "external_source_objects_v1")
+        .await?
+        .is_some();
+    if has_retired_external_sources {
         validate_source_rows(conn).await?;
     }
-
-    execute_batch(conn, "PRAGMA defer_foreign_keys = ON;").await?;
-    if source_shape.uses_legacy_external_copies() {
-        snapshot_diagnostics(conn).await?;
+    if source_version == 35 && !has_retired_external_sources {
+        // This live stamp already has the final relational schema; only the
+        // known alias guard may differ. Do not repair arbitrary v35 drift.
+        super::final_shape::require_exact_final_shape_or_shipped_v35_alias_trigger(conn).await?;
     }
-    if source_shape.uses_legacy_external_copies() {
-        execute_batch(
-            conn,
-            "DROP TRIGGER IF EXISTS retrieval_anchor_aliases_immutable_update;
-             DROP TRIGGER IF EXISTS semantic_vector_replay_stage_identity_guard;
-             DROP TABLE generation_diagnostics;
-             DROP TABLE diagnostic_generation_publications;",
-        )
-        .await?;
-    } else {
-        execute_batch(
-            conn,
-            "DROP TRIGGER IF EXISTS retrieval_anchor_aliases_immutable_update;
-             DROP TRIGGER IF EXISTS semantic_vector_replay_stage_identity_guard;",
-        )
-        .await?;
+    for group in RELEASED_V34_REBUILDS {
+        rebuild_released_group(conn, group).await?;
     }
-
+    // Replaces the released alias-immutability trigger, which guarded every
+    // update instead of only the fields that must not change.
     crate::db::retrieval_anchor_schema::install_retrieval_anchor_schema(conn, OPERATION).await?;
-    memory_v2::create_schema(conn, OPERATION).await?;
-    evidence_assembly::install_evidence_assembly_schema(conn, OPERATION).await?;
-    external_source::install_external_source_schema(conn, OPERATION).await?;
-    execute_batch(conn, tracedecay_store::GENERATION_DIAGNOSTICS_SCHEMA_DDL).await?;
-    execute_batch(
-        conn,
-        tracedecay_rusqlite_runtime::repository::GRAPH_PUBLICATION_SCHEMA_V1,
-    )
-    .await?;
-    execute_batch(
-        conn,
-        tracedecay_rusqlite_runtime::handoff::HANDOFF_OPEN_SCHEMA_V1,
-    )
-    .await?;
-    execute_batch(
-        conn,
-        tracedecay_rusqlite_runtime::runtime_ledger::RUNTIME_LEDGER_SCHEMA,
-    )
-    .await?;
-
-    if source_shape.uses_legacy_external_copies() {
-        restore_diagnostics(conn).await?;
-    }
-    migrate_payload_digests(conn).await?;
-    if source_shape.uses_legacy_external_copies() {
+    crate::db::memory_v2::create_schema(conn, OPERATION).await?;
+    crate::db::external_source::install_external_source_schema(conn, OPERATION).await?;
+    if has_retired_external_sources {
         migrate_external_source(conn).await?;
-        migrate_runtime_ledger(conn).await?;
     }
-    drop_retired_semantic_projection(conn).await?;
-
-    super::final_shape::require_exact_final_shape(conn).await?;
-    super::set_version(conn, super::SCHEMA_VERSION).await
+    super::install_runtime_writer_ledger(conn, OPERATION).await?;
+    if source_version == super::PAYLOAD_DIGEST_STEP_SOURCE_VERSION {
+        super::final_shape::require_final_shape_except_payload_digests(conn).await
+    } else {
+        super::final_shape::require_exact_final_shape(conn).await?;
+        super::set_version(conn, super::SCHEMA_VERSION).await
+    }
 }
 
-/// Refuses rows in the v35 semantic staging projection before any schema or
-/// data mutation. The v36 final shape intentionally has no semantic staging
-/// tables, and no migration can reconstruct their provider/model payloads.
-async fn validate_retired_semantic_projection(conn: &impl QueryExecutor) -> Result<()> {
-    for &table in RETIRED_SEMANTIC_TABLES {
-        let mut rows = conn
-            .query(&format!("SELECT 1 FROM {table} LIMIT 1"), ())
-            .await
-            .map_err(|error| {
-                failure(format!(
-                    "failed to inspect retired semantic table {table}: {error}"
-                ))
-            })?;
-        if rows
-            .next()
-            .await
-            .map_err(|error| {
-                failure(format!(
-                    "failed to inspect retired semantic table {table}: {error}"
-                ))
-            })?
-            .is_some()
-        {
-            return Err(reset_required(format!(
-                "released project store contains rows in retired semantic table '{table}'"
-            )));
-        }
-
-        // AUTOINCREMENT keeps a high-water mark even after all rows are
-        // deleted. That mark is part of the released table's durable identity
-        // allocation, and dropping the retired table would otherwise rewind
-        // it silently. There is no lossless v36 home for it, so refuse the
-        // store before issuing any migration write.
-        let mut sequence_rows = conn
-            .query(
-                "SELECT seq FROM sqlite_sequence WHERE name = ?1",
-                params![table],
-            )
-            .await
-            .map_err(|error| {
-                failure(format!(
-                    "failed to inspect retired semantic sequence {table}: {error}"
-                ))
-            })?;
-        if sequence_rows
-            .next()
-            .await
-            .map_err(|error| {
-                failure(format!(
-                    "failed to inspect retired semantic sequence {table}: {error}"
-                ))
-            })?
-            .is_some()
-        {
-            return Err(reset_required(format!(
-                "released project store contains a retired semantic table '{table}' with a used AUTOINCREMENT sequence"
-            )));
+/// Rebuilds every table in one group whose stored DDL is not the one the
+/// current contract expects.
+///
+/// The released rows are copied aside, the tables dropped with their indexes
+/// and triggers, the canonical batch replayed, and the rows written back
+/// through the canonical column list. A table's own triggers are dropped again
+/// before the rows return: a census trigger that fired per copied row would
+/// count work its authority already records. Replaying the batch afterwards
+/// restores them, which is sound because every statement in these batches
+/// creates its object only if it is absent.
+///
+/// A store this binary created has no pending table and pays one catalog probe
+/// per listed table.
+async fn rebuild_released_group(
+    conn: &(impl Executor + Sync),
+    group: &ReleasedRebuildGroup,
+) -> Result<()> {
+    let mut pending = Vec::new();
+    for rebuild in group.tables {
+        if released_table_pending(conn, rebuild.table).await? {
+            pending.push(rebuild);
         }
     }
-    Ok(())
+    if pending.is_empty() {
+        // Released stores installed diagnostics lazily; both tables may be absent.
+        return batch(conn, group.canonical).await;
+    }
+    let mut triggers = Vec::new();
+    for rebuild in &pending {
+        triggers.extend(table_triggers(conn, rebuild.table).await?);
+    }
+    // Children of a rebuilt table are valid again before this transaction
+    // commits, which is when deferred enforcement checks them.
+    batch(conn, "PRAGMA defer_foreign_keys = ON;").await?;
+    for rebuild in &pending {
+        let scratch = scratch_table(rebuild.table);
+        batch(
+            conn,
+            &format!(
+                "CREATE TABLE {scratch} AS SELECT * FROM {table};
+                 DROP TABLE {table};",
+                table = rebuild.table
+            ),
+        )
+        .await?;
+    }
+    batch(conn, group.canonical).await?;
+    for trigger in &triggers {
+        batch(conn, &format!("DROP TRIGGER IF EXISTS {trigger};")).await?;
+    }
+    for rebuild in &pending {
+        let scratch = scratch_table(rebuild.table);
+        let columns = rebuild.released_columns;
+        let (added, value) = match rebuild.added_column {
+            Some((added, value)) => (format!("{added}, "), format!("{value}, ")),
+            None => (String::new(), String::new()),
+        };
+        batch(
+            conn,
+            &format!(
+                "INSERT INTO {table}({added}{columns})
+                 SELECT {value}{columns} FROM {scratch};
+                 DROP TABLE {scratch};",
+                table = rebuild.table
+            ),
+        )
+        .await?;
+    }
+    batch(conn, group.canonical).await
+}
+
+/// Reports whether a table exists carrying DDL other than the one this binary
+/// creates.
+async fn released_table_pending(conn: &impl QueryExecutor, table: &str) -> Result<bool> {
+    let Some(expected) = super::final_shape::expected_object_sql(table)? else {
+        return Err(failure(format!(
+            "'{table}' is not part of the shape this binary creates"
+        )));
+    };
+    Ok(stored_object_sql(conn, table)
+        .await?
+        .is_some_and(|stored| stored != expected))
+}
+
+/// Names the copy a rebuild reads its released rows out of. The copy lives and
+/// dies inside the caller's transaction, so an interrupted convergence leaves
+/// neither it nor a half-rebuilt table behind.
+fn scratch_table(table: &str) -> String {
+    format!("{table}_released_v34")
+}
+
+async fn batch(conn: &impl Executor, sql: &str) -> Result<()> {
+    conn.execute_batch(sql)
+        .await
+        .map_err(|error| failure(format!("failed to converge released schema: {error}")))
 }
 
 async fn execute_batch(conn: &impl Executor, sql: &str) -> Result<()> {
-    conn.execute_batch(sql)
+    batch(conn, sql).await
+}
+
+async fn stored_object_sql(conn: &impl QueryExecutor, name: &str) -> Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(sql, '') FROM sqlite_master WHERE name = ?1",
+            params![name],
+        )
         .await
-        .map_err(|error| failure(format!("failed to execute migration SQL: {error}")))
-}
-
-async fn snapshot_diagnostics(conn: &impl Executor) -> Result<()> {
-    execute_batch(
-        conn,
-        "CREATE TEMP TABLE td_migration_diagnostic_publications AS
-         SELECT generation_id, record_state, state_generation, published_at
-         FROM diagnostic_generation_publications;
-         CREATE TEMP TABLE td_migration_generation_diagnostics AS
-         SELECT diagnostic_anchor, generation_id, repository, worktree, reference,
-                source_revision, file_occurrence_id, content_digest,
-                symbol_occurrence_id, span_start, span_end, code, severity, message,
-                message_digest, producer_kind, producer, analyzer_revision,
-                configuration_revision, sanitization_receipt, evidence_class,
-                collected_at, record_state, state_generation, persisted_at
-         FROM generation_diagnostics;",
-    )
-    .await
-}
-
-async fn restore_diagnostics(conn: &impl Executor) -> Result<()> {
-    conn.execute(
-        "INSERT INTO diagnostic_generation_publications(
-             generation_id, publication_revision, record_state, state_generation, published_at
-         )
-         SELECT generation_id, 1, record_state, state_generation, published_at
-         FROM td_migration_diagnostic_publications",
-        (),
-    )
-    .await
-    .map_err(|error| {
+        .map_err(|error| failure(format!("failed to read the stored DDL of {name}: {error}")))?;
+    let Some(row) = rows.next().await.map_err(|error| {
         failure(format!(
-            "failed to restore diagnostic publications: {error}"
+            "failed to decode the stored DDL of {name}: {error}"
         ))
-    })?;
-    conn.execute(
-        "INSERT INTO generation_diagnostics(
-             diagnostic_anchor, generation_id, publication_revision, repository, worktree,
-             reference, source_revision, file_occurrence_id, content_digest,
-             symbol_occurrence_id, span_start, span_end, code, severity, message,
-             message_digest, producer_kind, producer, analyzer_revision,
-             configuration_revision, sanitization_receipt, evidence_class,
-             collected_at, record_state, state_generation, persisted_at
-         )
-         SELECT diagnostic_anchor, generation_id, 1, repository, worktree,
-                reference, source_revision, file_occurrence_id, content_digest,
-                symbol_occurrence_id, span_start, span_end, code, severity, message,
-                message_digest, producer_kind, producer, analyzer_revision,
-                configuration_revision, sanitization_receipt, evidence_class,
-                collected_at, record_state, state_generation, persisted_at
-         FROM td_migration_generation_diagnostics",
-        (),
-    )
-    .await
-    .map_err(|error| failure(format!("failed to restore generation diagnostics: {error}")))?;
-    execute_batch(
-        conn,
-        "DROP TABLE td_migration_diagnostic_publications;
-         DROP TABLE td_migration_generation_diagnostics;",
-    )
-    .await
+    })?
+    else {
+        return Ok(None);
+    };
+    row.get::<String>(0).map(Some).map_err(|error| {
+        failure(format!(
+            "failed to decode the stored DDL of {name}: {error}"
+        ))
+    })
+}
+
+/// Every trigger defined on one table, in catalog order.
+async fn table_triggers(conn: &impl QueryExecutor, table: &str) -> Result<Vec<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'trigger' AND tbl_name = ?1 ORDER BY name",
+            params![table],
+        )
+        .await
+        .map_err(|error| failure(format!("failed to list the triggers of {table}: {error}")))?;
+    let mut triggers = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| failure(format!("failed to read the triggers of {table}: {error}")))?
+    {
+        triggers
+            .push(row.get::<String>(0).map_err(|error| {
+                failure(format!("failed to decode a {table} trigger: {error}"))
+            })?);
+    }
+    Ok(triggers)
 }
 
 fn payload_content_digest(content: &str) -> String {
@@ -640,72 +368,6 @@ async fn validate_payload_digest_rows(conn: &impl QueryExecutor) -> Result<()> {
                 )));
             }
         }
-    }
-    Ok(())
-}
-
-async fn migrate_payload_digests(conn: &(impl Executor + Sync)) -> Result<()> {
-    let mut rows = conn
-        .query(
-            "SELECT payloads.rowid, payloads.assertion_id, payloads.fact_id,
-                    payloads.owner_kind, payloads.project_id, payloads.content
-             FROM memory_v2_assertion_payloads AS payloads
-             LEFT JOIN memory_v2_assertion_payload_digests AS digests
-               ON digests.payload_rowid = payloads.rowid
-             WHERE digests.payload_rowid IS NULL
-             ORDER BY payloads.rowid",
-            (),
-        )
-        .await
-        .map_err(|error| {
-            failure(format!(
-                "failed to read payloads for digest migration: {error}"
-            ))
-        })?;
-    while let Some(row) = rows.next().await.map_err(|error| {
-        failure(format!(
-            "failed to read a payload for digest migration: {error}"
-        ))
-    })? {
-        let rowid = row
-            .get::<i64>(0)
-            .map_err(|error| failure(format!("failed to decode payload rowid: {error}")))?;
-        let assertion_id = row.get::<String>(1).map_err(|error| {
-            failure(format!(
-                "failed to decode payload {rowid} assertion id: {error}"
-            ))
-        })?;
-        let fact_id = row.get::<String>(2).map_err(|error| {
-            failure(format!("failed to decode payload {rowid} fact id: {error}"))
-        })?;
-        let owner_kind = row.get::<String>(3).map_err(|error| {
-            failure(format!(
-                "failed to decode payload {rowid} owner kind: {error}"
-            ))
-        })?;
-        let project_id = row.get::<String>(4).map_err(|error| {
-            failure(format!(
-                "failed to decode payload {rowid} project id: {error}"
-            ))
-        })?;
-        let content = row.get::<String>(5).map_err(|error| {
-            failure(format!("failed to decode payload {rowid} content: {error}"))
-        })?;
-        conn.execute(
-            "INSERT INTO memory_v2_assertion_payload_digests(
-                 payload_rowid, assertion_id, fact_id, owner_kind, project_id, content_digest
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                rowid,
-                assertion_id,
-                fact_id,
-                owner_kind,
-                project_id,
-                payload_content_digest(&content),
-            ],
-        )
-        .await
-        .map_err(|error| failure(format!("failed to write payload digest {rowid}: {error}")))?;
     }
     Ok(())
 }
@@ -2379,7 +2041,6 @@ async fn validate_frontier_rows(conn: &impl QueryExecutor) -> Result<()> {
     }
     Ok(())
 }
-
 async fn migrate_external_source(conn: &(impl Executor + Sync)) -> Result<()> {
     execute_batch(
         conn,
@@ -2475,53 +2136,4 @@ async fn migrate_external_source(conn: &(impl Executor + Sync)) -> Result<()> {
          DROP TABLE external_source_projection_publications_v1;",
     )
     .await
-}
-
-async fn migrate_runtime_ledger(conn: &(impl Executor + Sync)) -> Result<()> {
-    execute_batch(
-        conn,
-        "INSERT INTO td_runtime_writer_idempotency_v2(
-             shard_json, incarnation, authority_epoch, idempotency_key, request_digest,
-             original_receipt_json, transaction_scope_json, operation_id,
-             durability_json, committed_at_micros
-         )
-         SELECT shard_json, incarnation, authority_epoch, idempotency_key, request_digest,
-                original_receipt_json, transaction_scope_json, operation_id,
-                durability_json, committed_at_micros
-         FROM td_runtime_writer_idempotency_v1;
-         DROP TABLE td_runtime_writer_idempotency_v1;",
-    )
-    .await
-}
-
-async fn drop_retired_semantic_projection(conn: &(impl Executor + Sync)) -> Result<()> {
-    execute_batch(
-        conn,
-        "DROP TRIGGER IF EXISTS semantic_vector_replay_stage_identity_guard;
-         DROP TABLE semantic_vector_stage_chunk_receipts;
-         DROP TABLE semantic_vector_stage_graph_effects;
-         DROP TABLE semantic_vector_stage_batches;
-         DROP TABLE semantic_vector_source_scope_bindings;
-         DROP TABLE semantic_vector_stage_adoption_authority;
-         DROP TABLE semantic_vector_stage_census_authority;
-         DROP TABLE semantic_vector_retirement_cleanup;
-         DROP TABLE semantic_vector_stages;",
-    )
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RELEASED_SHAPES;
-
-    #[test]
-    fn released_inventory_counts_are_pinned_to_tagged_shapes() {
-        let shapes = RELEASED_SHAPES
-            .as_ref()
-            .expect("released source fixtures must build");
-        assert_eq!(shapes.v34.len(), 183);
-        assert_eq!(shapes.v35_legacy.len(), 187);
-        assert_eq!(shapes.v35.len(), 190);
-        assert_eq!(shapes.v35_shipped_alias.len(), 190);
-    }
 }

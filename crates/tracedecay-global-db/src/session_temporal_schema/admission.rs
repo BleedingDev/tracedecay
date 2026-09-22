@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::LazyLock;
+use std::collections::BTreeSet;
 
 use sha2::{Digest, Sha256};
 use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
@@ -7,8 +6,8 @@ use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
 use crate::configuration::FreshConfigurationStoreEvidence;
 use crate::schema_contract::{
     SESSION_RELATION_RECEIPT_RECOVERY_COLUMNS, invariant_trigger_names_for_tables,
-    invariant_trigger_sql_for_tables, released_v3_invariant_triggers_intact,
-    starts_with_ignore_ascii_case, validate_released_v3_temporal_projection_receipt_contract,
+    released_v3_invariant_triggers_intact, starts_with_ignore_ascii_case,
+    validate_released_v3_temporal_projection_receipt_contract,
     validate_session_graph_publication_schema_contract,
     validate_session_relation_receipts_without_recovery_contract,
     validate_session_temporal_schema_contract,
@@ -36,83 +35,17 @@ const TEMPORAL_FTS_SHADOW_TABLES: &[&str] = &[
 
 const SESSION_RELATION_RECEIPTS_TABLE: &str = "session_relation_receipts";
 
-// `session_relation_receipts` as published in beta.37 and carried unchanged
-// into the v4 stores persisted before receipt recovery added its columns.
+// `session_relation_receipts` as published by every v3 release and carried
+// unchanged into the v4 stores persisted before receipt recovery added its
+// columns.
 const SESSION_RELATION_RECEIPTS_WITHOUT_RECOVERY_DIGEST: &str =
     "867dc83c80264f4b13aeab7f1ac51572a88ee5d614739a701ebddbb8dcb84a80";
 
-type TemporalTableContractInventory = BTreeMap<String, String>;
-
-/// The structural PRAGMA contract can observe columns, indexes, and foreign
-/// key metadata, but SQLite does not expose CHECK expressions through a
-/// PRAGMA. Keep the canonical CREATE TABLE text in one place (the installer)
-/// and compare its normalized form during current-store admission. This pins
-/// both CHECK expressions and FOREIGN KEY clauses while allowing harmless
-/// formatting and `IF NOT EXISTS` differences in persisted SQLite text.
-static EXPECTED_TEMPORAL_TABLE_CONTRACTS: LazyLock<
-    std::result::Result<TemporalTableContractInventory, String>,
-> = LazyLock::new(build_expected_temporal_table_contracts);
-
-fn build_expected_temporal_table_contracts()
--> std::result::Result<TemporalTableContractInventory, String> {
-    let connection = rusqlite::Connection::open_in_memory()
-        .map_err(|error| format!("failed to open canonical session temporal schema: {error}"))?;
-    connection
-        .execute_batch(super::TEMPORAL_SCHEMA_DDL)
-        .map_err(|error| format!("failed to install canonical session temporal schema: {error}"))?;
-
-    let expected_tables = TEMPORAL_TABLE_COLUMNS
-        .iter()
-        .map(|(table, _)| *table)
-        .filter(|table| !table.ends_with("_fts"))
-        .collect::<BTreeSet<_>>();
-    let mut statement = connection
-        .prepare(
-            "SELECT name, sql FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-        )
-        .map_err(|error| format!("failed to prepare canonical session temporal schema: {error}"))?;
-    let rows = statement
-        .query_map((), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })
-        .map_err(|error| format!("failed to query canonical session temporal schema: {error}"))?;
-    let mut inventory = TemporalTableContractInventory::new();
-    for row in rows {
-        let (name, sql) = row.map_err(|error| {
-            format!("failed to read canonical session temporal schema: {error}")
-        })?;
-        if !expected_tables.contains(name.as_str()) {
-            continue;
-        }
-        let Some(sql) = sql else {
-            return Err(format!(
-                "canonical session temporal table '{name}' has no CREATE TABLE definition"
-            ));
-        };
-        if inventory
-            .insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql))
-            .is_some()
-        {
-            return Err(format!(
-                "canonical session temporal schema repeats table '{name}'"
-            ));
-        }
-    }
-    if inventory.len() != expected_tables.len() {
-        return Err(format!(
-            "canonical session temporal schema defines {} tables, expected {}",
-            inventory.len(),
-            expected_tables.len()
-        ));
-    }
-    Ok(inventory)
-}
-
-// Exact normalized CREATE TABLE authority published in v0.1.0-beta.37. The
-// structural PRAGMA contract cannot observe CHECK expressions, so released-v3
-// admission also pins every durable temporal table definition by digest.
+// Exact normalized CREATE TABLE authority published by every v3 release
+// (v0.1.0-beta.25 through v0.1.0-beta.37 ship one byte-identical temporal DDL).
+// The structural PRAGMA contract cannot observe CHECK expressions, so
+// released-v3 admission also pins every durable temporal table definition by
+// digest.
 const RELEASED_V3_TEMPORAL_TABLE_DIGESTS: &[(&str, &str)] = &[
     (
         "session_agents",
@@ -217,16 +150,14 @@ const RELEASED_V3_TEMPORAL_TABLE_DIGESTS: &[(&str, &str)] = &[
 ];
 
 /// Read-only admission result for the final session-temporal schema.
+///
+/// Non-final shapes, including the published v3 marker and the unreleased
+/// pre-recovery v4 receipt table, are not variants: admission returns
+/// `ResetRequired` before any conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionTemporalSchemaAdmission {
     /// The persisted schema and its objects exactly match the final contract.
     Current,
-    /// The store carries the final marker and contract except that
-    /// `session_relation_receipts` still has the exact shape persisted before
-    /// receipt recovery added its columns and index.
-    WithoutReceiptRecovery,
-    /// The store carries the exact schema shipped through beta.37.
-    ReleasedV3,
     /// The registered store is proven empty and may receive the final contract.
     Fresh,
 }
@@ -244,14 +175,22 @@ pub(crate) async fn require_admissible_session_temporal_schema(
         Some(SESSION_TEMPORAL_SCHEMA_VERSION) => {
             if session_relation_receipts_lack_recovery_columns(conn).await? {
                 validate_without_receipt_recovery_session_temporal_schema(conn).await?;
-                return Ok(SessionTemporalSchemaAdmission::WithoutReceiptRecovery);
+                return Err(session_temporal_reset_required(
+                    "session_relation_receipts carries the unreleased pre-recovery v4 shape; \
+                     that shape never shipped as its own version and there is no sanctioned \
+                     conversion, reset the session temporal authority to recreate the final schema",
+                ));
             }
             validate_current_session_temporal_schema(conn).await?;
             Ok(SessionTemporalSchemaAdmission::Current)
         }
         Some(RELEASED_SESSION_TEMPORAL_SCHEMA_VERSION) => {
             validate_released_v3_session_temporal_schema(conn).await?;
-            Ok(SessionTemporalSchemaAdmission::ReleasedV3)
+            Err(session_temporal_reset_required(
+                "persisted session temporal schema is the published v3 shape; the final shape \
+                 is required and there is no sanctioned conversion, reset the session temporal \
+                 authority",
+            ))
         }
         Some(version) => Err(session_temporal_reset_required(format!(
             "persisted schema version {version} does not match final version {SESSION_TEMPORAL_SCHEMA_VERSION}"
@@ -271,185 +210,10 @@ pub(super) async fn validate_current_session_temporal_schema(
         .map(|(table, _)| *table)
         .filter(|table| !table.ends_with("_fts"))
         .collect::<Vec<_>>();
-    validate_current_session_temporal_schema_shape(conn).await?;
-    validate_temporal_trigger_inventory(conn, &tables)
-        .await
-        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
-    Ok(())
-}
-
-/// Validates the final table, FTS, and publication shape while allowing the
-/// released-v3 authority trigger bodies that the migration repairs in the
-/// enclosing global schema transaction.
-pub(super) async fn validate_current_session_temporal_schema_shape(
-    conn: &impl QueryExecutor,
-) -> tracedecay_domain::errors::Result<()> {
-    let tables = TEMPORAL_TABLE_COLUMNS
-        .iter()
-        .map(|(table, _)| *table)
-        .filter(|table| !table.ends_with("_fts"))
-        .collect::<Vec<_>>();
     validate_session_temporal_schema_contract(conn, &tables)
         .await
         .map_err(|error| session_temporal_reset_required(error.to_string()))?;
-    validate_temporal_table_contracts(conn, &tables)
-        .await
-        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
     validate_temporal_namespace_and_fts(conn).await
-}
-
-async fn validate_temporal_table_contracts(
-    conn: &impl QueryExecutor,
-    tables: &[&str],
-) -> tracedecay_domain::errors::Result<()> {
-    let expected = EXPECTED_TEMPORAL_TABLE_CONTRACTS
-        .as_ref()
-        .map_err(|error| global_db_operation_message(OPERATION, error.clone()))?;
-    let mut rows = conn
-        .query(
-            "SELECT name, sql FROM sqlite_master
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-            (),
-        )
-        .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?;
-    let mut actual = TemporalTableContractInventory::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?
-    {
-        let name = row
-            .get::<String>(0)
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        if !tables.iter().any(|table| table.eq_ignore_ascii_case(&name)) {
-            continue;
-        }
-        let sql = row
-            .get::<Option<String>>(1)
-            .map_err(|error| global_db_operation_error(OPERATION, error))?
-            .ok_or_else(|| {
-                global_db_operation_message(
-                    OPERATION,
-                    format!("temporal table '{name}' has no CREATE TABLE definition"),
-                )
-            })?;
-        actual.insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql));
-    }
-
-    for table in tables {
-        let key = table.to_ascii_lowercase();
-        let Some(expected_sql) = expected.get(&key) else {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!("canonical session temporal contract is missing table '{table}'"),
-            ));
-        };
-        let Some(actual_sql) = actual.get(&key) else {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!("temporal table '{table}' is missing"),
-            ));
-        };
-        if actual_sql != expected_sql {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!(
-                    "table '{table}' has an incompatible normalized CHECK/FOREIGN KEY contract"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-async fn validate_temporal_trigger_inventory(
-    conn: &impl QueryExecutor,
-    tables: &[&str],
-) -> tracedecay_domain::errors::Result<()> {
-    let expected_names = invariant_trigger_names_for_tables(tables);
-    let expected_sql = invariant_trigger_sql_for_tables(tables);
-    if expected_names.len() != expected_sql.len() {
-        return Err(global_db_operation_message(
-            OPERATION,
-            "temporal trigger contract has mismatched name and SQL inventories",
-        ));
-    }
-    let mut expected = BTreeMap::new();
-    for (name, sql) in expected_names.into_iter().zip(expected_sql) {
-        if expected
-            .insert(name.to_ascii_lowercase(), normalize_schema_sql(sql))
-            .is_some()
-        {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!("temporal trigger contract repeats '{name}'"),
-            ));
-        }
-    }
-
-    let mut rows = conn
-        .query(
-            "SELECT name, tbl_name, sql FROM sqlite_master
-             WHERE type = 'trigger' ORDER BY name",
-            (),
-        )
-        .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?;
-    let mut actual = BTreeMap::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?
-    {
-        let name = row
-            .get::<String>(0)
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        let table = row
-            .get::<String>(1)
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        if !tables
-            .iter()
-            .any(|expected_table| expected_table.eq_ignore_ascii_case(&table))
-        {
-            continue;
-        }
-        let sql = row
-            .get::<Option<String>>(2)
-            .map_err(|error| global_db_operation_error(OPERATION, error))?
-            .ok_or_else(|| {
-                global_db_operation_message(
-                    OPERATION,
-                    format!("temporal trigger '{name}' has no CREATE TRIGGER definition"),
-                )
-            })?;
-        if actual
-            .insert(name.to_ascii_lowercase(), normalize_schema_sql(&sql))
-            .is_some()
-        {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!("temporal trigger inventory repeats '{name}'"),
-            ));
-        }
-    }
-
-    if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
-        return Err(global_db_operation_message(
-            OPERATION,
-            "temporal trigger inventory is not exact",
-        ));
-    }
-    for (name, expected_sql) in expected {
-        if actual.get(&name) != Some(&expected_sql) {
-            return Err(global_db_operation_message(
-                OPERATION,
-                format!("temporal trigger '{name}' has an incompatible normalized contract"),
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// True only when the persisted `session_relation_receipts` column list is
@@ -502,12 +266,6 @@ pub(super) async fn validate_without_receipt_recovery_session_temporal_schema(
         .filter(|table| !table.ends_with("_fts") && *table != SESSION_RELATION_RECEIPTS_TABLE)
         .collect::<Vec<_>>();
     validate_session_temporal_schema_contract(conn, &tables)
-        .await
-        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
-    validate_temporal_table_contracts(conn, &tables)
-        .await
-        .map_err(|error| session_temporal_reset_required(error.to_string()))?;
-    validate_temporal_trigger_inventory(conn, &tables)
         .await
         .map_err(|error| session_temporal_reset_required(error.to_string()))?;
     validate_session_relation_receipts_without_recovery_contract(conn)

@@ -731,6 +731,23 @@ impl DaemonAdvisoryRuntimeRegistrar {
             .await
             .map_err(Into::into)
     }
+
+    /// Publishes the early proximity-only advisory-cycle owner. Like Delivery,
+    /// this remounts on every project open so a fresher checkout observation
+    /// replaces a displaced incumbent instead of wedging a stale gate. Full
+    /// advisory publication later replaces this owner under the same slot.
+    #[hotpath::skip]
+    pub async fn publish_proximity_owner(
+        &self,
+        project_root: &Path,
+        owner: DaemonAdvisoryCycleInvocationOwner,
+    ) -> Result<(), DaemonAdvisoryRuntimeRegistrationError> {
+        self.service
+            .project_runtimes
+            .publish(project_root.to_path_buf(), owner)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 impl tracedecay_dashboard_api::feedback_api::FeedbackStatusRuntime
@@ -1264,64 +1281,4 @@ pub enum DaemonSourceEditOwnerRegistrationError {
     Registry(#[from] ProjectRuntimeRegistryError),
     #[error("a source-edit owner for a different authorized scope is already registered")]
     ForeignAuthority,
-}
-
-/// Registers one native-integration owner per exact project/repository identity.
-///
-/// The owner registry lives in `tracedecay-agent-hosts`. This registrar is the
-/// daemon composition entry so project-open and store administration do not
-/// reach the owner map directly.
-#[derive(Clone, Default)]
-pub struct DaemonNativeIntegrationRuntimeRegistrar {
-    registry:
-        Arc<tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationServiceRegistry>,
-}
-
-impl DaemonNativeIntegrationRuntimeRegistrar {
-    #[hotpath::skip]
-    pub async fn ensure(
-        &self,
-        database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-        target: tracedecay_agent_hosts::native_integration::NativeIntegrationTargetV1,
-        observed_at: UtcMicros,
-        analysis: Arc<
-            dyn tracedecay_application::native_integration::NativeIntegrationAnalysisPort,
-        >,
-    ) -> Result<
-        tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationOwner,
-        tracedecay_contracts::NativeIntegrationPortError,
-    > {
-        self.registry
-            .ensure(database, target, observed_at, analysis)
-            .await
-    }
-
-    #[hotpath::skip]
-    pub async fn for_repository_root(
-        &self,
-        repository_root: &Path,
-    ) -> Result<
-        Option<tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationOwner>,
-        tracedecay_contracts::NativeIntegrationPortError,
-    > {
-        self.registry.for_repository_root(repository_root).await
-    }
-
-    #[hotpath::skip]
-    pub async fn retire_project_database(
-        &self,
-        project_id: &ProjectId,
-        database_path: &Path,
-    ) -> Result<(), tracedecay_contracts::NativeIntegrationPortError> {
-        self.registry
-            .retire_project_database(project_id, database_path)
-            .await
-    }
-
-    #[hotpath::skip]
-    pub async fn shutdown(
-        &self,
-    ) -> Result<usize, tracedecay_contracts::NativeIntegrationPortError> {
-        self.registry.shutdown().await
-    }
 }

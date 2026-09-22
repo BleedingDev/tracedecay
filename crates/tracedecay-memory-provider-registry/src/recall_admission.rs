@@ -1,7 +1,7 @@
 //! Host admission authority for provider recall replies.
 //!
 //! A provider answers a recall call with a canonical
-//! `tracedecay.memory.provider.recall.v1` outcome. Nothing in that outcome is
+//! `tracedecay.memory.recall.query.outcome.v1` outcome. Nothing in that outcome is
 //! trusted on its own: every candidate re-asserts the exact coding scope and a
 //! validity record, and this module is the single place where those provider
 //! claims are compared against the scope and temporal query the host itself
@@ -49,9 +49,10 @@ use tracedecay_memory_provider_api::{
     ApiError, CanonicalPayload, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
     ProviderReply,
 };
+use tracedecay_memory_provider_native::RECALL_RESULT_CONTRACT_ID;
 
-/// Canonical payload contract identity of recall requests and outcomes.
-pub const RECALL_PAYLOAD_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
+/// Canonical payload contract identity of recall requests.
+pub const RECALL_REQUEST_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
 
 /// Capability every recall call requires.
 pub const RECALL_QUERY_CAPABILITY_ID: &str = "recall.query.v1";
@@ -455,7 +456,7 @@ pub enum RecallAdmissionError {
     #[error("recall reply terminal succeeded without an outcome payload")]
     MissingPayload,
     /// The payload names a contract other than the recall outcome contract.
-    #[error("recall payload contract {contract_id} is not {RECALL_PAYLOAD_CONTRACT_ID}")]
+    #[error("recall payload contract {contract_id} is not {RECALL_RESULT_CONTRACT_ID}")]
     PayloadContractMismatch {
         /// The declared contract identity.
         contract_id: String,
@@ -896,7 +897,7 @@ pub(crate) fn build_recall_request_payload_with_capabilities(
         })?;
     let sha256 = hex::encode(Sha256::digest(&bytes));
     Ok(CanonicalPayload::new(
-        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        OwnedVersionedId::new(RECALL_REQUEST_CONTRACT_ID)?,
         bytes,
         sha256,
     )?)
@@ -1490,7 +1491,7 @@ pub(crate) fn admit_recall_reply_with_profile(
 pub fn decode_recall_outcome(
     payload: &CanonicalPayload,
 ) -> Result<RecallOutcomeV1, RecallAdmissionError> {
-    if payload.contract_id.as_str() != RECALL_PAYLOAD_CONTRACT_ID {
+    if payload.contract_id.as_str() != RECALL_RESULT_CONTRACT_ID {
         return Err(RecallAdmissionError::PayloadContractMismatch {
             contract_id: payload.contract_id.as_str().to_owned(),
         });

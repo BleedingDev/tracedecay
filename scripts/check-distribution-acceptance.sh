@@ -113,7 +113,6 @@ assert_required_assets() {
     "tests/fixtures/provider_normalization/codex/agent_message.input.json"
     "tests/fixtures/analytics/codex_skill_prose.txt"
     "benchmark_data/claude-observation/workload-v1.json"
-    "benchmark_data/search-quality/query-fallback-report-v1.json"
   )
 
   for required in "${root_assets[@]}"; do
@@ -154,9 +153,11 @@ verify_feature_wiring() {
   local code_index_packaged_manifest=$4
   local extraction_source_manifest=$5
   local extraction_packaged_manifest=$6
-  local cli_source_manifest=$7
-  local cli_packaged_manifest=$8
-  local cargo_config=$9
+  local semantic_source_manifest=$7
+  local semantic_packaged_manifest=$8
+  local cli_source_manifest=$9
+  local cli_packaged_manifest=${10}
+  local cargo_config=${11}
   python3 "$repo/scripts/check-distribution-feature-wiring.py" \
     --root-source "$source_manifest" \
     --root-packaged "$packaged_manifest" \
@@ -164,6 +165,8 @@ verify_feature_wiring() {
     --code-index-packaged "$code_index_packaged_manifest" \
     --extraction-source "$extraction_source_manifest" \
     --extraction-packaged "$extraction_packaged_manifest" \
+    --semantic-source "$semantic_source_manifest" \
+    --semantic-packaged "$semantic_packaged_manifest" \
     --cli-source "$cli_source_manifest" \
     --cli-packaged "$cli_packaged_manifest" \
     --check-extraction-manifest "$extraction_packaged_manifest" \
@@ -530,6 +533,7 @@ for required_package in \
   tracedecay-code-index \
   tracedecay-code-index-runtime \
   tracedecay-code-extraction \
+  tracedecay-semantic \
   tracedecay-query; do
   [[ -n ${package_dirs[$required_package]:-} ]] ||
     die "workspace package required by the distribution gate was not produced: $required_package"
@@ -540,6 +544,7 @@ agent_hosts_package=${package_dirs[tracedecay-agent-hosts]}
 lsp_package=${package_dirs[tracedecay-lsp]}
 code_index_package=${package_dirs[tracedecay-code-index]}
 code_extraction_package=${package_dirs[tracedecay-code-extraction]}
+semantic_package=${package_dirs[tracedecay-semantic]}
 query_package=${package_dirs[tracedecay-query]}
 catalog_package=${package_dirs[tracedecay-tool-catalog]}
 contracts_package=${package_dirs[tracedecay-contracts]}
@@ -588,6 +593,8 @@ verify_feature_wiring \
   "$code_index_package/Cargo.toml" \
   "$repo/crates/tracedecay-code-extraction/Cargo.toml" \
   "$code_extraction_package/Cargo.toml" \
+  "$repo/crates/tracedecay-semantic/Cargo.toml" \
+  "$semantic_package/Cargo.toml" \
   "$repo/crates/tracedecay-cli/Cargo.toml" \
   "$cli_package/Cargo.toml" \
   "$patch_config"

@@ -1,6 +1,7 @@
 //! Query-only admission for the exact relational shape created by this binary.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use crate::db::engine::QueryExecutor;
@@ -22,6 +23,30 @@ type SchemaInventory = BTreeMap<String, SchemaObject>;
 
 static EXPECTED_FINAL_SHAPE: LazyLock<std::result::Result<SchemaInventory, String>> =
     LazyLock::new(build_expected_final_shape);
+
+pub(super) const SHIPPED_V35_ALIAS_UPDATE_TRIGGER: &str = "
+    CREATE TRIGGER retrieval_anchor_aliases_immutable_update
+    BEFORE UPDATE ON retrieval_anchor_aliases BEGIN
+        SELECT RAISE(ABORT, 'retrieval anchor aliases are immutable');
+    END;
+";
+
+static SHIPPED_V35_ALIAS_UPDATE_OBJECT: LazyLock<std::result::Result<SchemaObject, String>> =
+    LazyLock::new(build_shipped_v35_alias_update_object);
+
+fn build_shipped_v35_alias_update_object() -> std::result::Result<SchemaObject, String> {
+    let connection = rusqlite::Connection::open_in_memory()
+        .map_err(|error| format!("failed to open shipped-v35 trigger fixture: {error}"))?;
+    connection
+        .execute_batch("CREATE TABLE retrieval_anchor_aliases(anchor_id TEXT);")
+        .map_err(|error| format!("failed to create shipped-v35 trigger table: {error}"))?;
+    connection
+        .execute_batch(SHIPPED_V35_ALIAS_UPDATE_TRIGGER)
+        .map_err(|error| format!("failed to create shipped-v35 trigger: {error}"))?;
+    read_rusqlite_inventory(&connection)?
+        .remove("retrieval_anchor_aliases_immutable_update")
+        .ok_or_else(|| "shipped-v35 trigger fixture did not create its trigger".to_owned())
+}
 
 fn build_expected_final_shape() -> std::result::Result<SchemaInventory, String> {
     let connection = rusqlite::Connection::open_in_memory()
@@ -125,6 +150,80 @@ where
     canonical_framed_sha256(SCHEMA_SHAPE_FINGERPRINT_DOMAIN, &parts)
 }
 
+/// Markdown listing of the canonical final `SQLite` shape this binary creates.
+///
+/// The body is the `sqlite_master` inventory admission already builds from the
+/// migration DDL. Callers that need the schema read this instead of keeping a
+/// second document.
+pub fn render_expected_final_schema_markdown() -> Result<String> {
+    let inventory = EXPECTED_FINAL_SHAPE
+        .as_ref()
+        .map_err(|error| database_error(error.clone()))?;
+    Ok(render_schema_markdown(inventory))
+}
+
+fn render_schema_markdown(inventory: &SchemaInventory) -> String {
+    let mut tables = Vec::new();
+    let mut indexes = Vec::new();
+    let mut triggers = Vec::new();
+    let mut views = Vec::new();
+    for (name, object) in inventory {
+        match object.object_type.as_str() {
+            "table" => tables.push((name.as_str(), object)),
+            "index" => indexes.push((name.as_str(), object)),
+            "trigger" => triggers.push((name.as_str(), object)),
+            "view" => views.push((name.as_str(), object)),
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    out.push_str("# tracedecay SQLite schema\n\n");
+    out.push_str(
+        "Relational shape this binary creates and admits. Code topology lives in the verified graph generation, not in these tables.\n\n",
+    );
+    let _ = writeln!(out, "schema_version: {}\n", super::SCHEMA_VERSION);
+    write_schema_section(&mut out, "Tables", &tables);
+    write_schema_section(&mut out, "Indexes", &indexes);
+    write_schema_section(&mut out, "Triggers", &triggers);
+    write_schema_section(&mut out, "Views", &views);
+    out
+}
+
+fn write_schema_section(out: &mut String, title: &str, objects: &[(&str, &SchemaObject)]) {
+    let _ = writeln!(out, "## {title}\n");
+    if objects.is_empty() {
+        out.push_str("None.\n\n");
+        return;
+    }
+    for (name, object) in objects {
+        let _ = writeln!(out, "### {title} `{name}`\n");
+        if object.object_type != "table" && !object.table.is_empty() {
+            let _ = writeln!(out, "table: `{}`\n", object.table);
+        }
+        let sql = object.sql.trim();
+        if sql.is_empty() {
+            out.push_str("no stored SQL\n\n");
+            continue;
+        }
+        let fence = if sql.contains("```") { "~~~~" } else { "```" };
+        let _ = writeln!(out, "{fence}sql\n{sql}\n{fence}\n");
+    }
+}
+
+/// The DDL this binary creates for one schema object, or `None` when the
+/// object is not part of the final shape.
+///
+/// This is the single expected-shape authority, so a convergence step can ask
+/// it whether a store's stored DDL is the current one instead of carrying its
+/// own copy of either shape.
+pub(super) fn expected_object_sql(name: &str) -> Result<Option<&'static str>> {
+    Ok(EXPECTED_FINAL_SHAPE
+        .as_ref()
+        .map_err(|error| database_error(error.clone()))?
+        .get(name)
+        .map(|object| object.sql.as_str()))
+}
+
 /// Fingerprint of the exact final shape this binary creates and admits.
 pub fn expected_final_schema_fingerprint() -> Result<String> {
     let inventory = EXPECTED_FINAL_SHAPE
@@ -138,8 +237,12 @@ pub fn expected_final_schema_fingerprint() -> Result<String> {
 pub(super) fn require_admissible_final_shape_rusqlite(
     connection: &rusqlite::Connection,
 ) -> Result<()> {
-    let actual = read_rusqlite_inventory(connection).map_err(database_error)?;
-    require_final_shape_inventory(&actual)
+    let mut actual = read_rusqlite_inventory(connection).map_err(database_error)?;
+    admit_released_staging_objects(&mut actual)?;
+    let shipped = SHIPPED_V35_ALIAS_UPDATE_OBJECT
+        .as_ref()
+        .map_err(|error| database_error(error.clone()))?;
+    require_final_shape_inventory(&actual, Some(shipped)).map(|_| ())
 }
 
 async fn read_inventory(conn: &impl QueryExecutor) -> Result<SchemaInventory> {
@@ -191,6 +294,53 @@ async fn read_inventory(conn: &impl QueryExecutor) -> Result<SchemaInventory> {
     Ok(inventory)
 }
 
+/// The tagged beta.25..beta.37 and live a2e7694c51 staging inventories are retained,
+/// including publication receipts and identity guards. It has no current
+/// writer or retrieval path; fresh stores never install it. Only this exact
+/// inventory may accompany the current relational authority.
+fn admit_released_staging_objects(actual: &mut SchemaInventory) -> Result<()> {
+    let released: Vec<_> = actual
+        .iter()
+        .filter(|(name, object)| {
+            name.starts_with("semantic_vector_") || object.table.starts_with("semantic_vector_")
+        })
+        .collect();
+    let Some((first_name, _)) = released.first() else {
+        return Ok(());
+    };
+    let parts: Vec<_> = released
+        .iter()
+        .flat_map(|(name, object)| {
+            [
+                name.as_bytes(),
+                object.object_type.as_bytes(),
+                object.table.as_bytes(),
+                object.sql.as_bytes(),
+            ]
+        })
+        .collect();
+    // Tagged DDL and the a2e7694c51 Mac dogfood DDL differ only in the
+    // expected_chunk_count CHECK. Neither inventory comes from today's schema.
+    let digest = canonical_framed_sha256(b"tracedecay.released-staging-shape.v1", &parts);
+    if !matches!(
+        digest.as_str(),
+        "ca0d1cd46378c80005b081b095095a1d9e1d0afb804547fe43f60787f7e3fba1"
+            | "418ac9a0900844ba66f869c1f113086d6d726e6dafa5963b8fa5a2730a09596f"
+    ) {
+        return Err(reset_required(format!(
+            "database schema has an incompatible released staging inventory at '{first_name}'"
+        )));
+    }
+    actual.retain(|name, object| {
+        !name.starts_with("semantic_vector_") && !object.table.starts_with("semantic_vector_")
+    });
+    Ok(())
+}
+
+pub(super) async fn require_admissible_released_staging(conn: &impl QueryExecutor) -> Result<()> {
+    admit_released_staging_objects(&mut read_inventory(conn).await?)
+}
+
 fn database_error(message: String) -> TraceDecayError {
     TraceDecayError::Database {
         message,
@@ -209,18 +359,30 @@ fn reset_required(reason: impl Into<String>) -> TraceDecayError {
     )
 }
 
-pub(super) async fn require_exact_final_shape(conn: &impl QueryExecutor) -> Result<()> {
-    let actual = read_inventory(conn).await?;
-    require_final_shape_inventory(&actual)?;
-    Ok(())
-}
-
-fn require_final_shape_inventory(actual: &SchemaInventory) -> Result<()> {
+/// Admits a store for the v34 -> v35 payload-digest step: apart from the
+/// digest objects themselves (absent, or already created by an interrupted
+/// earlier step) its inventory must be exactly the final shape.
+pub(super) async fn require_final_shape_except_payload_digests(
+    conn: &impl QueryExecutor,
+) -> Result<()> {
+    let mut actual = read_inventory(conn).await?;
+    admit_released_staging_objects(&mut actual)?;
     let expected = EXPECTED_FINAL_SHAPE
         .as_ref()
         .map_err(|error| database_error(error.clone()))?;
-
+    let digest_objects = crate::db::memory_v2::PAYLOAD_DIGEST_OBJECTS;
     for (name, expected_object) in expected {
+        if digest_objects.contains(&name.as_str()) {
+            if let Some(actual_object) = actual.get(name)
+                && actual_object != expected_object
+            {
+                return Err(reset_required(format!(
+                    "database schema has incompatible {} '{name}' from an earlier payload-digest step",
+                    expected_object.object_type
+                )));
+            }
+            continue;
+        }
         let Some(actual_object) = actual.get(name) else {
             return Err(reset_required(format!(
                 "database schema is missing required {} '{name}'",
@@ -244,6 +406,106 @@ fn require_final_shape_inventory(actual: &SchemaInventory) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+pub(super) async fn require_exact_final_shape(conn: &impl QueryExecutor) -> Result<()> {
+    let mut actual = read_inventory(conn).await?;
+    admit_released_staging_objects(&mut actual)?;
+    require_final_shape_inventory(&actual, None)?;
+    Ok(())
+}
+
+/// Admits only the exact current shape or the exact shape emitted by the
+/// shipped v35 binary before alias-target correction was supported.
+///
+/// The returned flag identifies the one known trigger replacement the writer
+/// may perform. Every other missing, additional, or byte-different schema
+/// object remains reset-required.
+pub(super) async fn require_exact_final_shape_or_shipped_v35_alias_trigger(
+    conn: &impl QueryExecutor,
+) -> Result<bool> {
+    let mut actual = read_inventory(conn).await?;
+    admit_released_staging_objects(&mut actual)?;
+    let shipped = SHIPPED_V35_ALIAS_UPDATE_OBJECT
+        .as_ref()
+        .map_err(|error| database_error(error.clone()))?;
+    require_final_shape_inventory(&actual, Some(shipped))
+}
+
+fn require_final_shape_inventory(
+    actual: &SchemaInventory,
+    shipped_v35_alias_trigger: Option<&SchemaObject>,
+) -> Result<bool> {
+    const TRIGGER: &str = "retrieval_anchor_aliases_immutable_update";
+
+    let expected = EXPECTED_FINAL_SHAPE
+        .as_ref()
+        .map_err(|error| database_error(error.clone()))?;
+    let mut shipped_trigger_found = false;
+
+    for (name, expected_object) in expected {
+        let Some(actual_object) = actual.get(name) else {
+            return Err(reset_required(format!(
+                "database schema is missing required {} '{name}'",
+                expected_object.object_type
+            )));
+        };
+        if actual_object != expected_object {
+            if name == TRIGGER && shipped_v35_alias_trigger == Some(actual_object) {
+                shipped_trigger_found = true;
+            } else {
+                return Err(reset_required(format!(
+                    "database schema has incompatible {} '{name}'",
+                    expected_object.object_type
+                )));
+            }
+        }
+    }
+    if let Some((name, object)) = actual
+        .iter()
+        .find(|(name, _object)| !expected.contains_key(*name))
+    {
+        return Err(reset_required(format!(
+            "database schema contains unexpected {} '{name}'",
+            object.object_type
+        )));
+    }
+    Ok(shipped_trigger_found)
+}
+
+#[cfg(test)]
+mod render_tests {
+    use std::collections::BTreeSet;
+
+    use super::{EXPECTED_FINAL_SHAPE, render_expected_final_schema_markdown};
+
+    #[test]
+    fn rendered_schema_markdown_is_the_admission_inventory() {
+        let inventory = EXPECTED_FINAL_SHAPE
+            .as_ref()
+            .expect("canonical schema inventory");
+        let markdown = render_expected_final_schema_markdown().expect("schema markdown");
+        let headings: BTreeSet<&str> = markdown
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("### Tables `")?;
+                rest.strip_suffix('`')
+            })
+            .collect();
+        let tables: BTreeSet<&str> = inventory
+            .iter()
+            .filter(|(_, object)| object.object_type == "table")
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            headings, tables,
+            "schema markdown table headings must be exactly the admission inventory"
+        );
+        assert!(
+            markdown.contains("schema_version: "),
+            "schema markdown must name the stamp the migrator writes"
+        );
+    }
 }
 
 #[cfg(test)]

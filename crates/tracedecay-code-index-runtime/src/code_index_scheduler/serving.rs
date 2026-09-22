@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::Read,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock,
@@ -25,10 +25,10 @@ use tracedecay_code_extraction::{
     RENAME_CLONE_NORMALIZATION_REVISION_V1,
 };
 use tracedecay_code_index_retention::code_index_generations::{
-    DurableCodeTextArtifactDescriptorV1, DurablePublicationPointerV1,
-    DurableSealedCodeGenerationIdentityV1, acquire_code_generation_store_lock,
-    attach_verified_text_artifact_under_lock, code_text_artifact_path, code_text_artifacts_root,
-    replace_verified_text_artifact_under_lock, withdraw_verified_text_artifact_under_lock,
+    CodeGenerationStoreLockV1, DurableCodeTextArtifactDescriptorV1, DurablePublicationPointerV1,
+    DurableSealedCodeGenerationIdentityV1, attach_verified_text_artifact_under_lock,
+    code_text_artifact_path, code_text_artifacts_root, replace_verified_text_artifact_under_lock,
+    try_acquire_code_generation_store_lock, withdraw_verified_text_artifact_under_lock,
 };
 use tracedecay_contracts::{
     code_index_freshness::{
@@ -78,7 +78,8 @@ use crate::{
             CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
             CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
             CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneFingerprintPartialReasonV1,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+            CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1, CloneFingerprintPartialReasonV1,
             CloneFingerprintReadAccountingV1, CloneFingerprintStreamDescriptorV1,
             CloneSelectedBlockV1, CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBuilderV1,
             CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationPhaseV1,
@@ -101,6 +102,9 @@ const TEXT_ARTIFACT_PAGE_BYTES_V1: usize = 4 * 1024 * 1024;
 const CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1: usize = 128 * 1024 * 1024;
 const TEXT_ARTIFACT_BASE_BATCH_PAGES_V1: usize = 64;
 const TEXT_ARTIFACT_BASE_BATCH_BYTES_V1: usize = 64 * 1024 * 1024;
+/// Live JSON copies `append_clone_rows` holds for one clone body while the
+/// staged pages remain live: payload, occurrence, stored payload, comparison.
+const CLONE_SUCCESSOR_APPEND_LIVE_COPIES_V1: usize = 4;
 const TEXT_ARTIFACT_MAXIMUM_BATCH_SCALE_V1: usize = 8;
 /// One synchronous activation advances only this many page/finalization
 /// operations. Larger caller hints are clamped so work accounting cannot
@@ -119,6 +123,61 @@ pub(super) fn text_artifact_source_batch_limits(
     let bytes = TEXT_ARTIFACT_BASE_BATCH_BYTES_V1 * scale;
     (pages, bytes, pages * 2)
 }
+
+/// Clone-successor page-batch bounds from the 128 MiB reservation ledger.
+///
+/// `open_builder_connection` grants the full `SQLite` cache. `append_clone_rows`
+/// then serializes payload/occurrence, reads the stored payload, and compares
+/// a second serialization while the batch's pages stay live, and the builder
+/// retains metadata. The batch byte ceiling is the remainder after those
+/// charges so resident-memory admission is not filled to the last byte.
+///
+/// The ceiling is capped at the scale-1 first-pass batch (64 MiB), while
+/// the first pass itself scales up to 8x, so a single page retained above
+/// this ceiling would be admitted there and refused here as a `Contract`
+/// error. That is unreachable in practice only because the sealed source
+/// caps every page at `TEXT_ARTIFACT_PAGE_BYTES_V1` (4 MiB) serialized.
+pub(super) fn clone_successor_source_batch_limits(
+    metadata: &CodeLexicalProjectionMetadataV1,
+) -> Result<(usize, usize), RetrievalPortError> {
+    clone_successor_source_batch_limits_from_charges(metadata.retained_owned_bytes())
+}
+
+pub(super) fn clone_successor_source_batch_limits_from_charges(
+    metadata_bytes: usize,
+) -> Result<(usize, usize), RetrievalPortError> {
+    let scratch = CLONE_SUCCESSOR_APPEND_LIVE_COPIES_V1
+        .checked_mul(TEXT_ARTIFACT_PAGE_BYTES_V1)
+        .ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "clone-successor append-scratch ledger overflowed".to_owned(),
+            )
+        })?;
+    let fixed = CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(scratch))
+        .ok_or_else(|| {
+            RetrievalPortError::Contract("clone-successor fixed ledger overflowed".to_owned())
+        })?;
+    if fixed >= CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1 {
+        return Err(RetrievalPortError::Contract(format!(
+            "clone-successor SQLite cache, metadata, and append scratch exhaust the {CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1}-byte reservation"
+        )));
+    }
+    let remaining = CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1 - fixed;
+    if remaining < TEXT_ARTIFACT_PAGE_BYTES_V1 {
+        return Err(RetrievalPortError::Contract(format!(
+            "clone-successor reservation leaves {remaining} bytes for pages, under the {TEXT_ARTIFACT_PAGE_BYTES_V1}-byte source page bound"
+        )));
+    }
+    let bytes = remaining.min(TEXT_ARTIFACT_BASE_BATCH_BYTES_V1);
+    let slot = std::mem::size_of::<VerifiedSealedLexicalPageV1>();
+    let pages = TEXT_ARTIFACT_BASE_BATCH_PAGES_V1
+        .min(bytes / slot.max(1))
+        .max(1);
+    Ok((pages, bytes))
+}
+
 /// Cancellation-checkpoint cadence for a wake parked behind another wake's
 /// corpus-sized verified head open. The parked wake re-checks its typed
 /// cancellation state at this interval, so shutdown or supersession surfaces
@@ -126,10 +185,23 @@ pub(super) fn text_artifact_source_batch_limits(
 /// digest call that has not yet reached its own checkpoint.
 const TEXT_HEAD_OPEN_CANCELLATION_CHECK_INTERVAL_V1: Duration = Duration::from_millis(100);
 const TEXT_ARTIFACT_MAXIMUM_OWNER_WARMUP_ADVANCES_V1: usize = 10_000;
+/// Clone-fingerprint backfill slices a request may drive inline. The retained
+/// worker owns the rest after `request_query_background_reconcile`; more than
+/// one advance here re-owns the whole successor encode on a Tokio thread.
+const TEXT_ARTIFACT_MAXIMUM_CLONE_WARMUP_ADVANCES_V1: usize = 1;
 /// Rows digested by one scheduler finalization operation. The builder persists
 /// its exact section/row cursor after this bounded slice, avoiding both a
 /// corpus-sized wake and one scheduler wake per individual `SQLite` row.
 const TEXT_ARTIFACT_FINALIZATION_ROWS_PER_OPERATION_V1: usize = 4 * 1024;
+
+/// Outcome of the one-slice clone-fingerprint warmup on a similar/redundancy
+/// request. `Pending` means the retained worker owns remaining backfill —
+/// never collapse that into a hard `GenerationUnavailable` miss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneSimilarityWarmupForRequestV1 {
+    Ready,
+    Pending,
+}
 
 pub(super) type GenerationServingCachesV1 = (
     CodeGenerationId,
@@ -2066,6 +2138,16 @@ impl DaemonCodeTextArtifactStoreV1 {
         Ok(reservation)
     }
 
+    fn acquire_store_write_lock(&self) -> Result<CodeGenerationStoreLockV1, RetrievalPortError> {
+        try_acquire_code_generation_store_lock(&self.store_root)
+            .map_err(text_artifact_unavailable)?
+            .ok_or_else(|| {
+                RetrievalPortError::AuthorityUnavailable(
+                    "code-generation store has an active owner".to_owned(),
+                )
+            })
+    }
+
     /// The durably attached artifact descriptor for one retained generation,
     /// or `None` when the generation has no published text artifact yet.
     pub(super) fn published_descriptor(
@@ -2094,9 +2176,10 @@ impl DaemonCodeTextArtifactStoreV1 {
         &self,
         descriptor: &DurableCodeTextArtifactDescriptorV1,
         quarantine_corrupt_file: bool,
+        control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<(), RetrievalPortError> {
-        let lock = acquire_code_generation_store_lock(&self.store_root)
-            .map_err(text_artifact_unavailable)?;
+        checkpoint_text_artifact_control(control)?;
+        let lock = self.acquire_store_write_lock()?;
         let pointer = self
             .publication
             .read_publication_pointer()
@@ -2169,8 +2252,7 @@ impl DaemonCodeTextArtifactStoreV1 {
                 "text-artifact staging path is outside its canonical root".to_owned(),
             ));
         }
-        let _lock = acquire_code_generation_store_lock(&self.store_root)
-            .map_err(text_artifact_unavailable)?;
+        let _lock = self.acquire_store_write_lock()?;
         checkpoint_text_artifact_control(control)?;
         let metadata = staging_path
             .symlink_metadata()
@@ -2180,7 +2262,7 @@ impl DaemonCodeTextArtifactStoreV1 {
                 "incompatible text-artifact staging path is not a regular file".to_owned(),
             ));
         }
-        std::fs::remove_file(staging_path).map_err(text_artifact_unavailable)?;
+        retire_text_artifact_staging_family(staging_path).map_err(text_artifact_unavailable)?;
         DaemonCodeIndexPublicationStoreV1::sync_directory(&artifacts_root)
             .map_err(text_artifact_unavailable)
     }
@@ -2265,7 +2347,7 @@ impl DaemonCodeTextArtifactStoreV1 {
             manifest,
             &manifest_bytes,
             identity.digest.clone(),
-            move |digest, expected_size, buffer| {
+            move |digest, expected_size, buffer, control| {
                 publication.read_retained_partitioned_segment(
                     &source_identity,
                     SealedGenerationSegmentReadV1::Whole {
@@ -2273,6 +2355,7 @@ impl DaemonCodeTextArtifactStoreV1 {
                         size_bytes: expected_size,
                     },
                     buffer,
+                    control,
                 )
             },
             TEXT_ARTIFACT_PAGE_CHUNKS_V1,
@@ -2314,8 +2397,8 @@ impl DaemonCodeTextArtifactStoreV1 {
             // Hold it from the first staging observation until pointer attachment
             // is durable so retention cannot unlink a newly visible artifact from
             // a plan made before the descriptor was attached.
-            let lock = acquire_code_generation_store_lock(&self.store_root)
-                .map_err(text_artifact_unavailable)?;
+            checkpoint_text_artifact_control(control)?;
+            let lock = self.acquire_store_write_lock()?;
             let (artifact_sha256, artifact_size_bytes) = hotpath::measure_block!(
                 "query.artifact.store.state_digest",
                 sha256_private_file_and_size(staging_path, control)
@@ -2354,10 +2437,13 @@ impl DaemonCodeTextArtifactStoreV1 {
                             "existing code text artifact contains different bytes".to_owned(),
                         ));
                     }
-                    std::fs::remove_file(staging_path).map_err(text_artifact_unavailable)?;
+                    retire_text_artifact_staging_family(staging_path)
+                        .map_err(text_artifact_unavailable)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     std::fs::rename(staging_path, &final_path)
+                        .map_err(text_artifact_unavailable)?;
+                    clear_text_artifact_staging_sidecars(staging_path)
                         .map_err(text_artifact_unavailable)?;
                 }
                 Err(error) => return Err(text_artifact_unavailable(error)),
@@ -2521,6 +2607,13 @@ impl LatestCompleteCodeIndexV1 {
 }
 
 impl LatestCodeTextGenerationV1 {
+    /// Exact and lexical query owners are installed for this generation.
+    ///
+    /// This is the sole readiness predicate for a publication's graph seat
+    /// gate and for admitting a full sealed-generation graph replay. Clone
+    /// fingerprint backfill may still be unfinished when this returns true —
+    /// that remaining work is [`Self::text_projection_needs_work`], not a
+    /// seat or replay precondition.
     pub fn query_owners_are_ready(&self) -> bool {
         matches!(
             self.query_owner_readiness(),
@@ -2544,12 +2637,23 @@ impl LatestCodeTextGenerationV1 {
     }
 
     pub(super) fn text_projection_needs_work(&self) -> bool {
-        !self.text_projection_failed.load(Ordering::Acquire)
-            && (!self.query_owners_are_ready()
-                || !matches!(
-                    &*self.text_projection_build.lock_slot(),
-                    CodeTextProjectionSlotV1::Idle
-                ))
+        if self.text_projection_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.query_owners_are_ready() {
+            return true;
+        }
+        // A read probe must not queue behind an advance: a wake holds the
+        // slot lock for its whole bounded slice, and a clone-fingerprint
+        // backfill slice over a large sealed source runs for seconds. A
+        // contended slot is by definition work in progress.
+        match self.text_projection_build.slot.try_lock() {
+            Ok(slot) => !matches!(&*slot, CodeTextProjectionSlotV1::Idle),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                !matches!(&*poisoned.into_inner(), CodeTextProjectionSlotV1::Idle)
+            }
+        }
     }
 
     pub(super) fn clone_index_status(
@@ -2860,11 +2964,13 @@ impl LatestCodeTextGenerationV1 {
     ///
     /// Lexical owners can be Ready while clone backfill is still background
     /// work. `tracedecay_similar` needs those postings; ordinary search does not
-    /// wait here.
+    /// wait here. Drive at most one bounded slice inline and leave the rest to
+    /// the retained worker wake the caller must have requested — owning the
+    /// whole successor on the request thread was the #1339 S1 regression.
     pub(crate) fn finish_clone_similarity_warmup_for_request(
         &self,
         request_control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<bool, RetrievalPortError> {
+    ) -> Result<CloneSimilarityWarmupForRequestV1, RetrievalPortError> {
         let mut advances = 0_usize;
         while self.text_projection_needs_work() {
             self.advance_text_serving_for_request(
@@ -2872,11 +2978,17 @@ impl LatestCodeTextGenerationV1 {
                 request_control,
             )?;
             advances += 1;
-            if advances >= TEXT_ARTIFACT_MAXIMUM_OWNER_WARMUP_ADVANCES_V1 {
-                return Ok(false);
+            if advances >= TEXT_ARTIFACT_MAXIMUM_CLONE_WARMUP_ADVANCES_V1 {
+                return Ok(if self.text_projection_needs_work() {
+                    // Background owns the remainder; do not collapse this into
+                    // a hard GenerationUnavailable miss at the executor.
+                    CloneSimilarityWarmupForRequestV1::Pending
+                } else {
+                    CloneSimilarityWarmupForRequestV1::Ready
+                });
             }
         }
-        Ok(true)
+        Ok(CloneSimilarityWarmupForRequestV1::Ready)
     }
 
     pub(crate) fn production_query_owners_with_budget(
@@ -3468,6 +3580,7 @@ impl LatestCodeTextGenerationV1 {
             )
         })?;
         let staging_path = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
+        prepare_absent_text_artifact_staging(&staging_path).map_err(text_artifact_unavailable)?;
         let metadata = self.text_projection_metadata()?;
         let open_builder = || {
             CodeLexicalCloneSuccessorV1::open_or_create(
@@ -3572,17 +3685,17 @@ impl LatestCodeTextGenerationV1 {
             }
             Err(CodeLexicalArtifactErrorV1::Missing(_)) => {
                 drop(reader_reservation);
-                store.withdraw_unavailable_descriptor(&descriptor, false)?;
+                store.withdraw_unavailable_descriptor(&descriptor, false, control)?;
                 Ok(None)
             }
             Err(CodeLexicalArtifactErrorV1::Corrupt(_)) => {
                 drop(reader_reservation);
-                store.withdraw_unavailable_descriptor(&descriptor, true)?;
+                store.withdraw_unavailable_descriptor(&descriptor, true, control)?;
                 Ok(None)
             }
             Err(CodeLexicalArtifactErrorV1::Incompatible(_)) => {
                 drop(reader_reservation);
-                store.withdraw_unavailable_descriptor(&descriptor, false)?;
+                store.withdraw_unavailable_descriptor(&descriptor, false, control)?;
                 Ok(None)
             }
             Err(error) => Err(map_text_artifact_error(error)),
@@ -3631,6 +3744,7 @@ impl LatestCodeTextGenerationV1 {
         let artifacts_root = code_text_artifacts_root(store.store_root());
         ensure_private_text_artifacts_root(&artifacts_root)?;
         let staging_path = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
+        prepare_absent_text_artifact_staging(&staging_path).map_err(text_artifact_unavailable)?;
         let mut source = self.take_preopened_source_or_open(&sealed_identity, control)?;
         let builder_budget =
             text_artifact_builder_budget(build_memory_budget, source.staging_window_bytes())?;
@@ -4136,27 +4250,54 @@ impl LatestCodeTextGenerationV1 {
         if build.builder.is_none() {
             self.rebuild_clone_successor(build, control)?;
         }
+        let (batch_pages, batch_bytes) = clone_successor_source_batch_limits(
+            build
+                .builder
+                .as_ref()
+                .ok_or_else(|| {
+                    RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
+                })?
+                .projection_metadata(),
+        )?;
         let mut remaining = maximum_work.max(1);
         while remaining > 0 && build.source_receipt.is_none() {
-            match build
-                .source
-                .next_page(control)
-                .map_err(map_sealed_page_source_error)?
-            {
-                VerifiedSealedLexicalPageReadV1::Page(page) => {
-                    if !self.advance_clone_successor_page(build, &page, control)? {
-                        return Ok(false);
+            if let CloneSuccessorSourcePositionV1::Revalidating(target) = &build.source_position {
+                // Resume revalidation replays already-committed pages one at a
+                // time until the persisted successor cursor is reached.
+                let target = target.clone();
+                let read = build
+                    .source
+                    .next_page(control)
+                    .map_err(map_sealed_page_source_error)?;
+                match read {
+                    VerifiedSealedLexicalPageReadV1::Page(page) => {
+                        if !self.revalidate_clone_successor_page(build, target, &page, control)? {
+                            return Ok(false);
+                        }
+                        remaining -= 1;
                     }
-                    remaining -= 1;
-                }
-                VerifiedSealedLexicalPageReadV1::Complete(receipt) => {
-                    if matches!(
-                        build.source_position,
-                        CloneSuccessorSourcePositionV1::Revalidating(_)
-                    ) {
+                    VerifiedSealedLexicalPageReadV1::Complete(_) => {
                         self.rebuild_clone_successor(build, control)?;
                         return Ok(false);
                     }
+                }
+                continue;
+            }
+            let bounds = VerifiedSealedLexicalPageBatchBoundsV1::new(
+                remaining.clamp(1, batch_pages),
+                batch_bytes,
+            )
+            .map_err(map_sealed_page_source_error)?;
+            match self.append_clone_successor_batch(build, bounds, control)? {
+                VerifiedSealedLexicalPageBatchReadV1::Pages(batch) => {
+                    remaining = remaining.checked_sub(batch.len()).ok_or_else(|| {
+                        RetrievalPortError::Contract(
+                            "clone-successor batch delivered more pages than the remaining work bound"
+                                .to_owned(),
+                        )
+                    })?;
+                }
+                VerifiedSealedLexicalPageBatchReadV1::Complete(receipt) => {
                     build.source_receipt = Some(receipt);
                 }
             }
@@ -4204,12 +4345,41 @@ impl LatestCodeTextGenerationV1 {
         Ok(true)
     }
 
-    fn advance_clone_successor_page(
+    /// Stage one bounded ordered page batch from the sealed source and append
+    /// it to the clone successor under one durable commit. The source cursor
+    /// only advances through pages the successor accepted, so a failed batch
+    /// leaves both authorities at their pre-batch position.
+    fn append_clone_successor_batch(
         &self,
         build: &mut CodeTextCloneSuccessorBuildV1,
-        page: &VerifiedSealedLexicalPageV1,
+        bounds: VerifiedSealedLexicalPageBatchBoundsV1,
         control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<bool, RetrievalPortError> {
+    ) -> Result<VerifiedSealedLexicalPageBatchReadV1, RetrievalPortError> {
+        let (source, builder) = (&mut build.source, &mut build.builder);
+        let builder = builder.as_mut().ok_or_else(|| {
+            RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
+        })?;
+        source
+            .next_page_batch_if(control, bounds, |pages| {
+                for page in pages {
+                    self.observe_clone_page_scratch(page)?;
+                }
+                builder
+                    .append_pages(pages, control)
+                    .map_err(map_text_artifact_error)?;
+                NonZeroUsize::new(pages.len()).ok_or_else(|| {
+                    RetrievalPortError::Contract(
+                        "sealed lexical source staged an empty clone-successor batch".to_owned(),
+                    )
+                })
+            })
+            .map_err(map_sealed_page_source_error)?
+    }
+
+    fn observe_clone_page_scratch(
+        &self,
+        page: &VerifiedSealedLexicalPageV1,
+    ) -> Result<(), RetrievalPortError> {
         let scratch_bytes = page.clone_bodies().iter().try_fold(0_u64, |peak, body| {
             let payload = serde_json::to_vec(&body.payload)
                 .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
@@ -4223,18 +4393,20 @@ impl LatestCodeTextGenerationV1 {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .observe_clone_scratch(scratch_bytes);
-        let CloneSuccessorSourcePositionV1::Revalidating(target) = &build.source_position else {
-            build
-                .builder
-                .as_mut()
-                .ok_or_else(|| {
-                    RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
-                })?
-                .append_page(page, control)
-                .map_err(map_text_artifact_error)?;
-            return Ok(true);
-        };
-        let target = target.clone();
+        Ok(())
+    }
+
+    /// Replay one already-committed page against the resumed successor while
+    /// it is `Revalidating` toward `target`. Returns `false` when the
+    /// successor had to be rebuilt and the slice must stop.
+    fn revalidate_clone_successor_page(
+        &self,
+        build: &mut CodeTextCloneSuccessorBuildV1,
+        target: VerifiedSealedLexicalCursorV1,
+        page: &VerifiedSealedLexicalPageV1,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<bool, RetrievalPortError> {
+        self.observe_clone_page_scratch(page)?;
         let verification = build
             .builder
             .as_ref()
@@ -4270,6 +4442,8 @@ impl LatestCodeTextGenerationV1 {
         drop(build.builder.take());
         self.text_artifact_store
             .discard_incompatible_staging(&build.staging_path, control)?;
+        prepare_absent_text_artifact_staging(&build.staging_path)
+            .map_err(text_artifact_unavailable)?;
         let prior_path = code_text_artifact_path(
             self.text_artifact_store.store_root(),
             &build.prior_descriptor,
@@ -4502,6 +4676,69 @@ fn checkpoint_text_artifact_control(
     }
 }
 
+/// Drop a leftover `SQLite` journal before a fresh staging file is created.
+///
+/// DELETE-mode recovery applies `path-journal` into whatever file is later
+/// opened at `path`. A crash that unlinked the database and left the journal
+/// would otherwise roll that journal into the next successor copy.
+fn prepare_absent_text_artifact_staging(staging_path: &Path) -> std::io::Result<()> {
+    match staging_path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "text-artifact staging path is not a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            clear_text_artifact_staging_sidecars(staging_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Retire a staging database and its hot journal together.
+///
+/// Sidecars go first. A crash after that leaves a database with no journal,
+/// which the next discard can unlink. The reverse order leaves a journal that
+/// the next create applies into a new file.
+fn retire_text_artifact_staging_family(staging_path: &Path) -> std::io::Result<()> {
+    clear_text_artifact_staging_sidecars(staging_path)?;
+    match staging_path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(staging_path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "text-artifact staging path is not a regular file",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_text_artifact_staging_sidecars(staging_path: &Path) -> std::io::Result<()> {
+    let Some(name) = staging_path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "text-artifact staging path has no file name",
+        ));
+    };
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar_name = name.to_os_string();
+        sidecar_name.push(suffix);
+        let sidecar = staging_path.with_file_name(sidecar_name);
+        match sidecar.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(sidecar)?,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "text-artifact staging sidecar is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Divide the single process reservation between the source's concurrently
 /// retained decode window and the `SQLite` builder. Each component fitting the
 /// ceiling independently is insufficient because both remain live while a
@@ -4514,4 +4751,34 @@ pub(super) fn text_artifact_builder_budget(
         .checked_sub(source_window_bytes)
         .filter(|remaining| *remaining > 0)
         .ok_or(RetrievalPortError::BudgetExceeded)
+}
+
+#[cfg(test)]
+mod staging_sidecar_tests {
+    use super::{
+        clear_text_artifact_staging_sidecars, prepare_absent_text_artifact_staging,
+        retire_text_artifact_staging_family,
+    };
+
+    #[test]
+    fn absent_staging_database_does_not_keep_a_hot_journal_for_the_next_create() {
+        let root = tempfile::tempdir().expect("staging root");
+        let staging = root.path().join(".text-artifact-ab.staging");
+        let journal = root.path().join(".text-artifact-ab.staging-journal");
+        std::fs::write(&journal, b"rollback").expect("plant hot journal");
+
+        prepare_absent_text_artifact_staging(&staging).expect("clear orphan journal");
+        assert!(!journal.exists());
+
+        std::fs::write(&staging, b"prior-copy").expect("fresh successor copy");
+        std::fs::write(&journal, b"rollback").expect("replant journal");
+        retire_text_artifact_staging_family(&staging).expect("retire family");
+        assert!(!staging.exists());
+        assert!(!journal.exists());
+
+        std::fs::write(root.path().join(".text-artifact-ab.staging-wal"), b"wal")
+            .expect("plant wal");
+        clear_text_artifact_staging_sidecars(&staging).expect("clear wal");
+        assert!(!root.path().join(".text-artifact-ab.staging-wal").exists());
+    }
 }

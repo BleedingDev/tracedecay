@@ -1,6 +1,5 @@
 use tracedecay_contracts::feedback::{
     CI_FAILURE_LOCALIZE_CAPABILITY_ID_V1, GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1,
-    PROXIMITY_CAPABILITY_ID_V1,
 };
 use tracedecay_contracts::{
     application_catalog_contributions, application_handler_descriptors,
@@ -97,13 +96,12 @@ fn application_contribution_set_uses_registered_feedback_handlers() {
         let provider_contribution = [
             GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1,
             CI_FAILURE_LOCALIZE_CAPABILITY_ID_V1,
-            PROXIMITY_CAPABILITY_ID_V1,
         ]
         .contains(&capability.capability_id().as_str());
         assert_eq!(
             capability.binding_ids().is_empty(),
             provider_contribution,
-            "{} must use the combined advisory transport",
+            "{} has no direct bindings only when it is a producer contribution",
             capability.capability_id()
         );
     }
@@ -184,4 +182,45 @@ fn verified_graph_mcp_reads_have_application_primitive_admission_identity() {
                 && binding.surface() == BindingSurface::Http
         }));
     }
+}
+
+#[test]
+fn similar_and_redundancy_use_the_current_protocol_revision_only() {
+    use tracedecay_tool_catalog::BindingStatus;
+
+    let contribution = primitive_read_contribution().unwrap();
+    for operation in ["similar", "redundancy"] {
+        let mcp_bindings: Vec<_> = contribution
+            .bindings()
+            .iter()
+            .filter(|binding| {
+                binding.surface() == BindingSurface::Mcp
+                    && binding.operation().as_str() == operation
+            })
+            .collect();
+        assert_eq!(
+            mcp_bindings.len(),
+            1,
+            "{operation} must keep one MCP (surface, operation) binding"
+        );
+        let binding = mcp_bindings[0];
+        assert!(matches!(binding.status(), BindingStatus::Current));
+        assert_eq!(binding.alias_of(), None);
+        assert!(
+            binding.protocol_revisions().contains(1),
+            "{operation} must accept the current protocol revision"
+        );
+        assert!(
+            !binding.protocol_revisions().contains(2),
+            "{operation} must not keep a retired protocol revision"
+        );
+        assert_eq!(binding.protocol_revisions().minimum(), 1);
+        assert_eq!(binding.protocol_revisions().maximum(), 1);
+    }
+}
+
+#[test]
+fn application_catalog_snapshot_admits_one_similar_redundancy_binding() {
+    tracedecay_contracts::catalog_composition::build_application_catalog_snapshot()
+        .expect("catalog construction must succeed with one binding per surface-operation");
 }

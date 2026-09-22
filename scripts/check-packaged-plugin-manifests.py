@@ -113,11 +113,11 @@ def validate_kimi(path: Path) -> None:
             or not isinstance(hook.get("timeout"), int)
         ):
             fail(f"{path} requires a callable {event} hook with an integer timeout")
-    server = manifest.get("mcpServers", {}).get("tracedecay")
-    if not isinstance(server, dict):
-        fail(f"{path} requires mcpServers.tracedecay")
-    require_equal(server, "command", "tracedecay", path)
-    require_equal(server, "args", ["serve"], path)
+    # Fail closed if inline MCP returns: the supported route is the installer
+    # writing session/user mcp.json (see host-integration evidence for Kimi
+    # MCP). Omission here is only a conflict guard, not MCP success evidence.
+    if "mcpServers" in manifest:
+        fail(f"{path} must omit mcpServers (MCP is registered outside the plugin manifest)")
 
 
 def shared_skill_slugs(root: Path) -> list[str]:

@@ -15,13 +15,13 @@ use tracedecay_application::advisory::github_runtime::{
 };
 use tracedecay_application::advisory::{
     AdvisoryCycleControl, AdvisoryCycleOutcome, AdvisoryCycleRequest, AdvisoryHookDeliveryV1,
-    AdvisoryHookLookupNoticeV1, AdvisoryHookNoticeQueueV1, AdvisoryHookNoticeSinkV1,
-    AdvisoryProductionOpenV1, AdvisoryProductionStartupRegistrationV1, AdvisoryRuntimeOpenV1,
-    CiCodeAnchorStoreV1, CiRetainedProviderObservationAuthorityV1, CiSourceAccessAuthorityV1,
-    GitHubCiRepositoryTargetV1, GitHubHttpReadConfigV1, GitHubReadOnlyCredentialV1,
-    GitHubReadPermissionV1, GitHubRepositoryTargetV1, GitHubReviewProviderIdentityV1,
-    GitHubReviewRuntimeOwnerConfigV1, ProductionCiFailureDiscoveryOutcomeV1,
-    ProductionCiProviderConfigV1, ProjectCiCodeAnchorStoreV1, ProjectCiRetainedObservationStoreV1,
+    AdvisoryHookNoticeQueueV1, AdvisoryProductionOpenV1, AdvisoryProductionStartupRegistrationV1,
+    AdvisoryRuntimeOpenV1, CiCodeAnchorStoreV1, CiRetainedProviderObservationAuthorityV1,
+    CiSourceAccessAuthorityV1, GitHubCiRepositoryTargetV1, GitHubHttpReadConfigV1,
+    GitHubReadOnlyCredentialV1, GitHubReadPermissionV1, GitHubRepositoryTargetV1,
+    GitHubReviewProviderIdentityV1, GitHubReviewRuntimeOwnerConfigV1,
+    ProductionCiFailureDiscoveryOutcomeV1, ProductionCiProviderConfigV1,
+    ProjectCiCodeAnchorStoreV1, ProjectCiRetainedObservationStoreV1,
     discover_production_ci_failure_request_v1, github_anchor_authorities_arc_v1,
     open_advisory_production_authorities, register_advisory_daemon_startup,
     register_advisory_hook_notice_queue, unregister_advisory_hook_notice_queue,
@@ -69,7 +69,7 @@ use tracedecay_global_db::configuration::OwnedGlobalDbConfigurationControlStore;
 use tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1;
 use tracedecay_hooks::{
     HookConfigurationFileReaderV1, HookConfigurationReadOutcomeV1, HookConfigurationSubscriberV1,
-    HookFeedbackDeliveryRouteV1, HookFeedbackRollbackSwitchV1, hook_configuration_path,
+    HookFeedbackRollbackSwitchV1, hook_configuration_path,
 };
 use tracedecay_lsp::{
     DiagnosticTrigger, FeedbackCycleRequest, FeedbackCycleRuntimePort, LspRuntimeFailure,
@@ -407,7 +407,6 @@ fn advisory_hook_notice_dispatch(
                     host.host_kind(),
                     HookFeedbackRollbackSwitchV1 {
                         configuration_revision: snapshot.revision,
-                        route: HookFeedbackDeliveryRouteV1::HookV2,
                     },
                 )),
                 _ => None,
@@ -630,16 +629,6 @@ impl ProductionFeedbackCycleAuthorizationPort for ProjectOpenFeedbackCycleAuthor
             .map_err(|_| LspRuntimeFailure::new("feedback-cycle-authorization"))
         })
     }
-}
-
-fn unavailable_advisory_hook_notice(
-    _notice: &AdvisoryHookLookupNoticeV1,
-) -> tracedecay_hooks::HookFeedbackDeliveryOutcomeV1 {
-    tracedecay_hooks::HookFeedbackDeliveryOutcomeV1::Unavailable
-}
-
-fn unavailable_advisory_hook_sink() -> Arc<AdvisoryHookNoticeSinkV1> {
-    Arc::new(unavailable_advisory_hook_notice)
 }
 
 async fn install_project_open_context_scout_configuration(
@@ -1343,6 +1332,12 @@ pub(in crate::daemon) async fn register_project_open_dependent_owners(
         return Ok(());
     }
     register_project_delivery_read_authority(invocation, project_root, &state).await?;
+    // Proximity is a typed read over session/git correlation and the current
+    // code graph. Like Delivery, it must be available before a sealed
+    // generation mounts the full advisory cycle — otherwise HTTP
+    // `/api/feedback/proximity` answers `feedback.proximity.unavailable`
+    // while Work/application are already serving.
+    register_project_proximity_read_authority(invocation, project_root, &state).await?;
     let indexed_generation =
         selected_feedback_generation(invocation, project_root, &state.scope).await;
     if let (Some(lsp_session_factory), Some(indexed_generation)) =
@@ -1653,7 +1648,6 @@ async fn register_production_advisory_owner(
         ci_retained,
         ci_code_anchors,
         hook_v2: hook_notices.sink(),
-        legacy_hook: unavailable_advisory_hook_sink(),
     };
     let proximity_read = production_feedback_proximity_read_runtime_v1(
         production.project_runtime_db.clone(),
@@ -1932,6 +1926,159 @@ async fn register_project_delivery_read_authority(
         .map_err(|error| TraceDecayError::Config {
             message: format!("project-open delivery read registration failed: {error}"),
         })
+}
+
+/// Registers the feedback-proximity read owner for this admitted checkout as
+/// its own early project-open component, before and independent of the full
+/// advisory cycle whose mount can stay deferred behind a sealed code-index
+/// generation. Full advisory publication later replaces this owner under the
+/// same `advisory_cycle` slot.
+async fn register_project_proximity_read_authority(
+    invocation: &DaemonInvocationState,
+    project_root: &Path,
+    state: &ProjectOpenDependentOwnerState,
+) -> Result<()> {
+    let feedback_scope = match resolve_project_feedback_scope_v1(project_root, &state.scope) {
+        Ok(scope) => scope,
+        Err(error) => {
+            tracing::warn!(
+                event = "feedback_proximity_mount",
+                outcome = "unavailable",
+                project = %project_root.display(),
+                reason = %error,
+                "project-open proximity read has no resolvable feedback scope"
+            );
+            return Ok(());
+        }
+    };
+    let proximity_read = match production_feedback_proximity_read_runtime_v1(
+        state.session_db.clone(),
+        Arc::clone(&state.code_graph),
+        feedback_scope.clone(),
+        project_root.to_path_buf(),
+        Arc::new(invocation.code_index_schedulers.clone()),
+    ) {
+        Some(runtime) => runtime,
+        None => {
+            tracing::warn!(
+                event = "feedback_proximity_mount",
+                outcome = "unavailable",
+                project = %project_root.display(),
+                "project-open proximity read authority could not be constructed"
+            );
+            return Ok(());
+        }
+    };
+    let owner = DaemonAdvisoryCycleInvocationOwner::new(
+        feedback_scope.project_id.clone(),
+        Arc::new(ProjectOpenProximityReadOwnerV1 {
+            graph: Arc::clone(&state.graph),
+            scope: state.scope.clone(),
+            project_root: project_root.to_path_buf(),
+            feedback_scope,
+            proximity_read,
+        }) as Arc<dyn DaemonAdvisoryCycleInvocationPort>,
+    );
+    invocation
+        .advisory_runtime_registrar()
+        .publish_proximity_owner(project_root, owner)
+        .await
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open proximity read registration failed: {error}"),
+        })?;
+    tracing::info!(
+        event = "feedback_proximity_mount",
+        outcome = "ready",
+        project = %project_root.display(),
+    );
+    Ok(())
+}
+
+/// Early proximity-only owner: serves `feedback_proximity` before the sealed
+/// generation mounts the full advisory cycle. Advisory-cycle invocations stay
+/// unavailable until that upgrade replaces this owner.
+#[derive(Clone)]
+struct ProjectOpenProximityReadOwnerV1 {
+    graph: Arc<crate::project::TraceDecay>,
+    scope: tracedecay_contracts::ResolvedScope,
+    project_root: std::path::PathBuf,
+    feedback_scope: FeedbackScopeV1,
+    proximity_read: FeedbackProximityReadRuntimeV1,
+}
+
+impl DaemonAdvisoryCycleInvocationPort for ProjectOpenProximityReadOwnerV1 {
+    fn invoke(
+        &self,
+        _request: DaemonAdvisoryCycleInvocationRequest,
+    ) -> DaemonAdvisoryCycleInvocationFuture<'_> {
+        Box::pin(async move {
+            Err(ApplicationProblem::unavailable(SafeDiagnostic {
+                code: "feedback.advisory-cycle.unavailable".to_owned(),
+                message: "The advisory feedback cycle is not mounted yet".to_owned(),
+            }))
+        })
+    }
+
+    fn invoke_proximity(
+        &self,
+        request: DaemonFeedbackProximityInvocationRequest,
+    ) -> DaemonFeedbackProximityInvocationFuture<'_> {
+        let owner = self.clone();
+        Box::pin(async move {
+            if request.cancellation.is_cancelled() {
+                return Err(ApplicationProblem::cancelled_before_admission());
+            }
+            if request.deadline.is_elapsed_at(request.request.observed_at)
+                || request.deadline.is_elapsed_at(now_micros())
+            {
+                return Err(ApplicationProblem::timed_out_before_admission());
+            }
+            let configuration = owner
+                .graph
+                .configuration_runtime()
+                .client()
+                .current()
+                .await
+                .map_err(|_| {
+                    ApplicationProblem::unavailable(SafeDiagnostic {
+                        code: "feedback.proximity.configuration".to_owned(),
+                        message: "The feedback proximity configuration is unavailable".to_owned(),
+                    })
+                })?;
+            let access = daemon_owned_project_source_access_at(
+                &owner.scope,
+                &owner.project_root,
+                &configuration,
+                request.request.observed_at,
+            )
+            .map_err(|_| {
+                ApplicationProblem::not_found_or_not_authorized(
+                    tracedecay_contracts::RetryDirective::Never,
+                )
+            })?;
+            let context = proximity_authorization_context(
+                &access,
+                &owner.feedback_scope,
+                request.request.observed_at,
+                request.request_id,
+                request.deadline.clone(),
+                request.cancellation.clone(),
+            )
+            .ok_or_else(|| {
+                ApplicationProblem::not_found_or_not_authorized(
+                    tracedecay_contracts::RetryDirective::Never,
+                )
+            })?;
+            let result = owner.proximity_read.read(&context, &request.request).await;
+            feedback_proximity_invocation_result(
+                &context,
+                request.request.observed_at,
+                request.deadline,
+                request.cancellation,
+                result,
+            )
+        })
+    }
 }
 
 struct ProductionGitHubProviderConfigV1 {

@@ -10,15 +10,20 @@ import {
 import type { EnvelopeResult } from '../../data/query/envelope.ts';
 import {
   browseLane,
+  laneAnswered,
   laneEvidence,
+  laneFromScope,
   laneFromSourceProgress,
   laneFromTransport,
   laneHits,
+  lanePending,
   laneStateDetail,
   laneStateKind,
   runIsTerminal,
   runStateKind,
   searchLane,
+  SEMANTIC_UNREGISTERED_DETAIL,
+  semanticLane,
   type ExplorerLaneReadModel,
 } from './laneModel.ts';
 
@@ -185,8 +190,33 @@ describe('laneFromSourceProgress', () => {
       hits: [],
       reportedTotal: 0,
       unreadableRows: 0,
+      hasMore: false,
+      freshness: 'unknown',
+      watermark: null,
     });
     expect(new Set([...states, readyEmpty.state]).size).toBe(4);
+  });
+
+  it('carries the page\u2019s own continuation as hasMore, and no continuation as null', () => {
+    const paged = laneFromSourceProgress(
+      'code',
+      progress({
+        page: {
+          offset: 0,
+          limit: 1,
+          total: 3,
+          next_offset: 1,
+          rows: [{ id: 'n1', name: 'first' }],
+          metadata: {},
+        },
+      }),
+      [],
+    );
+    expect(paged).toMatchObject({ state: 'ready', hasMore: true, reportedTotal: 3 });
+    // A source that never sent a page said nothing about continuation.
+    expect(laneFromSourceProgress('code', progress({ page: null }), [])).toMatchObject({
+      hasMore: null,
+    });
   });
 
   it('carries the source error code and message rather than flattening them', () => {
@@ -219,32 +249,19 @@ describe('laneFromSourceProgress', () => {
       hits: [],
       reportedTotal: null,
       unreadableRows: 0,
+      hasMore: null,
+      freshness: 'unknown',
+      watermark: null,
     });
   });
 
-  it('fails closed when a ready page exposes an unresumable continuation', () => {
-    const read = laneFromSourceProgress(
+  it('carries the source\u2019s own freshness word and watermark verbatim', () => {
+    const fresh = laneFromSourceProgress(
       'code',
-      progress({
-        page: {
-          offset: 0,
-          limit: 50,
-          total: 3,
-          next_offset: 50,
-          rows: [{ id: 'n1', name: 'only the first page' }],
-          metadata: {},
-        },
-      }),
+      progress({ freshness: 'fresh', watermark: 'g-42' }),
       [],
     );
-
-    expect(read).toEqual({
-      state: 'unavailable',
-      lane: 'code',
-      errorCode: 'explorer_resume_cursor_unavailable',
-      detail: 'the Explorer source is truncated without a signed, scope-bound resume cursor',
-    });
-    expect(laneHits(read)).toEqual([]);
+    expect(fresh).toMatchObject({ state: 'ready', freshness: 'fresh', watermark: 'g-42' });
   });
 
   it('reports rows it could not read instead of silently returning fewer', () => {
@@ -313,7 +330,7 @@ describe('laneFromSourceProgress', () => {
     expect(reads.map((read) => laneStateKind(read))).toEqual(['stale', 'timed_out']);
   });
 
-  it('fails closed for partial rows without a signed, scope-bound resume cursor', () => {
+  it('keeps partial rows visible with the source\u2019s omission state', () => {
     const partial = laneFromSourceProgress(
       'sessions',
       progress({
@@ -334,15 +351,17 @@ describe('laneFromSourceProgress', () => {
       [],
     );
 
-    expect(partial).toEqual({
-      state: 'unavailable',
+    expect(partial).toMatchObject({
+      state: 'partial',
       lane: 'sessions',
       errorCode: 'lcm_temporal_read_incomplete',
-      detail: 'the Explorer source is truncated without a signed, scope-bound resume cursor',
+      detail: null,
+      hasMore: false,
+      hits: [{ title: 'partial row' }],
     });
-    expect(laneHits(partial)).toEqual([]);
-    expect(laneStateKind(partial)).toBe('unavailable');
-    expect(laneEvidence(partial)).toBe('unknown');
+    expect(laneHits(partial)).toHaveLength(1);
+    expect(laneStateKind(partial)).toBe('partial');
+    expect(laneEvidence(partial)).toBe('associated');
   });
 });
 
@@ -506,8 +525,57 @@ describe('laneFromTransport', () => {
       state: 'indeterminate',
       lane: 'code',
       domainState: 'stale',
+      detail: null,
     });
     expect(laneStateDetail(laneFromTransport('code', 'stale', null))).toBe('stale');
+  });
+
+  it('keeps a read-only scope refusal as locked, carrying the gateway sentence', () => {
+    const locked = laneFromTransport('sessions', 'locked', 'read-only for non-active projects');
+    expect(locked).toEqual({
+      state: 'locked',
+      lane: 'sessions',
+      detail: 'read-only for non-active projects',
+    });
+    expect(laneStateKind(locked)).toBe('locked');
+    expect(laneStateDetail(locked)).toBe('read-only for non-active projects');
+  });
+});
+
+describe('semanticLane', () => {
+  it('is a standing typed absence, not an unavailable source and not an empty answer', () => {
+    const lane = semanticLane();
+    expect(lane.state).toBe('unregistered');
+    expect(lane.lane).toBe('semantic');
+    // Rendered with the taxonomy's unavailable chip, but the detail names the
+    // contract fact: there is no source to have declined.
+    expect(laneStateKind(lane)).toBe('unavailable');
+    expect(laneStateDetail(lane)).toBe(SEMANTIC_UNREGISTERED_DETAIL);
+    expect(laneHits(lane)).toEqual([]);
+    expect(laneAnswered(lane)).toBe(false);
+    expect(lanePending(lane)).toBe(false);
+    expect(laneEvidence(lane)).toBe('unknown');
+  });
+});
+
+describe('laneFromScope', () => {
+  it('lets a writable scope proceed and refuses the other two with their own reasons', () => {
+    expect(laneFromScope('code', { state: 'writable', target: 'the active project' })).toBeNull();
+    expect(
+      laneFromScope('code', { state: 'read_only', reason: 'Other is not the active project.' }),
+    ).toEqual({ state: 'locked', lane: 'code', detail: 'Other is not the active project.' });
+    const unknown = laneFromScope('knowledge', {
+      state: 'unknown',
+      reason: 'not checked against the registry yet',
+    });
+    expect(unknown).toEqual({
+      state: 'indeterminate',
+      lane: 'knowledge',
+      domainState: 'unknown',
+      detail: 'not checked against the registry yet',
+    });
+    expect(laneStateKind(unknown!)).toBe('unknown');
+    expect(laneStateDetail(unknown!)).toBe('not checked against the registry yet');
   });
 });
 

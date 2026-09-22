@@ -27,7 +27,7 @@ mod tests;
 #[allow(clippy::expect_used)]
 mod update_restore_tests;
 
-pub use probe::daemon_reachable;
+pub use probe::{DaemonProcessProofV1, daemon_reachable};
 pub use unit_file::installed_service_socket_path;
 
 use probe::{
@@ -1774,6 +1774,29 @@ pub fn installed_service_state() -> Result<DaemonServiceState> {
     runner.service_state(&socket_path)
 }
 
+/// Observe whether the managed unit's process completed initialize.
+///
+/// `Running` from systemd or a connectable socket is not this proof. A missing
+/// or stopped unit is [`DaemonProcessProofV1::Unproven`] without a probe.
+pub fn installed_service_process_proof(expected_version: &str) -> Result<DaemonProcessProofV1> {
+    let runner = ServiceRunner::current()?;
+    let service_path = runner.service_path()?;
+    if !service_unit_exists_for(&service_path, runner.namespace())? {
+        return Ok(DaemonProcessProofV1::Unproven {
+            detail: "no managed TraceDecay daemon service is installed".to_owned(),
+        });
+    }
+    let unit = read_service_unit_for(&service_path, runner.namespace())?;
+    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let state = runner.service_state(&socket_path)?;
+    if !state.is_running() {
+        return Ok(DaemonProcessProofV1::Unproven {
+            detail: "managed daemon unit is not running".to_owned(),
+        });
+    }
+    Ok(probe::probe_daemon_process(&socket_path, expected_version))
+}
+
 #[hotpath::measure(label = "daemon.service.start")]
 pub fn start_service(expected_version: &str) -> Result<()> {
     let runner = ServiceRunner::current()?;
@@ -1998,7 +2021,7 @@ fn uninstall_service_under_lease(
 }
 
 #[hotpath::measure(label = "daemon.service.status")]
-pub fn service_status(socket_path: &Path) -> String {
+pub fn service_status(socket_path: &Path, expected_version: &str) -> String {
     let mut transport_path = PathBuf::from("<unavailable>");
     let mut socket_error = None;
     let mut service = String::from("unavailable");
@@ -2051,7 +2074,7 @@ pub fn service_status(socket_path: &Path) -> String {
         socket_error = Some(error.to_string());
         state = format!("unavailable: {error}");
     }
-    let socket_state = daemon_socket_state(&transport_path);
+    let (socket_state, process) = probe::observe_daemon_process(&transport_path, expected_version);
     let detail = runner
         .as_ref()
         .ok()
@@ -2067,6 +2090,6 @@ pub fn service_status(socket_path: &Path) -> String {
     let identity =
         socket_error.map_or_else(String::new, |error| format!("identity-error: {error}\n"));
     format!(
-        "service: {service}\nstate: {state}\n{identity}{transport_kind}: {transport} ({socket_state})\n{detail}logs: {logs}\n",
+        "service: {service}\nstate: {state}\n{identity}{transport_kind}: {transport} ({socket_state})\nprotocol: {process:?}\n{detail}logs: {logs}\n",
     )
 }

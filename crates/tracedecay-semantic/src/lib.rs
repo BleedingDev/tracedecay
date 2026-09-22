@@ -1925,6 +1925,8 @@ mod scheduling_tests {
         source: char,
         target_projection_key: ProjectionKeyV1,
     ) -> ProjectionBatchRequestV1 {
+        let (reused_count, reused_digest) =
+            ChangedCodeChunkSetV1::seal_reused_partition(&[]).expect("empty reused seal");
         ProjectionBatchRequestV1 {
             request_digest: ManifestDigest::new(format!("sha256:{}", "c".repeat(64)))
                 .expect("request digest"),
@@ -1935,7 +1937,8 @@ mod scheduling_tests {
                     .expect("source manifest"),
                 added_or_changed: Vec::new(),
                 deleted: Vec::new(),
-                reused: Vec::new(),
+                reused_count,
+                reused_digest,
             },
             previous_projection_key: None,
             target_projection_key,

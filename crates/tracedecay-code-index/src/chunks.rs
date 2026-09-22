@@ -13,7 +13,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_code_extraction::{ExtractedCloneBodyV1, ExtractionArtifactV1};
@@ -87,7 +86,12 @@ pub enum ChunkingFailureV1 {
     #[error("chunking was cancelled")]
     Cancelled,
     #[error("chunk identity inputs are not canonical: {0}")]
-    NonCanonicalIdentity(String),
+    NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1),
+    /// A per-chunk unit panicked. Contained here so a later panic cannot
+    /// unwind the join and drop an earlier typed failure, and so the panicked
+    /// unit is named instead of aborting the sweep.
+    #[error("chunk worker unit {index} panicked: {message}")]
+    WorkerPanic { index: usize, message: String },
 }
 
 /// The deterministic chunker contract (Plan 25: `src/code_index/chunks.rs`
@@ -207,41 +211,38 @@ unsafe impl ExtractionAdmittedChunkV1 for ExtractionAdmittedCodeSearchChunkV1 {
     }
 }
 
-/// Chunk counts below this stay on the calling thread. One canonical chunk
-/// digest costs single-digit microseconds, so small files are cheaper inline
-/// than split across the pool — and leaving them sequential keeps the pool free
-/// for the coarser per-file fan-out above this layer.
-const PARALLEL_CHUNK_THRESHOLD: usize = 16;
+/// Run one chunk unit and turn a panic into that unit's typed failure.
+///
+/// The file fan-out already does this. A chunk panic that unwinds the join
+/// drops every earlier `Result` the sweep had collected.
+fn contain_chunk_unit<T>(
+    index: usize,
+    unit: impl FnOnce() -> Result<T, ChunkingFailureV1>,
+) -> Result<T, ChunkingFailureV1> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(unit)).unwrap_or_else(|payload| {
+        let message = match crate::parallelism::CodeIndexParallelismErrorV1::from_panic_payload(
+            index, &*payload,
+        ) {
+            crate::parallelism::CodeIndexParallelismErrorV1::WorkerPanic { message, .. }
+            | crate::parallelism::CodeIndexParallelismErrorV1::PoolBuild { message } => message,
+        };
+        Err(ChunkingFailureV1::WorkerPanic { index, message })
+    })
+}
 
-/// Run `operation` over every chunk for its failure only, fanning out across
-/// the pool once the batch is large enough. The lowest-index failure is
-/// returned, matching the sequential sweep's short-circuit outcome.
-fn try_for_each_chunk_ordered<F, A>(
-    admit: A,
+/// Run `operation` over every chunk in input order. The first typed failure or
+/// panic is returned without scheduling later units.
+fn try_for_each_chunk_ordered<F>(
     chunks: &[Arc<CodeSearchChunkV1>],
     operation: F,
 ) -> Result<(), ChunkingFailureV1>
 where
-    F: Fn(&Arc<CodeSearchChunkV1>) -> Result<(), ChunkingFailureV1> + Send + Sync,
-    A: Fn(&mut dyn FnMut() -> Result<(), ChunkingFailureV1>) -> Result<(), ChunkingFailureV1>
-        + Sync,
+    F: Fn(&Arc<CodeSearchChunkV1>) -> Result<(), ChunkingFailureV1>,
 {
-    if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
-        return chunks.iter().try_for_each(&operation);
+    for (index, chunk) in chunks.iter().enumerate() {
+        contain_chunk_unit(index, || operation(chunk))?;
     }
-    let failure = chunks
-        .par_iter()
-        .enumerate()
-        .filter_map(|(index, chunk)| {
-            admit(&mut || operation(chunk))
-                .err()
-                .map(|error| (index, error))
-        })
-        .min_by_key(|(index, _)| *index);
-    match failure {
-        Some((_, error)) => Err(error),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 impl ExactExtractionAuthorityV1 {
@@ -291,13 +292,15 @@ impl ExactExtractionAuthorityV1 {
     }
 
     fn validate_chunk(&self, chunk: &Arc<CodeSearchChunkV1>) -> Result<(), ChunkingFailureV1> {
-        chunk
-            .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+        chunk.validate().map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })?;
         let mismatch = || {
-            ChunkingFailureV1::NonCanonicalIdentity(
-                "chunk does not match parser-backed exact extraction authority".to_owned(),
-            )
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1::new(
+                crate::noncanonical::NonCanonicalReasonCodeV1::ExactAuthorityMismatch,
+            ))
         };
         let minted = self.chunk_digests.get(&chunk.id).ok_or_else(mismatch)?;
         if Arc::ptr_eq(&minted.minted_row, chunk) {
@@ -317,7 +320,9 @@ impl ExactExtractionAuthorityV1 {
     ) -> Result<(), ChunkingFailureV1> {
         if chunks.len() != self.chunk_digests.len() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "chunk set does not match parser-backed exact extraction authority".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ExactAuthoritySetMismatch,
+                ),
             ));
         }
         let mut seen = BTreeSet::new();
@@ -327,14 +332,12 @@ impl ExactExtractionAuthorityV1 {
             .unwrap_or(chunks.len());
         // The sequential sweep stopped at the first repeated identity, so only
         // the chunks ahead of it were ever digest-checked.
-        try_for_each_chunk_ordered(
-            |unit| crate::parallelism::with_background_cpu_permit(unit),
-            &chunks[..repeated_at],
-            |chunk| self.validate_chunk(chunk),
-        )?;
+        try_for_each_chunk_ordered(&chunks[..repeated_at], |chunk| self.validate_chunk(chunk))?;
         if repeated_at < chunks.len() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "chunk set repeats parser-backed exact extraction identity".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ExactAuthorityDuplicateIdentity,
+                ),
             ));
         }
         Ok(())
@@ -352,14 +355,11 @@ impl ExactExtractionAuthorityV1 {
         &self,
         chunks: Vec<Arc<CodeSearchChunkV1>>,
     ) -> Result<Vec<ExtractionAdmittedCodeSearchChunkV1>, ChunkingFailureV1> {
-        if chunks.len() < PARALLEL_CHUNK_THRESHOLD {
-            return chunks.into_iter().map(|chunk| self.admit(chunk)).collect();
-        }
-        let admitted = chunks
-            .into_par_iter()
-            .map(|chunk| crate::parallelism::with_background_cpu_permit(|| self.admit(chunk)))
-            .collect::<Vec<_>>();
-        admitted.into_iter().collect()
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(index, chunk)| contain_chunk_unit(index, || self.admit(chunk)))
+            .collect()
     }
 
     /// Rebind an exact authority only after every prior parser-backed chunk
@@ -383,7 +383,9 @@ impl ExactExtractionAuthorityV1 {
                 })
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "carried exact chunks changed logical identity or content".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ExactAuthorityCarryChanged,
+                ),
             ));
         }
         self.validate_all(&prior.chunks)?;
@@ -395,18 +397,24 @@ impl CodeFileChunksV1 {
     /// Validate the generation/file binding and canonical document membership
     /// of one chunker result before it can cross the publication boundary.
     pub fn validate(&self) -> Result<(), ChunkingFailureV1> {
-        self.document
-            .generation_id
-            .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+        self.document.generation_id.validate().map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })?;
         self.document
             .file_occurrence_id
             .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
-        self.document
-            .content_digest
-            .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+            .map_err(|error| {
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::noncanonical_from_domain(error),
+                )
+            })?;
+        self.document.content_digest.validate().map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })?;
 
         if self.document.chunk_ids.len() != self.chunks.len()
             || self
@@ -417,23 +425,23 @@ impl CodeFileChunksV1 {
                 .any(|(document_id, chunk)| document_id != &chunk.id)
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "document chunk membership does not match canonical chunk order".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::DocumentChunkMembershipMismatch,
+                ),
             ));
         }
-        try_for_each_chunk_ordered(
-            |unit| crate::parallelism::with_background_cpu_permit(unit),
-            &self.chunks,
-            |chunk| {
-                if chunk.anchor.generation_id != self.document.generation_id
-                    || chunk.anchor.file_occurrence_id != self.document.file_occurrence_id
-                {
-                    return Err(ChunkingFailureV1::GenerationMismatch);
-                }
-                chunk
-                    .validate()
-                    .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
-            },
-        )
+        try_for_each_chunk_ordered(&self.chunks, |chunk| {
+            if chunk.anchor.generation_id != self.document.generation_id
+                || chunk.anchor.file_occurrence_id != self.document.file_occurrence_id
+            {
+                return Err(ChunkingFailureV1::GenerationMismatch);
+            }
+            chunk.validate().map_err(|error| {
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::noncanonical_from_domain(error),
+                )
+            })
+        })
     }
 
     /// Rebind carried-forward chunks to their next generation without
@@ -465,7 +473,9 @@ impl CodeFileChunksV1 {
                 let current_occurrence =
                     occurrences.get(&prior_occurrence).cloned().ok_or_else(|| {
                         ChunkingFailureV1::NonCanonicalIdentity(
-                            "carried chunk occurrence has no logical symbol binding".to_owned(),
+                            crate::noncanonical::NonCanonicalCauseV1::new(
+                                crate::noncanonical::NonCanonicalReasonCodeV1::CarriedChunkMissingSymbol,
+                            ),
                         )
                     })?;
                 chunk.anchor.symbol_occurrence_id = Some(current_occurrence.clone());
@@ -473,7 +483,9 @@ impl CodeFileChunksV1 {
                     if term.kind() == ExactTechnicalTermKindV1::WholeSymbol {
                         term.rebind_symbol_occurrence(current_occurrence.clone())
                             .map_err(|error| {
-                                ChunkingFailureV1::NonCanonicalIdentity(error.to_string())
+                                ChunkingFailureV1::NonCanonicalIdentity(
+                                    crate::noncanonical::noncanonical_from_domain(error),
+                                )
                             })?;
                     }
                 }
@@ -701,8 +713,11 @@ impl DeterministicCodeChunker {
             chunker_revision: self.chunker_revision.clone(),
         };
         let digest = canonical_digest(CHUNK_IDENTITY_SEPARATOR, &identity)?;
-        CodeSearchChunkId::new(format!("chunk.v1.{digest}"))
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
+        CodeSearchChunkId::new(format!("chunk.v1.{digest}")).map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })
     }
 }
 
@@ -728,7 +743,11 @@ fn canonical_digest<T: serde::Serialize>(
 ) -> Result<String, ChunkingFailureV1> {
     canonical_sha256(&(separator, payload))
         .map(|digest| digest.as_str().to_owned())
-        .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
+        .map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })
 }
 
 pub(crate) fn symbol_occurrence_id(
@@ -740,8 +759,11 @@ pub(crate) fn symbol_occurrence_id(
         &(file_occurrence_id.as_str(), identity.as_str()),
     )
     .and_then(|digest| {
-        SymbolOccurrenceId::new(format!("symbol.v1.{digest}"))
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))
+        SymbolOccurrenceId::new(format!("symbol.v1.{digest}")).map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })
     })
 }
 
@@ -802,7 +824,9 @@ fn bind_clone_bodies(
             .is_some()
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "one parser node id names multiple symbol occurrences".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::DuplicateParserNodeId,
+                ),
             ));
         }
     }
@@ -811,13 +835,14 @@ fn bind_clone_bodies(
         let symbol_occurrence_id = occurrences
             .get(body.symbol_occurrence_id.as_str())
             .ok_or_else(|| {
-                ChunkingFailureV1::NonCanonicalIdentity(
-                    "clone body is not bound to an indexed symbol".to_owned(),
-                )
+                ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1::new(crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyNotBoundToIndexedSymbol))
             })?;
-        let payload = clone_build
-            .payload(body)
-            .map_err(ChunkingFailureV1::NonCanonicalIdentity)?;
+        let payload = clone_build.payload(body).map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_detail(
+                crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyPayloadNotCanonical,
+                error,
+            ))
+        })?;
         bound.push(CodeIndexCloneBodyV1 {
             occurrence: CloneBodyOccurrenceV1 {
                 project_id: authority.project_id.clone(),
@@ -1234,9 +1259,15 @@ impl DeterministicCodeChunker {
         clone_build: &mut ClonePayloadBuildContextV1<'_>,
     ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
         let full_source = std::str::from_utf8(&file.sanitized_bytes).map_err(|error| {
-            ChunkingFailureV1::NonCanonicalIdentity(format!(
-                "sanitized bytes are not valid UTF-8: {error}"
-            ))
+            ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SanitizedBytesNotUtf8,
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::Error,
+                    error.to_string(),
+                ),
+            )
         })?;
         let full_len = full_source.len() as u64;
         let mut parsed_prefix_end = 0;
@@ -1252,13 +1283,21 @@ impl DeterministicCodeChunker {
             }
         }
         let parsed_prefix_end = usize::try_from(parsed_prefix_end).map_err(|error| {
-            ChunkingFailureV1::NonCanonicalIdentity(format!(
-                "parsed prefix does not fit this host: {error}"
-            ))
+            ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ParsedPrefixHostFit,
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::Error,
+                    error.to_string(),
+                ),
+            )
         })?;
         if !full_source.is_char_boundary(parsed_prefix_end) {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "parsed prefix is not a UTF-8 boundary".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ParsedPrefixNotUtf8Boundary,
+                ),
             ));
         }
         let source = &full_source[..parsed_prefix_end];
@@ -1542,24 +1581,43 @@ impl DeterministicCodeChunker {
         let mut symbols = Vec::with_capacity(rows.len());
         for row in rows {
             let span = published_spans.get(&row.occurrence).ok_or_else(|| {
-                ChunkingFailureV1::NonCanonicalIdentity(format!(
-                    "symbol {} has no published source span",
-                    row.qualified_name
-                ))
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::SymbolMissingPublishedSpan,
+                    )
+                    .with(
+                        crate::noncanonical::NonCanonicalDetailKeyV1::QualifiedName,
+                        row.qualified_name.clone(),
+                    ),
+                )
             })?;
             let start = usize::try_from(span.start_byte).map_err(|error| {
-                ChunkingFailureV1::NonCanonicalIdentity(format!(
-                    "symbol start offset does not fit this host: {error}"
-                ))
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::SymbolStartHostFit,
+                    )
+                    .with(
+                        crate::noncanonical::NonCanonicalDetailKeyV1::Error,
+                        error.to_string(),
+                    ),
+                )
             })?;
             let end = usize::try_from(span.end_byte).map_err(|error| {
-                ChunkingFailureV1::NonCanonicalIdentity(format!(
-                    "symbol end offset does not fit this host: {error}"
-                ))
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::SymbolEndHostFit,
+                    )
+                    .with(
+                        crate::noncanonical::NonCanonicalDetailKeyV1::Error,
+                        error.to_string(),
+                    ),
+                )
             })?;
             let text = source.get(start..end).ok_or_else(|| {
                 ChunkingFailureV1::NonCanonicalIdentity(
-                    "symbol span is not a valid UTF-8 source range".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::SymbolSpanNotUtf8,
+                    ),
                 )
             })?;
             symbols.push(LineageSymbolRecordV1 {
@@ -1849,7 +1907,9 @@ impl DeterministicCodeChunker {
                     exact_terms,
                     subtokens,
                     sanitized_text: BoundedSanitizedText::new(text).map_err(|error| {
-                        ChunkingFailureV1::NonCanonicalIdentity(error.to_string())
+                        ChunkingFailureV1::NonCanonicalIdentity(
+                            crate::noncanonical::noncanonical_from_domain(error),
+                        )
                     })?,
                 });
             }
@@ -2013,6 +2073,83 @@ pub(crate) const CROSS_FILE_REFERENCE_BLOCKLIST: &[&str] = &[
     "try_lock",
 ];
 
+/// Whether a reference name can never bind cross-file because it is one of
+/// the ubiquitous names above.
+///
+/// A bare name is judged as is. A qualified path (`Type::member`,
+/// `krate::module::Type::member`) is judged by the segment that owns the
+/// member: `new`, `build`, or `default` behind a project type is a distinct
+/// path the resolver validates segment by segment, so the member itself is
+/// exempt; behind `Self` or a blocklisted std type it stays out, since those
+/// paths never lead to a project symbol. Retention cannot tell `std::fs`
+/// from a workspace module, so sealing re-applies the member's verdict when
+/// the owner is not attested by the referencing file's imports, crate roots,
+/// or modules.
+pub(crate) fn cross_file_reference_name_is_blocklisted(reference_name: &str) -> bool {
+    let Some((owner_path, member)) = reference_name.rsplit_once("::") else {
+        return reference_name.is_empty()
+            || CROSS_FILE_REFERENCE_BLOCKLIST.contains(&reference_name);
+    };
+    let owner = owner_path.rsplit("::").next().unwrap_or(owner_path);
+    member.is_empty()
+        || owner.is_empty()
+        || owner == "Self"
+        || CROSS_FILE_REFERENCE_BLOCKLIST.contains(&owner)
+}
+
+/// Map a Rust UFCS trait-impl method path `<Type as Trait>::method` to the
+/// type-path form `Type::method` that call sites write (`WalkEventIter::from`,
+/// `Builder::default`). Keeps the intentional `<Type as Trait>` definition
+/// name while restoring same-file / seal recall for those calls. `None` when
+/// `path` is not a well-formed UFCS trait-impl method.
+pub(crate) fn rust_type_path_alias_for_trait_impl_method(path: &str) -> Option<String> {
+    if !path.starts_with('<') {
+        return None;
+    }
+    let mut depth = 0_i32;
+    let mut as_split = None;
+    let mut close = None;
+    for (index, character) in path.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(index);
+                    break;
+                }
+            }
+            _ => {
+                if depth == 1 && as_split.is_none() && path[index..].starts_with(" as ") {
+                    as_split = Some(index);
+                }
+            }
+        }
+    }
+    let as_split = as_split?;
+    let close = close?;
+    let type_name = path.get(1..as_split)?.trim();
+    let trait_name = path.get(as_split + " as ".len()..close)?.trim();
+    let method = path.get(close + 1..)?.strip_prefix("::")?;
+    if type_name.is_empty()
+        || trait_name.is_empty()
+        || method.is_empty()
+        || method.contains(':')
+        || method.contains('<')
+    {
+        return None;
+    }
+    Some(format!("{type_name}::{method}"))
+}
+
+/// Whether `qualified_name`'s file-relative path is a UFCS trait-impl method
+/// (`file.rs::<Type as Trait>::method`).
+pub(crate) fn rust_qualified_name_is_ufcs_trait_impl(qualified_name: &str) -> bool {
+    qualified_name
+        .split_once("::")
+        .is_some_and(|(_, relative)| rust_type_path_alias_for_trait_impl_method(relative).is_some())
+}
+
 /// Resolve same-file symbol references (calls and other extractor reference
 /// kinds) into relation edges, and retain the references this file cannot
 /// bind as typed cross-file candidates. Only an UNAMBIGUOUS kind-compatible
@@ -2069,7 +2206,8 @@ fn resolve_file_references(
     Vec<CodeIndexUnresolvedReferenceV1>,
 ) {
     let mut by_name: BTreeMap<&str, Vec<&SymbolRow>> = BTreeMap::new();
-    let mut by_file_relative_name: BTreeMap<&str, Vec<&SymbolRow>> = BTreeMap::new();
+    let mut by_file_relative_name: BTreeMap<String, Vec<&SymbolRow>> = BTreeMap::new();
+    let mut type_path_aliases: Vec<(String, &SymbolRow)> = Vec::new();
     for symbol in symbols {
         by_name
             .entry(symbol.name.as_str())
@@ -2080,9 +2218,41 @@ fn resolve_file_references(
             .split_once("::")
             .map_or(symbol.qualified_name.as_str(), |(_, name)| name);
         by_file_relative_name
-            .entry(relative_name)
+            .entry(relative_name.to_owned())
             .or_default()
             .push(symbol);
+        // Dual-index `<Type as Trait>::method` under `Type::method` so
+        // type-path calls bind without renaming the definition. Collected
+        // first so an inherent `Type::method` already in the map keeps the
+        // path and trait-impl aliases do not steal it.
+        if let Some(alias) = rust_type_path_alias_for_trait_impl_method(relative_name) {
+            type_path_aliases.push((alias.clone(), symbol));
+            if let Some((type_name, method)) = alias.rsplit_once("::")
+                && let Some(simple) = type_name.rsplit("::").next()
+                && simple != type_name
+            {
+                type_path_aliases.push((format!("{simple}::{method}"), symbol));
+            }
+        }
+    }
+    for (alias, symbol) in type_path_aliases {
+        let bucket = by_file_relative_name.entry(alias).or_default();
+        if bucket.iter().any(|existing| {
+            let relative = existing
+                .qualified_name
+                .split_once("::")
+                .map_or(existing.qualified_name.as_str(), |(_, name)| name);
+            rust_type_path_alias_for_trait_impl_method(relative).is_none()
+        }) {
+            continue;
+        }
+        if bucket
+            .iter()
+            .any(|existing| existing.node_id == symbol.node_id)
+        {
+            continue;
+        }
+        bucket.push(symbol);
     }
     let mut references_by_site: HashMap<(&str, EdgeKind, u32, u32), Vec<&UnresolvedRef>> =
         HashMap::new();
@@ -2207,15 +2377,9 @@ fn cross_file_reference_candidate(
     reference: &UnresolvedRef,
     by_node_id: &BTreeMap<&str, Option<&SymbolRow>>,
 ) -> Option<CodeIndexUnresolvedReferenceV1> {
-    if reference.reference_name.contains('.') {
-        return None;
-    }
-    let simple_name = reference
-        .reference_name
-        .rsplit("::")
-        .next()
-        .unwrap_or(reference.reference_name.as_str());
-    if simple_name.is_empty() || CROSS_FILE_REFERENCE_BLOCKLIST.contains(&simple_name) {
+    if reference.reference_name.contains('.')
+        || cross_file_reference_name_is_blocklisted(&reference.reference_name)
+    {
         return None;
     }
     let kind = canonical_relation_kind(&reference.reference_kind)?;
@@ -2560,17 +2724,20 @@ fn attribute_whitespace_only_windows(source: &str, pending: &mut Vec<PendingChun
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::extract::ExtractionCoverageV1;
     use tracedecay_domain::{
-        BoundedSanitizedText, ChunkerRevision, CodeGenerationId, CodeSearchChunkAnchorV1,
-        CodeSearchChunkGrainV1, CodeSearchChunkId, ContentDigest, FileOccurrenceId,
-        GrammarRevision, LanguageDescriptorRevision, LanguageId, ManifestDigest, PolicyRevisionId,
-        ProjectId, SanitizationReceiptId, SanitizedCodeFileV1, SanitizedCodeSnapshotV1,
-        SanitizerRevision, SensitivityDecision, SensitivityLevelV1, SnapshotFileDispositionV1,
-        SourceSpan, SymbolOccurrenceId, UtcMicros, ValidatedCodeFileV1,
+        BoundedSanitizedText, ChunkerRevision, CodeGenerationId, CodeIndexWorkerSelectionV1,
+        CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId, ContentDigest,
+        FileOccurrenceId, GrammarRevision, LanguageDescriptorRevision, LanguageId, ManifestDigest,
+        PolicyRevisionId, ProjectId, SanitizationReceiptId, SanitizedCodeFileV1,
+        SanitizedCodeSnapshotV1, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
+        SnapshotFileDispositionV1, SourceSpan, SymbolOccurrenceId, UtcMicros, ValidatedCodeFileV1,
     };
+    use tracedecay_runtime_core::resident_memory::DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1;
 
     use crate::extract::{
         ExtractionCancellation, LanguageExtractor as CanonicalLanguageExtractor, NeverCancelled,
@@ -2694,7 +2861,163 @@ mod tests {
 
         let mut wrong_membership = file_chunks();
         wrong_membership.document.chunk_ids[0] = id("chunk.other");
-        assert!(wrong_membership.validate().is_err());
+        assert_eq!(
+            wrong_membership.validate(),
+            Err(ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::DocumentChunkMembershipMismatch,
+                )
+            ))
+        );
+    }
+
+    const ADMISSION_STEP_DEADLINE: Duration = Duration::from_secs(10);
+
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !condition() {
+            assert!(
+                started.elapsed() < ADMISSION_STEP_DEADLINE,
+                "{what} did not happen within {ADMISSION_STEP_DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The caller that already holds one background-CPU unit keeps it for the
+    /// ordered chunk sweep. A full-width waiter queued at the FIFO head must
+    /// stay queued: handing it the caller's unit is the return path that left
+    /// the same parent holding the role on every batch.
+    #[test]
+    fn ordered_chunk_sweep_does_not_return_the_callers_cpu_unit() {
+        // The installed authority is global. Run this scenario alone so its
+        // queue counters cannot be advanced by another test's admissions.
+        if std::env::var_os("TRACEDECAY_CHUNK_SWEEP_ROLE_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .arg("--exact")
+                .arg(std::thread::current().name().expect("named libtest thread"))
+                .arg("--nocapture")
+                .env("TRACEDECAY_CHUNK_SWEEP_ROLE_CHILD", "1")
+                .output()
+                .expect("run isolated admission test");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let installed = crate::parallelism::install_worker_plan(
+            CodeIndexWorkerSelectionV1::Automatic {},
+            DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get(),
+        )
+        .expect("install the automatic worker plan");
+        let authority = installed.background_cpu;
+        let width = authority.width().get();
+        if width < 2 {
+            return;
+        }
+        // Above the old batch threshold so a reverted join still admits leaves.
+        let chunks =
+            std::iter::repeat_n(Arc::clone(&file_chunks().chunks[0]), 64).collect::<Vec<_>>();
+        let holder_admitted = Arc::new(AtomicBool::new(false));
+        let head_queued = Arc::new(AtomicBool::new(false));
+        let head_finished = Arc::new(AtomicBool::new(false));
+
+        let holder = {
+            let authority = Arc::clone(&authority);
+            let holder_admitted = Arc::clone(&holder_admitted);
+            let head_queued = Arc::clone(&head_queued);
+            let head_finished = Arc::clone(&head_finished);
+            std::thread::spawn(move || {
+                crate::parallelism::with_background_cpu_permit(|| {
+                    holder_admitted.store(true, Ordering::SeqCst);
+                    wait_until("full-width head request queued", || {
+                        head_queued.load(Ordering::SeqCst)
+                    });
+                    assert_eq!(authority.active_units(), 1);
+                    assert_eq!(authority.waiting_work_units(), width);
+                    try_for_each_chunk_ordered(&chunks, |_| Ok(())).expect("ordered chunk sweep");
+                    assert!(
+                        !head_finished.load(Ordering::SeqCst),
+                        "the chunk sweep returned the caller's unit to the FIFO head"
+                    );
+                    assert_eq!(
+                        authority.active_units(),
+                        1,
+                        "the caller must still hold its unit after the sweep"
+                    );
+                    assert_eq!(
+                        authority.waiting_work_units(),
+                        width,
+                        "chunk leaves joined the FIFO as their own waiters"
+                    );
+                });
+            })
+        };
+        wait_until("holder admitted", || holder_admitted.load(Ordering::SeqCst));
+
+        let head = {
+            let head_finished = Arc::clone(&head_finished);
+            std::thread::spawn(move || {
+                crate::parallelism::with_background_cpu_permits(width, || {
+                    head_finished.store(true, Ordering::SeqCst);
+                });
+            })
+        };
+        wait_until("head request waiting for the full width", || {
+            authority.waiting_work_units() >= width
+        });
+        head_queued.store(true, Ordering::SeqCst);
+
+        let started = Instant::now();
+        while !holder.is_finished() {
+            assert!(
+                started.elapsed() < ADMISSION_STEP_DEADLINE,
+                "ordered chunk sweep wedged for {ADMISSION_STEP_DEADLINE:?}: \
+                 active_units={} waiting_work_units={}",
+                authority.active_units(),
+                authority.waiting_work_units()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.join().expect("holder thread");
+        head.join().expect("head thread");
+        assert!(head_finished.load(Ordering::SeqCst));
+        assert_eq!(authority.active_units(), 0);
+        assert_eq!(authority.waiting_work_units(), 0);
+    }
+
+    /// Chunk rows are not a pool actor. A merge that puts a join back in this
+    /// file assigns the CPU role to stolen leaves again.
+    #[test]
+    fn chunk_sweeps_are_not_a_pool_actor() {
+        let source = include_str!("chunks.rs");
+        let pool_tokens = [
+            concat!("ray", "on"),
+            concat!("par_", "iter"),
+            concat!("par_", "chunks"),
+            concat!("par_", "bridge"),
+            concat!("with_yielded_background_cpu_", "permits"),
+        ];
+        let code_lines = source
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| !line.starts_with("//"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for token in pool_tokens {
+            let hits = code_lines
+                .iter()
+                .filter(|line| line.contains(token))
+                .collect::<Vec<_>>();
+            assert!(
+                hits.is_empty(),
+                "`{token}` assigns chunk work a pool role: {hits:?}"
+            );
+        }
     }
 
     const RUST_SOURCE: &str = "//! Module documentation.\n\nuse std::collections::HashMap;\n\n/// Doc comment.\npub fn alpha(x: u32) -> u32 {\n    x + 1\n}\n\npub struct Holder {\n    map: HashMap<u32, u32>,\n}\n\nimpl Holder {\n    pub fn get(&self, key: u32) -> Option<u32> {\n        self.map.get(&key).copied()\n    }\n}\n\n// A trailing free-floating comment.\n";
@@ -2811,8 +3134,8 @@ mod tests {
             .expect("chunking succeeds")
     }
 
-    /// A chunk set large enough to cross `PARALLEL_CHUNK_THRESHOLD`, built from
-    /// real extraction rather than hand-assembled chunks.
+    /// A generation-sized chunk set, built from real extraction rather than
+    /// hand-assembled chunks.
     fn wide_chunk_source(symbols: usize) -> String {
         let mut source =
             String::from("//! Module documentation.\n\nuse std::collections::HashMap;\n\n");
@@ -2827,8 +3150,8 @@ mod tests {
     fn wide_chunks(symbols: usize) -> CodeFileChunksV1 {
         let chunks = chunk_source(&wide_chunk_source(symbols));
         assert!(
-            chunks.chunks.len() > PARALLEL_CHUNK_THRESHOLD,
-            "fixture must cross the parallel threshold, got {} chunks",
+            chunks.chunks.len() > 16,
+            "fixture must be a non-trivial generation, got {} chunks",
             chunks.chunks.len()
         );
         chunks
@@ -2867,8 +3190,9 @@ mod tests {
         forged.subtokens.push("forged".to_owned());
         assert!(matches!(
             authority.admit(Arc::new(forged)),
-            Err(ChunkingFailureV1::NonCanonicalIdentity(message))
-                if message.contains("does not match parser-backed exact extraction authority")
+            Err(ChunkingFailureV1::NonCanonicalIdentity(cause))
+                if cause.reason_code()
+                    == crate::noncanonical::NonCanonicalReasonCodeV1::ExactAuthorityMismatch
         ));
 
         let mut unknown = (*chunks.chunks[5]).clone();
@@ -2938,11 +3262,11 @@ mod tests {
 
         authority
             .validate_all(&chunks.chunks)
-            .expect("parallel validation accepts its own chunks");
+            .expect("ordered validation accepts its own chunks");
 
         let admitted = authority
             .admit_all(chunks.chunks.clone())
-            .expect("parallel admission");
+            .expect("ordered admission");
         let readmitted = admitted
             .into_iter()
             .map(ExtractionAdmittedCodeSearchChunkV1::into_chunk)
@@ -2955,10 +3279,10 @@ mod tests {
         assert_eq!(readmitted, expected, "admission must preserve order");
     }
 
-    /// The fanned-out sweeps still report the lowest-index failure, so callers
-    /// observe the same error the sequential short-circuit produced.
+    /// The ordered sweep reports the lowest-index failure, the same error a
+    /// short-circuit over the chunks produces.
     #[test]
-    fn parallel_validation_reports_the_lowest_index_failure() {
+    fn ordered_validation_reports_the_lowest_index_failure() {
         let baseline = wide_chunks(48);
         let early = 3usize;
         let late = baseline.chunks.len() - 2;
@@ -2988,6 +3312,65 @@ mod tests {
         assert_eq!(
             generation_first.validate(),
             Err(ChunkingFailureV1::GenerationMismatch)
+        );
+    }
+
+    /// A typed failure stops later units, and an earlier panic is returned as
+    /// a typed failure rather than unwinding the sweep.
+    #[test]
+    fn ordered_sweep_keeps_the_earliest_unit() {
+        let chunks = wide_chunks(48);
+        let early = 3usize;
+        let late = chunks.chunks.len() - 1;
+        assert!(early < late);
+
+        let kept = try_for_each_chunk_ordered(&chunks.chunks, |chunk| {
+            let index = chunks
+                .chunks
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, chunk))
+                .expect("chunk index");
+            if index == late {
+                panic!("later unit");
+            }
+            if index == early {
+                return Err(ChunkingFailureV1::GenerationMismatch);
+            }
+            Ok(())
+        });
+        assert_eq!(
+            kept,
+            Err(ChunkingFailureV1::GenerationMismatch),
+            "the earlier typed failure must survive a later panic"
+        );
+
+        let panicked = try_for_each_chunk_ordered(&chunks.chunks, |chunk| {
+            let index = chunks
+                .chunks
+                .iter()
+                .position(|candidate| Arc::ptr_eq(candidate, chunk))
+                .expect("chunk index");
+            if index == early {
+                panic!("earliest unit");
+            }
+            if index == late {
+                return Err(ChunkingFailureV1::GenerationMismatch);
+            }
+            Ok(())
+        })
+        .expect_err("the earliest panic must be a typed failure, not an unwind");
+        let rendered = panicked.to_string();
+        assert!(
+            rendered.contains(&early.to_string()),
+            "the panicked unit index must be named, got {rendered}"
+        );
+        assert!(
+            rendered.contains("panicked"),
+            "the earliest failure must say the unit panicked, got {rendered}"
+        );
+        assert!(
+            !matches!(panicked, ChunkingFailureV1::GenerationMismatch),
+            "a later typed failure must not replace the earlier panic"
         );
     }
 
@@ -3983,6 +4366,130 @@ pub fn real_symbol() {}
             ["target", "target"]
         );
         assert_ne!(calls[0].evidence_span, calls[1].evidence_span);
+    }
+
+    #[test]
+    fn rust_type_path_alias_parses_ufcs_trait_impl_methods() {
+        assert_eq!(
+            rust_type_path_alias_for_trait_impl_method("<WalkEventIter as From<WalkDir>>::from")
+                .as_deref(),
+            Some("WalkEventIter::from")
+        );
+        assert_eq!(
+            rust_type_path_alias_for_trait_impl_method("<crate::Builder as crate::First>::build")
+                .as_deref(),
+            Some("crate::Builder::build")
+        );
+        assert_eq!(
+            rust_type_path_alias_for_trait_impl_method("WalkEventIter::from"),
+            None
+        );
+        assert!(rust_qualified_name_is_ufcs_trait_impl(
+            "crates/ignore/src/walk.rs::<WalkEventIter as From<WalkDir>>::from"
+        ));
+        assert!(!rust_qualified_name_is_ufcs_trait_impl(
+            "crates/ignore/src/walk.rs::WalkEventIter::from"
+        ));
+    }
+
+    #[test]
+    fn type_path_call_binds_unique_trait_impl_method() {
+        let source = concat!(
+            "struct WalkEventIter;\n",
+            "struct WalkDir;\n",
+            "impl From<WalkDir> for WalkEventIter {\n",
+            "    fn from(it: WalkDir) -> WalkEventIter { WalkEventIter }\n",
+            "}\n",
+            "fn build(wd: WalkDir) {\n",
+            "    let _ = WalkEventIter::from(wd);\n",
+            "}\n",
+        );
+        let file = validated_file("src/walk.rs", source.as_bytes());
+        let batch = batch_for(&file, ParseOutcomeV1::Complete);
+        let artifacts = chunker()
+            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
+            .expect("indexing succeeds");
+        let from_method = artifacts
+            .symbols
+            .iter()
+            .find(|symbol| {
+                symbol.qualified_name == "src/walk.rs::<WalkEventIter as From<WalkDir>>::from"
+            })
+            .expect("UFCS From::from method");
+        let build = artifacts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "src/walk.rs::build")
+            .expect("build function");
+        assert!(
+            artifacts.edges.iter().any(|edge| {
+                edge.from_occurrence == build.occurrence
+                    && edge.to_occurrence == from_method.occurrence
+                    && edge.kind == RelationEdgeKindV1::Calls
+                    && edge.authority == EdgeAuthorityV1::SyntaxExact
+            }),
+            "WalkEventIter::from must bind to <WalkEventIter as From<WalkDir>>::from"
+        );
+        assert!(
+            !artifacts
+                .unresolved_references
+                .iter()
+                .any(|reference| { reference.reference_name == "WalkEventIter::from" }),
+            "type-path call must resolve same-file rather than remain for sealing"
+        );
+    }
+
+    #[test]
+    fn type_path_alias_does_not_steal_inherent_method() {
+        let source = concat!(
+            "struct Builder;\n",
+            "trait First { fn build(&self); }\n",
+            "impl Builder {\n",
+            "    fn build(&self) {}\n",
+            "}\n",
+            "impl First for Builder {\n",
+            "    fn build(&self) {}\n",
+            "}\n",
+            "fn assemble() {\n",
+            "    Builder::build(&Builder);\n",
+            "}\n",
+        );
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let batch = batch_for(&file, ParseOutcomeV1::Complete);
+        let artifacts = chunker()
+            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
+            .expect("indexing succeeds");
+        let inherent = artifacts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "src/lib.rs::Builder::build")
+            .expect("inherent Builder::build");
+        let trait_impl = artifacts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "src/lib.rs::<Builder as First>::build")
+            .expect("trait-impl build");
+        let assemble = artifacts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "src/lib.rs::assemble")
+            .expect("assemble");
+        assert!(
+            artifacts.edges.iter().any(|edge| {
+                edge.from_occurrence == assemble.occurrence
+                    && edge.to_occurrence == inherent.occurrence
+                    && edge.kind == RelationEdgeKindV1::Calls
+            }),
+            "Builder::build must keep the inherent method when both exist"
+        );
+        assert!(
+            artifacts.edges.iter().all(|edge| {
+                edge.from_occurrence != assemble.occurrence
+                    || edge.to_occurrence != trait_impl.occurrence
+                    || edge.kind != RelationEdgeKindV1::Calls
+            }),
+            "trait-impl alias must not steal the inherent type-path binding"
+        );
     }
 
     #[test]

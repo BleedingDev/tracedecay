@@ -71,7 +71,6 @@ pub enum FeedbackDeliveryRouteV1 {
     Http,
     Lsp,
     HookV2,
-    HookLegacy,
     Scout,
 }
 
@@ -551,7 +550,6 @@ pub fn rejected_argument_cell(
                 Some(
                     FeedbackDeliveryRouteV1::Lsp
                     | FeedbackDeliveryRouteV1::HookV2
-                    | FeedbackDeliveryRouteV1::HookLegacy
                     | FeedbackDeliveryRouteV1::Scout,
                 )
                 | None => RejectedArgumentSurfaceV1::Unknown,

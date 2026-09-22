@@ -134,14 +134,9 @@
       "scope": "cargo_slot"
     }
   ],
-  "decision_policy": {
-    "required_cancellation": "bounded_typed_cancelled",
-    "required_fallback_byte_stability": true,
-    "required_offline": "no_network_and_query_fallback_available"
-  },
   "expected_query_fallback_digests": {
-    "train": "sha256:afa693698d371e76f4b6bb127886e6636e5294399ff5e95a5a29e9ea1ef77b36",
-    "validation": "sha256:0d797947f45d597927c6cbdd4e4d9598ff2fe46c78acfd121164d5584a0a2fc5"
+    "train": "sha256:d020b61b1658145487d4d1ea9622ad6075293c329e202bb351c49290bc398067",
+    "validation": "sha256:934459d069cc368f06ce81d950116d4c823965a95c8f752eef9d41b45a0c01cb"
   },
   "profile_matrix": [
     {

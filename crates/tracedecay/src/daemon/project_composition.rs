@@ -1124,10 +1124,8 @@ impl ProjectOpenInputs<'_> {
             ),
         );
         let code_index_hook_sink = code_index_hook_sink(Arc::clone(&code_index_activation));
-        let code_index_reconcile_sink = code_index_reconcile_sink(
-            self.invocation.code_index_schedulers.clone(),
-            Arc::clone(&code_index_activation),
-        );
+        let code_index_reconcile_sink =
+            code_index_reconcile_sink(Arc::clone(&code_index_activation));
         let code_index_freshness_probe_sink = code_index_freshness_probe_sink(
             self.invocation.code_index_schedulers.clone(),
             Arc::clone(&code_index_activation),
@@ -2229,7 +2227,7 @@ fn project_dashboard_freshness_reader(
     let reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
         Arc::new(move |project_root| {
             let schedulers = schedulers.clone();
-            Box::pin(async move { schedulers.dashboard_freshness(&project_root).await })
+            Box::pin(async move { schedulers.dashboard_freshness_read(&project_root).await })
         });
     reader
 }

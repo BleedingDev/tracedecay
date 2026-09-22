@@ -29,6 +29,7 @@ import {
   AutomationSchedulerStatusV1Schema,
   CodeIndexFreshnessPayloadV1Schema,
   CostsReadModelV1Schema,
+  DeliveryInboxV1Schema,
   DeliveryOverviewV1Schema,
   DoctorFindingsPayloadV1Schema,
   DashboardEnvelopeV1Schema,
@@ -42,6 +43,7 @@ import {
   LcmOverviewPayloadV1Schema,
   LcmTimelinePayloadV1Schema,
   LoomTemporalPayloadV1Schema,
+  MemoryFactDetailPayloadV1Schema,
   MemoryOverviewPayloadV1Schema,
   AutomationRunResultV1Schema,
   MemoryStatusPayloadV1Schema,
@@ -49,6 +51,7 @@ import {
   ProjectContextPayloadV1Schema,
   ProjectsPayloadV1Schema,
   RemoteOperationalStatusPayloadV1Schema,
+  SavingsModelsPayloadV1Schema,
   SavingsOverviewPayloadV1Schema,
   SavingsSessionsPayloadV1Schema,
   SettingsPayloadV1Schema,
@@ -57,9 +60,11 @@ import {
   StructureReadV12Schema,
   ListTaskHandoffsResultV1Schema,
   WorkflowDefinitionSchema,
+  WorkflowRunProjectionSchema,
   WorkGraphReadV1Schema,
 } from '../../src/contracts/generated.ts';
 import { workPayload } from '../../src/workspaces/work/workApi.ts';
+import { TrustHistoryPayloadSchema } from '../../src/data/query/memory.ts';
 
 /** Parse one resolved fixture, surfacing zod's issues on failure — the same
  * reporting shape `endpoint-fixtures.test.ts` uses, so a drift report reads the
@@ -112,8 +117,10 @@ const CONTRACTS: Readonly<Record<string, ZodType<unknown>>> = {
   ),
   '/api/loom/temporal': DashboardEnvelopeV1Schema(LoomTemporalPayloadV1Schema),
   '/api/delivery/overview': DashboardEnvelopeV1Schema(DeliveryOverviewV1Schema),
+  '/api/delivery/inbox': DashboardEnvelopeV1Schema(DeliveryInboxV1Schema),
   '/api/plugins/savings/overview': DashboardEnvelopeV1Schema(SavingsOverviewPayloadV1Schema),
   '/api/plugins/savings/sessions': SavingsSessionsPayloadV1Schema,
+  '/api/plugins/savings/models': SavingsModelsPayloadV1Schema,
   '/api/plugins/analytics/overview': DashboardEnvelopeV1Schema(AnalyticsOverviewPayloadV1Schema),
   '/api/plugins/analytics/usage': DashboardEnvelopeV1Schema(AnalyticsUsageSummaryV1Schema),
   '/api/plugins/analytics/agents': DashboardEnvelopeV1Schema(AnalyticsAgentsPayloadV1Schema),
@@ -154,6 +161,8 @@ const APPLICATION_ENVELOPE: Readonly<Record<string, ZodType<unknown>>> = {
   // A workflow read answers through the same application wrapper Work reads
   // use; the walked payload is the definitions array itself.
   '/api/application/workflow/list-definitions': z.array(WorkflowDefinitionSchema),
+  '/api/application/workflow/definition-history': z.array(WorkflowDefinitionSchema),
+  '/api/application/workflow/get-run': WorkflowRunProjectionSchema,
   '/api/application/handoff/list-task': ListTaskHandoffsResultV1Schema,
 };
 
@@ -189,6 +198,21 @@ const DYNAMIC: ReadonlyArray<{
     schema: DashboardEnvelopeV1Schema(GraphNeighborsPayloadV1Schema),
   },
   {
+    label: 'memory_api::fact_detail held fact',
+    pathname: `/api/plugins/holographic/fact/${encodeURIComponent(`fact.${'a'.repeat(64)}.${'0'.repeat(64)}`)}`,
+    schema: DashboardEnvelopeV1Schema(MemoryFactDetailPayloadV1Schema),
+  },
+  {
+    label: 'memory_api::fact_detail unknown identity',
+    pathname: '/api/plugins/holographic/fact/fact.unknown',
+    schema: DashboardEnvelopeV1Schema(z.null()),
+  },
+  {
+    label: 'memory_api::fact_trust_history',
+    pathname: `/api/plugins/holographic/fact/${encodeURIComponent(`fact.${'a'.repeat(64)}.${'0'.repeat(64)}`)}/trust-history`,
+    schema: TrustHistoryPayloadSchema,
+  },
+  {
     label: 'graph_api::subgraph seeded',
     pathname: '/api/plugins/graph/subgraph',
     search: '?node_id=sym-0',
@@ -211,6 +235,18 @@ const DYNAMIC: ReadonlyArray<{
     pathname: '/api/plugins/graph/shared-code/family',
     search: '?symbol_occurrence_id=sym-0&match_class=rename_normalized_exact&limit=100',
     schema: DashboardEnvelopeV1Schema(SimilarResultV1Schema),
+  },
+  {
+    label: 'savings_api::models today',
+    pathname: '/api/plugins/savings/models',
+    search: '?range=today',
+    schema: SavingsModelsPayloadV1Schema,
+  },
+  {
+    label: 'savings_api::models 30d',
+    pathname: '/api/plugins/savings/models',
+    search: '?range=30d',
+    schema: SavingsModelsPayloadV1Schema,
   },
 ];
 

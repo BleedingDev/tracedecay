@@ -249,7 +249,23 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1> {
-        let canonical_root = project_root.canonicalize().ok()?;
+        self.dashboard_freshness_read(project_root)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn dashboard_freshness_read(
+        &self,
+        project_root: &Path,
+    ) -> Result<
+        Option<tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1>,
+        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1,
+    > {
+        let canonical_root = match project_root.canonicalize() {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
         let cadence_telemetry = Arc::clone(&self.cadence_telemetry);
         let (
             scheduler,
@@ -266,7 +282,9 @@ impl CodeIndexSchedulerRegistryV1 {
             graph_activation_enabled,
         ) = {
             let mounted = self.mounted.lock().await;
-            let worktree = mounted.get(&canonical_root)?;
+            let Some(worktree) = mounted.get(&canonical_root) else {
+                return Ok(None);
+            };
             (
                 Arc::clone(&worktree.scheduler),
                 Arc::clone(&worktree.reconcile_in_progress),
@@ -360,12 +378,23 @@ impl CodeIndexSchedulerRegistryV1 {
                         graph_activation_enabled,
                         &code_graph_serving,
                     );
-                    let verifying = ready && refresh_in_flight && !source_change_pending;
-                    let refreshing = refresh_in_flight && !verifying;
-                    let rebuild_in_flight = refreshing;
-                    let stale = hook_hint_count != Some(0);
+                    let observation = tracedecay_contracts::code_index_freshness::CodeIndexFreshnessLadderV1::project(
+                        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessLadderInputsV1 {
+                            ready,
+                            refresh_in_flight,
+                            source_change_pending,
+                            parked: parked.as_ref(),
+                            // The scheduler lock is held by the pass this read
+                            // could not join, so verification is unknown here.
+                            source_verified: None,
+                            hook_hint_count,
+                        },
+                    );
                     let clone_index = text.as_ref().map_or_else(Default::default, |text| {
-                        text.clone_index_status(stale || refreshing, clone_update)
+                        text.clone_index_status(
+                            hook_hint_count != Some(0) || observation.rebuild_in_flight,
+                            clone_update,
+                        )
                     });
                     let last_reconcile_micros = match last_reconciled_at_micros
                         .load(Ordering::Acquire)
@@ -378,38 +407,10 @@ impl CodeIndexSchedulerRegistryV1 {
                         code_graph_serving,
                         clone_index: Some(clone_index),
                         last_reconcile_micros,
-                        rebuild_in_flight,
-                        staleness_state: Some(
-                            if parked.is_some() && !ready {
-                                "parked"
-                            } else if verifying {
-                                "verifying"
-                            } else if refreshing {
-                                if ready {
-                                    "refreshing"
-                                } else {
-                                    "indexing"
-                                }
-                            } else if stale && ready {
-                                "stale"
-                            } else if ready {
-                                "fresh"
-                            } else {
-                                "indexing"
-                            }
-                            .to_owned(),
-                        ),
+                        rebuild_in_flight: observation.rebuild_in_flight,
+                        staleness_state: Some(observation.staleness_state),
                         hook_hint_count,
-                        coverage: if refreshing {
-                            "partial_refresh_in_progress"
-                        } else if verifying {
-                            "partial_source_verification"
-                        } else if hook_hint_count.is_some() {
-                            "complete"
-                        } else {
-                            "partial_hook_hint_overflow"
-                        }
-                        .to_owned(),
+                        coverage: observation.coverage,
                         progress,
                         parked,
                         generation_recovery,
@@ -451,33 +452,19 @@ impl CodeIndexSchedulerRegistryV1 {
                 graph_activation_enabled,
                 &code_graph_serving,
             );
-            let verifying = ready && refresh_in_flight && !source_change_pending;
-            let refreshing = refresh_in_flight && !verifying;
-            let rebuild_in_flight = refreshing;
+            let observation = tracedecay_contracts::code_index_freshness::CodeIndexFreshnessLadderV1::project(
+                tracedecay_contracts::code_index_freshness::CodeIndexFreshnessLadderInputsV1 {
+                    ready,
+                    refresh_in_flight,
+                    source_change_pending,
+                    parked: parked.as_ref(),
+                    source_verified: Some(verified),
+                    hook_hint_count,
+                },
+            );
             let clone_index = text.as_ref().map_or_else(Default::default, |text| {
-                text.clone_index_status(stale || refreshing, clone_update)
+                text.clone_index_status(stale || observation.rebuild_in_flight, clone_update)
             });
-            let staleness_state = if parked.is_some() && !ready {
-                "parked"
-            } else if verifying {
-                "verifying"
-            } else if refreshing {
-                if ready {
-                    "refreshing"
-                } else {
-                    "indexing"
-                }
-            } else if stale || hook_hint_count != Some(0) {
-                if ready {
-                    "stale"
-                } else {
-                    "indexing"
-                }
-            } else if ready {
-                "fresh"
-            } else {
-                "indexing"
-            };
             let identity = if text.is_some() {
                 dashboard_text_freshness_identity(text.as_ref())
             } else {
@@ -488,21 +475,10 @@ impl CodeIndexSchedulerRegistryV1 {
                 code_graph_serving,
                 clone_index: Some(clone_index),
                 last_reconcile_micros: scheduler.last_reconciled_at_micros(),
-                rebuild_in_flight,
-                staleness_state: Some(staleness_state.to_owned()),
+                rebuild_in_flight: observation.rebuild_in_flight,
+                staleness_state: Some(observation.staleness_state),
                 hook_hint_count,
-                coverage: if refreshing {
-                    "partial_refresh_in_progress"
-                } else if verifying {
-                    "partial_source_verification"
-                } else if !verified {
-                    "partial_unverified_restore"
-                } else if hook_hint_count.is_some() {
-                    "complete"
-                } else {
-                    "partial_hook_hint_overflow"
-                }
-                .to_owned(),
+                coverage: observation.coverage,
                 progress,
                 parked,
                 generation_recovery,
@@ -510,7 +486,10 @@ impl CodeIndexSchedulerRegistryV1 {
             }
         })
         .await
-        .ok()
+        .map(Some)
+        .map_err(|_| {
+            tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1::ReadFailed
+        })
     }
 
     /// The deterministic contract violation currently parking background
@@ -1475,7 +1454,8 @@ impl CodeIndexSchedulerRegistryV1 {
     pub async fn request_query_background_reconcile(
         &self,
         scope: &tracedecay_contracts::ResolvedScope,
-    ) -> bool {
+    ) -> super::CodeIndexReconcileAdmissionV1 {
+        use super::CodeIndexReconcileAdmissionV1;
         #[cfg(test)]
         let test_control = Self::query_admission_control_for_test(scope);
         #[cfg(test)]
@@ -1496,8 +1476,11 @@ impl CodeIndexSchedulerRegistryV1 {
         ) = {
             let mounted = self.mounted.lock().await;
             let Some((root, worktree)) = unique_mounted_for_scope(&mounted, scope).unique() else {
-                return false;
+                return CodeIndexReconcileAdmissionV1::Unavailable;
             };
+            if let Some(parked) = Self::publication_authority_reset(worktree) {
+                return CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(parked);
+            }
             (
                 root.clone(),
                 worktree.source_freshness.clone(),
@@ -1519,7 +1502,7 @@ impl CodeIndexSchedulerRegistryV1 {
         // the blocking freshness probe. A pending or concurrently claimed wake
         // already supplies this query's remedy.
         let Some(wake_claim) = PendingWakeClaimV1::claim(Arc::clone(&pending_wake)) else {
-            return false;
+            return CodeIndexReconcileAdmissionV1::Unavailable;
         };
         #[cfg(test)]
         if let Some(test_control) = test_control.as_ref()
@@ -1547,7 +1530,7 @@ impl CodeIndexSchedulerRegistryV1 {
             .is_some_and(LatestCodeTextGenerationV1::text_projection_needs_work);
         let proof_expired = !source_freshness.ready_without_stat(&root, &shutting_down);
         if !nothing_servable && !text_owners_are_warming && !proof_expired {
-            return false;
+            return CodeIndexReconcileAdmissionV1::Unavailable;
         }
         if nothing_servable {
             // This admission observed no source mutation, so it may not
@@ -1571,7 +1554,7 @@ impl CodeIndexSchedulerRegistryV1 {
         // `take_pending_arrival` (owner reset to zero); that only happens
         // inside a reconcile pass, which is itself the remedy.
         if !wake_claim.still_owns() {
-            return false;
+            return CodeIndexReconcileAdmissionV1::Unavailable;
         }
         Self::note_wake(
             &pending_wake,
@@ -1579,6 +1562,6 @@ impl CodeIndexSchedulerRegistryV1 {
             CodeIndexCadenceTriggerV1::QueryAdmission,
         );
         wake_claim.settle();
-        true
+        CodeIndexReconcileAdmissionV1::Accepted
     }
 }

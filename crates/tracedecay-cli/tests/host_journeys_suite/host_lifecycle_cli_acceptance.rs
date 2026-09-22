@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay_agent_hosts::agents::host_bundle::{
-    HostBundleComponentV1, HostComponentSetReceiptV1, HostKindV1, latest_host_component_receipt_at,
+    HostComponentSetReceiptV1, HostComponentV1, HostKindV1, latest_host_component_receipt_at,
     latest_host_component_set_receipt_at,
 };
 use tracedecay_agent_hosts::agents::host_bundle_registry::unsupported_host_component_set_reason;
@@ -927,11 +927,14 @@ fn production_cli_pins_lifecycle_outputs_to_invoked_v2_with_v1_on_path() {
     )
     .unwrap();
 
-    // Exercise the default install, update-plugin, repair, read-only
+    // Exercise explicit hook installation, update-plugin, repair, read-only
     // preflight, and an explicit component-set lifecycle while PATH offers a
     // different (V1) tracedecay entry first.
     for (phase, args) in [
-        ("install", vec!["install", "--agent", "opencode"]),
+        (
+            "install",
+            vec!["install", "--agent", "opencode", "--git-hook"],
+        ),
         ("update-plugin", vec!["update-plugin"]),
         ("reinstall", vec!["reinstall"]),
         ("preflight", vec!["reinstall", "--dry-run"]),
@@ -949,6 +952,11 @@ fn production_cli_pins_lifecycle_outputs_to_invoked_v2_with_v1_on_path() {
     ] {
         let output = cli.command_with_shadowing_v1(&args).output().unwrap();
         assert_success("opencode", phase, output);
+        if phase == "install" {
+            let contents = fs::read_to_string(&git_hook).unwrap();
+            assert!(contents.contains(&format!("{invoked_v2_text} sync >/dev/null 2>&1 &")));
+            assert!(!contents.contains(&format!("{shadowing_v1_text} sync >/dev/null 2>&1 &")));
+        }
     }
 
     let receipt = latest_receipt(&cli, HostKindV1::OpenCode);
@@ -2092,7 +2100,7 @@ fn killed_feedback_switch_recovers_from_durable_effect_identity() {
         &before_receipt
             .component_receipts
             .iter()
-            .find(|receipt| receipt.component == HostBundleComponentV1::Core)
+            .find(|receipt| receipt.component == HostComponentV1::Core)
             .unwrap()
             .artifacts[0]
             .relative_path,
@@ -2104,13 +2112,10 @@ fn killed_feedback_switch_recovers_from_durable_effect_identity() {
         fs::set_permissions(&permission_path, fs::Permissions::from_mode(0o640)).unwrap();
     }
     let before = owned_bytes(&cli, &before_receipt, &originals);
-    let before_core = latest_host_component_receipt_at(
-        &cli.lifecycle_root(),
-        case.host,
-        HostBundleComponentV1::Core,
-    )
-    .unwrap()
-    .unwrap();
+    let before_core =
+        latest_host_component_receipt_at(&cli.lifecycle_root(), case.host, HostComponentV1::Core)
+            .unwrap()
+            .unwrap();
     let state = cli.home.path().join("killed-feedback-rollback.json");
     let mut command = cli.command(&[
         "feedback-rollback",
@@ -2136,13 +2141,9 @@ fn killed_feedback_switch_recovers_from_durable_effect_identity() {
         "feedback fault boundary did not cross an artifact mutation"
     );
     assert_ne!(
-        latest_host_component_receipt_at(
-            &cli.lifecycle_root(),
-            case.host,
-            HostBundleComponentV1::Core
-        )
-        .unwrap()
-        .unwrap(),
+        latest_host_component_receipt_at(&cli.lifecycle_root(), case.host, HostComponentV1::Core)
+            .unwrap()
+            .unwrap(),
         before_core,
         "feedback fault boundary did not publish its component receipt"
     );

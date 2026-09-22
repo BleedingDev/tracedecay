@@ -352,6 +352,8 @@ fn projection_case_request(
     projection: &tracedecay_domain::AdmittedEmbeddingProjectionKeyV1,
     replay_reason: ProjectionReplayReasonV1,
 ) -> ProjectionBatchRequestV1 {
+    let (reused_count, reused_digest) =
+        ChangedCodeChunkSetV1::seal_reused_partition(&[]).expect("empty reused seal");
     let mut changes = ChangedCodeChunkSetV1 {
         from_generation,
         to_generation: generation.clone(),
@@ -366,7 +368,8 @@ fn projection_case_request(
             })
             .collect(),
         deleted: Vec::new(),
-        reused: Vec::new(),
+        reused_count,
+        reused_digest,
     };
     changes.manifest_digest = changes.compute_digest().expect("changed chunk digest");
     let mut request = ProjectionBatchRequestV1 {

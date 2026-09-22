@@ -522,6 +522,13 @@ export const AutomationRunTerminalV1Schema = z.discriminatedUnion("status", [z.o
 }).strict()]);
 export type AutomationRunTerminalV1 = z.infer<typeof AutomationRunTerminalV1Schema>;
 
+/** Closed availability vocabulary for the scheduler status reading.
+
+Wire tokens stay the historical labels. A new state is a compile error in
+[`scheduler_status_label`] until this enum gains a variant. */
+export const AutomationSchedulerAvailabilityV1Schema = z.enum(["automation_disabled", "backend_disabled", "configured", "delegated_host", "paused"]);
+export type AutomationSchedulerAvailabilityV1 = z.infer<typeof AutomationSchedulerAvailabilityV1Schema>;
+
 /** The scheduler reading served by `status`, `pause`, and `resume`.
 
 Automation is autonomous: the status has no pending-review counters. The
@@ -535,7 +542,7 @@ export const AutomationSchedulerStatusV1Schema = z.object({
   now: z.number().int().safe(),
   paused: z.boolean(),
   scheduler_tick_secs: z.number().int().safe().min(0),
-  status: z.string(),
+  status: z.lazy(() => AutomationSchedulerAvailabilityV1Schema),
   tasks: z.array(z.lazy(() => AutomationTaskStatusV1Schema)),
 }).strict();
 export type AutomationSchedulerStatusV1 = z.infer<typeof AutomationSchedulerStatusV1Schema>;
@@ -550,13 +557,13 @@ export const AutomationSettingsPayloadV1Schema = z.object({
 });
 export type AutomationSettingsPayloadV1 = z.infer<typeof AutomationSettingsPayloadV1Schema>;
 
-export const AutomationSkipReasonV1Schema = z.enum(["automation_disabled", "backend_disabled", "combined_review_disabled", "delegated_host_mode", "job_commands_disabled", "memory_curator_disabled", "no_new_session_activity", "no_session_evidence", "nothing_to_review", "partial_coverage_no_candidates", "scheduler_cooldown_active", "scheduler_cron_not_due", "scheduler_idle_window_active", "scheduler_interval_not_elapsed", "scheduler_lock_active", "scheduler_non_retryable_failure", "scheduler_schedule_invalid", "scheduler_schedule_manual", "session_cursor_manifest_limit_exceeded", "session_evidence_budget_exhausted", "session_evidence_budget_suppressed", "session_evidence_cancelled", "session_evidence_denied", "session_evidence_filter_unavailable", "session_evidence_locked", "session_evidence_partial", "session_evidence_reset_required", "session_evidence_retrieval_unavailable", "session_evidence_stale", "session_evidence_timed_out", "session_evidence_unavailable", "session_reflector_disabled", "shipped_fact_proposal_history_retired", "similarity_authority_unavailable", "skill_writer_disabled", "task_not_schedulable", "user_job_disabled"]);
+export const AutomationSkipReasonV1Schema = z.enum(["automation_disabled", "backend_disabled", "backend_identity_suppressed", "combined_review_disabled", "delegated_host_mode", "job_commands_disabled", "job_lock_active", "memory_curator_disabled", "no_new_session_activity", "no_session_evidence", "nothing_to_review", "partial_coverage_no_candidates", "scheduler_cooldown_active", "scheduler_cron_not_due", "scheduler_history_invalid", "scheduler_idle_window_active", "scheduler_interval_not_elapsed", "scheduler_lock_active", "scheduler_non_retryable_failure", "scheduler_paused", "scheduler_schedule_invalid", "scheduler_schedule_manual", "session_cursor_manifest_limit_exceeded", "session_evidence_budget_exhausted", "session_evidence_budget_suppressed", "session_evidence_cancelled", "session_evidence_denied", "session_evidence_filter_unavailable", "session_evidence_locked", "session_evidence_partial", "session_evidence_reset_required", "session_evidence_retrieval_unavailable", "session_evidence_stale", "session_evidence_timed_out", "session_evidence_unavailable", "session_reflector_disabled", "shipped_fact_proposal_history_retired", "similarity_authority_unavailable", "skill_writer_disabled", "task_not_schedulable", "user_job_disabled"]);
 export type AutomationSkipReasonV1 = z.infer<typeof AutomationSkipReasonV1Schema>;
 
 export const AutomationTaskStatusV1Schema = z.object({
   due: z.boolean(),
   last_scheduler_run: z.unknown(),
-  skip_reason: z.string().nullable(),
+  skip_reason: z.union([z.lazy(() => AutomationSkipReasonV1Schema), z.null()]),
   task: z.string(),
 });
 export type AutomationTaskStatusV1 = z.infer<typeof AutomationTaskStatusV1Schema>;
@@ -812,6 +819,7 @@ owner-private mode) is picked up on the next wake without a restart. The
 state exists so `status`, doctor, and the dashboard report the violation
 typed instead of an indefinite "warming". */
 export const CodeIndexConvergenceParkedV1Schema = z.object({
+  blocked_reason: z.union([z.lazy(() => CodeIndexBuildBlockedReasonV1Schema), z.null()]).optional(),
   observed_passes: z.number().int().safe().min(0),
   parked_at_micros: z.number().int().safe(),
   reason: z.string(),
@@ -819,6 +827,15 @@ export const CodeIndexConvergenceParkedV1Schema = z.object({
   retries_on_wake: z.boolean(),
 });
 export type CodeIndexConvergenceParkedV1 = z.infer<typeof CodeIndexConvergenceParkedV1Schema>;
+
+/** Coverage of one freshness read. Distinct from [`CodeIndexStalenessStateV1`]:
+a generation can be fresh and still omit hook-hint counts, or unverified
+while the ladder would otherwise say ready.
+
+`Unobserved` is only the constructed default. A projected read never emits
+it, so an absent observation cannot be mistaken for `complete`. */
+export const CodeIndexFreshnessCoverageV1Schema = z.enum(["complete", "partial_hook_hint_overflow", "partial_refresh_in_progress", "partial_source_verification", "partial_unverified_restore", "unobserved"]);
+export type CodeIndexFreshnessCoverageV1 = z.infer<typeof CodeIndexFreshnessCoverageV1Schema>;
 
 export const CodeIndexFreshnessPayloadV1Schema = z.object({
   note: z.string(),
@@ -838,6 +855,14 @@ export const CodeIndexGenerationRecoveryV1Schema = z.object({
   serving: z.lazy(() => CodeIndexGenerationRecoveryServingV1Schema),
 });
 export type CodeIndexGenerationRecoveryV1 = z.infer<typeof CodeIndexGenerationRecoveryV1Schema>;
+
+/** Closed staleness ladder for one mounted worktree.
+
+The scheduler publishes one of these tokens. MCP, the dashboard, and the
+CLI must match the variant — not a hand-copied string — so a new ladder
+state cannot appear at one caller and be missed at the others. */
+export const CodeIndexStalenessStateV1Schema = z.enum(["fresh", "indexing", "parked", "refreshing", "stale", "verifying"]);
+export type CodeIndexStalenessStateV1 = z.infer<typeof CodeIndexStalenessStateV1Schema>;
 
 export const CodeIndexWorkerLimitingReasonV1Schema = z.enum(["automatic_all_cores", "automatic_half_cores", "configured_exact", "environment_override", "resident_memory"]);
 export type CodeIndexWorkerLimitingReasonV1 = z.infer<typeof CodeIndexWorkerLimitingReasonV1Schema>;
@@ -880,7 +905,7 @@ keeping one authority for the freshness shape. */
 export const CodeIndexWorktreeFreshnessV1Schema = z.object({
   clone_index: z.union([z.lazy(() => CodeCloneIndexStatusV1Schema), z.null()]).optional(),
   code_graph_serving: z.union([z.lazy(() => CodeGraphServingReadinessV1Schema), z.null()]).optional(),
-  coverage: z.string(),
+  coverage: z.lazy(() => CodeIndexFreshnessCoverageV1Schema),
   generation_recovery: z.union([z.lazy(() => CodeIndexGenerationRecoveryV1Schema), z.null()]).optional(),
   hook_hint_count: z.number().int().safe().min(0).nullable(),
   last_reconcile_micros: z.number().int().safe().nullable(),
@@ -893,7 +918,7 @@ export const CodeIndexWorktreeFreshnessV1Schema = z.object({
   snapshot_content_identity: z.string().nullable(),
   source_reference: z.string().nullable(),
   source_revision: z.string().nullable(),
-  staleness_state: z.string().nullable(),
+  staleness_state: z.union([z.lazy(() => CodeIndexStalenessStateV1Schema), z.null()]),
   worktree_id: z.string().nullable(),
   worktree_root: z.string(),
 });
@@ -1174,6 +1199,10 @@ export const DeliveryAttentionEvidenceV1Schema = z.discriminatedUnion("kind", [z
   fetched_at_micros: z.number().int().safe(),
   kind: z.literal("provider_operation"),
   operation: z.lazy(() => DeliveryGitHubReadOperationV1Schema),
+}), z.object({
+  encounter_id: z.string(),
+  kind: z.literal("proximity_encounter"),
+  relation: z.lazy(() => DeliveryProximityRelationV1Schema),
 }), z.object({
   comment_id: z.string(),
   kind: z.literal("review_comment"),
@@ -1711,6 +1740,9 @@ export type DeliveryProjectionV18 = z.infer<typeof DeliveryProjectionV18Schema>;
 
 export const DeliveryProviderStateV1Schema = z.enum(["denied", "failed", "not_configured", "not_published", "partial", "rate_limited", "ready", "stale", "unavailable"]);
 export type DeliveryProviderStateV1 = z.infer<typeof DeliveryProviderStateV1Schema>;
+
+export const DeliveryProximityRelationV1Schema = z.enum(["code_neighborhood_candidate", "confirmed_conflict", "overlapping_edit", "shared_code_candidate"]);
+export type DeliveryProximityRelationV1 = z.infer<typeof DeliveryProximityRelationV1Schema>;
 
 export const DeliveryPullRequestIdentityV1Schema = z.object({
   additions: z.number().int().safe().min(0),
@@ -4698,6 +4730,54 @@ export const SavingsLifetimeProjectV1Schema = z.object({
 });
 export type SavingsLifetimeProjectV1 = z.infer<typeof SavingsLifetimeProjectV1Schema>;
 
+/** One UTC-day bucket of the per-model content aggregate. */
+export const SavingsModelDayRowV1Schema = z.object({
+  cost_basis: z.string(),
+  day: z.number().int().safe(),
+  estimated: z.lazy(() => TokenPairV1Schema),
+  estimated_messages: z.number().int().safe(),
+  messages: z.number().int().safe(),
+  model: z.string().nullable(),
+  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
+  provider_usage_events: z.number().int().safe(),
+  tokenized: z.lazy(() => TokenPairV1Schema),
+  tokenized_messages: z.number().int().safe(),
+});
+export type SavingsModelDayRowV1 = z.infer<typeof SavingsModelDayRowV1Schema>;
+
+/** One model-keyed content aggregate from the session store, joined to the
+exact provider usage recorded for that model. `model` is `None` for
+messages whose model was never recorded; that row keeps its token counts
+and is priced by nothing. */
+export const SavingsModelRowV1Schema = z.object({
+  cost_basis: z.string(),
+  estimated: z.lazy(() => TokenPairV1Schema),
+  estimated_messages: z.number().int().safe(),
+  messages: z.number().int().safe(),
+  model: z.string().nullable(),
+  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
+  provider_usage_events: z.number().int().safe(),
+  sessions: z.number().int().safe(),
+  tokenized: z.lazy(() => TokenPairV1Schema),
+  tokenized_messages: z.number().int().safe(),
+  tokenizer: z.unknown(),
+});
+export type SavingsModelRowV1 = z.infer<typeof SavingsModelRowV1Schema>;
+
+/** GET `/api/plugins/savings/models` response contract. */
+export const SavingsModelsPayloadV1Schema = z.object({
+  available: z.boolean(),
+  daily: z.array(z.lazy(() => SavingsModelDayRowV1Schema)),
+  error: z.string().nullable(),
+  models: z.array(z.lazy(() => SavingsModelRowV1Schema)),
+  provider_usage: z.lazy(() => SavingsProviderUsageAttributionV1Schema),
+  provider_usage_coverage: z.string().nullable(),
+  range: z.string(),
+  since: z.number().int().safe().nullable(),
+  status: z.string().nullable(),
+});
+export type SavingsModelsPayloadV1 = z.infer<typeof SavingsModelsPayloadV1Schema>;
+
 export const SavingsOverviewPayloadV1Schema = z.object({
   costs: z.lazy(() => CostsReadModelV1Schema),
   pricing: z.lazy(() => SavingsPricingSummaryV1Schema),
@@ -4707,6 +4787,12 @@ export const SavingsOverviewPayloadV1Schema = z.object({
 });
 export type SavingsOverviewPayloadV1 = z.infer<typeof SavingsOverviewPayloadV1Schema>;
 
+/** How much of one provider's observed usage the pricing authority could
+price. `priced` means every usage event priced; `partial` means some did
+and the dollar figure covers only those; `unpriced` means none did. */
+export const SavingsPricingClassV1Schema = z.enum(["partial", "priced", "unpriced"]);
+export type SavingsPricingClassV1 = z.infer<typeof SavingsPricingClassV1Schema>;
+
 export const SavingsPricingSummaryV1Schema = z.object({
   fetched_at: z.unknown(),
   model_count: z.unknown(),
@@ -4715,6 +4801,79 @@ export const SavingsPricingSummaryV1Schema = z.object({
   source: z.unknown(),
 });
 export type SavingsPricingSummaryV1 = z.infer<typeof SavingsPricingSummaryV1Schema>;
+
+/** One provider's canonical priced usage on one UTC day. */
+export const SavingsProviderDayPointV1Schema = z.object({
+  day: z.number().int().safe(),
+  priced_cost_usd: z.number().nullable(),
+  priced_events: z.number().int().safe(),
+  provider: z.string(),
+  total_cost_usd: z.number().nullable(),
+  total_tokens: z.number().int().safe().nullable(),
+  unpriced_events: z.number().int().safe(),
+  usage_events: z.number().int().safe(),
+});
+export type SavingsProviderDayPointV1 = z.infer<typeof SavingsProviderDayPointV1Schema>;
+
+/** Canonical priced usage for one UTC day across every provider. */
+export const SavingsProviderDaySpendV1Schema = z.object({
+  cost_usd: z.number().nullable(),
+  day: z.number().int().safe(),
+  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
+  total_tokens: z.number().int().safe().nullable(),
+  usage_events: z.number().int().safe(),
+});
+export type SavingsProviderDaySpendV1 = z.infer<typeof SavingsProviderDaySpendV1Schema>;
+
+/** Canonical priced usage for one exact provider/model pair. `cost_usd` is
+`None` whenever any usage event in the pair could not be priced: the
+projector never emits a partial dollar figure for a model. */
+export const SavingsProviderModelSpendV1Schema = z.object({
+  cost_basis: z.string(),
+  cost_usd: z.number().nullable(),
+  model: z.string().nullable(),
+  provider: z.string(),
+  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
+  total_tokens: z.number().int().safe().nullable(),
+  usage_events: z.number().int().safe(),
+});
+export type SavingsProviderModelSpendV1 = z.infer<typeof SavingsProviderModelSpendV1Schema>;
+
+/** Provider-level spend attribution over exact provider usage observations.
+
+`priced_cost_usd` sums only the model groups the canonical projector
+priced completely, and the event/model counts beside it say how much of
+the provider's usage that figure covers. `total_cost_usd` is the
+projector's own complete total and is `None` unless every event priced. */
+export const SavingsProviderSpendV1Schema = z.object({
+  models: z.number().int().safe(),
+  priced_cost_usd: z.number().nullable(),
+  priced_events: z.number().int().safe(),
+  priced_models: z.number().int().safe(),
+  pricing: z.lazy(() => SavingsPricingClassV1Schema),
+  provider: z.string(),
+  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
+  sessions: z.number().int().safe(),
+  total_cost_usd: z.number().nullable(),
+  total_tokens: z.number().int().safe().nullable(),
+  undated_events: z.number().int().safe(),
+  unknown_model_events: z.number().int().safe(),
+  unpriced_events: z.number().int().safe(),
+  unpriced_models: z.number().int().safe(),
+  usage_events: z.number().int().safe(),
+});
+export type SavingsProviderSpendV1 = z.infer<typeof SavingsProviderSpendV1Schema>;
+
+export const SavingsProviderUsageAttributionV1Schema = z.object({
+  available: z.boolean(),
+  by_day: z.array(z.lazy(() => SavingsProviderDaySpendV1Schema)),
+  by_model: z.array(z.lazy(() => SavingsProviderModelSpendV1Schema)),
+  by_provider: z.array(z.lazy(() => SavingsProviderSpendV1Schema)),
+  by_provider_day: z.array(z.lazy(() => SavingsProviderDayPointV1Schema)),
+  pricing_revision: z.string().nullable(),
+  undated_events: z.number().int().safe().nullable(),
+});
+export type SavingsProviderUsageAttributionV1 = z.infer<typeof SavingsProviderUsageAttributionV1Schema>;
 
 export const SavingsSessionModelV1Schema = z.object({
   cost_basis: z.string(),
@@ -5234,7 +5393,6 @@ export const StoreTelemetryEntryV1Schema = z.object({
   growth: z.lazy(() => StoreGrowthDimensionV1Schema),
   path: z.string(),
   read: z.lazy(() => StorageTelemetryReadV1Schema),
-  role: z.string(),
   roles: z.array(z.string()),
   store: z.string(),
   table_growth: z.lazy(() => TableGrowthDimensionV1Schema),

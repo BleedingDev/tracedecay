@@ -1,6 +1,8 @@
 //! Session-projection serving status: current / stale / unavailable, plus the
 //! port refresh workers implement so retrieval can surface a typed refusal.
 
+use tracedecay_contracts::{SessionTemporalRefreshWakePort, UnavailableSessionTemporalRefreshWake};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionProjectionServingState {
     Current,
@@ -55,4 +57,45 @@ pub struct SessionProjectionServingStatus {
 
 pub trait SessionProjectionServingStatusPort: Send + Sync {
     fn serving_status(&self) -> SessionProjectionServingStatus;
+}
+
+/// The serving status of a store no refresh worker is mounted for.
+///
+/// A retrieval service that has no worker cannot know whether its projection
+/// is current, so it reports that as the typed `WorkerMissing` state rather
+/// than carrying the worker as an `Option` and reading its absence as fresh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefreshWorkerMissing;
+
+impl SessionProjectionServingStatusPort for RefreshWorkerMissing {
+    fn serving_status(&self) -> SessionProjectionServingStatus {
+        SessionProjectionServingStatus {
+            state: SessionProjectionServingState::Unavailable {
+                reason: SessionProjectionUnavailableReason::WorkerMissing,
+            },
+            last_progress_at_unix_micros: None,
+            backlog: 0,
+            blocker: Some(SessionProjectionWorkerBlocker::WorkerMissing),
+            retry_class: None,
+        }
+    }
+}
+
+impl SessionProjectionServingStatusPort for UnavailableSessionTemporalRefreshWake {
+    fn serving_status(&self) -> SessionProjectionServingStatus {
+        RefreshWorkerMissing.serving_status()
+    }
+}
+
+/// One mounted refresh worker. Wake and serving status are the same object.
+/// Do not split them into parallel ports: retrieval and refresh then have to
+/// be threaded as two signals and can disagree about whether a worker exists.
+pub trait SessionRefreshWorkerPort:
+    SessionTemporalRefreshWakePort + SessionProjectionServingStatusPort
+{
+}
+
+impl<T> SessionRefreshWorkerPort for T where
+    T: SessionTemporalRefreshWakePort + SessionProjectionServingStatusPort + ?Sized
+{
 }

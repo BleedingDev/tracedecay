@@ -23,7 +23,7 @@ use tracedecay_memory_provider_api::{
 };
 
 use crate::{
-    NCM_PROVIDER_ID, NcmCognitiveSurface, NcmNamespace, NcmSurfaceCall, NcmSurfaceHandshakeRequest,
+    NCM_PROVIDER_ID, NcmCognitiveSurface, NcmSurfaceCall, NcmSurfaceHandshakeRequest,
     NcmSurfaceHandshakeResponse,
 };
 
@@ -432,7 +432,7 @@ impl RustNcmSurface {
     /// the PID remains available only as a diagnostic.
     #[must_use]
     pub fn worker_incarnation(&self) -> Option<u64> {
-        self.worker.owner_incarnation()
+        self.worker.worker_incarnation()
     }
 
     fn bound_worker_incarnation(&self) -> Option<u64> {
@@ -1716,6 +1716,7 @@ fn digest_identity(digest: &mut Sha256, identity: &RuntimeIdentity) {
     digest.update([u8::from(identity.encoder_normalize.unwrap_or(false))]);
 }
 
+#[cfg(test)]
 fn ready_receipt(namespace: &str, identity: &RuntimeIdentity) -> String {
     ready_receipt_with_incarnation(namespace, identity, None)
 }

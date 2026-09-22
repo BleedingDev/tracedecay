@@ -146,7 +146,10 @@ pub enum HostBundleAction {
         #[arg(long)]
         quarantine: bool,
     },
-    /// Snapshot one installed component's managed artifact files
+    /// Snapshot one installed component's managed artifact files.
+    ///
+    /// Requires the global `--yes` confirmation. The backup writer refuses an
+    /// unconfirmed receipt even though deployed files are not overwritten.
     ArtifactBackup {
         /// Agent whose selected component owns the managed artifacts
         #[arg(long, value_parser = agent_value_parser())]
@@ -359,6 +362,11 @@ pub enum Commands {
         /// (only used with --agent codex).
         #[arg(long)]
         automation: bool,
+        /// Install the global git post-commit hook that runs `tracedecay sync`.
+        /// Explicit because setting `core.hooksPath` can redirect every
+        /// repository away from `.git/hooks`. Never prompts.
+        #[arg(long)]
+        git_hook: bool,
     },
     /// Refresh settings for all already-installed agents
     #[command(long_about = REINSTALL_LONG_ABOUT, after_help = REINSTALL_AFTER_HELP)]

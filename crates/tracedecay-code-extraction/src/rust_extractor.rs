@@ -1,14 +1,18 @@
 /// Tree-sitter based Rust source code extractor.
 ///
 /// Parses Rust source files and emits nodes and edges for the code graph.
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    time::Instant,
+};
 
 use tree_sitter::{Node as TsNode, Tree};
 
 use crate::common::local_node_id;
 use crate::complexity::{RUST_COMPLEXITY, count_complexity};
 use crate::extraction_artifact::{
-    ExtractedImportEvidenceV1, ExtractionArtifactV1, ImportNamespaceV1, import_module_kind,
+    ExtractedImportEvidenceV1, ExtractionArtifactV1, ImportNamespaceV1, ImportReexportScopeV1,
+    import_module_kind,
 };
 use crate::types::{
     ComplexityAnalysisV1, Edge, EdgeKind, ExtractionResult, Node, NodeKind, SourceSpan,
@@ -21,6 +25,40 @@ pub struct RustExtractor;
 #[derive(Default)]
 struct ShadowedCallNames {
     names: Vec<String>,
+}
+
+/// Receiver bindings whose type the function body states outright: typed
+/// parameters, typed `let`s, and `let`s initialised by a struct literal
+/// (`T { .. }`, possibly behind `?`). A dotted
+/// call on such a binding also names the method by its type
+/// (`builder.build()` → `ignore::WalkBuilder::build`), which is the only form
+/// the resolver can bind across files. Method calls and constructor-like names
+/// (`new`, `with_*`, `from_*`, `default`) are never treated as return-type evidence —
+/// Rust does not require those associated functions to return their owning
+/// type. Bindings are function-scoped: a name bound more than once to
+/// different or unknown types is withheld rather than guessed.
+#[derive(Default)]
+struct ReceiverTypes {
+    by_name: BTreeMap<String, Option<String>>,
+}
+
+impl ReceiverTypes {
+    fn record(&mut self, name: String, type_path: Option<String>) {
+        match self.by_name.entry(name) {
+            Entry::Vacant(vacant) => {
+                vacant.insert(type_path);
+            }
+            Entry::Occupied(mut occupied) => {
+                if *occupied.get() != type_path {
+                    occupied.insert(None);
+                }
+            }
+        }
+    }
+
+    fn type_of(&self, name: &str) -> Option<&str> {
+        self.by_name.get(name)?.as_deref()
+    }
 }
 
 /// Internal state used during AST traversal.
@@ -190,7 +228,16 @@ impl RustExtractor {
         } else {
             NodeKind::Function
         };
-        let visibility = Self::extract_visibility(node, state);
+        let visibility = if is_inside_trait {
+            state
+                .parent_node_id()
+                .and_then(|parent_id| state.nodes.iter().rev().find(|node| node.id == parent_id))
+                .filter(|parent| parent.kind == NodeKind::Trait)
+                .map(|parent| parent.visibility.clone())
+                .unwrap_or_else(|| Self::extract_visibility(node, state))
+        } else {
+            Self::extract_visibility(node, state)
+        };
         let signature = Some(Self::extract_function_signature(state, node));
         let docstring = Self::extract_docstring(state, node);
         let is_async = Self::detect_async(state, node);
@@ -239,7 +286,9 @@ impl RustExtractor {
             });
         }
 
-        Self::extract_call_sites(state, node, &id);
+        let mut receivers = ReceiverTypes::default();
+        Self::collect_receiver_types(state, node, node, &mut receivers);
+        Self::extract_call_sites(state, node, &id, &receivers);
         Self::suppress_shadowed_calls(state, node, &id);
 
         Self::extract_annotations_from_modifiers(state, node, &id);
@@ -598,7 +647,10 @@ impl RustExtractor {
         Self::extract_annotations_from_modifiers(state, node, &id);
 
         // Visit impl body: functions become Method nodes.
-        state.node_stack.push((type_name, id));
+        let method_owner = trait_name.as_ref().map_or(type_name.clone(), |trait_name| {
+            format!("<{type_name} as {trait_name}>")
+        });
+        state.node_stack.push((method_owner, id));
         if let Some(body) = node.child_by_field_name("body") {
             Self::visit_children(state, body);
         }
@@ -627,7 +679,8 @@ impl RustExtractor {
             .filter(|parent| parent.kind() == "source_file")
             .and_then(|_| node.child_by_field_name("argument"));
         if let Some(argument) = top_level_argument {
-            Self::extract_use_bindings(state, argument, None, visibility == Visibility::Pub);
+            let (is_public, reexport_scope) = Self::use_reexport_visibility(node, state);
+            Self::extract_use_bindings(state, argument, None, is_public, reexport_scope.as_ref());
         }
         let qualified_name = format!("{}::{}", state.qualified_prefix(), path);
         let id = local_node_id(&state.file_path, state.source, &NodeKind::Use, &path, node);
@@ -712,6 +765,7 @@ impl RustExtractor {
         node: TsNode<'_>,
         prefix: Option<&str>,
         is_public: bool,
+        reexport_scope: Option<&ImportReexportScopeV1>,
     ) {
         match node.kind() {
             "scoped_use_list" => {
@@ -720,13 +774,19 @@ impl RustExtractor {
                     .map(|path| state.node_text(path));
                 let combined = Self::join_use_path(prefix, path);
                 if let Some(list) = node.child_by_field_name("list") {
-                    Self::extract_use_bindings(state, list, combined.as_deref(), is_public);
+                    Self::extract_use_bindings(
+                        state,
+                        list,
+                        combined.as_deref(),
+                        is_public,
+                        reexport_scope,
+                    );
                 }
             }
             "use_list" => {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
-                    Self::extract_use_bindings(state, child, prefix, is_public);
+                    Self::extract_use_bindings(state, child, prefix, is_public, reexport_scope);
                 }
             }
             "use_as_clause" => {
@@ -744,6 +804,7 @@ impl RustExtractor {
                         state.node_text(alias),
                         node,
                         is_public,
+                        reexport_scope,
                     );
                 }
             }
@@ -755,14 +816,21 @@ impl RustExtractor {
                     .or(prefix)
                     .or_else(|| text.strip_suffix("::*"));
                 if let Some(module) = module {
-                    Self::push_glob_binding(state, module, node, is_public);
+                    Self::push_glob_binding(state, module, node, is_public, reexport_scope);
                 }
             }
             _ => {
                 let full_path = Self::join_use_path(prefix, Some(state.node_text(node)));
                 if let Some(full_path) = full_path {
                     let local_name = full_path.rsplit("::").next().unwrap_or(full_path.as_str());
-                    Self::push_use_binding(state, &full_path, local_name, node, is_public);
+                    Self::push_use_binding(
+                        state,
+                        &full_path,
+                        local_name,
+                        node,
+                        is_public,
+                        reexport_scope,
+                    );
                 }
             }
         }
@@ -784,6 +852,7 @@ impl RustExtractor {
         local_name: &str,
         evidence_node: TsNode<'_>,
         is_public: bool,
+        reexport_scope: Option<&ImportReexportScopeV1>,
     ) {
         let (module_specifier, imported_name) = match full_path.rsplit_once("::") {
             Some(parts) => parts,
@@ -800,6 +869,7 @@ impl RustExtractor {
             imported_name: Some(imported_name.to_owned()),
             local_name: Some(local_name.to_owned()),
             is_public,
+            reexport_scope: reexport_scope.cloned(),
             is_glob: false,
             namespace: ImportNamespaceV1::Value,
             module_kind,
@@ -817,6 +887,7 @@ impl RustExtractor {
         module: &str,
         evidence_node: TsNode<'_>,
         is_public: bool,
+        reexport_scope: Option<&ImportReexportScopeV1>,
     ) {
         let module_specifier = Self::canonical_rust_import_module(state, module);
         let Some(module_kind) = import_module_kind("rust", &module_specifier) else {
@@ -828,6 +899,7 @@ impl RustExtractor {
             imported_name: Some("*".to_owned()),
             local_name: None,
             is_public,
+            reexport_scope: reexport_scope.cloned(),
             is_glob: true,
             namespace: ImportNamespaceV1::Value,
             module_kind,
@@ -1174,6 +1246,41 @@ impl RustExtractor {
             .map(|n| state.node_text(n).to_string())
     }
 
+    fn use_reexport_visibility(
+        node: TsNode<'_>,
+        state: &ExtractionState<'_>,
+    ) -> (bool, Option<ImportReexportScopeV1>) {
+        let mut cursor = node.walk();
+        if !cursor.goto_first_child() {
+            return (false, None);
+        }
+        loop {
+            let child = cursor.node();
+            if child.kind() == "visibility_modifier" {
+                let visibility = state.node_text(child);
+                return match visibility {
+                    "pub" => (true, None),
+                    "pub(crate)" | "pub(in crate)" => (false, Some(ImportReexportScopeV1::Crate)),
+                    "pub(super)" | "pub(in super)" => (false, Some(ImportReexportScopeV1::Super)),
+                    "pub(self)" | "pub(in self)" => {
+                        (false, Some(ImportReexportScopeV1::SelfModule))
+                    }
+                    _ => (
+                        false,
+                        visibility
+                            .strip_prefix("pub(in crate::")
+                            .and_then(|module| module.strip_suffix(')'))
+                            .filter(|module| !module.is_empty())
+                            .map(|module| ImportReexportScopeV1::Module(module.replace("::", "/"))),
+                    ),
+                };
+            }
+            if !cursor.goto_next_sibling() {
+                return (false, None);
+            }
+        }
+    }
+
     /// Extract visibility from a node.
     fn extract_visibility(node: TsNode<'_>, state: &ExtractionState<'_>) -> Visibility {
         let mut cursor = node.walk();
@@ -1450,7 +1557,12 @@ impl RustExtractor {
 
     /// Recursively find `call_expression` nodes inside a given node and create
     /// unresolved Calls references.
-    fn extract_call_sites(state: &mut ExtractionState<'_>, node: TsNode<'_>, fn_node_id: &str) {
+    fn extract_call_sites(
+        state: &mut ExtractionState<'_>,
+        node: TsNode<'_>,
+        fn_node_id: &str,
+        receivers: &ReceiverTypes,
+    ) {
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
@@ -1482,8 +1594,23 @@ impl RustExtractor {
                                     file_path: state.file_path.clone(),
                                 });
                             }
+                            // A dotted call on a binding with a stated type also
+                            // names the method through its type, the only form
+                            // that binds across files.
+                            if let Some(typed_method) =
+                                Self::typed_receiver_method(state, callee, receivers)
+                            {
+                                state.unresolved_refs.push(UnresolvedRef {
+                                    from_node_id: fn_node_id.to_string(),
+                                    reference_name: typed_method,
+                                    reference_kind: EdgeKind::Calls,
+                                    line: child.start_position().row as u32,
+                                    column: child.start_position().column as u32,
+                                    file_path: state.file_path.clone(),
+                                });
+                            }
                         }
-                        Self::extract_call_sites(state, child, fn_node_id);
+                        Self::extract_call_sites(state, child, fn_node_id, receivers);
                     }
                     "macro_invocation" => {
                         let macro_name = child.child_by_field_name("macro").map_or_else(
@@ -1501,7 +1628,7 @@ impl RustExtractor {
                             column: child.start_position().column as u32,
                             file_path: state.file_path.clone(),
                         });
-                        Self::extract_call_sites(state, child, fn_node_id);
+                        Self::extract_call_sites(state, child, fn_node_id, receivers);
                     }
                     // Inside a macro's token_tree, the grammar does not produce
                     // call_expression nodes. Instead, a function call appears as
@@ -1515,13 +1642,157 @@ impl RustExtractor {
                     // Skip nested function definitions — they are handled separately.
                     "function_item" => {}
                     _ => {
-                        Self::extract_call_sites(state, child, fn_node_id);
+                        Self::extract_call_sites(state, child, fn_node_id, receivers);
                     }
                 }
                 if !cursor.goto_next_sibling() {
                     break;
                 }
             }
+        }
+    }
+
+    /// `Type::method` for a `binding.method(..)` callee whose binding has one
+    /// stated type in this function; `None` for every other callee shape.
+    fn typed_receiver_method(
+        state: &ExtractionState<'_>,
+        callee: TsNode<'_>,
+        receivers: &ReceiverTypes,
+    ) -> Option<String> {
+        if callee.kind() != "field_expression" {
+            return None;
+        }
+        let value = callee.child_by_field_name("value")?;
+        let field = callee.child_by_field_name("field")?;
+        if value.kind() != "identifier" || field.kind() != "field_identifier" {
+            return None;
+        }
+        let type_path = receivers.type_of(state.node_text(value))?;
+        Some(format!("{type_path}::{}", state.node_text(field)))
+    }
+
+    /// Records every binding the function introduces with the type it states,
+    /// or `None` for a binding whose type the syntax does not state (pattern
+    /// destructuring, `if let`, `match` arms, closure parameters, `for`).
+    fn collect_receiver_types(
+        state: &ExtractionState<'_>,
+        node: TsNode<'_>,
+        function: TsNode<'_>,
+        receivers: &mut ReceiverTypes,
+    ) {
+        match node.kind() {
+            "parameter" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    let type_path = node
+                        .child_by_field_name("type")
+                        .and_then(|ty| Self::stated_type_path(state, ty));
+                    Self::record_receiver_pattern(state, pattern, type_path, receivers);
+                }
+            }
+            "let_declaration" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    let type_path = match node.child_by_field_name("type") {
+                        Some(ty) => Self::stated_type_path(state, ty),
+                        None => node
+                            .child_by_field_name("value")
+                            .and_then(|value| Self::stated_initializer_type_path(state, value)),
+                    };
+                    Self::record_receiver_pattern(state, pattern, type_path, receivers);
+                }
+            }
+            "let_condition" | "match_arm" | "for_expression" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    Self::record_receiver_pattern(state, pattern, None, receivers);
+                }
+            }
+            // Typed closure parameters are `parameter` nodes handled above;
+            // untyped ones are bare patterns that shadow with unknown type.
+            "closure_parameters" => {
+                let mut cursor = node.walk();
+                if cursor.goto_first_child() {
+                    loop {
+                        let child = cursor.node();
+                        if child.is_named() && child.kind() != "parameter" {
+                            Self::record_receiver_pattern(state, child, None, receivers);
+                        }
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if node != function && node.kind() == "function_item" {
+            return;
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                Self::collect_receiver_types(state, cursor.node(), function, receivers);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// A bare identifier pattern takes `type_path`; every identifier inside any
+    /// other pattern is bound with an unknown type.
+    fn record_receiver_pattern(
+        state: &ExtractionState<'_>,
+        pattern: TsNode<'_>,
+        type_path: Option<String>,
+        receivers: &mut ReceiverTypes,
+    ) {
+        if pattern.kind() == "identifier" {
+            receivers.record(state.node_text(pattern).to_owned(), type_path);
+            return;
+        }
+        let mut cursor = pattern.walk();
+        if cursor.goto_first_child() {
+            loop {
+                Self::record_receiver_pattern(state, cursor.node(), None, receivers);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The nominal type path a type annotation names, seen through references,
+    /// generic arguments, and `dyn`/`impl` trait objects; `None` for tuples,
+    /// slices, function pointers, and anything else without one nominal head.
+    fn stated_type_path(state: &ExtractionState<'_>, ty: TsNode<'_>) -> Option<String> {
+        match ty.kind() {
+            "type_identifier" | "scoped_type_identifier" => {
+                Some(state.node_text(ty).to_owned()).filter(|path| path != "Self")
+            }
+            "reference_type" | "generic_type" => ty
+                .child_by_field_name("type")
+                .and_then(|inner| Self::stated_type_path(state, inner)),
+            "dynamic_type" | "abstract_type" => ty
+                .child_by_field_name("trait")
+                .and_then(|inner| Self::stated_type_path(state, inner)),
+            _ => None,
+        }
+    }
+
+    /// The type a `let` initialiser states in syntax: a `T { .. }` literal,
+    /// optionally behind `?`. Method names are never return-type evidence —
+    /// abstain rather than fabricate a receiver type.
+    fn stated_initializer_type_path(
+        state: &ExtractionState<'_>,
+        value: TsNode<'_>,
+    ) -> Option<String> {
+        match value.kind() {
+            "try_expression" => value
+                .child(0)
+                .and_then(|inner| Self::stated_initializer_type_path(state, inner)),
+            "struct_expression" => value
+                .child_by_field_name("name")
+                .and_then(|name| Self::stated_type_path(state, name)),
+            _ => None,
         }
     }
 
@@ -1642,7 +1913,8 @@ impl RustExtractor {
                 Self::extract_calls_in_token_tree(state, cur, fn_node_id);
             } else if cur.kind() == "macro_invocation" {
                 // Nested macro inside a macro — handled via extract_call_sites.
-                Self::extract_call_sites(state, cur, fn_node_id);
+                // Receiver types are not tracked through macro token trees.
+                Self::extract_call_sites(state, cur, fn_node_id, &ReceiverTypes::default());
             }
             i += 1;
         }

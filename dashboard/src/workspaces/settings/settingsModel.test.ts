@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { FIXTURES } from '../../../stories/fixtures/data.ts';
 import { CodeIndexWorkerSelectionV1Schema } from '../../contracts/generated.ts';
-import { buildSettingsEditor, buildSettingsModel, filterOverrides, filterRows, isPathLike, planCodeIndexWorkerChangeAgainst, planProjectChangeAgainst, planUserChangeAgainst, readSettingsEnvelope, settingsRevisionConflict } from './settingsModel.ts';
+import { buildSettingsEditor, buildSettingsModel, isPathLike, planCodeIndexWorkerChangeAgainst, planProjectChangeAgainst, planUserChangeAgainst, readSettingsEnvelope, settingsRevisionConflict } from './settingsModel.ts';
 
 // `/api/settings` answers a DashboardEnvelopeV1; the read model addresses the
 // settings groups inside its payload. Reading it through the generated
@@ -59,12 +59,52 @@ describe('Settings read model', () => {
     expect(model.activeOverrides).toBe(1);
   });
 
-  it('does not double-report environment variables as generic rows', () => {
-    const model = buildSettingsModel(payload);
+  it('reports each environment variable once, as a row carrying the served provenance', () => {
+    const model = buildSettingsModel({
+      environment: {
+        pricing_offline: true,
+        variables: [
+          { name: 'A', active: true, value: '1', description: 'set' },
+          { name: 'C', active: false, value: null, description: 'unset' },
+        ],
+      },
+    });
     const environment = model.sections.find((s) => s.id === 'environment');
-    expect(environment?.rows.some((row) => row.id.startsWith('variables'))).toBe(false);
-    // The plain scalars in the same group are still reported.
-    expect(environment?.rows.map((r) => r.label)).toContain('pricing_offline');
+    const variables = environment?.rows.filter((row) => row.id.startsWith('variables.')) ?? [];
+    expect(variables.map((row) => [row.id, row.provenance, row.text, row.description])).toEqual([
+      ['variables.A', 'explicit', '1', 'set'],
+      ['variables.C', 'default', 'unset', 'unset'],
+    ]);
+    // No generic flattening of the array beside the dedicated rows.
+    expect(environment?.rows.filter((row) => row.id.startsWith('variables[')).length).toBe(0);
+    // The plain scalars in the same group are still reported, and say `unserved`.
+    const pricing = environment?.rows.find((r) => r.label === 'pricing_offline');
+    expect(pricing?.provenance).toBe('unserved');
+    expect(environment?.settingCount).toBe(3);
+  });
+
+  it('reports the worker selection as one row rather than a mode/workers pair', () => {
+    const model = buildSettingsModel(payload);
+    const user = model.sections.find((s) => s.id === 'user');
+    const selection = user?.rows.find((row) => row.id === 'code_index_workers');
+    expect(selection?.kind).toBe('selection');
+    expect(selection?.text).toBe('automatic');
+    expect(user?.rows.some((row) => row.id === 'code_index_workers.mode')).toBe(false);
+    expect(
+      buildSettingsModel({ user: { code_index_workers: { mode: 'exact', workers: 4 } } })
+        .sections[0]?.rows[0]?.text,
+    ).toBe('exact · 4 workers');
+  });
+
+  it('does not render the PATCH receipt flags as configuration groups', () => {
+    const model = buildSettingsModel({
+      ...payload,
+      resync_recommended: true,
+      restart_recommended: true,
+    });
+    expect(model.sections.map((section) => section.id)).not.toContain('resync_recommended');
+    expect(model.sections.map((section) => section.id)).not.toContain('restart_recommended');
+    expect(model.settingCount).toBe(buildSettingsModel(payload).settingCount);
   });
 
   it('classifies leaf values by type', () => {
@@ -80,37 +120,6 @@ describe('Settings read model', () => {
       buildSettingsModel({ version: { cached_latest_version: null } }).sections[0]?.rows[0]
         ?.kind,
     ).toBe('null');
-  });
-
-  /** A live payload's project and user groups routinely pin the SAME snapshot
-   * and revision ids. One identity is one stamp — repeating it rendered the
-   * header strip twice and collided its `label:value` React keys — while two
-   * groups pinned to DIFFERENT snapshots still both appear, because that
-   * disagreement is a reading. */
-  it('states a snapshot identity shared by several groups exactly once', () => {
-    const model = buildSettingsModel({
-      project: {
-        configuration_snapshot_id: 'snap-shared',
-        configuration_revision_id: 'rev-shared',
-      },
-      user: {
-        configuration_snapshot_id: 'snap-shared',
-        configuration_revision_id: 'rev-shared',
-      },
-    });
-    expect(model.stamps).toEqual([
-      { label: 'snapshot', value: 'snap-shared' },
-      { label: 'revision', value: 'rev-shared' },
-    ]);
-
-    const disagreeing = buildSettingsModel({
-      project: { configuration_snapshot_id: 'snap-a' },
-      user: { configuration_snapshot_id: 'snap-b' },
-    });
-    expect(disagreeing.stamps).toEqual([
-      { label: 'snapshot', value: 'snap-a' },
-      { label: 'snapshot', value: 'snap-b' },
-    ]);
   });
 
   it('returns an empty model for a payload that is not an object', () => {
@@ -158,37 +167,6 @@ describe('Settings read model', () => {
     expect(automation?.rows.find((row) => row.id === 'availability.reason')?.text).toBe(
       'project automation configuration could not be read',
     );
-  });
-});
-
-describe('Settings filtering', () => {
-  it('keeps ancestors of a matching row so nesting still reads', () => {
-    const rows = buildSettingsModel(payload).sections.find((s) => s.id === 'project')!.rows;
-    const filtered = filterRows(rows, 'auto_track_pr_poll_secs');
-    expect(filtered.map((row) => row.id)).toEqual([
-      'config',
-      'config.sync',
-      'config.sync.auto_track_pr_poll_secs',
-    ]);
-  });
-
-  it('keeps the whole subtree of a group that matches by name', () => {
-    const rows = buildSettingsModel(payload).sections.find((s) => s.id === 'project')!.rows;
-    const filtered = filterRows(rows, 'telemetry');
-    expect(filtered.map((row) => row.id)).toEqual([
-      'config',
-      'config.telemetry',
-      'config.telemetry.timings',
-    ]);
-  });
-
-  it('filters overrides across name, value and description', () => {
-    const overrides = buildSettingsModel(payload).overrides;
-    expect(filterOverrides(overrides, 'DATA_DIR').map((o) => o.name)).toEqual([
-      'TRACEDECAY_DATA_DIR',
-    ]);
-    expect(filterOverrides(overrides, 'pricing')).toEqual([]);
-    expect(filterOverrides(overrides, '')).toHaveLength(2);
   });
 });
 

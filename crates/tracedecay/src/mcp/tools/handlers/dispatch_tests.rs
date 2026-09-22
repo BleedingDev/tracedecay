@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -566,6 +565,9 @@ async fn status_and_runtime_share_cursor_session_ingest_authority() {
         "tracedecay_status",
         json!({
             "format": "json",
+            // Compact-by-default status omits ingest unless requested; opt in so
+            // this authority check shares the same surface as tracedecay_runtime.
+            "include_session_ingest": true,
             "include_branch_diagnostics": false,
             "include_storage_health": false,
             "include_staleness": false,
@@ -657,18 +659,20 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                             staleness_state: Option<&str>,
                             rebuild_in_flight: bool| {
         let latest_generation_id = latest_generation_id.map(str::to_owned);
-        let staleness_state = staleness_state.map(str::to_owned);
+        let staleness_state = staleness_state.and_then(
+            tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::from_wire,
+        );
         let reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
             std::sync::Arc::new(move |worktree_root: std::path::PathBuf| {
                 let freshness =
                     tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
                         worktree_root: worktree_root.display().to_string(),
                         latest_generation_id: latest_generation_id.clone(),
-                        staleness_state: staleness_state.clone(),
+                        staleness_state,
                         rebuild_in_flight,
                         ..Default::default()
                     };
-                Box::pin(async move { Some(freshness) })
+                Box::pin(async move { Ok(Some(freshness)) })
             });
         reader
     };
@@ -760,21 +764,23 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                         tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
                     ),
                     coverage: if staleness == "fresh" {
-                        "complete".to_owned()
+                        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
                     } else {
-                        "partial_source_verification".to_owned()
+                        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::PartialSourceVerification
                     },
-                    staleness_state: Some(staleness.to_owned()),
+                    staleness_state: tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::from_wire(staleness),
                     ..Default::default()
                 };
-                Box::pin(async move { Some(freshness) })
+                Box::pin(async move { Ok(Some(freshness)) })
             });
         reader
     };
     let stale_public = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_status",
-        json!({"format": "json"}),
+        // Full branch claim fields (branch_resolution, diagnostics) are opt-in
+        // after compact-by-default status; serving truth still uses the freshness path.
+        json!({"format": "json", "include_branch_diagnostics": true}),
         None,
         None,
         ToolCallRegistryOptions {
@@ -797,7 +803,7 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
     let current_public = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_status",
-        json!({"format": "json"}),
+        json!({"format": "json", "include_branch_diagnostics": true}),
         None,
         None,
         ToolCallRegistryOptions {
@@ -899,15 +905,17 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                 code_graph_serving: Some(
                     tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
                 ),
-                staleness_state: Some("fresh".to_owned()),
+                staleness_state: Some(
+                    tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh,
+                ),
                 ..Default::default()
             };
-            Box::pin(async move { Some(freshness) })
+            Box::pin(async move { Ok(Some(freshness)) })
         });
     let published_feature = handle_tool_call_with_registry_options(
         &cg,
         "tracedecay_status",
-        json!({"format": "json"}),
+        json!({"format": "json", "include_branch_diagnostics": true}),
         None,
         None,
         ToolCallRegistryOptions {
@@ -1009,10 +1017,12 @@ async fn status_serving_branch_reports_the_lane_serving_truth() {
                     worktree_root: worktree_root.display().to_string(),
                     latest_generation_id: Some("generation.status-serving-truth.1".to_owned()),
                     sealed_at_micros: Some(sealed_at_micros),
-                    staleness_state: Some("stale".to_owned()),
+                    staleness_state: Some(
+                        tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Stale,
+                    ),
                     ..Default::default()
                 };
-            Box::pin(async move { Some(freshness) })
+            Box::pin(async move { Ok(Some(freshness)) })
         });
     let aged = handle_tool_call_with_registry_options(
         &cg,
@@ -2244,66 +2254,24 @@ async fn admin_sync_reports_terminal_publication_corruption_without_queueing() {
     )
     .await
     .expect("TraceDecay fixture");
-    let queued = std::sync::Arc::new(AtomicUsize::new(0));
-    let reconcile_sink: crate::mcp::server::CodeIndexReconcileSink = {
-        let queued = std::sync::Arc::clone(&queued);
-        std::sync::Arc::new(move |_, _| {
-            let queued = std::sync::Arc::clone(&queued);
+    let reconcile_sink: crate::mcp::server::CodeIndexReconcileSink = std::sync::Arc::new(
+        move |_, _| {
             Box::pin(async move {
-                queued.fetch_add(1, Ordering::AcqRel);
-                crate::mcp::server::CodeIndexAdmission::Accepted
-            })
-        })
-    };
-    let freshness_reader: tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader =
-        std::sync::Arc::new(move |worktree_root| {
-            Box::pin(async move {
-                Some(
-                    tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
-                        worktree_root: worktree_root.display().to_string(),
-                        progress: Some(
-                            tracedecay_contracts::code_index_freshness::CodeIndexBuildProgressV1 {
-                                generation_id: "generation.terminal-sync".to_owned(),
-                                daemon_incarnation: 1,
-                                producer_incarnation: 1,
-                                progress_epoch: 1,
-                                sealed_source_digest: format!("sha256:{}", "a".repeat(64)),
-                                phase: tracedecay_contracts::code_index_freshness::CodeIndexBuildPhaseV1::SourceScan,
-                                committed_pages: 0,
-                                committed_chunks: 0,
-                                committed_imports: 0,
-                                committed_payload_bytes: 0,
-                                completed_files: 0,
-                                total_files: 1,
-                                completed_lexical_units: 0,
-                                total_lexical_units: 1,
-                                current_batch_pages: 0,
-                                current_batch_payload_bytes: 0,
-                                elapsed_micros: 1,
-                                last_commit_latency_micros: None,
-                                files_per_second: None,
-                                lexical_units_per_second: None,
-                                estimated_remaining_seconds: None,
-                                last_progress_micros: 1,
-                                blocked_reason: Some(
-                                    tracedecay_contracts::code_index_freshness::CodeIndexBuildBlockedReasonV1::PublicationAuthorityCorrupt,
-                                ),
-                            },
+                crate::mcp::server::CodeIndexDemandAdmissionV1::Terminal(
+                    tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1 {
+                        reason: "the publication authority is corrupt and requires an index reset: injected sync refusal".to_owned(),
+                        blocked_reason: Some(
+                            tracedecay_contracts::code_index_freshness::CodeIndexBuildBlockedReasonV1::PublicationAuthorityCorrupt,
                         ),
-                        parked: Some(
-                            tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1 {
-                                reason: "the publication authority is corrupt and requires an index reset: injected sync refusal".to_owned(),
-                                remediation: "reset the code-index publication authority".to_owned(),
-                                parked_at_micros: 1,
-                                observed_passes: 1,
-                                retries_on_wake: false,
-                            },
-                        ),
-                        ..Default::default()
+                        remediation: "reset the code-index publication authority".to_owned(),
+                        parked_at_micros: 1,
+                        observed_passes: 1,
+                        retries_on_wake: false,
                     },
                 )
             })
-        });
+        },
+    );
 
     let error = handle_tool_call_with_registry_options(
         &cg,
@@ -2313,7 +2281,6 @@ async fn admin_sync_reports_terminal_publication_corruption_without_queueing() {
         None,
         ToolCallRegistryOptions {
             code_index_reconcile_sink: Some(reconcile_sink),
-            code_index_freshness_reader: Some(freshness_reader),
             ..Default::default()
         }
         .admit_opened_project(&cg)
@@ -2322,14 +2289,16 @@ async fn admin_sync_reports_terminal_publication_corruption_without_queueing() {
     .await
     .expect_err("terminal publication corruption must refuse sync");
 
-    assert!(
-        error.to_string().contains("injected sync refusal"),
-        "sync must report the terminal cause: {error}"
-    );
+    let (reason_code, retryable, detail) =
+        error.project_route_context().expect("typed project route");
     assert_eq!(
-        queued.load(Ordering::Acquire),
-        0,
-        "terminal sync must not queue work"
+        reason_code,
+        tracedecay_contracts::code_index_freshness::CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT
+    );
+    assert!(!retryable, "publication corruption requires reset");
+    assert!(
+        detail.contains("injected sync refusal"),
+        "sync must report the terminal cause: {detail}"
     );
     cg.close();
 }

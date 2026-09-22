@@ -76,6 +76,32 @@ impl CodeIndexSearchUnavailableReasonV1 {
             Self::Internal => "search_failed",
         }
     }
+
+    /// Whether the same request can succeed later without the caller changing
+    /// it. The enum owns the answer so every surface that renders a lane
+    /// failure reports one retry story.
+    ///
+    /// Clone-family MCP (`tracedecay_similar` / `tracedecay_redundancy`) used to
+    /// fork retryability behind opaque tokens such as
+    /// `verified-code-redundancy-unavailable`. That path is retired: both lanes
+    /// now map through these discriminants so future arms cannot re-fork the
+    /// wire.
+    #[hotpath::skip]
+    pub const fn is_retryable(self) -> bool {
+        match self {
+            Self::Cancelled
+            | Self::TimedOut
+            | Self::CapacityUnavailable
+            | Self::GenerationUnavailable
+            | Self::GenerationUnverified => true,
+            Self::CapabilityUnavailable
+            | Self::AuthorityUnavailable
+            | Self::LinkedWorktreeDisabled
+            | Self::InvalidRequest
+            | Self::CorruptionResetRequired
+            | Self::Internal => false,
+        }
+    }
 }
 
 /// Stable machine tokens for why one retrieval lane could not serve.
@@ -92,6 +118,20 @@ pub mod lane_reason {
     /// The authenticated fallback payload reports that this retriever could
     /// not serve the request.
     pub const RETRIEVER_UNAVAILABLE: &str = "retriever_unavailable";
+}
+
+/// Wire tags for [`tracedecay_domain::RetrievalFailure`] variants that bound a
+/// partial lane's recall. Pinned so journey terminals and coverage serialization
+/// share one vocabulary instead of repeating English/machine strings.
+pub mod partial_reason {
+    /// [`tracedecay_domain::RetrievalFailure::CandidateSourcesPruned`] serde tag.
+    pub const CANDIDATE_SOURCES_PRUNED: &str = "candidate_sources_pruned";
+    pub const AUTHORITY_UNAVAILABLE: &str = "authority_unavailable";
+    pub const INCOMPATIBLE_PROJECTION: &str = "incompatible_projection";
+    pub const STALE_SOURCE: &str = "stale_source";
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const INTERNAL: &str = "internal";
+    pub const BUDGET_EXCEEDED: &str = "budget_exceeded";
 }
 
 /// Per-lane serving status for one search response.
@@ -129,14 +169,18 @@ fn partial_lane_reason(outcome: &tracedecay_domain::RetrieverOutcome<()>) -> Opt
     use tracedecay_domain::{RetrievalFailure, RetrieverOutcome};
     match outcome {
         RetrieverOutcome::Partial { reason, .. } => Some(match reason {
-            RetrievalFailure::CandidateSourcesPruned { .. } => "candidate_sources_pruned",
-            RetrievalFailure::AuthorityUnavailable { .. } => "authority_unavailable",
-            RetrievalFailure::IncompatibleProjection { .. } => "incompatible_projection",
-            RetrievalFailure::StaleSource => "stale_source",
-            RetrievalFailure::InvalidRequest { .. } => "invalid_request",
-            RetrievalFailure::Internal { .. } => "internal",
+            RetrievalFailure::CandidateSourcesPruned { .. } => {
+                partial_reason::CANDIDATE_SOURCES_PRUNED
+            }
+            RetrievalFailure::AuthorityUnavailable { .. } => partial_reason::AUTHORITY_UNAVAILABLE,
+            RetrievalFailure::IncompatibleProjection { .. } => {
+                partial_reason::INCOMPATIBLE_PROJECTION
+            }
+            RetrievalFailure::StaleSource => partial_reason::STALE_SOURCE,
+            RetrievalFailure::InvalidRequest { .. } => partial_reason::INVALID_REQUEST,
+            RetrievalFailure::Internal { .. } => partial_reason::INTERNAL,
         }),
-        RetrieverOutcome::BudgetExceeded(_) => Some("budget_exceeded"),
+        RetrieverOutcome::BudgetExceeded(_) => Some(partial_reason::BUDGET_EXCEEDED),
         _ => None,
     }
 }
@@ -693,10 +737,10 @@ mod tests {
         assert!(partial.graph.is_servable());
     }
 
-    /// The dogfood defect (#917): a natural-language task whose common terms
-    /// exceed the lexical document-frequency budget is served from the
-    /// current complete generation with pruned recall. The lane must say so,
-    /// rather than reading like an incomplete index.
+    /// A natural-language task whose common terms exceed the lexical
+    /// document-frequency budget is served from the current complete
+    /// generation with pruned recall. The lane must say so rather than
+    /// reading like an incomplete index.
     #[test]
     fn a_pruned_lexical_lane_names_why_its_recall_is_partial() {
         let fallback = std::collections::BTreeMap::from([
@@ -735,7 +779,7 @@ mod tests {
             coverage.lexical,
             CodeIndexLaneStatusV1::Partial {
                 generation: None,
-                reason: Some("candidate_sources_pruned"),
+                reason: Some(partial_reason::CANDIDATE_SOURCES_PRUNED),
             }
         );
         assert!(coverage.lexical.is_servable());

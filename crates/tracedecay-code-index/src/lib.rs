@@ -32,6 +32,7 @@ pub mod incremental;
 pub mod intake;
 pub mod languages;
 pub mod lineage;
+pub mod noncanonical;
 pub mod parallelism;
 pub mod production;
 pub mod projection;

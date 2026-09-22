@@ -43,6 +43,7 @@ fn import(
         imported_name: names.imported.map(str::to_owned),
         local_name: names.local.map(str::to_owned),
         is_public: false,
+        reexport_scope: None,
         is_glob: false,
         namespace,
         module_kind,

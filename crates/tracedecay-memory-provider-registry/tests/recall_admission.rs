@@ -12,11 +12,12 @@ use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{CanonicalPayload, OwnedProviderId, OwnedVersionedId};
 use tracedecay_memory_provider_native::NATIVE_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
-    AdmittedTemporalQuery, RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID,
-    RecallAdmissionError, RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1,
-    RecallConfidenceDefect, RecallDenialReason, RecallRequestParts, RecallScopeBindingsV1,
-    ScopeBinding, ScopeField, TemporalState, UnknownValidityPolicy, admit_recall_candidates,
-    admit_recall_reply, build_recall_request_payload, decode_recall_outcome,
+    AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RECALL_REQUEST_CONTRACT_ID,
+    RECALL_RESULT_CONTRACT_ID, RecallAdmissionError, RecallBudgetsV1, RecallCandidateContent,
+    RecallCandidateV1, RecallConfidenceDefect, RecallDenialReason, RecallRequestParts,
+    RecallScopeBindingsV1, ScopeBinding, ScopeField, TemporalState, UnknownValidityPolicy,
+    admit_recall_candidates, admit_recall_reply, build_recall_request_payload,
+    decode_recall_outcome,
 };
 
 mod recall_fixture;
@@ -1009,7 +1010,7 @@ fn overflowing_confidence_number_decodes_to_typed_candidate_denial() -> Result<(
     );
     let bytes = json.into_bytes();
     let payload = CanonicalPayload::new(
-        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)?,
         bytes.clone(),
         sha256_hex(&bytes),
     )?;
@@ -1055,7 +1056,7 @@ fn invalid_confidence_literals_are_payload_decode_errors() -> Result<(), Box<dyn
             );
             let bytes = format!("{leading_whitespace}{invalid_json}").into_bytes();
             let payload = CanonicalPayload::new(
-                OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+                OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)?,
                 bytes.clone(),
                 sha256_hex(&bytes),
             )?;
@@ -1096,7 +1097,7 @@ fn confidence_f64_rounding_at_the_upper_boundary_is_admitted() -> Result<(), Box
     );
     let bytes = json.into_bytes();
     let payload = CanonicalPayload::new(
-        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)?,
         bytes.clone(),
         sha256_hex(&bytes),
     )?;
@@ -1134,7 +1135,7 @@ fn nonfinite_literals_outside_candidate_confidence_remain_payload_decode_errors(
     let json = json.replacen("\"provenance\":{", "\"provenance\":{\"confidence\":NaN,", 1);
     let bytes = json.into_bytes();
     let payload = CanonicalPayload::new(
-        OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID)?,
+        OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)?,
         bytes.clone(),
         sha256_hex(&bytes),
     )?;
@@ -1209,7 +1210,7 @@ fn request_payload_carries_exactly_the_admitted_scope_and_temporal_query()
         deadline_utc_micros: 42,
         remaining_millis: 7,
     })?;
-    assert_eq!(payload.contract_id.as_str(), RECALL_PAYLOAD_CONTRACT_ID);
+    assert_eq!(payload.contract_id.as_str(), RECALL_REQUEST_CONTRACT_ID);
     let value: Value = serde_json::from_slice(&payload.bytes)?;
     let mut keys: Vec<_> = value
         .as_object()

@@ -13,6 +13,7 @@ use tracedecay_mcp::{
     ToolResult, mark_semantic_tool_error, semantic_failure_reason, server::resources_list_result,
     tool_error_response, tool_result_has_semantic_error,
 };
+use tracedecay_runtime_core::db::migrations::render_expected_final_schema_markdown;
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 /// Prefix of the out-of-band token-accounting block appended after a tool's
@@ -248,106 +249,6 @@ impl McpServer {
             })
     }
 }
-
-/// Hand-maintained schema documentation for the `tracedecay://schema` resource.
-/// Mirrors `src/db/migrations.rs::create_schema`. Update both together.
-const SCHEMA_MARKDOWN: &str = r"# tracedecay SQLite schema
-
-The active project database lives in the user-level TraceDecay profile store
-(`~/.tracedecay/projects/<project_id>/tracedecay.db` by default), scoped to the
-current project. Linked worktrees share this durable project store. All tables
-are plain SQLite; safe to query with any client. WAL mode is used, so readers
-do not block writers.
-
-## Tables
-
-### `nodes` — every indexed symbol
-- `id` TEXT PRIMARY KEY — content-hashed identifier (changes when symbol moves or renames)
-- `kind` TEXT — e.g. `function`, `struct`, `trait`, `impl`, `method`, `module`, `file`
-- `name` TEXT — local identifier
-- `qualified_name` TEXT — language-style path (e.g. `crate::module::Type::method`)
-- `file_path` TEXT — relative to the project root
-- `start_line`, `end_line` INTEGER — 1-based inclusive line range of the symbol
-- `start_column`, `end_column` INTEGER — 0-based column range
-- `attrs_start_line` INTEGER — first line of leading doc-comments / attributes (or `start_line` if none)
-- `signature` TEXT NULL — extracted source-level signature
-- `docstring` TEXT NULL — leading doc-comment
-- `visibility` TEXT — one of `public`, `pub_crate`, `pub_super`, `private`
-- `is_async` INTEGER (0/1)
-- `branches`, `loops`, `returns`, `max_nesting`, `unsafe_blocks`, `unchecked_calls`, `assertions` INTEGER — complexity metrics
-- `updated_at` INTEGER — UNIX epoch seconds
-
-Indexes: `kind`, `name`, `qualified_name`, `file_path`, `(file_path,start_line)`, `lower(name)`.
-
-### `edges` — directed relationships between nodes
-- `id` INTEGER PRIMARY KEY AUTOINCREMENT
-- `source` TEXT — FK → `nodes.id` (CASCADE DELETE)
-- `target` TEXT — FK → `nodes.id` (CASCADE DELETE)
-- `kind` TEXT — one of `contains`, `calls`, `returns`, `type_of`, `uses`, `implements`, `extends`, `annotates`, `derives_macro`, `receives`
-- `line` INTEGER NULL — source line of the relationship
-
-Unique constraint: `(source, target, kind, COALESCE(line, -1))`. Indexes on `source`, `target`, `kind`, `(source,kind)`, `(target,kind)`.
-
-### `files` — index bookkeeping
-- `path` TEXT PRIMARY KEY
-- `content_hash` TEXT — sha256 of file contents at index time
-- `size` INTEGER — file size in bytes
-- `modified_at`, `indexed_at` INTEGER — UNIX epoch seconds
-- `node_count` INTEGER — number of nodes extracted from this file
-
-### `unresolved_refs` — references the resolver could not bind
-- `from_node_id` FK → `nodes.id`
-- `reference_name` TEXT
-- `reference_kind` TEXT
-- `line`, `col` INTEGER
-- `file_path` TEXT
-
-### `metadata` — key/value store
-Common keys: `tokens_saved`, schema-version markers.
-
-### `read_cache` — rendered `tracedecay_read` responses
-- primary key: `(project_id, session_id, file_path, mode, args_hash)`
-- stores `mtime_ns`, `digest`, rendered `body` BLOB, token count, and `created_at`
-
-## Recipes
-
-### Find every impl block of a trait
-```sql
-SELECT n.id, n.qualified_name, n.file_path, n.start_line
-FROM nodes n
-JOIN edges e ON e.source = n.id
-WHERE e.kind = 'implements'
-  AND e.target IN (SELECT id FROM nodes WHERE qualified_name = ?1);
-```
-
-### Top callers of a node
-```sql
-SELECT n.qualified_name, COUNT(*) AS call_count
-FROM edges e
-JOIN nodes n ON n.id = e.source
-WHERE e.target = ?1 AND e.kind = 'calls'
-GROUP BY n.qualified_name
-ORDER BY call_count DESC
-LIMIT 20;
-```
-
-### Files modified since last index
-Compare `files.modified_at` against the live filesystem mtime — `tracedecay_affected` does this with extra git plumbing.
-
-### Largest functions by line span
-```sql
-SELECT qualified_name, file_path, end_line - start_line + 1 AS lines
-FROM nodes
-WHERE kind IN ('function', 'method')
-ORDER BY lines DESC
-LIMIT 20;
-```
-
-## Gotchas
-- `nodes.id` is a content hash, so it changes when the symbol moves. For cross-run lookups use `qualified_name` (or `tracedecay_by_qualified_name`).
-- `edges.kind = 'calls'` may reference a *trait method* node rather than the resolved concrete impl — trait dispatch is not currently rewritten.
-- `derives_macro` edges record `#[derive(...)]` usage but generated impls are not in the graph.
-";
 
 impl McpServer {
     pub(crate) fn cancel_application_surface_request(
@@ -648,8 +549,9 @@ impl McpServer {
             // An accepted admission means the paths really entered a mounted
             // worktree's incremental queue — the exact moment indexing work is
             // created for this project, and the only condition worth lighting.
-            if sink(root.clone(), event.rel_paths.clone()).await
-                == super::CodeIndexAdmission::Accepted
+            if sink(root.clone(), event.rel_paths.clone())
+                .await
+                .is_queued()
                 && let Some(activity_db) = dispatch_server.project_session_db.as_deref()
             {
                 tracedecay_session_memory::event_lane::publish(
@@ -689,10 +591,7 @@ impl McpServer {
         // durable spool record is authoritatively committed (Committed or
         // ExactDuplicate). Failures are best-effort and must never change the
         // admission outcome already decided above.
-        if matches!(
-            outcome.status,
-            HostAdmissionStatus::Committed | HostAdmissionStatus::ExactDuplicate
-        ) {
+        if outcome.status.commits_replay_record() {
             if let Some(wake) = &dispatch_server.project_session_refresh_wake {
                 wake.wake();
             }
@@ -837,10 +736,14 @@ impl McpServer {
         )
     }
 
-    /// Returns the `SQLite` schema documentation as a markdown resource.
-    /// Sourced from `src/db/migrations.rs::create_schema` — keep in sync.
+    /// Returns the `SQLite` shape this binary creates, rendered from the migration inventory.
     pub(crate) fn read_resource_schema(id: Value) -> JsonRpcResponse {
-        Self::resource_contents(id, "tracedecay://schema", "text/markdown", SCHEMA_MARKDOWN)
+        match render_expected_final_schema_markdown() {
+            Ok(markdown) => {
+                Self::resource_contents(id, "tracedecay://schema", "text/markdown", &markdown)
+            }
+            Err(error) => JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string()),
+        }
     }
 
     /// Returns typed file-inventory availability for the active project.
@@ -1531,7 +1434,7 @@ impl McpServer {
             .is_cancelled()
         {
             (
-                "project_server_response_revoked",
+                crate::daemon::PROJECT_SERVER_RESPONSE_REVOKED_REASON_CODE,
                 "the retained project server was retired before response completion",
             )
         } else if self
@@ -1606,19 +1509,41 @@ impl McpServer {
         // Resolve the exact execution server before creating cancellation,
         // deadline, settlement, or accounting state. A failed/ambiguous route
         // therefore cannot leave request authority on the active server.
-        let routed = match self
-            .route_tool_arguments(
-                &id,
-                &tool_name,
-                arguments,
-                &connection.route_cache,
-                connection.initialize_route(),
-                &memory_request_scope,
-            )
-            .await
+        //
+        // Route resolution can await registry reads and retained-server
+        // construction, so the transport token is sampled *around* it, not
+        // only after it: a client that cancels mid-route reads its typed
+        // cancelled terminal instead of waiting for routing to finish. No
+        // request authority exists yet, so abandoning the route future is the
+        // complete unwind.
+        let routing = self.route_tool_arguments(
+            &id,
+            &tool_name,
+            arguments,
+            &connection.route_cache,
+            connection.initialize_route(),
+            &memory_request_scope,
+        );
+        let routed = match tracedecay_mcp::server::await_route_with_cancellation(
+            routing,
+            cancellation.cancelled(),
+        )
+        .await
         {
-            Ok(routed) => routed,
-            Err(error) => return tool_error_response(id, &tool_name, &error),
+            Some(Ok(routed)) => routed,
+            Some(Err(error)) => return tool_error_response(id, &tool_name, &error),
+            // Cancel won before route selection installed dispatch authority.
+            // That is transport abandonment, not an admitted tool cancel:
+            // emit the same -32800 / request_cancelled terminal the RMCP and
+            // broker transports use when no application request exists yet.
+            None => {
+                return JsonRpcResponse::error_with_data(
+                    id,
+                    ErrorCode::RequestCancelled,
+                    "MCP request cancelled".to_owned(),
+                    Some(json!({"reason_code": "request_cancelled"})),
+                );
+            }
         };
         let dispatch_server = match routed.selected_server.as_ref() {
             Some(selected) => Arc::clone(selected),
@@ -1694,7 +1619,7 @@ impl McpServer {
                 .project_server_revoked_response(&id, &tool_name)
                 .unwrap_or_else(|| {
                     let error = TraceDecayError::project_route(
-                        "project_server_response_revoked",
+                        crate::daemon::PROJECT_SERVER_RESPONSE_REVOKED_REASON_CODE,
                         true,
                         "the retained project server was retired before response admission",
                     );
@@ -2175,6 +2100,8 @@ mod activity_dispatch_tests {
                     None,
                 )
                 .await
+                .ok()
+                .flatten()
                 .is_some_and(|replay| {
                     replay.records.iter().any(|record| {
                         record.pulse.family

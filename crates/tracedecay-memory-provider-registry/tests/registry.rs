@@ -32,10 +32,10 @@ const REGISTRY_PAYLOAD_SHA: &str =
     "2bc217171d7030f82de2853ea3e4914b803d3504a3409433d62bf426a613d7ee";
 const OPAQUE_PAYLOAD_SHA: &str = "a4ebe309c7d7eaf1b08aec54feea5668a4b10a564770d162dbd7a131990d0de8";
 const OBSERVATION_PAYLOAD_SHA: &str =
-    "b6c0cb54c14eb8485ba9f86925c370bbcb8e464687f875b7fa1085a1d1b9b1fe";
+    "44ac27354a32cf05157b61fa2267cdca7ec3e1cace0222a16ac1f22d602b5219";
 const RESOLVED_SCOPE_DIGEST: &str =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-const OBSERVATION_PAYLOAD: &[u8] = br#"{"canonical_payload":{"kind":"settled_native_fact_write","fact":{"fixture":true},"commit":{"fixture":true}},"observation_kind":"native.fact_promoted.v1","payload_contract":"tracedecay.memory.observation.native-fact-promotion.v1"}"#;
+const OBSERVATION_PAYLOAD: &[u8] = br#"{"canonical_payload":{"commit":{"fixture":true},"fact":{"fixture":true},"kind":"settled_native_fact_write"},"observation_kind":"native.fact_promoted.v1","payload_contract":"tracedecay.memory.observation.native-fact-promotion.v1"}"#;
 
 struct MockNativePort {
     descriptor: ProviderDescriptor,
@@ -115,6 +115,7 @@ struct EvidenceNativePort {
     handshake_terminal_operation: ProviderOperation,
     handshake_terminal_provider_id: OwnedProviderId,
     handshake_accepted_scope: Option<OwnedExactScope>,
+    application_fallback: FallbackDirective,
     handshake_calls: AtomicUsize,
     health_calls: AtomicUsize,
     observe_calls: AtomicUsize,
@@ -128,6 +129,7 @@ impl EvidenceNativePort {
             handshake_terminal_provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID)
                 .expect("native provider"),
             handshake_accepted_scope: None,
+            application_fallback: FallbackDirective::forbidden(),
             handshake_calls: AtomicUsize::new(0),
             health_calls: AtomicUsize::new(0),
             observe_calls: AtomicUsize::new(0),
@@ -149,27 +151,19 @@ impl EvidenceNativePort {
         self
     }
 
+    fn with_application_fallback(mut self, fallback: FallbackDirective) -> Self {
+        self.application_fallback = fallback;
+        self
+    }
+
     fn unavailable_reply(&self, call: &ProviderCall) -> ProviderReply {
-        let current_provider = OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider");
-        let policy = PinnedFallbackPolicy::new(
-            "memory.fallback.policy",
-            7,
-            OwnedProviderId::new("vendor.backup").expect("fallback provider"),
-        )
-        .expect("fallback policy");
-        let fallback = FallbackDirective::explicit_policy_only(
-            &current_provider,
-            policy,
-            "explicit host policy may select the pinned provider",
-        )
-        .expect("fallback directive");
         ProviderReply {
             terminal: TerminalRecord::new(
                 call.operation,
                 call.provider_id.clone(),
                 TerminalCode::ProviderUnavailable,
                 CommittedEffectEvidence::none(Some(call.expected_state_generation)),
-                fallback,
+                self.application_fallback.clone(),
                 call.operation_id.clone(),
                 call.exact_scope.exact_scope_sha256(),
                 Some("native.provider_unavailable".to_owned()),
@@ -668,7 +662,8 @@ fn adapter_identity_and_registration_revision_failures_remain_typed() {
 }
 
 #[test]
-fn active_route_preserves_structured_fallback_evidence() -> Result<(), Box<dyn Error>> {
+fn active_route_preserves_unavailability_without_inventing_fallback() -> Result<(), Box<dyn Error>>
+{
     let port = Arc::new(EvidenceNativePort::new());
     let composition =
         ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
@@ -702,31 +697,48 @@ fn active_route_preserves_structured_fallback_evidence() -> Result<(), Box<dyn E
         reply.terminal.committed_effect().state(),
         CommittedEffectState::None
     );
-    assert_eq!(
-        reply.terminal.fallback().eligibility(),
-        FallbackEligibility::ExplicitPolicyOnly
-    );
-    assert_eq!(
-        reply
-            .terminal
-            .fallback()
-            .source_provider_id()
-            .map(OwnedProviderId::as_str),
-        Some(NATIVE_PROVIDER_ID)
-    );
-    let policy = reply
-        .terminal
-        .fallback()
-        .policy()
-        .expect("pinned fallback policy");
-    assert_eq!(policy.policy_id(), "memory.fallback.policy");
-    assert_eq!(policy.policy_revision(), 7);
-    assert_eq!(policy.target_provider_id().as_str(), "vendor.backup");
-    assert_eq!(
-        reply.terminal.fallback().reason(),
-        Some("explicit host policy may select the pinned provider")
-    );
+    assert_eq!(reply.terminal.fallback(), &FallbackDirective::forbidden());
     assert_eq!(reply.state_generation, 5);
+    assert_eq!(port.health_calls.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[test]
+fn active_route_rejects_provider_authored_fallback_policy() -> Result<(), Box<dyn Error>> {
+    let current_provider = OwnedProviderId::new(NATIVE_PROVIDER_ID)?;
+    let policy = PinnedFallbackPolicy::new(
+        "memory.fallback.policy",
+        7,
+        OwnedProviderId::new("vendor.backup")?,
+    )?;
+    let fallback = FallbackDirective::explicit_policy_only(
+        &current_provider,
+        policy,
+        "provider cannot select a host fallback",
+    )?;
+    let port = Arc::new(EvidenceNativePort::new().with_application_fallback(fallback));
+    let composition =
+        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
+            fabric_config: config(1, 2),
+            port: port.clone(),
+            registration_revision: 31,
+            mode: EnabledProviderMode::Active,
+        })?;
+    let registry = composition.registry().expect("enabled registry");
+    let handshake_response = registry.handshake(&handshake())?;
+    let call = call_after_handshake(ProviderOperation::Health, &handshake_response);
+
+    let reply = registry.invoke_active(&call)?;
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ContractViolation
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("native.application_reply_contract_violation")
+    );
+    assert_eq!(reply.terminal.fallback(), &FallbackDirective::forbidden());
     assert_eq!(port.health_calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -776,7 +788,7 @@ fn handshake_route_preserves_complete_provider_neutral_terminal() -> Result<(), 
 }
 
 #[test]
-fn handshake_route_rejects_wrong_terminal_operation_and_provider() -> Result<(), Box<dyn Error>> {
+fn handshake_route_sanitizes_wrong_terminal_operation_and_provider() -> Result<(), Box<dyn Error>> {
     let wrong_operation = Arc::new(
         EvidenceNativePort::new()
             .with_handshake_terminal(ProviderOperation::Health, NATIVE_PROVIDER_ID),
@@ -788,16 +800,21 @@ fn handshake_route_rejects_wrong_terminal_operation_and_provider() -> Result<(),
             registration_revision: 31,
             mode: EnabledProviderMode::Active,
         })?;
+    let response = composition
+        .registry()
+        .expect("enabled registry")
+        .handshake(&handshake())?;
+    assert_eq!(response.terminal.operation(), ProviderOperation::Handshake);
+    assert_eq!(response.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
     assert_eq!(
-        composition
-            .registry()
-            .expect("enabled registry")
-            .handshake(&handshake()),
-        Err(FabricError::ResponseOperationKindMismatch {
-            expected: ProviderOperation::Handshake,
-            returned: ProviderOperation::Health,
-        })
+        response.terminal.terminal_code(),
+        TerminalCode::ContractViolation
     );
+    assert_eq!(
+        response.terminal.diagnostic_id(),
+        Some("native.handshake_response_contract_violation")
+    );
+    assert!(response.descriptor.is_none());
     assert_eq!(wrong_operation.handshake_calls.load(Ordering::Relaxed), 1);
 
     let wrong_provider = Arc::new(
@@ -811,16 +828,21 @@ fn handshake_route_rejects_wrong_terminal_operation_and_provider() -> Result<(),
             registration_revision: 31,
             mode: EnabledProviderMode::Active,
         })?;
+    let response = composition
+        .registry()
+        .expect("enabled registry")
+        .handshake(&handshake())?;
+    assert_eq!(response.terminal.operation(), ProviderOperation::Handshake);
+    assert_eq!(response.terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
     assert_eq!(
-        composition
-            .registry()
-            .expect("enabled registry")
-            .handshake(&handshake()),
-        Err(FabricError::ResponseProviderMismatch {
-            expected: NATIVE_PROVIDER_ID.to_owned(),
-            returned: "vendor.foreign".to_owned(),
-        })
+        response.terminal.terminal_code(),
+        TerminalCode::ContractViolation
     );
+    assert_eq!(
+        response.terminal.diagnostic_id(),
+        Some("native.handshake_response_contract_violation")
+    );
+    assert!(response.descriptor.is_none());
     assert_eq!(wrong_provider.handshake_calls.load(Ordering::Relaxed), 1);
     Ok(())
 }
@@ -850,12 +872,14 @@ fn observer_route_strips_output_but_preserves_structured_effect_evidence()
 
     let receipt = registry.deliver_observation(&call)?;
 
-    assert_eq!(port.observe_calls.load(Ordering::Relaxed), 1);
     let ObserverReceipt {
         provider_id,
         registration_revision,
         terminal,
     } = receipt;
+    assert_eq!(terminal.diagnostic_id(), None);
+    assert_eq!(terminal.terminal_code(), TerminalCode::Success);
+    assert_eq!(port.observe_calls.load(Ordering::Relaxed), 1);
     assert_eq!(provider_id.as_str(), NATIVE_PROVIDER_ID);
     assert_eq!(registration_revision, 31);
     assert_eq!(terminal.operation_id(), call.operation_id);
@@ -865,8 +889,6 @@ fn observer_route_strips_output_but_preserves_structured_effect_evidence()
         terminal.exact_scope_sha256(),
         call.exact_scope.exact_scope_sha256()
     );
-    assert_eq!(terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(terminal.diagnostic_id(), None);
     let effect = terminal.committed_effect();
     assert_eq!(effect.state(), CommittedEffectState::Committed);
     assert_eq!(effect.committed_boundary(), None);
@@ -965,7 +987,7 @@ fn readiness_target_rejects_stale_registration_revision() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn readiness_target_rejects_foreign_accepted_scope() -> Result<(), Box<dyn Error>> {
+fn readiness_target_rejects_scope_refused_by_native_adapter() -> Result<(), Box<dyn Error>> {
     let port =
         Arc::new(EvidenceNativePort::new().with_handshake_accepted_scope(foreign_exact_scope()));
     let composition =
@@ -978,12 +1000,7 @@ fn readiness_target_rejects_foreign_accepted_scope() -> Result<(), Box<dyn Error
     let registry = composition.registry().expect("enabled registry");
 
     let result = registry.readiness_target(&handshake());
-    assert_eq!(
-        result,
-        Err(ReadinessTargetError::Fabric(
-            FabricError::SuccessfulHandshakeScopeMismatch
-        ))
-    );
+    assert_eq!(result, Err(ReadinessTargetError::HandshakeNotReady));
 
     // The registry retains no readiness from the rejected attempt: status
     // still reports NotReady, so no stale scope could leak into a later

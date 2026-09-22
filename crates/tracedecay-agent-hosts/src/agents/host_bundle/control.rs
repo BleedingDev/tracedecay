@@ -15,14 +15,19 @@ use super::model::{
 };
 use super::planner::inspect_install_target;
 use super::{
-    HOST_BUNDLE_RECEIPT_SCHEMA_VERSION, HostBundleBackupReceiptV1, HostBundleComponentV1,
-    HostBundleError, HostBundleInstallReceiptV1, HostBundleJournalV1, HostBundleLifecycleOpV1,
+    HOST_BUNDLE_RECEIPT_SCHEMA_VERSION, HostBundleBackupReceiptV1, HostBundleError,
+    HostBundleInstallReceiptV1, HostBundleJournalV1, HostBundleLifecycleOpV1,
     HostBundleRestoreReceiptV1, HostBundleRollbackBoundaryV1, HostComponentSetJournalV1,
-    HostComponentSetReceiptV1, HostKindV1, MAX_HOST_COMPONENTS, MAX_MANIFEST_ARTIFACTS,
-    stock_host_kinds, validate_identifier, validate_relative_install_path,
+    HostComponentSetReceiptV1, HostComponentV1, HostKindV1, MAX_HOST_COMPONENTS,
+    MAX_MANIFEST_ARTIFACTS, stock_host_kinds, validate_identifier, validate_relative_install_path,
 };
 
 pub(super) const HOST_BUNDLE_CONTROL_DIR: &str = ".tracedecay-host-bundle-v1";
+/// Legacy shared single-component journal. One file per lifecycle root meant
+/// recovering host Y rolled back host X, and a wedged journal blocked every
+/// other host. Journals are host-scoped now; this name is still read (and
+/// retired) so a journal left by an older binary is recovered rather than
+/// orphaned.
 pub(super) const HOST_BUNDLE_JOURNAL_FILE: &str = "journal.v1.json";
 /// Legacy shared component-set journal name. One journal per lifecycle root
 /// meant an interrupted transaction for any host blocked every other host.
@@ -33,6 +38,9 @@ pub(super) const HOST_COMPONENT_SET_STAGE_DIR: &str = "component-set-staging";
 /// Set-aside directory for journals an operator explicitly abandoned with
 /// `tracedecay host-bundle recover --quarantine --yes`. Backups stay in place.
 pub(super) const HOST_BUNDLE_QUARANTINE_DIR: &str = "quarantine";
+/// Retired lifecycle-root lock. Hosts do not share a write target, so each
+/// host owns `writer.{slug}.v1.lock`. This name is not acquired; a new binary
+/// must not recreate it or independent hosts serialize again.
 pub(super) const HOST_BUNDLE_LOCK_FILE: &str = "writer.v1.lock";
 pub(super) const MAX_CONTROL_FILE_BYTES: usize = 256 * 1024;
 
@@ -99,7 +107,7 @@ pub fn host_bundle_backup_root(lifecycle_root: &Path) -> PathBuf {
 pub fn latest_host_component_receipt_at(
     lifecycle_root: &Path,
     host: HostKindV1,
-    component: HostBundleComponentV1,
+    component: HostComponentV1,
 ) -> Result<Option<HostBundleInstallReceiptV1>, HostBundleError> {
     read_receipt_at(lifecycle_root, host, component)
 }
@@ -107,7 +115,7 @@ pub fn latest_host_component_receipt_at(
 pub(super) fn read_receipt_at(
     root: &Path,
     host: HostKindV1,
-    component: HostBundleComponentV1,
+    component: HostComponentV1,
 ) -> Result<Option<HostBundleInstallReceiptV1>, HostBundleError> {
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -530,10 +538,7 @@ pub(super) fn host_bundle_restore_receipt_file(operation_id: [u8; 16]) -> String
     format!("restore-receipt.{}.v1.json", hex::encode(operation_id))
 }
 
-pub(super) fn component_set_stage_name(
-    component: HostBundleComponentV1,
-    relative_path: &str,
-) -> String {
+pub(super) fn component_set_stage_name(component: HostComponentV1, relative_path: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(component_slug(component).as_bytes());
     hasher.update(relative_path.as_bytes());
@@ -544,7 +549,7 @@ pub(super) fn component_set_stage_name(
     )
 }
 
-pub(super) fn receipt_file(host: HostKindV1, component: HostBundleComponentV1) -> String {
+pub(super) fn receipt_file(host: HostKindV1, component: HostComponentV1) -> String {
     format!(
         "receipt.{}.{}.v1.json",
         host.descriptor().slug(),
@@ -564,10 +569,19 @@ pub(super) fn receipt_file(host: HostKindV1, component: HostBundleComponentV1) -
 /// reason to refuse Y. `first_party_host_artifact_prefixes_are_disjoint`
 /// pins that premise as a test, so a future host that violates it fails the
 /// suite rather than silently widening the blast radius. The receipt namespace
-/// is already host-scoped (`receipt_file`), and the single writer lock still
-/// serializes all mutation within a lifecycle root.
+/// is already host-scoped (`receipt_file`). The writer lock is host-scoped
+/// too (`writer_lock_file`): one host's in-flight mutation is a real
+/// invariant, a second host's is not.
 pub(super) fn component_set_journal_file(host: HostKindV1) -> String {
     format!("component-set-journal.{}.v1.json", host.descriptor().slug())
+}
+
+pub(super) fn journal_file(host: HostKindV1) -> String {
+    format!("journal.{}.v1.json", host.descriptor().slug())
+}
+
+pub(super) fn writer_lock_file(host: HostKindV1) -> String {
+    format!("writer.{}.v1.lock", host.descriptor().slug())
 }
 
 pub(super) fn component_set_receipt_file(operation_id: [u8; 16]) -> String {
@@ -579,12 +593,12 @@ pub(super) fn component_set_receipt_file(operation_id: [u8; 16]) -> String {
 
 pub(super) fn receipt_identity_from_file_name(
     file_name: &str,
-) -> Option<(HostKindV1, HostBundleComponentV1)> {
+) -> Option<(HostKindV1, HostComponentV1)> {
     let components = [
-        HostBundleComponentV1::Core,
-        HostBundleComponentV1::Agent,
-        HostBundleComponentV1::ContextMcp,
-        HostBundleComponentV1::OperatorMcp,
+        HostComponentV1::Core,
+        HostComponentV1::Agent,
+        HostComponentV1::ContextMcp,
+        HostComponentV1::OperatorMcp,
     ];
     stock_host_kinds().into_iter().find_map(|host| {
         components
@@ -595,10 +609,7 @@ pub(super) fn receipt_identity_from_file_name(
     })
 }
 
-pub(super) fn expected_ownership_marker(
-    host: HostKindV1,
-    component: HostBundleComponentV1,
-) -> String {
+pub(super) fn expected_ownership_marker(host: HostKindV1, component: HostComponentV1) -> String {
     format!(
         "tracedecay.{}.{}.v1",
         host.descriptor().slug(),
@@ -606,11 +617,11 @@ pub(super) fn expected_ownership_marker(
     )
 }
 
-pub(super) fn component_slug(component: HostBundleComponentV1) -> &'static str {
+pub(super) fn component_slug(component: HostComponentV1) -> &'static str {
     match component {
-        HostBundleComponentV1::Core => "core",
-        HostBundleComponentV1::Agent => "agent",
-        HostBundleComponentV1::ContextMcp => "context-mcp",
-        HostBundleComponentV1::OperatorMcp => "operator-mcp",
+        HostComponentV1::Core => "core",
+        HostComponentV1::Agent => "agent",
+        HostComponentV1::ContextMcp => "context-mcp",
+        HostComponentV1::OperatorMcp => "operator-mcp",
     }
 }

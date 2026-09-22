@@ -14,8 +14,8 @@ use tokio::time::{Duration, Instant};
 use super::{
     DAEMON_TOOL_LIVENESS_POLL_INTERVAL, DaemonClientDeadline, DaemonHandshake,
     PROJECT_OPEN_RETRY_GRACE, PROJECT_OPEN_RETRY_INTERVAL, PROJECT_WARMING_RETRY_HINT,
-    connect_to_current_daemon_within, json_rpc_error_is_project_open_retryable,
-    next_daemon_response_line, write_daemon_preamble,
+    REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE, connect_to_current_daemon_within,
+    json_rpc_error_is_project_open_retryable, next_daemon_response_line, write_daemon_preamble,
 };
 #[cfg(unix)]
 use super::{binary_version, connect_with_restart_grace};
@@ -445,6 +445,9 @@ pub(crate) async fn resolve_daemon_initialize_route(
     registry: Option<&tracedecay_global_db::RegisteredGlobalDb>,
 ) -> tracedecay_domain::errors::Result<Option<InitializeRouteMetadata>> {
     let roots = crate::mcp::server::initialize_root_paths(params);
+    // One parent discovery budget for the whole initialize request — not N×
+    // REPOSITORY_DISCOVERY_DEADLINE across roots / registry then fallback loops.
+    let discovery_deadline = repository_discovery_parent_deadline();
     if let Some(registry) = registry {
         for root in &roots {
             let mut candidate = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -463,7 +466,7 @@ pub(crate) async fn resolve_daemon_initialize_route(
                     break;
                 }
             }
-            match bounded_repository_identity(root).await {
+            match bounded_repository_identity(root, discovery_deadline).await {
                 tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
                     identity,
                 ) => {
@@ -489,11 +492,13 @@ pub(crate) async fn resolve_daemon_initialize_route(
         }
     }
     for root in roots {
-        let repository_identity = bounded_repository_identity(&root).await;
+        let repository_identity = bounded_repository_identity(&root, discovery_deadline).await;
         if let tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(
             reason,
         ) = &repository_identity
         {
+            // Deferred is uncertainty, not a decided root — never fall through
+            // to discover_project_root / Resolved admission.
             return Err(repository_discovery_deferred(&root, *reason));
         }
         if let Some(project_path) = crate::config::discover_project_root(&root) {
@@ -530,13 +535,19 @@ pub(crate) async fn resolve_daemon_initialize_route(
     Ok(None)
 }
 
+/// Parent deadline for one daemon/MCP composition edge's repository discovery.
+pub(super) fn repository_discovery_parent_deadline()
+-> tracedecay_runtime_core::cancellation::MonotonicDeadline {
+    tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
+        std::time::Instant::now() + super::REPOSITORY_DISCOVERY_DEADLINE,
+    )
+}
+
 #[hotpath::measure(label = "daemon.engine.proxy.repository_identity", future = true)]
 pub(super) async fn bounded_repository_identity(
     path: &Path,
+    deadline: tracedecay_runtime_core::cancellation::MonotonicDeadline,
 ) -> tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome {
-    let deadline = tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
-        std::time::Instant::now() + super::REPOSITORY_DISCOVERY_DEADLINE,
-    );
     tracedecay_runtime_core::git_discovery::discover_repository_identity(
         path,
         deadline,
@@ -562,11 +573,6 @@ pub(super) fn repository_discovery_deferred(
         reason,
         tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown::DeadlineExceeded
     );
-    let retry_hint = if deferred {
-        PROJECT_WARMING_RETRY_HINT
-    } else {
-        "cannot be resolved"
-    };
     let progress = if deferred {
         let retry_after_ms = super::REPOSITORY_DISCOVERY_DEADLINE.as_millis();
         match tracedecay_runtime_core::git_discovery::identity_resolution_elapsed(path) {
@@ -579,11 +585,19 @@ pub(super) fn repository_discovery_deferred(
     } else {
         String::new()
     };
-    TraceDecayError::Config {
-        message: format!(
-            "repository discovery for '{}' is deferred ({reason:?}){progress}; the project route {retry_hint}",
-            path.display()
-        ),
+    let detail = format!(
+        "repository discovery for '{}' is deferred ({reason:?}){progress}; the project route {}",
+        path.display(),
+        if deferred {
+            PROJECT_WARMING_RETRY_HINT
+        } else {
+            "cannot be resolved"
+        }
+    );
+    if deferred {
+        TraceDecayError::project_route(REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE, true, detail)
+    } else {
+        TraceDecayError::Config { message: detail }
     }
 }
 
@@ -945,7 +959,13 @@ mod tests {
                 "id": 1,
                 "error": {
                     "code": -32603,
-                    "message": "project is warming in the background; retry the same tool shortly"
+                    "message": "project is warming in the background; retry the same tool shortly",
+                    "data": {
+                        "reason_code": "project_warming",
+                        "retryable": true,
+                        "detail": "project is warming in the background; retry the same tool shortly",
+                        "kind": "project_warming"
+                    }
                 }
             }),
             json!({

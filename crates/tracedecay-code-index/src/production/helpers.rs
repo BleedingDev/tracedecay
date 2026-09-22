@@ -1,11 +1,16 @@
 use super::*;
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-use tracedecay_code_extraction::{ImportModuleKindV1, ImportNamespaceV1};
+use tracedecay_code_extraction::{ImportModuleKindV1, ImportNamespaceV1, ImportReexportScopeV1};
 use tracedecay_domain::{EdgeAuthorityV1, RelationEdgeKindV1, SymbolOccurrenceId};
 
-use crate::chunks::{CROSS_FILE_REFERENCE_BLOCKLIST, relation_target_kind_is_compatible};
+use crate::chunks::{
+    CROSS_FILE_REFERENCE_BLOCKLIST, cross_file_reference_name_is_blocklisted,
+    relation_target_kind_is_compatible, rust_qualified_name_is_ufcs_trait_impl,
+    rust_type_path_alias_for_trait_impl_method,
+};
 use crate::lineage::LineageSymbolRecordV1;
 
 pub(crate) struct StagedGenerationV1 {
@@ -13,6 +18,9 @@ pub(crate) struct StagedGenerationV1 {
     pub(crate) chunks: GenerationChunkManifestV1,
     pub(crate) symbols: GenerationSymbolIndexV1,
     pub(crate) lineage: Vec<SymbolLineageCandidateV1>,
+    /// File occurrences Arc-shared from the parent published generation.
+    /// `None` when this stage was built without a parent.
+    pub(crate) parent_shared_occurrences: Option<BTreeSet<tracedecay_domain::FileOccurrenceId>>,
     pub(crate) clone_payloads_reused: u64,
     pub(crate) clone_payloads_computed: u64,
     pub(crate) clone_stale_invalidations: u64,
@@ -22,6 +30,7 @@ pub(crate) fn staged_generation(
     generation_id: CodeGenerationId,
     mut files: Vec<Arc<FileGenerationArtifactsV1>>,
     lineage: Vec<SymbolLineageCandidateV1>,
+    parent: Option<&CodeIndexPublishedGenerationV1>,
 ) -> Result<StagedGenerationV1, CodeIndexProductionErrorV1> {
     files.sort_by(|left, right| {
         left.artifacts
@@ -30,37 +39,131 @@ pub(crate) fn staged_generation(
             .file_occurrence_id
             .cmp(&right.artifacts.chunks.document.file_occurrence_id)
     });
-    let chunks = hotpath::measure_block!(
-        "code_index.generation.aggregate_chunks",
-        GenerationChunkManifestV1::new(
-            generation_id.clone(),
-            files
-                .iter()
-                .map(|file| file.artifacts.chunks.clone())
-                .collect(),
-        )
-    )
-    .map_err(CodeIndexProductionErrorV1::Increment)?;
-    let symbols = hotpath::measure_block!(
-        "code_index.generation.aggregate_symbols",
-        GenerationSymbolIndexV1::new(
-            generation_id,
-            files
-                .iter()
-                .flat_map(|file| file.artifacts.symbols.clone())
-                .collect(),
-        )
-    )
-    .map_err(CodeIndexProductionErrorV1::Lineage)?;
+    let (chunks, symbols, parent_shared_occurrences) = match parent {
+        Some(parent) => {
+            let (chunks, symbols, shared) = hotpath::measure_block!(
+                "code_index.generation.aggregate_parent_delta",
+                aggregate_from_parent(generation_id, parent, &files)
+            )?;
+            (chunks, symbols, Some(shared))
+        }
+        None => {
+            let chunks = hotpath::measure_block!(
+                "code_index.generation.aggregate_chunks",
+                GenerationChunkManifestV1::from_validated_files(
+                    generation_id.clone(),
+                    files
+                        .iter()
+                        .map(|file| file.artifacts.chunks.clone())
+                        .collect(),
+                )
+            )
+            .map_err(CodeIndexProductionErrorV1::Increment)?;
+            let symbols = hotpath::measure_block!(
+                "code_index.generation.aggregate_symbols",
+                GenerationSymbolIndexV1::new(
+                    generation_id,
+                    files
+                        .iter()
+                        .flat_map(|file| file.artifacts.symbols.clone())
+                        .collect(),
+                )
+            )
+            .map_err(CodeIndexProductionErrorV1::Lineage)?;
+            (chunks, symbols, None)
+        }
+    };
     Ok(StagedGenerationV1 {
         files,
         chunks,
         symbols,
         lineage,
+        parent_shared_occurrences,
         clone_payloads_reused: 0,
         clone_payloads_computed: 0,
         clone_stale_invalidations: 0,
     })
+}
+
+/// Build serving chunk/symbol indexes from Arc-shared parent pages plus fresh
+/// file pages. File-page `generation_id` stays extraction provenance; the
+/// returned manifests carry the publish generation as serving identity.
+fn aggregate_from_parent(
+    generation_id: CodeGenerationId,
+    parent: &CodeIndexPublishedGenerationV1,
+    files: &[Arc<FileGenerationArtifactsV1>],
+) -> Result<
+    (
+        GenerationChunkManifestV1,
+        GenerationSymbolIndexV1,
+        BTreeSet<tracedecay_domain::FileOccurrenceId>,
+    ),
+    CodeIndexProductionErrorV1,
+> {
+    let parent_by_occurrence = parent
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.artifacts.chunks.document.file_occurrence_id.clone(),
+                file,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut shared_occurrences = BTreeSet::new();
+    let mut fresh_files = Vec::new();
+    for file in files {
+        let occurrence = &file.artifacts.chunks.document.file_occurrence_id;
+        if parent_by_occurrence
+            .get(occurrence)
+            .is_some_and(|prior| Arc::ptr_eq(prior, file))
+        {
+            shared_occurrences.insert(occurrence.clone());
+        } else {
+            fresh_files.push(file);
+        }
+    }
+
+    let replaced_parent_occurrences = parent_by_occurrence
+        .keys()
+        .filter(|occurrence| !shared_occurrences.contains(*occurrence))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    // Ordinary increments replace a tiny complement of the parent. Track that
+    // complement instead of hashing nearly every shared file and symbol.
+    let fresh_chunks = fresh_files
+        .iter()
+        .flat_map(|file| file.artifacts.chunks.chunks.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let replaced_symbol_ptrs = replaced_parent_occurrences
+        .iter()
+        .filter_map(|occurrence| parent_by_occurrence.get(occurrence))
+        .flat_map(|file| file.artifacts.symbols.iter())
+        .map(Arc::as_ptr)
+        .collect::<HashSet<_>>();
+    let fresh_symbols = fresh_files
+        .iter()
+        .flat_map(|file| file.artifacts.symbols.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let chunks = GenerationChunkManifestV1::from_parent_delta_arcs(
+        generation_id.clone(),
+        &parent.chunks,
+        &replaced_parent_occurrences,
+        fresh_chunks,
+    )
+    .map_err(CodeIndexProductionErrorV1::Increment)?;
+    let symbols = GenerationSymbolIndexV1::from_parent_delta_arcs(
+        generation_id,
+        &parent.symbols,
+        &replaced_symbol_ptrs,
+        fresh_symbols,
+    )
+    .map_err(CodeIndexProductionErrorV1::Lineage)?;
+    Ok((chunks, symbols, shared_occurrences))
 }
 
 /// Pin one descriptor registry to the languages this generation can actually
@@ -174,7 +277,8 @@ pub(crate) fn projection_request(
     active: Option<&CodeIndexPublishedGenerationV1>,
     increment: Option<&crate::generations::GenerationIncrementPlanV1>,
     target_projection_key: ProjectionKeyV1,
-    changes: tracedecay_domain::ChangedCodeChunkSetV1,
+    mut changes: tracedecay_domain::ChangedCodeChunkSetV1,
+    current_chunks: &GenerationChunkManifestV1,
 ) -> Result<ProjectionBatchRequestV1, CodeIndexProductionErrorV1> {
     let previous_projection_key =
         active.map(|active| active.projection.request().target_projection_key.clone());
@@ -188,6 +292,37 @@ pub(crate) fn projection_request(
         }
         _ => ProjectionReplayReasonV1::SourceEdit,
     };
+    if replay_reason == ProjectionReplayReasonV1::ProjectionProfileChange {
+        // Expand while the current corpus is still available.
+        let mut added_or_changed = current_chunks
+            .chunks()
+            .iter()
+            .map(|chunk| tracedecay_domain::ChangedCodeChunkV1 {
+                chunk_id: chunk.id.clone(),
+                prior_digest: None,
+                current_digest: Some(chunk.content_digest.clone()),
+            })
+            .collect::<Vec<_>>();
+        added_or_changed.sort_by(|left, right| left.chunk_id.cmp(&right.chunk_id));
+        let (reused_count, reused_digest) =
+            tracedecay_domain::ChangedCodeChunkSetV1::seal_reused_partition(&[])
+                .map_err(|error| CodeIndexProductionErrorV1::Contract(error.to_string()))?;
+        changes = tracedecay_domain::ChangedCodeChunkSetV1 {
+            from_generation: changes.from_generation,
+            to_generation: changes.to_generation,
+            manifest_digest: changes.manifest_digest,
+            added_or_changed,
+            deleted: Vec::new(),
+            reused_count,
+            reused_digest,
+        };
+        changes.manifest_digest = changes
+            .compute_digest()
+            .map_err(|error| CodeIndexProductionErrorV1::Contract(error.to_string()))?;
+        changes
+            .validate()
+            .map_err(|error| CodeIndexProductionErrorV1::Contract(error.to_string()))?;
+    }
     let mut request = ProjectionBatchRequestV1 {
         request_digest: changes.manifest_digest.clone(),
         changes,
@@ -438,7 +573,10 @@ where
         .unwrap_or(reference.reference_name.as_str());
     // Retention already narrows names, but carried artifacts outlive policy
     // revisions; apply the current blocklist to every retained reference.
-    if simple_name.is_empty() || CROSS_FILE_REFERENCE_BLOCKLIST.contains(&simple_name) {
+    if simple_name.is_empty()
+        || (import.is_some() && CROSS_FILE_REFERENCE_BLOCKLIST.contains(&simple_name))
+        || cross_file_reference_name_is_blocklisted(&reference.reference_name)
+    {
         return None;
     }
     let candidates = by_simple_name.get(simple_name)?;
@@ -454,71 +592,125 @@ where
     }
     let source_path = &file.authority.logical_path;
     let crate_qualified = reference.reference_name.strip_prefix("crate::");
+    let is_rust = file.extraction.language.as_str() == "rust";
     let mut rust = RustResolutionContextV1 {
         files: rust_files,
         reexports: reexport_cache,
     };
-    let mut compatible = candidates.iter().filter(|(candidate_index, symbol)| {
-        let target = RustSymbolTargetV1 {
-            index: *candidate_index,
-            symbol,
-        };
-        files[*candidate_index].as_ref().extraction.language == file.extraction.language
-            && relation_target_kind_is_compatible(reference.kind, &symbol.kind)
-            && match import {
-                None => crate_qualified.map_or_else(
-                    || {
-                        if has_rust_glob
-                            && hotpath::measure_block!(
-                                "code_index.seal.glob_expansion",
-                                rust_parent_glob_import_matches(
-                                    files,
-                                    &mut rust,
-                                    index,
-                                    &reference.reference_name,
-                                    reference.kind,
-                                    target,
+    // A blocklisted member (`new`, `read`, `spawn`) is exempt from the
+    // blocklist only behind an owner this file attests as project code;
+    // `fs::read` through `use std::fs` keeps the member's verdict.
+    if qualified
+        && is_rust
+        && CROSS_FILE_REFERENCE_BLOCKLIST.contains(&simple_name)
+        && !rust_qualified_owner_is_project_attested(&rust, file, &reference.reference_name)
+    {
+        return None;
+    }
+    let compatible = candidates
+        .iter()
+        .filter(|(candidate_index, symbol)| {
+            let target = RustSymbolTargetV1 {
+                index: *candidate_index,
+                symbol,
+            };
+            files[*candidate_index].as_ref().extraction.language == file.extraction.language
+                && relation_target_kind_is_compatible(reference.kind, &symbol.kind)
+                && match import {
+                    None => {
+                        let direct = match crate_qualified {
+                            None => {
+                                (has_rust_glob
+                                    && hotpath::measure_block!(
+                                        "code_index.seal.glob_expansion",
+                                        rust_parent_glob_import_matches(
+                                            files,
+                                            &mut rust,
+                                            index,
+                                            &reference.reference_name,
+                                            reference.kind,
+                                            target,
+                                        )
+                                    ))
+                                    // Rust `::` paths bind only through the
+                                    // hop-by-hop walk below; a bare file-stem
+                                    // match would bind `fs::read` to any crate's
+                                    // `fs.rs`.
+                                    || (!is_rust
+                                        && file_qualified_name_matches(
+                                            &reference.reference_name,
+                                            &files[*candidate_index]
+                                                .as_ref()
+                                                .authority
+                                                .logical_path,
+                                            &symbol.qualified_name,
+                                        ))
+                            }
+                            Some(crate_path) => rust_crate_qualified_name_matches(
+                                crate_path,
+                                source_path,
+                                &files[*candidate_index].as_ref().authority.logical_path,
+                                &symbol.qualified_name,
+                            ),
+                        };
+                        direct
+                            || (qualified
+                                && is_rust
+                                && hotpath::measure_block!(
+                                    "code_index.seal.qualified_path_walk",
+                                    rust_qualified_path_matches(
+                                        files,
+                                        &mut rust,
+                                        index,
+                                        &reference.reference_name,
+                                        target,
+                                    )
+                                ))
+                    }
+                    Some(binding) => match binding.module_kind {
+                        ImportModuleKindV1::ProjectRelative => project_import_matches(
+                            binding,
+                            &binding.logical_path,
+                            &files[*candidate_index].as_ref().authority.logical_path,
+                            &symbol.qualified_name,
+                        ),
+                        ImportModuleKindV1::BareModule
+                            if file.extraction.language.as_str() == "rust" =>
+                        {
+                            hotpath::measure_block!(
+                                "code_index.seal.reexport_walk",
+                                rust_bare_import_matches(
+                                    files, &mut rust, index, binding, target, ""
                                 )
                             )
-                        {
-                            return true;
                         }
-                        file_qualified_name_matches(
-                            &reference.reference_name,
-                            &files[*candidate_index].as_ref().authority.logical_path,
-                            &symbol.qualified_name,
-                        )
+                        ImportModuleKindV1::BareModule => false,
                     },
-                    |qualified| {
-                        rust_crate_qualified_name_matches(
-                            qualified,
-                            source_path,
-                            &files[*candidate_index].as_ref().authority.logical_path,
-                            &symbol.qualified_name,
-                        )
-                    },
-                ),
-                Some(binding) => match binding.module_kind {
-                    ImportModuleKindV1::ProjectRelative => project_import_matches(
-                        binding,
-                        &binding.logical_path,
-                        &files[*candidate_index].as_ref().authority.logical_path,
-                        &symbol.qualified_name,
-                    ),
-                    ImportModuleKindV1::BareModule
-                        if file.extraction.language.as_str() == "rust" =>
-                    {
-                        hotpath::measure_block!(
-                            "code_index.seal.reexport_walk",
-                            rust_bare_import_matches(files, &mut rust, binding, target,)
-                        )
-                    }
-                    ImportModuleKindV1::BareModule => false,
-                },
+                }
+        })
+        .collect::<Vec<_>>();
+    // A type-path call may match both an inherent `Type::method` and one or
+    // more `<Type as Trait>::method` aliases; Rust prefers the inherent, so
+    // keep a unique non-UFCS hit when aliases also matched.
+    let compatible = match compatible.as_slice() {
+        [] => return None,
+        [_] => compatible,
+        many => {
+            let inherent = many
+                .iter()
+                .copied()
+                .filter(|(_, symbol)| {
+                    !rust_qualified_name_is_ufcs_trait_impl(&symbol.qualified_name)
+                })
+                .collect::<Vec<_>>();
+            match inherent.as_slice() {
+                [_] => inherent,
+                _ => return None,
             }
-    });
-    let (first_index, target) = compatible.next()?;
-    if *first_index == index || compatible.next().is_some() {
+        }
+    };
+    let (first_index, target) = compatible.into_iter().next()?;
+    if *first_index == index {
         return None;
     }
     Some((*first_index, target.occurrence.clone()))
@@ -546,7 +738,7 @@ fn unique_import<'a>(
     matches.next().is_none().then_some(binding)
 }
 
-type RustReexportCacheV1 = HashMap<(usize, usize, String, usize, String), bool>;
+type RustReexportCacheV1 = HashMap<(usize, usize, usize, String, usize, String), bool>;
 
 struct RustResolutionContextV1<'a> {
     files: &'a RustFileIndexV1,
@@ -694,7 +886,7 @@ where
                 &target.symbol.qualified_name,
             ),
             ImportModuleKindV1::BareModule => {
-                rust_bare_import_matches(files, rust, binding, target)
+                rust_bare_import_matches(files, rust, source_index, binding, target, "")
             }
         })
 }
@@ -702,8 +894,10 @@ where
 fn rust_bare_import_matches<T>(
     files: &[T],
     rust: &mut RustResolutionContextV1<'_>,
+    access_index: usize,
     binding: &CodeIndexImportEvidenceV1,
     target: RustSymbolTargetV1<'_>,
+    member: &str,
 ) -> bool
 where
     T: AsRef<FileGenerationArtifactsV1>,
@@ -737,38 +931,326 @@ where
         rust,
         root_index,
         scope_index,
+        access_index,
         imported_name,
         target,
+        member,
         &mut visited,
     )
 }
 
+/// Where a qualified Rust path starts once its head segment is expanded.
+enum RustPathOriginV1 {
+    /// A path inside the referencing file's own crate, as module segments
+    /// from that crate's root.
+    InCrate,
+    /// A path into another workspace crate, from that crate's root file.
+    Crate { root_index: usize },
+}
+
+/// Whether the qualified reference `reference_name` names `target` when its
+/// path is walked segment by segment: `Type::member` through the file's
+/// import of `Type`, `krate::module::Type::member` through the workspace
+/// crate's root and its (re-)exports, `crate::`/`self::`/`super::` paths
+/// through this crate's module files, and a bare module path relative to the
+/// referencing module. Every hop is parser-attested (a module file, an
+/// import row, or a symbol whose qualified name equals the walked path), so
+/// a path that does not exist in the staged file set never binds.
+fn rust_qualified_path_matches<T>(
+    files: &[T],
+    rust: &mut RustResolutionContextV1<'_>,
+    index: usize,
+    reference_name: &str,
+    target: RustSymbolTargetV1<'_>,
+) -> bool
+where
+    T: AsRef<FileGenerationArtifactsV1>,
+{
+    let file = files[index].as_ref();
+    let source_path = file.authority.logical_path.as_str();
+    let segments = reference_name.split("::").collect::<Vec<_>>();
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('<'))
+    {
+        return false;
+    }
+    let Some((origin, path)) = rust_expand_path_head(rust, file, &segments) else {
+        return false;
+    };
+    let (origin_index, root_path) = match origin {
+        RustPathOriginV1::InCrate => (index, source_path),
+        RustPathOriginV1::Crate { root_index } => {
+            if target.symbol.visibility != "public" {
+                return false;
+            }
+            (
+                root_index,
+                files[root_index].as_ref().authority.logical_path.as_str(),
+            )
+        }
+    };
+    // Each split treats `path[..k]` as modules, `path[k]` as the exported
+    // name, and the rest as the member path below it, so both a method on a
+    // re-exported type and a free function in a nested module are covered.
+    for k in 0..path.len() {
+        let module = path[..k].join("/");
+        let scope_index = if module.is_empty() {
+            rust.files.module(root_path, "")
+        } else {
+            rust.files.module(root_path, &module)
+        };
+        let Some(scope_index) = scope_index else {
+            continue;
+        };
+        let member = path[k + 1..]
+            .iter()
+            .map(|segment| format!("::{segment}"))
+            .collect::<String>();
+        let mut visited = BTreeSet::new();
+        if rust_export_resolves_to_target(
+            files,
+            rust,
+            origin_index,
+            scope_index,
+            index,
+            &path[k],
+            target,
+            &member,
+            &mut visited,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expands the head of a qualified path into its origin and the remaining
+/// segments: `crate`/`self`/`super` prefixes become module segments of this
+/// crate, an imported name becomes the path it was imported from, a
+/// workspace crate name becomes that crate's root, and any other name is a
+/// module beside the referencing one. A path whose head is not attested by
+/// any of those is `None`.
+fn rust_expand_path_head(
+    rust: &RustResolutionContextV1<'_>,
+    file: &FileGenerationArtifactsV1,
+    segments: &[&str],
+) -> Option<(RustPathOriginV1, Vec<String>)> {
+    let source_path = file.authority.logical_path.as_str();
+    let head = segments[0];
+    if matches!(head, "crate" | "self" | "super") {
+        return rust_relative_path(source_path, segments)
+            .map(|path| (RustPathOriginV1::InCrate, path));
+    }
+    if let Some(binding) = unique_named_import(file, head) {
+        let imported_name = binding.imported_name.as_deref()?;
+        let mut expanded = binding
+            .module_specifier
+            .split("::")
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        expanded.push(imported_name.to_owned());
+        expanded.extend(segments[1..].iter().map(|segment| (*segment).to_owned()));
+        let expanded_segments = expanded.iter().map(String::as_str).collect::<Vec<_>>();
+        let head = expanded_segments[0];
+        if matches!(head, "crate" | "self" | "super") {
+            return rust_relative_path(source_path, &expanded_segments)
+                .map(|path| (RustPathOriginV1::InCrate, path));
+        }
+        let root_index = rust.files.crate_root(head)?;
+        return Some((
+            RustPathOriginV1::Crate { root_index },
+            expanded[1..].to_vec(),
+        ));
+    }
+    if let Some(root_index) = rust.files.crate_root(head) {
+        return Some((
+            RustPathOriginV1::Crate { root_index },
+            segments[1..]
+                .iter()
+                .map(|segment| (*segment).to_owned())
+                .collect(),
+        ));
+    }
+    let mut relative = vec!["self"];
+    relative.extend_from_slice(segments);
+    rust_relative_path(source_path, &relative).map(|path| (RustPathOriginV1::InCrate, path))
+}
+
+/// Whether the head of the qualified Rust path `reference_name` is attested
+/// as project code by `file`'s own evidence: a `crate`/`self`/`super` path,
+/// an import whose path leads into this crate or a staged workspace crate,
+/// a workspace crate name, a module file beside the referencing module, or
+/// a type this file defines. `fs` from `use std::fs` is none of those, so
+/// `fs::read` is judged by its member, while `ignore::WalkBuilder::new`
+/// behind a workspace crate is not.
+fn rust_qualified_owner_is_project_attested(
+    rust: &RustResolutionContextV1<'_>,
+    file: &FileGenerationArtifactsV1,
+    reference_name: &str,
+) -> bool {
+    let Some((head, _)) = reference_name.split_once("::") else {
+        return false;
+    };
+    if matches!(head, "crate" | "self" | "super") {
+        return true;
+    }
+    if let Some(binding) = unique_named_import(file, head) {
+        let import_head = binding
+            .module_specifier
+            .split("::")
+            .next()
+            .unwrap_or_default();
+        return matches!(import_head, "crate" | "self" | "super")
+            || rust.files.crate_root(import_head).is_some();
+    }
+    if rust.files.crate_root(head).is_some() {
+        return true;
+    }
+    let source_path = file.authority.logical_path.as_str();
+    rust_relative_module(&format!("self::{head}"), source_path)
+        .is_some_and(|module| rust.files.module(source_path, &module).is_some())
+        || file.artifacts.symbols.iter().any(|symbol| {
+            symbol.simple_name == head
+                && relation_target_kind_is_compatible(RelationEdgeKindV1::TypeOf, &symbol.kind)
+        })
+}
+
+/// The crate-root-relative module segments of a `crate::`/`self::`/`super::`
+/// path from `source_path`, followed by the path's remaining segments.
+fn rust_relative_path(source_path: &str, segments: &[&str]) -> Option<Vec<String>> {
+    let prefix_len = segments
+        .iter()
+        .take_while(|segment| matches!(**segment, "crate" | "self" | "super"))
+        .count();
+    let module = rust_relative_module(&segments[..prefix_len].join("::"), source_path)?;
+    let mut path = module
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    path.extend(
+        segments[prefix_len..]
+            .iter()
+            .map(|segment| (*segment).to_owned()),
+    );
+    (!path.is_empty()).then_some(path)
+}
+
+/// The single non-glob import binding `local_name` in `file`, whatever its
+/// namespace: a path head may be a type, a module, or a value.
+fn unique_named_import<'a>(
+    file: &'a FileGenerationArtifactsV1,
+    local_name: &str,
+) -> Option<&'a CodeIndexImportEvidenceV1> {
+    let mut matches =
+        file.artifacts.imports.iter().filter(|binding| {
+            !binding.is_glob && binding.local_name.as_deref() == Some(local_name)
+        });
+    let binding = matches.next()?;
+    matches.next().is_none().then_some(binding)
+}
+
+fn rust_reexport_visible<T>(
+    files: &[T],
+    binding: &CodeIndexImportEvidenceV1,
+    access_index: usize,
+    scope_index: usize,
+) -> bool
+where
+    T: AsRef<FileGenerationArtifactsV1>,
+{
+    if binding.is_public {
+        return true;
+    }
+    let Some(reexport_scope) = binding.reexport_scope.as_ref() else {
+        return false;
+    };
+    let access_path = files[access_index].as_ref().authority.logical_path.as_str();
+    let scope_path = files[scope_index].as_ref().authority.logical_path.as_str();
+    let (Some(access_root), Some(scope_root)) =
+        (rust_source_root(access_path), rust_source_root(scope_path))
+    else {
+        return false;
+    };
+    if access_root != scope_root {
+        return false;
+    }
+    if *reexport_scope == ImportReexportScopeV1::Crate {
+        return true;
+    }
+    let Some(access_module) = access_path
+        .strip_prefix(access_root)
+        .and_then(|path| path.strip_prefix('/'))
+        .and_then(rust_file_module)
+    else {
+        return false;
+    };
+    let Some(scope_module) = scope_path
+        .strip_prefix(scope_root)
+        .and_then(|path| path.strip_prefix('/'))
+        .and_then(rust_file_module)
+    else {
+        return false;
+    };
+    let visible_module = match reexport_scope {
+        ImportReexportScopeV1::Crate => Some(String::new()),
+        ImportReexportScopeV1::SelfModule => Some(scope_module.to_owned()),
+        ImportReexportScopeV1::Super => Some(
+            scope_module
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+                .to_owned(),
+        ),
+        ImportReexportScopeV1::Module(module) => Some(module.clone()),
+    };
+    visible_module.is_some_and(|module| rust_module_contains(&module, access_module))
+}
+
+fn rust_module_contains(container: &str, candidate: &str) -> bool {
+    container.is_empty()
+        || candidate == container
+        || candidate
+            .strip_prefix(container)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Whether `exported_name` in the scope file `scope_index` reaches `target`,
+/// directly or through re-exports visible to `access_index`. `member` is the
+/// `::segment` suffix below the exported name (`::build` for a method on a
+/// re-exported type; empty for the export itself). `origin_index` is the
+/// file whose Cargo source root anchors every qualified-name comparison.
+#[allow(clippy::too_many_arguments)]
 fn rust_export_resolves_to_target<T>(
     files: &[T],
     rust: &mut RustResolutionContextV1<'_>,
-    root_index: usize,
+    origin_index: usize,
     scope_index: usize,
+    access_index: usize,
     exported_name: &str,
     target: RustSymbolTargetV1<'_>,
+    member: &str,
     visited: &mut BTreeSet<(usize, String)>,
 ) -> bool
 where
     T: AsRef<FileGenerationArtifactsV1>,
 {
     let cache_key = (
-        root_index,
+        origin_index,
         scope_index,
-        exported_name.to_owned(),
+        access_index,
+        format!("{exported_name}{member}"),
         target.index,
         target.symbol.qualified_name.clone(),
     );
     if let Some(resolves) = rust.reexports.get(&cache_key) {
         return *resolves;
     }
-    if !visited.insert((scope_index, exported_name.to_owned())) {
+    if !visited.insert((scope_index, format!("{exported_name}{member}"))) {
         return false;
     }
-    let root_path = &files[root_index].as_ref().authority.logical_path;
+    let root_path = &files[origin_index].as_ref().authority.logical_path;
     let scope_path = &files[scope_index].as_ref().authority.logical_path;
     let Some(source_root) = rust_source_root(scope_path) else {
         return false;
@@ -782,17 +1264,29 @@ where
     let Some(scope_module) = rust_file_module(relative_scope) else {
         return false;
     };
-    let qualified = if scope_module.is_empty() {
+    let scope_qualified_type = if scope_module.is_empty() {
         exported_name.to_owned()
     } else {
         format!("{}::{exported_name}", scope_module.replace('/', "::"))
     };
-    let resolves = if target.index == scope_index
+    let qualified = format!("{scope_qualified_type}{member}");
+    let target_path = &files[target.index].as_ref().authority.logical_path;
+    let resolves = if (target.index == scope_index
         && rust_crate_qualified_name_matches(
             &qualified,
             root_path,
-            &files[target.index].as_ref().authority.logical_path,
+            target_path,
             &target.symbol.qualified_name,
+        ))
+        || rust_inherent_method_owned_by_scope_type(
+            files,
+            rust,
+            origin_index,
+            scope_index,
+            &scope_qualified_type,
+            exported_name,
+            member,
+            target,
         ) {
         true
     } else {
@@ -802,54 +1296,84 @@ where
             .imports
             .iter()
             .filter(|binding| {
-                binding.is_public && binding.local_name.as_deref() == Some(exported_name)
+                rust_reexport_visible(files, binding, access_index, scope_index)
+                    && binding.local_name.as_deref() == Some(exported_name)
             });
         match (bindings.next(), bindings.next()) {
             (Some(binding), None) => match binding.module_kind {
                 ImportModuleKindV1::BareModule => {
-                    rust_bare_import_matches(files, rust, binding, target)
+                    rust_bare_import_matches(files, rust, access_index, binding, target, member)
                 }
-                ImportModuleKindV1::ProjectRelative => {
-                    let Some(imported_name) = binding.imported_name.as_deref() else {
-                        return false;
-                    };
-                    let Some(qualified) = rust_import_qualified_name(
-                        &binding.module_specifier,
-                        imported_name,
-                        scope_path,
-                    ) else {
-                        return false;
-                    };
-                    if rust_crate_qualified_name_matches(
-                        &qualified,
-                        root_path,
-                        &files[target.index].as_ref().authority.logical_path,
-                        &target.symbol.qualified_name,
-                    ) {
-                        true
-                    } else if let Some((module, imported_name)) = qualified.rsplit_once("::")
-                        && let Some(next_scope) =
-                            rust.files.module(scope_path, &module.replace("::", "/"))
-                    {
-                        rust_export_resolves_to_target(
-                            files,
-                            rust,
-                            root_index,
-                            next_scope,
-                            imported_name,
-                            target,
-                            visited,
-                        )
-                    } else {
-                        false
-                    }
-                }
+                ImportModuleKindV1::ProjectRelative => rust_project_import_resolves_to_target(
+                    files,
+                    rust,
+                    origin_index,
+                    access_index,
+                    scope_path,
+                    binding,
+                    target,
+                    member,
+                    visited,
+                ),
             },
             _ => false,
         }
     };
     rust.reexports.insert(cache_key, resolves);
     resolves
+}
+
+/// Whether the `crate::`/`self::`/`super::` import `binding`, read from the
+/// file at `scope_path`, names `target` (with `member` appended): directly
+/// by the imported path, or through the public re-exports of the module the
+/// path leads into.
+#[allow(clippy::too_many_arguments)]
+fn rust_project_import_resolves_to_target<T>(
+    files: &[T],
+    rust: &mut RustResolutionContextV1<'_>,
+    origin_index: usize,
+    access_index: usize,
+    scope_path: &str,
+    binding: &CodeIndexImportEvidenceV1,
+    target: RustSymbolTargetV1<'_>,
+    member: &str,
+    visited: &mut BTreeSet<(usize, String)>,
+) -> bool
+where
+    T: AsRef<FileGenerationArtifactsV1>,
+{
+    let Some(imported_name) = binding.imported_name.as_deref() else {
+        return false;
+    };
+    let Some(qualified) =
+        rust_import_qualified_name(&binding.module_specifier, imported_name, scope_path)
+    else {
+        return false;
+    };
+    let root_path = &files[origin_index].as_ref().authority.logical_path;
+    if rust_crate_qualified_name_matches(
+        &format!("{qualified}{member}"),
+        root_path,
+        &files[target.index].as_ref().authority.logical_path,
+        &target.symbol.qualified_name,
+    ) {
+        return true;
+    }
+    let (module, imported_name) = qualified.rsplit_once("::").unwrap_or(("", &qualified));
+    let Some(next_scope) = rust.files.module(scope_path, &module.replace("::", "/")) else {
+        return false;
+    };
+    rust_export_resolves_to_target(
+        files,
+        rust,
+        origin_index,
+        next_scope,
+        access_index,
+        imported_name,
+        target,
+        member,
+        visited,
+    )
 }
 
 fn project_import_matches(
@@ -997,6 +1521,214 @@ fn file_qualified_name_matches(
         == Some(symbol_path)
 }
 
+/// A `Type::method` whose owning type is defined in `scope_index` (as
+/// `scope_qualified_type`, the type's crate-relative path) may live in any
+/// other file of the same crate — either an inherent `impl Type` or a unique
+/// `impl Trait for Type` whose UFCS name still answers the type-path call.
+/// Validate the type at scope, match the method by its file-relative
+/// `Type::method` path (including the UFCS alias), and require the `impl`
+/// file to bind `Type` to that same definition: it is the defining file, or
+/// it defines no `Type` of its own and imports the type, by name or through
+/// a glob of a module that exports it. A same-named type in another module
+/// therefore never lends its methods to the scope's type.
+#[allow(clippy::too_many_arguments)]
+fn rust_inherent_method_owned_by_scope_type<T>(
+    files: &[T],
+    rust: &mut RustResolutionContextV1<'_>,
+    origin_index: usize,
+    scope_index: usize,
+    scope_qualified_type: &str,
+    exported_name: &str,
+    member: &str,
+    target: RustSymbolTargetV1<'_>,
+) -> bool
+where
+    T: AsRef<FileGenerationArtifactsV1>,
+{
+    if member.is_empty() {
+        return false;
+    }
+    let root_path = &files[origin_index].as_ref().authority.logical_path;
+    let scope = files[scope_index].as_ref();
+    let Some(scope_type) = scope.artifacts.symbols.iter().find(|symbol| {
+        relation_target_kind_is_compatible(RelationEdgeKindV1::TypeOf, &symbol.kind)
+            && rust_crate_qualified_name_matches(
+                scope_qualified_type,
+                root_path,
+                &scope.authority.logical_path,
+                &symbol.qualified_name,
+            )
+    }) else {
+        return false;
+    };
+    let impl_file = files[target.index].as_ref();
+    if !rust_method_belongs_to_type_impl(impl_file, target.symbol) {
+        return false;
+    }
+    let Some(impl_owner) = rust_inherent_method_owner(
+        exported_name,
+        member,
+        root_path,
+        &impl_file.authority.logical_path,
+        &target.symbol.qualified_name,
+    ) else {
+        return false;
+    };
+    if impl_owner.rsplit("::").next() != Some(exported_name) {
+        return false;
+    }
+    let shadowed = impl_file.artifacts.symbols.iter().any(|symbol| {
+        symbol.simple_name == exported_name
+            && relation_target_kind_is_compatible(RelationEdgeKindV1::TypeOf, &symbol.kind)
+    });
+    if shadowed {
+        return false;
+    }
+    let type_target = RustSymbolTargetV1 {
+        index: scope_index,
+        symbol: scope_type,
+    };
+    if impl_owner.contains("::") {
+        return rust_qualified_path_matches(files, rust, target.index, impl_owner, type_target);
+    }
+    if target.index == scope_index {
+        return true;
+    }
+    let impl_path = impl_file.authority.logical_path.as_str();
+    if let Some(binding) = unique_named_import(impl_file, exported_name) {
+        return binding.module_kind == ImportModuleKindV1::ProjectRelative
+            && rust_project_import_resolves_to_target(
+                files,
+                rust,
+                origin_index,
+                target.index,
+                impl_path,
+                binding,
+                type_target,
+                "",
+                &mut BTreeSet::new(),
+            );
+    }
+    let glob_modules = impl_file
+        .artifacts
+        .imports
+        .iter()
+        .filter(|binding| {
+            binding.is_glob && binding.module_kind == ImportModuleKindV1::ProjectRelative
+        })
+        .filter_map(|binding| rust_relative_module(&binding.module_specifier, impl_path))
+        .collect::<Vec<_>>();
+    glob_modules.iter().any(|module| {
+        rust.files
+            .module(impl_path, module)
+            .is_some_and(|glob_scope| {
+                rust_export_resolves_to_target(
+                    files,
+                    rust,
+                    origin_index,
+                    glob_scope,
+                    target.index,
+                    exported_name,
+                    type_target,
+                    "",
+                    &mut BTreeSet::new(),
+                )
+            })
+    })
+}
+
+fn rust_method_belongs_to_type_impl(
+    file: &FileGenerationArtifactsV1,
+    method: &LineageSymbolRecordV1,
+) -> bool {
+    file.artifacts
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == RelationEdgeKindV1::Contains && edge.to_occurrence == method.occurrence
+        })
+        .filter_map(|edge| {
+            file.artifacts
+                .symbols
+                .iter()
+                .find(|symbol| symbol.occurrence == edge.from_occurrence)
+        })
+        .any(|owner| owner.kind == "impl")
+}
+
+/// File-relative method identity for an `impl Type` or `impl Trait for Type`
+/// block's `Type::method` (UFCS definitions keep a type-path alias). Same
+/// crate as `source_path`, in whichever module file holds the `impl`.
+/// Methods of an `impl` nested in an inline module are not matched: their
+/// `Type` is bound by that module's own imports, which file import rows do
+/// not attest.
+fn rust_inherent_method_owner<'a>(
+    type_name: &str,
+    member: &str,
+    source_path: &str,
+    target_path: &str,
+    target_qualified_name: &'a str,
+) -> Option<&'a str> {
+    let source_root = rust_source_root(source_path)?;
+    if rust_source_root(target_path) != Some(source_root) {
+        return None;
+    }
+    let relative_file = target_path
+        .strip_prefix(source_root)
+        .and_then(|path| path.strip_prefix('/'))?;
+    let source_file = source_path
+        .strip_prefix(source_root)
+        .and_then(|path| path.strip_prefix('/'))?;
+    if source_file.starts_with("bin/") || relative_file.starts_with("bin/") {
+        return None;
+    }
+    if matches!(
+        (source_file, relative_file),
+        ("lib.rs", "main.rs") | ("main.rs", "lib.rs")
+    ) {
+        return None;
+    }
+    let symbol_path = target_qualified_name
+        .strip_prefix(target_path)
+        .and_then(|path| path.strip_prefix("::"))?;
+    let (target_owner, target_member) = symbol_path.rsplit_once("::")?;
+    let member = member.strip_prefix("::")?;
+    if target_member != member {
+        return None;
+    }
+    let owner =
+        rust_ufcs_impl_type_name(target_owner).or_else(|| nominal_rust_impl_owner(target_owner))?;
+    (owner.rsplit("::").next() == Some(type_name)).then_some(owner)
+}
+
+fn rust_ufcs_impl_type_name(owner: &str) -> Option<&str> {
+    let body = owner.strip_prefix('<')?.strip_suffix('>')?;
+    let mut depth = 0_i32;
+    for (index, character) in body.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            _ if depth == 0 && body[index..].starts_with(" as ") => {
+                let type_name = body[..index].trim();
+                return (!type_name.is_empty()).then_some(type_name);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn nominal_rust_impl_owner(owner: &str) -> Option<&str> {
+    if rust_ufcs_impl_type_name(owner).is_some() {
+        return None;
+    }
+    match owner.find('<') {
+        Some(generic_start) if owner.ends_with('>') => Some(&owner[..generic_start]),
+        Some(_) => None,
+        None => Some(owner),
+    }
+}
+
 /// Map an extracted Rust symbol back to the path used by a `crate::...`
 /// reference. Standard Cargo source roots scope the match, so equal module
 /// paths in sibling workspace crates cannot cross-bind.
@@ -1042,11 +1774,32 @@ fn rust_crate_qualified_name_matches(
     let Some(module) = rust_file_module(relative_file) else {
         return false;
     };
-    if module.is_empty() {
-        reference_path == symbol_path
-    } else {
-        reference_path == format!("{}::{symbol_path}", module.replace('/', "::"))
+    let path_matches = |path: &str| {
+        if module.is_empty() {
+            reference_path == path
+        } else {
+            reference_path == path
+                || reference_path == format!("{}::{path}", module.replace('/', "::"))
+        }
+    };
+    if path_matches(symbol_path) {
+        return true;
     }
+    // `<Type as Trait>::method` also answers a type-path call `Type::method`
+    // (and the type's final path segment when the UFCS type is crate-qualified).
+    let Some(alias) = rust_type_path_alias_for_trait_impl_method(symbol_path) else {
+        return false;
+    };
+    if path_matches(&alias) {
+        return true;
+    }
+    let Some((type_name, method)) = alias.rsplit_once("::") else {
+        return false;
+    };
+    let Some(simple) = type_name.rsplit("::").next() else {
+        return false;
+    };
+    simple != type_name && path_matches(&format!("{simple}::{method}"))
 }
 
 fn rust_file_module(relative_file: &str) -> Option<&str> {

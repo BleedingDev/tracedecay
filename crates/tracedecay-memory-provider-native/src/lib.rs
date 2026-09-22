@@ -105,7 +105,8 @@ const OBSERVATION_ENVELOPE_FIELDS: [&str; 3] =
 const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
-const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
+/// Canonical payload contract identity returned by a successful recall operation.
+pub const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
 const FEEDBACK_CONTRACT_ID: &str = "tracedecay.memory.provider.feedback.v1";
 const MAINTENANCE_CONTRACT_ID: &str = "tracedecay.memory.provider.maintenance.v1";
 const INSPECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.inspection.v1";

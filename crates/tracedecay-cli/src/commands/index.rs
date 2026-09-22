@@ -1,4 +1,3 @@
-use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use tracedecay::project::TraceDecay;
@@ -36,36 +35,13 @@ pub(crate) async fn handle_no_command() -> tracedecay_domain::errors::Result<()>
         );
         eprintln!();
     }
-    if !io::stdin().is_terminal() {
-        eprintln!(
-            "No TraceDecay index found at '{}'. Non-interactive: skipping index creation (run `tracedecay init`).",
-            project_path.display()
-        );
-        return Ok(());
-    }
-    eprint!(
-        "No TraceDecay index found at '{}'. Create one now? [Y/n] ",
+    // Bare `tracedecay` is ambiguous (help vs init) and creating a store here
+    // is how phantom indexes used to appear. Present the next command and
+    // return; do not read stdin on a terminal or a pipe.
+    eprintln!(
+        "No TraceDecay index found at '{}'. Skipping index creation (run `tracedecay init`).",
         project_path.display()
     );
-    io::stderr().flush().ok();
-    let mut answer = String::new();
-    io::stdin().lock().read_line(&mut answer).map_err(|e| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: format!("failed to read stdin: {}", e),
-        }
-    })?;
-    let answer = answer.trim();
-    if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
-        handle_init(
-            Some(project_path.to_string_lossy().into_owned()),
-            Vec::new(),
-            Vec::new(),
-            None,
-            false,
-            false,
-        )
-        .await?;
-    }
     Ok(())
 }
 
@@ -152,14 +128,22 @@ fn annotate_reset_required_init_error(
     if !is_reset_required {
         return error;
     }
+    let project_path = project_path.to_string_lossy();
+    let reset_command = shell_words::join([
+        "tracedecay",
+        "storage",
+        "reset-project-store",
+        "--project-root",
+        project_path.as_ref(),
+        "--yes",
+    ]);
+    let init_command = shell_words::join(["tracedecay", "init", project_path.as_ref()]);
     tracedecay_domain::errors::TraceDecayError::Config {
         message: format!(
             "{error}\n\nthis store cannot be opened until it is reset; run:\n  \
-             tracedecay storage reset-project-store --project-root {} --yes\n\
-             then re-run `tracedecay init {}` — sessions re-ingest from the \
-             preserved transcripts",
-            project_path.display(),
-            project_path.display()
+             {reset_command}\n\
+             then re-run `{init_command}` — sessions re-ingest from the \
+             preserved transcripts"
         ),
     }
 }
@@ -218,20 +202,41 @@ async fn brokered_init(
         init_deadline,
     )
     .await;
-    if let Err(error) = reconcile {
-        if !code_index_reconciliation_is_optional(project_path, &error).await {
-            return Err(error);
+    let reconcile = match reconcile {
+        Err(error) => {
+            if !code_index_reconciliation_is_optional(project_path, &error).await {
+                return Err(error);
+            }
+            eprintln!(
+                "initialized {}; code indexing is unavailable for this non-Git project",
+                project_path.display()
+            );
+            return Ok(());
         }
-        eprintln!(
-            "initialized {}; code indexing is unavailable for this non-Git project",
+        Ok(reconcile) => reconcile,
+    };
+    match admin_sync_status(&reconcile).as_deref() {
+        // Status `queued` means the daemon accepted the reconcile demand into
+        // its pre-mount queue. Init's user-facing confirmation names that
+        // request (`requested`), matching the brokered-init contract tests and
+        // dogfood journeys — not the internal queue noun.
+        Some("queued") => eprintln!(
+            "initialized {}; daemon code-index reconciliation requested",
             project_path.display()
-        );
-        return Ok(());
+        ),
+        Some("not_applicable") => eprintln!(
+            "initialized {}; code indexing does not apply to this non-Git project",
+            project_path.display()
+        ),
+        Some(status) => eprintln!(
+            "initialized {}; daemon code-index reconciliation status is {status}",
+            project_path.display()
+        ),
+        None => eprintln!(
+            "initialized {}; daemon code-index reconciliation returned no status",
+            project_path.display()
+        ),
     }
-    eprintln!(
-        "initialized {}; daemon code-index reconciliation requested",
-        project_path.display()
-    );
     Ok(())
 }
 
@@ -248,6 +253,19 @@ fn validated_reconcile_request(
     .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
         message: error.to_string(),
     })
+}
+
+fn admin_sync_status(envelope: &serde_json::Value) -> Option<String> {
+    let text = envelope
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|block| block.get("text").and_then(|text| text.as_str()))?;
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get("status")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 async fn code_index_reconciliation_is_optional(
@@ -509,6 +527,47 @@ mod init_bootstrap_tests {
         assert!(!code_index_reconciliation_is_optional(&nested_git, &unavailable).await);
         assert!(!code_index_reconciliation_is_optional(&non_git, &unrelated).await);
     }
+
+    #[test]
+    fn reset_remedy_commands_survive_paths_with_spaces_and_apostrophes() {
+        let error = annotate_reset_required_init_error(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "project-fixture",
+                "incompatible persisted shape",
+            ),
+            Path::new("/repo/it's an example"),
+        );
+
+        let text = error.to_string();
+        assert!(text.contains("this store cannot be opened until it is reset"));
+        let reset_command = text
+            .split_once("run:\n  ")
+            .expect("reset command must be named")
+            .1;
+        let (reset_command, then_part) = reset_command
+            .split_once("\n")
+            .expect("reset command ends before the init remedy");
+        assert_eq!(
+            shell_words::split(reset_command).unwrap(),
+            [
+                "tracedecay",
+                "storage",
+                "reset-project-store",
+                "--project-root",
+                "/repo/it's an example",
+                "--yes",
+            ]
+        );
+        let init_command = then_part
+            .split_once("`tracedecay init ")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once('`').map(|(command, _)| command))
+            .expect("init remedy must be named");
+        assert_eq!(
+            shell_words::split(&format!("tracedecay init {init_command}")).unwrap(),
+            ["tracedecay", "init", "/repo/it's an example"]
+        );
+    }
 }
 
 #[hotpath::measure(label = "cli.sync.run", future = true)]
@@ -543,10 +602,24 @@ pub(crate) async fn handle_sync(
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
     }
-    eprintln!(
-        "code-index reconciliation queued via daemon for {}",
-        resolved.project_path.display()
-    );
+    match admin_sync_status(&result).as_deref() {
+        Some("queued") => eprintln!(
+            "code-index reconciliation queued via daemon for {}",
+            resolved.project_path.display()
+        ),
+        Some("not_applicable") => eprintln!(
+            "code indexing does not apply to {}",
+            resolved.project_path.display()
+        ),
+        Some(status) => eprintln!(
+            "code-index reconciliation status is {status} for {}",
+            resolved.project_path.display()
+        ),
+        None => eprintln!(
+            "daemon code-index reconciliation returned no status for {}",
+            resolved.project_path.display()
+        ),
+    }
     if doctor {
         tracedecay::doctor::run_doctor(crate::cloud::doctor_network_probes()).await?;
     }

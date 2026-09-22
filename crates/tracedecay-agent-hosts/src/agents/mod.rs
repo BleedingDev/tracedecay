@@ -70,7 +70,10 @@ pub use roo_code::RooCodeIntegration;
 pub use vibe::VibeIntegration;
 pub use zed::ZedIntegration;
 
-pub use git_post_commit_hook::{offer_git_post_commit_hook, reconcile_git_post_commit_hook};
+pub use git_post_commit_hook::{
+    install_git_post_commit_hook, reconcile_git_post_commit_hook,
+    report_git_post_commit_hook_status,
+};
 pub use host_config_io::{
     HostFileMetadataIdentityV1, JsonConfigDialect, backup_config_file, capture_host_file_metadata,
     config_backup_path, copilot_cli_dir, home_dir, host_config_write_intent_path, kiro_data_dir,
@@ -378,7 +381,7 @@ pub trait AgentIntegration {
     /// receipts; implementations must not infer uninstalled catalog pairs.
     fn host_component_registration(
         &self,
-        _component: host_bundle::HostBundleComponentV1,
+        _component: host_bundle::HostComponentV1,
         _ctx: &HealthcheckContext,
     ) -> host_bundle::HostBundleRegistrationStateV1 {
         host_bundle::HostBundleRegistrationStateV1::Missing
@@ -389,7 +392,7 @@ pub trait AgentIntegration {
     /// dashboard-disabled registrations without weakening doctor readback.
     fn host_component_registration_for_lifecycle(
         &self,
-        component: host_bundle::HostBundleComponentV1,
+        component: host_bundle::HostComponentV1,
         health: &HealthcheckContext,
         _install: &InstallContext,
     ) -> host_bundle::HostBundleRegistrationStateV1 {
@@ -432,7 +435,7 @@ pub trait AgentIntegration {
     /// transaction never snapshots or restores another component's state.
     fn host_component_registration_paths(
         &self,
-        _components: &[host_bundle::HostBundleComponentV1],
+        _components: &[host_bundle::HostComponentV1],
         home: &Path,
     ) -> Vec<PathBuf> {
         self.host_registration_paths(home)
@@ -444,7 +447,7 @@ pub trait AgentIntegration {
     /// than silently dropping files from rollback ownership.
     fn host_component_registration_paths_checked(
         &self,
-        components: &[host_bundle::HostBundleComponentV1],
+        components: &[host_bundle::HostComponentV1],
         home: &Path,
     ) -> Result<Vec<PathBuf>> {
         Ok(self.host_component_registration_paths(components, home))
@@ -455,7 +458,7 @@ pub trait AgentIntegration {
     /// complete set before invoking the projection.
     fn project_host_component_registration_paths(
         &self,
-        _components: &[host_bundle::HostBundleComponentV1],
+        _components: &[host_bundle::HostComponentV1],
         _home: &Path,
         _project_path: &Path,
     ) -> Result<Vec<PathBuf>> {
@@ -478,10 +481,10 @@ pub trait AgentIntegration {
     /// deployed registration boundary.
     fn activate_deployed_host_component_registration(
         &self,
-        components: &[host_bundle::HostBundleComponentV1],
+        components: &[host_bundle::HostComponentV1],
         ctx: &InstallContext,
     ) -> Result<()> {
-        if components.contains(&host_bundle::HostBundleComponentV1::Core) {
+        if components.contains(&host_bundle::HostComponentV1::Core) {
             self.activate_deployed_host_registration(ctx)
         } else {
             Ok(())
@@ -499,10 +502,10 @@ pub trait AgentIntegration {
     /// receipt-backed components.
     fn deactivate_deployed_host_component_registration(
         &self,
-        components: &[host_bundle::HostBundleComponentV1],
+        components: &[host_bundle::HostComponentV1],
         ctx: &InstallContext,
     ) -> Result<()> {
-        if components.contains(&host_bundle::HostBundleComponentV1::Core) {
+        if components.contains(&host_bundle::HostComponentV1::Core) {
             self.deactivate_deployed_host_registration(ctx)
         } else {
             Ok(())
@@ -516,7 +519,7 @@ pub trait AgentIntegration {
     /// project registration paths; they must not install global assets.
     fn activate_project_host_component_registration(
         &self,
-        _components: &[host_bundle::HostBundleComponentV1],
+        _components: &[host_bundle::HostComponentV1],
         _ctx: &InstallContext,
         _project_path: &Path,
     ) -> Result<()> {
@@ -531,7 +534,7 @@ pub trait AgentIntegration {
     /// Remove only this host's project-scoped registration projection.
     fn deactivate_project_host_component_registration(
         &self,
-        _components: &[host_bundle::HostBundleComponentV1],
+        _components: &[host_bundle::HostComponentV1],
         _ctx: &InstallContext,
         _project_path: &Path,
     ) -> Result<()> {
@@ -726,7 +729,7 @@ impl host_bundle::HostBundleRegistrationInspectorV1 for AgentRegistrationInspect
     fn inspect_registration(
         &self,
         host: host_bundle::HostKindV1,
-        component: host_bundle::HostBundleComponentV1,
+        component: host_bundle::HostComponentV1,
     ) -> host_bundle::HostBundleRegistrationStateV1 {
         get_integration(integration_id_for_host(host)).map_or(
             host_bundle::HostBundleRegistrationStateV1::Missing,
@@ -828,14 +831,14 @@ pub(crate) fn skill_contents_have_tracedecay_marker(contents: &str) -> bool {
     })
 }
 
-/// Interactively pick which agents to install/uninstall.
+/// Choose which detected agents `tracedecay install` should configure.
 ///
-/// - 0 detected agents → returns an error.
-/// - 1 detected and not already installed → returns it directly (no prompt).
-/// - Otherwise → asks a Y/n question for each detected agent.
+/// The install verb is already the authorization. Detected agents that are not
+/// yet installed are selected and already-installed agents are kept. This never
+/// reads stdin and never uninstalls: removal is a separate destructive command.
 ///
-/// Returns `(to_install, to_uninstall)`.
-pub fn pick_integrations_interactive(
+/// Returns `(to_install, to_uninstall)`. `to_uninstall` is always empty.
+pub fn select_detected_integrations(
     home: &Path,
     installed: &[String],
 ) -> Result<(Vec<String>, Vec<String>)> {
@@ -850,39 +853,40 @@ pub fn pick_integrations_interactive(
         });
     }
 
-    // Fast path: exactly one detected agent and it isn't installed yet.
-    if detected.len() == 1 && !installed.contains(&detected[0].id().to_string()) {
-        let id = detected[0].id().to_string();
-        return Ok((vec![id], vec![]));
+    let to_install = detected
+        .iter()
+        .map(|agent| agent.id().to_string())
+        .filter(|id| !installed.contains(id))
+        .collect();
+    Ok((to_install, Vec::new()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod select_detected_integrations_tests {
+    use super::select_detected_integrations;
+
+    #[test]
+    fn empty_home_is_an_error_not_a_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let error = select_detected_integrations(home.path(), &[]).expect_err("no detected agents");
+        assert!(
+            error.to_string().contains("No supported agents detected"),
+            "{error}"
+        );
     }
 
-    let mut to_install = Vec::new();
-    let mut to_uninstall = Vec::new();
+    #[test]
+    fn detected_agents_are_installed_and_kept_without_reading_stdin() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir(home.path().join(".claude")).unwrap();
 
-    for ag in &detected {
-        let id = ag.id().to_string();
-        let already = installed.contains(&id);
-        if already {
-            eprint!("Keep TraceDecay for {}? [Y/n] ", ag.name());
-        } else {
-            eprint!("Install TraceDecay for {}? [Y/n] ", ag.name());
-        }
+        let (to_install, to_uninstall) =
+            select_detected_integrations(home.path(), &["cursor".to_string()]).unwrap();
 
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| TraceDecayError::Config {
-                message: format!("failed to read input: {e}"),
-            })?;
-        let answer = input.trim().to_lowercase();
-        let yes = answer.is_empty() || answer == "y" || answer == "yes";
-
-        if yes && !already {
-            to_install.push(id);
-        } else if !yes && already {
-            to_uninstall.push(id);
-        }
+        assert!(to_uninstall.is_empty(), "install must not uninstall");
+        assert!(!to_install.iter().any(|id| id == "cursor"));
+        assert!(to_install.iter().any(|id| id == "claude"));
     }
-
-    Ok((to_install, to_uninstall))
 }

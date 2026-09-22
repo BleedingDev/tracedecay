@@ -1,4 +1,6 @@
-use tracedecay_code_extraction::{ImportModuleKindV1, LanguageExtractor, RustExtractor};
+use tracedecay_code_extraction::{
+    ImportModuleKindV1, ImportReexportScopeV1, LanguageExtractor, RustExtractor,
+};
 use tracedecay_domain::*;
 use tree_sitter::Parser;
 
@@ -22,7 +24,7 @@ fn destructure(context: Context) {
     let mut parser = Parser::new();
     parser
         .set_language(
-            &tracedecay_code_extraction::ts_provider::language("rust")
+            &tracedecay_code_extraction::ts_provider::try_language("rust")
                 .expect("bundled Rust grammar"),
         )
         .expect("configure Rust parser");
@@ -229,12 +231,18 @@ pub trait Drawable {
         .collect();
     assert_eq!(traits.len(), 1);
     assert_eq!(traits[0].name, "Drawable");
+    assert_eq!(traits[0].visibility, Visibility::Pub);
     let methods: Vec<_> = result
         .nodes
         .iter()
         .filter(|n| n.kind == NodeKind::Method)
         .collect();
     assert_eq!(methods.len(), 2);
+    assert!(
+        methods
+            .iter()
+            .all(|method| method.visibility == Visibility::Pub)
+    );
 }
 
 #[test]
@@ -336,6 +344,43 @@ use std::io::{self, Read};
     assert_eq!(sibling.imported_name.as_deref(), Some("Detail"));
     assert!(sibling.is_public);
     assert_eq!(sibling.module_kind, ImportModuleKindV1::ProjectRelative);
+}
+
+#[test]
+fn test_rust_restricted_reexports_are_not_public_import_evidence() {
+    let source = r#"
+mod read;
+pub use read::Open;
+pub(crate) use read::CrateOnly;
+pub(super) use read::ParentOnly;
+pub(self) use read::SelfOnly;
+pub(in crate::read) use read::InOnly;
+use read::Private;
+"#;
+    let artifact = RustExtractor.extract_artifact("reexports.rs", source);
+    assert!(
+        artifact.result.errors.is_empty(),
+        "errors: {:?}",
+        artifact.result.errors
+    );
+    let visibility = |name: &str| {
+        let import = artifact
+            .imports
+            .iter()
+            .find(|import| import.local_name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("{name} missing from {:?}", artifact.imports));
+        (import.is_public, import.reexport_scope.clone())
+    };
+    assert_eq!(visibility("Open"), (true, None));
+    for (name, scope) in [
+        ("CrateOnly", ImportReexportScopeV1::Crate),
+        ("ParentOnly", ImportReexportScopeV1::Super),
+        ("SelfOnly", ImportReexportScopeV1::SelfModule),
+        ("InOnly", ImportReexportScopeV1::Module("read".to_owned())),
+    ] {
+        assert_eq!(visibility(name), (false, Some(scope)));
+    }
+    assert_eq!(visibility("Private"), (false, None));
 }
 
 #[test]
@@ -573,6 +618,181 @@ fn helper() {}
     );
 }
 
+/// Every `Calls` reference name the function `function_name` emits.
+fn call_names(result: &ExtractionResult, function_name: &str) -> Vec<String> {
+    let function = result
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::Function && node.name == function_name)
+        .unwrap_or_else(|| panic!("function {function_name} is extracted"));
+    let mut names = result
+        .unresolved_refs
+        .iter()
+        .filter(|reference| {
+            reference.reference_kind == EdgeKind::Calls && reference.from_node_id == function.id
+        })
+        .map(|reference| reference.reference_name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[test]
+fn test_rust_dotted_calls_on_typed_bindings_also_name_the_method_by_type() {
+    let source = r#"
+fn assemble(args: &HiArgs, raw: Vec<u8>) -> Widget {
+    let mut builder: ignore::WalkBuilder = ignore::WalkBuilder::new(&raw);
+    let types = ignore::types::TypesBuilder::new().build()?;
+    let parsed: config::Parsed = config::parse(raw)?;
+    let fallback: Fallback = Fallback::default().unwrap();
+    let literal = Literal { raw };
+    args.walk_builder();
+    builder.build();
+    types.matched();
+    parsed.entries();
+    fallback.apply();
+    literal.len();
+    raw.len();
+    types.clone().matched();
+}
+"#;
+    let result = RustExtractor.extract("typed.rs", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let names = call_names(&result, "assemble");
+    // `Vec::len` is stated too: which owners never bind cross-file is the
+    // index's blocklist policy, not the extractor's.
+    for expected in [
+        "HiArgs::walk_builder",
+        "ignore::WalkBuilder::build",
+        "config::Parsed::entries",
+        "Fallback::apply",
+        "Literal::len",
+        "Vec::len",
+    ] {
+        assert!(
+            names.contains(&expected.to_owned()),
+            "{expected} missing from {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name.ends_with("::matched")),
+        "a `let` initialised by a call chain has no stated type: {names:?}"
+    );
+    assert!(
+        names.contains(&"raw.len".to_owned()) && names.contains(&"builder.build".to_owned()),
+        "the receiver-dotted forms stay alongside the typed ones: {names:?}"
+    );
+}
+
+#[test]
+fn test_rust_constructor_like_names_do_not_infer_receiver_types() {
+    let source = r#"
+struct Factory;
+struct Product;
+impl Factory {
+    fn new() -> Product { Product }
+    fn run(&self) {}
+}
+impl Product {
+    fn run(&self) {}
+}
+fn assemble() {
+    let p = Factory::new();
+    p.run();
+    let q = Factory::with_defaults();
+    q.run();
+    let r = Factory::from_config();
+    r.run();
+}
+"#;
+    let result = RustExtractor.extract("factory.rs", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let names = call_names(&result, "assemble");
+    assert!(
+        !names.iter().any(|name| name == "Factory::run"),
+        "constructor-like names must not fabricate Factory::run callers: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "Product::run"),
+        "without an explicit type or struct literal, abstain from Product::run too: {names:?}"
+    );
+    assert!(
+        names.contains(&"p.run".to_owned()) && names.contains(&"Factory::new".to_owned()),
+        "receiver-dotted and associated-function forms remain: {names:?}"
+    );
+}
+
+#[test]
+fn test_rust_method_initializers_do_not_fabricate_receiver_types() {
+    let source = r#"
+struct Literal;
+struct Questioned;
+impl Literal {
+    fn len(&self) {}
+}
+impl Questioned {
+    fn len(&self) {}
+}
+fn assemble() -> Questioned {
+    let unwrapped = Literal {}.unwrap();
+    unwrapped.len();
+    let expected = Literal {}.expect("msg");
+    expected.len();
+    let questioned = Questioned {}?;
+    questioned.len();
+    Questioned {}
+}
+"#;
+    let result = RustExtractor.extract("initializers.rs", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let names = call_names(&result, "assemble");
+    assert!(
+        !names.iter().any(|name| name == "Literal::len"),
+        "unwrap/expect must not fabricate Literal::len: {names:?}"
+    );
+    assert!(
+        names.contains(&"Questioned::len".to_owned()),
+        "a struct literal behind `?` still states its type: {names:?}"
+    );
+}
+
+#[test]
+fn test_rust_rebound_or_pattern_bound_receivers_have_no_typed_call() {
+    let source = r#"
+fn rebound(builders: Vec<Builder>, pair: (Builder, Builder), maybe: Option<Builder>) {
+    let builder = Builder::new();
+    builder.build();
+    let builder = Other::new();
+    builder.build();
+    for item in builders {
+        item.build();
+    }
+    let (left, right) = pair;
+    left.build();
+    if let Some(found) = maybe {
+        found.build();
+    }
+    let shadow = Builder::new();
+    let handler = |shadow| shadow.build();
+    let typed = |arg: Builder| arg.build();
+}
+"#;
+    let result = RustExtractor.extract("rebound.rs", source);
+    assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    let names = call_names(&result, "rebound");
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.contains("::build"))
+            .collect::<Vec<_>>(),
+        vec!["Builder::build"],
+        "only the typed closure parameter has one stated type; rebound, pattern-bound, \
+         and closure-shadowed receivers have none: {names:?}"
+    );
+    assert!(names.contains(&"Builder::new".to_owned()) && names.contains(&"Other::new".to_owned()));
+}
+
 #[test]
 fn test_rust_trait_impl() {
     let source = r#"
@@ -597,6 +817,9 @@ impl Greet for Bot {
         .filter(|n| n.kind == NodeKind::Impl)
         .collect();
     assert_eq!(impls.len(), 1);
+    assert!(result.nodes.iter().any(|node| {
+        node.kind == NodeKind::Method && node.qualified_name == "greet.rs::<Bot as Greet>::hello"
+    }));
     assert!(
         result
             .unresolved_refs

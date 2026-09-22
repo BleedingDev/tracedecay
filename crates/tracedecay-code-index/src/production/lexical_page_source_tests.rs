@@ -104,20 +104,6 @@ impl CodeChunkProjectionSink for ApplyingProjectionSink {
                     output_digest: None,
                 }),
         );
-        decisions.extend(
-            request
-                .changes
-                .reused
-                .iter()
-                .map(|change| ChunkProjectionDecisionV1 {
-                    chunk_id: change.chunk_id.clone(),
-                    prior_chunk_digest: change.prior_digest.clone(),
-                    current_chunk_digest: change.current_digest.clone(),
-                    operation: tracedecay_domain::ProjectionOperationV1::Reused,
-                    outcome: tracedecay_domain::ProjectionOutcomeV1::Reused,
-                    output_digest: None,
-                }),
-        );
         receipt_builder
             .build(&decisions)
             .map_err(|error| ProjectionSinkErrorV1::Rejected(error.to_string()))
@@ -289,7 +275,7 @@ fn partitioned_reopen_reports_encoded_byte_progress_and_bounds_prefetch() {
         Cursor::new(Vec::<u8>::new()),
         &manifest,
         fixture.state_digest.clone(),
-        move |digest, _, buffer| {
+        move |digest, _, buffer, _control| {
             read_count.fetch_add(1, Ordering::SeqCst);
             buffer.clear();
             buffer.extend_from_slice(read_segments.get(digest).expect("sealed segment exists"));
@@ -314,7 +300,12 @@ fn partitioned_reopen_reports_encoded_byte_progress_and_bounds_prefetch() {
         "compact file identities must remain below an eighth of the decoded corpus encoding"
     );
     source.next_page(&ActiveControl).expect("first page admits");
-    assert!(reads.load(Ordering::SeqCst) <= crate::parallelism::indexing_workers().max(1));
+    assert!(
+        reads.load(Ordering::SeqCst)
+            <= crate::parallelism::indexing_workers()
+                .max(1)
+                .saturating_mul(LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1)
+    );
     source.rewind().expect("rewind lazy source");
     let mut observed_encoded_byte_progress = false;
     loop {
@@ -360,7 +351,7 @@ fn partitioned_reopen_reports_encoded_byte_progress_and_bounds_prefetch() {
         Cursor::new(Vec::<u8>::new()),
         &manifest,
         fixture.state_digest.clone(),
-        move |digest, _, buffer| {
+        move |digest, _, buffer, _control| {
             buffer.clear();
             buffer.extend_from_slice(segments.get(digest).expect("sealed segment exists"));
             buffer[0] ^= 1;
@@ -397,6 +388,92 @@ fn incompatible_cursor_restore_drops_the_stale_prefetch_window() {
     assert!(
         source.admitted_window.is_empty(),
         "a rejected stale cursor must not retain its prefetched decode window"
+    );
+}
+
+/// Clears the forced width even when the guarded assertion panics, so a
+/// failing test cannot leak a forced width into unrelated tests.
+struct ForcedWorkerWidth;
+
+impl ForcedWorkerWidth {
+    fn install(workers: usize) -> Self {
+        crate::parallelism::force_indexing_workers_for_test(workers);
+        Self
+    }
+}
+
+impl Drop for ForcedWorkerWidth {
+    fn drop(&mut self) {
+        crate::parallelism::clear_forced_indexing_workers_for_test();
+    }
+}
+
+/// One `fill_admitted_window` call must batch `workers *
+/// LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1` files, not a bare
+/// `workers`-sized fan-out — otherwise draining N files pays one
+/// `code_index.workers.install` round trip (dispatch + barrier overhead)
+/// every `workers` files instead of every `workers * multiplier` files.
+#[test]
+fn fill_admitted_window_batches_worker_width_times_multiplier_files() {
+    let fixture =
+        fixture_for_source_files(BATCH_FIXTURE_SOURCE, "src/window_fixture.rs", "rust", 40);
+    let _width = ForcedWorkerWidth::install(4);
+    let mut source = fixture.open();
+    let first_file_offset = source.file_ranges[0].0;
+
+    source
+        .fill_admitted_window(first_file_offset, &ActiveControl)
+        .expect("first window admits");
+
+    assert_eq!(
+        source.admitted_window.len(),
+        4 * LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1,
+        "a 40-file fixture at worker width 4 must admit a {}-file window, not a bare 4-file one",
+        4 * LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1,
+    );
+}
+
+/// Draining every page of a many-file sealed generation must call
+/// `fill_admitted_window` (and therefore `code_index.workers.install`)
+/// `ceil(file_count / (workers * multiplier))` times, not `ceil(file_count /
+/// workers)` times. This is the call-count reduction the window multiplier
+/// exists for.
+#[test]
+fn draining_a_many_file_generation_amortizes_install_calls_by_the_multiplier() {
+    let file_count = 40usize;
+    let fixture = fixture_for_source_files(
+        BATCH_FIXTURE_SOURCE,
+        "src/window_fixture.rs",
+        "rust",
+        file_count,
+    );
+    let workers = 4usize;
+    let _width = ForcedWorkerWidth::install(workers);
+    let mut source = fixture.open();
+
+    let mut window_fills = 0usize;
+    let mut start_index = 0usize;
+    loop {
+        let file_offset = source.file_ranges[start_index].0;
+        // Mirrors `ensure_admitted_file`'s clear-then-refill on a window miss.
+        source.admitted_window.clear();
+        source
+            .fill_admitted_window(file_offset, &ActiveControl)
+            .expect("window admits");
+        window_fills += 1;
+        start_index += source.admitted_window.len();
+        if start_index >= file_count {
+            break;
+        }
+    }
+
+    let expected_fills = file_count.div_ceil(workers * LEXICAL_DECODE_WINDOW_FILES_PER_WORKER_V1);
+    assert_eq!(
+        window_fills,
+        expected_fills,
+        "draining {file_count} files at worker width {workers} must take {expected_fills} \
+         window fills with the multiplier, not {} without it",
+        file_count.div_ceil(workers),
     );
 }
 

@@ -23,8 +23,8 @@ use tracedecay_memory_provider_registry::{
     AdmittedTemporalQuery, EnabledProviderMode, FabricConfig, NativeProviderActivation,
     ProjectMemoryProviderComposition, ProviderInvocationBoundaryV1, ProviderInvocationLimitsV1,
     ProviderWorkV1, ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
-    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_PAYLOAD_CONTRACT_ID,
-    RECALL_QUERY_CAPABILITY_ID, RecallBudgetsV1, RecallCandidateV1, RecallRequestParts,
+    ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RECALL_QUERY_CAPABILITY_ID,
+    RECALL_RESULT_CONTRACT_ID, RecallBudgetsV1, RecallCandidateV1, RecallRequestParts,
     RecallScopeBindingsV1, ScopeBinding, build_recall_request_payload,
 };
 
@@ -401,7 +401,7 @@ impl RecallFixturePort {
             ),
         ];
         json!({
-            "provider_id": NATIVE_PROVIDER_ID,
+            "provider_id": self.descriptor.provider_id.as_str(),
             "provider_instance_id": "native.recall-fixture",
             "registration_revision": call.registration_revision,
             "ready_receipt_digest": call.ready_receipt_sha256,
@@ -450,7 +450,7 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
         HandshakeResponse {
             terminal: TerminalRecord::new(
                 ProviderOperation::Handshake,
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("provider id"),
+                self.descriptor.provider_id.clone(),
                 self.handshake_terminal_code,
                 CommittedEffectEvidence::none(Some(self.descriptor.state_generation)),
                 FallbackDirective::forbidden(),
@@ -488,7 +488,7 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
             let sha256 = sha256_hex(&bytes);
             Some(
                 CanonicalPayload::new(
-                    OwnedVersionedId::new(RECALL_PAYLOAD_CONTRACT_ID).expect("contract"),
+                    OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID).expect("contract"),
                     bytes,
                     sha256,
                 )

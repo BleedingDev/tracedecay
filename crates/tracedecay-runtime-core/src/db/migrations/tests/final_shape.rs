@@ -722,9 +722,18 @@ async fn released_project_store_migrates_without_data_loss() {
             "read-only released admission must report a pending migration: {read_only}"
         );
         let reason = read_only.to_string();
+        let pending_step = if stamp == 34 {
+            "payload digest"
+        } else {
+            "released schema"
+        };
         assert!(
-            reason.contains("writer migration") && reason.contains(&format!("schema v{stamp}")),
-            "v{stamp} read-only admission must identify the writer migration: {reason}"
+            reason.contains(&format!(
+                "schema v{stamp} needs convergence to v{SCHEMA_VERSION}"
+            )) && reason.contains(&format!("the {pending_step} step is pending"))
+                && reason.contains("writer opens this store")
+                && reason.contains("instead of resetting the store"),
+            "v{stamp} read-only admission must identify the pending {pending_step} writer step: {reason}"
         );
         drop(read_only_connection);
         assert_eq!(store_snapshot(&path), before);
@@ -1261,8 +1270,8 @@ async fn released_project_store_migrates_without_data_loss() {
             None
         );
         assert!(
-            object_sql(&path, "table", "semantic_vector_stages").is_none(),
-            "retired semantic projection is removed after migration"
+            object_sql(&path, "table", "semantic_vector_stages").is_some(),
+            "the exact released semantic inventory remains available after migration"
         );
         assert!(
             object_sql(&path, "table", "external_source_objects_v1").is_none(),
@@ -1283,8 +1292,35 @@ async fn released_project_store_migrates_without_data_loss() {
     }
 }
 
+#[tokio::test]
+async fn released_project_store_without_lazy_diagnostics_converges() {
+    let directory = tempfile::tempdir().expect("create released fixture directory");
+    let path = released_project_store(&directory, 34);
+    tamper(
+        &path,
+        "DROP TABLE generation_diagnostics;
+         DROP TABLE diagnostic_generation_publications;",
+    );
+
+    let connection = TestConnection::open(&path);
+    ensure_schema_current_connection(&connection)
+        .await
+        .expect("a released store without lazily installed diagnostics must converge");
+    drop(connection);
+
+    assert!(object_sql(&path, "table", "generation_diagnostics").is_some());
+    assert!(object_sql(&path, "table", "diagnostic_generation_publications").is_some());
+    let migrated = rusqlite::Connection::open(&path).expect("open migrated project store");
+    assert_eq!(
+        migrated
+            .query_row("PRAGMA user_version", (), |row| row.get::<_, i64>(0))
+            .expect("read migrated schema stamp"),
+        i64::from(SCHEMA_VERSION)
+    );
+}
+
 /// The immutable v35 snapshot is admitted independently of the current
-/// installers, and its empty retired staging family is removed atomically.
+/// installers, and its exact released staging family remains intact.
 #[tokio::test]
 async fn released_v35_current_snapshot_migrates_to_the_final_shape() {
     let directory = tempfile::tempdir().expect("create released v35 current directory");
@@ -1303,7 +1339,7 @@ async fn released_v35_current_snapshot_migrates_to_the_final_shape() {
             .expect("read migrated v35 current stamp"),
         i64::from(SCHEMA_VERSION)
     );
-    assert!(object_sql(&path, "table", "semantic_vector_stages").is_none());
+    assert!(object_sql(&path, "table", "semantic_vector_stages").is_some());
     let before = store_snapshot(&path);
     let connection = TestConnection::open(&path);
     ensure_schema_current_connection(&connection)
@@ -1390,7 +1426,7 @@ async fn released_invalid_payload_digest_is_rejected_without_mutation() {
 }
 
 #[tokio::test]
-async fn released_semantic_rows_are_reset_required_without_mutation() {
+async fn released_semantic_rows_are_preserved_during_provider_migration() {
     let directory = tempfile::tempdir().expect("create semantic-row fixture directory");
     let path = released_project_store(&directory, 35);
     tamper(
@@ -1417,26 +1453,22 @@ async fn released_semantic_rows_are_reset_required_without_mutation() {
              '{}', 'pending', 0, 'checkpoint', 0, NULL, NULL, NULL, NULL, NULL, NULL
          );",
     );
-    let reason = assert_reset_required_without_repair(&path, "retired semantic row").await;
-    assert!(
-        reason.contains("retired semantic") || reason.contains("semantic_vector"),
-        "retired semantic data refusal must identify the unsupported table: {reason}"
-    );
+    let connection = TestConnection::open(&path);
+    ensure_schema_current_connection(&connection)
+        .await
+        .expect("provider migration preserves the exact released semantic inventory");
+    drop(connection);
+    let migrated = rusqlite::Connection::open(&path).expect("open migrated semantic fixture");
     assert_eq!(
-        object_sql(&path, "table", "semantic_vector_stages").is_some(),
-        true,
-        "retired semantic data refusal must leave the source table in place"
-    );
-    tamper(
-        &path,
-        "DELETE FROM semantic_vector_stages;
-         DELETE FROM semantic_vector_stage_census_authority;
-         DELETE FROM semantic_vector_stage_adoption_authority;",
-    );
-    let reason = assert_reset_required_without_repair(&path, "retired semantic sequence").await;
-    assert!(
-        reason.contains("AUTOINCREMENT") || reason.contains("sequence"),
-        "retired semantic sequence refusal must identify the unrecoverable high-water mark: {reason}"
+        migrated
+            .query_row(
+                "SELECT semantic_generation_id FROM semantic_vector_stages
+                 WHERE shard_id = 'shard'",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .expect("semantic stage survives provider migration"),
+        "semantic-generation"
     );
 }
 

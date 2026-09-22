@@ -351,13 +351,10 @@ fn one_readiness_pass_carries_both_the_target_and_the_state_evidence() {
 /// provider-local position for the host journal's recovery target. Direct
 /// observations and policy-specific history streams have their own receipts.
 #[test]
-fn canonical_replay_capability_does_not_claim_an_observation_recovery_position() {
+fn native_application_replay_claim_does_not_escape_capability_projection() {
     let port = Arc::new(MountedNativePort::with_capability("replay.apply.v1"));
     let readiness = mount(enabled_composition(Arc::clone(&port)), 4);
-    let mut request = handshake_request(exact_scope("worktree-canonical-replay"));
-    request
-        .required_capabilities
-        .insert(OwnedVersionedId::new("replay.apply.v1").expect("canonical replay capability"));
+    let request = handshake_request(exact_scope("worktree-canonical-replay"));
 
     let (_, evidence) = readiness
         .ready_target_with_evidence(&request, 1_000)
@@ -370,21 +367,17 @@ fn canonical_replay_capability_does_not_claim_an_observation_recovery_position()
 /// descriptor. It remains a claim the recovery gate must compare or refuse
 /// as unreadable; canonical replay support cannot silently replace it.
 #[test]
-fn readiness_evidence_reports_whether_the_provider_retains_a_replay_position() {
+fn native_application_recovery_position_claim_does_not_escape_capability_projection() {
     let port = Arc::new(MountedNativePort::with_capability(
         "observation.recovery_position.v1",
     ));
     let readiness = mount(enabled_composition(Arc::clone(&port)), 4);
-    let mut request = handshake_request(exact_scope("worktree-recovery-position"));
-    request.required_capabilities.insert(
-        OwnedVersionedId::new("observation.recovery_position.v1")
-            .expect("observation recovery position capability"),
-    );
+    let request = handshake_request(exact_scope("worktree-recovery-position"));
 
     let (_, evidence) = readiness
         .ready_target_with_evidence(&request, 1_000)
         .expect("readiness target and evidence");
-    assert!(evidence.retains_replay_position());
+    assert!(!evidence.retains_replay_position());
     assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 1);
 }
 
@@ -577,14 +570,14 @@ fn a_malformed_success_never_yields_a_readiness_target() {
     let request = handshake_request(exact_scope("worktree-a"));
 
     match readiness.ready_target(&request, 1_000) {
-        Err(SupervisedReadinessError::Unavailable { kind, .. }) => assert!(
-            matches!(
-                kind,
-                DegradationKindV1::HandshakeContractViolation
-                    | DegradationKindV1::HandshakeTransportFailed
-            ),
-            "unexpected degradation kind {kind}"
-        ),
+        Err(SupervisedReadinessError::Unavailable {
+            kind,
+            terminal_code,
+            ..
+        }) => {
+            assert_eq!(kind, DegradationKindV1::HandshakeRefused);
+            assert_eq!(terminal_code, Some(TerminalCode::ContractViolation));
+        }
         other => panic!("expected typed unavailability, got {other:?}"),
     }
     assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 1);

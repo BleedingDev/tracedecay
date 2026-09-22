@@ -162,6 +162,7 @@ pub mod branch_generations;
 pub mod branch_publication;
 mod cadence;
 mod classification;
+mod demand_admission;
 mod freshness_witness;
 mod git_tree_capture;
 pub use git_tree_capture::{
@@ -196,11 +197,15 @@ pub use cadence::{
     CodeIndexArrivalV1, CodeIndexCadenceOutcomeV1, CodeIndexCadenceTelemetryV1,
     CodeIndexCadenceTriggerV1, CodeIndexEventToReadyReceiptV1, newly_eligible_percentile,
 };
+pub use demand_admission::{
+    CodeIndexDemandAdmissionV1, CodeIndexDemandUnavailableV1, CodeIndexDemandV1,
+};
 pub use graph_activation::{CodeGraphActivationAuthorityV1, CodeGraphActivationPolicyV1};
 pub use ignored_dependencies::{
     CodeIndexIgnoredDependencyIndexOutcomeV1, CodeIndexIgnoredDependencyRefusalV1,
     CodeIndexIgnoredDependencyRequestV1,
 };
+pub use registry::CodeIndexReconcileAdmissionV1;
 pub use registry::CodeIndexSchedulerRegistryV1;
 pub use registry::watch_ingress::GitStateChangeRequestV1;
 pub use registry::{
@@ -234,18 +239,20 @@ pub use reconcile::{
     ReconcilePassGuard,
 };
 pub(crate) use reconcile::{ServingSourceWitnessV1, SourceFreshnessFenceV1};
+pub use serving::{
+    CloneSimilarityWarmupForRequestV1, CodeIndexBuildProgressSlotStateV1,
+    CodeIndexBuildProgressSlotV1, DaemonCodeTextArtifactStoreV1, LatestCodeTextGenerationV1,
+    LatestCompleteCodeIndexV1, ProductionCodeIndexQueryOwnersV1,
+};
 use serving::{
     CodeGraphActivationStateV1, CodeGraphServingAuthorityV1, CodeIndexBuildProgressStateV1,
     CodeTextProjectionStateV1, DurableActiveSealedGenerationBindingV1, GenerationServingCachesV1,
     GenerationTextControlV1, TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1, try_publish_build_progress,
 };
-pub use serving::{
-    CodeIndexBuildProgressSlotStateV1, CodeIndexBuildProgressSlotV1, DaemonCodeTextArtifactStoreV1,
-    LatestCodeTextGenerationV1, LatestCompleteCodeIndexV1, ProductionCodeIndexQueryOwnersV1,
-};
 #[cfg(test)]
 use serving::{
     CodeIndexCommittedProgressSampleV1, CodeTextProjectionSlotV1, TEXT_ARTIFACT_PAGE_CHUNKS_V1,
-    map_sealed_page_source_error, sha256_private_file_and_size, text_artifact_builder_budget,
+    clone_successor_source_batch_limits_from_charges, map_sealed_page_source_error,
+    sha256_private_file_and_size, text_artifact_builder_budget,
     text_artifact_resident_memory_charges, text_artifact_source_batch_limits,
 };

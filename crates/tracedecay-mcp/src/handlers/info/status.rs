@@ -4,6 +4,9 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use tracedecay_application::tracedecay::BranchDiagnostics;
+use tracedecay_contracts::code_index_freshness::{
+    CodeIndexFreshnessCoverageV1, CodeIndexStalenessStateV1,
+};
 use tracedecay_contracts::storage::{SchemaConvergenceFindingV1, SchemaConvergenceStateV1};
 use tracedecay_domain::errors::Result;
 use tracedecay_global_db::{RegisteredGlobalDb, SessionIngestHealth};
@@ -138,8 +141,8 @@ fn ready_serving_source(
     Some(ReadyServingSourceV1 {
         reference: freshness.source_reference.as_deref()?,
         revision: freshness.source_revision.as_deref(),
-        current_source_verified: freshness.coverage == "complete"
-            && freshness.staleness_state.as_deref() == Some("fresh"),
+        current_source_verified: freshness.coverage == CodeIndexFreshnessCoverageV1::Complete
+            && freshness.staleness_state == Some(CodeIndexStalenessStateV1::Fresh),
     })
 }
 
@@ -242,10 +245,14 @@ pub async fn handle_status(
         ));
     }
 
-    let include_branch_diagnostics = status_arg_flag(&args, "include_branch_diagnostics", true);
-    let include_storage_health = status_arg_flag(&args, "include_storage_health", true);
-    let include_session_ingest = status_arg_flag(&args, "include_session_ingest", true);
-    let include_staleness = status_arg_flag(&args, "include_staleness", true);
+    // Compact by default. The CLI already skips these sections because they
+    // commonly push status over the response-frame budget, and the truncated
+    // body is not something the caller should reassemble into context. Opt in
+    // when the full diagnostic section is the thing being asked for.
+    let include_branch_diagnostics = status_arg_flag(&args, "include_branch_diagnostics", false);
+    let include_storage_health = status_arg_flag(&args, "include_storage_health", false);
+    let include_session_ingest = status_arg_flag(&args, "include_session_ingest", false);
+    let include_staleness = status_arg_flag(&args, "include_staleness", false);
 
     let graph_statistics = graph_statistics_value(ctx.generation_census())?;
     let mut output = json!({
@@ -272,10 +279,11 @@ pub async fn handle_status(
                 // exists for the worktree; until the first seal every
                 // retrieval lane refuses `generation_rebuilding`.
                 let retrieval_serving = if freshness.latest_generation_id.is_some() {
-                    let (serving_freshness, condition) = match freshness.staleness_state.as_deref()
-                    {
-                        Some("fresh") => ("current", None),
-                        Some("verifying") => ("last_complete_stale", Some("source_verification")),
+                    let (serving_freshness, condition) = match freshness.staleness_state {
+                        Some(CodeIndexStalenessStateV1::Fresh) => ("current", None),
+                        Some(CodeIndexStalenessStateV1::Verifying) => {
+                            ("last_complete_stale", Some("source_verification"))
+                        }
                         Some(_) if freshness.rebuild_in_flight => {
                             ("last_complete_stale", Some("rebuilding"))
                         }
@@ -353,58 +361,58 @@ pub async fn handle_status(
     }
 
     // Session-transcript ingest health (recall trust): last ingest time and
-    // any un-ingested transcript backlog from the project sessions.db.
+    // any un-ingested transcript backlog from the admitted project session
+    // authority. Match tracedecay_runtime: consult the lease directly rather
+    // than gating on the layout path existing on disk (fixtures and some
+    // retained mounts hold an open authority before the path is observed).
     if include_session_ingest {
-        let session_db_path = ctx.store_layout().sessions_db_path.clone();
-        if session_db_path.exists() {
-            match ctx.authorized_project_session_db() {
-                None => {
-                    // Attached means admitted; absent is the typed
-                    // unavailable/denied state. Fail closed instead of
-                    // opening a second connection here.
-                    output["session_ingest"] = json!({
-                        "status": "unavailable",
-                        "reason": "session_store_denied",
-                        "message": "this request is not authorized to read the admitted project session store",
-                    });
-                }
-                Some((lease, _)) => {
-                    let db = lease.as_ref();
-                    match hotpath::future!(
-                        db.cursor_session_ingest_health(),
-                        label = "mcp.info.status.session_ingest"
-                    )
-                    .await
-                    {
-                        Ok(ingest) => {
-                            output["session_ingest"] = serde_json::to_value(&ingest)
-                                .unwrap_or_else(|error| {
-                                    json!({
-                                        "status": "unavailable",
-                                        "reason": "session_ingest_serialization_failed",
-                                        "message": error.to_string(),
-                                    })
-                                });
-                            // `session_ingest` stays cursor-scoped so it keeps matching the
-                            // doctor-owned signal. Historical catch-up is measured across
-                            // providers and remains explicitly partial while the retained
-                            // daemon authority drains its bounded backlog.
-                            if let Some(catch_up) = hotpath::future!(
-                                historical_session_catch_up(db),
-                                label = "mcp.info.status.session_history"
-                            )
-                            .await
-                            {
-                                output["session_history_catch_up"] = catch_up;
-                            }
-                        }
-                        Err(error) => {
-                            output["session_ingest"] = json!({
-                                "status": "unavailable",
-                                "reason": "session_ingest_query_failed",
-                                "message": error,
+        match ctx.authorized_project_session_db() {
+            None => {
+                // Attached means admitted; absent is the typed
+                // unavailable/denied state. Fail closed instead of
+                // opening a second connection here.
+                output["session_ingest"] = json!({
+                    "status": "unavailable",
+                    "reason": "session_store_denied",
+                    "message": "this request is not authorized to read the admitted project session store",
+                });
+            }
+            Some((lease, _)) => {
+                let db = lease.as_ref();
+                match hotpath::future!(
+                    db.cursor_session_ingest_health(),
+                    label = "mcp.info.status.session_ingest"
+                )
+                .await
+                {
+                    Ok(ingest) => {
+                        output["session_ingest"] =
+                            serde_json::to_value(&ingest).unwrap_or_else(|error| {
+                                json!({
+                                    "status": "unavailable",
+                                    "reason": "session_ingest_serialization_failed",
+                                    "message": error.to_string(),
+                                })
                             });
+                        // `session_ingest` stays cursor-scoped so it keeps matching the
+                        // doctor-owned signal. Historical catch-up is measured across
+                        // providers and remains explicitly partial while the retained
+                        // daemon authority drains its bounded backlog.
+                        if let Some(catch_up) = hotpath::future!(
+                            historical_session_catch_up(db),
+                            label = "mcp.info.status.session_history"
+                        )
+                        .await
+                        {
+                            output["session_history_catch_up"] = catch_up;
                         }
+                    }
+                    Err(error) => {
+                        output["session_ingest"] = json!({
+                            "status": "unavailable",
+                            "reason": "session_ingest_query_failed",
+                            "message": error,
+                        });
                     }
                 }
             }
@@ -444,14 +452,14 @@ fn code_index_freshness_projection(
     freshness: &tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1,
 ) -> (&'static str, Option<String>) {
     let authoritative = freshness.latest_generation_id.is_some()
-        && freshness.coverage == "complete"
-        && freshness.staleness_state.as_deref() == Some("fresh");
+        && freshness.coverage == CodeIndexFreshnessCoverageV1::Complete
+        && freshness.staleness_state == Some(CodeIndexStalenessStateV1::Fresh);
     if let Some(parked) = freshness.parked.as_ref() {
         let warning = format!(
             "code-index background convergence is parked: {}; {}",
             parked.reason, parked.remediation
         );
-        let status = if freshness.staleness_state.as_deref() == Some("parked") {
+        let status = if freshness.staleness_state == Some(CodeIndexStalenessStateV1::Parked) {
             "parked"
         } else if authoritative {
             "current"
@@ -462,7 +470,7 @@ fn code_index_freshness_projection(
     }
     if authoritative {
         ("current", None)
-    } else if freshness.staleness_state.as_deref() == Some("verifying") {
+    } else if freshness.staleness_state == Some(CodeIndexStalenessStateV1::Verifying) {
         (
             "stale",
             Some(
@@ -607,6 +615,13 @@ fn render_status_md(value: &Value) -> String {
                     } else {
                         md.field(k, &format!("{{{} field(s)}}", o.len()));
                     }
+                    if k == "schema_convergence"
+                        && let Some(findings) = o.get("findings").and_then(Value::as_array)
+                    {
+                        for finding in findings {
+                            md.bullet(&finding.to_string());
+                        }
+                    }
                 }
                 Value::Null => {}
             }
@@ -717,8 +732,12 @@ mod tests {
         code_index_freshness_projection, graph_statistics_value, historical_session_catch_up_state,
         render_status_md, schema_convergence_status,
     };
+    use tracedecay_contracts::code_index_freshness::{
+        CodeIndexFreshnessCoverageV1, CodeIndexStalenessStateV1,
+    };
     use tracedecay_contracts::storage::{
-        SchemaConvergenceFindingV1, SchemaConvergenceStageV1, SchemaConvergenceStateV1,
+        SchemaConvergenceFindingV1, SchemaConvergenceProgressV1, SchemaConvergenceStageV1,
+        SchemaConvergenceStateV1,
     };
 
     #[test]
@@ -751,7 +770,10 @@ mod tests {
                 store: "profile-sessions".to_owned(),
                 stage: SchemaConvergenceStageV1::RegisteredSchema,
                 state,
-                progress: None,
+                progress: Some(SchemaConvergenceProgressV1::Rows {
+                    done: 3,
+                    remaining: 7,
+                }),
                 started_at_micros: 42,
                 degraded_row: (state == SchemaConvergenceStateV1::Degraded)
                     .then(|| "observation_id=obs-7".to_owned()),
@@ -760,6 +782,14 @@ mod tests {
             assert_eq!(value["status"], expected);
             assert_eq!(value["findings"][0]["state"], serde_json::json!(state));
             assert_eq!(value["findings"][0]["started_at_micros"], 42);
+            let rendered = render_status_md(&serde_json::json!({"schema_convergence": value}));
+            assert!(rendered.contains(state.as_str()));
+            assert!(rendered.contains("profile-sessions"));
+            assert!(rendered.contains(r#""done":3"#));
+            assert!(rendered.contains(r#""remaining":7"#));
+            if state == SchemaConvergenceStateV1::Degraded {
+                assert!(rendered.contains("observation_id=obs-7"));
+            }
         }
     }
 
@@ -801,12 +831,13 @@ mod tests {
     fn a_parked_deterministic_violation_reports_parked_not_warming() {
         let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
             worktree_root: "/project".to_owned(),
-            staleness_state: Some("parked".to_owned()),
-            coverage: "complete".to_owned(),
+            staleness_state: Some(CodeIndexStalenessStateV1::Parked),
+            coverage: CodeIndexFreshnessCoverageV1::Complete,
             parked: Some(
                 tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1 {
                     reason: "code text artifacts root is not owner-private (mode 775, need 700)"
                         .to_owned(),
+                    blocked_reason: None,
                     remediation: "restore owner-only access".to_owned(),
                     parked_at_micros: 42,
                     observed_passes: 3,
@@ -831,7 +862,9 @@ mod tests {
             code_graph_serving: Some(
                 tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready,
             ),
-            clone_index: Some(Default::default()),
+            clone_index: Some(
+                tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::default(),
+            ),
             ..Default::default()
         };
 
@@ -854,11 +887,12 @@ mod tests {
         let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
             worktree_root: "/project".to_owned(),
             latest_generation_id: Some("generation.fixture".to_owned()),
-            staleness_state: Some("fresh".to_owned()),
-            coverage: "complete".to_owned(),
+            staleness_state: Some(CodeIndexStalenessStateV1::Fresh),
+            coverage: CodeIndexFreshnessCoverageV1::Complete,
             parked: Some(
                 tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1 {
                     reason: "code text artifacts root is not owner-private".to_owned(),
+                    blocked_reason: None,
                     remediation: "restore owner-only access".to_owned(),
                     parked_at_micros: 42,
                     observed_passes: 1,
@@ -878,8 +912,8 @@ mod tests {
     fn an_unparked_incomplete_read_stays_warming() {
         let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
             worktree_root: "/project".to_owned(),
-            staleness_state: Some("indexing".to_owned()),
-            coverage: "complete".to_owned(),
+            staleness_state: Some(CodeIndexStalenessStateV1::Indexing),
+            coverage: CodeIndexFreshnessCoverageV1::Complete,
             ..Default::default()
         };
 
@@ -898,8 +932,8 @@ mod tests {
         let freshness = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
             worktree_root: "/project".to_owned(),
             latest_generation_id: Some("generation.fixture".to_owned()),
-            staleness_state: Some("verifying".to_owned()),
-            coverage: "partial_source_verification".to_owned(),
+            staleness_state: Some(CodeIndexStalenessStateV1::Verifying),
+            coverage: CodeIndexFreshnessCoverageV1::PartialSourceVerification,
             ..Default::default()
         };
 

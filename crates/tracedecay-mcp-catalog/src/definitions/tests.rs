@@ -1,6 +1,43 @@
 use super::*;
 
 #[test]
+fn work_and_workflow_advertise_every_executable_request_schema() {
+    let definitions = get_maximal_tool_definitions().expect("tool definitions");
+    for (family, registry) in [
+        (
+            "work",
+            tracedecay_contracts::work_executable_binding_registry().expect("Work registry"),
+        ),
+        (
+            "workflow",
+            tracedecay_contracts::workflow_executable_binding_registry()
+                .expect("Workflow registry"),
+        ),
+    ] {
+        assert!(registry.iter().count() > 0);
+        for availability in registry.iter() {
+            let binding = availability.binding().expect("executable binding");
+            let operation = binding
+                .operation_id()
+                .as_str()
+                .strip_prefix(&format!("operation.{family}."))
+                .expect("operation family");
+            let name = format!("tracedecay_{family}_{operation}");
+            let advertised = definitions
+                .iter()
+                .filter(|definition| definition.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(advertised.len(), 1, "{name}");
+            assert_eq!(
+                advertised[0].input_schema,
+                mcp_input_schema(binding.request_schema().body()),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn internal_host_ingest_is_cli_resolvable_but_not_advertised() {
     assert!(
         get_tool_definitions()
@@ -331,4 +368,71 @@ fn per_session_budget_does_not_leak_through_the_cached_registry() {
         !neutral_description.contains("9 broad context calls"),
         "an unbudgeted caller inherited another session's budget: {neutral_description}"
     );
+}
+
+/// Always-loaded schemas enter the model prompt on every turn. The agreed cap
+/// is the small core; growing it is a context-window decision, not a drive-by.
+#[test]
+fn always_loaded_tools_stay_inside_the_agreed_core() {
+    let definitions = get_maximal_tool_definitions().expect("tool definitions");
+    let mut always_loaded = definitions
+        .iter()
+        .filter(|definition| {
+            definition
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("anthropic/alwaysLoad"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    always_loaded.sort_unstable();
+    assert_eq!(
+        always_loaded,
+        vec![
+            "tracedecay_active_project",
+            "tracedecay_callers",
+            "tracedecay_context",
+            "tracedecay_grep",
+            "tracedecay_search",
+            "tracedecay_status",
+            "tracedecay_storage_status",
+        ]
+    );
+}
+
+#[test]
+fn status_and_skill_view_default_to_summaries() {
+    let definitions = get_tool_definitions().expect("tool definitions");
+    let status = definitions
+        .iter()
+        .find(|definition| definition.name == "tracedecay_status")
+        .expect("status");
+    for key in [
+        "include_branch_diagnostics",
+        "include_storage_health",
+        "include_session_ingest",
+        "include_staleness",
+    ] {
+        assert_eq!(
+            status.input_schema["properties"][key]["default"],
+            serde_json::json!(false),
+            "{key}"
+        );
+    }
+    let view = definitions
+        .iter()
+        .find(|definition| definition.name == "tracedecay_skill_view")
+        .expect("skill view");
+    assert_eq!(
+        view.input_schema["properties"]["include_support_files"]["default"],
+        serde_json::json!(false)
+    );
+    let retrieve = definitions
+        .iter()
+        .find(|definition| definition.name == "tracedecay_retrieve")
+        .expect("retrieve");
+    assert!(retrieve.description.contains("Do not walk next_offset"));
+    assert!(!retrieve.description.contains("byte-exactly"));
 }

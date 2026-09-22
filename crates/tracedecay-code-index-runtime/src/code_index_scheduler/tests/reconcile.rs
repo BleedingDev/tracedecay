@@ -25,7 +25,7 @@ use tracedecay_runtime_core::resident_memory::{
 use super::{
     ALPHA_LIB_V1, GitFixture, RETAINED_REVISION_0, SERVING_SEAT_FAILURE_CEILING,
     advance_pointer_to_unseated_successor, application_context, committed_capture_corpus_files,
-    core_search_request, git, git_stdout, mounted_core_query_worktree,
+    core_search_request, drain_clone_backfill, git, git_stdout, mounted_core_query_worktree,
     mounted_core_query_worktree_with_one_permit, published, query_authority, query_meta,
     quiesced_background_reconcile_admission, replace_scheduler_chunker_revision,
     replace_scheduler_policy_revision, rewrite_active_rust_extractor_revision,
@@ -45,10 +45,10 @@ use crate::{
         },
     },
     code_index_scheduler::{
-        CodeIndexCadenceOutcomeV1, CodeIndexCadenceTriggerV1, CodeIndexHintPolicyV1,
-        CodeIndexIgnoredDependencyRequestV1, CodeIndexReconcileOutcomeV1,
-        CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1, GenerationDecodeAdmissionV1,
-        SharedCodeIndexBytePoolV1,
+        CodeIndexCadenceOutcomeV1, CodeIndexCadenceTriggerV1, CodeIndexEventToReadyReceiptV1,
+        CodeIndexHintPolicyV1, CodeIndexIgnoredDependencyRequestV1, CodeIndexReconcileAdmissionV1,
+        CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1,
+        GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
         classification::{WorktreeChangeClassV1, WorktreeChangeClassificationV1},
         feedback_document_identity_from_generation,
         freshness_witness::RestoreFreshnessWitnessV1,
@@ -715,15 +715,19 @@ async fn registry_feeds_publications_and_bounded_freshness_reads() {
         Some(initial.generation_id.as_str())
     );
     assert!(freshness.last_reconcile_micros.is_some());
-    assert_eq!(freshness.staleness_state.as_deref(), Some("fresh"));
+    assert_eq!(
+        freshness.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh)
+    );
     assert_eq!(freshness.hook_hint_count, Some(0));
 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let changed = tokio::time::timeout(Duration::from_secs(2), publications.recv())
         .await
         .expect("changed publication timeout")
@@ -765,11 +769,12 @@ async fn registry_clone_freshness_reports_coverage_and_update_accounting() {
     assert!(observation.resources.peak_scratch_memory_bytes.is_some());
 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let _ = wait_for_generation_change(&registry, fixture.path(), &initial).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
     let changed = registry
@@ -838,11 +843,12 @@ async fn restart_remount_serves_the_retained_generation_without_republishing() {
     );
 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         restarted
             .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let first_broadcast = tokio::time::timeout(Duration::from_secs(5), publications.recv())
         .await
         .expect("post-restart publication timeout")
@@ -896,7 +902,7 @@ fn retained_v3_rust_extractor_generation_is_refused_and_rebuilt_by_v5() {
             .iter()
             .find(|(language, _)| language.as_str() == "rust")
             .map(|(_, revision)| revision.as_str()),
-        Some("extractor.rust.v5")
+        Some("extractor.rust.v8")
     );
 }
 
@@ -1081,7 +1087,10 @@ async fn scheduler_notifications_remain_nonblocking_while_reconcile_is_busy() {
         .await
         .expect("scheduler notification must not wait for the reconcile lock")
         .expect("notification task");
-    assert!(notified);
+    assert!(matches!(
+        notified,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     assert!(
         registry
             .latest_complete_ready(fixture.path())
@@ -2503,6 +2512,111 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
     registry.shutdown().await;
 }
 
+/// A seat that installed without a currency witness (its publishing pass saw
+/// `code_index_post_projection_source_unverified`) can only be re-proven by a
+/// pass. When the retained native graph already serves, the swap arm that
+/// used to do that never runs, so the unchanged-pass path must bind the
+/// renewed proof to the seat itself — and only for the exact snapshot the
+/// pass verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_pass_binds_its_source_proof_to_an_unproven_seat() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(ready) = registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+            {
+                break ready;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the mounted generation becomes ready-decoded");
+    let generation_id = ready.generation().manifest().generation_id.clone();
+    let seated_snapshot = ready.generation().snapshot().content_identity.clone();
+
+    let serving_generation = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .expect("mounted worktree")
+                .serving_generation,
+        )
+    };
+    let witness = registry
+        .serving_source_witness_for_root(fixture.path())
+        .await
+        .expect("mounted worktree witness");
+    let fence = registry
+        .source_freshness_for_root(fixture.path())
+        .await
+        .expect("mounted worktree fence");
+
+    // Stage the unproven seat the post-projection race leaves behind.
+    *witness
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+    let foreign_snapshot = tracedecay_domain::ContentDigest::new(format!("sha256:{:064x}", 0_u8))
+        .expect("digest literal");
+    assert!(
+        !CodeIndexSchedulerRegistryV1::bind_unproven_seat_to_verified_source(
+            &serving_generation,
+            &witness,
+            &fence,
+            &foreign_snapshot,
+        ),
+        "a proof over a different snapshot must never arm the seat"
+    );
+    assert!(
+        witness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none(),
+        "the seat stays unproven after a foreign-snapshot proof"
+    );
+
+    assert!(
+        CodeIndexSchedulerRegistryV1::bind_unproven_seat_to_verified_source(
+            &serving_generation,
+            &witness,
+            &fence,
+            &seated_snapshot,
+        ),
+        "the proof over the seated snapshot arms the seat"
+    );
+    assert_eq!(
+        witness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|witness| witness.generation_id.clone()),
+        Some(generation_id.clone()),
+        "the witness names the seated generation"
+    );
+    assert!(
+        !CodeIndexSchedulerRegistryV1::bind_unproven_seat_to_verified_source(
+            &serving_generation,
+            &witness,
+            &fence,
+            &seated_snapshot,
+        ),
+        "an already-proven seat is left alone"
+    );
+    assert!(
+        registry.has_current_ready_decoded_for_root_scope(fixture.path(), &scope),
+        "the readiness census admits the re-proven seat without another pass"
+    );
+
+    registry.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_currency_witness_refuses_a_stale_generation() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
@@ -2515,9 +2629,12 @@ async fn source_currency_witness_refuses_a_stale_generation() {
     fixture.edit("src/main.rs", "fn main() { changed(); }\n");
     git(fixture.path(), &["commit", "-qam", "publish successor"]);
     assert!(
-        registry
-            .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
-            .await,
+        matches!(
+            registry
+                .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "the changed source is admitted to the retained worker"
     );
     let successor = wait_for_generation_change(&registry, fixture.path(), &stale_generation).await;
@@ -2671,11 +2788,12 @@ async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_se
     })
     .await;
     let generation = ready.generation().manifest().generation_id.clone();
+    // The seat precedes the clone-fingerprint backfill; settle it so the pass
+    // observed below is the source-verification Noop alone.
+    drain_clone_backfill(&registry, fixture.path()).await;
 
-    // Exercise the ordinary expiry path too: one readiness request starts a
-    // real Noop, and a read during that owner pass records one BusyFollowUp.
-    // Both passes must settle because the existing seat keeps its exact
-    // witness while the source proof is renewed.
+    // Exercise the ordinary expiry path too. The existing seat keeps its exact
+    // witness while the source-verification Noop renews the proof.
     {
         let mut state = source_freshness
             .state
@@ -2694,59 +2812,33 @@ async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_se
             .is_none(),
         "the expired proof declines before the worker renews it"
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !registry
-            .reconcile_in_progress_for_test(fixture.path())
-            .await
-        {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("readiness did not start a source-verification pass");
+    assert_eq!(
+        wait_until_serving_seat(&registry, fixture.path(), Duration::from_secs(10), || {
+            registry.latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+        })
+        .await
+        .generation()
+        .manifest()
+        .generation_id,
+        generation
+    );
     assert!(
         registry
-            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
-            .await
-            .is_none(),
-        "readiness stays fail-closed while the Noop owns verification"
-    );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let receipts = registry.event_to_ready_receipts();
-            let settled = !registry
-                .reconcile_in_progress_for_test(fixture.path())
-                .await
-                && registry.pending_wake_micros_for_scope(&scope).await == Some(0);
-            let new = &receipts[receipts_before.min(receipts.len())..];
-            if settled
-                && new.iter().any(|receipt| {
-                    receipt.trigger == CodeIndexCadenceTriggerV1::BusyFollowUp && receipt.is_noop()
-                })
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    })
-    .await
-    .expect("the real Noop and its single busy follow-up did not settle");
-    assert_eq!(
-        registry
-            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
-            .await
-            .expect("renewed seat is ready")
-            .generation()
-            .manifest()
-            .generation_id,
-        generation
+            .event_to_ready_receipts()
+            .iter()
+            .skip(receipts_before)
+            .any(CodeIndexEventToReadyReceiptV1::is_noop),
+        "source verification records an unchanged-source receipt"
     );
 
     fixture.edit("src/lib.rs", "pub fn changed_after_seat() {}\n");
     assert!(
-        registry
-            .notify_path(fixture.path(), fixture.path().join("src/lib.rs"))
-            .await,
+        matches!(
+            registry
+                .notify_path(fixture.path(), fixture.path().join("src/lib.rs"))
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "changed source reaches the mounted owner"
     );
     assert!(
@@ -2883,6 +2975,7 @@ async fn ignored_dependency_waits_for_global_admission_before_publication_gate()
     let store = TempDir::new().expect("store root");
     let (registry, _) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
     let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    drain_clone_backfill(&registry, fixture.path()).await;
     let generation = latest.generation();
     let verified_import = generation
         .imports()
@@ -3508,9 +3601,12 @@ async fn foreign_serving_generation_replacement_rejects_stale_rollback_token() {
         &["commit", "-qm", "refresh retained generation"],
     );
     assert!(
-        registry
-            .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
-            .await,
+        matches!(
+            registry
+                .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "the mounted worktree must accept a refresh hint"
     );
     let newer = wait_for_generation_change(&registry, fixture.path(), &original_id).await;
@@ -3734,11 +3830,14 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
     assert_eq!(projected_progress.generation_id, expected.generation_id);
     assert!(projected_progress.progress_epoch >= expected.progress_epoch);
     assert_eq!(
-        projected.staleness_state.as_deref(),
-        Some("fresh"),
+        projected.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh),
         "an unrelated scheduler-mutex holder is not a source refresh"
     );
-    assert_eq!(projected.coverage, "complete");
+    assert_eq!(
+        projected.coverage,
+        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
+    );
     assert_eq!(projected.hook_hint_count, Some(0));
     let _ = release_tx.send(());
     scheduler_holder
@@ -3846,7 +3945,10 @@ async fn unchanged_background_freshness_probe_posts_no_overflow_wake() {
     }
     let receipts_before = registry.event_to_ready_receipts().len();
 
-    assert!(registry.probe_freshness(fixture.path()).await);
+    assert_eq!(
+        registry.probe_freshness_admission(fixture.path()).await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let mounted = registry.mounted.lock().await;
@@ -3898,11 +4000,12 @@ async fn diagnostics_change_generation_is_stable_until_a_sibling_edit_hint() {
         "src/sibling.rs",
         "pub fn sibling() { println!(\"changed\"); }\n",
     );
-    assert!(
+    assert!(matches!(
         registry
             .notify_hook_paths(fixture.path(), &["src/sibling.rs".to_owned()])
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let changed = registry
         .diagnostics_change_generation(fixture.path())
         .await
@@ -4009,8 +4112,14 @@ async fn elapsed_freshness_window_alone_does_not_make_dashboard_state_stale() {
         .dashboard_freshness(fixture.path())
         .await
         .expect("dashboard freshness");
-    assert_eq!(projected.staleness_state.as_deref(), Some("fresh"));
-    assert_eq!(projected.coverage, "complete");
+    assert_eq!(
+        projected.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh)
+    );
+    assert_eq!(
+        projected.coverage,
+        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
+    );
     registry.shutdown().await;
 }
 
@@ -4037,9 +4146,12 @@ async fn dashboard_freshness_reports_pending_rebuild_liveness() {
         .expect("hold background reconcile admission");
     fixture.edit("src/main.rs", "fn main() { println!(\"changed\"); }\n");
     assert!(
-        registry
-            .notify_hook_paths(fixture.path(), &["src/main.rs".to_owned()])
-            .await,
+        matches!(
+            registry
+                .notify_hook_paths(fixture.path(), &["src/main.rs".to_owned()])
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "the source change must publish a pending scheduler wake"
     );
     let projected = registry
@@ -4070,6 +4182,9 @@ async fn a_fresh_seat_declines_query_admission_during_source_verification() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
+    // Pending clone work is a reason to admit a background pass; settle it so
+    // the freshness gate alone decides this admission.
+    drain_clone_backfill(&registry, fixture.path()).await;
     registry.clear_pending_wake_for_scope(&scope).await;
 
     let pass = registry
@@ -4077,7 +4192,10 @@ async fn a_fresh_seat_declines_query_admission_during_source_verification() {
         .await
         .expect("mounted reconcile owner");
     assert!(
-        !registry.request_query_background_reconcile(&scope).await,
+        matches!(
+            registry.request_query_background_reconcile(&scope).await,
+            CodeIndexReconcileAdmissionV1::Unavailable
+        ),
         "a servable seat under an unexpired proof is already the query's answer"
     );
     assert_eq!(
@@ -4090,8 +4208,11 @@ async fn a_fresh_seat_declines_query_admission_during_source_verification() {
         .dashboard_freshness(fixture.path())
         .await
         .expect("dashboard freshness");
-    assert_eq!(projected.staleness_state.as_deref(), Some("verifying"));
-    assert_eq!(projected.coverage, "partial_source_verification");
+    assert_eq!(
+        projected.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Verifying)
+    );
+    assert_eq!(projected.coverage, tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::PartialSourceVerification);
     assert!(!projected.rebuild_in_flight);
 
     drop(pass);
@@ -5211,7 +5332,10 @@ async fn concurrent_query_admissions_claim_one_pending_wake_before_worker_coales
 
     let mut admitted = 0;
     for request in requests {
-        if request.await.expect("query admission task joins") {
+        if matches!(
+            request.await.expect("query admission task joins"),
+            CodeIndexReconcileAdmissionV1::Accepted
+        ) {
             admitted += 1;
         }
     }
@@ -5420,14 +5544,20 @@ async fn foreign_wake_keeps_pending_arrival_when_query_claim_is_released() {
     };
     registry.wait_for_query_claim(&scope).await;
     assert!(
-        registry
-            .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
-            .await,
+        matches!(
+            registry
+                .notify_path(fixture.path(), fixture.path().join("src/main.rs"))
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "foreign hint wake is accepted for the mounted root"
     );
     registry.release_query_claim(&scope);
     assert!(
-        !request.await.expect("query admission task joins"),
+        matches!(
+            request.await.expect("query admission task joins"),
+            CodeIndexReconcileAdmissionV1::Unavailable
+        ),
         "a query whose claim lost its owner to a foreign wake must not restamp \
          QueryAdmission over that arrival"
     );
@@ -5450,6 +5580,9 @@ async fn foreign_wake_arriving_during_query_claim_drop_is_retained() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
+    // A query over pending clone work is admitted for that work and never
+    // reaches the claim gate under test; settle the backfill first.
+    drain_clone_backfill(&registry, fixture.path()).await;
     let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
     registry.clear_pending_wake_for_scope(&scope).await;
     registry.install_query_claim_gate(&scope);
@@ -5474,11 +5607,17 @@ async fn foreign_wake_arriving_during_query_claim_drop_is_retained() {
     registry.release_pending_wake_claim_drop(&scope).await;
 
     assert!(
-        !request.await.expect("query admission task joins"),
+        matches!(
+            request.await.expect("query admission task joins"),
+            CodeIndexReconcileAdmissionV1::Unavailable
+        ),
         "the rejected query releases its own claimed marker"
     );
     assert!(
-        foreign_wake.await.expect("foreign wake task joins"),
+        matches!(
+            foreign_wake.await.expect("foreign wake task joins"),
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "foreign hint wake is accepted after the claim release"
     );
     let stamped = registry
@@ -5707,11 +5846,12 @@ async fn background_reconciles_respect_a_single_admission_permit() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     second.edit("src/lib.rs", "pub fn second() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_path(second.path(), second.path().join("src/lib.rs"))
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
         registry.latest_generation_id(second.path()).await,
@@ -5747,11 +5887,12 @@ async fn build_publication_lock_serializes_source_reconcile() {
     let held = build_lock.lock_owned().await;
 
     fixture.edit("src/lib.rs", "pub fn source() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         registry.latest_generation_id(fixture.path()).await,
@@ -5826,11 +5967,12 @@ async fn distinct_stores_reconcile_in_parallel_under_bounded_admission() {
     // query the first worktree via `latest_generation_id`, which would block on
     // that lock while holding the registry map lock.)
     second.edit("src/lib.rs", "pub fn second() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_path(second.path(), second.path().join("src/lib.rs"))
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let advanced_second =
         wait_for_generation_change(&registry, second.path(), &second_generation).await;
     assert_ne!(
@@ -7693,7 +7835,7 @@ async fn reopened_current_text_generation_resolves_publication_identity_without_
         "mounted worktree admits complete-generation demand"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let current = loop {
         if let Some((current, true)) = registry
             .latest_text_serving_freshness_for_scope(&scope)
@@ -7702,11 +7844,10 @@ async fn reopened_current_text_generation_resolves_publication_identity_without_
         {
             break current;
         }
-        assert!(
-            Instant::now() <= deadline,
-            "reopened text generation did not become current"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout_at(deadline, serving_changes.changed())
+            .await
+            .expect("the current retained text owner wakes deferred consumers")
+            .expect("the serving-change channel stays open while mounted");
     };
     assert!(
         current.uses_partitioned_manifest(),
@@ -7719,10 +7860,6 @@ async fn reopened_current_text_generation_resolves_publication_identity_without_
             .is_none(),
         "configured graph refusal must leave the full generation unavailable"
     );
-    tokio::time::timeout(Duration::from_secs(5), serving_changes.changed())
-        .await
-        .expect("the current retained text owner wakes deferred consumers")
-        .expect("the serving-change channel stays open while mounted");
     let selected = registry
         .latest_feedback_generation_for_scope(fixture.path(), &scope)
         .await
@@ -7872,7 +8009,10 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
     // the retry prove and activate the exact retained generation.
     std::fs::rename(&unavailable_git_dir, &git_dir).expect("restore Git authority");
     assert!(
-        registry.notify_hook_overflow(fixture.path()).await,
+        matches!(
+            registry.notify_hook_overflow(fixture.path()).await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "restored worktree accepts a retry hint"
     );
     let receipts_before = registry.event_to_ready_receipts().len();
@@ -8460,9 +8600,12 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         )
     };
     assert!(
-        registry
-            .notify_hook_paths(fixture.path(), &["src/file_0000.rs".to_owned()])
-            .await,
+        matches!(
+            registry
+                .notify_hook_paths(fixture.path(), &["src/file_0000.rs".to_owned()])
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "changed source wakes the mounted graph-off owner"
     );
 
@@ -8553,9 +8696,12 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         );
     }
     assert!(
-        registry
-            .notify_hook_paths(fixture.path(), &["src/file_0000.rs".to_owned()])
-            .await,
+        matches!(
+            registry
+                .notify_hook_paths(fixture.path(), &["src/file_0000.rs".to_owned()])
+                .await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "retry wake reaches the restored source hint"
     );
 
@@ -9740,11 +9886,12 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
         .await
         .expect("initial generation");
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_path(fixture.path(), fixture.path().join("src/lib.rs"))
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let _ = wait_for_generation_change(&registry, fixture.path(), &initial).await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -9753,7 +9900,7 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
             .dashboard_freshness(fixture.path())
             .await
             .expect("dashboard freshness");
-        if freshness.staleness_state.as_deref() == Some("fresh") && freshness.coverage == "complete"
+        if freshness.staleness_state == Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh) && freshness.coverage == tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
         {
             break;
         }
@@ -9847,11 +9994,12 @@ async fn installed_observability_lane_records_index_and_retrieval_observations()
     // not after optional graph seating.
     let initial = initial_text.metadata().manifest().generation_id.clone();
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    assert!(
+    assert!(matches!(
         registry
             .notify_path(fixture.path(), fixture.path().join("src/lib.rs"))
-            .await
-    );
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
     let _ = wait_for_queryable_text_generation_change(&registry, fixture.path(), &initial).await;
 
     // One real query composition through the mounted authority carries the
@@ -10094,6 +10242,10 @@ fn a_publication_seats_its_own_generation_without_waiting_for_a_quiet_tree() {
         GraphSeatGateV1::PublishedTextOwnerUnavailable,
         "a publication whose replacement text owner did not become ready must not start graph work"
     );
+    // The ready bit above is `query_owners_are_ready` at both the published
+    // seat gate and the full-replay skip — never a second, forked check for
+    // "exact/lexical" or clone-complete. See
+    // `query_owners_ready_admits_seat_and_replay_both_directions`.
     assert_eq!(
         GraphSeatGateV1::decide(true, false, true, false, true),
         GraphSeatGateV1::Prepare,

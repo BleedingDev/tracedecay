@@ -106,6 +106,7 @@ export function Panel({
   children,
   className,
   bodyClassName,
+  headerClassName,
   tone = 'edge',
   elevation = 'face',
 }: {
@@ -115,6 +116,9 @@ export function Panel({
   children: ReactNode;
   className?: string;
   bodyClassName?: string;
+  /** For a header whose actions must wrap at a breakpoint instead of clipping;
+   * the default 32px single line is unchanged unless a caller opts in. */
+  headerClassName?: string;
   tone?: 'edge' | 'signal';
   /** Which plane of the chassis the panel body occupies. `well` recesses the
    * body so the region reads as something you look into — use it for lists,
@@ -130,7 +134,12 @@ export function Panel({
       )}
     >
       <Corners tone={tone} />
-      <header className="flex h-8 shrink-0 items-center gap-2.5 border-b border-edge-subtle px-2.5">
+      <header
+        className={cn(
+          'flex h-8 shrink-0 items-center gap-2.5 border-b border-edge-subtle px-2.5',
+          headerClassName,
+        )}
+      >
         <h2 className="td-title truncate">{legend}</h2>
         <span aria-hidden className="td-rule" />
         {actions}
@@ -320,8 +329,9 @@ export function MeterRow({
    * something (a kind, a source) as well as named. */
   leading?: ReactNode;
   /** `wide` widens the figure column by half a rem, for values that carry a
-   * unit suffix and would otherwise wrap the row. */
-  figureWidth?: 'standard' | 'wide';
+   * unit suffix and would otherwise wrap the row; `byte` widens it to hold a
+   * four-figure byte size with its unit (`204.7 MiB`). */
+  figureWidth?: 'standard' | 'wide' | 'byte';
   className?: string;
 }) {
   return (
@@ -339,7 +349,7 @@ export function MeterRow({
       <span
         className={cn(
           'td-value shrink-0 text-right text-2xs text-text-secondary',
-          figureWidth === 'wide' ? 'w-14' : 'w-12',
+          figureWidth === 'byte' ? 'w-[4.75rem]' : figureWidth === 'wide' ? 'w-14' : 'w-12',
         )}
         data-cell="numeric"
       >

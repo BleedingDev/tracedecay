@@ -7,13 +7,12 @@
 //! result.
 //!
 //! Both typed dimensions now have a real server-side source:
-//! - **budget**: the owner-configurable soft budgets live in the configuration
-//!   control plane under [`tracedecay_configuration::SYNC_RETENTION_SETTING_KEY`]
-//!   (`sync.retention.v1` → `store_soft_budgets_bytes`, keyed by store key).
-//!   A configured budget is evaluated against the live sample; a store with no
-//!   entry reports `unset` — *the owner has not configured a budget*, which is
-//!   deliberately distinct from "the server cannot evaluate budgets". A config
-//!   or sample the dashboard cannot read reports `unknown`, never a fabricated
+//! - **budget**: soft budgets are a field of [`tracedecay_configuration::RetentionConfig`]
+//!   (`store_soft_budgets_bytes`). That tree is not a registered configuration
+//!   setting, so a control-plane snapshot cannot admit one. A store with no
+//!   entry reports `unset` — *no budget is configured*, which is deliberately
+//!   distinct from "the server cannot evaluate budgets". A config or sample
+//!   the dashboard cannot read reports `unknown`, never a fabricated
 //!   "within budget".
 //! - **growth**: this route never establishes watermarks. Until a daemon-owned
 //!   execution sampler supplies a bounded history, store growth is typed
@@ -67,10 +66,6 @@ pub struct StoreTelemetryEntryV1 {
     /// Stable store key (the store's file name), or the raw file name when it is
     /// not a valid [`StoreKeyV1`].
     pub store: String,
-    /// The dashboard's primary role label for the store (`graph` / `memory` /
-    /// `lcm` / `savings`). Retained for compatibility; see `roles` for the
-    /// complete set.
-    pub role: String,
     /// Every dashboard role served by this one store file. More than one role
     /// here means the roles share a database, not that a store was duplicated.
     pub roles: Vec<String>,
@@ -137,12 +132,15 @@ pub struct StorageTelemetryPayloadV1 {
     pub table_growth_coverage: DashboardCoverageV1,
 }
 
-/// The owner setting path that configures a store's soft byte budget.
-pub const BUDGET_SETTING_KEY: &str = "sync.retention.v1 store_soft_budgets_bytes";
-const BUDGET_UNSET_REASON: &str = "no soft size budget is configured by the owner for this store (set \
-     sync.retention.v1 store_soft_budgets_bytes for the store key to configure one)";
-const BUDGET_NOTE: &str = "budgets are owner configuration: sync.retention.v1 store_soft_budgets_bytes, keyed by store \
-     key; a store with no entry reports unset (no budget configured), never a fabricated pass";
+/// Internal retention field that would carry a soft byte budget.
+///
+/// No registered configuration setting writes this field. Unset means no
+/// budget is configured, not that an unregistered text key was parsed.
+pub const BUDGET_SETTING_KEY: &str = "store_soft_budgets_bytes";
+const BUDGET_UNSET_REASON: &str = "no registered configuration setting configures a soft size budget for this store \
+     (store_soft_budgets_bytes)";
+const BUDGET_NOTE: &str = "soft size budgets are not a registered configuration setting; a store with no entry reports \
+     unset (store_soft_budgets_bytes), never a fabricated pass";
 const GROWTH_NOTE: &str = "store growth requires bounded execution-owned watermarks; dashboard reads observe current size but \
      never establish a baseline or a historical series";
 const GROWTH_UNKNOWN_REASON: &str =
@@ -176,14 +174,6 @@ impl SampledStoreV1 {
             StorageTelemetryReadV1::Observed { sample } => Some(sample),
             _ => None,
         }
-    }
-
-    /// The dashboard's primary role label for this store.
-    fn primary_role(&self) -> String {
-        self.roles
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "store".to_string())
     }
 }
 
@@ -565,7 +555,6 @@ fn telemetry_entry(
     });
     let budget = budget_dimension(&sampled.store, sample, retention);
     let growth = growth_dimension(total_bytes, free_bytes);
-    let role = sampled.primary_role();
     let table_growth = table_growth_dimension(TableGrowthTelemetryReadV1::Unsupported {
         store: StoreKeyV1::new(sanitize_store_key(&sampled.store))
             .unwrap_or_else(|_| fallback_store_key()),
@@ -573,7 +562,6 @@ fn telemetry_entry(
 
     StoreTelemetryEntryV1 {
         store: sampled.store,
-        role,
         roles: sampled.roles,
         path: sampled.path,
         read: sampled.read,

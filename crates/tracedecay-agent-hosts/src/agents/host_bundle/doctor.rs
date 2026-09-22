@@ -10,16 +10,16 @@ use tracedecay_host_integration::host_bundle_storage_failure;
 
 use super::control::{
     HOST_BUNDLE_CONTROL_DIR, HOST_BUNDLE_JOURNAL_FILE, HOST_COMPONENT_SET_JOURNAL_FILE,
-    MAX_CONTROL_FILE_BYTES, component_set_journal_file, component_slug, receipt_file,
+    MAX_CONTROL_FILE_BYTES, component_set_journal_file, component_slug, journal_file, receipt_file,
     receipt_identity_from_file_name, validate_component_set_journal, validate_journal,
     validate_receipt,
 };
 use super::planner::{ObservedArtifactKindV1, ObservedHostArtifactV1, observe_artifact_at};
 use super::{
-    HostBundleArtifactV1, HostBundleComponentV1, HostBundleError, HostBundleInstallReceiptV1,
-    HostBundleJournalV1, HostBundleLifecycleOpV1, HostBundleRollbackBoundaryV1,
-    HostComponentSetJournalV1, HostEditStopConformanceEvidenceV1, HostKindV1,
-    HostNativeFixtureEvidenceV1, native_host_edit_stop_conformance_evidence, stock_host_kinds,
+    HostBundleArtifactV1, HostBundleError, HostBundleInstallReceiptV1, HostBundleJournalV1,
+    HostBundleLifecycleOpV1, HostBundleRollbackBoundaryV1, HostComponentSetJournalV1,
+    HostComponentV1, HostEditStopConformanceEvidenceV1, HostKindV1, HostNativeFixtureEvidenceV1,
+    native_host_edit_stop_conformance_evidence, stock_host_kinds,
     supported_host_edit_stop_conformance_evidence,
 };
 
@@ -36,7 +36,7 @@ pub trait HostBundleRegistrationInspectorV1 {
     fn inspect_registration(
         &self,
         host: HostKindV1,
-        component: HostBundleComponentV1,
+        component: HostComponentV1,
     ) -> HostBundleRegistrationStateV1;
 
     /// Operator guidance for a host that exposes component activation only
@@ -102,7 +102,7 @@ pub struct HostBundleArtifactDoctorResultV1 {
 pub struct HostBundleComponentDoctorResultV1 {
     pub receipt_path: PathBuf,
     pub host: Option<HostKindV1>,
-    pub component: Option<HostBundleComponentV1>,
+    pub component: Option<HostComponentV1>,
     pub state: HostBundleComponentDoctorStateV1,
     pub registration: Option<HostBundleRegistrationStateV1>,
     pub artifacts: Vec<HostBundleArtifactDoctorResultV1>,
@@ -365,44 +365,50 @@ pub fn inspect_installed_host_bundle_components_at(
             repair_action: component_repair_action,
         });
     }
-    let journal_path = control_root.join(HOST_BUNDLE_JOURNAL_FILE);
-    if journal_path.exists() {
-        let journal = fs::read(&journal_path)
-            .ok()
-            .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_CONTROL_FILE_BYTES)
-            .and_then(|bytes| serde_json::from_slice::<HostBundleJournalV1>(&bytes).ok())
-            .filter(|journal| validate_journal(journal).is_ok());
-        match journal {
-            Some(journal) => {
-                if let Some(component) = components.iter_mut().find(|component| {
-                    component.host == Some(journal.host)
-                        && component.component == Some(journal.component)
-                }) {
-                    component.state = HostBundleComponentDoctorStateV1::Repairable;
-                    component.repair_action = repair_action(
-                        journal.host,
-                        journal.component,
-                        HostBundleComponentDoctorStateV1::Repairable,
-                        HostBundleRegistrationStateV1::Current,
-                    );
-                } else {
-                    components.push(HostBundleComponentDoctorResultV1 {
-                        receipt_path: journal_path.clone(),
-                        host: Some(journal.host),
-                        component: Some(journal.component),
-                        state: HostBundleComponentDoctorStateV1::Repairable,
-                        registration: None,
-                        artifacts: Vec::new(),
-                        repair_action: repair_action(
+    // Single-component journals are host-scoped; the legacy shared name is
+    // still inspected so a journal left by an older binary stays visible.
+    let journal_paths = std::iter::once(HOST_BUNDLE_JOURNAL_FILE.to_string())
+        .chain(stock_host_kinds().into_iter().map(journal_file))
+        .map(|file| control_root.join(file));
+    for journal_path in journal_paths {
+        if journal_path.exists() {
+            let journal = fs::read(&journal_path)
+                .ok()
+                .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_CONTROL_FILE_BYTES)
+                .and_then(|bytes| serde_json::from_slice::<HostBundleJournalV1>(&bytes).ok())
+                .filter(|journal| validate_journal(journal).is_ok());
+            match journal {
+                Some(journal) => {
+                    if let Some(component) = components.iter_mut().find(|component| {
+                        component.host == Some(journal.host)
+                            && component.component == Some(journal.component)
+                    }) {
+                        component.state = HostBundleComponentDoctorStateV1::Repairable;
+                        component.repair_action = repair_action(
                             journal.host,
                             journal.component,
                             HostBundleComponentDoctorStateV1::Repairable,
                             HostBundleRegistrationStateV1::Current,
-                        ),
-                    });
+                        );
+                    } else {
+                        components.push(HostBundleComponentDoctorResultV1 {
+                            receipt_path: journal_path.clone(),
+                            host: Some(journal.host),
+                            component: Some(journal.component),
+                            state: HostBundleComponentDoctorStateV1::Repairable,
+                            registration: None,
+                            artifacts: Vec::new(),
+                            repair_action: repair_action(
+                                journal.host,
+                                journal.component,
+                                HostBundleComponentDoctorStateV1::Repairable,
+                                HostBundleRegistrationStateV1::Current,
+                            ),
+                        });
+                    }
                 }
+                None => components.push(corrupt_component_result(journal_path, None, None)),
             }
-            None => components.push(corrupt_component_result(journal_path, None, None)),
         }
     }
     // Component-set journals are host-scoped; the legacy shared name is still
@@ -500,7 +506,7 @@ pub fn inspect_installed_host_bundle_components_at(
             state_path,
             host.descriptor().cli_id()
         );
-        let component = HostBundleComponentV1::Core;
+        let component = HostComponentV1::Core;
         if let Some(result) = components
             .iter_mut()
             .find(|result| result.host == Some(host) && result.component == Some(component))
@@ -610,7 +616,7 @@ fn artifacts_are_wholly_unmaterialised(artifacts: &[HostBundleArtifactDoctorResu
 pub(super) fn corrupt_component_result(
     receipt_path: PathBuf,
     host: Option<HostKindV1>,
-    component: Option<HostBundleComponentV1>,
+    component: Option<HostComponentV1>,
 ) -> HostBundleComponentDoctorResultV1 {
     let repair_action = match (host, component) {
         (Some(HostKindV1::KimiCode), Some(_)) => format!(
@@ -618,7 +624,7 @@ pub(super) fn corrupt_component_result(
             receipt_path.display()
         ),
         (Some(host), Some(component)) => format!(
-            "remove the corrupt receipt {}, then run `tracedecay install --agent {} --component {} --yes`",
+            "remove the corrupt receipt {}, then run `tracedecay install --agent {} --component {}`",
             receipt_path.display(),
             host.descriptor().cli_id(),
             component_slug(component)
@@ -641,7 +647,7 @@ pub(super) fn corrupt_component_result(
 
 pub(super) fn repair_action(
     host: HostKindV1,
-    component: HostBundleComponentV1,
+    component: HostComponentV1,
     state: HostBundleComponentDoctorStateV1,
     registration: HostBundleRegistrationStateV1,
 ) -> String {
@@ -662,7 +668,7 @@ pub(super) fn repair_action(
             "resolve the foreign or modified files for {host}/{component}, then run `tracedecay reinstall --component {component} --yes`"
         ),
         HostBundleComponentDoctorStateV1::Drifted => format!(
-            "run `tracedecay reinstall --component {component} --yes` (backs up and re-owns)"
+            "run `tracedecay reinstall --component {component}` (backs up and refreshes tracedecay-owned files)"
         ),
         HostBundleComponentDoctorStateV1::OrphanedRegistration => format!(
             "{host} still registers {component} with no owning receipt; run `tracedecay uninstall --agent {host} --component {component} --yes` to finish removing it, or `tracedecay reinstall --component {component} --yes` to re-own it"
@@ -676,7 +682,7 @@ pub(super) fn repair_action(
         HostBundleComponentDoctorStateV1::Repairable
         | HostBundleComponentDoctorStateV1::Missing
         | HostBundleComponentDoctorStateV1::Corrupt => {
-            format!("run `tracedecay reinstall --component {component} --yes`")
+            format!("run `tracedecay reinstall --component {component}`")
         }
     }
 }

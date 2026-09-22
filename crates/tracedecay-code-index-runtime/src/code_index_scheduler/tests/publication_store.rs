@@ -11,10 +11,12 @@ use std::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay_code_index_retention::code_index_generations::{
-    CodeGenerationRetentionErrorV1, CodeGenerationRetentionModeV1, DurablePublicationPointerV1,
-    MAX_CODE_GENERATION_RETENTION_BATCH_V1, acquire_code_generation_store_lock,
-    durable_generation_index_digest, execute_code_generation_retention_cancellable,
+    CodeGenerationRetentionErrorV1, CodeGenerationRetentionModeV1, DurableGenerationIndexEntryV1,
+    DurablePublicationPointerV1, MAX_CODE_GENERATION_RETENTION_BATCH_V1,
+    acquire_code_generation_store_lock, durable_generation_index_digest,
+    execute_code_generation_retention_cancellable,
     prepare_next_code_generation_retention_cancellable, run_code_generation_retention,
+    try_acquire_code_generation_store_read_lock,
 };
 use tracedecay_domain::{
     CodeGenerationId, ManifestDigest, SanitizerRevision, UtcMicros, encode_lowercase_hex,
@@ -30,13 +32,38 @@ use super::{
 };
 use crate::{
     code_index::production::{
-        CodeIndexAtomicPublicationPort, CodeIndexInterruptionV1, CodeIndexProductionErrorV1,
-        CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
-        SEALED_GENERATION_FORMAT_REVISION_V1, SealedGenerationSegmentReadV1,
-        UninterruptibleCodeIndexControlV1, VerifiedSealedLexicalPageReadV1,
+        CodeIndexAtomicPublicationPort, CodeIndexExecutionControlV1, CodeIndexInterruptionV1,
+        CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1,
+        CodeIndexPublishedGenerationV1, SEALED_GENERATION_FORMAT_REVISION_V1,
+        SealedGenerationSegmentReadV1, UninterruptibleCodeIndexControlV1,
+        VerifiedSealedLexicalPageReadV1,
     },
     code_index_scheduler::{CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1},
 };
+
+struct CancelledCodeIndexControlV1;
+
+impl CodeIndexExecutionControlV1 for CancelledCodeIndexControlV1 {
+    fn is_cancelled(&self) -> bool {
+        true
+    }
+
+    fn is_deadline_exceeded(&self) -> bool {
+        false
+    }
+}
+
+struct ExpiredCodeIndexControlV1;
+
+impl CodeIndexExecutionControlV1 for ExpiredCodeIndexControlV1 {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
+    fn is_deadline_exceeded(&self) -> bool {
+        true
+    }
+}
 
 #[test]
 fn partitioned_reclamation_is_bounded_and_preserves_retained_segments() {
@@ -442,29 +469,45 @@ fn lazy_lexical_source_cancels_when_retention_retires_its_unread_segments() {
         .expect("open lazy source without retaining every file");
     let initial_cursor = source.cursor().clone();
     let lock = acquire_code_generation_store_lock(store.path()).expect("hold publication lock");
+    assert!(matches!(
+        source.next_page(&CancelledCodeIndexControlV1),
+        Err(CodeIndexProductionErrorV1::Interrupted(
+            CodeIndexInterruptionV1::Cancelled
+        ))
+    ));
+    assert_eq!(source.cursor(), &initial_cursor);
+    assert!(matches!(
+        source.next_page(&ExpiredCodeIndexControlV1),
+        Err(CodeIndexProductionErrorV1::Interrupted(
+            CodeIndexInterruptionV1::DeadlineExceeded
+        ))
+    ));
+    assert_eq!(source.cursor(), &initial_cursor);
     let (sent, received) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
         let result = source.next_page(&UninterruptibleCodeIndexControlV1);
         sent.send((source, result)).expect("return lexical source");
     });
-    let response = received.recv_timeout(Duration::from_secs(2));
+    // An immutable segment read holds the store as a shared reader: while a
+    // publication or retention writer owns the exclusive lock the reader
+    // waits (bounded by that hold) instead of failing typed and abandoning
+    // the projection pass; once the writer releases, the same page is served
+    // from the unchanged cursor.
+    let held = received.recv_timeout(Duration::from_millis(500));
+    assert!(
+        matches!(held, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+        "an exclusive publication hold must park the lexical reader, not fail it"
+    );
     drop(lock);
     reader.join().expect("lexical reader exits");
-    let (mut source, result) =
-        response.expect("busy publication must not block the lexical reader");
+    let (mut source, result) = received
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the lexical reader resumes once the publication hold is released");
     assert!(matches!(
-        result,
-        Err(CodeIndexProductionErrorV1::Publication(
-            CodeIndexPublicationStoreErrorV1::Unavailable(_)
-        ))
-    ));
-    assert_eq!(source.cursor(), &initial_cursor);
-    assert!(matches!(
-        source
-            .next_page(&UninterruptibleCodeIndexControlV1)
-            .expect("retry after publication unlock"),
+        result.expect("read after publication unlock"),
         VerifiedSealedLexicalPageReadV1::Page(_)
     ));
+    assert_ne!(source.cursor(), &initial_cursor);
     source
         .rewind()
         .expect("rewind before retiring unread source");
@@ -516,6 +559,68 @@ fn lazy_lexical_source_cancels_when_retention_retires_its_unread_segments() {
         "corrupt authority is terminal, never transient store contention"
     );
     assert_eq!(corrupt_source.cursor(), &cursor);
+}
+
+#[test]
+fn generation_decode_shares_store_and_refuses_exclusive_writer_contention() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn ready() -> usize { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish generation"));
+    drop(scheduler);
+
+    let open_cold = |root: &Path, project: &Path| {
+        super::super::DaemonCodeIndexPublicationStoreV1::new(
+            root,
+            project,
+            SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+                .expect("sanitizer revision"),
+        )
+        .expect("open cold publication store")
+    };
+
+    // `new` takes the exclusive store lock while it records the scope root, so
+    // the store must be open before either probe hold or this test deadlocks.
+    let publication = open_cold(store.path(), fixture.path());
+    let shared = try_acquire_code_generation_store_read_lock(store.path())
+        .expect("shared hold")
+        .expect("shared hold not contended");
+    let (sent, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        sent.send(publication.load_active_shared())
+            .expect("return shared decode");
+    });
+    let decoded = received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a shared generation decode must finish while another shared hold is still taken");
+    assert!(
+        decoded.expect("shared decode").is_some(),
+        "published generation must decode under a shared store hold"
+    );
+    drop(shared);
+    reader.join().expect("shared reader exits");
+
+    let publication = open_cold(store.path(), fixture.path());
+    let exclusive = acquire_code_generation_store_lock(store.path()).expect("exclusive hold");
+    assert!(
+        matches!(
+            publication.load_active_shared(),
+            Err(CodeIndexPublicationStoreErrorV1::Unavailable(message))
+                if message.contains("contended")
+        ),
+        "an unscoped generation decode must fail retryably instead of blocking indefinitely"
+    );
+    drop(exclusive);
+    assert!(
+        publication
+            .load_active_shared()
+            .expect("decode after unlock")
+            .is_some()
+    );
 }
 
 #[test]
@@ -778,6 +883,86 @@ fn retired_fence_cancels_a_generation_seal_between_segments() {
     assert_eq!(
         leftover, 0,
         "a cancelled seal must leave no manifest behind"
+    );
+}
+
+#[test]
+fn publishing_many_new_segments_syncs_the_segments_directory_once() {
+    // Eight distinct files seal to eight distinct new segment files. POSIX
+    // durability only requires the containing directory to be fsynced once
+    // after all of those segments are renamed into place, so a healthy
+    // publish must not pay for one directory fsync per segment.
+    let sources = (0..8)
+        .map(|file| {
+            (
+                format!("src/module_{file}.rs"),
+                format!("pub fn sealed_{file}() -> u32 {{ {file} }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(
+        &sources
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let source_store = TempDir::new().expect("source store root");
+    let generation = {
+        let mut scheduler = scheduler(
+            &fixture,
+            source_store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(
+            scheduler
+                .reconcile_now()
+                .expect("build multi-file generation"),
+        );
+        Arc::clone(
+            &scheduler
+                .latest_complete_already_decoded()
+                .expect("multi-file generation remains decoded")
+                .generation,
+        )
+    };
+    assert!(
+        generation.snapshot().files.len() >= 8,
+        "fixture must seal one segment per file"
+    );
+
+    let target_store = TempDir::new().expect("target publication store root");
+    let published_segments = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let segment_observer = Arc::clone(&published_segments);
+    let directory_syncs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sync_observer = Arc::clone(&directory_syncs);
+    let mut publication = super::super::DaemonCodeIndexPublicationStoreV1::new(
+        target_store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("open target publication store")
+    .with_seal_segment_observer_for_test(Arc::new(move || {
+        segment_observer.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }))
+    .with_segments_dir_sync_observer_for_test(Arc::new(move || {
+        sync_observer.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }));
+
+    publication
+        .publish_atomically(&generation.sealed_scope(), None, Arc::clone(&generation))
+        .expect("publish a fresh multi-segment generation");
+
+    let segment_count = published_segments.load(std::sync::atomic::Ordering::Acquire);
+    assert!(
+        segment_count >= 8,
+        "expected at least 8 newly durable segments, saw {segment_count}"
+    );
+    assert_eq!(
+        directory_syncs.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "one publish writing {segment_count} new segments must sync the segments \
+         directory exactly once, not once per segment"
     );
 }
 
@@ -2369,4 +2554,97 @@ fn publication_over_an_undecodable_active_generation_refuses_a_moved_pointer() {
     admitting
         .publish_atomically(&scope, None, seeded)
         .expect("the observed identity still admits the rebuild");
+}
+
+fn same_length_publication_pointer(
+    generation_id: &str,
+    digest_byte: u8,
+) -> DurablePublicationPointerV1 {
+    let digest = format!("sha256:{}", hex_byte(digest_byte));
+    let entry = DurableGenerationIndexEntryV1 {
+        generation_id: generation_id.to_owned(),
+        snapshot_content_identity: digest.clone(),
+        sealed_at_micros: 1,
+        size_bytes: 1,
+        segment_bytes: 0,
+        generation_file: format!("generation-{}.json", hex_byte(digest_byte)),
+        state_digest: digest.clone(),
+        source_reference: None,
+        source_revision: None,
+        source_tree: None,
+        cardinality: None,
+        text_artifact: None,
+    };
+    let generation_index = vec![entry];
+    DurablePublicationPointerV1 {
+        generation_id: generation_id.to_owned(),
+        snapshot_content_identity: digest.clone(),
+        publication_digest: digest.clone(),
+        sealed_at_micros: 1,
+        generation_file: generation_index[0].generation_file.clone(),
+        state_digest: digest,
+        generation_index_truncated: false,
+        generation_index_digest: Some(
+            durable_generation_index_digest(&generation_index, false).expect("index digest"),
+        ),
+        generation_index,
+    }
+}
+
+fn hex_byte(byte: u8) -> String {
+    format!("{byte:02x}{}", "ab".repeat(31))
+}
+
+#[test]
+fn publication_pointer_memo_follows_bytes_when_size_and_mtime_stay_put() {
+    let store = TempDir::new().expect("store root");
+    let project = TempDir::new().expect("project root");
+    let publication = super::super::DaemonCodeIndexPublicationStoreV1::new(
+        store.path(),
+        project.path(),
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("open publication store");
+    let pointer_path = store.path().join("active-code-generation-v1.json");
+    let first = same_length_publication_pointer("generation.memo-aaaa", 0x11);
+    let second = same_length_publication_pointer("generation.memo-bbbb", 0x22);
+    let first_bytes = serde_json::to_vec(&first).expect("encode first pointer");
+    let second_bytes = serde_json::to_vec(&second).expect("encode second pointer");
+    assert_eq!(
+        first_bytes.len(),
+        second_bytes.len(),
+        "the replacement must not be distinguishable by size"
+    );
+    assert_ne!(first_bytes, second_bytes);
+    std::fs::write(&pointer_path, &first_bytes).expect("write first pointer");
+    let loaded = publication
+        .read_publication_pointer()
+        .expect("read first pointer")
+        .expect("first pointer exists");
+    assert_eq!(loaded.generation_id, first.generation_id);
+
+    let mtime = std::fs::metadata(&pointer_path)
+        .expect("pointer metadata")
+        .modified()
+        .expect("pointer mtime");
+    std::fs::write(&pointer_path, &second_bytes).expect("replace pointer bytes");
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&pointer_path)
+        .expect("reopen pointer");
+    file.set_modified(mtime).expect("restore pointer mtime");
+    drop(file);
+    let replaced = std::fs::metadata(&pointer_path).expect("replaced metadata");
+    assert_eq!(replaced.len(), first_bytes.len() as u64);
+    assert_eq!(replaced.modified().ok(), Some(mtime));
+
+    let reread = publication
+        .read_publication_pointer()
+        .expect("reread pointer by content")
+        .expect("replaced pointer exists");
+    assert_eq!(
+        reread.generation_id, second.generation_id,
+        "equal size and mtime must not reuse the previous pointer"
+    );
 }

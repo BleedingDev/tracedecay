@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use thiserror::Error;
 use tracedecay_code_index::production::CodeIndexExecutionControlV1;
@@ -21,7 +20,10 @@ use tracedecay_domain::{
     ScoreDomainCalibrationV1, ScoreDomainId, SingleRootScopeV1, TemporalModeV1, VectorWatermark,
 };
 
-use super::{CodeIndexSchedulerRegistryV1, serving::CodeTextQueryOwnerReadinessV1};
+use super::{
+    CodeIndexReconcileAdmissionV1, CodeIndexSchedulerRegistryV1,
+    serving::CodeTextQueryOwnerReadinessV1,
+};
 use tracedecay_query::retrieval::exact::{
     CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneEvidence, ExactLaneRequest,
 };
@@ -84,9 +86,14 @@ pub enum DeferredMountAttemptV1 {
 /// outcome or the publication channel closes (daemon shutdown).
 ///
 /// The open-time mount runs before code-index activation, so the first ready
-/// check usually misses. A later `Published` event wakes the waiter on a
-/// fresh build; a restart that restores the same sealed generation records
-/// `Noop` and never repeats that event, so the serving slot is polled too.
+/// check usually misses. Wake sources are event-driven only:
+/// - a matching `Published` broadcast on a fresh build;
+/// - registry-wide root-mounted watches so a pre-activation subscribe can
+///   re-attach the per-worktree serving-generation watch after mount;
+/// - serving-slot / serving-generation watches for a restart `Noop` restore
+///   that never rebroadcasts (partitioned recovery may leave the decoded seat
+///   empty and only flip the generation watch);
+/// - on `Lagged`, retry immediately. Never a standing 1 Hz ready poll.
 pub async fn retry_deferred_query_authority_until_serving<F, Fut>(
     registry: &CodeIndexSchedulerRegistryV1,
     project_root: PathBuf,
@@ -96,9 +103,22 @@ pub async fn retry_deferred_query_authority_until_serving<F, Fut>(
     Fut: std::future::Future<Output = DeferredMountAttemptV1>,
 {
     let mut publications = registry.subscribe_generation_publications();
-    let mut ready_poll = tokio::time::interval(Duration::from_secs(1));
-    ready_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut serving_seats = registry.subscribe_serving_seats();
+    let mut root_mounted = registry.subscribe_root_mounted();
+    let mut serving_changes = None;
     loop {
+        // Subscribe before probing so a seat that lands between subscribe and
+        // the ready check remains observable. Demand a complete generation once
+        // the watch exists so a late subscribe after a silent Noop still gets a
+        // follow-up wake (same contract as the deferred advisory owner).
+        if serving_changes.is_none() {
+            serving_changes = registry
+                .subscribe_serving_generation_changes(&project_root)
+                .await;
+            if serving_changes.is_some() {
+                let _ = registry.request_complete_generation(&project_root).await;
+            }
+        }
         if registry
             .retained_text_owner_for_root(&project_root)
             .await
@@ -108,14 +128,36 @@ pub async fn retry_deferred_query_authority_until_serving<F, Fut>(
             return;
         }
         tokio::select! {
-            _ = ready_poll.tick() => {}
             publication = publications.recv() => match publication {
-                Ok(publication) if publication.project_root == project_root => {}
+                // Any publication wakes the next attempt at the top of the
+                // loop; a foreign project's publication costs one attempt,
+                // which is what the previous per-root filter also paid.
                 Ok(_) => {}
                 // A lagged receiver dropped publications; one of them may have
-                // been this project's, so attempt the mount anyway.
+                // been this project's. Retry immediately; do not install a
+                // standing timer.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            serving = async {
+                match serving_changes.as_mut() {
+                    Some(changes) => changes.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if serving.is_err() {
+                    return;
+                }
+            }
+            seat = serving_seats.changed() => {
+                if seat.is_err() {
+                    return;
+                }
+            }
+            mounted = root_mounted.changed() => {
+                if mounted.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -542,7 +584,17 @@ impl CodeIndexSchedulerRegistryV1 {
                         // admission (debounced on the pending wake), never inline and
                         // never parking, then still fail typed rather than degrade
                         // into an empty answer.
-                        self.request_query_background_reconcile(scope).await;
+                        match self.request_query_background_reconcile(scope).await {
+                            CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(_) => {
+                                return Err(
+                                    QuerySearchExecutionErrorV1::ExactGenerationUnavailable(
+                                        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired,
+                                    ),
+                                );
+                            }
+                            CodeIndexReconcileAdmissionV1::Accepted
+                            | CodeIndexReconcileAdmissionV1::Unavailable => {}
+                        }
                         let unverified = self.generation_is_unverified_for_scope(scope).await;
                         return Err(if unverified {
                             QuerySearchExecutionErrorV1::GenerationUnverified
@@ -666,7 +718,15 @@ where
         if !matches!(&readiness, CodeTextQueryOwnerReadinessV1::Ready(_))
             || text.text_projection_needs_work()
         {
-            schedulers.request_query_background_reconcile(scope).await;
+            match schedulers.request_query_background_reconcile(scope).await {
+                CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(_) => {
+                    return Err(QuerySearchExecutionErrorV1::ExactGenerationUnavailable(
+                        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired,
+                    ));
+                }
+                CodeIndexReconcileAdmissionV1::Accepted
+                | CodeIndexReconcileAdmissionV1::Unavailable => {}
+            }
         }
         let CodeTextQueryOwnerReadinessV1::Ready(owners) = readiness else {
             return Err(QuerySearchExecutionErrorV1::GenerationUnverified);
@@ -694,11 +754,11 @@ where
                     base: request.clone(),
                     query_view,
                     generation: generation.clone(),
-                    whole_terms: route.parts.whole_terms.clone(),
-                    subtokens: route.parts.subtokens.clone(),
-                    phrases: route.parts.phrases.clone(),
-                    proximities: route.proximities.clone(),
-                    field_filters: route.field_filters.clone(),
+                    whole_terms: std::borrow::Cow::Borrowed(route.parts.whole_terms.as_slice()),
+                    subtokens: std::borrow::Cow::Borrowed(route.parts.subtokens.as_slice()),
+                    phrases: std::borrow::Cow::Borrowed(route.parts.phrases.as_slice()),
+                    proximities: std::borrow::Cow::Borrowed(route.proximities.as_slice()),
+                    field_filters: std::borrow::Cow::Borrowed(route.field_filters.as_slice()),
                     fuzzy_budget: input.fuzzy_budget,
                     lexical_profile_revision: input.lexical_profile_revision.clone(),
                     score_domain: input.lexical_score_domain.clone(),

@@ -174,6 +174,12 @@ impl HostAdmissionOutcome {
         }
     }
 
+    /// The demand does not apply. Ack the replay record and do not retry it.
+    #[hotpath::skip]
+    pub const fn not_applicable(reason_code: &'static str) -> Self {
+        Self::new(HostAdmissionStatus::NotApplicable, false, Some(reason_code))
+    }
+
     #[hotpath::skip]
     pub const fn spool_overflow() -> Self {
         Self::new(
@@ -222,6 +228,17 @@ impl HostAdmissionOutcome {
             false,
             Some("spool_corrupted"),
         )
+    }
+
+    /// Terminal, non-retryable unavailability that requires an explicit reset
+    /// or remount before the route can accept work again.
+    ///
+    /// Distinct from [`Self::degraded`]: hosts must not treat this as soft
+    /// capacity pressure, and distinct from [`Self::retained_unavailable`]
+    /// which stays retryable.
+    #[hotpath::skip]
+    pub const fn terminal_unavailable(reason_code: &'static str) -> Self {
+        Self::new(HostAdmissionStatus::Unavailable, false, Some(reason_code))
     }
 
     #[hotpath::skip]

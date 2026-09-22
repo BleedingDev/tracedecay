@@ -30,15 +30,15 @@ pub use artifact::{
     CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
     CLONE_REDUNDANCY_CURSOR_PREFIX_V2, CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_MAXIMUM_PAGE_RETAINED_BYTES_V1,
-    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneArtifactCursorPositionV2,
-    CloneArtifactCursorV1, CloneArtifactCursorV2, CloneArtifactPageV1, CloneCursorCodecV1,
-    CloneCursorErrorV1, CloneCursorReadErrorV1, CloneExactArtifactMemberV1,
-    CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1,
-    CloneFamilyCursorPositionV2, CloneFamilyCursorV2, CloneFingerprintArtifactReadV1,
-    CloneFingerprintCancellationPointV1, CloneFingerprintDiscoveryPositionV2,
-    CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
-    CloneFingerprintStreamDescriptorV1, CloneNearMatchArtifactV1, CloneNearMatchExtentV1,
-    CloneRedundancyCursorPositionV2, CloneRedundancyCursorV2,
+    CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1,
+    CloneArtifactCursorPositionV2, CloneArtifactCursorV1, CloneArtifactCursorV2,
+    CloneArtifactPageV1, CloneCursorCodecV1, CloneCursorErrorV1, CloneCursorReadErrorV1,
+    CloneExactArtifactMemberV1, CloneExactFamilyArtifactCandidateV1,
+    CloneExactFamilyArtifactPageV1, CloneFamilyCursorPositionV2, CloneFamilyCursorV2,
+    CloneFingerprintArtifactReadV1, CloneFingerprintCancellationPointV1,
+    CloneFingerprintDiscoveryPositionV2, CloneFingerprintPartialReasonV1,
+    CloneFingerprintReadAccountingV1, CloneFingerprintStreamDescriptorV1, CloneNearMatchArtifactV1,
+    CloneNearMatchExtentV1, CloneRedundancyCursorPositionV2, CloneRedundancyCursorV2,
     CloneSelectedBlockArtifactCandidateV1, CloneSelectedBlockArtifactReadV1,
     CloneSelectedBlockContainmentClassV1, CloneSelectedBlockV1, CloneSuccessorReuseAccountingV1,
     CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBatchLimitV1,
@@ -107,6 +107,45 @@ impl CodeLexicalProjectionMetadataV1 {
             .validate()
             .map_err(contract_error)?;
         self.exact_score_domain.validate().map_err(contract_error)
+    }
+
+    /// Owned bytes one projection metadata structure retains: logical paths at
+    /// capacity with per-entry b-tree node overhead, and every scalar identity
+    /// string charged as its `String` header plus payload length.
+    #[must_use]
+    pub fn retained_owned_bytes(&self) -> usize {
+        const BTREE_MAP_ENTRY_OVERHEAD_BYTES: usize = 16;
+        let path_bytes = self.logical_paths.iter().fold(
+            self.logical_paths.len().saturating_mul(
+                std::mem::size_of::<(FileOccurrenceId, String)>()
+                    .saturating_add(BTREE_MAP_ENTRY_OVERHEAD_BYTES),
+            ),
+            |bytes, (file, path)| {
+                bytes
+                    .saturating_add(file.as_str().len())
+                    .saturating_add(path.capacity())
+            },
+        );
+        let scalar_identities = [
+            Some(self.generation.as_str()),
+            self.repository_id
+                .as_ref()
+                .map(|repository| repository.as_str()),
+            Some(self.freshness.source_namespace.as_str()),
+            Some(self.freshness.source_instance.as_str()),
+            Some(self.freshness.policy_revision.as_str()),
+            Some(self.exact_retriever_revision.as_str()),
+            Some(self.lexical_retriever_revision.as_str()),
+            Some(self.exact_score_domain.as_str()),
+        ];
+        scalar_identities
+            .into_iter()
+            .flatten()
+            .fold(path_bytes, |bytes, identity| {
+                bytes
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(identity.len())
+            })
     }
 }
 

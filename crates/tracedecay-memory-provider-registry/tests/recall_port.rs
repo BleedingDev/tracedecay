@@ -24,8 +24,8 @@ use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeResponse,
-    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy, ProviderCall,
-    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
+    MemoryProvider, OwnedExactScope, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy,
+    ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
 use tracedecay_memory_provider_registry::{
@@ -2314,6 +2314,8 @@ struct ProfileRecordingFixture {
     payload_capabilities: Mutex<Vec<BTreeSet<OwnedVersionedId>>>,
 }
 
+const PROFILE_RECORDING_PROVIDER_ID: &str = "test.profile-recording-provider";
+
 impl NativeMemoryApplicationPort for ProfileRecordingFixture {
     fn descriptor(&self) -> ProviderDescriptor {
         self.inner.descriptor()
@@ -2388,8 +2390,26 @@ impl NativeMemoryApplicationPort for ProfileRecordingFixture {
     }
 }
 
-/// Both paths use the exact same provider identity and capability declaration.
-/// Only the actual host registration path decides the common-profile policy.
+impl MemoryProvider for ProfileRecordingFixture {
+    fn descriptor(&self) -> ProviderDescriptor {
+        NativeMemoryApplicationPort::descriptor(self)
+    }
+
+    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+        NativeMemoryApplicationPort::handshake(self, request)
+    }
+
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        match call.operation {
+            ProviderOperation::Recall => NativeMemoryApplicationPort::recall(self, call),
+            _ => unexpected(),
+        }
+    }
+}
+
+/// Both paths use the same implementation and capability declaration. The
+/// generic provider takes the common-profile registration path, while the
+/// Native-shaped port retains the strict Native adapter and legacy profile.
 fn compose_profile_fixture(
     mut fixture: RecallFixturePort,
     common_profile: bool,
@@ -2397,7 +2417,6 @@ fn compose_profile_fixture(
     Arc<ProjectMemoryProviderComposition>,
     Arc<ProfileRecordingFixture>,
 ) {
-    use tracedecay_memory_provider_native::NativeProvider;
     use tracedecay_memory_provider_registry::{
         COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES,
         ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1, ProviderRegistrationV1,
@@ -2410,6 +2429,11 @@ fn compose_profile_fixture(
             .descriptor
             .capabilities
             .insert(OwnedVersionedId::new(capability).unwrap());
+    }
+    if common_profile {
+        fixture.descriptor.provider_id =
+            OwnedProviderId::new(PROFILE_RECORDING_PROVIDER_ID).unwrap();
+        fixture.descriptor.validate().unwrap();
     }
     let fixture = Arc::new(ProfileRecordingFixture {
         inner: fixture,
@@ -2425,8 +2449,8 @@ fn compose_profile_fixture(
                         max_in_flight: 2,
                     },
                     registration: ProviderRegistrationV1 {
-                        provider: Arc::new(NativeProvider::new(fixture.clone()).unwrap()),
-                        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap(),
+                        provider: fixture.clone(),
+                        provider_id: OwnedProviderId::new(PROFILE_RECORDING_PROVIDER_ID).unwrap(),
                         registration_revision: 31,
                         mode: EnabledProviderMode::Active,
                         execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
@@ -2530,9 +2554,11 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
             "zz-granted".to_owned(),
             observation_candidate_fields(&source, &exact),
         );
-        let port = mount(
+        let port = mount_routed(
             compose_profile_fixture(fixture, true).0,
             Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
         )
         .unwrap()
         .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
@@ -2617,7 +2643,7 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
 }
 
 #[tokio::test]
-async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or_grant_presence() {
+async fn registration_profile_controls_capability_projection_and_grant_admission() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
     let source = canonical_observation_source(&exact);
@@ -2632,7 +2658,13 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
         observation_candidate_fields(&source, &exact),
     );
     let (common_composition, common_recording) = compose_profile_fixture(common, true);
-    let port = mount(common_composition, Arc::new(LedgerObserver::default())).unwrap();
+    let port = mount_routed(
+        common_composition,
+        Arc::new(LedgerObserver::default()),
+        budgets(),
+        routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
+    )
+    .unwrap();
     let outcome = port
         .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
@@ -2643,14 +2675,37 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
         RecallDenialReason::InvalidSourceAttribution { .. }
     ));
     // The legacy registration keeps fact extension bindings even with the
-    // same common capabilities and a real-shaped host history grant present.
+    // same declared capabilities and a real-shaped host history grant present.
     let mut legacy = RecallFixturePort::new();
     legacy.candidate_contents = Some(vec![(
         "legacy-fact".to_owned(),
         "retained canonical fact extension".to_owned(),
     )]);
     let (legacy_composition, legacy_recording) = compose_profile_fixture(legacy, false);
-    assert_eq!(common_recording.descriptor(), legacy_recording.descriptor());
+    let common_descriptor = MemoryProvider::descriptor(common_recording.as_ref());
+    let legacy_descriptor = MemoryProvider::descriptor(legacy_recording.as_ref());
+    assert_eq!(
+        common_descriptor.provider_id.as_str(),
+        PROFILE_RECORDING_PROVIDER_ID
+    );
+    assert_eq!(legacy_descriptor.provider_id.as_str(), NATIVE_PROVIDER_ID);
+    assert_eq!(
+        common_descriptor.capabilities,
+        legacy_descriptor.capabilities
+    );
+    assert_eq!(
+        common_descriptor.implementation_identity_sha256,
+        legacy_descriptor.implementation_identity_sha256
+    );
+    assert_eq!(
+        common_descriptor.state_schema_version,
+        legacy_descriptor.state_schema_version
+    );
+    assert_eq!(
+        common_descriptor.state_generation,
+        legacy_descriptor.state_generation
+    );
+    assert_eq!(common_descriptor.limits, legacy_descriptor.limits);
     let port = mount(legacy_composition, Arc::new(LedgerObserver::default())).unwrap();
     let outcome = port
         .recall_admitted_with_history(
@@ -2702,7 +2757,7 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
             (ProviderOperation::Handshake, legacy_capabilities.clone()),
             (ProviderOperation::Recall, legacy_capabilities.clone()),
         ],
-        "a legacy registration with the same descriptor and a grant remains recall-only"
+        "an otherwise equivalent legacy registration with a grant remains recall-only"
     );
     assert_eq!(
         *legacy_recording.payload_capabilities.lock().unwrap(),

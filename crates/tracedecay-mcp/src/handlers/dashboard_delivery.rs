@@ -5,13 +5,15 @@ use std::time::{Duration, Instant};
 
 use tracedecay_application::advisory::GitHubReleaseReadControlV1;
 use tracedecay_application::delivery::{
-    ProjectDeliveryReadOutcomeV1, ProjectDeliveryReadRequestV1,
+    ProjectDeliveryProximityAttentionSourceV1, ProjectDeliveryReadOutcomeV1,
+    ProjectDeliveryReadRequestV1, project_delivery_proximity_attention_source_from_read_v1,
 };
 use tracedecay_application::git_query::GitQueryBounds;
 use tracedecay_application::git_reads::{GitReadAuthorityV1, GitReadOutcomeV1, GitReadResultV1};
 use tracedecay_contracts::feedback::{
     CI_FAILURE_LOCALIZE_CAPABILITY_ID_V1, CI_FAILURE_LOCALIZE_USE_CASE_ID_V1,
-    GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1, GITHUB_REVIEW_INGEST_USE_CASE_ID_V1,
+    FeedbackProximityReadRequestV1, GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1,
+    GITHUB_REVIEW_INGEST_USE_CASE_ID_V1,
 };
 use tracedecay_contracts::git::GitReadRequestV1;
 use tracedecay_contracts::{
@@ -22,10 +24,12 @@ use tracedecay_domain::{CommitId, canonical_sha256};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
-use tracedecay_daemon_service::DaemonInvocationService;
+use tracedecay_daemon_service::{
+    DaemonFeedbackProximityInvocationRequest, DaemonInvocationService,
+};
 use tracedecay_dashboard_api::{
     DashboardDeliveryProjectV1, DashboardDeliveryReadFutureV1, DashboardDeliveryReadPortV1,
-    DashboardHttpRequestControlV1,
+    DashboardHttpRequestControlV1, DashboardProximityAttentionReadFutureV1,
 };
 
 pub struct DashboardDeliveryReadAdapter {
@@ -182,6 +186,72 @@ fn attached_head_commit(
     CommitId::new(commit.as_str().to_owned()).ok()
 }
 
+impl DashboardDeliveryReadAdapter {
+    /// Folds the registered project's canonical feedback-proximity read into
+    /// Delivery's join input. Same invocation service as provider reads.
+    /// This is the production authority for `overlapping_edit` /
+    /// `confirmed_conflict` / `divergent_shared_implementation` — the
+    /// dashboard never re-joins `/api/feedback/proximity` client-side.
+    #[hotpath::measure(label = "mcp.dashboard.delivery.proximity.total")]
+    async fn read_proximity(
+        &self,
+        control: DashboardHttpRequestControlV1,
+        project: DashboardDeliveryProjectV1,
+    ) -> ProjectDeliveryProximityAttentionSourceV1 {
+        if control.deadline().is_elapsed_at(control.observed_at())
+            || control.cancellation().is_cancelled()
+        {
+            return ProjectDeliveryProximityAttentionSourceV1::Unavailable;
+        }
+        let Some(owner) = self
+            .service
+            .advisory_cycle_owner(Some(&project.project_root))
+            .await
+        else {
+            // No advisory/proximity owner registered for this project —
+            // leave proximity sources Unsupported rather than Clear.
+            return ProjectDeliveryProximityAttentionSourceV1::Unsupported;
+        };
+        if project.project_id != owner.project_id().as_str() {
+            return ProjectDeliveryProximityAttentionSourceV1::Unavailable;
+        }
+        let cancellation = control.cancellation().cancelled();
+        let invoke = owner.invoke_proximity(DaemonFeedbackProximityInvocationRequest {
+            request_id: control.request_id(),
+            request: FeedbackProximityReadRequestV1 {
+                observed_at: control.observed_at(),
+            },
+            deadline: control.deadline(),
+            cancellation: control.cancellation().context(),
+        });
+        let outcome = tokio::select! {
+            biased;
+            () = cancellation => return ProjectDeliveryProximityAttentionSourceV1::Unavailable,
+            outcome = hotpath::future!(
+                invoke,
+                label = "mcp.dashboard.delivery.proximity.read"
+            ) => outcome,
+        };
+        match outcome {
+            Ok(result) if result.project_id().as_str() == project.project_id => {
+                match result.feedback_proximity_read_result() {
+                    Ok(read) => project_delivery_proximity_attention_source_from_read_v1(&read),
+                    Err(error) => {
+                        tracing::error!(
+                            event = "dashboard_delivery_proximity_payload_invalid",
+                            project_id = %project.project_id,
+                            error = %error,
+                            "canonical proximity evidence could not be decoded"
+                        );
+                        ProjectDeliveryProximityAttentionSourceV1::Unavailable
+                    }
+                }
+            }
+            Ok(_) | Err(_) => ProjectDeliveryProximityAttentionSourceV1::Unavailable,
+        }
+    }
+}
+
 impl DashboardDeliveryReadPortV1 for DashboardDeliveryReadAdapter {
     fn read(
         &self,
@@ -190,6 +260,14 @@ impl DashboardDeliveryReadPortV1 for DashboardDeliveryReadAdapter {
         request: ProjectDeliveryReadRequestV1,
     ) -> DashboardDeliveryReadFutureV1<'_> {
         Box::pin(async move { self.execute(control, project, request).await })
+    }
+
+    fn read_proximity_attention(
+        &self,
+        control: DashboardHttpRequestControlV1,
+        project: DashboardDeliveryProjectV1,
+    ) -> DashboardProximityAttentionReadFutureV1<'_> {
+        Box::pin(async move { self.read_proximity(control, project).await })
     }
 }
 

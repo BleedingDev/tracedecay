@@ -1,22 +1,24 @@
 //! Schema creation for the tracedecay database.
 //!
-//! This binary creates every new store at one final schema shape. `PRAGMA
-//! user_version` records that shape as an atomic integer built into `SQLite`;
-//! the only older stores with an in-place path are the exact released v34 and
-//! v35 project inventories handled by `released_shape`.
+//! Fresh stores use the current relational shape. Known released v34/v35
+//! stores converge in place, retaining their durable rows and exact historical
+//! staging objects; unknown shapes remain typed refusals.
 
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::db::connection::DatabaseEngineWriteConnection;
-use crate::db::engine::{Connection, Executor, QueryExecutor};
+use crate::db::engine::{Connection, Executor, QueryExecutor, params};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_rusqlite_runtime::runtime_ledger;
 
 mod final_shape;
 mod released_shape;
 
-pub use final_shape::{expected_final_schema_fingerprint, fingerprint_schema_objects};
+pub use final_shape::{
+    expected_final_schema_fingerprint, fingerprint_schema_objects,
+    render_expected_final_schema_markdown,
+};
 
 const ROOT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
         key TEXT PRIMARY KEY,
@@ -40,33 +42,33 @@ const ROOT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS metadata (
     CREATE INDEX IF NOT EXISTS idx_read_cache_session
         ON read_cache(session_id, created_at);";
 
-/// The one schema shape this binary creates and accepts after any explicit
-/// released v34/v35 bridge. It is an identity stamp, not a general ladder
-/// rung: every other version is refused.
+/// The schema stamp this binary creates after released-store convergence.
 ///
 /// Code topology lives only in the verified Grafeo generation. Exact memory
 /// content, provenance, trust, retention, and feedback live only in the
 /// canonical `memory_v2_*` tables; holographic memory vectors are re-derived
 /// from that content and never persisted. v36 dropped the semantic-vector
-/// staging family (`semantic_vector_*`) with dense code retrieval. A store
-/// containing a retired projection fails closed before interpretation.
+/// staging family (`semantic_vector_*`) from fresh stores with dense code
+/// retrieval. Existing exact released staging objects remain preserved.
 pub const SCHEMA_VERSION: u32 = 36;
 
-/// Verifies that a rusqlite connection sees the exact final relational shape
-/// this binary admits. This is query-only and shares the daemon's schema
-/// authority.
+/// Verifies that a rusqlite connection sees the final relational shape this
+/// binary admits, including the one shipped-v35 trigger shape it repairs on a
+/// writer open. This is query-only and shares the daemon's schema authority.
 pub fn verify_admissible_final_shape_rusqlite(conn: &rusqlite::Connection) -> Result<()> {
     final_shape::require_admissible_final_shape_rusqlite(conn)
 }
 
-/// The released project-store stamp accepted by the bounded v34/v35 -> v36
-/// migration. The migration still requires the exact tagged source inventory.
+/// The released stamp preceding persisted payload digests. Live v35 stores
+/// already carry those digests and only need relational convergence.
 pub const PAYLOAD_DIGEST_STEP_SOURCE_VERSION: u32 = 34;
 
-/// Metadata key retained for source compatibility with older callers. The
-/// zero-loss bridge does not write a backfill receipt because its transaction
-/// either commits the complete v36 shape or rolls back every change.
+/// Metadata key journaling the payload-digest backfill receipt the v34 step
+/// writes; named for the stamp that introduced the digests.
 pub const PAYLOAD_DIGEST_BACKFILL_RECEIPT_KEY: &str = "memory_v2.payload_digest_backfill.v35";
+
+/// Payload rows fingerprinted per short backfill write.
+const PAYLOAD_DIGEST_BACKFILL_CHUNK_ROWS: usize = 512;
 
 /// Reads the current schema version from `PRAGMA user_version`.
 async fn get_version(conn: &impl QueryExecutor) -> Result<u32> {
@@ -119,8 +121,8 @@ pub async fn configure_fresh_auto_vacuum(conn: &Connection, operation: &str) -> 
 }
 
 /// Creates the complete schema from scratch for a brand-new database and
-/// stamps [`SCHEMA_VERSION`]. Released v34/v35 files enter through the
-/// explicit writer migration instead.
+/// stamps [`SCHEMA_VERSION`]. This is the only way a store comes into
+/// existence: there is no stepwise path to this shape.
 pub async fn create_schema(database: &crate::db::Database) -> Result<()> {
     let writer = database.writer_connection("create schema").await?;
     let connection = writer.engine_connection();
@@ -215,7 +217,7 @@ async fn create_schema_transaction(conn: &(impl Executor + Sync)) -> Result<()> 
             message: format!("failed to create handoff-open schema: {e}"),
             operation: "create_schema".to_string(),
         })?;
-    conn.execute_batch(runtime_ledger::RUNTIME_LEDGER_SCHEMA)
+    conn.execute_batch(tracedecay_rusqlite_runtime::runtime_ledger::RUNTIME_LEDGER_SCHEMA)
         .await
         .map_err(|e| TraceDecayError::Database {
             message: format!("failed to create runtime writer ledger: {e}"),
@@ -224,6 +226,67 @@ async fn create_schema_transaction(conn: &(impl Executor + Sync)) -> Result<()> 
     final_shape::require_exact_final_shape(conn).await?;
     set_version(conn, SCHEMA_VERSION).await?;
     Ok(())
+}
+
+/// Installs the runtime-writer ledger into a canonical store that predates it
+/// and folds a retired `idempotency_v1` table into the current one with the
+/// same bounded statements the registered stores converge with. Idempotent: a
+/// store already at the current ledger shape is untouched.
+async fn install_runtime_writer_ledger(
+    conn: &(impl Executor + Sync),
+    operation: &str,
+) -> Result<()> {
+    let failure = |message: String| TraceDecayError::Database {
+        message,
+        operation: operation.to_owned(),
+    };
+    conn.execute_batch(runtime_ledger::RUNTIME_LEDGER_SCHEMA)
+        .await
+        .map_err(|e| {
+            failure(format!(
+                "failed to create runtime-writer ledger schema: {e}"
+            ))
+        })?;
+    if !runtime_writer_ledger_retired_table_present(conn, operation).await? {
+        return Ok(());
+    }
+    loop {
+        let copied = conn
+            .execute(runtime_ledger::COPY_RETIRED_IDEMPOTENCY_LEDGER_PAGE_SQL, ())
+            .await
+            .map_err(|e| failure(format!("failed to copy retired idempotency page: {e}")))?;
+        let retired = conn
+            .execute(
+                runtime_ledger::DELETE_CONVERGED_IDEMPOTENCY_LEDGER_PAGE_SQL,
+                (),
+            )
+            .await
+            .map_err(|e| failure(format!("failed to retire converged idempotency page: {e}")))?;
+        let remaining = sqlite_master_probe(
+            conn,
+            "SELECT 1 FROM td_runtime_writer_idempotency_v1 LIMIT 1",
+            operation,
+        )
+        .await?;
+        if !remaining {
+            break;
+        }
+        if copied == 0 && retired == 0 {
+            // A key present in both tables with different receipts: neither
+            // side may be chosen silently.
+            return Err(failure(
+                "retired runtime-writer idempotency receipts diverge from the current ledger"
+                    .to_owned(),
+            ));
+        }
+    }
+    conn.execute_batch(runtime_ledger::DROP_RETIRED_IDEMPOTENCY_LEDGER_SQL)
+        .await
+        .map_err(|e| {
+            failure(format!(
+                "failed to drop the retired idempotency ledger: {e}"
+            ))
+        })
 }
 
 /// Runs a `SELECT 1 ... LIMIT 1`-shaped probe against `sqlite_master` and
@@ -250,6 +313,41 @@ async fn sqlite_master_probe(
         .is_some())
 }
 
+async fn runtime_writer_ledger_retired_table_present(
+    conn: &impl QueryExecutor,
+    operation: &str,
+) -> Result<bool> {
+    sqlite_master_probe(
+        conn,
+        runtime_ledger::RETIRED_IDEMPOTENCY_LEDGER_PRESENT_SQL,
+        operation,
+    )
+    .await
+}
+
+/// Reports whether an existing store still lacks any ledger object or carries
+/// the retired idempotency table, i.e. whether the sanctioned additive ledger
+/// install has work to do before the exact-shape check.
+async fn runtime_writer_ledger_pending(conn: &impl QueryExecutor, operation: &str) -> Result<bool> {
+    sqlite_master_probe(
+        conn,
+        "SELECT 1 WHERE EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'td_runtime_writer_idempotency_v1'
+         ) OR (
+             SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                 'td_runtime_writer_checkpoint_v1',
+                 'td_runtime_writer_idempotency_v2',
+                 'td_runtime_writer_outbox_v1',
+                 'td_runtime_writer_inbox_v1'
+             )
+         ) < 4",
+        operation,
+    )
+    .await
+}
+
 /// Reports whether the file already carries user schema objects.
 ///
 /// A brand-new file has `user_version = 0` and no objects at all. That is not a
@@ -269,7 +367,7 @@ async fn retired_sqlite_projection_object(conn: &impl QueryExecutor) -> Result<O
     let mut rows = conn
         .query(
             "SELECT name FROM sqlite_master
-             WHERE type IN ('table', 'index', 'view', 'trigger')
+             WHERE type IN ('table', 'view', 'trigger')
                AND (
                    name IN (
                        'nodes', 'edges', 'files', 'unresolved_refs',
@@ -295,7 +393,6 @@ async fn retired_sqlite_projection_object(conn: &impl QueryExecutor) -> Result<O
                    )
                    OR name GLOB 'nodes_fts*'
                    OR name GLOB 'memory_facts_fts*'
-                   OR name GLOB 'semantic_vector_*'
                )
              ORDER BY name
              LIMIT 1",
@@ -329,7 +426,7 @@ async fn retired_sqlite_projection_object(conn: &impl QueryExecutor) -> Result<O
 /// so this runs before any stamp-specific step may write.
 async fn require_no_retired_sqlite_projection_object(conn: &impl QueryExecutor) -> Result<()> {
     let Some(object) = retired_sqlite_projection_object(conn).await? else {
-        return Ok(());
+        return final_shape::require_admissible_released_staging(conn).await;
     };
     let current = get_version(conn).await?;
     Err(TraceDecayError::reset_required(
@@ -354,11 +451,9 @@ fn unsupported_schema_version(current: u32) -> TraceDecayError {
 }
 
 /// Verifies an opened store carries the schema this binary creates, creating it
-/// when the file is still empty or running the exact released bridge for v34 or
-/// v35.
+/// when the file is still empty.
 ///
-/// A store stamped with any other version is refused with the fresh-start
-/// remedy rather than guessed forward.
+/// Known released stores converge before admission; unknown shapes remain refused.
 ///
 /// The schema ladder is awaited through a `dyn Future` so its concrete future
 /// type stops at this phase boundary: with the `hotpath` wrappers compiled in,
@@ -373,17 +468,21 @@ pub async fn ensure_schema_current(database: &crate::db::Database) -> Result<()>
     ladder.await
 }
 
-/// Checks an existing store before publication. A released v34/v35 store is
-/// migrated only through the explicit writer-owned transaction; every other
-/// retired or incompatible shape remains reset-required.
+/// Applies either sanctioned writer-side repair before read-only admission:
+/// the v34 -> v35 payload-digest step, or the exact shipped-v35 alias-trigger
+/// replacement. Every other stamp or shape remains for
+/// [`verify_final_schema_connection`] to refuse.
 pub(crate) async fn step_schema_if_pending(conn: &Connection) -> Result<bool> {
     let current = get_version(conn).await?;
-    if matches!(current, 34 | 35) {
-        migrate_released_project_schema_connection(conn, current).await?;
+    if matches!(current, PAYLOAD_DIGEST_STEP_SOURCE_VERSION | 35) {
+        converge_released_project_schema_connection(conn).await?;
+        if current == PAYLOAD_DIGEST_STEP_SOURCE_VERSION {
+            step_payload_digests(conn).await?;
+        }
         return Ok(true);
     }
-    verify_final_schema_connection(conn).await?;
-    Ok(false)
+    let ledger_installed = install_runtime_writer_ledger_connection(conn).await?;
+    Ok(repair_shipped_v35_alias_trigger_connection(conn).await? || ledger_installed)
 }
 
 async fn ensure_schema_current_engine_connection(
@@ -393,51 +492,55 @@ async fn ensure_schema_current_engine_connection(
     if current == 0 && !store_has_objects(conn).await? {
         return create_schema_engine_connection(conn).await;
     }
-    if matches!(current, 34 | 35) {
-        migrate_released_project_schema_engine_connection(conn, current).await?;
+    if matches!(current, PAYLOAD_DIGEST_STEP_SOURCE_VERSION | 35) {
+        converge_released_project_schema_engine_connection(conn).await?;
+        if current == PAYLOAD_DIGEST_STEP_SOURCE_VERSION {
+            step_payload_digests(conn).await?;
+        }
     }
+    install_runtime_writer_ledger_engine_connection(conn).await?;
+    repair_shipped_v35_alias_trigger_engine_connection(conn).await?;
     verify_final_schema_connection(conn).await
 }
 
-const RELEASED_SCHEMA_OPERATION: &str = "migrate released project schema";
+const RELEASED_SCHEMA_OPERATION: &str = "converge released project schema";
 
-/// Runs the only supported in-place project-store migration. The source
-/// inventory and rows are checked inside the long-lease transaction; any
-/// failure rolls the transaction back before the caller can publish the
-/// connection.
-async fn migrate_released_project_schema_engine_connection(
+/// Converges a released store to the current shape in one transaction, so an
+/// interrupted upgrade leaves the released shape rather than a half-rebuilt
+/// table. Runs before the payload-digest step, whose admission check requires
+/// the current shape everywhere but the digest objects.
+async fn converge_released_project_schema_engine_connection(
     conn: &DatabaseEngineWriteConnection,
-    stamp: u32,
 ) -> Result<()> {
     let transaction = conn
         .authorized_long_lease_transaction()
         .await
         .map_err(|error| released_schema_failure(format!("failed to acquire lock: {error}")))?;
-    match released_shape::migrate_released_project_schema(&transaction, stamp).await {
+    match released_shape::converge_released_project_schema(&transaction).await {
         Ok(()) => transaction
             .commit()
             .await
             .map_err(|error| released_schema_failure(format!("failed to commit: {error}"))),
         Err(error) => match transaction.rollback().await {
             Ok(()) => Err(error),
-            Err(rollback_error) => Err(released_schema_rollback_failure(error, rollback_error)),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
         },
     }
 }
 
-async fn migrate_released_project_schema_connection(conn: &Connection, stamp: u32) -> Result<()> {
+async fn converge_released_project_schema_connection(conn: &Connection) -> Result<()> {
     let transaction = conn
         .authorized_long_lease_transaction()
         .await
         .map_err(|error| released_schema_failure(format!("failed to acquire lock: {error}")))?;
-    match released_shape::migrate_released_project_schema(&transaction, stamp).await {
+    match released_shape::converge_released_project_schema(&transaction).await {
         Ok(()) => transaction
             .commit()
             .await
             .map_err(|error| released_schema_failure(format!("failed to commit: {error}"))),
         Err(error) => match transaction.rollback().await {
             Ok(()) => Err(error),
-            Err(rollback_error) => Err(released_schema_rollback_failure(error, rollback_error)),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
         },
     }
 }
@@ -449,41 +552,340 @@ fn released_schema_failure(message: String) -> TraceDecayError {
     }
 }
 
-fn released_schema_rollback_failure(
+const LEDGER_INSTALL_OPERATION: &str = "install runtime-writer ledger";
+
+/// Sanctioned additive step for a current-version store that predates the
+/// ledger being part of the canonical shape, or that still carries the retired
+/// idempotency table. Only ledger objects are touched; the exact-shape check
+/// that follows still refuses every other drift.
+async fn install_runtime_writer_ledger_engine_connection(
+    conn: &DatabaseEngineWriteConnection,
+) -> Result<()> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !runtime_writer_ledger_pending(conn, LEDGER_INSTALL_OPERATION).await?
+    {
+        return Ok(());
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| ledger_install_failure(format!("failed to acquire lock: {error}")))?;
+    match install_runtime_writer_ledger(&transaction, LEDGER_INSTALL_OPERATION).await {
+        Ok(()) => transaction
+            .commit()
+            .await
+            .map_err(|error| ledger_install_failure(format!("failed to commit: {error}"))),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+async fn install_runtime_writer_ledger_connection(conn: &Connection) -> Result<bool> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !runtime_writer_ledger_pending(conn, LEDGER_INSTALL_OPERATION).await?
+    {
+        return Ok(false);
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| ledger_install_failure(format!("failed to acquire lock: {error}")))?;
+    match install_runtime_writer_ledger(&transaction, LEDGER_INSTALL_OPERATION).await {
+        Ok(()) => transaction
+            .commit()
+            .await
+            .map(|()| true)
+            .map_err(|error| ledger_install_failure(format!("failed to commit: {error}"))),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+fn ledger_install_failure(message: String) -> TraceDecayError {
+    TraceDecayError::Database {
+        message,
+        operation: LEDGER_INSTALL_OPERATION.to_owned(),
+    }
+}
+
+async fn repair_shipped_v35_alias_trigger(conn: &(impl Executor + Sync)) -> Result<bool> {
+    if !final_shape::require_exact_final_shape_or_shipped_v35_alias_trigger(conn).await? {
+        return Ok(false);
+    }
+    crate::db::retrieval_anchor_schema::install_retrieval_anchor_schema(
+        conn,
+        "repair shipped v35 retrieval-anchor alias trigger",
+    )
+    .await?;
+    final_shape::require_exact_final_shape(conn).await?;
+    Ok(true)
+}
+
+async fn repair_shipped_v35_alias_trigger_engine_connection(
+    conn: &DatabaseEngineWriteConnection,
+) -> Result<()> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !final_shape::require_exact_final_shape_or_shipped_v35_alias_trigger(conn).await?
+    {
+        return Ok(());
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("failed to acquire shipped-v35 trigger repair lock: {error}"),
+            operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+        })?;
+    let result = repair_shipped_v35_alias_trigger(&transaction).await;
+    match result {
+        Ok(true) => transaction
+            .commit()
+            .await
+            .map_err(|error| TraceDecayError::Database {
+                message: format!("failed to commit shipped-v35 trigger repair: {error}"),
+                operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+            }),
+        Ok(false) => transaction
+            .rollback()
+            .await
+            .map_err(|error| TraceDecayError::Database {
+                message: format!(
+                    "failed to roll back redundant shipped-v35 trigger repair: {error}"
+                ),
+                operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+            }),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+async fn repair_shipped_v35_alias_trigger_connection(conn: &Connection) -> Result<bool> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !final_shape::require_exact_final_shape_or_shipped_v35_alias_trigger(conn).await?
+    {
+        return Ok(false);
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("failed to acquire shipped-v35 trigger repair lock: {error}"),
+            operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+        })?;
+    let result = repair_shipped_v35_alias_trigger(&transaction).await;
+    match result {
+        Ok(true) => {
+            transaction
+                .commit()
+                .await
+                .map(|()| true)
+                .map_err(|error| TraceDecayError::Database {
+                    message: format!("failed to commit shipped-v35 trigger repair: {error}"),
+                    operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+                })
+        }
+        Ok(false) => transaction
+            .rollback()
+            .await
+            .map(|()| false)
+            .map_err(|error| TraceDecayError::Database {
+                message: format!(
+                    "failed to roll back redundant shipped-v35 trigger repair: {error}"
+                ),
+                operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
+            }),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+fn trigger_repair_rollback_failure(
     error: TraceDecayError,
     rollback_error: impl std::fmt::Display,
 ) -> TraceDecayError {
     match error {
         TraceDecayError::ResetRequired { authority, reason } => TraceDecayError::ResetRequired {
             authority,
-            reason: format!("{reason}; migration rollback also failed: {rollback_error}"),
+            reason: format!("{reason}; trigger-repair rollback also failed: {rollback_error}"),
         },
         TraceDecayError::Database { message, operation } => TraceDecayError::Database {
-            message: format!("{message}; migration rollback also failed: {rollback_error}"),
+            message: format!("{message}; trigger-repair rollback also failed: {rollback_error}"),
             operation,
         },
         error => TraceDecayError::Database {
-            message: format!("{error}; migration rollback also failed: {rollback_error}"),
-            operation: RELEASED_SCHEMA_OPERATION.to_owned(),
+            message: format!("{error}; trigger-repair rollback also failed: {rollback_error}"),
+            operation: "repair shipped v35 retrieval-anchor alias trigger".to_owned(),
         },
     }
+}
+
+/// Steps a v34 store to v35: creates the payload-digest objects (idempotent)
+/// and fingerprints every existing payload in bounded chunks, each its own
+/// short write, so the writer is released between chunks and an interrupted
+/// run resumes from the rows still missing a digest. The stamp moves only
+/// after the last chunk and the receipt are durable.
+async fn step_payload_digests<C: Executor>(conn: &C) -> Result<()> {
+    const OPERATION: &str = "step_payload_digests";
+    final_shape::require_final_shape_except_payload_digests(conn).await?;
+    conn.execute_batch(super::memory_v2::PAYLOAD_DIGESTS_SCHEMA)
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("failed to create payload digest objects: {error}"),
+            operation: OPERATION.to_owned(),
+        })?;
+    let mut cursor: i64 = 0;
+    let mut backfilled: u64 = 0;
+    loop {
+        let chunk = payload_digest_backfill_chunk(conn, cursor).await?;
+        let Some(last_rowid) = chunk.last().map(|row| row.rowid) else {
+            break;
+        };
+        for row in &chunk {
+            let digest = payload_content_digest(&row.content);
+            conn.execute(
+                "INSERT OR IGNORE INTO memory_v2_assertion_payload_digests(
+                    payload_rowid, assertion_id, fact_id, owner_kind, project_id, content_digest
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    row.rowid,
+                    row.assertion_id.as_str(),
+                    row.fact_id.as_str(),
+                    row.owner_kind.as_str(),
+                    row.project_id.as_str(),
+                    digest.as_str(),
+                ],
+            )
+            .await
+            .map_err(|error| TraceDecayError::Database {
+                message: format!("failed to backfill payload digest: {error}"),
+                operation: OPERATION.to_owned(),
+            })?;
+            backfilled += 1;
+        }
+        cursor = last_rowid;
+    }
+    let receipt = serde_json::json!({
+        "from_version": PAYLOAD_DIGEST_STEP_SOURCE_VERSION,
+        "to_version": SCHEMA_VERSION,
+        "backfilled_rows": backfilled,
+        "chunk_rows": PAYLOAD_DIGEST_BACKFILL_CHUNK_ROWS,
+    });
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+        params![PAYLOAD_DIGEST_BACKFILL_RECEIPT_KEY, receipt.to_string()],
+    )
+    .await
+    .map_err(|error| TraceDecayError::Database {
+        message: format!("failed to journal payload digest backfill receipt: {error}"),
+        operation: OPERATION.to_owned(),
+    })?;
+    set_version(conn, SCHEMA_VERSION).await
+}
+
+struct PayloadDigestBackfillRow {
+    rowid: i64,
+    assertion_id: String,
+    fact_id: String,
+    owner_kind: String,
+    project_id: String,
+    content: String,
+}
+
+async fn payload_digest_backfill_chunk(
+    conn: &impl QueryExecutor,
+    after_rowid: i64,
+) -> Result<Vec<PayloadDigestBackfillRow>> {
+    const OPERATION: &str = "step_payload_digests";
+    let map = |error: String| TraceDecayError::Database {
+        message: error,
+        operation: OPERATION.to_owned(),
+    };
+    let mut rows = conn
+        .query(
+            "SELECT payloads.rowid, payloads.assertion_id, payloads.fact_id,
+                    payloads.owner_kind, payloads.project_id, payloads.content
+             FROM memory_v2_assertion_payloads AS payloads
+             LEFT JOIN memory_v2_assertion_payload_digests AS digests
+               ON digests.payload_rowid = payloads.rowid
+             WHERE digests.payload_rowid IS NULL AND payloads.rowid > ?1
+             ORDER BY payloads.rowid ASC
+             LIMIT ?2",
+            params![
+                after_rowid,
+                i64::try_from(PAYLOAD_DIGEST_BACKFILL_CHUNK_ROWS).unwrap_or(i64::MAX)
+            ],
+        )
+        .await
+        .map_err(|error| {
+            map(format!(
+                "failed to read payload digest backfill chunk: {error}"
+            ))
+        })?;
+    let mut chunk = Vec::with_capacity(PAYLOAD_DIGEST_BACKFILL_CHUNK_ROWS);
+    while let Some(row) = rows.next().await.map_err(|error| {
+        map(format!(
+            "failed to read payload digest backfill row: {error}"
+        ))
+    })? {
+        let column = |index: i32| -> Result<String> {
+            row.get::<String>(index)
+                .map_err(|error| map(format!("failed to read backfill column {index}: {error}")))
+        };
+        chunk.push(PayloadDigestBackfillRow {
+            rowid: row
+                .get::<i64>(0)
+                .map_err(|error| map(format!("failed to read backfill rowid: {error}")))?,
+            assertion_id: column(1)?,
+            fact_id: column(2)?,
+            owner_kind: column(3)?,
+            project_id: column(4)?,
+            content: column(5)?,
+        });
+    }
+    Ok(chunk)
+}
+
+/// Byte-for-byte the digest `tracedecay_session_memory::fact_store::crud::content_digest` derives for
+/// a payload's `content`: `sha256:` plus lowercase hex.
+fn payload_content_digest(content: &str) -> String {
+    use sha2::Digest as _;
+    tracedecay_domain::canonical_text::encode_tagged_lowercase_hex(
+        "sha256:",
+        &sha2::Sha256::digest(content.as_bytes()),
+    )
 }
 
 /// Verifies that an already-existing store has the one exact final shape this
 /// binary accepts. This query-only authority intentionally cannot initialize a
 /// fresh file, so read-only mounts cannot change persisted state.
 pub(crate) async fn verify_final_schema_connection(conn: &impl QueryExecutor) -> Result<()> {
+    require_no_retired_sqlite_projection_object(conn).await?;
     let current = get_version(conn).await?;
-    if matches!(current, 34 | 35) {
-        released_shape::require_exact_source_shape(conn, current).await?;
+    if matches!(current, PAYLOAD_DIGEST_STEP_SOURCE_VERSION | 35) {
+        // A read-only mount may not step the store; the message names the
+        // writer-side remedy instead of the fresh-start reset.
+        let step = if current == PAYLOAD_DIGEST_STEP_SOURCE_VERSION {
+            "payload digest"
+        } else {
+            "released schema"
+        };
         return Err(TraceDecayError::Database {
             message: format!(
-                "database schema v{current} is a released project shape; writer migration to v{SCHEMA_VERSION} is pending"
+                "database schema v{current} needs convergence to v{SCHEMA_VERSION}: \
+                 the {step} step is pending and runs the next time a writer \
+                 opens this store; retry after that open instead of resetting the store"
             ),
             operation: "verify_final_schema".to_owned(),
         });
     }
-    require_no_retired_sqlite_projection_object(conn).await?;
     if current != SCHEMA_VERSION {
         return Err(unsupported_schema_version(current));
     }
@@ -497,9 +899,13 @@ pub(crate) async fn ensure_schema_current_connection(conn: &Connection) -> Resul
     if current == 0 && !store_has_objects(conn).await? {
         return create_schema_connection(conn).await;
     }
-    if matches!(current, 34 | 35) {
-        migrate_released_project_schema_connection(conn, current).await?;
+    if matches!(current, PAYLOAD_DIGEST_STEP_SOURCE_VERSION | 35) {
+        converge_released_project_schema_connection(conn).await?;
+        if current == PAYLOAD_DIGEST_STEP_SOURCE_VERSION {
+            step_payload_digests(conn).await?;
+        }
     }
+    repair_shipped_v35_alias_trigger_connection(conn).await?;
     verify_final_schema_connection(conn).await
 }
 

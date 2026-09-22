@@ -27,7 +27,9 @@ use tracedecay_query::retrieval::{
     QueryAuthorityV1, fusion::RetrievalCursorKeyringV1, lexical::LexicalRoutingV1,
     ports::RetrievalExecutionControl,
 };
-use tracedecay_runtime_core::path_safety::{plain_git_args, plain_host_path};
+use tracedecay_runtime_core::path_safety::{
+    canonical_root_identity, plain_git_args, plain_host_path,
+};
 
 use crate::code_index_scheduler::{
     CodeIndexHintPolicyV1, CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1,
@@ -39,6 +41,7 @@ use crate::code_index_scheduler::{
 static HOTPATH_ALLOCATOR: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
 mod branch_publication_tests;
+mod deferred_mount_tests;
 mod noop_reconcile_tests;
 mod publication_store;
 mod reconcile;
@@ -63,8 +66,7 @@ fn decode_hex(encoded: &str) -> Vec<u8> {
 }
 
 fn canonical_temp_root() -> std::path::PathBuf {
-    let base = std::env::temp_dir();
-    base.canonicalize().unwrap_or(base)
+    canonical_root_identity(&std::env::temp_dir())
 }
 
 struct GitFixture {
@@ -1201,6 +1203,44 @@ async fn wait_for_quiescent_owner_pass(
     }
 }
 
+/// Drive the seated owner's clone-fingerprint backfill to completion.
+///
+/// The seat no longer waits for that successor: exact and lexical serve as
+/// soon as the admission artifact is ready and the backfill runs on a later
+/// pass. A query over pending clone work requests that pass, so a test that
+/// pins query admission or wake accounting against a *settled* seat drains
+/// the backfill first with plain wakes.
+async fn drain_clone_backfill(registry: &CodeIndexSchedulerRegistryV1, path: &Path) {
+    let canonical = path.canonicalize().expect("canonical project");
+    let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    loop {
+        let text = {
+            let mounted = registry.mounted.lock().await;
+            mounted
+                .get(&canonical)
+                .expect("mounted worktree")
+                .text_generation
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        if text.is_none_or(|text| !text.text_projection_needs_work()) {
+            let admission = quiesced_background_reconcile_admission(registry, path).await;
+            drop(admission);
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the clone backfill for {} never finished",
+            path.display()
+        );
+        // Complete-generation demand is an ordinary wake; the pass it starts
+        // drives the pending successor on the retained path.
+        registry.request_complete_generation(path).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Hold the background worker out of a new pass, then wait for the in-flight
 /// pass to finish, and keep the admission permit.
 ///
@@ -1319,7 +1359,8 @@ async fn serving_seat_wait_diagnostic(
 /// wakes on per-worktree seating, including restored mounts that emit no new
 /// registry-wide seat count. That subscribe returns `None` until the worktree
 /// is mounted, so the loop re-attempts it each iteration until it returns
-/// `Some`. A waiter that starts before mount still observes
+/// `Some`. A waiter that starts before mount observes
+/// [`CodeIndexSchedulerRegistryV1::subscribe_root_mounted`] and
 /// [`CodeIndexSchedulerRegistryV1::subscribe_serving_seats`].
 ///
 /// `watch::Sender::subscribe()` marks the current value seen, so a seat that
@@ -1343,6 +1384,7 @@ where
             return value;
         }
         let mut seats = registry.subscribe_serving_seats();
+        let mut root_mounted = registry.subscribe_root_mounted();
         let mut per_worktree = None;
         loop {
             if per_worktree.is_none() {
@@ -1363,13 +1405,20 @@ where
                         result = changes.changed() => {
                             result.expect("the per-worktree serving channel stays open while the owner lives");
                         }
+                        result = root_mounted.changed() => {
+                            result.expect("the root-mounted channel stays open while the registry lives");
+                        }
                     }
                 }
                 None => {
-                    seats
-                        .changed()
-                        .await
-                        .expect("the seating channel stays open while the registry lives");
+                    tokio::select! {
+                        result = seats.changed() => {
+                            result.expect("the seating channel stays open while the registry lives");
+                        }
+                        result = root_mounted.changed() => {
+                            result.expect("the root-mounted channel stays open while the registry lives");
+                        }
+                    }
                 }
             }
         }
@@ -1456,8 +1505,8 @@ async fn wait_for_dashboard_ready(registry: &CodeIndexSchedulerRegistryV1, path:
                 .dashboard_freshness(path)
                 .await
                 .is_some_and(|freshness| {
-                    freshness.staleness_state.as_deref() == Some("fresh")
-                        && freshness.coverage == "complete"
+                    freshness.staleness_state == Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh)
+                        && freshness.coverage == tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
                 });
             if ready {
                 break;

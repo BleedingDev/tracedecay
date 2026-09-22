@@ -15,6 +15,7 @@ use tracedecay_domain::{
     WorktreeId,
 };
 
+use crate::code_index_freshness::CodeIndexStalenessStateV1;
 use crate::error::ApplicationContractError;
 use crate::memory::{
     CognitiveRecallExclusions, CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery,
@@ -237,7 +238,7 @@ pub struct PrimitiveIndexingStateV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub staleness_state: Option<String>,
+    pub staleness_state: Option<CodeIndexStalenessStateV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebuild_in_flight: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -342,6 +343,7 @@ pub struct SimilarSurfaceRequestV1 {
     /// cursor selects the lane position, so a cursor is valid even when this
     /// vector contains both classes.
     pub match_classes: Vec<SimilarMatchClassV1>,
+    /// Preferred result page size.
     pub result_limit: u32,
     pub work_limit: u32,
     /// Opaque authenticated lane continuation. The serving owner authenticates
@@ -434,6 +436,7 @@ pub struct RedundancySurfaceRequestV1 {
     pub match_classes: Vec<SimilarMatchClassV1>,
     pub scope: RedundancyScopeV1,
     pub include_generated_paths: bool,
+    /// Preferred family page size.
     pub family_limit: u32,
     pub member_limit: u32,
     pub work_limit: u32,
@@ -1064,9 +1067,10 @@ mod tests {
         ContextModeV1, ContextResultV1, ContextSurfaceRequestV1, PrimitiveFreshnessStateV1,
         PrimitiveIndexingStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1,
         PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
-        SimilarNearCoverageV1, SimilarNearPartialReasonV1, SimilarNearUnavailableReasonV1,
-        SimilarSourceExtentV1, SimilarSurfaceRequestV1,
+        RedundancySurfaceRequestV1, SimilarNearCoverageV1, SimilarNearPartialReasonV1,
+        SimilarNearUnavailableReasonV1, SimilarSourceExtentV1, SimilarSurfaceRequestV1,
     };
+    use crate::code_index_freshness::CodeIndexStalenessStateV1;
     use crate::memory::{FactSearchGraphCoverageV1, FactSearchGraphDegradationV1};
 
     #[test]
@@ -1328,7 +1332,7 @@ mod tests {
                 summary: "state=refreshing".to_owned(),
                 served_generation: Some("generation.old".to_owned()),
                 latest_generation: Some("generation.new".to_owned()),
-                staleness_state: Some("refreshing".to_owned()),
+                staleness_state: Some(CodeIndexStalenessStateV1::Refreshing),
                 rebuild_in_flight: Some(true),
                 stale_lanes: vec!["lexical".to_owned()],
                 reason: None,
@@ -1501,5 +1505,80 @@ mod tests {
         assert!(schema["properties"]["source_coverage_millionths"].is_object());
         assert!(schema["properties"]["candidate_coverage_millionths"].is_object());
         assert!(schema["properties"].get("score").is_none());
+    }
+
+    #[test]
+    fn similar_and_redundancy_reject_retired_request_shapes() {
+        let current_similar = json!({
+            "project_id": "project.demo",
+            "repository_id": "repo.demo",
+            "target": {"kind": "symbol_occurrence", "symbol_occurrence_id": "symbol.v1.demo"},
+            "match_classes": ["conservative_exact"],
+            "result_limit": 3,
+            "work_limit": 100,
+            "cursor": null
+        });
+        let request: SimilarSurfaceRequestV1 =
+            serde_json::from_value(current_similar).expect("current similar schema decodes");
+        assert_eq!(request.result_limit, 3);
+
+        assert!(
+            serde_json::from_value::<SimilarSurfaceRequestV1>(json!({"symbol": "foo", "limit": 5}))
+                .is_err(),
+            "retired {{symbol, limit}} is not a similar request"
+        );
+        assert!(
+            serde_json::from_value::<SimilarSurfaceRequestV1>(json!({
+                "project_id": "project.demo",
+                "repository_id": "repo.demo",
+                "target": {"kind": "symbol_occurrence", "symbol_occurrence_id": "symbol.v1.demo"},
+                "match_classes": ["conservative_exact"],
+                "limit": 3,
+                "work_limit": 100
+            }))
+            .is_err(),
+            "limit is not an alias of result_limit"
+        );
+
+        let current_redundancy = json!({
+            "project_id": "project.demo",
+            "repository_id": "repo.demo",
+            "match_classes": ["conservative_exact"],
+            "scope": {"kind": "repository"},
+            "include_generated_paths": false,
+            "family_limit": 4,
+            "member_limit": 2,
+            "work_limit": 8,
+            "cursor": null
+        });
+        let request: RedundancySurfaceRequestV1 =
+            serde_json::from_value(current_redundancy).expect("current redundancy schema decodes");
+        assert_eq!(request.family_limit, 4);
+        assert!(
+            serde_json::from_value::<RedundancySurfaceRequestV1>(json!({
+                "path": "src/",
+                "min_lines": 10,
+                "max_pairs": 20,
+                "similarity_threshold": 0.9,
+                "include_naming_only": false,
+                "include_generated_paths": true
+            }))
+            .is_err(),
+            "retired path/min_lines/max_pairs shape is not a redundancy request"
+        );
+        assert!(
+            serde_json::from_value::<RedundancySurfaceRequestV1>(json!({
+                "project_id": "project.demo",
+                "repository_id": "repo.demo",
+                "match_classes": ["conservative_exact"],
+                "scope": {"kind": "repository"},
+                "include_generated_paths": false,
+                "max_pairs": 4,
+                "member_limit": 2,
+                "work_limit": 8
+            }))
+            .is_err(),
+            "max_pairs is not an alias of family_limit"
+        );
     }
 }

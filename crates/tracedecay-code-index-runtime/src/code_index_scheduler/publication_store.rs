@@ -9,7 +9,7 @@ use std::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use same_file::Handle;
@@ -19,8 +19,8 @@ use tracedecay_code_index_retention::code_index_generations::{
     CodeGenerationStoreLockV1, DurableGenerationCardinalityV1, DurableGenerationIndexEntryV1,
     DurablePublicationPointerV1, DurableSealedCodeGenerationIdentityV1,
     MAX_DURABLE_GENERATION_INDEX_BYTES_V1, MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1,
-    acquire_code_generation_store_lock, durable_generation_index_digest,
-    retain_bounded_generation_index, try_acquire_code_generation_store_lock,
+    durable_generation_index_digest, retain_bounded_generation_index,
+    try_acquire_code_generation_store_lock, try_acquire_code_generation_store_read_lock,
 };
 use tracedecay_domain::{
     CodeGenerationId, ContentDigest, ManifestDigest, ProjectionBatchRequestV1,
@@ -475,6 +475,11 @@ pub struct DaemonCodeIndexPublicationStoreV1 {
     /// retire the shutdown signal between two segments of one seal.
     #[cfg(test)]
     seal_segment_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test-only: observes each batched `segments_root` directory fsync so a
+    /// test can assert a single publish syncs the directory once regardless
+    /// of how many new file segments it wrote.
+    #[cfg(test)]
+    segments_dir_sync_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Last generation handed to `publish_atomically`. A transient store
     /// failure must not drop it: the next undecoded retry republishes this
     /// candidate instead of extracting the whole worktree again.
@@ -736,8 +741,9 @@ impl DaemonCodeIndexPublicationStoreV1 {
         std::fs::create_dir_all(&generations_root)?;
         let segments_root = store_root.join("code-generation-segments-v1");
         std::fs::create_dir_all(&segments_root)?;
-        let _store_lock = acquire_code_generation_store_lock(store_root)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let _store_lock = try_acquire_code_generation_store_lock(store_root)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .ok_or_else(|| std::io::Error::other("code-generation store has an active owner"))?;
         // Scope reconciliation only sees this directory's hash; the record
         // lets it collect the scope as soon as the checkout is deleted rather
         // than after the stranding age.
@@ -769,6 +775,8 @@ impl DaemonCodeIndexPublicationStoreV1 {
             shutdown_signal: None,
             #[cfg(test)]
             seal_segment_observer: None,
+            #[cfg(test)]
+            segments_dir_sync_observer: None,
             unpublished_candidate: Arc::new(Mutex::new(None)),
         })
     }
@@ -804,6 +812,15 @@ impl DaemonCodeIndexPublicationStoreV1 {
         observer: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         self.seal_segment_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_segments_dir_sync_observer_for_test(
+        mut self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.segments_dir_sync_observer = Some(observer);
         self
     }
 
@@ -852,7 +869,9 @@ impl DaemonCodeIndexPublicationStoreV1 {
             .active_path
             .parent()
             .ok_or_else(|| Self::unavailable("active code-generation pointer has no store root"))?;
-        acquire_code_generation_store_lock(store_root).map_err(Self::unavailable)
+        try_acquire_code_generation_store_read_lock(store_root)
+            .map_err(Self::unavailable)?
+            .ok_or_else(|| Self::unavailable("generation store read lock is contended"))
     }
 
     fn remove_abandoned_evidence_packs(
@@ -899,12 +918,20 @@ impl DaemonCodeIndexPublicationStoreV1 {
         file.sync_all().map_err(Self::unavailable)
     }
 
+    /// Writes a sealed segment durably, deferring the containing-directory
+    /// fsync to the caller so a multi-segment publish batch pays for one
+    /// directory sync instead of one per segment (each segment file is
+    /// still fsynced before its rename, so per-file durability is
+    /// unaffected). Returns `true` if a new segment file was written and
+    /// renamed into place (requiring the caller to sync the directory
+    /// afterward), or `false` if an already-durable, verified segment was
+    /// found in place (no rename occurred, so no directory sync is owed).
     #[hotpath::measure(label = "code_index.generation.publish.segment")]
     fn publish_segment_durable(
         &self,
         digest: &ManifestDigest,
         bytes: &[u8],
-    ) -> Result<(), CodeIndexPublicationStoreErrorV1> {
+    ) -> Result<bool, CodeIndexPublicationStoreErrorV1> {
         let digest_hex = sha256_hex_suffix(digest.as_str())
             .ok_or_else(|| Self::unavailable("sealed segment digest is not sha256"))?;
         let expected_digest = digest.as_str();
@@ -928,7 +955,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
                         "existing sealed segment does not match its content address",
                     ));
                 }
-                return Ok(());
+                return Ok(false);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(Self::unavailable(error)),
@@ -952,7 +979,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
         }
         Self::write_durable(&temporary_path, bytes)?;
         std::fs::rename(&temporary_path, &final_path).map_err(Self::unavailable)?;
-        Self::sync_directory(&self.segments_root)
+        Ok(true)
     }
 
     fn state_digest_file(path: &Path) -> Result<String, CodeIndexPublicationStoreErrorV1> {
@@ -1062,19 +1089,10 @@ impl DaemonCodeIndexPublicationStoreV1 {
         }
         let mtime = metadata.modified().ok();
         let size = metadata.len();
-        {
-            let memo = self
-                .pointer_memo
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(memo) = memo.as_ref()
-                && memo.size == size
-                && memo.mtime.is_some()
-                && memo.mtime == mtime
-            {
-                return Ok(Some(memo.pointer.clone()));
-            }
-        }
+        // Size and mtime are hints, not identity. Text-artifact attach writes
+        // a fixed-width pointer through another path, and a 1-second mtime
+        // filesystem can leave both unchanged while the bytes move. The memo
+        // is reused only when the file digest matches.
         let bytes = std::fs::read(&self.active_path).map_err(Self::unavailable)?;
         let digest = Self::state_digest(&bytes);
         {
@@ -1242,14 +1260,30 @@ impl DaemonCodeIndexPublicationStoreV1 {
         identity: &DurableSealedCodeGenerationIdentityV1,
         request: SealedGenerationSegmentReadV1<'_>,
         buffer: &mut Vec<u8>,
+        control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<(), CodeIndexProductionErrorV1> {
         let root = self
             .active_path
             .parent()
             .ok_or_else(|| Self::unavailable("active code-generation pointer has no store root"))?;
-        let _lock = try_acquire_code_generation_store_lock(root)
-            .map_err(Self::unavailable)?
-            .ok_or_else(|| Self::unavailable("sealed lexical source generation store is busy"))?;
+        let _lock = loop {
+            if control.is_cancelled() {
+                return Err(CodeIndexProductionErrorV1::Interrupted(
+                    CodeIndexInterruptionV1::Cancelled,
+                ));
+            }
+            if control.is_deadline_exceeded() {
+                return Err(CodeIndexProductionErrorV1::Interrupted(
+                    CodeIndexInterruptionV1::DeadlineExceeded,
+                ));
+            }
+            if let Some(lock) =
+                try_acquire_code_generation_store_read_lock(root).map_err(Self::unavailable)?
+            {
+                break lock;
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        };
         let pointer = self.read_publication_pointer()?;
         if !pointer.as_ref().is_some_and(|pointer| {
             pointer.generation_index.iter().any(|entry| {
@@ -2114,8 +2148,9 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                 }
             }
         };
-        let _store_lock =
-            acquire_code_generation_store_lock(store_root).map_err(Self::unavailable)?;
+        let _store_lock = try_acquire_code_generation_store_lock(store_root)
+            .map_err(Self::unavailable)?
+            .ok_or_else(|| Self::unavailable("code-generation store has an active owner"))?;
         let prior_pointer = if let Some(expected) = undecoded_expectation.as_ref() {
             if expected_active_generation.is_some() {
                 return Err(CodeIndexPublicationStoreErrorV1::CompareAndSwap);
@@ -2221,6 +2256,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         ));
         let mut evidence_pack = TemporaryEvidencePackV1::create(evidence_temporary_path)?;
         let mut referenced_segment_bytes = 0_u64;
+        let mut wrote_new_file_segment = false;
         self.seal_encoded_segment_bytes.store(0, Ordering::Relaxed);
         self.seal_existing_segment_bytes_read
             .store(0, Ordering::Relaxed);
@@ -2240,13 +2276,15 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                                     "sealed segment length exceeds u64".to_owned(),
                                 )
                             })?;
-                            hotpath::measure_block!(
+                            if hotpath::measure_block!(
                                 "code_index.generation.publish.segment_durable",
                                 self.publish_segment_durable(digest, bytes)
                             )
                             .map_err(|error| {
                                 CodeIndexProductionErrorV1::Contract(error.to_string())
-                            })?;
+                            })? {
+                                wrote_new_file_segment = true;
+                            }
                             #[cfg(test)]
                             if let Some(observer) = self.seal_segment_observer.as_ref() {
                                 observer();
@@ -2312,6 +2350,22 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                 return Err(Self::unavailable(error));
             }
         };
+        // All newly written segment files for this publish were fsynced
+        // and renamed above; POSIX only requires a single directory fsync
+        // to make those renames durable, so batch it here rather than
+        // syncing once per segment inside `publish_segment_durable`.
+        // The manifest and active pointer must remain unpublished until this
+        // succeeds: a crash before it may discard any of the segment renames.
+        if wrote_new_file_segment {
+            hotpath::measure_block!(
+                "code_index.generation.publish.segments_dir_sync",
+                Self::sync_directory(&self.segments_root)
+            )?;
+            #[cfg(test)]
+            if let Some(observer) = self.segments_dir_sync_observer.as_ref() {
+                observer();
+            }
+        }
         #[cfg(feature = "hotpath")]
         {
             hotpath::gauge!("code_index.generation.publish.encoded_file_segment_bytes")
@@ -2588,20 +2642,9 @@ impl CodeChunkProjectionSink for DaemonProjectionSinkV1 {
                     output_digest: None,
                 }),
         );
-        decisions.extend(
-            request
-                .changes
-                .reused
-                .iter()
-                .map(|change| ChunkProjectionDecisionV1 {
-                    chunk_id: change.chunk_id.clone(),
-                    prior_chunk_digest: change.prior_digest.clone(),
-                    current_chunk_digest: change.current_digest.clone(),
-                    operation: ProjectionOperationV1::Reused,
-                    outcome: ProjectionOutcomeV1::Reused,
-                    output_digest: None,
-                }),
-        );
+        // Unchanged chunks are not a list. `reused_count` / `reused_digest`
+        // authenticate them, and the receipt builder records that count.
+        // Emitting per-chunk Reused decisions is now ExtraChunkReceipt.
         decisions.sort_by(|left, right| left.chunk_id.cmp(&right.chunk_id));
         receipt_builder
             .build(&decisions)

@@ -67,7 +67,7 @@ impl AgentIntegration for ClaudeIntegration {
     #[hotpath::measure(label = "hosts.agent.claude.project_install")]
     fn activate_project_host_component_registration(
         &self,
-        _components: &[super::host_bundle::HostBundleComponentV1],
+        _components: &[super::host_bundle::HostComponentV1],
         ctx: &InstallContext,
         project_path: &Path,
     ) -> Result<()> {
@@ -84,7 +84,7 @@ impl AgentIntegration for ClaudeIntegration {
 
     fn project_host_component_registration_paths(
         &self,
-        _components: &[super::host_bundle::HostBundleComponentV1],
+        _components: &[super::host_bundle::HostComponentV1],
         _home: &Path,
         project_path: &Path,
     ) -> Result<Vec<PathBuf>> {
@@ -93,7 +93,7 @@ impl AgentIntegration for ClaudeIntegration {
 
     fn deactivate_project_host_component_registration(
         &self,
-        _components: &[super::host_bundle::HostBundleComponentV1],
+        _components: &[super::host_bundle::HostComponentV1],
         ctx: &InstallContext,
         project_path: &Path,
     ) -> Result<()> {
@@ -175,7 +175,7 @@ impl AgentIntegration for ClaudeIntegration {
 
     fn host_component_registration(
         &self,
-        _component: super::host_bundle::HostBundleComponentV1,
+        _component: super::host_bundle::HostComponentV1,
         ctx: &HealthcheckContext,
     ) -> super::host_bundle::HostBundleRegistrationStateV1 {
         use super::host_bundle::HostBundleRegistrationStateV1 as State;
@@ -215,7 +215,7 @@ impl AgentIntegration for ClaudeIntegration {
 
     fn host_component_registration_for_lifecycle(
         &self,
-        component: super::host_bundle::HostBundleComponentV1,
+        component: super::host_bundle::HostComponentV1,
         ctx: &HealthcheckContext,
         install: &InstallContext,
     ) -> super::host_bundle::HostBundleRegistrationStateV1 {

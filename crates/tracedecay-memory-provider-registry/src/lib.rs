@@ -70,7 +70,7 @@ pub use provider_invocation::{
 };
 pub use recall_admission::{
     AdmittedRecallCandidate, AdmittedTemporalQuery, DeniedRecallCandidate,
-    RECALL_PAYLOAD_CONTRACT_ID, RECALL_QUERY_CAPABILITY_ID, RecallAdmission, RecallAdmissionError,
+    RECALL_QUERY_CAPABILITY_ID, RECALL_REQUEST_CONTRACT_ID, RecallAdmission, RecallAdmissionError,
     RecallAdmissionReport, RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1,
     RecallConfidenceDefect, RecallDenialReason, RecallOutcomeScopeV1, RecallOutcomeV1,
     RecallRequestParts, RecallScopeBindingsV1, RecallScopeIdentityV1, RecallValidityV1,
@@ -151,6 +151,7 @@ pub use tracedecay_memory_fabric::{
     ProviderStatus, ReadyRouteTarget, RouteTarget, RoutedActiveReply, RoutedProviderIdentity,
     RoutingError, RoutingPolicyError,
 };
+pub use tracedecay_memory_provider_native::RECALL_RESULT_CONTRACT_ID;
 // Re-export the narrow provider-neutral surface that product composition needs
 // to implement an application port. The product crate deliberately depends on
 // this registry crate only; concrete provider crates stay behind this boundary.

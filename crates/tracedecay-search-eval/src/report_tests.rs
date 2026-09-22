@@ -168,6 +168,104 @@ fn baseline_report_retains_raw_fallback_current_and_exact_ten_x_samples() {
     }
 }
 
+/// The report is evidence about labels, not authority over retrieval: its
+/// status vocabulary cannot express qualification or activation, unknown
+/// activation fields are refused on the wire, and workload documents may not
+/// be re-read as the candidate evidence an evaluator run produces. See
+/// `docs/development/search-quality-direct-evaluation.md`.
+#[test]
+fn direct_report_is_evidence_only_and_owns_its_candidate_schema() {
+    let fixture = crate::candidate_output::tests::packaged_fixture();
+    let repo_root = fixture.root();
+    let workload = fixture.workload();
+    let profile_ids = vec![QUERY_BASELINE_PROFILE.to_owned()];
+    let generated = generate_candidate_outputs(&GenerateCandidateOutputsOptions {
+        repo_root,
+        workload_path: None,
+        profile_ids: Some(&profile_ids),
+        admitted_scope: direct_fixture_scope,
+    })
+    .expect("generate direct fixture outputs");
+    let report = evaluate_generated_outputs(repo_root, workload, &generated)
+        .expect("evaluate direct fixture outputs");
+
+    // Closed evidence statuses only. An activation claim such as
+    // status:"qualified" is not a representable DirectEvaluationStatusV1.
+    assert!(matches!(
+        report.status,
+        crate::DirectEvaluationStatusV1::Pass
+            | crate::DirectEvaluationStatusV1::Fail
+            | crate::DirectEvaluationStatusV1::Pending
+    ));
+    for profile in &report.profiles {
+        assert!(matches!(
+            profile.status,
+            crate::DirectEvaluationStatusV1::Pass
+                | crate::DirectEvaluationStatusV1::Fail
+                | crate::DirectEvaluationStatusV1::Pending
+        ));
+        // Offline and cancellation were aliases of observations already on
+        // the profile (fallback match, and a fail-closed generate proof).
+        // They are not separate report fields.
+        let profile_value = serde_json::to_value(profile).expect("profile serializes");
+        assert!(profile_value.get("offline").is_none());
+        assert!(profile_value.get("cancellation_bounded").is_none());
+    }
+
+    let value = serde_json::to_value(&report).expect("serialize direct report");
+    let mut activation_claim = value.clone();
+    activation_claim
+        .as_object_mut()
+        .expect("report object")
+        .insert(
+            "activation".to_owned(),
+            serde_json::json!({"status": "qualified"}),
+        );
+    serde_json::from_value::<DirectEvaluationReportV1>(activation_claim)
+        .expect_err("an activation object is an unknown field, not evidence");
+
+    let mut qualified_status = value.clone();
+    qualified_status["status"] = serde_json::json!("qualified");
+    serde_json::from_value::<DirectEvaluationReportV1>(qualified_status)
+        .expect_err("status:\"qualified\" is not an evidence status");
+
+    // Unrelated future keys are not activation claims; deny_unknown_fields
+    // refuses them as schema, not because their names contain "accepted".
+    let mut unrelated = value;
+    unrelated
+        .as_object_mut()
+        .expect("report object")
+        .insert("accepted_languages".to_owned(), serde_json::json!(["rust"]));
+    let unrelated_error = serde_json::from_value::<DirectEvaluationReportV1>(unrelated)
+        .expect_err("unknown fields are refused by schema")
+        .to_string();
+    assert!(
+        unrelated_error.contains("accepted_languages"),
+        "{unrelated_error}"
+    );
+
+    // Workload documents are schema 1; candidate evidence is schema 2. The two
+    // schemas have separate owners, and the gate refuses to conflate them.
+    assert_eq!(workload.schema_version, 1);
+    assert!(
+        report
+            .raw_outputs
+            .iter()
+            .all(|output| output.schema_version == 2)
+    );
+    let mut workload_schema = generated.clone();
+    for output in &mut workload_schema.outputs {
+        output.schema_version = workload.schema_version;
+    }
+    let error = evaluate_generated_outputs(repo_root, workload, &workload_schema)
+        .expect_err("schema-1 evidence is refused rather than reinterpreted")
+        .to_string();
+    assert!(
+        error.contains("unsupported candidate output schema"),
+        "{error}"
+    );
+}
+
 #[test]
 fn baseline_report_is_self_validating_and_refuses_conceptual_misses() {
     if std::env::var_os(BASELINE_REPORT_RESOURCE_CHILD_ENV).is_none() {

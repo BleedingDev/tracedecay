@@ -24,6 +24,19 @@ import type {
 import { fixtureEnvelope } from "../../test/fixtureEnvelope.ts";
 import { KnowledgePage } from "./KnowledgePage.tsx";
 
+// jsdom ships no 2D canvas, so the ECharts instance behind the trust trace is
+// replaced with an inert one. The trace's option is a pure mapping of the
+// audit rows, and the exact rows it summarises are asserted below; the drawn
+// canvas is proved in a browser.
+vi.mock("../../viz/chart/echarts.ts", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../viz/chart/echarts.ts")>()),
+  init: () => ({
+    setOption: () => {},
+    resize: () => {},
+    dispose: () => {},
+  }),
+}));
+
 /* ---- route bodies -------------------------------------------------------- */
 
 function memoryGraph(facts: readonly MemoryFactRowV1[]): MemoryGraphPayloadV1 {
@@ -241,6 +254,7 @@ const RUNS = {
       run_id: "run-a",
       trigger: "scheduler",
       task: "memory_curator",
+      task_key: "memory_curator",
       backend: "codex_app_server",
       model: "gpt-5-codex",
       status: "succeeded",
@@ -249,6 +263,9 @@ const RUNS = {
       rejected_count: 2,
       skipped_count: 0,
       error: null,
+      error_classification: null,
+      error_retryable: null,
+      backend_attempt_count: 1,
       started_at: "2026-08-01T00:00:00Z",
       completed_at: "2026-08-01T00:01:00Z",
       artifact_kinds: [],
@@ -257,6 +274,7 @@ const RUNS = {
       run_id: "run-b",
       trigger: "manual",
       task: "skill_writer",
+      task_key: "skill_writer",
       backend: "codex_app_server",
       model: null,
       status: "failed",
@@ -267,6 +285,9 @@ const RUNS = {
       started_at: "2026-08-02T00:00:00Z",
       completed_at: "2026-08-02T00:00:30Z",
       error: "backend timed out after 60s",
+      error_classification: "timeout",
+      error_retryable: true,
+      backend_attempt_count: 1,
       artifact_kinds: [],
     },
   ],
@@ -555,7 +576,7 @@ describe("Fact trust history", () => {
   it("renders withheld and unrecorded event details as their own states", async () => {
     stubWithFact();
     renderPage();
-    await userEvent.click(await screen.findByText("a memory fact"));
+    await userEvent.click(await screen.findByRole("button", { name: /a memory fact/ }));
 
     const events = await screen.findByRole("region", {
       name: "Trust history events",
@@ -587,7 +608,7 @@ describe("Fact trust history", () => {
       },
     });
     renderPage();
-    await userEvent.click(await screen.findByText("a memory fact"));
+    await userEvent.click(await screen.findByRole("button", { name: /a memory fact/ }));
 
     expect(await screen.findByText(/this is a partial history window/i)).toBeTruthy();
     expect(screen.getByText("window opening")).toBeTruthy();

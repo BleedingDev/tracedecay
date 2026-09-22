@@ -45,7 +45,8 @@ export const STORY_SURFACES: readonly StorySurface[] = [
     id: 'explorer',
     path: '/explorer',
     label: 'Explorer',
-    description: 'Pivotable search across messages, sessions, facts, code, and time.',
+    description:
+      'One query across four independent lanes — code, sessions, knowledge, semantic — each with its own lifecycle and typed absence.',
     wired: true,
   },
   {
@@ -59,7 +60,8 @@ export const STORY_SURFACES: readonly StorySurface[] = [
     id: 'sessions',
     path: '/sessions',
     label: 'Sessions',
-    description: 'Transcript search, LCM summaries, and raw-message drill-down.',
+    description:
+      'Message volume timeline, provider-qualified session index, transcript search, and the session provenance inspector.',
     wired: true,
   },
   {
@@ -115,7 +117,8 @@ export const STORY_SURFACES: readonly StorySurface[] = [
     id: 'settings',
     path: '/settings',
     label: 'Settings',
-    description: 'Effective layered configuration and validated changes.',
+    description:
+      'Effective configuration review: served provenance, typed write capability, compare-and-swap changes.',
     wired: true,
   },
   {

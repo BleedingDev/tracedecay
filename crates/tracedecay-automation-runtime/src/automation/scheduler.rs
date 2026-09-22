@@ -12,16 +12,13 @@ use serde::{Deserialize, Serialize};
 use tracedecay_automation::config::validate_schedule as validate_leaf_schedule;
 pub use tracedecay_automation::config::{AutomationSchedule, CronSchedule, parse_schedule};
 use tracedecay_automation::evidence_budget::{
-    SESSION_EVIDENCE_BUDGET_SUPPRESSED, SessionEvidenceBudgetBackoff,
-    SessionEvidenceBudgetExceeded, SessionEvidenceBudgetGate,
+    SessionEvidenceBudgetBackoff, SessionEvidenceBudgetExceeded, SessionEvidenceBudgetGate,
 };
 
 use super::backend::{
     AgentTaskFailureClass, AgentTaskKind, agent_task_failure_disposition, task_key,
 };
-use super::backend_identity::{
-    BACKEND_IDENTITY_SUPPRESSED, backend_identity, is_deterministic_failure_class,
-};
+use super::backend_identity::{backend_identity, is_deterministic_failure_class};
 use super::config::{
     AutomationBackend, AutomationConfig, AutomationHostMode, AutomationTaskConfig,
 };
@@ -31,6 +28,7 @@ use super::run_ledger::{
     latest_record_by_canonical_completion, latest_record_by_canonical_completion_key,
 };
 use crate::ports::session_store::AutomationSessionStore;
+use tracedecay_contracts::retained_surfaces::AutomationSkipReasonV1;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
 const DEFAULT_FAILURE_COOLDOWN_SECS: u64 = 300;
@@ -99,7 +97,7 @@ pub fn project_open_backoff(consecutive_failures: u32) -> std::time::Duration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutomationScheduleDecision {
-    skip_reason: Option<&'static str>,
+    skip_reason: Option<AutomationSkipReasonV1>,
 }
 
 impl AutomationScheduleDecision {
@@ -107,18 +105,28 @@ impl AutomationScheduleDecision {
         Self { skip_reason: None }
     }
 
-    pub fn skipped(reason: &'static str) -> Self {
+    pub fn skipped(reason: AutomationSkipReasonV1) -> Self {
         Self {
             skip_reason: Some(reason),
         }
     }
 
-    pub fn skip_reason(&self) -> Option<&'static str> {
+    pub const fn skip_reason(&self) -> Option<AutomationSkipReasonV1> {
         self.skip_reason
     }
 
-    pub fn is_due(&self) -> bool {
+    pub const fn is_due(&self) -> bool {
         self.skip_reason.is_none()
+    }
+}
+
+pub(crate) fn task_disabled_skip(task: AgentTaskKind) -> AutomationSkipReasonV1 {
+    match task {
+        AgentTaskKind::MemoryCurator => AutomationSkipReasonV1::MemoryCuratorDisabled,
+        AgentTaskKind::SessionReflector => AutomationSkipReasonV1::SessionReflectorDisabled,
+        AgentTaskKind::SkillWriter => AutomationSkipReasonV1::SkillWriterDisabled,
+        AgentTaskKind::CombinedReview => AutomationSkipReasonV1::CombinedReviewDisabled,
+        AgentTaskKind::UserJob => AutomationSkipReasonV1::UserJobDisabled,
     }
 }
 
@@ -373,7 +381,9 @@ fn schedule_decision_or_history_denial(
     match schedule_decision_for_trigger(config, task, records, activity, now_secs, enforce_schedule)
     {
         Ok(decision) => decision,
-        Err(_) => AutomationScheduleDecision::skipped("scheduler_history_invalid"),
+        Err(_) => {
+            AutomationScheduleDecision::skipped(AutomationSkipReasonV1::SchedulerHistoryInvalid)
+        }
     }
 }
 
@@ -386,31 +396,41 @@ fn schedule_decision_for_trigger(
     enforce_schedule: bool,
 ) -> Result<AutomationScheduleDecision> {
     if !config.enabled {
-        return Ok(AutomationScheduleDecision::skipped("automation_disabled"));
+        return Ok(AutomationScheduleDecision::skipped(
+            AutomationSkipReasonV1::AutomationDisabled,
+        ));
     }
     if config.host_mode == AutomationHostMode::DelegatedHost {
-        return Ok(AutomationScheduleDecision::skipped("delegated_host_mode"));
+        return Ok(AutomationScheduleDecision::skipped(
+            AutomationSkipReasonV1::DelegatedHostMode,
+        ));
     }
     if config.backend == AutomationBackend::Disabled {
-        return Ok(AutomationScheduleDecision::skipped("backend_disabled"));
+        return Ok(AutomationScheduleDecision::skipped(
+            AutomationSkipReasonV1::BackendDisabled,
+        ));
     }
     let Some(task_config) = task_config(config, task) else {
-        return Ok(AutomationScheduleDecision::skipped("task_not_schedulable"));
+        return Ok(AutomationScheduleDecision::skipped(
+            AutomationSkipReasonV1::TaskNotSchedulable,
+        ));
     };
     if !task_config.enabled {
-        return Ok(AutomationScheduleDecision::skipped("task_disabled"));
+        return Ok(AutomationScheduleDecision::skipped(task_disabled_skip(
+            task,
+        )));
     }
 
     let (interval_secs, cron) = if enforce_schedule {
         let Ok(schedule) = parse_schedule(task_config.schedule.as_deref()) else {
             return Ok(AutomationScheduleDecision::skipped(
-                "scheduler_schedule_invalid",
+                AutomationSkipReasonV1::SchedulerScheduleInvalid,
             ));
         };
         let timing = match schedule {
             AutomationSchedule::Manual => {
                 return Ok(AutomationScheduleDecision::skipped(
-                    "scheduler_schedule_manual",
+                    AutomationSkipReasonV1::SchedulerScheduleManual,
                 ));
             }
             AutomationSchedule::ConfiguredInterval => (task_config.interval_secs, None),
@@ -419,7 +439,7 @@ fn schedule_decision_for_trigger(
         };
         if timing.0.is_none() && timing.1.is_none() {
             return Ok(AutomationScheduleDecision::skipped(
-                "scheduler_schedule_manual",
+                AutomationSkipReasonV1::SchedulerScheduleManual,
             ));
         }
         timing
@@ -435,7 +455,7 @@ fn schedule_decision_for_trigger(
         && elapsed_secs(last_activity, now_secs) < min_idle_secs
     {
         return Ok(AutomationScheduleDecision::skipped(
-            "scheduler_idle_window_active",
+            AutomationSkipReasonV1::SchedulerIdleWindowActive,
         ));
     }
 
@@ -460,7 +480,7 @@ fn schedule_decision_for_trigger(
             );
         if let SessionEvidenceBudgetGate::Suppressed { .. } = backoff.gate(exceeded, now_secs) {
             return Ok(AutomationScheduleDecision::skipped(
-                SESSION_EVIDENCE_BUDGET_SUPPRESSED,
+                AutomationSkipReasonV1::SessionEvidenceBudgetSuppressed,
             ));
         }
     }
@@ -487,7 +507,7 @@ fn schedule_decision_for_trigger(
             match deterministic_backend_failure_standing(record, config) {
                 Ok(BackendFailureStanding::Stands) => {
                     return Ok(AutomationScheduleDecision::skipped(
-                        BACKEND_IDENTITY_SUPPRESSED,
+                        AutomationSkipReasonV1::BackendIdentitySuppressed,
                     ));
                 }
                 Ok(BackendFailureStanding::IdentityChanged) => {
@@ -504,7 +524,7 @@ fn schedule_decision_for_trigger(
                         && !matches!(failure.classification, Some(AgentTaskFailureClass::Denied))
                     {
                         return Ok(AutomationScheduleDecision::skipped(
-                            "scheduler_non_retryable_failure",
+                            AutomationSkipReasonV1::SchedulerNonRetryableFailure,
                         ));
                     }
                 }
@@ -523,7 +543,7 @@ fn schedule_decision_for_trigger(
                 .unwrap_or(DEFAULT_FAILURE_COOLDOWN_SECS);
             if elapsed_secs(completed_at, now_secs) < cooldown_secs {
                 return Ok(AutomationScheduleDecision::skipped(
-                    "scheduler_cooldown_active",
+                    AutomationSkipReasonV1::SchedulerCooldownActive,
                 ));
             }
         }
@@ -551,14 +571,14 @@ fn schedule_decision_for_trigger(
                 && elapsed_secs(completed_at, now_secs) < interval_secs
             {
                 return Ok(AutomationScheduleDecision::skipped(
-                    "scheduler_interval_not_elapsed",
+                    AutomationSkipReasonV1::SchedulerIntervalNotElapsed,
                 ));
             }
             if let Some(cron) = cron.filter(|_| !fresh_session_activity)
                 && !cron_is_due(&cron, Some(completed_at), now_secs)
             {
                 return Ok(AutomationScheduleDecision::skipped(
-                    "scheduler_cron_not_due",
+                    AutomationSkipReasonV1::SchedulerCronNotDue,
                 ));
             }
         }
@@ -566,7 +586,7 @@ fn schedule_decision_for_trigger(
         && !cron_is_due(&cron, None, now_secs)
     {
         return Ok(AutomationScheduleDecision::skipped(
-            "scheduler_cron_not_due",
+            AutomationSkipReasonV1::SchedulerCronNotDue,
         ));
     }
 
@@ -580,7 +600,7 @@ fn schedule_decision_for_trigger(
         let requires_fresh_activity = latest_cadence.is_some() && !retryable_cadence_terminal;
         if !has_activity_authority || (requires_fresh_activity && !fresh_session_activity) {
             return Ok(AutomationScheduleDecision::skipped(
-                "no_new_session_activity",
+                AutomationSkipReasonV1::NoNewSessionActivity,
             ));
         }
     }
@@ -709,10 +729,9 @@ fn skipped_terminal_failure_class(
     {
         return None;
     }
-    match record.error.as_deref()? {
-        "session_evidence_timed_out" => Some(AgentTaskFailureClass::Timeout),
-        _ => None,
-    }
+    AutomationSkipReasonV1::from_ledger_reason(record.error.as_deref()?)?
+        .is_retryable_retrieval_timeout()
+        .then_some(AgentTaskFailureClass::Timeout)
 }
 
 /// A cron schedule is due when a matching wall-clock minute has occurred
@@ -784,23 +803,13 @@ fn is_scheduler_diagnostic_skip(reason: Option<&str>) -> bool {
     let Some(reason) = reason else {
         return false;
     };
-    reason.starts_with("scheduler_")
-        || matches!(
-            reason,
-            "automation_disabled"
-                | "delegated_host_mode"
-                | "backend_disabled"
-                | "task_not_schedulable"
-                | "task_disabled"
-                | "memory_curator_disabled"
-                | "session_reflector_disabled"
-                | "skill_writer_disabled"
-                | "combined_review_disabled"
-                | "user_job_disabled"
-                | "no_new_session_activity"
-                | SESSION_EVIDENCE_BUDGET_SUPPRESSED
-                | BACKEND_IDENTITY_SUPPRESSED
-        )
+    // Retired intermediate label. Current producers emit the task-specific
+    // disabled variant. Historical rows must stay cadence-neutral.
+    if reason == "task_disabled" {
+        return true;
+    }
+    AutomationSkipReasonV1::from_ledger_reason(reason)
+        .is_some_and(AutomationSkipReasonV1::is_cadence_diagnostic)
 }
 
 fn parse_started_at(record: &AutomationRunLedgerRecord) -> Result<i64> {
@@ -1055,10 +1064,18 @@ fn prepare_task_lock_publication(
         options.mode(0o600);
         parent.open_with(&staging_name, &options)?
     };
-    let payload = format!(
-        "pid={}\ncreated_at={now_secs}\ntoken={ownership_token}\n",
-        std::process::id()
-    );
+    let started_at =
+        tracedecay_runtime_core::lifecycle_lease::process_start_time(std::process::id());
+    let payload = match started_at {
+        Some(started_at) => format!(
+            "pid={}\ncreated_at={now_secs}\nstarted_at={started_at}\ntoken={ownership_token}\n",
+            std::process::id()
+        ),
+        None => format!(
+            "pid={}\ncreated_at={now_secs}\ntoken={ownership_token}\n",
+            std::process::id()
+        ),
+    };
     let write_result = file
         .write_all(payload.as_bytes())
         .and_then(|()| file.sync_all());
@@ -1251,6 +1268,10 @@ fn acquire_task_lock_coordination(path: &Path) -> std::io::Result<std::fs::File>
 struct AutomationTaskLockSnapshot {
     pid: Option<u32>,
     created_at: Option<i64>,
+    /// Process start time recorded when the lock was published. Absent on
+    /// locks written before start-time fencing, and when the publisher could
+    /// not read its own start time.
+    started_at: Option<u64>,
     ownership_token: Option<String>,
 }
 
@@ -1291,6 +1312,9 @@ fn read_task_lock_snapshot(path: &Path) -> std::io::Result<Option<AutomationTask
     let payload_created_at = contents
         .and_then(|contents| parse_unique_lock_field(contents, "created_at="))
         .and_then(|value| value.parse::<i64>().ok());
+    let started_at = contents
+        .and_then(|contents| parse_unique_lock_field(contents, "started_at="))
+        .and_then(|value| value.parse::<u64>().ok());
     let ownership_token = contents
         .and_then(|contents| parse_unique_lock_field(contents, "token="))
         .filter(|value| valid_automation_task_lock_token(value))
@@ -1306,6 +1330,7 @@ fn read_task_lock_snapshot(path: &Path) -> std::io::Result<Option<AutomationTask
     Ok(Some(AutomationTaskLockSnapshot {
         pid,
         created_at,
+        started_at,
         ownership_token,
     }))
 }
@@ -1330,34 +1355,65 @@ fn task_lock_is_reclaimable(
     stale_after_secs: Option<u64>,
     now_secs: i64,
 ) -> bool {
-    let Some(stale_after_secs) = stale_after_secs else {
-        return false;
-    };
     match snapshot.pid {
         Some(pid) => match process_state(pid) {
-            // A live (or unknown-liveness, kept conservative) owner still
-            // holds the lock regardless of age.
-            ProcessState::Live | ProcessState::Unknown => false,
-            // A confirmed-dead owner's lock is reclaimable once it is stale.
-            ProcessState::Dead => snapshot
-                .created_at
-                .is_some_and(|created_at| elapsed_secs(created_at, now_secs) >= stale_after_secs),
+            // A confirmed-dead owner cannot still be inside the critical
+            // section. Age is irrelevant: a reused PID would look live, not
+            // dead, so waiting `stale_after_secs` only delays the retry.
+            ProcessState::Dead => true,
+            // Unknown liveness stays on the age gate. A missing age bound
+            // means the caller disabled that fallback.
+            ProcessState::Unknown => {
+                age_lock_is_reclaimable(snapshot.created_at, stale_after_secs, now_secs)
+            }
+            // A live PID is the owner only when its start time matches the
+            // one published with the lock. A mismatch is PID reuse (including
+            // a process this user cannot signal). A live PID with no recorded
+            // start time is a legacy lock and is not stolen.
+            ProcessState::Live => recorded_owner_was_reused(pid, snapshot.started_at),
         },
         // The payload could not yield a pid (missing, oversized, non-UTF-8,
         // or duplicate `pid=` lines). Fall back to age-based staleness using
         // `created_at`, which `read_task_lock_snapshot` already backfills
         // from the file's mtime when the payload has no parseable
         // `created_at=` field.
-        None => match snapshot.created_at {
-            Some(created_at) => elapsed_secs(created_at, now_secs) >= stale_after_secs,
-            // Crash-debris escape hatch: no parseable pid AND no readable
-            // creation time (payload and mtime both unavailable) means the
-            // lock can never be aged by any other path, so treat it as
-            // reclaimable rather than permanently wedging the scheduler
-            // tick behind garbage lock contents.
-            None => true,
-        },
+        None => age_lock_is_reclaimable(snapshot.created_at, stale_after_secs, now_secs),
     }
+}
+
+fn age_lock_is_reclaimable(
+    created_at: Option<i64>,
+    stale_after_secs: Option<u64>,
+    now_secs: i64,
+) -> bool {
+    let Some(stale_after_secs) = stale_after_secs else {
+        return false;
+    };
+    match created_at {
+        Some(created_at) => elapsed_secs(created_at, now_secs) >= stale_after_secs,
+        // Crash-debris escape hatch: no parseable pid AND no readable
+        // creation time (payload and mtime both unavailable) means the
+        // lock can never be aged by any other path, so treat it as
+        // reclaimable rather than permanently wedging the scheduler
+        // tick behind garbage lock contents.
+        None => true,
+    }
+}
+
+fn recorded_owner_was_reused(pid: u32, recorded_started_at: Option<u64>) -> bool {
+    let Some(recorded_started_at) = recorded_started_at else {
+        return false;
+    };
+    tracedecay_runtime_core::lifecycle_lease::process_start_time(pid)
+        .is_some_and(|live_started_at| live_started_at != recorded_started_at)
+}
+
+/// Confirmed-dead process, as opposed to a live or unreadable one.
+///
+/// Skill-overlay crash residue and other convergent startup scans use this
+/// so they adopt a dead exporter's backup without stealing a live one's.
+pub(crate) fn foreign_process_is_dead(pid: u32) -> bool {
+    pid != std::process::id() && matches!(process_state(pid), ProcessState::Dead)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1457,10 +1513,13 @@ fn windows_process_state(pid: u32) -> ProcessState {
 #[cfg(test)]
 mod tests {
     use super::super::backend::{AgentTaskFailureClass, AgentTaskRetryAttempt};
+    use super::super::backend_identity::BACKEND_IDENTITY_SUPPRESSED;
     use super::super::config::AutomationTaskSet;
     use super::*;
     use tempfile::tempdir;
-    use tracedecay_automation::evidence_budget::SESSION_EVIDENCE_BUDGET_EXHAUSTED;
+    use tracedecay_automation::evidence_budget::{
+        SESSION_EVIDENCE_BUDGET_EXHAUSTED, SESSION_EVIDENCE_BUDGET_SUPPRESSED,
+    };
 
     #[test]
     fn backoff_starts_at_one_tick_and_grows() {
@@ -1660,7 +1719,8 @@ disconnected: config error: codex app-server closed stdout before completing";
                     SessionActivity::none(),
                     now_secs,
                 )
-                .skip_reason(),
+                .skip_reason()
+                .map(AutomationSkipReasonV1::as_str),
                 Some(BACKEND_IDENTITY_SUPPRESSED),
                 "tick at {now_secs} must stay settled, not relaunch",
             );
@@ -1722,7 +1782,8 @@ evidence about it",
                 SessionActivity::none(),
                 now_secs,
             )
-            .skip_reason(),
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
             Some(BACKEND_IDENTITY_SUPPRESSED),
         );
         std::fs::write(&path, b"backend-revision-two-replaced").unwrap();
@@ -1778,7 +1839,8 @@ evidence about it",
                     SessionActivity::none(),
                     2_000 + DEFAULT_FAILURE_COOLDOWN_SECS as i64 - 1,
                 )
-                .skip_reason(),
+                .skip_reason()
+                .map(AutomationSkipReasonV1::as_str),
                 Some("scheduler_cooldown_active"),
                 "transient {classification:?} must keep the ordinary cooldown",
             );
@@ -1890,7 +1952,8 @@ evidence about it",
                     SessionActivity::at(2_500),
                     2_060,
                 )
-                .skip_reason(),
+                .skip_reason()
+                .map(AutomationSkipReasonV1::as_str),
                 Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED),
                 "{reason} must activate the same backoff",
             );
@@ -1959,7 +2022,8 @@ evidence about it",
                 SessionActivity::at(2_500),
                 2_060,
             )
-            .skip_reason(),
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
             Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED)
         );
     }
@@ -1988,7 +2052,8 @@ evidence about it",
                 SessionActivity::at(2_500),
                 2_120,
             )
-            .skip_reason(),
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
             Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED)
         );
         assert!(
@@ -2064,6 +2129,16 @@ evidence about it",
         );
 
         assert_eq!(
+            skipped_terminal_failure_class(&timeout),
+            Some(AgentTaskFailureClass::Timeout),
+            "ledger timeout must classify through AutomationSkipReasonV1, not an inline string match",
+        );
+        assert_eq!(
+            AutomationSkipReasonV1::from_ledger_reason("session_evidence_timed_out"),
+            Some(AutomationSkipReasonV1::SessionEvidenceTimedOut),
+        );
+
+        assert_eq!(
             schedule_decision(
                 &config,
                 AgentTaskKind::SessionReflector,
@@ -2071,7 +2146,8 @@ evidence about it",
                 SessionActivity::at(1_500),
                 2_000 + DEFAULT_FAILURE_COOLDOWN_SECS as i64 - 1,
             )
-            .skip_reason(),
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
             Some("scheduler_cooldown_active"),
         );
         assert!(
@@ -2094,6 +2170,11 @@ evidence about it",
             2_000,
         );
         assert_eq!(
+            skipped_terminal_failure_class(&cancelled),
+            None,
+            "cancellation must not enter the retryable failure class",
+        );
+        assert_eq!(
             schedule_decision(
                 &config,
                 AgentTaskKind::SessionReflector,
@@ -2101,7 +2182,8 @@ evidence about it",
                 SessionActivity::at(1_500),
                 2_000 + DEFAULT_FAILURE_COOLDOWN_SECS as i64,
             )
-            .skip_reason(),
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
             Some("no_new_session_activity"),
             "cancellation remains an effectful skip that needs fresh activity",
         );
@@ -2307,6 +2389,7 @@ evidence about it",
         let snapshot = AutomationTaskLockSnapshot {
             pid: None,
             created_at: Some(100),
+            started_at: None,
             ownership_token: None,
         };
         assert!(
@@ -2320,6 +2403,7 @@ evidence about it",
         let snapshot = AutomationTaskLockSnapshot {
             pid: None,
             created_at: Some(195),
+            started_at: None,
             ownership_token: None,
         };
         assert!(
@@ -2333,6 +2417,7 @@ evidence about it",
         let snapshot = AutomationTaskLockSnapshot {
             pid: None,
             created_at: None,
+            started_at: None,
             ownership_token: None,
         };
         assert!(
@@ -2347,11 +2432,76 @@ evidence about it",
         let snapshot = AutomationTaskLockSnapshot {
             pid: Some(std::process::id()),
             created_at: Some(0),
+            started_at: None,
             ownership_token: None,
         };
         assert!(
             !task_lock_is_reclaimable(&snapshot, Some(10), 200),
             "a live owner must never be reclaimed, no matter how old the lock is"
+        );
+    }
+
+    fn reapable_process_program() -> &'static str {
+        if cfg!(windows) { "cmd" } else { "true" }
+    }
+
+    fn reapable_process_args() -> &'static [&'static str] {
+        if cfg!(windows) { &["/C", "exit"] } else { &[] }
+    }
+
+    #[test]
+    fn task_lock_is_reclaimable_for_a_fresh_confirmed_dead_pid() {
+        let mut child = std::process::Command::new(reapable_process_program())
+            .args(reapable_process_args())
+            .spawn()
+            .expect("spawn a process to reap");
+        let dead_pid = child.id();
+        child.wait().expect("reap lock owner");
+        assert!(
+            matches!(process_state(dead_pid), ProcessState::Dead),
+            "the reaped child must be a confirmed-dead owner"
+        );
+        let snapshot = AutomationTaskLockSnapshot {
+            pid: Some(dead_pid),
+            created_at: Some(200),
+            started_at: None,
+            ownership_token: None,
+        };
+        assert!(
+            task_lock_is_reclaimable(&snapshot, Some(6 * 60 * 60), 200),
+            "a confirmed-dead owner must be reclaimed immediately, not after the age gate"
+        );
+        assert!(
+            task_lock_is_reclaimable(&snapshot, None, 200),
+            "disabling the age fallback must not keep a dead owner's lock"
+        );
+    }
+
+    #[test]
+    fn task_lock_is_reclaimable_when_a_live_pid_start_time_does_not_match() {
+        let Some(live_started_at) =
+            tracedecay_runtime_core::lifecycle_lease::process_start_time(std::process::id())
+        else {
+            return;
+        };
+        let mismatched = live_started_at.saturating_add(1);
+        let snapshot = AutomationTaskLockSnapshot {
+            pid: Some(std::process::id()),
+            created_at: Some(200),
+            started_at: Some(mismatched),
+            ownership_token: None,
+        };
+        assert!(
+            task_lock_is_reclaimable(&snapshot, None, 200),
+            "a reused PID must not keep a lock published by a different process start"
+        );
+        let same_owner = AutomationTaskLockSnapshot {
+            started_at: Some(live_started_at),
+            ..snapshot
+        };
+        assert!(
+            !task_lock_is_reclaimable(&same_owner, Some(0), 10_000),
+            "a matching start time is the same owner even when the lock is old"
         );
     }
 

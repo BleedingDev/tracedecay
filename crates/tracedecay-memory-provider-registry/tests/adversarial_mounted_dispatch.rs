@@ -43,6 +43,19 @@ fn always(misbehaviour: MisbehaviourV1) -> AdversarialScriptV1<MisbehaviourV1> {
     AdversarialScriptV1::always(misbehaviour)
 }
 
+fn assert_native_application_contract_violation(error: &CognitiveRecallPortError) {
+    assert!(
+        matches!(
+            error,
+            CognitiveRecallPortError::TerminalFailed {
+                terminal_code: TerminalCode::ContractViolation,
+                diagnostic_id,
+            } if diagnostic_id.as_deref() == Some("native.application_reply_contract_violation")
+        ),
+        "{error:?}"
+    );
+}
+
 /// A generous deadline: no test that is not about deadlines should be able to
 /// pass or fail because of one.
 const AMPLE_DEADLINE_MICROS: i64 = 60_000_000;
@@ -66,15 +79,15 @@ const ENTRY_BUDGET: Duration = Duration::from_secs(5);
 const CANCELLATION_RELEASE_CEILING: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------
-// Readiness: a provider that lies about what it is
+// Readiness: application claims cannot expand the Native capability surface
 // ---------------------------------------------------------------------------
 
-/// A provider whose *handshake* grows a capability its registered descriptor
-/// never declared is refused before one recall is dispatched. Capability
-/// claims are settled against the registration, not against whatever the
-/// provider says once it is running.
+/// A Native application port whose handshake grows an unsupported capability
+/// cannot expand the adapter's fixed provider capability surface. The extra
+/// claim is projected out and ordinary recall still uses the registered
+/// capability set.
 #[tokio::test]
-async fn a_provider_that_lies_about_its_capabilities_never_answers_a_recall() {
+async fn an_unregistered_application_capability_is_projected_out() {
     let provider = double_with_handshake(
         AdversarialScriptV1::always(HandshakeMisbehaviourV1::DeclaresUnregisteredCapability(
             "adversarial.extra.v1".to_owned(),
@@ -86,25 +99,15 @@ async fn a_provider_that_lies_about_its_capabilities_never_answers_a_recall() {
     let port =
         mount(compose_active(Arc::clone(&provider)), Arc::clone(&observer)).expect("mounted port");
 
-    let error = port
+    let outcome = port
         .recall_admitted(request(AMPLE_DEADLINE_MICROS, 8), &live_signal())
         .await
-        .expect_err("the host must refuse a provider that redeclares its capabilities");
+        .expect("an unsupported application capability cannot expand Native");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::SuccessfulHandshakeDescriptorMismatch)
-        ),
-        "{error:?}"
-    );
-    assert_eq!(
-        provider.invocation_count(),
-        0,
-        "no recall may be dispatched to a provider whose readiness was refused"
-    );
+    assert_eq!(outcome.result.candidates().len(), 2);
+    assert_eq!(provider.invocation_count(), 1);
     assert_eq!(provider.in_flight(), 0);
-    assert!(observer.reports().is_empty());
+    assert_eq!(observer.reports().len(), 1);
 }
 
 /// A provider that answers readiness for a different checkout is refused: the
@@ -130,7 +133,9 @@ async fn a_handshake_that_accepts_a_foreign_scope_never_reaches_a_recall() {
     assert!(
         matches!(
             error,
-            CognitiveRecallPortError::Fabric(FabricError::SuccessfulHandshakeScopeMismatch)
+            CognitiveRecallPortError::HandshakeNotReady {
+                terminal_code: TerminalCode::ContractViolation,
+            }
         ),
         "{error:?}"
     );
@@ -160,16 +165,7 @@ async fn a_recall_terminal_for_another_operation_is_refused() {
         .await
         .expect_err("a terminal for another operation kind must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::ResponseOperationKindMismatch {
-                expected: ProviderOperation::Recall,
-                returned: ProviderOperation::Health,
-            })
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
     assert_eq!(provider.invocation_count(), 1);
     assert_eq!(provider.in_flight(), 0);
     assert!(observer.reports().is_empty());
@@ -194,13 +190,7 @@ async fn a_recall_reply_for_a_foreign_operation_id_is_refused() {
         .await
         .expect_err("a reply for a foreign operation must be refused");
 
-    match error {
-        CognitiveRecallPortError::Fabric(FabricError::ResponseOperationMismatch {
-            returned,
-            ..
-        }) => assert_eq!(returned, "adversarial.foreign-operation.v1"),
-        other => panic!("expected an operation-identity mismatch, got {other:?}"),
-    }
+    assert_native_application_contract_violation(&error);
 }
 
 /// A reply bound to another exact scope is refused even though every other
@@ -222,13 +212,7 @@ async fn a_recall_terminal_bound_to_a_foreign_scope_is_refused() {
         .await
         .expect_err("a terminal bound to a foreign scope must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::ResponseScopeMismatch { .. })
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
 }
 
 /// A failing terminal may not smuggle a result payload past the host: the
@@ -252,17 +236,7 @@ async fn a_payload_on_a_failing_recall_terminal_is_refused() {
         .await
         .expect_err("a payload on a failing terminal must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::Api(
-                ApiError::PayloadForbiddenForTerminal {
-                    terminal_code: TerminalCode::CapacityExceeded,
-                }
-            ))
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
 }
 
 /// A provider whose state generation moved backwards under the host — a
@@ -284,13 +258,7 @@ async fn a_recall_state_generation_that_moved_backwards_is_refused() {
         .await
         .expect_err("a regressed state generation must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::ResponseStateGenerationMismatch { .. })
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
 }
 
 /// A reply past the effective response ceiling negotiated at handshake is
@@ -314,16 +282,7 @@ async fn an_oversized_recall_reply_is_refused_by_the_effective_ceiling() {
         .await
         .expect_err("an oversized reply must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::Api(ApiError::BoundaryBytesExceeded {
-                field: "response",
-                ..
-            }))
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
 }
 
 /// A success whose payload digest does not describe its bytes is corrupted
@@ -345,25 +304,17 @@ async fn a_recall_payload_whose_digest_is_forged_is_refused() {
         .await
         .expect_err("a forged payload digest must be refused");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Fabric(FabricError::Api(ApiError::ContentDigestMismatch(
-                "payload_sha256"
-            )))
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
 }
 
 // ---------------------------------------------------------------------------
 // Candidate-level misbehaviour: admission, selection, and leak containment
 // ---------------------------------------------------------------------------
 
-/// Bytes that are not a canonical recall outcome are a typed admission
-/// failure, never a silently empty result.
+/// Bytes that are not a canonical JSON result are refused by Native before
+/// admission, never treated as a silently empty result.
 #[tokio::test]
-async fn undecodable_recall_bytes_are_a_typed_admission_error() {
+async fn undecodable_recall_bytes_are_refused_at_native_boundary() {
     let provider = double(
         always(MisbehaviourV1::Compliant),
         RecallOutcomeShapeV1::Undecodable,
@@ -377,13 +328,7 @@ async fn undecodable_recall_bytes_are_a_typed_admission_error() {
         .await
         .expect_err("undecodable outcome bytes must be a typed failure");
 
-    assert!(
-        matches!(
-            error,
-            CognitiveRecallPortError::Admission(RecallAdmissionError::PayloadDecode { .. })
-        ),
-        "{error:?}"
-    );
+    assert_native_application_contract_violation(&error);
     assert!(
         observer.reports().is_empty(),
         "no admission ledger exists for an outcome that never decoded"

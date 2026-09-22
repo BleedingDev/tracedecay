@@ -42,6 +42,9 @@ pub(crate) mod native_provider;
 #[cfg(all(test, feature = "memory-provider-host"))]
 #[path = "retained_owner/native_provider_parity_tests.rs"]
 mod native_provider_parity_tests;
+#[cfg(all(test, feature = "memory-provider-host"))]
+#[path = "retained_owner/native_provider_replacement_acceptance.rs"]
+mod native_provider_replacement_acceptance;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_session_recall;
 #[cfg(feature = "memory-provider-host")]

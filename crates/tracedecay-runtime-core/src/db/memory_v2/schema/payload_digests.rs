@@ -46,6 +46,16 @@ pub(in crate::db) const PAYLOAD_DIGESTS_SCHEMA: &str =
             WHERE payload_rowid = OLD.rowid;
         END;";
 
+/// Catalog objects owned by [`PAYLOAD_DIGESTS_SCHEMA`]. Migration admission
+/// uses this inventory to distinguish an interrupted digest step from other
+/// schema drift without duplicating the DDL authority.
+pub(in crate::db) const PAYLOAD_DIGEST_OBJECTS: &[&str] = &[
+    "memory_v2_assertion_payload_digests",
+    "memory_v2_assertion_payload_digests_lookup",
+    "memory_v2_assertion_payload_digests_no_update",
+    "memory_v2_payloads_digest_delete",
+];
+
 pub(super) async fn install_payload_digests(
     conn: &impl MemoryV2Executor,
     operation: &str,

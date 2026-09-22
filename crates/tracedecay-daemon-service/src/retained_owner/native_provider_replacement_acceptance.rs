@@ -2155,36 +2155,27 @@ fn create_backup(fixture: &Beta37V1ProfileFixture) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn replacement_ncm_paths(temp: &TempDir) -> Option<(PathBuf, PathBuf)> {
-    let worker = match std::env::var_os("TRACEDECAY_NCM_WORKER") {
-        Some(path) => PathBuf::from(path),
-        None => {
-            eprintln!("SKIP beta37 replacement journey: TRACEDECAY_NCM_WORKER is not configured");
-            return None;
-        }
-    };
-    let installed = match std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT") {
-        Some(path) => PathBuf::from(path),
-        None => {
-            eprintln!(
-                "SKIP beta37 replacement journey: TRACEDECAY_NCM_REAL_MODEL_ROOT is not configured"
-            );
-            return None;
-        }
-    };
-    if !worker.is_absolute() || !installed.is_absolute() || !worker.is_file() {
-        eprintln!(
-            "SKIP beta37 replacement journey: configured NCM worker/model paths are not absolute regular paths"
-        );
-        return None;
-    }
+fn replacement_ncm_paths(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let worker = PathBuf::from(
+        std::env::var_os("TRACEDECAY_NCM_WORKER")
+            .expect("TRACEDECAY_NCM_WORKER is required for the ignored beta37 replacement journey"),
+    );
+    let installed = PathBuf::from(std::env::var_os("TRACEDECAY_NCM_REAL_MODEL_ROOT").expect(
+        "TRACEDECAY_NCM_REAL_MODEL_ROOT is required for the ignored beta37 replacement journey",
+    ));
+    assert!(
+        worker.is_absolute() && worker.is_file(),
+        "TRACEDECAY_NCM_WORKER must be an absolute regular-file path"
+    );
+    assert!(
+        installed.is_absolute(),
+        "TRACEDECAY_NCM_REAL_MODEL_ROOT must be an absolute path"
+    );
     let model_dir = installed.join("models");
-    if !model_dir.is_dir() {
-        eprintln!(
-            "SKIP beta37 replacement journey: installed NCM model root has no models directory"
-        );
-        return None;
-    }
+    assert!(
+        model_dir.is_dir(),
+        "TRACEDECAY_NCM_REAL_MODEL_ROOT must contain a models directory"
+    );
     let worker = fs::canonicalize(worker).expect("canonical configured NCM worker");
     let model_dir = fs::canonicalize(model_dir).expect("canonical installed NCM models");
     let state_root = temp.path().join("ncm-state");
@@ -2200,7 +2191,7 @@ fn replacement_ncm_paths(temp: &TempDir) -> Option<(PathBuf, PathBuf)> {
         model_dir,
         "NCM mutable state must remain separate from immutable model artifacts"
     );
-    Some((worker, state_root))
+    (worker, state_root)
 }
 
 #[cfg(unix)]
@@ -2250,43 +2241,37 @@ fn copy_ncm_model_tree(source: &Path, target: &Path) {
 }
 
 #[cfg(unix)]
-fn replacement_cli_path() -> Option<PathBuf> {
+fn replacement_cli_path() -> PathBuf {
     if let Some(path) = std::env::var_os("TRACEDECAY_V1_TO_V2_CLI") {
         let path = PathBuf::from(path);
         assert!(
             path.is_file(),
             "TRACEDECAY_V1_TO_V2_CLI must point to the shipped tracedecay binary"
         );
-        return Some(path);
+        return path;
     }
-    let Some(path) = std::env::var_os("CARGO_BIN_EXE_tracedecay") else {
-        eprintln!(
-            "SKIP beta37 replacement journey: no shipped tracedecay CLI (TRACEDECAY_V1_TO_V2_CLI/CARGO_BIN_EXE_tracedecay) is available"
-        );
-        return None;
-    };
+    let path = std::env::var_os("CARGO_BIN_EXE_tracedecay").expect(
+        "TRACEDECAY_V1_TO_V2_CLI or CARGO_BIN_EXE_tracedecay is required for the ignored beta37 replacement journey",
+    );
     let path = PathBuf::from(path);
     assert!(
         path.is_file(),
         "CARGO_BIN_EXE_tracedecay must point to the shipped tracedecay binary"
     );
-    Some(path)
+    path
 }
 
 #[cfg(unix)]
-fn replacement_v1_harness_path() -> Option<PathBuf> {
-    let Some(path) = std::env::var_os("TRACEDECAY_V1_BETA37_HARNESS") else {
-        eprintln!(
-            "SKIP beta37 replacement journey: TRACEDECAY_V1_BETA37_HARNESS is not configured with the released beta.37 service harness"
-        );
-        return None;
-    };
+fn replacement_v1_harness_path() -> PathBuf {
+    let path = std::env::var_os("TRACEDECAY_V1_BETA37_HARNESS").expect(
+        "TRACEDECAY_V1_BETA37_HARNESS is required for the ignored beta37 replacement journey",
+    );
     let path = PathBuf::from(path);
     assert!(
         path.is_file(),
         "TRACEDECAY_V1_BETA37_HARNESS must point to the released beta.37 service/binary harness"
     );
-    Some(path)
+    path
 }
 
 #[cfg(unix)]
@@ -3863,17 +3848,12 @@ async fn beta37_complete_backup_faults_preserve_authorities_and_rehearse_exactly
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the shipped V2 CLI, released beta.37 harness, NCM worker, and pinned offline model"]
 async fn beta37_released_native_ncm_native_rollback_journey() {
-    let Some(cli) = replacement_cli_path() else {
-        return;
-    };
-    let Some(harness) = replacement_v1_harness_path() else {
-        return;
-    };
+    let cli = replacement_cli_path();
+    let harness = replacement_v1_harness_path();
     let fixture = Beta37V1ProfileFixture::create().await;
-    let Some((worker_binary, ncm_state_root)) = replacement_ncm_paths(&fixture.temp) else {
-        return;
-    };
+    let (worker_binary, ncm_state_root) = replacement_ncm_paths(&fixture.temp);
 
     // The old release is installed and started by its own service harness;
     // this keeps the pre-migration evidence tied to a real V1 process rather

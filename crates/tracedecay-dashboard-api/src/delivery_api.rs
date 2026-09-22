@@ -8,8 +8,9 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
+use futures_util::stream::{self, StreamExt};
 use schemars::JsonSchema;
 use serde::Serialize;
 use tracedecay_application::advisory::{GitHubReleaseV1, ProjectGitHubReleasePageV1};
@@ -26,6 +27,7 @@ use tracedecay_application::delivery::{
     ProjectDeliveryInboxCoverageV1, ProjectDeliveryInboxPullRequestStateV1,
     ProjectDeliveryInboxSourceV1, ProjectDeliveryIndexedHeadV1, ProjectDeliveryMembershipBasisV1,
     ProjectDeliveryProviderMountGateV1, ProjectDeliveryProviderStateV1,
+    ProjectDeliveryProximityAttentionSourceV1, ProjectDeliveryProximityRelationV1,
     ProjectDeliveryPullRequestIdentityV1, ProjectDeliveryPullRequestOperationV1,
     ProjectDeliveryPullRequestStateV1, ProjectDeliveryPullRequestV1, ProjectDeliveryReadKindV1,
     ProjectDeliveryReadOutcomeV1, ProjectDeliveryReadRequestV1, ProjectDeliveryRegistrySourceV1,
@@ -56,7 +58,7 @@ use super::read_model::{
     DashboardLegalActionKindV1, DashboardLegalActionRefV1, DashboardVersionV1,
     DashboardWatermarkV1, scope_from_state,
 };
-use super::{DashboardHttpRequestControlV1, DashboardState};
+use super::{DashboardHttpRequestControlV1, DashboardState, RequestControl};
 
 const DELIVERY_SOURCE_COUNT: u64 = 8;
 const MAX_DELIVERY_INBOX_PROJECTS_V1: usize = 64;
@@ -659,6 +661,28 @@ pub enum DeliveryAttentionStateV1 {
     Denied,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryProximityRelationV1 {
+    CodeNeighborhoodCandidate,
+    SharedCodeCandidate,
+    OverlappingEdit,
+    ConfirmedConflict,
+}
+
+impl From<ProjectDeliveryProximityRelationV1> for DeliveryProximityRelationV1 {
+    fn from(relation: ProjectDeliveryProximityRelationV1) -> Self {
+        match relation {
+            ProjectDeliveryProximityRelationV1::CodeNeighborhoodCandidate => {
+                Self::CodeNeighborhoodCandidate
+            }
+            ProjectDeliveryProximityRelationV1::SharedCodeCandidate => Self::SharedCodeCandidate,
+            ProjectDeliveryProximityRelationV1::OverlappingEdit => Self::OverlappingEdit,
+            ProjectDeliveryProximityRelationV1::ConfirmedConflict => Self::ConfirmedConflict,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DeliveryAttentionEvidenceV1 {
@@ -675,6 +699,10 @@ pub enum DeliveryAttentionEvidenceV1 {
     },
     IndexedGeneration {
         generation: String,
+    },
+    ProximityEncounter {
+        encounter_id: String,
+        relation: DeliveryProximityRelationV1,
     },
 }
 
@@ -793,6 +821,9 @@ pub struct DashboardDeliveryProjectV1 {
 /// registered project's live head. HTTP supplies the registered target and an
 /// observed head only as bounded consistency inputs; it never constructs a
 /// `RequestContext`.
+///
+/// Proximity is a read on this same port. Inbox HTTP must not thread a second
+/// authority for a join the delivery adapter already owns.
 pub trait DashboardDeliveryReadPortV1: Send + Sync {
     fn read(
         &self,
@@ -800,18 +831,35 @@ pub trait DashboardDeliveryReadPortV1: Send + Sync {
         project: DashboardDeliveryProjectV1,
         request: ProjectDeliveryReadRequestV1,
     ) -> DashboardDeliveryReadFutureV1<'_>;
+
+    /// Canonical proximity folded into Delivery's join input.
+    ///
+    /// The default is `Unsupported`: a port that does not read proximity must
+    /// not invent Clear. Production adapters override this and keep denied,
+    /// unavailable, and partial coverage distinct.
+    fn read_proximity_attention(
+        &self,
+        _control: DashboardHttpRequestControlV1,
+        _project: DashboardDeliveryProjectV1,
+    ) -> DashboardProximityAttentionReadFutureV1<'_> {
+        Box::pin(async { ProjectDeliveryProximityAttentionSourceV1::Unsupported })
+    }
 }
+
+pub type DashboardProximityAttentionReadFutureV1<'a> =
+    Pin<Box<dyn Future<Output = ProjectDeliveryProximityAttentionSourceV1> + Send + 'a>>;
 
 #[hotpath::measure(label = "dashboard_api.delivery.overview", future = true)]
 pub async fn overview(
     State(state): State<DashboardState>,
-    control: Option<Extension<DashboardHttpRequestControlV1>>,
+    RequestControl(control): RequestControl,
 ) -> Json<DashboardEnvelopeV1<DeliveryOverviewV1>> {
     let (changes, commits) = read_git_projections(&state).await;
     let indexed_commit = match &state.code_index_freshness_reader {
-        Some(reader) => reader(state.project_root.clone())
-            .await
-            .and_then(|freshness| freshness.source_revision),
+        Some(reader) => match reader(state.project_root.clone()).await {
+            Ok(Some(freshness)) => freshness.source_revision,
+            _ => None,
+        },
         None => None,
     };
     let generation_freshness = hotpath::measure_block!(
@@ -822,16 +870,10 @@ pub async fn overview(
 
     let delivery = match (
         state.delivery_read_authority.as_ref(),
-        control,
         live_head,
         state.project_id.as_ref(),
     ) {
-        (
-            Some(authority),
-            Some(Extension(control)),
-            Some(expected_head_commit_id),
-            Some(project_id),
-        ) => {
+        (Some(authority), Some(expected_head_commit_id), Some(project_id)) => {
             authority
                 .read(
                     control,
@@ -910,7 +952,7 @@ pub async fn overview(
 #[hotpath::measure(label = "dashboard_api.delivery.inbox", future = true)]
 pub async fn inbox(
     State(state): State<DashboardState>,
-    control: Option<Extension<DashboardHttpRequestControlV1>>,
+    RequestControl(control): RequestControl,
 ) -> Json<DashboardEnvelopeV1<DeliveryInboxV1>> {
     let unavailable = || DeliveryInboxV1 {
         registry_state: DeliveryRegistryStateV1::Unavailable,
@@ -942,72 +984,112 @@ pub async fn inbox(
     };
     let registry_truncated = registered.len() > MAX_DELIVERY_INBOX_PROJECTS_V1;
     registered.truncate(MAX_DELIVERY_INBOX_PROJECTS_V1);
-    let mut sources = Vec::with_capacity(registered.len());
-    for project in registered {
-        let project_id = match ProjectId::new(project.project_id.clone()) {
-            Ok(project_id) => project_id,
+    let reads = stream::iter(registered.into_iter().map(|project| {
+        let state = state.clone();
+        let control = control.clone();
+        async move {
+            let project_id = ProjectId::new(project.project_id.clone())
+                .map_err(|error| format!("registered project identity is invalid: {error}"))?;
+            let label = Path::new(&project.display_root)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| project.display_root.clone());
+            let project_root = PathBuf::from(&project.canonical_root);
+            let freshness = match state.code_index_freshness_reader.as_ref() {
+                Some(reader) => reader(project_root.clone()).await,
+                None => Ok(None),
+            };
+            let project_root_for_proximity = project_root.clone();
+            let indexed = match freshness.as_ref() {
+                Ok(Some(freshness)) => indexed_delivery_head(freshness.clone()),
+                _ => None,
+            };
+            let delivery_read = async {
+                match (state.delivery_read_authority.as_ref(), indexed.as_ref()) {
+                    (Some(authority), Some(indexed)) => {
+                        authority
+                            .read(
+                                control.clone(),
+                                DashboardDeliveryProjectV1 {
+                                    project_id: project.project_id.clone(),
+                                    project_root: project_root.clone(),
+                                },
+                                ProjectDeliveryReadRequestV1 {
+                                    kind: ProjectDeliveryReadKindV1::Inbox,
+                                    expected_head_commit_id: indexed.head_commit_id.clone(),
+                                    max_pull_requests: MAX_PROJECT_DELIVERY_PULL_REQUESTS_V1,
+                                    max_review_items: MAX_PROJECT_DELIVERY_REVIEW_ITEMS_V1,
+                                    max_ci_checks: MAX_PROJECT_DELIVERY_CI_CHECKS_V1,
+                                    max_releases: 1,
+                                },
+                            )
+                            .await
+                    }
+                    _ => ProjectDeliveryReadOutcomeV1::Unavailable,
+                }
+            };
+            let proximity_read = async {
+                match (
+                    state.delivery_read_authority.as_ref(),
+                    &freshness,
+                    indexed.as_ref(),
+                ) {
+                    (Some(authority), Ok(Some(_)), Some(_)) => {
+                        authority
+                            .read_proximity_attention(
+                                control.clone(),
+                                DashboardDeliveryProjectV1 {
+                                    project_id: project.project_id.clone(),
+                                    project_root: project_root_for_proximity,
+                                },
+                            )
+                            .await
+                    }
+                    // No proximity authority and a successful read: the feature
+                    // is not mounted. A failed or missing index is unavailable,
+                    // not an invented unsupported claim.
+                    (None, Ok(_), _) | (Some(_), Ok(_), None) => {
+                        ProjectDeliveryProximityAttentionSourceV1::Unsupported
+                    }
+                    _ => ProjectDeliveryProximityAttentionSourceV1::Unavailable,
+                }
+            };
+            let (delivery, proximity) = tokio::join!(delivery_read, proximity_read);
+            Ok::<_, String>(ProjectDeliveryInboxSourceV1 {
+                registry: ProjectDeliveryRegistrySourceV1 {
+                    project_id,
+                    label,
+                    project_root: project.display_root,
+                    git_common_dir: project.git_common_dir,
+                    repository_id: indexed
+                        .as_ref()
+                        .map(|indexed| indexed.repository_id.clone()),
+                    worktree_id: indexed.as_ref().map(|indexed| indexed.worktree_id.clone()),
+                    branch_ref: indexed.as_ref().map(|indexed| indexed.branch_ref.clone()),
+                },
+                indexed,
+                delivery,
+                memberships: Vec::new(),
+                proximity,
+            })
+        }
+    }))
+    .buffer_unordered(MAX_DELIVERY_INBOX_PROJECTS_V1)
+    .collect::<Vec<_>>()
+    .await;
+    let mut sources = Vec::with_capacity(reads.len());
+    for read in reads {
+        match read {
+            Ok(source) => sources.push(source),
             Err(error) => {
                 return Json(DashboardEnvelopeV1::unavailable(
                     scope_from_state(&state),
                     unavailable(),
-                    format!("registered project identity is invalid: {error}"),
+                    error,
                 ));
             }
-        };
-        let label = Path::new(&project.display_root)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| project.display_root.clone());
-        let project_root = PathBuf::from(&project.canonical_root);
-        let indexed = match state.code_index_freshness_reader.as_ref() {
-            Some(reader) => reader(project_root.clone())
-                .await
-                .and_then(indexed_delivery_head),
-            None => None,
-        };
-        let delivery = match (
-            state.delivery_read_authority.as_ref(),
-            control.as_ref(),
-            indexed.as_ref(),
-        ) {
-            (Some(authority), Some(Extension(control)), Some(indexed)) => {
-                authority
-                    .read(
-                        control.clone(),
-                        DashboardDeliveryProjectV1 {
-                            project_id: project.project_id.clone(),
-                            project_root,
-                        },
-                        ProjectDeliveryReadRequestV1 {
-                            kind: ProjectDeliveryReadKindV1::Inbox,
-                            expected_head_commit_id: indexed.head_commit_id.clone(),
-                            max_pull_requests: MAX_PROJECT_DELIVERY_PULL_REQUESTS_V1,
-                            max_review_items: MAX_PROJECT_DELIVERY_REVIEW_ITEMS_V1,
-                            max_ci_checks: MAX_PROJECT_DELIVERY_CI_CHECKS_V1,
-                            max_releases: 1,
-                        },
-                    )
-                    .await
-            }
-            _ => ProjectDeliveryReadOutcomeV1::Unavailable,
-        };
-        sources.push(ProjectDeliveryInboxSourceV1 {
-            registry: ProjectDeliveryRegistrySourceV1 {
-                project_id,
-                label,
-                project_root: project.display_root,
-                git_common_dir: project.git_common_dir,
-                repository_id: indexed
-                    .as_ref()
-                    .map(|indexed| indexed.repository_id.clone()),
-                worktree_id: indexed.as_ref().map(|indexed| indexed.worktree_id.clone()),
-                branch_ref: indexed.as_ref().map(|indexed| indexed.branch_ref.clone()),
-            },
-            indexed,
-            delivery,
-            memberships: Vec::new(),
-        });
+        }
     }
     let mut aggregation =
         aggregate_project_delivery_inbox_v1(sources, MAX_DELIVERY_INBOX_PULL_REQUESTS_V1);
@@ -1084,9 +1166,13 @@ fn indexed_delivery_head(
         branch_ref: freshness.source_reference?,
         head_commit_id: CommitId::new(freshness.source_revision?).ok()?,
         generation: CodeGenerationId::new(freshness.latest_generation_id?).ok()?,
-        coverage: if freshness.coverage != "complete" {
+        coverage: if freshness.coverage
+            != tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
+        {
             ProjectDeliveryInboxCoverageV1::Partial
-        } else if freshness.staleness_state.as_deref() == Some("fresh") {
+        } else if freshness.staleness_state
+            == Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh)
+        {
             ProjectDeliveryInboxCoverageV1::Complete
         } else {
             ProjectDeliveryInboxCoverageV1::Stale
@@ -1130,6 +1216,12 @@ fn map_delivery_inbox(
                 .as_str()
                 .to_owned();
             let indexed_generation = pull_request.indexed_generation.as_str().to_owned();
+            let indexed_head_commit_id = pull_request.indexed_head_commit_id.as_str().to_owned();
+            let shared_code = code_navigation_refs(
+                &pull_request.branch_ref,
+                &indexed_head_commit_id,
+                indexed_generation.clone(),
+            );
             DeliveryInboxPullRequestV1 {
                 id: format!(
                     "{project_id}:{}:{pull_request_id}",
@@ -1139,8 +1231,8 @@ fn map_delivery_inbox(
                 repository_id: pull_request.repository_id.as_str().to_owned(),
                 worktree_id: pull_request.worktree_id.as_str().to_owned(),
                 branch_ref: pull_request.branch_ref,
-                indexed_head_commit_id: pull_request.indexed_head_commit_id.as_str().to_owned(),
-                indexed_generation: indexed_generation.clone(),
+                indexed_head_commit_id,
+                indexed_generation,
                 state: map_inbox_pull_request_state(pull_request.state),
                 attention: pull_request
                     .attention
@@ -1149,20 +1241,7 @@ fn map_delivery_inbox(
                         map_attention_item(item, project_id.as_str(), pull_request_id.as_str())
                     })
                     .collect(),
-                shared_code: vec![
-                    DeliverySharedCodeRefV1 {
-                        kind: DeliverySharedCodeRefKindV1::SharedCode,
-                        state: DeliverySharedCodeRefStateV1::RequiresSelection,
-                        href: "/code?view=shared-code".to_owned(),
-                        source_generation: indexed_generation.clone(),
-                    },
-                    DeliverySharedCodeRefV1 {
-                        kind: DeliverySharedCodeRefKindV1::Compare,
-                        state: DeliverySharedCodeRefStateV1::RequiresSelection,
-                        href: "/code?view=compare".to_owned(),
-                        source_generation: indexed_generation,
-                    },
-                ],
+                shared_code,
                 pull_request: map_pull_request(pull_request.pull_request),
             }
         })
@@ -1208,6 +1287,56 @@ fn map_provider_state(state: ProjectDeliveryProviderStateV1) -> DeliveryProvider
         ProjectDeliveryProviderStateV1::NotConfigured => DeliveryProviderStateV1::NotConfigured,
         ProjectDeliveryProviderStateV1::Unavailable => DeliveryProviderStateV1::Unavailable,
     }
+}
+
+/// Next steps, not completed Code readings.
+///
+/// `RequiresSelection` means this row does not name a symbol or a base
+/// revision. Shared Code must link to `/code`, where selection starts — not
+/// `/code?view=shared-code`, which blocks with no symbol. Compare carries the
+/// indexed head so the operator only names the base.
+fn code_navigation_refs(
+    branch_ref: &str,
+    indexed_head_commit_id: &str,
+    indexed_generation: String,
+) -> Vec<DeliverySharedCodeRefV1> {
+    let branch = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
+    let compare_href = format!(
+        "/code?view=compare&head={}&head_revision={}",
+        encode_query_component(branch),
+        encode_query_component(indexed_head_commit_id),
+    );
+    vec![
+        DeliverySharedCodeRefV1 {
+            kind: DeliverySharedCodeRefKindV1::SharedCode,
+            state: DeliverySharedCodeRefStateV1::RequiresSelection,
+            href: "/code".to_owned(),
+            source_generation: indexed_generation.clone(),
+        },
+        DeliverySharedCodeRefV1 {
+            kind: DeliverySharedCodeRefKindV1::Compare,
+            state: DeliverySharedCodeRefStateV1::RequiresSelection,
+            href: compare_href,
+            source_generation: indexed_generation,
+        },
+    ]
+}
+
+/// Match `URLSearchParams` application/x-www-form-urlencoded encoding so a
+/// client that follows this href and the dashboard that builds the same
+/// params agree on slashes in branch names.
+fn encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn map_inbox_pull_request_state(
@@ -1267,6 +1396,13 @@ fn map_attention_item(
                         generation: generation.as_str().to_owned(),
                     }
                 }
+                ProjectDeliveryAttentionEvidenceV1::ProximityEncounter {
+                    encounter_id,
+                    relation,
+                } => DeliveryAttentionEvidenceV1::ProximityEncounter {
+                    encounter_id: encounter_id.to_string(),
+                    relation: DeliveryProximityRelationV1::from(relation),
+                },
             })
             .collect(),
         coverage: map_inbox_coverage(item.coverage),
@@ -2219,6 +2355,34 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn code_navigation_refs_start_selection_instead_of_opening_blocked_views() {
+        let refs = code_navigation_refs(
+            "refs/heads/feature/delivery",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "generation.alpha.1".to_owned(),
+        );
+        let shared = refs
+            .iter()
+            .find(|item| item.kind == DeliverySharedCodeRefKindV1::SharedCode)
+            .expect("shared code ref");
+        let compare = refs
+            .iter()
+            .find(|item| item.kind == DeliverySharedCodeRefKindV1::Compare)
+            .expect("compare ref");
+        assert_eq!(
+            shared.state,
+            DeliverySharedCodeRefStateV1::RequiresSelection
+        );
+        assert_eq!(shared.href, "/code");
+        assert!(!shared.href.contains("view=shared-code"));
+        assert_eq!(
+            compare.href,
+            "/code?view=compare&head=feature%2Fdelivery&head_revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_ne!(compare.href, "/code?view=compare");
+    }
+
     fn snapshot(retained_head: &str, expected_head: &str) -> ProjectDeliverySnapshotV1 {
         ProjectDeliverySnapshotV1 {
             scope: FeedbackScopeV1 {
@@ -2345,7 +2509,13 @@ mod tests {
         let (_project, state) =
             crate::events_api::dashboard_state_fixture("project.delivery-inbox-unavailable").await;
 
-        let Json(envelope) = inbox(State(state), None).await;
+        let Json(envelope) = inbox(
+            State(state),
+            RequestControl(DashboardHttpRequestControlV1::test_fixture(
+                "delivery-inbox-test",
+            )),
+        )
+        .await;
 
         assert_eq!(envelope.domain_state, DashboardDomainStateV1::Unknown);
         assert_eq!(

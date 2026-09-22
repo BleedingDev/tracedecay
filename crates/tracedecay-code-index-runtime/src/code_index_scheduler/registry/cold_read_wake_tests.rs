@@ -8,8 +8,10 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tracedecay_contracts::ResolvedScope;
 
-use super::super::{DaemonCodeIndexControlV1, ReconcilePassGuard};
-use super::CodeIndexSchedulerRegistryV1;
+use super::super::{
+    CodeIndexBuildProgressSlotStateV1, DaemonCodeIndexControlV1, ReconcilePassGuard,
+};
+use super::{CodeIndexReconcileAdmissionV1, CodeIndexSchedulerRegistryV1};
 use crate::code_index::production::CodeIndexExecutionControlV1;
 
 #[tokio::test]
@@ -100,7 +102,10 @@ async fn cold_read_wakes_do_not_cancel_an_in_flight_reconcile_snapshot() {
     let query_control =
         DaemonCodeIndexControlV1::new(Arc::clone(&epoch), Arc::clone(&shutting_down));
     assert!(
-        registry.request_query_background_reconcile(&scope).await,
+        matches!(
+            registry.request_query_background_reconcile(&scope).await,
+            CodeIndexReconcileAdmissionV1::Accepted
+        ),
         "a cold query still records one follow-up wake"
     );
     assert!(
@@ -118,14 +123,46 @@ async fn cold_read_wakes_do_not_cancel_an_in_flight_reconcile_snapshot() {
 
     let invalidation_control = DaemonCodeIndexControlV1::new(epoch, shutting_down);
     assert!(
-        registry
-            .notify_hook_paths(&project, &["src/main.rs".to_owned()])
-            .await,
+        matches!(
+            registry
+                .notify_hook_paths(&project, &["src/main.rs".to_owned()])
+                .await,
+            super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "a real source hint reaches the mounted scheduler"
     );
     assert!(
         invalidation_control.is_cancelled(),
         "source-change evidence must still supersede the in-flight snapshot"
+    );
+
+    assert!(
+        registry
+            .plant_terminal_publication_authority_park_for_test(
+                &project,
+                "publication authority corrupt before progress",
+            )
+            .await
+    );
+    {
+        let mounted = registry.mounted.lock().await;
+        let worktree = mounted.get(&canonical_project).expect("mounted worktree");
+        *worktree.build_progress.write().unwrap() = CodeIndexBuildProgressSlotStateV1::default();
+    }
+    registry.clear_pending_wake_for_scope(&scope).await;
+    let admission_result = registry.request_query_background_reconcile(&scope).await;
+    assert!(
+        matches!(
+            admission_result,
+            CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(ref parked)
+                if parked.reason == "publication authority corrupt before progress"
+        ),
+        "query admission must use the terminal park without a progress snapshot: {admission_result:?}"
+    );
+    assert_eq!(
+        registry.pending_wake_micros_for_scope(&scope).await,
+        Some(0),
+        "terminal query admission must not enqueue another reconcile"
     );
 
     drop(reconcile_pass);

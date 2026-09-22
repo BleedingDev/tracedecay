@@ -61,9 +61,17 @@ pub(crate) async fn handle_host_bundle_component_command(
     operation: HostBundleCliOperation,
     options: crate::cli::HostBundleCliOptions,
 ) -> tracedecay_domain::errors::Result<()> {
-    if options.component.is_some() && !options.dry_run && !options.yes {
+    if component_mutation_still_requires_yes(
+        operation,
+        options.component.is_some(),
+        options.dry_run,
+        options.yes,
+    ) {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: "host component mutation requires --yes; use --dry-run first".to_string(),
+            message: "host component uninstall requires --yes; use --dry-run to preview. \
+                      install, update, and repair proceed from the named command \
+                      and only stop for competing extension claims or --adopt"
+                .to_string(),
         });
     }
     let home = tracedecay_agent_hosts::agents::home_dir().ok_or_else(|| {
@@ -309,12 +317,21 @@ fn apply_host_bundle_artifact_action_at_with_tracedecay_bin(
             message: "artifact backup/restore has no dry-run mode".to_string(),
         });
     }
-    // A backup only ever writes a new snapshot; nothing deployed changes, so
-    // it needs no confirmation. A restore overwrites deployed bytes and keeps
-    // requiring `--yes`.
-    if matches!(action, crate::cli::HostBundleAction::ArtifactRestore { .. }) && !options.yes {
+    // The writer refuses either operation without explicit confirmation.
+    // Restore overwrites deployed bytes; backup publishes a receipt. The shell
+    // must not advertise a weaker policy than that contract.
+    if !options.yes {
+        let message = match &action {
+            crate::cli::HostBundleAction::ArtifactBackup { .. } => "artifact backup requires --yes",
+            crate::cli::HostBundleAction::ArtifactRestore { .. } => {
+                "artifact restore requires --yes"
+            }
+            crate::cli::HostBundleAction::Status | crate::cli::HostBundleAction::Recover { .. } => {
+                "status and recovery are not artifact backup/restore operations"
+            }
+        };
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: "artifact restore requires --yes".to_string(),
+            message: message.to_string(),
         });
     }
     let component =
@@ -442,6 +459,27 @@ pub(crate) async fn handle_host_bundle_artifact_command(
         );
     }
     Ok(())
+}
+
+/// Uninstall removes host registration. That stays behind `--yes`.
+/// Install, update, and repair are the command the operator already ran.
+pub(crate) fn component_mutation_still_requires_yes(
+    operation: HostBundleCliOperation,
+    component_selected: bool,
+    dry_run: bool,
+    yes: bool,
+) -> bool {
+    component_selected && !dry_run && !yes && operation == HostBundleCliOperation::Uninstall
+}
+
+/// The named verb authorizes a reversible plan. `--yes` is still required to
+/// accept competing third-party claims, and uninstall still requires it.
+pub(crate) fn lifecycle_invocation_confirms_plan(
+    operation: HostBundleCliOperation,
+    component_selected: bool,
+    yes: bool,
+) -> bool {
+    yes || !component_selected || operation != HostBundleCliOperation::Uninstall
 }
 
 fn lifecycle_operation(
@@ -572,7 +610,7 @@ fn dry_run_canonical_component_set(
 fn receipt_owned_paths(
     lifecycle_root: &Path,
     host: tracedecay_agent_hosts::agents::host_bundle::HostKindV1,
-    component: tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1,
+    component: tracedecay_agent_hosts::agents::host_bundle::HostComponentV1,
 ) -> std::collections::BTreeSet<String> {
     tracedecay_agent_hosts::agents::host_bundle::latest_host_component_receipt_at(
         lifecycle_root,
@@ -767,7 +805,7 @@ fn apply_canonical_component_set(
     let request = component_set_request(
         component_set,
         operation,
-        options.component.is_none() || options.yes,
+        lifecycle_invocation_confirms_plan(operation, options.component.is_some(), options.yes),
         options.adopt,
     )?;
     let mut writer =
@@ -1033,19 +1071,19 @@ fn project_local_host_lifecycle_unavailable() -> tracedecay_domain::errors::Trac
 
 fn host_bundle_component(
     component: crate::cli::HostBundleComponentArg,
-) -> tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1 {
+) -> tracedecay_agent_hosts::agents::host_bundle::HostComponentV1 {
     match component {
         crate::cli::HostBundleComponentArg::Core => {
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::Core
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::Core
         }
         crate::cli::HostBundleComponentArg::Agent => {
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::Agent
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::Agent
         }
         crate::cli::HostBundleComponentArg::ContextMcp => {
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::ContextMcp
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::ContextMcp
         }
         crate::cli::HostBundleComponentArg::OperatorMcp => {
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::OperatorMcp
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::OperatorMcp
         }
     }
 }
@@ -1259,6 +1297,7 @@ pub(crate) async fn handle_install_command(
     no_dashboard: bool,
     automation: Option<CodexAutomationInstall>,
     adopt: bool,
+    git_hook: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     validate_codex_automation_flags(agent.as_deref(), automation)?;
     if local {
@@ -1266,8 +1305,11 @@ pub(crate) async fn handle_install_command(
             message: "`tracedecay install --local` requires a project-capable `--agent`"
                 .to_string(),
         })?;
-        return handle_project_local_lifecycle_command(agent_id, HostBundleCliOperation::Install)
-            .await;
+        handle_project_local_lifecycle_command(agent_id, HostBundleCliOperation::Install).await?;
+        if git_hook {
+            install_requested_git_hook()?;
+        }
+        return Ok(());
     }
     let home = tracedecay_agent_hosts::agents::home_dir().ok_or_else(|| {
         tracedecay_domain::errors::TraceDecayError::Config {
@@ -1332,7 +1374,7 @@ pub(crate) async fn handle_install_command(
             })?;
     } else {
         let (to_install, to_uninstall) =
-            tracedecay_agent_hosts::agents::pick_integrations_interactive(
+            tracedecay_agent_hosts::agents::select_detected_integrations(
                 &home,
                 &user_cfg.installed_agents,
             )?;
@@ -1416,8 +1458,18 @@ pub(crate) async fn handle_install_command(
             })?;
     }
 
-    tracedecay_agent_hosts::agents::offer_git_post_commit_hook(&tracedecay_bin);
+    if git_hook {
+        install_requested_git_hook()?;
+    } else {
+        tracedecay_agent_hosts::agents::report_git_post_commit_hook_status();
+    }
     Ok(())
+}
+
+pub(crate) fn install_requested_git_hook() -> tracedecay_domain::errors::Result<()> {
+    let tracedecay_bin = lifecycle_tracedecay_bin()?;
+    tracedecay_agent_hosts::agents::install_git_post_commit_hook(&tracedecay_bin)
+        .map_err(|message| tracedecay_domain::errors::TraceDecayError::Config { message })
 }
 
 pub(crate) async fn handle_reinstall_command(adopt: bool) -> tracedecay_domain::errors::Result<()> {
@@ -1872,15 +1924,54 @@ mod tests {
     use super::{
         AgentReinstallOutcome, CatalogHostComponentRegistrationAuthority, ComponentSetApplyContext,
         HostBundleCliOperation, apply_canonical_component_set,
-        apply_default_canonical_component_set, broker_codex_daemon_automation_project,
-        canonical_host_component_set, canonical_host_component_set_with_tracedecay_bin,
-        component_is_not_applicable, component_set_request,
+        apply_default_canonical_component_set, apply_host_bundle_artifact_action_at,
+        broker_codex_daemon_automation_project, canonical_host_component_set,
+        canonical_host_component_set_with_tracedecay_bin, component_is_not_applicable,
+        component_mutation_still_requires_yes, component_set_request,
+        lifecycle_invocation_confirms_plan,
         reinstall_agent_integrations_with_persisted_dashboard_policies,
     };
     use tracedecay_agent_hosts::agents::host_bundle::{
         CompetingHostExtensionClaimV1, HostBundleError, HostComponentSetExecutionRequestV1,
         HostComponentSetLifecyclePreviewV1, HostComponentSetRegistrationV1, HostComponentSetV1,
     };
+
+    #[test]
+    fn reversible_component_commands_do_not_wait_for_a_second_yes() {
+        for operation in [
+            HostBundleCliOperation::Install,
+            HostBundleCliOperation::Update,
+            HostBundleCliOperation::Repair,
+        ] {
+            assert!(
+                !component_mutation_still_requires_yes(operation, true, false, false),
+                "{operation:?} must proceed from the named command"
+            );
+            assert!(lifecycle_invocation_confirms_plan(operation, true, false));
+        }
+        assert!(component_mutation_still_requires_yes(
+            HostBundleCliOperation::Uninstall,
+            true,
+            false,
+            false
+        ));
+        assert!(!lifecycle_invocation_confirms_plan(
+            HostBundleCliOperation::Uninstall,
+            true,
+            false
+        ));
+        assert!(lifecycle_invocation_confirms_plan(
+            HostBundleCliOperation::Uninstall,
+            true,
+            true
+        ));
+        assert!(!component_mutation_still_requires_yes(
+            HostBundleCliOperation::Uninstall,
+            true,
+            true,
+            false
+        ));
+    }
 
     const OPENCODE_UNRELATED_CONFIG: &[u8] = br#"{"lsp":{"other":{"command":["tracedecay","lsp","bridge","--stdio"]}},"unrelated":{"keep":true}}
 "#;
@@ -2597,7 +2688,7 @@ mod tests {
         assert_eq!(explicit.component_set.components.len(), 1);
         assert_eq!(
             explicit.component_set.components[0].manifest.component,
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::ContextMcp
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::ContextMcp
         );
         let hermes = canonical_host_component_set("hermes", None, 0)
             .unwrap()
@@ -2605,7 +2696,7 @@ mod tests {
         assert_eq!(hermes.component_set.components.len(), 1);
         assert_eq!(
             hermes.component_set.components[0].manifest.component,
-            tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::Core
+            tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::Core
         );
         // Kiro's supported route is its MCP registration alone; the degraded
         // hook route lives in Core and stays out of the default set.
@@ -2618,7 +2709,7 @@ mod tests {
                 .iter()
                 .map(|component| component.manifest.component)
                 .collect::<Vec<_>>(),
-            vec![tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::ContextMcp]
+            vec![tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::ContextMcp]
         );
         // Gemini's extension carries the MCP server and declares no hook, so
         // its default set is the separable MCP route and Core is a typed
@@ -2633,7 +2724,7 @@ mod tests {
                 .iter()
                 .map(|component| component.manifest.component)
                 .collect::<Vec<_>>(),
-            vec![tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::ContextMcp]
+            vec![tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::ContextMcp]
         );
         assert!(
             canonical_host_component_set(
@@ -2686,6 +2777,24 @@ mod tests {
                 lifecycle.path(),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn artifact_backup_requires_the_writer_confirmation() {
+        let error = apply_host_bundle_artifact_action_at(
+            crate::cli::HostBundleAction::ArtifactBackup {
+                agent: "opencode".to_string(),
+            },
+            crate::cli::HostBundleCliOptions::default(),
+            Path::new("/tmp"),
+            Path::new("/tmp"),
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("artifact backup requires --yes"),
+            "{error}"
         );
     }
 
@@ -2912,9 +3021,16 @@ mod tests {
         .unwrap();
 
         assert!(
+            !std::fs::read_to_string(&legacy_steering)
+                .unwrap()
+                .contains("old rules"),
+            "global install must converge leftover legacy steering"
+        );
+        assert!(
             std::fs::read_to_string(&legacy_steering)
                 .unwrap()
-                .contains("old rules")
+                .contains("<!-- tracedecay:kiro:start -->"),
+            "converged steering must carry the current ownership sentinel"
         );
         assert!(
             std::fs::read_to_string(&legacy_agent)
@@ -2931,7 +3047,10 @@ mod tests {
             },
         );
         assert_eq!(counters.issues, 0);
-        assert_eq!(counters.warnings, 0);
+        // Canonical MCP install leaves retired global leftovers untouched, and
+        // doctor must advise migration for the owned steering block plus the
+        // managed agent fixture rather than reporting a silent green check.
+        assert_eq!(counters.warnings, 2);
     }
 
     /// A transaction interrupted after it staged registration leaves a journal
@@ -3421,13 +3540,13 @@ mod tests {
 
         integration
             .activate_deployed_host_component_registration(
-                &[tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::OperatorMcp],
+                &[tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::OperatorMcp],
                 &context,
             )
             .unwrap();
         integration
             .deactivate_deployed_host_component_registration(
-                &[tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::OperatorMcp],
+                &[tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::OperatorMcp],
                 &context,
             )
             .unwrap();
@@ -4127,7 +4246,7 @@ mod tests {
     #[tokio::test]
     async fn kimi_native_activated_retry_tracks_staged_source() {
         use tracedecay_agent_hosts::agents::host_bundle::{
-            HostBundleComponentV1, HostKindV1, latest_host_component_receipt_at,
+            HostComponentV1, HostKindV1, latest_host_component_receipt_at,
             resolved_host_bundle_lifecycle_root,
         };
 
@@ -4193,7 +4312,7 @@ mod tests {
             latest_host_component_receipt_at(
                 &lifecycle_root,
                 HostKindV1::KimiCode,
-                HostBundleComponentV1::Core,
+                HostComponentV1::Core,
             )
             .unwrap()
             .is_some()
@@ -4204,7 +4323,7 @@ mod tests {
     #[tokio::test]
     async fn codex_native_activated_retry_tracks_component_set() {
         use tracedecay_agent_hosts::agents::host_bundle::{
-            HostBundleComponentV1, HostKindV1, latest_host_component_receipt_at,
+            HostComponentV1, HostKindV1, latest_host_component_receipt_at,
             resolved_host_bundle_lifecycle_root,
         };
 
@@ -4274,7 +4393,7 @@ mod tests {
             latest_host_component_receipt_at(
                 &lifecycle_root,
                 HostKindV1::Codex,
-                HostBundleComponentV1::Core,
+                HostComponentV1::Core,
             )
             .unwrap()
             .is_some()
@@ -4552,7 +4671,7 @@ mod tests {
                 .iter()
                 .map(|component| component.manifest.component)
                 .collect::<Vec<_>>(),
-            vec![tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1::ContextMcp]
+            vec![tracedecay_agent_hosts::agents::host_bundle::HostComponentV1::ContextMcp]
         );
         assert!(
             canonical_host_component_set(

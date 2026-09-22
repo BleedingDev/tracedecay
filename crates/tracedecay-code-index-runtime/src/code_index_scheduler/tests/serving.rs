@@ -3,13 +3,16 @@ use std::{
     fmt::Write as _,
     num::NonZeroU64,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tracedecay_code_index_retention::code_index_generations::code_text_artifacts_root;
+use tracedecay_code_index_retention::code_index_generations::{
+    acquire_code_generation_store_lock, code_text_artifacts_root,
+};
 use tracedecay_contracts::{
     CallableCodeOperationKind, CallableCodeQueryPort, CodeQueryScope, CodeRelationRequest,
     CodeSymbolSearchRequest, ExactOccurrenceRequest, OmissionReason, OpaqueCursor, PageRequest,
@@ -31,10 +34,12 @@ use tracedecay_domain::{
     TemporalModeV1, UtcMicros, VectorWatermark, encode_lowercase_hex, sha256_hex_suffix,
 };
 use tracedecay_query::retrieval::{
+    RetrievalPortError,
     exact::{CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneRequest},
     lexical::{
         CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeLexicalArtifactBuilderV1,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1, CodeLexicalArtifactBuilderV1,
         CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1, LexicalLaneRequest,
         LexicalRouteKindV1, LexicalRoutingV1,
     },
@@ -64,7 +69,7 @@ use crate::{
     code_index::provider::GenerationTestAttributionJoinReadPort,
     code_index_scheduler::{
         CodeIndexBuildProgressStateV1, CodeIndexCommittedProgressSampleV1,
-        CodeIndexSchedulerRegistryV1, SharedCodeIndexBytePoolV1,
+        CodeIndexReconcileAdmissionV1, CodeIndexSchedulerRegistryV1, SharedCodeIndexBytePoolV1,
     },
 };
 
@@ -81,6 +86,42 @@ fn text_artifact_source_batches_scale_with_build_memory() {
             8 * CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1
         ),
         (512, 512 * 1024 * 1024, 1024)
+    );
+}
+
+#[test]
+fn clone_successor_batches_leave_scratch_and_metadata_headroom() {
+    const RESERVATION: usize = 128 * 1024 * 1024;
+    const PAGE: usize = 4 * 1024 * 1024;
+    const SCRATCH: usize = 4 * PAGE;
+    let (pages, bytes) = super::super::clone_successor_source_batch_limits_from_charges(0)
+        .expect("empty metadata fits the successor reservation");
+    assert_eq!(pages, 64);
+    assert_eq!(
+        bytes,
+        RESERVATION - CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1 - SCRATCH
+    );
+    assert_eq!(
+        CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1 + SCRATCH + bytes,
+        RESERVATION
+    );
+    assert!(
+        bytes < 64 * 1024 * 1024,
+        "a 64 MiB page batch would consume the entire remainder after the SQLite cache"
+    );
+
+    let metadata = 8 * 1024 * 1024;
+    let (_, with_metadata) =
+        super::super::clone_successor_source_batch_limits_from_charges(metadata)
+            .expect("modest metadata still leaves a page batch");
+    assert_eq!(with_metadata, bytes - metadata);
+
+    let too_large = RESERVATION
+        .saturating_sub(CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1)
+        .saturating_sub(SCRATCH);
+    assert!(
+        super::super::clone_successor_source_batch_limits_from_charges(too_large).is_err(),
+        "metadata that fills the remainder after cache and scratch must fail closed"
     );
 }
 
@@ -377,11 +418,11 @@ fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
         .retrieve_lexical(&LexicalLaneRequest {
             query_view: &query_view,
             generation,
-            whole_terms: vec!["callee".to_owned()],
-            subtokens: vec!["callee".to_owned()],
-            phrases: Vec::new(),
-            proximities: Vec::new(),
-            field_filters: Vec::new(),
+            whole_terms: std::borrow::Cow::Owned(vec!["callee".to_owned()]),
+            subtokens: std::borrow::Cow::Owned(vec!["callee".to_owned()]),
+            phrases: std::borrow::Cow::Owned(Vec::new()),
+            proximities: std::borrow::Cow::Owned(Vec::new()),
+            field_filters: std::borrow::Cow::Owned(Vec::new()),
             fuzzy_budget: 0,
             lexical_profile_revision: ComponentRevision::new(
                 tracedecay_query::retrieval::QUERY_LEXICAL_PROFILE_REVISION_V1,
@@ -724,9 +765,9 @@ fn text_artifact_publication_serializes_pointer_attachment_with_retention() {
             .expect("report retention completion");
     });
 
-    // Unfixed publication owns no store lock here, so retention completes and
-    // unlinks the destination. Fixed publication holds the canonical lock and
-    // keeps retention blocked until its pointer attachment is durable.
+    // Publication holds the canonical lock through pointer attachment.
+    // Retention must settle as typed busy instead of blocking or unlinking the
+    // destination from its stale plan.
     let early_retention = retention_done_rx.recv_timeout(Duration::from_secs(2));
     control.resume();
     let descriptor = publisher
@@ -907,6 +948,21 @@ async fn query_admission_serves_v14_while_clone_successor_is_pending() {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(latest.text_generation_handle());
+        let serving_generation = worktree
+            .serving_generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .expect("the injected text owner has a serving seat")
+            .generation()
+            .manifest()
+            .generation_id
+            .clone();
+        assert_eq!(
+            serving_generation,
+            latest.metadata().manifest().generation_id,
+            "the test must exercise pending backfill on the seated generation"
+        );
     }
 
     let executed = registry
@@ -926,6 +982,93 @@ async fn query_admission_serves_v14_while_clone_successor_is_pending() {
     );
 
     drop(admission);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn expired_source_proof_reschedules_pending_clone_backfill() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
+    )]);
+    let retained_store = TempDir::new().expect("retained store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        retained_store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish generation"));
+    let latest = scheduler.latest_complete().expect("latest generation");
+    while !latest.query_owners_are_ready() {
+        latest.advance_text_serving(1).expect("advance V14 build");
+    }
+    assert!(
+        latest.text_projection_needs_work(),
+        "the query must enter admission while clone successor work remains"
+    );
+
+    let registry_store = TempDir::new().expect("registry store root");
+    let (registry, scope) =
+        mounted_core_query_worktree_with_one_permit(&fixture, &registry_store).await;
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    registry.clear_pending_wake_for_scope(&scope).await;
+    {
+        let mounted = registry.mounted.lock().await;
+        let worktree = mounted
+            .get(&fixture.path().canonicalize().expect("canonical root"))
+            .expect("mounted worktree");
+        *worktree
+            .text_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(latest.text_generation_handle());
+    }
+
+    let source_freshness = registry
+        .source_freshness_for_root(fixture.path())
+        .await
+        .expect("mounted source fence");
+    {
+        let mut state = source_freshness.state.lock().unwrap();
+        state.last_reconciled_at = Instant::now()
+            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
+            .expect("expire source proof");
+    }
+    assert!(matches!(
+        registry.request_query_background_reconcile(&scope).await,
+        CodeIndexReconcileAdmissionV1::Accepted
+    ));
+    drop(admission);
+    // No second query or external wake: refreshing the proof must hand the
+    // pending clone work to a successor pass by itself.
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if registry
+                .latest_text_serving_for_root(fixture.path())
+                .await
+                .is_some_and(|text| !text.text_projection_needs_work())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the source refresh stranded clone backfill: pending_wake={:?} reconcile_in_progress={} source_age={:?} receipts={:?}",
+        registry.pending_wake_micros_for_scope(&scope).await,
+        registry
+            .reconcile_in_progress_for_test(fixture.path())
+            .await,
+        source_freshness
+            .state
+            .lock()
+            .unwrap()
+            .last_reconciled_at
+            .elapsed(),
+        registry.event_to_ready_receipts(),
+    );
     registry.shutdown().await;
 }
 
@@ -1395,6 +1538,66 @@ fn text_artifact_publish_rejects_a_permissive_artifacts_root() {
     assert!(staging.is_file(), "refusal must preserve staging evidence");
 }
 
+#[test]
+fn text_artifact_publish_refuses_a_busy_generation_store_and_retries() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn retry_publish() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish generation"));
+    let latest = scheduler.latest_complete().expect("latest generation");
+    let artifact_store = latest.text_artifact_store.clone();
+    let generation_id = latest.generation().manifest().generation_id.clone();
+    let sealed_identity = artifact_store
+        .sealed_identity(&generation_id)
+        .expect("sealed generation identity");
+    let artifacts_root = store.path().join("code-text-artifacts-v1");
+    tracedecay_private_fs::create_private_directory(&artifacts_root)
+        .expect("create private artifacts root");
+    let staging = artifacts_root.join("busy-publish.staging");
+    let mut staging_file =
+        tracedecay_private_fs::create_private_file(&staging).expect("create staging artifact");
+    std::io::Write::write_all(&mut staging_file, b"busy publication")
+        .expect("write staging artifact");
+    drop(staging_file);
+
+    let lock = acquire_code_generation_store_lock(store.path()).expect("hold generation store");
+    let publish_store = artifact_store.clone();
+    let publish_generation = generation_id.clone();
+    let publish_identity = sealed_identity.clone();
+    let publish_staging = staging.clone();
+    let (sent, received) = mpsc::sync_channel(1);
+    let blocked = thread::spawn(move || {
+        sent.send(publish_store.publish(
+            &publish_staging,
+            &publish_generation,
+            &publish_identity,
+            &UninterruptibleCodeIndexControlV1,
+        ))
+        .expect("return publication outcome");
+    });
+    assert!(matches!(
+        received
+            .recv_timeout(Duration::from_millis(500))
+            .expect("busy publication must settle without waiting"),
+        Err(RetrievalPortError::AuthorityUnavailable(_))
+    ));
+    drop(lock);
+    blocked.join().expect("publication attempt exits");
+
+    artifact_store
+        .publish(
+            &staging,
+            &generation_id,
+            &sealed_identity,
+            &UninterruptibleCodeIndexControlV1,
+        )
+        .expect("publication retries after the store owner releases");
+}
+
 #[cfg(unix)]
 #[test]
 fn text_artifact_publish_rejects_a_symlink_artifacts_root() {
@@ -1526,6 +1729,69 @@ fn cold_owner_warmup_seats_query_owners_before_clone_backfill() {
             .advance_text_serving(64)
             .expect("finish clone successor");
     }
+}
+
+/// `query_owners_are_ready` is the sole exact/lexical bit for the published
+/// seat gate and the full graph-replay skip — both directions.
+///
+/// Owners-ready with clone backfill still unfinished must admit seat/replay;
+/// lexical-incomplete (owners absent) must refuse both. Clone completeness is
+/// `text_projection_needs_work`, not a fork of this predicate.
+#[test]
+fn query_owners_ready_admits_seat_and_replay_both_directions() {
+    use super::super::registry::GraphSeatGateV1;
+
+    let fixture = GitFixture::new(&[
+        ("src/lib.rs", "pub fn cold_activation() {}\n"),
+        ("src/second.rs", "pub fn second_unit() -> usize { 2 }\n"),
+        ("src/third.rs", "pub fn third_unit() -> usize { 3 }\n"),
+    ]);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("publish generation"));
+    let latest = scheduler.latest_complete().expect("latest generation");
+
+    // Direction: lexical-incomplete → owners not ready → seat denies, replay waits.
+    assert!(
+        !latest.query_owners_are_ready(),
+        "a freshly published generation has no exact/lexical owners yet"
+    );
+    assert_eq!(
+        GraphSeatGateV1::decide(true, false, true, true, latest.query_owners_are_ready()),
+        GraphSeatGateV1::PublishedTextOwnerUnavailable,
+        "published seat gate must refuse while exact/lexical owners are absent"
+    );
+    assert!(
+        !latest.query_owners_are_ready(),
+        "full graph replay skip uses the same owners-ready bit and must wait"
+    );
+
+    latest
+        .production_query_owners()
+        .expect("cold owner warmup must install exact/lexical owners");
+
+    // Direction: owners-ready while clone backfill remains → seat admits, replay admits.
+    assert!(
+        latest.query_owners_are_ready(),
+        "exact/lexical owners ready"
+    );
+    assert!(
+        latest.text_projection_needs_work(),
+        "clone backfill must still be unfinished so the two predicates stay distinct"
+    );
+    assert_eq!(
+        GraphSeatGateV1::decide(true, false, true, true, latest.query_owners_are_ready()),
+        GraphSeatGateV1::Prepare,
+        "published seat gate admits on owners-ready without waiting for clone backfill"
+    );
+    assert!(
+        latest.query_owners_are_ready(),
+        "full graph replay skip clears on the same owners-ready bit; clone backfill is not a wait"
+    );
 }
 
 #[test]
@@ -4048,7 +4314,10 @@ async fn search_requests_one_background_reconcile_when_nothing_is_servable() {
             .execute_query_search(&scope, core_search_request("main"))
             .await;
         assert!(
-            !registry.request_query_background_reconcile(&scope).await,
+            matches!(
+                registry.request_query_background_reconcile(&scope).await,
+                CodeIndexReconcileAdmissionV1::Unavailable
+            ),
             "an outstanding wake must debounce every further admission"
         );
         assert_eq!(
@@ -4064,11 +4333,17 @@ async fn search_requests_one_background_reconcile_when_nothing_is_servable() {
     // A fresh due window (the worker claimed the wake) admits exactly one more.
     registry.clear_pending_wake_for_scope(&scope).await;
     assert!(
-        registry.request_query_background_reconcile(&scope).await,
+        matches!(
+            registry.request_query_background_reconcile(&scope).await,
+            CodeIndexReconcileAdmissionV1::Accepted
+        ),
         "a new due window admits one request"
     );
     assert!(
-        !registry.request_query_background_reconcile(&scope).await,
+        matches!(
+            registry.request_query_background_reconcile(&scope).await,
+            CodeIndexReconcileAdmissionV1::Unavailable
+        ),
         "and only one"
     );
 
@@ -4333,8 +4608,6 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
             assert_eq!(callee.edge_kind, "calls");
             assert_eq!(callee.symbol.name, "callee");
             assert_eq!(callee.symbol.file, "src/lib.rs");
-            assert_eq!(callee.symbol.start_line_zero_based, 13);
-            assert_eq!(callee.symbol.end_line_zero_based, 13);
             assert_eq!(callee.symbol.line, 14);
             assert_eq!(callee.symbol.end_line, 14);
         }
@@ -6065,7 +6338,10 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .last_reconciled_at_micros();
     assert!(
-        registry.notify_hook_overflow(fixture.path()).await,
+        matches!(
+            registry.notify_hook_overflow(fixture.path()).await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
         "mounted graph-off worktree accepts the overflow reconcile"
     );
 
@@ -6103,7 +6379,10 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
                 .reconcile_in_progress_for_test(fixture.path())
                 .await
             && let Some(freshness) = registry.dashboard_freshness(fixture.path()).await
-            && freshness.staleness_state.as_deref() == Some("fresh")
+            && freshness.staleness_state
+                == Some(
+                    tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh,
+                )
         {
             // A completed owner pass can have another queued wake. Capture the
             // settled public snapshot instead of racing a later status read.
@@ -6211,8 +6490,14 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         Some(&PublicRetrieverStatus::Unavailable)
     );
 
-    assert_eq!(dashboard.staleness_state.as_deref(), Some("fresh"));
-    assert_eq!(dashboard.coverage, "complete");
+    assert_eq!(
+        dashboard.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh)
+    );
+    assert_eq!(
+        dashboard.coverage,
+        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessCoverageV1::Complete
+    );
     assert_eq!(
         dashboard
             .progress

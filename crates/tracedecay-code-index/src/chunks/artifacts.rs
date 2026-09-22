@@ -5,7 +5,8 @@ use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 use serde::{Deserialize, Serialize};
 use tracedecay_code_extraction::{
     ExtractedImportEvidenceV1, ExtractedSchemaEvidenceV1, ExtractionArtifactV1, ImportModuleKindV1,
-    ImportNamespaceV1, SchemaEvidenceLanguageV1, SchemaEvidenceStatusV1, import_module_kind,
+    ImportNamespaceV1, ImportReexportScopeV1, SchemaEvidenceLanguageV1, SchemaEvidenceStatusV1,
+    import_module_kind,
 };
 use tracedecay_domain::{
     CanonicalRelationEdgeV1, CodeGenerationId, FileOccurrenceId, ManifestDigest,
@@ -19,9 +20,6 @@ use crate::extract::parser_import_rows_digest;
 use crate::intake::ReceiptBoundCodeFileAuthorityV1;
 use crate::lineage::LineageSymbolRecordV1;
 
-const IMPORT_AUTHORITY_MISMATCH: &str =
-    "import evidence does not match parser-backed extraction rows";
-
 /// One file-bound import binding observed directly by the language parser.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +31,8 @@ pub struct CodeIndexImportEvidenceV1 {
     pub local_name: Option<String>,
     #[serde(default)]
     pub is_public: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reexport_scope: Option<ImportReexportScopeV1>,
     #[serde(default)]
     pub is_glob: bool,
     pub namespace: ImportNamespaceV1,
@@ -54,6 +54,7 @@ impl CodeIndexImportEvidenceV1 {
             imported_name: row.imported_name.clone(),
             local_name: row.local_name.clone(),
             is_public: row.is_public,
+            reexport_scope: row.reexport_scope.clone(),
             is_glob: row.is_glob,
             namespace: row.namespace,
             module_kind: row.module_kind,
@@ -70,6 +71,7 @@ impl CodeIndexImportEvidenceV1 {
             imported_name: self.imported_name.clone(),
             local_name: self.local_name.clone(),
             is_public: self.is_public,
+            reexport_scope: self.reexport_scope.clone(),
             is_glob: self.is_glob,
             namespace: self.namespace,
             module_kind: self.module_kind,
@@ -80,24 +82,39 @@ impl CodeIndexImportEvidenceV1 {
     }
 
     pub(crate) fn validate(&self) -> Result<(), ChunkingFailureV1> {
-        self.file_occurrence_id
-            .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+        self.file_occurrence_id.validate().map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })?;
         if self.logical_path.is_empty() || self.module_specifier.is_empty() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import evidence has an empty logical path or module specifier".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportEmptyPathOrSpecifier,
+                ),
             ));
         }
         if self.span.is_empty() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import evidence has an empty source span".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportEmptySourceSpan,
+                ),
             ));
         }
         if self.imported_name.as_deref().is_some_and(str::is_empty)
             || self.local_name.as_deref().is_some_and(str::is_empty)
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import evidence has an empty binding name".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportEmptyBindingName,
+                ),
+            ));
+        }
+        if self.is_public && self.reexport_scope.is_some() {
+            return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportAuthorityMismatch,
+                ),
             ));
         }
 
@@ -114,7 +131,9 @@ impl CodeIndexImportEvidenceV1 {
         };
         if !binding_shape_is_valid {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import namespace does not match its binding names".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportNamespaceMismatch,
+                ),
             ));
         }
 
@@ -140,17 +159,23 @@ pub struct CodeIndexUnresolvedReferenceV1 {
 
 impl CodeIndexUnresolvedReferenceV1 {
     pub(crate) fn validate(&self) -> Result<(), ChunkingFailureV1> {
-        self.from_occurrence
-            .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+        self.from_occurrence.validate().map_err(|error| {
+            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+                error,
+            ))
+        })?;
         if self.reference_name.is_empty() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "unresolved reference has an empty name".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::UnresolvedReferenceEmptyName,
+                ),
             ));
         }
         if self.evidence_span.is_empty() {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "unresolved reference has an empty evidence span".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::UnresolvedReferenceEmptySpan,
+                ),
             ));
         }
         Ok(())
@@ -316,7 +341,9 @@ impl CodeFileIndexArtifactsV1 {
             .any(|pair| pair[0].occurrence >= pair[1].occurrence)
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "lineage symbols are not in occurrence order".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::LineageSymbolsUnordered,
+                ),
             ));
         }
         let chunk_occurrences = self
@@ -332,7 +359,9 @@ impl CodeFileIndexArtifactsV1 {
             .collect::<std::collections::BTreeSet<_>>();
         if !occurrences.is_subset(&chunk_occurrences) {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "lineage symbol is not represented by a chunk".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::LineageSymbolMissingChunk,
+                ),
             ));
         }
         if self.edges.iter().any(|edge| {
@@ -348,15 +377,15 @@ impl CodeFileIndexArtifactsV1 {
                 .any(|pair| pair[0] > pair[1])
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "file graph evidence is not canonical".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::FileGraphNotCanonical,
+                ),
             ));
         }
         for reference in &self.unresolved_references {
             reference.validate()?;
             if !occurrences.contains(&reference.from_occurrence) {
-                return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "unresolved reference is not anchored to a file symbol".to_owned(),
-                ));
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1::new(crate::noncanonical::NonCanonicalReasonCodeV1::UnresolvedReferenceMissingAnchor)));
             }
         }
         if self
@@ -365,7 +394,9 @@ impl CodeFileIndexArtifactsV1 {
             .any(|pair| pair[0] >= pair[1])
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "unresolved references are not in strict canonical order".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::UnresolvedReferencesUnordered,
+                ),
             ));
         }
         Ok(())
@@ -380,42 +411,82 @@ impl CodeFileIndexArtifactsV1 {
         if let Some(pair) = self.clone_bodies.windows(2).find(|pair| {
             pair[0].occurrence.symbol_occurrence_id >= pair[1].occurrence.symbol_occurrence_id
         }) {
-            return Err(ChunkingFailureV1::NonCanonicalIdentity(format!(
-                "clone body evidence is not in strict symbol-occurrence order: file={} file_occurrence={} left_payload={} left_symbol={} left_bound={} right_payload={} right_symbol={} right_bound={}",
-                pair[0].occurrence.path,
-                self.chunks.document.file_occurrence_id.as_str(),
-                pair[0].occurrence.payload_digest.as_str(),
-                pair[0].occurrence.symbol_occurrence_id.as_str(),
-                occurrences.contains(&pair[0].occurrence.symbol_occurrence_id),
-                pair[1].occurrence.payload_digest.as_str(),
-                pair[1].occurrence.symbol_occurrence_id.as_str(),
-                occurrences.contains(&pair[1].occurrence.symbol_occurrence_id),
-            )));
+            return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyOccurrenceOrder,
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::File,
+                    pair[0].occurrence.path.clone(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::FileOccurrenceId,
+                    self.chunks.document.file_occurrence_id.as_str(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::LeftPayloadDigest,
+                    pair[0].occurrence.payload_digest.as_str(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::LeftSymbolOccurrenceId,
+                    pair[0].occurrence.symbol_occurrence_id.as_str(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::LeftBound,
+                    occurrences
+                        .contains(&pair[0].occurrence.symbol_occurrence_id)
+                        .to_string(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::RightPayloadDigest,
+                    pair[1].occurrence.payload_digest.as_str(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::RightSymbolOccurrenceId,
+                    pair[1].occurrence.symbol_occurrence_id.as_str(),
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::RightBound,
+                    occurrences
+                        .contains(&pair[1].occurrence.symbol_occurrence_id)
+                        .to_string(),
+                ),
+            ));
         }
         for body in &self.clone_bodies {
             if body.occurrence.path.is_empty() {
                 return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "clone body evidence has an empty path".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyEmptyPath,
+                    ),
                 ));
             }
             if body.occurrence.body_span.is_empty() {
                 return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "clone body evidence has an empty body span".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyEmptySpan,
+                    ),
                 ));
             }
             if body.occurrence.payload_digest != body.payload.payload_digest {
-                return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "clone body evidence payload digest does not match its payload".to_owned(),
-                ));
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1::new(crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyPayloadDigestMismatch)));
             }
             if validate_payloads && let Err(detail) = body.payload.validate() {
-                return Err(ChunkingFailureV1::NonCanonicalIdentity(format!(
-                    "clone body evidence payload is not canonical: {detail}"
-                )));
+                return Err(ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyPayloadNotCanonical,
+                    )
+                    .with(
+                        crate::noncanonical::NonCanonicalDetailKeyV1::Detail,
+                        detail.to_string(),
+                    ),
+                ));
             }
             if !occurrences.contains(&body.occurrence.symbol_occurrence_id) {
                 return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "clone body evidence is not bound to a file symbol".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::CloneBodyMissingSymbol,
+                    ),
                 ));
             }
         }
@@ -428,12 +499,15 @@ impl CodeFileIndexArtifactsV1 {
         extraction: &ExtractionBatchV1,
         snapshot_digest: &ManifestDigest,
     ) -> Result<(), ChunkingFailureV1> {
+        let _ = snapshot_digest;
+        // `snapshot_digest` on clone bodies is the snapshot of last extraction /
+        // rematerialize. Carried Arc-shared pages keep that provenance across
+        // successor publishes; path/project/content binding is the live check.
         if self.clone_bodies.iter().any(|body| {
             body.occurrence.project_id != authority.project_id
                 || body.occurrence.repository_id != authority.repository_id
                 || body.occurrence.worktree_id != authority.worktree_id
                 || body.occurrence.source_generation != extraction.generation_id
-                || body.occurrence.snapshot_digest != *snapshot_digest
                 || body.occurrence.path != authority.logical_path
         }) {
             return Err(ChunkingFailureV1::GenerationMismatch);
@@ -450,7 +524,9 @@ impl CodeFileIndexArtifactsV1 {
             || evidence.facts.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "schema evidence is not in strict canonical order".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaUnordered,
+                ),
             ));
         }
         if matches!(evidence.status, SchemaEvidenceStatusV1::Complete) != evidence.issues.is_empty()
@@ -458,7 +534,9 @@ impl CodeFileIndexArtifactsV1 {
                 && !evidence.facts.is_empty())
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "schema evidence status does not match its facts and issues".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaStatusMismatch,
+                ),
             ));
         }
         let indexed_end = self
@@ -472,7 +550,9 @@ impl CodeFileIndexArtifactsV1 {
             span.is_empty() || indexed_end.is_none_or(|end| span.end_byte > end)
         }) {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "schema evidence exceeds the indexed file extent".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaExceedsFileExtent,
+                ),
             ));
         }
         Ok(())
@@ -487,26 +567,40 @@ impl CodeFileIndexArtifactsV1 {
                 != Some(row.module_kind)
         }) {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import module kind does not match its language and module specifier".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportModuleKindMismatch,
+                ),
             ));
         }
         extraction
             .parser_import_rows_digest
             .validate()
-            .map_err(|error| ChunkingFailureV1::NonCanonicalIdentity(error.to_string()))?;
+            .map_err(|error| {
+                ChunkingFailureV1::NonCanonicalIdentity(
+                    crate::noncanonical::noncanonical_from_domain(error),
+                )
+            })?;
         let parser_rows = self
             .imports
             .iter()
             .map(CodeIndexImportEvidenceV1::to_extracted)
             .collect::<Vec<_>>();
         let observed = parser_import_rows_digest(&parser_rows).map_err(|error| {
-            ChunkingFailureV1::NonCanonicalIdentity(format!(
-                "parser import rows digest failed: {error:?}"
-            ))
+            ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ParserImportRowsDigest,
+                )
+                .with(
+                    crate::noncanonical::NonCanonicalDetailKeyV1::Error,
+                    format!("{error:?}"),
+                ),
+            )
         })?;
         if observed != extraction.parser_import_rows_digest {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                IMPORT_AUTHORITY_MISMATCH.to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportAuthorityMismatch,
+                ),
             ));
         }
         validate_schema_evidence_language(extraction.language.as_str(), &self.schema_evidence)?;
@@ -520,7 +614,9 @@ impl CodeFileIndexArtifactsV1 {
             .any(|pair| canonical_import_order(&pair[0], &pair[1]) != Ordering::Less)
         {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "import evidence is not in strict canonical source order".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::ImportUnordered,
+                ),
             ));
         }
         let indexed_end = self
@@ -537,12 +633,16 @@ impl CodeFileIndexArtifactsV1 {
             }
             if Some(row.logical_path.as_str()) != expected_path {
                 return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "import evidence spans more than one logical file".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::ImportMultiFile,
+                    ),
                 ));
             }
             if indexed_end.is_none_or(|end| row.span.end_byte > end) {
                 return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                    "import evidence exceeds the indexed file extent".to_owned(),
+                    crate::noncanonical::NonCanonicalCauseV1::new(
+                        crate::noncanonical::NonCanonicalReasonCodeV1::ImportExceedsFileExtent,
+                    ),
                 ));
             }
         }
@@ -656,13 +756,17 @@ fn validate_schema_evidence_language(
         ("sql", Some(evidence)) if evidence.language == SchemaEvidenceLanguageV1::Sql => {}
         ("protobuf" | "sql", None) => {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "schema extraction is missing its typed evidence".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaMissingEvidence,
+                ),
             ));
         }
         (_, None) => {}
         (_, Some(_)) => {
             return Err(ChunkingFailureV1::NonCanonicalIdentity(
-                "schema evidence language does not match its extraction".to_owned(),
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaLanguageMismatch,
+                ),
             ));
         }
     }
@@ -674,9 +778,9 @@ fn rematerialized_occurrence(
     occurrence: &SymbolOccurrenceId,
 ) -> Result<SymbolOccurrenceId, ChunkingFailureV1> {
     occurrences.get(occurrence).cloned().ok_or_else(|| {
-        ChunkingFailureV1::NonCanonicalIdentity(
-            "graph evidence could not be rematerialized".to_owned(),
-        )
+        ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::NonCanonicalCauseV1::new(
+            crate::noncanonical::NonCanonicalReasonCodeV1::GraphRematerializeFailed,
+        ))
     })
 }
 
@@ -715,6 +819,14 @@ mod schema_evidence_tests {
             facts: Vec::new(),
         });
 
-        assert!(validate_schema_evidence_language("rust", &evidence).is_err());
+        assert_eq!(
+            validate_schema_evidence_language("rust", &evidence),
+            Err(ChunkingFailureV1::NonCanonicalIdentity(
+                crate::noncanonical::NonCanonicalCauseV1::new(
+                    crate::noncanonical::NonCanonicalReasonCodeV1::SchemaLanguageMismatch,
+                )
+            ))
+        );
+        assert_eq!(validate_schema_evidence_language("sql", &evidence), Ok(()));
     }
 }
