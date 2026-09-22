@@ -280,7 +280,7 @@ mod enabled {
                 Arc::new(|| false),
             )
             .unwrap();
-        assert!(proved.is_some());
+        let proved_instance = proved.expect("real worker proves pinned V2 identity");
         assert_eq!(surface.descriptor(), declared);
         assert!(
             surface.provider_instance_id().unwrap().is_none(),
@@ -290,6 +290,11 @@ mod enabled {
         assert_eq!(ready.terminal.terminal_code(), TerminalCode::Success);
         assert_eq!(surface.descriptor(), declared);
         assert!(surface.provider_instance_id().unwrap().is_some());
+        assert_eq!(
+            ready.provider_instance_id.as_deref(),
+            Some(proved_instance.as_str()),
+            "the real worker handshake must preserve the proved production identity"
+        );
         assert!(ready.ready_receipt_sha256.is_some());
     }
 
@@ -1342,20 +1347,25 @@ mod enabled {
         })
         .unwrap();
         assert_eq!(owner.worker_pid(), None);
+        assert_eq!(owner.worker_incarnation(), None);
         owner
             .start(std::time::Instant::now() + Duration::from_secs(5))
             .unwrap();
         let first = owner.worker_pid().unwrap();
+        let first_incarnation = owner.worker_incarnation().unwrap();
+        assert_eq!(first_incarnation, 1);
         assert!(
             owner
                 .request_stop(std::time::Instant::now() + Duration::from_secs(5))
                 .unwrap()
         );
         assert_eq!(owner.worker_pid(), None);
+        assert_eq!(owner.worker_incarnation(), Some(first_incarnation));
         owner
             .start(std::time::Instant::now() + Duration::from_secs(5))
             .unwrap();
         let second = owner.worker_pid().unwrap();
+        assert_eq!(owner.worker_incarnation(), Some(first_incarnation + 1));
         assert_ne!(first, second);
         owner
             .kill(std::time::Instant::now() + Duration::from_secs(5))
@@ -1366,6 +1376,74 @@ mod enabled {
             owner.worker_pid(),
             None,
             "expired start must not create a child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_worker_respawn_invalidates_cached_surface_readiness() {
+        let root = TestRoot::new("internal-worker-respawn-readiness");
+        let surface = surface(&root);
+        let adapter = NcmProviderAdapter::new(surface.clone()).expect("construct adapter");
+        let exact_scope = scope("internal-worker-respawn-readiness");
+        let first = handshake(&adapter, &exact_scope);
+        let (receipt, generation) = ready_parts(&first);
+        let first_instance = first
+            .provider_instance_id
+            .clone()
+            .expect("initial provider instance");
+        let first_pid = surface.worker_pid().expect("initial worker process");
+        let first_incarnation = surface
+            .worker_incarnation()
+            .expect("initial worker owner incarnation");
+        assert!(
+            Command::new("kill")
+                .args(["-9", &first_pid.to_string()])
+                .status()
+                .expect("kill worker process")
+                .success(),
+            "worker process must be killed"
+        );
+
+        let stale = adapter.invoke(&call(
+            ProviderOperation::Recall,
+            &exact_scope,
+            &receipt,
+            generation,
+            None,
+            json!({"query_text": "after internal restart", "top_k": 1}),
+            10_000,
+        ));
+        assert_eq!(
+            stale.terminal.terminal_code(),
+            TerminalCode::StaleIdentity,
+            "cached readiness must not route through a replacement worker: {stale:?}"
+        );
+
+        let replacement = handshake(&adapter, &exact_scope);
+        assert_eq!(
+            replacement.terminal.terminal_code(),
+            TerminalCode::Success,
+            "{replacement:?}"
+        );
+        assert_ne!(
+            replacement.provider_instance_id.as_deref(),
+            Some(first_instance.as_str()),
+            "replacement worker must receive a fresh provider instance identity"
+        );
+        assert_ne!(
+            surface.worker_pid(),
+            Some(first_pid),
+            "worker owner must have respawned a different process"
+        );
+        assert_eq!(
+            surface.worker_incarnation(),
+            Some(first_incarnation + 1),
+            "worker owner incarnation must advance across an internal respawn"
+        );
+        assert_ne!(
+            replacement.ready_receipt_sha256, first.ready_receipt_sha256,
+            "readiness receipt must bind the worker owner incarnation"
         );
     }
 
@@ -2156,6 +2234,19 @@ mod enabled {
             json!({"source_id": "source-delete"}),
         );
         assert_eq!(deleted.terminal.terminal_code(), TerminalCode::Success);
+        let post_delete_snapshot = invoke_after_handshake(
+            &adapter,
+            &exact_scope,
+            ProviderOperation::SnapshotExport,
+            None,
+            json!({}),
+        );
+        assert_eq!(
+            post_delete_snapshot.terminal.terminal_code(),
+            TerminalCode::Success,
+            "post-delete snapshot export diagnostic: {:?}",
+            post_delete_snapshot.terminal.diagnostic_id()
+        );
         let recall = invoke_after_handshake(
             &adapter,
             &exact_scope,
@@ -2342,6 +2433,7 @@ mod enabled {
                     ServeOptions {
                         allow_test_delays: true,
                         encoder_ready: true,
+                        allow_legacy_identity: true,
                     },
                 )
                 .unwrap();

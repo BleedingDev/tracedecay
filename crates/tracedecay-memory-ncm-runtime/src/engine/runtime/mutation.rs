@@ -190,6 +190,7 @@ impl NcmEngine {
                 Ok((
                     DurableOperation::Maintenance {
                         kind: request.kind.clone(),
+                        canonical_input: common.map(|common| common.canonical_input.clone()),
                     },
                     payload,
                     Some(maintenance_name(&request.kind).to_owned()),
@@ -283,6 +284,7 @@ impl NcmEngine {
             &reply,
             DurableOperation::Maintenance {
                 kind: MaintenanceKind::Compact,
+                canonical_input: common.map(|common| common.canonical_input.clone()),
             },
             &candidate,
             Some(&request.idempotency_key),
@@ -473,7 +475,7 @@ impl NcmEngine {
             }
         }
         if let Some(common) = common {
-            let DurableOperation::Maintenance { kind } = &operation else {
+            let DurableOperation::Maintenance { kind, .. } = &operation else {
                 return EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null);
             };
             if let Err(reply) = common.retain(&mut reply, kind, &live, &candidate) {

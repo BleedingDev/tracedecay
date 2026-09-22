@@ -963,7 +963,7 @@ mod tests {
             unique_contributions: 2,
         };
         assert_eq!(observed("graph").validate(), Ok(()));
-        assert_eq!(observed("semantic").validate(), Err("retriever_counts"));
+        assert_eq!(observed("semantic").validate(), Ok(()));
 
         let planner = |lanes: &[&str]| RetrievalPlannerObservedV1 {
             planner_revision: "planner.v1".into(),
@@ -975,6 +975,7 @@ mod tests {
             planner(&[
                 "exact_literal",
                 "lexical",
+                "semantic",
                 "graph",
                 "temporal",
                 "task_session",
@@ -984,7 +985,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            planner(&["lexical", "semantic"]).validate(),
+            planner(&["lexical", "semantic", "retired_dense"]).validate(),
             Err("retrieval_planner_lanes")
         );
     }

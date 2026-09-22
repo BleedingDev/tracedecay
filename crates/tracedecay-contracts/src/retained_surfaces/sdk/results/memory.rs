@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use tracedecay_domain::{FactAssertionId, FactEventId, FactId, UtcMicros};
 
 pub use crate::memory::{
-    FactCommitOwnerV1, FactIdentitySourceResultV1, FactPayloadAccessV1, FactProjectionV1,
-    FactRetrievalTelemetryDegradationV1, FactRetrievalTelemetryV1, FactSearchCursorV1,
-    FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1, FactSearchScoresV1,
-    FactStatusV1, FactTelemetryV1, FactV1,
+    FactCommitOwnerV1, FactIdentitySourceResultV1, FactListCursorV1, FactPayloadAccessV1,
+    FactProjectionV1, FactRetrievalTelemetryDegradationV1, FactRetrievalTelemetryV1,
+    FactSearchCursorV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
+    FactSearchScoresV1, FactStatusV1, FactTelemetryV1, FactV1,
 };
 use crate::retained_surfaces::FactFeedbackActionV1;
 
@@ -184,7 +184,7 @@ pub enum FactStoreSupersedeResultV1 {
 pub struct FactStoreListResultV1 {
     pub owner: FactCommitOwnerV1,
     pub facts: Vec<FactProjectionV1>,
-    pub next_after_fact_id: Option<FactId>,
+    pub next_after: Option<FactListCursorV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]

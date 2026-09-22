@@ -9,6 +9,7 @@ use crate::wire::{self, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION, Reply, R
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +24,9 @@ pub struct ServeOptions {
     pub allow_test_delays: bool,
     /// Whether the configured encoder is loaded and ready for text operations.
     pub encoder_ready: bool,
+    /// Keep the sparse V1 ready shape for an explicitly admitted test double.
+    /// Production workers always emit and validate complete V2 identity.
+    pub allow_legacy_identity: bool,
 }
 
 impl Default for ServeOptions {
@@ -30,6 +34,7 @@ impl Default for ServeOptions {
         Self {
             allow_test_delays: false,
             encoder_ready: true,
+            allow_legacy_identity: false,
         }
     }
 }
@@ -180,7 +185,12 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
     let result = match request.op {
         Operation::Handshake => {
             if options.encoder_ready {
-                dispatch_handshake(engine, &request.namespace, &request.payload)
+                dispatch_handshake(
+                    engine,
+                    &request.namespace,
+                    &request.payload,
+                    options.allow_legacy_identity,
+                )
             } else {
                 EngineReply {
                     outcome: Outcome::Unavailable("encoder not ready".to_owned()),
@@ -266,35 +276,46 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
             crate::snapshot::export_to_file(engine, &request.namespace, deadline)
         }
         Operation::SnapshotRestore => parse_payload::<SnapshotRestorePayload>(&request.payload)
-            .map_or_else(rejected, |payload| {
+            .and_then(|payload| {
+                let blocked_sources = parse_restore_authority(payload.blocked_sources)?;
                 match (
                     payload.snapshot,
                     payload.snapshot_file,
                     payload.byte_length,
                     payload.content_sha256,
                 ) {
-                    (Some(snapshot), None, None, None) => engine.snapshot_restore(
-                        &request.namespace,
-                        &snapshot,
-                        &payload.idempotency_key,
-                        deadline,
-                    ),
+                    (Some(snapshot), None, None, None) => {
+                        Ok(crate::snapshot::restore_with_revocations(
+                            engine,
+                            &request.namespace,
+                            crate::snapshot::RestoreRequest {
+                                idempotency_key: payload.idempotency_key,
+                                bytes: snapshot,
+                            },
+                            deadline,
+                            &blocked_sources,
+                            None,
+                        ))
+                    }
                     (None, Some(snapshot_file), Some(byte_length), Some(content_sha256)) => {
-                        crate::snapshot::restore_from_file(
+                        Ok(crate::snapshot::restore_from_file_with_revocations(
                             engine,
                             &request.namespace,
                             &payload.idempotency_key,
                             &snapshot_file,
                             byte_length,
                             &content_sha256,
+                            &blocked_sources,
                             deadline,
-                        )
+                        ))
                     }
-                    _ => rejected(
-                        "snapshot restore requires exactly one complete inline or file transport",
+                    _ => Err(
+                        "snapshot restore requires exactly one complete inline or file transport"
+                            .to_owned(),
                     ),
                 }
-            }),
+            })
+            .unwrap_or_else(rejected),
         Operation::Replay => engine.replay(&request.namespace, deadline),
     };
     hold_committed_reply(&request, &result, options);
@@ -325,7 +346,12 @@ fn health(engine: &NcmEngine, encoder_ready: bool) -> EngineReply {
     reply
 }
 
-fn dispatch_handshake(engine: &NcmEngine, namespace: &str, payload: &Value) -> EngineReply {
+fn dispatch_handshake(
+    engine: &NcmEngine,
+    namespace: &str,
+    payload: &Value,
+    allow_legacy_identity: bool,
+) -> EngineReply {
     let expected = match parse_payload::<HandshakePayload>(payload) {
         Ok(expected) => expected,
         Err(reason) => return rejected(reason),
@@ -340,9 +366,12 @@ fn dispatch_handshake(engine: &NcmEngine, namespace: &str, payload: &Value) -> E
     {
         return incompatible("handshake protocol identity mismatch");
     }
-    let reply = engine.handshake(namespace);
+    let mut reply = engine.handshake(namespace);
     if reply.outcome != Outcome::Success {
         return reply;
+    }
+    if allow_legacy_identity {
+        downgrade_ready_identity(&mut reply.payload);
     }
     if let Some(profile) = expected.algorithm_profile.as_deref()
         && reply
@@ -367,7 +396,61 @@ fn dispatch_handshake(engine: &NcmEngine, namespace: &str, payload: &Value) -> E
     {
         return incompatible("handshake epoch identity mismatch");
     }
+    if let Some(revision) = expected.identity_revision {
+        if revision != 2 {
+            return incompatible("unsupported handshake identity revision");
+        }
+        if reply
+            .payload
+            .get("identity_revision")
+            .and_then(Value::as_u64)
+            != Some(2)
+        {
+            return incompatible("handshake did not prove a complete V2 identity");
+        }
+        if reply
+            .payload
+            .get("projection_sha256")
+            .and_then(Value::as_str)
+            .is_none()
+            || reply.payload.get("epoch").and_then(Value::as_u64).is_none()
+        {
+            return incompatible("handshake V2 identity omitted runtime state");
+        }
+        for (field, expected_value) in [
+            ("algorithm", expected.algorithm.as_ref()),
+            ("worker", expected.worker.as_ref()),
+            ("encoder", expected.encoder.as_ref()),
+        ] {
+            let Some(expected_value) = expected_value else {
+                return incompatible("handshake V2 request omitted pinned identity");
+            };
+            if reply.payload.get(field) != Some(expected_value) {
+                return incompatible("handshake V2 identity mismatch");
+            }
+        }
+        if let Some(expected_projection) = expected.projection_sha256.as_ref()
+            && reply
+                .payload
+                .get("projection_sha256")
+                .and_then(Value::as_str)
+                != Some(expected_projection)
+        {
+            return incompatible("handshake projection identity mismatch");
+        }
+    }
     reply
+}
+
+fn downgrade_ready_identity(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.remove("identity_revision");
+    object.remove("worker");
+    if let Some(encoder) = object.get_mut("encoder").and_then(Value::as_object_mut) {
+        encoder.retain(|field, _| matches!(field.as_str(), "model" | "artifact_sha256"));
+    }
 }
 
 fn parse_payload<T: DeserializeOwned>(payload: &Value) -> Result<T, String> {
@@ -405,6 +488,11 @@ struct HandshakePayload {
     algorithm_profile: Option<String>,
     model: Option<String>,
     epoch: Option<u64>,
+    identity_revision: Option<u16>,
+    algorithm: Option<Value>,
+    projection_sha256: Option<String>,
+    worker: Option<Value>,
+    encoder: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -453,6 +541,8 @@ struct DeletePayload {
 struct SnapshotRestorePayload {
     idempotency_key: String,
     #[serde(default)]
+    blocked_sources: Option<Vec<String>>,
+    #[serde(default)]
     snapshot: Option<Vec<u8>>,
     #[serde(default)]
     snapshot_file: Option<PathBuf>,
@@ -460,4 +550,89 @@ struct SnapshotRestorePayload {
     byte_length: Option<u64>,
     #[serde(default)]
     content_sha256: Option<String>,
+}
+
+fn parse_restore_authority(values: Option<Vec<String>>) -> Result<Vec<SourceId>, String> {
+    let Some(values) = values else {
+        return Err("snapshot restore requires deletion authority".to_owned());
+    };
+    if values.len() > 4096 {
+        return Err("snapshot restore deletion authority exceeds its bound".to_owned());
+    }
+    let mut sources = BTreeSet::new();
+    for value in values {
+        if value.is_empty() || !sources.insert(value) {
+            return Err("snapshot restore deletion authority is invalid".to_owned());
+        }
+    }
+    Ok(sources.into_iter().map(SourceId).collect())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::embedding::doubles::HashEncoder;
+    use crate::ports::StateRoot;
+    use tempfile::tempdir;
+    use tracedecay_memory_ncm_core::types::NcmConfig;
+
+    #[test]
+    fn handshake_observes_fresh_and_reopened_epoch_and_rejects_stale_epoch() {
+        let root = tempdir().expect("create worker handshake state root");
+        let state_root = StateRoot::new(root.path()).expect("state root is absolute");
+        let namespace = "ab".repeat(32);
+        let engine = NcmEngine::new(
+            state_root.clone(),
+            Arc::new(HashEncoder::new()),
+            NcmConfig::default(),
+        );
+
+        let fresh = dispatch_handshake(&engine, &namespace, &json!({}), false);
+        assert_eq!(fresh.outcome, Outcome::Success);
+        assert_eq!(fresh.payload["empty"].as_bool(), Some(true));
+        assert_eq!(fresh.payload["epoch"], 0);
+
+        let mut observation = ObserveRequest {
+            idempotency_key: "handshake-seed".to_owned(),
+            payload_sha256: String::new(),
+            source: SourceId("handshake-source".to_owned()),
+            key_text: "handshake key".to_owned(),
+            value_text: "handshake value".to_owned(),
+            affect: None,
+            surprise: 0.4,
+            intensity: 1.0,
+            provenance: json!({"origin": "worker-handshake-test"}),
+            deadline: Deadline {
+                remaining_ms: u64::MAX,
+            },
+        };
+        observation.payload_sha256 = observation
+            .canonical_payload_sha256()
+            .expect("observation payload hashes");
+        assert_eq!(
+            engine.observe(&namespace, observation).outcome,
+            Outcome::Success
+        );
+        drop(engine);
+
+        let reopened = NcmEngine::new(
+            state_root,
+            Arc::new(HashEncoder::new()),
+            NcmConfig::default(),
+        );
+        let unknown_epoch = dispatch_handshake(&reopened, &namespace, &json!({}), false);
+        assert_eq!(unknown_epoch.outcome, Outcome::Success);
+        assert_eq!(unknown_epoch.payload["empty"].as_bool(), Some(false));
+        assert_eq!(unknown_epoch.payload["epoch"], 1);
+
+        let exact = dispatch_handshake(&reopened, &namespace, &json!({"epoch": 1}), false);
+        assert_eq!(exact.outcome, Outcome::Success);
+        let stale = dispatch_handshake(&reopened, &namespace, &json!({"epoch": 0}), false);
+        assert_eq!(stale.outcome, Outcome::Incompatible);
+        assert_eq!(
+            stale.payload["reason"],
+            Value::String("handshake epoch identity mismatch".to_owned())
+        );
+    }
 }

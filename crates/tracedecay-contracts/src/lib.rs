@@ -58,6 +58,7 @@ pub mod retained_receipts;
 pub mod retained_surfaces;
 pub mod retrieval;
 pub mod sdk_catalog;
+pub mod semantic_activation;
 pub mod session_sync;
 mod session_temporal_refresh;
 pub mod settings_preview;
@@ -399,6 +400,15 @@ pub use retrieval::{
 pub use sdk_catalog::{
     application_http_executable_binding_registry, application_http_route_path,
     sdk_executable_binding_registry,
+};
+pub use semantic_activation::{
+    SemanticActivationAuthorityReceiptV1, SemanticActivationAvailabilityV1,
+    SemanticActivationBindingV1, SemanticActivationContractErrorV1,
+    SemanticActivationCoordinationErrorV1, SemanticActivationCoordinationPort,
+    SemanticActivationJournalEntryV1, SemanticActivationJournalErrorV1,
+    SemanticActivationJournalPhaseV1, SemanticActivationJournalPortV1,
+    SemanticActivationOperationV1, SemanticActivationUnavailableReasonV1,
+    SemanticQualificationFailureV1, SemanticQualificationStateV1,
 };
 pub use session_temporal_refresh::{
     SessionTemporalRefreshWakeFuture, SessionTemporalRefreshWakePort,

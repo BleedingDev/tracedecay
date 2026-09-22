@@ -7,6 +7,7 @@
 #![doc = "Atomic common maintenance receipts through the durable NCM engine."]
 
 use rusqlite::Connection;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -33,6 +34,28 @@ fn digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn opaque_id(namespace: &str, kind: &[u8], value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tracedecay.ncm.opaque-id.v1\0");
+    for field in [namespace.as_bytes(), kind, value.as_bytes()] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn worker_key(public_key: &str) -> String {
+    opaque_id(&namespace(), b"idempotency-key", public_key)
+}
+
+fn legacy_worker_key(public_key: &str) -> String {
+    digest(public_key.as_bytes())
 }
 
 fn engine(directory: &TempDir) -> NcmEngine {
@@ -74,7 +97,7 @@ fn seed(engine: &NcmEngine, source: &str) -> EngineReply {
 
 fn request(key: &str, task: &str, generation: u64) -> Value {
     let mut request = json!({
-        "action": "maintenance", "idempotency_key": digest(key.as_bytes()),
+        "action": "maintenance", "idempotency_key": worker_key(key),
         "expected_generation": generation, "task": task,
         "maximum_items": 100, "maximum_bytes": 1_048_576,
         "maximum_duration_millis": 60_000, "dry_run": false,
@@ -116,8 +139,8 @@ fn inspect_receipt(engine: &NcmEngine, key: &str) -> EngineReply {
     engine.common_control(
         &namespace(),
         json!({
-            "action": "inspection", "expected_generation": generation,
-            "view": "maintenance_receipt", "delivery_key": digest(key.as_bytes()),
+        "action": "inspection", "expected_generation": generation,
+            "view": "maintenance_receipt", "delivery_key": worker_key(key),
             "maximum_items": 1, "maximum_bytes": 1_048_576, "after": 0,
         }),
         DEADLINE,
@@ -126,7 +149,7 @@ fn inspect_receipt(engine: &NcmEngine, key: &str) -> EngineReply {
 
 fn receipt_item(engine: &NcmEngine, key: &str) -> Value {
     let reply = inspect_receipt(engine, key);
-    assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
+    assert_eq!(reply.outcome, Outcome::Success);
     assert_eq!(reply.payload["partial"], false);
     let items = reply.payload["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
@@ -138,6 +161,55 @@ fn identity(receipt: &Value) -> Value {
         serde_json::from_value(receipt["maintenance_receipt"]["admission"]["bytes"].clone())
             .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[derive(Serialize)]
+struct IntegrityReply<'a> {
+    outcome: &'a Value,
+    state_generation: &'a Value,
+    payload: &'a Value,
+}
+
+#[derive(Serialize)]
+struct IntegrityMaintenance<'a> {
+    kind: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_input: Option<&'a Value>,
+}
+
+#[derive(Serialize)]
+struct IntegrityOperation<'a> {
+    maintenance: IntegrityMaintenance<'a>,
+}
+
+#[derive(Serialize)]
+struct IntegrityBasis<'a> {
+    reply: IntegrityReply<'a>,
+    operation: IntegrityOperation<'a>,
+    state_digest: &'a str,
+}
+
+fn receipt_integrity_digest(receipt: &Value) -> String {
+    let reply = receipt["reply"].clone();
+    let operation = receipt["operation"].clone();
+    let state_digest = receipt["state_digest"].as_str().unwrap();
+    digest(
+        &serde_json::to_vec(&IntegrityBasis {
+            reply: IntegrityReply {
+                outcome: &reply["outcome"],
+                state_generation: &reply["state_generation"],
+                payload: &reply["payload"],
+            },
+            operation: IntegrityOperation {
+                maintenance: IntegrityMaintenance {
+                    kind: &operation["maintenance"]["kind"],
+                    canonical_input: operation["maintenance"].get("canonical_input"),
+                },
+            },
+            state_digest,
+        })
+        .unwrap(),
+    )
 }
 
 #[test]
@@ -281,14 +353,17 @@ fn maintenance_cursor_retries_reconcile_before_stale_generation_checks() {
     seed(&live, "alpha");
     seed(&live, "beta");
     let generation = seed(&live, "gamma").state_generation;
-    let mut page = request("paged-repair", "repair", generation);
+    let mut page = request("paged-repair-1", "repair", generation);
     page["maximum_items"] = json!(1);
-    for expected_after in [1, 2] {
-        seal(
-            &mut page,
-            "paged-repair",
-            "01993262-4d00-7000-8000-000000000001",
-        );
+    for (page_number, (key, operation_id)) in [
+        ("paged-repair-1", "01993262-4d00-7000-8000-000000000001"),
+        ("paged-repair-2", "01993262-4d00-7000-8000-000000000002"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        page["idempotency_key"] = json!(worker_key(key));
+        seal(&mut page, key, operation_id);
         let partial = invoke(&live, page.clone());
         assert_eq!(partial.outcome, Outcome::Success);
         assert_eq!(partial.state_generation, generation);
@@ -299,15 +374,17 @@ fn maintenance_cursor_retries_reconcile_before_stale_generation_checks() {
             partial.payload["resume_cursor"],
             format!(
                 "ncm-maintenance:{}:repair:{generation}:{expected_after}",
-                namespace()
+                namespace(),
+                expected_after = page_number + 1,
             )
         );
         page["resume_cursor"] = partial.payload["resume_cursor"].clone();
     }
+    page["idempotency_key"] = json!(worker_key("paged-repair-3"));
     seal(
         &mut page,
-        "paged-repair",
-        "01993262-4d00-7000-8000-000000000001",
+        "paged-repair-3",
+        "01993262-4d00-7000-8000-000000000003",
     );
     let committed = invoke(&live, page.clone());
     assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
@@ -322,11 +399,11 @@ fn maintenance_cursor_retries_reconcile_before_stale_generation_checks() {
     assert_eq!(replay.payload["replayed"], true);
 
     let mut fresh = page.clone();
-    fresh["idempotency_key"] = json!(digest(b"fresh-stale-cursor"));
+    fresh["idempotency_key"] = json!(worker_key("fresh-stale-cursor"));
     seal(
         &mut fresh,
         "fresh-stale-cursor",
-        "01993262-4d00-7000-8000-000000000002",
+        "01993262-4d00-7000-8000-000000000004",
     );
     assert_eq!(
         invoke(&live, fresh).outcome,
@@ -462,15 +539,23 @@ fn maintenance_cursor_grants_keep_same_position_for_distinct_operations() {
         first_b.payload["resume_cursor"]
     );
 
-    page_a["resume_cursor"] = first_a.payload["resume_cursor"].clone();
-    seal(&mut page_a, key_a, operation_a);
-    let second_a = invoke(&live, page_a.clone());
+    let key_a_second = "same-position-maintenance-a-second";
+    let operation_a_second = "01993262-4d00-0000-8000-000000000013";
+    let mut page_a_second = request(key_a_second, "repair", generation);
+    page_a_second["maximum_items"] = json!(1);
+    page_a_second["resume_cursor"] = first_a.payload["resume_cursor"].clone();
+    seal(&mut page_a_second, key_a_second, operation_a_second);
+    let second_a = invoke(&live, page_a_second.clone());
     assert_eq!(second_a.outcome, Outcome::Success, "{second_a:?}");
     assert_eq!(second_a.payload["partial"], true);
 
-    page_b["resume_cursor"] = first_b.payload["resume_cursor"].clone();
-    seal(&mut page_b, key_b, operation_b);
-    let second_b = invoke(&live, page_b);
+    let key_b_second = "same-position-maintenance-b-second";
+    let operation_b_second = "01993262-4d00-0000-8000-000000000014";
+    let mut page_b_second = request(key_b_second, "repair", generation);
+    page_b_second["maximum_items"] = json!(1);
+    page_b_second["resume_cursor"] = first_b.payload["resume_cursor"].clone();
+    seal(&mut page_b_second, key_b_second, operation_b_second);
+    let second_b = invoke(&live, page_b_second);
     assert_eq!(second_b.outcome, Outcome::Success, "{second_b:?}");
     assert_eq!(second_b.payload["partial"], true);
     assert_eq!(
@@ -478,11 +563,170 @@ fn maintenance_cursor_grants_keep_same_position_for_distinct_operations() {
         second_b.payload["resume_cursor"]
     );
 
-    page_a["resume_cursor"] = second_a.payload["resume_cursor"].clone();
-    seal(&mut page_a, key_a, operation_a);
-    let committed = invoke(&live, page_a);
+    let final_key = "same-position-maintenance-a-final";
+    let final_operation_id = "01993262-4d00-0000-8000-000000000019";
+    let mut final_page = request(final_key, "repair", generation);
+    final_page["maximum_items"] = json!(1);
+    final_page["resume_cursor"] = second_a.payload["resume_cursor"].clone();
+    seal(&mut final_page, final_key, final_operation_id);
+    let committed = invoke(&live, final_page);
     assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
     assert_eq!(committed.state_generation, generation + 1);
+}
+
+#[test]
+fn maintenance_continuation_accepts_a_fresh_identity_for_each_page() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    seed(&live, "beta");
+    let generation = seed(&live, "gamma").state_generation;
+
+    let mut first = request("fresh-page-1", "repair", generation);
+    first["maximum_items"] = json!(1);
+    seal(
+        &mut first,
+        "fresh-page-1",
+        "01993262-4d00-0000-8000-000000000013",
+    );
+    let first = invoke(&live, first);
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.state_generation, generation);
+    assert_eq!(first.payload["partial"], true);
+    let first_cursor = first.payload["resume_cursor"].clone();
+
+    let mut second = request("fresh-page-2", "repair", generation);
+    second["maximum_items"] = json!(1);
+    second["resume_cursor"] = first_cursor;
+    seal(
+        &mut second,
+        "fresh-page-2",
+        "01993262-4d00-0000-8000-000000000014",
+    );
+    let second = invoke(&live, second);
+    assert_eq!(second.outcome, Outcome::Success, "{second:?}");
+    assert_eq!(second.state_generation, generation);
+    assert_eq!(second.payload["partial"], true);
+    let second_cursor = second.payload["resume_cursor"].clone();
+
+    let mut final_page = request("fresh-page-3", "repair", generation);
+    final_page["maximum_items"] = json!(1);
+    final_page["resume_cursor"] = second_cursor;
+    seal(
+        &mut final_page,
+        "fresh-page-3",
+        "01993262-4d00-0000-8000-000000000015",
+    );
+    let committed = invoke(&live, final_page.clone());
+    assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
+    assert_eq!(committed.payload["partial"], false);
+    assert_eq!(committed.state_generation, generation + 1);
+
+    final_page["expected_generation"] = json!(committed.state_generation);
+    seal(
+        &mut final_page,
+        "fresh-page-3",
+        "01993262-4d00-0000-8000-000000000015",
+    );
+    let replay = invoke(&live, final_page);
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(replay.state_generation, committed.state_generation);
+}
+
+#[test]
+fn maintenance_cursor_rejects_same_key_on_a_changed_cursor_without_mutation() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    seed(&live, "alpha");
+    seed(&live, "beta");
+    let generation = seed(&live, "gamma").state_generation;
+
+    let mut first = request("cursor-identity-a", "repair", generation);
+    first["maximum_items"] = json!(1);
+    seal(
+        &mut first,
+        "cursor-identity-a",
+        "01993262-4d00-0000-8000-000000000020",
+    );
+    let first = invoke(&live, first);
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.payload["partial"], true);
+    let first_cursor = first.payload["resume_cursor"].clone();
+
+    let mut second = request("cursor-identity-b", "repair", generation);
+    second["maximum_items"] = json!(1);
+    second["resume_cursor"] = first_cursor;
+    seal(
+        &mut second,
+        "cursor-identity-b",
+        "01993262-4d00-0000-8000-000000000021",
+    );
+    let second = invoke(&live, second);
+    assert_eq!(second.outcome, Outcome::Success, "{second:?}");
+    assert_eq!(second.payload["partial"], true);
+    let second_cursor = second.payload["resume_cursor"].clone();
+
+    let mut retry = request("cursor-identity-b", "repair", generation);
+    retry["maximum_items"] = json!(1);
+    retry["resume_cursor"] = first.payload["resume_cursor"].clone();
+    seal(
+        &mut retry,
+        "cursor-identity-b",
+        "01993262-4d00-0000-8000-000000000021",
+    );
+    let retry = invoke(&live, retry);
+    assert_eq!(retry.outcome, Outcome::Success, "{retry:?}");
+    assert_eq!(retry.payload["partial"], true);
+    assert_eq!(retry.payload["resume_cursor"], second_cursor);
+
+    let before_conflict = state(&live);
+    let mut substituted = request("cursor-identity-b", "repair", generation);
+    substituted["maximum_items"] = json!(1);
+    substituted["resume_cursor"] = second_cursor;
+    seal(
+        &mut substituted,
+        "cursor-identity-b",
+        "01993262-4d00-0000-8000-000000000022",
+    );
+    let conflict = invoke(&live, substituted);
+    assert_eq!(
+        conflict.outcome,
+        Outcome::Rejected(RejectReason::IdempotencyConflict),
+        "{conflict:?}"
+    );
+    assert_eq!(conflict.state_generation, generation);
+
+    let after_conflict = state(&live);
+    assert_eq!(
+        after_conflict.state_generation,
+        before_conflict.state_generation
+    );
+    assert_eq!(
+        after_conflict.payload["state_digest"],
+        before_conflict.payload["state_digest"]
+    );
+}
+
+#[test]
+fn maintenance_admission_key_is_bound_to_the_opaque_request_key() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "admission-binding").state_generation;
+    let mut substituted = request("admission-key-a", "repair", generation);
+    seal(
+        &mut substituted,
+        "admission-key-b",
+        "01993262-4d00-0000-8000-000000000016",
+    );
+
+    assert_eq!(
+        invoke(&live, substituted).outcome,
+        Outcome::Rejected(RejectReason::InvalidRequest(
+            "maintenance admission does not match the request".to_owned()
+        ))
+    );
+    assert_eq!(state(&live).state_generation, generation);
 }
 
 #[test]
@@ -492,11 +736,12 @@ fn maintenance_cursor_survives_restart_before_resume_and_commits_once() {
     seed(&live, "alpha");
     seed(&live, "beta");
     let generation = seed(&live, "gamma").state_generation;
-    let key = "restart-paged-maintenance";
-    let operation_id = "01993262-4d00-7000-8000-000000000007";
-    let mut page = request(key, "repair", generation);
+    let first_key = "restart-paged-maintenance-1";
+    let second_key = "restart-paged-maintenance-2";
+    let final_key = "restart-paged-maintenance-3";
+    let mut page = request(first_key, "repair", generation);
     page["maximum_items"] = json!(1);
-    seal(&mut page, key, operation_id);
+    seal(&mut page, first_key, "01993262-4d00-7000-8000-000000000007");
     let first = invoke(&live, page.clone());
     assert_eq!(first.outcome, Outcome::Success, "{first:?}");
     assert_eq!(first.payload["partial"], true);
@@ -505,16 +750,22 @@ fn maintenance_cursor_survives_restart_before_resume_and_commits_once() {
     drop(live);
 
     let reopened = engine(&directory);
+    page["idempotency_key"] = json!(worker_key(second_key));
     page["resume_cursor"] = first_cursor;
-    seal(&mut page, key, operation_id);
+    seal(
+        &mut page,
+        second_key,
+        "01993262-4d00-0000-8000-000000000023",
+    );
     let second = invoke(&reopened, page.clone());
     assert_eq!(second.outcome, Outcome::Success, "{second:?}");
     assert_eq!(second.payload["partial"], true);
     assert_eq!(second.state_generation, generation);
     assert_eq!(second.payload["scanned_items"], 1);
 
+    page["idempotency_key"] = json!(worker_key(final_key));
     page["resume_cursor"] = second.payload["resume_cursor"].clone();
-    seal(&mut page, key, operation_id);
+    seal(&mut page, final_key, "01993262-4d00-0000-8000-000000000024");
     let committed = invoke(&reopened, page.clone());
     assert_eq!(committed.outcome, Outcome::Success, "{committed:?}");
     assert_eq!(committed.payload["partial"], false);
@@ -522,7 +773,7 @@ fn maintenance_cursor_survives_restart_before_resume_and_commits_once() {
     assert_eq!(committed.state_generation, generation + 1);
 
     page["expected_generation"] = json!(committed.state_generation);
-    seal(&mut page, key, operation_id);
+    seal(&mut page, final_key, "01993262-4d00-0000-8000-000000000024");
     let replay = invoke(&reopened, page);
     assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
     assert_eq!(replay.payload["replayed"], true);
@@ -536,22 +787,41 @@ fn deadline_after_partial_page_can_resume_without_a_second_commit() {
     seed(&live, "alpha");
     seed(&live, "beta");
     let generation = seed(&live, "gamma").state_generation;
-    let key = "deadline-paged-maintenance";
-    let operation_id = "01993262-4d00-0000-8000-000000000008";
-    let mut page = request(key, "repair", generation);
+    let mut page = request("deadline-paged-maintenance", "repair", generation);
     page["maximum_items"] = json!(2);
-    seal(&mut page, key, operation_id);
+    seal(
+        &mut page,
+        "deadline-paged-maintenance",
+        "01993262-4d00-0000-8000-000000000008",
+    );
     let first = invoke(&live, page.clone());
     assert_eq!(first.outcome, Outcome::Success, "{first:?}");
     assert_eq!(first.payload["partial"], true);
-    page["resume_cursor"] = first.payload["resume_cursor"].clone();
+    let first_cursor = first.payload["resume_cursor"].clone();
 
-    seal(&mut page, key, operation_id);
-    let interrupted = live.common_control(&namespace(), page.clone(), Deadline { remaining_ms: 0 });
+    // The cursor grant is durable before this continuation reaches the
+    // deadline. A fresh public identity must still be able to resume it.
+    let mut interrupted = request("deadline-paged-interrupted", "repair", generation);
+    interrupted["maximum_items"] = json!(2);
+    interrupted["resume_cursor"] = first_cursor.clone();
+    seal(
+        &mut interrupted,
+        "deadline-paged-interrupted",
+        "01993262-4d00-0000-8000-000000000017",
+    );
+    let interrupted = live.common_control(&namespace(), interrupted, Deadline { remaining_ms: 0 });
     assert_eq!(interrupted.outcome, Outcome::Cancelled);
     assert_eq!(state(&live).state_generation, generation);
 
-    let resumed = invoke(&live, page);
+    let mut resumed_request = request("deadline-paged-resumed", "repair", generation);
+    resumed_request["maximum_items"] = json!(2);
+    resumed_request["resume_cursor"] = first_cursor;
+    seal(
+        &mut resumed_request,
+        "deadline-paged-resumed",
+        "01993262-4d00-0000-8000-000000000018",
+    );
+    let resumed = invoke(&live, resumed_request);
     assert_eq!(resumed.outcome, Outcome::Success, "{resumed:?}");
     assert_eq!(resumed.payload["partial"], false);
     assert_eq!(resumed.state_generation, generation + 1);
@@ -579,17 +849,30 @@ fn paged_consolidate_and_merge_prune_receipts_validate_global_effects() {
         let generation = seed(&live, "gamma").state_generation;
         let mut page = request(key, task, generation);
         page["maximum_items"] = json!(1);
+        let mut page_number = 0_u64;
         loop {
-            seal(&mut page, key, operation_id);
+            let page_key = if page_number == 0 {
+                key.to_owned()
+            } else {
+                format!("{key}-page-{page_number}")
+            };
+            let page_operation_id = if page_number == 0 {
+                operation_id.to_owned()
+            } else {
+                format!("{operation_id}-page-{page_number}")
+            };
+            page["idempotency_key"] = json!(worker_key(&page_key));
+            seal(&mut page, &page_key, &page_operation_id);
             let reply = invoke(&live, page.clone());
             assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
             if reply.payload["partial"] == true {
                 page["resume_cursor"] = reply.payload["resume_cursor"].clone();
+                page_number += 1;
                 continue;
             }
             assert_eq!(reply.payload["scanned_items"], 1);
             assert!(reply.payload["_retained_receipt"].is_object());
-            let receipt = receipt_item(&live, key);
+            let receipt = receipt_item(&live, &page_key);
             let outcome = &receipt["maintenance_receipt"]["outcome"];
             assert_eq!(outcome["scanned_items"], 1);
             assert!(
@@ -602,7 +885,8 @@ fn paged_consolidate_and_merge_prune_receipts_validate_global_effects() {
             drop(live);
             let reopened = engine(&directory);
             page["expected_generation"] = json!(committed_generation);
-            seal(&mut page, key, operation_id);
+            page["idempotency_key"] = json!(worker_key(&page_key));
+            seal(&mut page, &page_key, &page_operation_id);
             let replay = invoke(&reopened, page);
             assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
             assert_eq!(replay.payload["replayed"], true);
@@ -724,7 +1008,7 @@ fn corrupted_common_maintenance_evidence_is_rejected_for_retry_inspection_and_ex
         .join(namespace())
         .join("ncm.sqlite");
     let connection = Connection::open(path).unwrap();
-    let key = digest(b"corrupt-receipt");
+    let key = worker_key("corrupt-receipt");
     let receipt: String = connection
         .query_row(
             "SELECT receipt FROM events WHERE idempotency_key = ?1",
@@ -774,7 +1058,7 @@ fn maintenance_event_key_mismatch_is_rejected_as_corrupt() {
         .join(namespace())
         .join("ncm.sqlite");
     let connection = Connection::open(path).unwrap();
-    let key = digest(b"event-key-mismatch");
+    let key = worker_key("event-key-mismatch");
     let receipt: String = connection
         .query_row(
             "SELECT receipt FROM events WHERE idempotency_key = ?1",
@@ -822,7 +1106,7 @@ fn common_maintenance_receipt_integrity_is_verified_on_all_replay_surfaces() {
         .join(namespace())
         .join("ncm.sqlite");
     let connection = Connection::open(path).unwrap();
-    let key = digest(b"integrity-receipt");
+    let key = worker_key("integrity-receipt");
     let receipt: String = connection
         .query_row(
             "SELECT receipt FROM events WHERE idempotency_key = ?1",
@@ -872,7 +1156,7 @@ fn common_maintenance_receipt_idempotency_key_is_bound_to_its_journal_event() {
         .join(namespace())
         .join("ncm.sqlite");
     let connection = Connection::open(path).unwrap();
-    let key = digest(b"receipt-key");
+    let key = worker_key("receipt-key");
     let receipt: String = connection
         .query_row(
             "SELECT receipt FROM events WHERE idempotency_key = ?1",
@@ -905,6 +1189,145 @@ fn common_maintenance_receipt_idempotency_key_is_bound_to_its_journal_event() {
             .outcome,
         Outcome::Corrupt
     );
+}
+
+#[test]
+fn legacy_common_maintenance_receipt_survives_restart_replay_and_export() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "legacy-receipt").state_generation;
+    let original = request("legacy-receipt", "repair", generation);
+    let first = invoke(&live, original.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let key = worker_key("legacy-receipt");
+    let legacy_key = legacy_worker_key("legacy-receipt");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    receipt["operation"]["maintenance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("canonical_input");
+    receipt["reply"]["payload"]["common_maintenance"]["event_basis"]["idempotency_key"] =
+        json!(legacy_key);
+    // The immediately preceding HEAD receipt type had no outer
+    // `idempotency_key` field. Keep this fixture's wire shape historical
+    // instead of adding the field back with a legacy value.
+    receipt.as_object_mut().unwrap().remove("idempotency_key");
+    assert!(receipt.get("idempotency_key").is_none());
+    receipt["integrity_digest"] = json!(receipt_integrity_digest(&receipt));
+    connection
+        .execute(
+            "UPDATE events SET idempotency_key = ?1, receipt = ?2 WHERE idempotency_key = ?3",
+            [
+                legacy_key.clone(),
+                serde_json::to_string(&receipt).unwrap(),
+                key,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Opening the engine exercises the recovery validator against the exact
+    // pre-canonical-input envelope before any replay or export is attempted.
+    let reopened = engine(&directory);
+    let recovered = reopened.handshake(&namespace());
+    assert_eq!(recovered.outcome, Outcome::Success, "{recovered:?}");
+    assert_eq!(recovered.state_generation, first.state_generation);
+    let before_retry = state(&reopened);
+    assert_eq!(
+        inspect_receipt(&reopened, "legacy-receipt").outcome,
+        Outcome::Success
+    );
+
+    let mut retry = original.clone();
+    retry["expected_generation"] = json!(before_retry.state_generation);
+    let replay = invoke(&reopened, retry);
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(replay.state_generation, before_retry.state_generation);
+    let mut legacy_retry = original;
+    legacy_retry["idempotency_key"] = json!(legacy_key);
+    legacy_retry["expected_generation"] = json!(before_retry.state_generation);
+    let legacy_replay = invoke(&reopened, legacy_retry);
+    assert_eq!(legacy_replay.outcome, Outcome::Success, "{legacy_replay:?}");
+    assert_eq!(legacy_replay.payload["replayed"], true);
+    assert_eq!(
+        legacy_replay.state_generation,
+        before_retry.state_generation
+    );
+    assert_eq!(
+        state(&reopened).payload["state_digest"],
+        before_retry.payload["state_digest"]
+    );
+    assert!(snapshot::export(&reopened, &namespace(), DEADLINE).is_ok());
+}
+
+#[test]
+fn maintenance_event_key_substitution_is_rejected_without_mutation() {
+    let directory = TempDir::new().unwrap();
+    let live = engine(&directory);
+    let generation = seed(&live, "event-substitution").state_generation;
+    let original = request("event-substitution", "repair", generation);
+    let first = invoke(&live, original.clone());
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    drop(live);
+
+    let path = directory
+        .path()
+        .join("namespaces")
+        .join(namespace())
+        .join("ncm.sqlite");
+    let connection = Connection::open(path).unwrap();
+    let key = worker_key("event-substitution");
+    let replacement = worker_key("event-substitution-other");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE idempotency_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut receipt: Value = serde_json::from_str(&receipt).unwrap();
+    receipt["idempotency_key"] = json!(replacement);
+    receipt["reply"]["payload"]["common_maintenance"]["event_basis"]["idempotency_key"] =
+        json!(replacement);
+    receipt["integrity_digest"] = json!(receipt_integrity_digest(&receipt));
+    connection
+        .execute(
+            "UPDATE events SET idempotency_key = ?1, receipt = ?2 WHERE idempotency_key = ?3",
+            [
+                replacement.clone(),
+                serde_json::to_string(&receipt).unwrap(),
+                key.clone(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = engine(&directory);
+    let mut retry = original;
+    retry["expected_generation"] = json!(first.state_generation);
+    let inspection = inspect_receipt(&reopened, "event-substitution");
+    assert_eq!(inspection.outcome, Outcome::Corrupt);
+    assert_eq!(inspection.state_generation, first.state_generation);
+    assert_eq!(invoke(&reopened, retry).outcome, Outcome::Corrupt);
+    let exported = snapshot::export(&reopened, &namespace(), DEADLINE).unwrap_err();
+    assert_eq!(exported.outcome, Outcome::Corrupt);
+    assert_eq!(exported.state_generation, first.state_generation);
 }
 
 #[test]

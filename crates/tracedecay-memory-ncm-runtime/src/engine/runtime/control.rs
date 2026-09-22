@@ -9,6 +9,7 @@ use super::util::{
 };
 use crate::store::{Capsule, CapsuleStatus, StoredCapsule};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::time::Instant;
 use tracedecay_memory_ncm_core::kernel::{NcmKernel, NewRecord};
 use tracedecay_memory_ncm_core::records::RecordState;
@@ -53,6 +54,9 @@ impl NcmEngine {
                     Err(_) => return invalid("invalid claimed deletion bindings", before),
                 },
             };
+            let source_set = sources.iter().cloned().collect::<BTreeSet<_>>();
+            let canonical_input =
+                crate::privacy::deletion_request_input(&source_set, Some(before), Some(&payload));
             let mut reply = crate::privacy::delete_sources(
                 self,
                 namespace,
@@ -61,6 +65,7 @@ impl NcmEngine {
                 deadline,
                 before,
                 bindings.as_deref(),
+                Some(canonical_input),
             );
             if reply.outcome == Outcome::Success {
                 let matched = reply.payload["deleted_records"].as_u64().unwrap_or(0);
@@ -823,11 +828,8 @@ fn recompute_retained_selection_identities(
         "origin_scope": origin_scope,
     }))
     .map_err(|_| "retained source identity encoding".to_owned())?;
-    let source_identity = crate::source_binding::opaque_id(
-        namespace,
-        b"source-target",
-        &source_identity_input,
-    );
+    let source_identity =
+        crate::source_binding::opaque_id(namespace, b"source-target", &source_identity_input);
     let observation_identity_input = serde_json::to_string(&json!([
         canonical_provider_id,
         canonical_session_id,

@@ -1274,6 +1274,11 @@ async fn similar_serves_verified_exact_and_rename_normalized_families() {
             ",
         )
         .unwrap();
+        fs::write(
+            project.join("src/near.rs"),
+            format!("pub fn near_copy(input: Input) {{ {body} changed_tail(input); }}\n"),
+        )
+        .unwrap();
     })
     .await;
     let source = graph_node_id(&fixture, "source_copy").await;
@@ -1300,8 +1305,8 @@ async fn similar_serves_verified_exact_and_rename_normalized_families() {
                 "symbol_occurrence_id": source,
             },
             "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 10,
-            "work_limit": 20,
+            "result_limit": 100,
+            "work_limit": 100,
         }),
         None,
         None,
@@ -1338,6 +1343,431 @@ async fn similar_serves_verified_exact_and_rename_normalized_families() {
             .as_u64()
             .is_some_and(|count| count >= 3),
         "formatting-only and comments-only copies must remain exact: {payload}"
+    );
+
+    // With the dashboard-sized page limit, work_limit == 2 leaves only the
+    // source lookup and one exact lookahead unit. The first request must hand
+    // back an authenticated boundary for the first exact key, while replaying
+    // that boundary must terminate without minting the identical cursor.
+    let minimal_work = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 1,
+            "work_limit": 2,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("minimal-work similar page");
+    let minimal_work: Value =
+        serde_json::from_str(extract_text(&minimal_work.value)).expect("minimal-work similar JSON");
+    let minimal_cursor = minimal_work["families"]
+        .as_array()
+        .expect("minimal-work exact families")
+        .iter()
+        .find_map(|family| family["next_cursor"].as_str())
+        .expect("minimal-work page must expose the first exact boundary")
+        .to_owned();
+    assert!(
+        minimal_work["near"]["matches"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "minimal work must leave no near budget: {minimal_work}"
+    );
+    let minimal_replay = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 1,
+            "work_limit": 2,
+            "cursor": minimal_cursor,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("minimal-work boundary replay");
+    let minimal_replay: Value = serde_json::from_str(extract_text(&minimal_replay.value))
+        .expect("minimal-work replay JSON");
+    let replay_cursors = minimal_replay["families"]
+        .as_array()
+        .expect("minimal-work replay exact families")
+        .iter()
+        .filter_map(|family| family["next_cursor"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        replay_cursors
+            .iter()
+            .all(|cursor| *cursor != minimal_cursor.as_str()),
+        "minimal-work replay must not mint the same exact boundary forever: {minimal_work} -> {minimal_replay}"
+    );
+    assert!(
+        minimal_replay["families"]
+            .as_array()
+            .is_some_and(|families| families
+                .iter()
+                .all(|family| family["next_cursor"].is_null())),
+        "minimal-work replay must terminate without an identical cursor: {minimal_replay}"
+    );
+
+    // Let the exact families establish their immutable result count, then
+    // issue a page whose exact lane fills that count. The authenticated
+    // NearStart phase boundary must make the first near candidate reachable
+    // on the following request.
+    let exact_result_limit = payload["families"]
+        .as_array()
+        .expect("exact family array")
+        .iter()
+        .filter_map(|family| family["member_count"].as_u64())
+        .sum::<u64>();
+    assert!(
+        exact_result_limit > 0,
+        "fixture must produce exact families"
+    );
+    let phase_request = |cursor: Option<&str>| {
+        let mut arguments = json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": exact_result_limit,
+            "work_limit": exact_result_limit + 8,
+        });
+        if let Some(cursor) = cursor {
+            arguments["cursor"] = json!(cursor);
+        }
+        arguments
+    };
+    let exact_filled = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        phase_request(None),
+        None,
+        None,
+    )
+    .await
+    .expect("exact-filled similar page");
+    let exact_filled: Value = serde_json::from_str(extract_text(&exact_filled.value)).unwrap();
+    assert_eq!(
+        exact_filled["families"]
+            .as_array()
+            .expect("exact-filled families")
+            .iter()
+            .filter_map(|family| family["member_count"].as_u64())
+            .sum::<u64>(),
+        exact_result_limit,
+        "the first page must spend its full result budget in exact families: {exact_filled}"
+    );
+    assert!(
+        exact_filled["near"]["matches"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the exact-filled page must leave the near lane empty until its phase continuation: {exact_filled}"
+    );
+    let near_phase_cursor = exact_filled["near"]["next_cursor"]
+        .as_str()
+        .expect("exact-filled page must expose the authenticated near phase cursor");
+    assert!(
+        near_phase_cursor.starts_with("ccclone2."),
+        "near phase cursor must use the authenticated clone cursor domain: {exact_filled}"
+    );
+    let near_phase_envelope: Value = serde_json::from_slice(
+        &hex::decode(
+            near_phase_cursor
+                .strip_prefix("ccclone2.")
+                .expect("authenticated clone cursor prefix"),
+        )
+        .expect("authenticated clone cursor payload is hex"),
+    )
+    .expect("authenticated clone cursor payload is JSON");
+    assert_eq!(
+        near_phase_envelope["payload"]["after"],
+        json!("NearStart"),
+        "exact-filled cursor must decode to the near phase boundary: {exact_filled}"
+    );
+    let mut removed_class_request = phase_request(Some(near_phase_cursor));
+    removed_class_request["match_classes"] = json!(["conservative_exact"]);
+    call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        removed_class_request,
+        None,
+        None,
+    )
+    .await
+    .expect_err("removing a requested class must stale the authenticated cursor");
+    let mut changed_extent_request = phase_request(Some(near_phase_cursor));
+    changed_extent_request["source_extent"] = json!({
+        "kind": "selected_token_range",
+        "start": 0,
+        "end": 8,
+    });
+    call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        changed_extent_request,
+        None,
+        None,
+    )
+    .await
+    .expect_err("changing the source extent must stale the authenticated cursor");
+    let added_class_first = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact"],
+            "result_limit": 1,
+            "work_limit": 20,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("single-class exact page");
+    let added_class_first: Value = serde_json::from_str(extract_text(&added_class_first.value))
+        .expect("single-class exact page JSON");
+    let added_class_cursor = added_class_first["families"][0]["next_cursor"]
+        .as_str()
+        .expect("single-class page must expose an exact continuation");
+    call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 1,
+            "work_limit": 20,
+            "cursor": added_class_cursor,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect_err("adding a requested class must stale the authenticated cursor");
+    let near_phase = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        phase_request(Some(near_phase_cursor)),
+        None,
+        None,
+    )
+    .await
+    .expect("near phase continuation");
+    let near_phase: Value = serde_json::from_str(extract_text(&near_phase.value)).unwrap();
+    assert!(
+        near_phase["families"]
+            .as_array()
+            .is_some_and(|families| families.is_empty()),
+        "near phase continuation must skip the completed exact lane: {near_phase}"
+    );
+    assert!(
+        near_phase["near"]["matches"]
+            .as_array()
+            .is_some_and(|matches| matches
+                .iter()
+                .any(|item| { item["candidate"]["path"] == json!("src/near.rs") })),
+        "near phase continuation must reach the first near result: {near_phase}"
+    );
+    assert!(
+        near_phase["near"]["next_cursor"].is_null(),
+        "the near phase fixture must complete without re-minting a cursor: {near_phase}"
+    );
+
+    // A continuation owned by the second exact key must never replay the
+    // earlier key. This exercises the real multi-key cursor path and checks
+    // the returned occurrence ids for duplication.
+    let multi_key_first = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 4,
+            "work_limit": 20,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("multi-key exact first page");
+    let multi_key_first: Value =
+        serde_json::from_str(extract_text(&multi_key_first.value)).unwrap();
+    let multi_key_families = multi_key_first["families"]
+        .as_array()
+        .expect("multi-key exact families");
+    let cursor_family_index = multi_key_families
+        .iter()
+        .position(|family| family["next_cursor"].is_string())
+        .expect("second exact key must expose a continuation");
+    assert!(
+        cursor_family_index > 0,
+        "the cursor must belong to a later exact key: {multi_key_first}"
+    );
+    let cursor_family_ids = multi_key_families[cursor_family_index]["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|member| member["symbol_occurrence_id"].as_str())
+        .collect::<Vec<_>>();
+    let earlier_family_class = multi_key_families[0]["match_class"].clone();
+    let exact_cursor = multi_key_families[cursor_family_index]["next_cursor"]
+        .as_str()
+        .expect("multi-key exact cursor")
+        .to_owned();
+    let multi_key_second = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 4,
+            "work_limit": 20,
+            "cursor": exact_cursor,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("multi-key exact continuation");
+    let multi_key_second: Value =
+        serde_json::from_str(extract_text(&multi_key_second.value)).unwrap();
+    let resumed_ids = multi_key_second["families"]
+        .as_array()
+        .expect("resumed exact families")
+        .iter()
+        .flat_map(|family| family["members"].as_array().into_iter().flatten())
+        .filter_map(|member| member["symbol_occurrence_id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        cursor_family_ids.iter().all(|id| !resumed_ids.contains(id)),
+        "exact continuation replayed a member before its cursor: {multi_key_first} -> {multi_key_second}"
+    );
+    assert!(
+        multi_key_second["families"]
+            .as_array()
+            .is_some_and(|families| families
+                .iter()
+                .all(|family| { family["match_class"] != earlier_family_class })),
+        "exact continuation must skip the earlier family: {multi_key_second}"
+    );
+
+    // The first exact key consumes three posting rows. The exact lane then
+    // reserves one lookahead unit before opening the next key, so the near
+    // lane must stay empty under the hard request-wide work limit.
+    let tight_work = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 10,
+            "work_limit": 5,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("tight multi-key work-budget page");
+    let tight_work: Value = serde_json::from_str(extract_text(&tight_work.value)).unwrap();
+    assert!(
+        tight_work["near"]["matches"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "exact lookahead must consume the shared work budget before near starts: {tight_work}"
+    );
+    assert!(
+        tight_work["families"]
+            .as_array()
+            .is_some_and(|families| families
+                .iter()
+                .any(|family| { family["next_cursor"].is_string() })),
+        "the tight page must leave the active exact key resumable: {tight_work}"
+    );
+    let tight_cursor = tight_work["families"]
+        .as_array()
+        .expect("tight exact families")
+        .iter()
+        .find_map(|family| family["next_cursor"].as_str())
+        .expect("tight exact continuation");
+    let tight_continuation = call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        json!({
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "target": {
+                "kind": "symbol_occurrence",
+                "symbol_occurrence_id": source,
+            },
+            "match_classes": ["conservative_exact", "rename_normalized_exact"],
+            "result_limit": 10,
+            "work_limit": 5,
+            "cursor": tight_cursor,
+        }),
+        None,
+        None,
+    )
+    .await
+    .expect("tight exact continuation");
+    let tight_continuation: Value = serde_json::from_str(extract_text(&tight_continuation.value))
+        .expect("tight exact continuation JSON");
+    assert!(
+        tight_continuation["families"]
+            .as_array()
+            .is_some_and(|families| {
+                families.iter().all(|family| {
+                    family["match_class"] != json!("conservative_exact")
+                        && family["member_count"]
+                            .as_u64()
+                            .is_some_and(|count| count > 0)
+                })
+            }),
+        "an ExactStart continuation must begin at the first unvisited key: {tight_continuation}"
     );
 
     let paged = call_production_tool(
@@ -1449,15 +1879,18 @@ async fn similar_near_pages_resume_each_occurrence_and_refuse_a_tampered_cursor(
             format!("pub fn source_copy(input: Input) -> u32 {{ {source_body} }}\n"),
         )
         .unwrap();
-        for (path, name) in [
-            ("src/near_a.rs", "near_a"),
-            ("src/near_b.rs", "near_b"),
-            ("src/near_c.rs", "near_c"),
-            ("src/near_d.rs", "near_d"),
+        // Keep the declaration text byte-identical so the artifact groups all
+        // four occurrences under one candidate body. The wire result limit
+        // must then resume inside that grouped occurrence set.
+        for path in [
+            "src/near_a.rs",
+            "src/near_b.rs",
+            "src/near_c.rs",
+            "src/near_d.rs",
         ] {
             fs::write(
                 project.join(path),
-                format!("pub fn {name}(input: Input) -> u32 {{ {repeated_near_body} }}\n"),
+                format!("pub fn near_copy(input: Input) -> u32 {{ {repeated_near_body} }}\n"),
             )
             .unwrap();
         }
@@ -1561,6 +1994,19 @@ async fn similar_near_pages_resume_each_occurrence_and_refuse_a_tampered_cursor(
         seen_paths.iter().all(|path| path.starts_with("src/near_")),
         "near pagination must not return the source occurrence: {seen_paths:?}"
     );
+
+    let mut changed_near_classes = request(Some(first_cursor.clone()));
+    changed_near_classes["match_classes"] =
+        json!(["conservative_exact", "rename_normalized_exact"]);
+    call_production_tool(
+        &fixture,
+        "tracedecay_similar",
+        changed_near_classes,
+        None,
+        None,
+    )
+    .await
+    .expect_err("adding a class must stale a near cursor as well");
 
     let mut tampered_cursor = first_cursor.into_bytes();
     let last = tampered_cursor

@@ -1979,6 +1979,24 @@ impl<A: ProviderLifecycleAdapterV1> ProviderSupervisorV1<A> {
                 }
             }
             Ok(evidence) => {
+                // A successful re-proof may have reached a replacement that
+                // the provider owner spawned internally.  Its transport is
+                // still reachable, but the prior readiness belongs to the
+                // predecessor and cannot authorize this process.  Bind the
+                // new proof to a fresh supervisor incarnation so crash
+                // reports and later routing cannot continue using the old
+                // identity.  The predecessor remains `Live`: only the
+                // adapter can confirm its death, and the next explicit
+                // restart must still perform that bounded reconciliation.
+                let provider_instance_changed = self.readiness.as_ref().is_some_and(|prior| {
+                    prior.provider_instance_id() != evidence.provider_instance_id()
+                });
+                if provider_instance_changed {
+                    self.incarnations_started = self.incarnations_started.saturating_add(1);
+                    self.live_incarnation = Some(self.incarnations_started);
+                    self.crash_reported_incarnation = None;
+                    self.predecessor = PredecessorStateV1::Live;
+                }
                 self.degradation = None;
                 self.clear_violations();
                 self.readiness = Some(evidence.clone());

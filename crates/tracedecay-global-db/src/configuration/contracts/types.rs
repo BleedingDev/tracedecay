@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_domain::configuration::{
     ChangePlanId, ConfigurationAuditEventId, ConfigurationIdempotencyKey, ConfigurationLayerIdV1,
@@ -36,7 +36,7 @@ impl AuthorizedActor {
 /// Mutation authority is never inferred from an actor identifier. It is a
 /// current policy/grant receipt whose complete binding is rechecked by the
 /// authorization port immediately before each durable effect.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ConfigurationMutationAuthority {
     pub receipt: ConfigurationMutationGrantReceiptV1,
 }
@@ -75,7 +75,7 @@ impl ConfigurationMutationAuthority {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum DirectConfigurationMutation {
     Set {
         layer: ConfigurationLayerIdV1,

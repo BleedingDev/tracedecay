@@ -22,15 +22,19 @@ where
 {
     warm_displayed_content_token_counts(&page, token_counts);
     let value = match request {
-        DashboardLcmReadRequestV1::Overview { query, limit } => {
-            overview_json(page, query, limit, storage_scope, token_counts)?
-        }
+        DashboardLcmReadRequestV1::Overview {
+            query,
+            limit,
+            provider,
+            ..
+        } => overview_json(page, query, limit, provider, storage_scope, token_counts)?,
         DashboardLcmReadRequestV1::Search {
             query,
             limit,
             cursor: _,
             role,
             source,
+            provider,
             session_id,
             since,
             until,
@@ -64,6 +68,7 @@ where
                 "filters": {
                     "role": role,
                     "source": source,
+                    "provider": provider,
                     "session_id": session_id,
                     "since": since,
                     "until": until
@@ -75,7 +80,9 @@ where
             session_id,
             limit,
             cursor: _,
+            provider,
         } => {
+            let provider = provider.ok_or(())?;
             let messages = page
                 .messages
                 .into_iter()
@@ -92,6 +99,7 @@ where
                 "storage_scope": storage_scope,
                 "exists": page.stats.message_count > 0 || page.stats.summary_node_count > 0,
                 "session_id": session_id,
+                "provider": provider,
                 "limit": limit,
                 "counts": {
                     "message_count": page.stats.message_count,
@@ -111,7 +119,17 @@ where
             bucket,
             session_id,
             limit,
-        } => timeline_json(page, bucket, session_id, limit, storage_scope, token_counts),
+            provider,
+            ..
+        } => timeline_json(
+            page,
+            bucket,
+            session_id,
+            provider,
+            limit,
+            storage_scope,
+            token_counts,
+        ),
     };
     serde_json::from_value(value).map_err(|_| ())
 }
@@ -120,27 +138,30 @@ fn overview_json(
     page: DashboardLcmCanonicalPageV1,
     query: String,
     limit: i64,
+    provider: Option<String>,
     storage_scope: &str,
     token_counts: &TokenCountCache,
 ) -> Result<serde_json::Value, ()> {
     let mut role_counts = BTreeMap::<String, i64>::new();
     let mut source_counts = BTreeMap::<String, i64>::new();
-    let mut sessions = BTreeMap::<String, (i64, Option<i64>)>::new();
+    let mut sessions = BTreeMap::<(String, String), (i64, Option<i64>)>::new();
     for message in &page.messages {
         *role_counts.entry(message.role.clone()).or_default() += 1;
         *source_counts.entry(message.provider.clone()).or_default() += 1;
-        let session = sessions.entry(message.session_id.clone()).or_default();
+        let session = sessions
+            .entry((message.provider.clone(), message.session_id.clone()))
+            .or_default();
         session.0 = session.0.saturating_add(1);
         session.1 = max_optional_timestamp(session.1, message.timestamp);
     }
     let mut depth_counts = BTreeMap::<i64, i64>::new();
-    let mut summary_sessions = BTreeSet::new();
+    let mut summary_sessions = BTreeSet::<(String, String)>::new();
     let mut source_token_count = Some(0_i64);
     let mut summary_token_count = Some(0_i64);
     let mut max_summary_depth = 0_i64;
     for summary in &page.summary_nodes {
         *depth_counts.entry(summary.depth).or_default() += 1;
-        summary_sessions.insert(summary.session_id.clone());
+        summary_sessions.insert((summary.provider.clone(), summary.session_id.clone()));
         source_token_count = source_token_count
             .zip(summary.source_token_count)
             .map(|(total, tokens)| total.saturating_add(tokens));
@@ -153,11 +174,19 @@ fn overview_json(
     let sessions_total = sessions.len();
     let mut latest_sessions = sessions
         .into_iter()
-        .map(|(session_id, (message_count, last_timestamp))| {
-            (session_id, message_count, last_timestamp)
-        })
+        .map(
+            |((provider, session_id), (message_count, last_timestamp))| {
+                (provider, session_id, message_count, last_timestamp)
+            },
+        )
         .collect::<Vec<_>>();
-    latest_sessions.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    latest_sessions.sort_by(|left, right| {
+        right
+            .3
+            .cmp(&left.3)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
     latest_sessions.truncate(i64_to_usize(limit));
 
     let mut latest_summary_nodes = page.summary_nodes.clone();
@@ -167,6 +196,8 @@ fn overview_json(
             .unwrap_or(right.created_at)
             .cmp(&left.latest_at.unwrap_or(left.created_at))
             .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.session_id.cmp(&right.session_id))
             .then_with(|| left.node_id.cmp(&right.node_id))
     });
     latest_summary_nodes.truncate(i64_to_usize(limit));
@@ -198,7 +229,8 @@ fn overview_json(
                 "count": count
             })).collect::<Vec<_>>(),
             "source_counts": source_counts.into_iter().map(|(source, count)| serde_json::json!({
-                "source": source,
+                "source": source.clone(),
+                "provider": source,
                 "count": count
             })).collect::<Vec<_>>(),
             "depth_counts": depth_counts.into_iter().map(|(depth, count)| serde_json::json!({
@@ -213,8 +245,9 @@ fn overview_json(
             }
         },
         "latest_sessions": latest_sessions.into_iter().map(
-            |(session_id, message_count, last_timestamp)| serde_json::json!({
+            |(provider, session_id, message_count, last_timestamp)| serde_json::json!({
                 "session_id": session_id,
+                "provider": provider,
                 "message_count": message_count,
                 "last_store_id": null,
                 "last_timestamp": last_timestamp
@@ -226,7 +259,9 @@ fn overview_json(
             "summary_nodes": matches.summary_nodes.into_iter().take(i64_to_usize(limit)).map(summary_json).collect::<Vec<_>>()
         },
         "query": query,
-        "limit": limit
+        "limit": limit,
+        "provider": provider,
+        "next_cursor": page.next_cursor
     }))
 }
 
@@ -391,6 +426,7 @@ fn timeline_json(
     page: DashboardLcmCanonicalPageV1,
     bucket: DashboardLcmTimelineBucketV1,
     session_id: Option<String>,
+    provider: Option<String>,
     limit: i64,
     storage_scope: &str,
     token_counts: &TokenCountCache,
@@ -408,7 +444,15 @@ fn timeline_json(
     }
     let total_dated_buckets = saturating_usize_to_i64(dated.len());
     let keep = i64_to_usize(limit);
-    let skip = dated.len().saturating_sub(keep);
+    let page_has_cursor = page.next_cursor.is_some();
+    // A page cursor resumes after the complete page. Reducing that page
+    // locally would discard buckets between the cursor boundary and the
+    // rendered window, so preserve all buckets while continuation is public.
+    let skip = if page_has_cursor {
+        0
+    } else {
+        dated.len().saturating_sub(keep)
+    };
     let buckets = dated
         .into_iter()
         .skip(skip)
@@ -440,7 +484,11 @@ fn timeline_json(
         let key = utc_bucket(timestamp, bucket);
         *node_buckets.entry(Some(key)).or_default() += 1;
     }
-    let node_skip = node_buckets.len().saturating_sub(keep);
+    let node_skip = if page_has_cursor {
+        0
+    } else {
+        node_buckets.len().saturating_sub(keep)
+    };
     let node_buckets = node_buckets
         .into_iter()
         .skip(node_skip)
@@ -452,6 +500,8 @@ fn timeline_json(
         "exists": true,
         "bucket": bucket.as_str(),
         "session_id": session_id,
+        "provider": provider,
+        "next_cursor": page.next_cursor,
         "buckets": buckets,
         "node_buckets": node_buckets,
         "undated": {
@@ -486,16 +536,26 @@ pub(super) fn timeline_view_coverage(
     let DashboardLcmReadRequestV1::Timeline { bucket, limit, .. } = request else {
         return None;
     };
-    let buckets = page
+    let message_buckets = page
         .messages
         .iter()
         .filter_map(|message| message.timestamp)
         .map(|timestamp| utc_bucket(timestamp, *bucket))
         .collect::<BTreeSet<_>>();
-    let eligible = saturating_usize_to_u64(buckets.len());
+    let summary_buckets = page
+        .summary_nodes
+        .iter()
+        .map(|summary| utc_bucket(summary.latest_at.unwrap_or(summary.created_at), *bucket))
+        .collect::<BTreeSet<_>>();
+    let eligible = saturating_usize_to_u64(message_buckets.len())
+        .max(saturating_usize_to_u64(summary_buckets.len()));
     let requested = u64::try_from((*limit).max(0)).unwrap_or(u64::MAX);
     let examined = eligible.min(requested);
-    Some((eligible, examined, eligible > examined))
+    Some((
+        eligible,
+        examined,
+        page.next_cursor.is_none() && eligible > examined,
+    ))
 }
 
 pub(super) fn returned_count(page: &DashboardLcmCanonicalPageV1) -> u64 {
@@ -558,6 +618,7 @@ fn message_json(
         "store_id": null,
         "session_id": message.session_id,
         "role": message.role,
+        "provider": message.provider.clone(),
         "source": message.provider,
         "timestamp": message.timestamp,
         "token_count": token_count.token_count,
@@ -578,6 +639,7 @@ fn summary_json(summary: DashboardLcmCanonicalSummaryV1) -> serde_json::Value {
     serde_json::json!({
         "node_id": summary.node_id,
         "session_id": summary.session_id,
+        "provider": summary.provider,
         "depth": summary.depth,
         "category": "summary",
         "source_type": "canonical_temporal",
@@ -615,7 +677,7 @@ mod tests {
         DashboardLcmCanonicalPageV1 {
             messages: vec![
                 DashboardLcmCanonicalMessageV1 {
-                    session_id: "session.older".to_owned(),
+                    session_id: "session.shared".to_owned(),
                     provider: "codex".to_owned(),
                     role: "user".to_owned(),
                     timestamp: Some(0),
@@ -626,7 +688,7 @@ mod tests {
                     tool_names: None,
                 },
                 DashboardLcmCanonicalMessageV1 {
-                    session_id: "session.newer".to_owned(),
+                    session_id: "session.shared".to_owned(),
                     provider: "claude".to_owned(),
                     role: "assistant".to_owned(),
                     timestamp: Some(86_400),
@@ -639,7 +701,8 @@ mod tests {
             ],
             summary_nodes: vec![DashboardLcmCanonicalSummaryV1 {
                 node_id: "summary.one".to_owned(),
-                session_id: "session.newer".to_owned(),
+                session_id: "session.shared".to_owned(),
+                provider: "claude".to_owned(),
                 depth: 2,
                 token_count: Some(5),
                 source_token_count: Some(20),
@@ -708,6 +771,34 @@ mod tests {
     }
 
     #[test]
+    fn overview_keeps_same_session_id_distinct_per_provider() {
+        let value = overview_json(
+            aggregate_page(),
+            String::new(),
+            25,
+            None,
+            "profile_sharded",
+            &TokenCountCache::new(),
+        )
+        .expect("provider-qualified overview");
+
+        assert_eq!(value["overview"]["sessions_total"], 2);
+        let latest = value["latest_sessions"]
+            .as_array()
+            .expect("latest sessions array");
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[0]["session_id"], "session.shared");
+        assert_eq!(latest[0]["provider"], "claude");
+        assert_eq!(latest[1]["session_id"], "session.shared");
+        assert_eq!(latest[1]["provider"], "codex");
+        assert_eq!(value["latest_summary_nodes"][0]["provider"], "claude");
+        assert_eq!(
+            value["latest_summary_nodes"][0]["session_id"],
+            "session.shared"
+        );
+    }
+
+    #[test]
     fn timeline_reduction_uses_utc_buckets_and_reports_the_omitted_boundary() {
         let mut page = aggregate_page();
         page.messages[1].metadata_json =
@@ -715,6 +806,7 @@ mod tests {
         let value = timeline_json(
             page,
             DashboardLcmTimelineBucketV1::Day,
+            None,
             None,
             1,
             "profile_sharded",
@@ -745,6 +837,29 @@ mod tests {
         assert_eq!(value["coverage"]["next_before_bucket"], "1970-01-02");
     }
 
+    #[test]
+    fn timeline_cursor_keeps_the_page_resumable_without_local_bucket_loss() {
+        let mut page = aggregate_page();
+        page.next_cursor = Some("opaque-timeline-cursor".to_owned());
+        let value = timeline_json(
+            page,
+            DashboardLcmTimelineBucketV1::Day,
+            Some("session.shared".to_owned()),
+            Some("codex".to_owned()),
+            1,
+            "profile_sharded",
+            &TokenCountCache::new(),
+        );
+
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["next_cursor"], "opaque-timeline-cursor");
+        assert_eq!(
+            value["buckets"].as_array().map(|buckets| buckets.len()),
+            Some(2)
+        );
+        assert_eq!(value["coverage"]["truncated"], false);
+    }
+
     #[cfg(not(feature = "token-counting"))]
     #[test]
     fn timeline_does_not_publish_a_partial_total_when_any_message_is_unknown() {
@@ -756,6 +871,7 @@ mod tests {
         let value = timeline_json(
             page,
             DashboardLcmTimelineBucketV1::Day,
+            None,
             None,
             25,
             "profile_sharded",
@@ -778,6 +894,7 @@ mod tests {
             page,
             String::new(),
             25,
+            None,
             "profile_sharded",
             &TokenCountCache::new(),
         )
@@ -822,6 +939,7 @@ mod tests {
         let value = timeline_json(
             page,
             DashboardLcmTimelineBucketV1::Day,
+            None,
             None,
             25,
             "profile_sharded",

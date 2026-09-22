@@ -3,6 +3,7 @@ mod branch;
 mod daemon;
 mod gain;
 mod index;
+mod profile_replacement;
 mod profile_storage;
 mod scope;
 mod settings;
@@ -16,6 +17,9 @@ pub(crate) use daemon::{
 };
 pub use gain::handle_gain;
 pub(crate) use index::{handle_init, handle_no_command, handle_sync};
+pub(crate) use profile_replacement::{
+    INTERNAL_REPLACEMENT_MIGRATION_ARG, run_internal_profile_migration,
+};
 pub(crate) use profile_storage::handle_profile_storage_action;
 pub(crate) use scope::resolve_project_scope;
 pub(crate) use settings::{

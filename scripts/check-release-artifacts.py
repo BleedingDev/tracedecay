@@ -28,6 +28,9 @@ MODEL_REVISION_PROVENANCE = (
     "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
     "#/identities/model/revision"
 )
+MODEL_REVISION_RECEIPT_PATH = (
+    "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+)
 MODEL_BASE_URL = (
     "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/"
     f"{MODEL_REVISION}/"
@@ -395,8 +398,74 @@ def _load_worker_manifest(path: Path) -> tuple[bytes, dict[str, Any]]:
     return raw, _parse_worker_manifest(raw, str(path))
 
 
+def _validate_model_revision_receipt(
+    path: Path,
+    *,
+    manifest: dict[str, Any],
+    files: dict[str, tuple[int, str]],
+    expected_digest: str,
+) -> None:
+    """Bind the release descriptor to the tracked backend revision evidence."""
+    if path.name != Path(MODEL_REVISION_RECEIPT_PATH).name:
+        raise SystemExit("NCM model revision receipt is not the canonical backend receipt")
+    raw = _read_regular(path, "trusted model revision receipt", MAX_MANIFEST_BYTES)
+    if hashlib.sha256(raw).hexdigest() != expected_digest:
+        raise SystemExit("NCM model revision receipt digest differs from the release pin")
+    try:
+        receipt = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid NCM model revision receipt: {error}") from error
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        raise SystemExit("NCM model revision receipt has an unsupported schema")
+    identities = receipt.get("identities")
+    model_identity = identities.get("model") if isinstance(identities, dict) else None
+    if not isinstance(model_identity, dict):
+        raise SystemExit("NCM model revision receipt has no model identity")
+    if model_identity.get("model") != manifest["model"]:
+        raise SystemExit("NCM model revision receipt model identity differs from the pin")
+    if model_identity.get("revision") != manifest["revision"]:
+        raise SystemExit("NCM model revision receipt revision identity differs from the pin")
+    artifact_digest = model_identity.get("artifact_sha256")
+    if not isinstance(artifact_digest, str) or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None:
+        raise SystemExit("NCM model revision receipt artifact digest is invalid")
+    if artifact_digest != files["onnx/model.onnx"][1]:
+        raise SystemExit("NCM model revision receipt artifact digest differs from the pin")
+    manifest_digest = model_identity.get("manifest_sha256")
+    if not isinstance(manifest_digest, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None:
+        raise SystemExit("NCM model revision receipt manifest digest is invalid")
+    if manifest_digest != manifest["embedding_manifest_sha256"]:
+        raise SystemExit(
+            "NCM model revision receipt manifest digest differs from the trusted model manifest"
+        )
+    receipt_files = model_identity.get("files")
+    if not isinstance(receipt_files, list):
+        raise SystemExit("NCM model revision receipt files must be a list")
+    by_path: dict[str, dict[str, Any]] = {}
+    for entry in receipt_files:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise SystemExit("NCM model revision receipt file entry is invalid")
+        relative = entry["path"]
+        if relative in by_path:
+            raise SystemExit(f"NCM model revision receipt repeats {relative}")
+        if (
+            not isinstance(entry.get("bytes"), int)
+            or isinstance(entry["bytes"], bool)
+            or entry["bytes"] <= 0
+            or not isinstance(entry.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+        ):
+            raise SystemExit(f"NCM model revision receipt file identity is invalid for {relative}")
+        by_path[relative] = entry
+    if set(by_path) != set(files):
+        raise SystemExit("NCM model revision receipt file set differs from the release pin")
+    for relative, (byte_count, digest) in files.items():
+        entry = by_path[relative]
+        if entry["bytes"] != byte_count or entry["sha256"] != digest:
+            raise SystemExit(f"NCM model revision receipt file identity differs for {relative}")
+
+
 def _validate_model_acquisition_manifest(
-    raw: bytes, *, release_target: dict[str, Any]
+    raw: bytes, *, release_target: dict[str, Any], revision_receipt_path: Path | None = None
 ) -> None:
     try:
         value = json.loads(raw.decode("utf-8"))
@@ -429,6 +498,13 @@ def _validate_model_acquisition_manifest(
         raise SystemExit("NCM model acquisition manifest embedding manifest digest drifted")
     if value.get("revision_provenance") != MODEL_REVISION_PROVENANCE:
         raise SystemExit("NCM model acquisition manifest revision provenance drifted")
+    revision_receipt_digest = value.get("revision_provenance_sha256")
+    if not isinstance(revision_receipt_digest, str) or re.fullmatch(
+        r"[0-9a-f]{64}", revision_receipt_digest
+    ) is None:
+        raise SystemExit(
+            "NCM model acquisition manifest revision receipt digest must be lowercase hexadecimal"
+        )
     if value.get("revision") != MODEL_REVISION:
         raise SystemExit("NCM model acquisition manifest is not pinned to the accepted revision")
     if value.get("max_length") != 128 or value.get("pooling") != "mean" or value.get("normalize") is not True:
@@ -459,7 +535,7 @@ def _validate_model_acquisition_manifest(
         not isinstance(transaction, dict)
         or transaction.get("version") != 1
         or transaction.get("publication") != "atomic-directory-swap"
-        or transaction.get("journal") != "ncm-model-acquisition-v1.json"
+        or transaction.get("journal") != "ncm-model-lifecycle-v1.json"
         or transaction.get("staging_prefix") != ".ncm-model-staging-"
         or transaction.get("backup_prefix") != ".ncm-model-backup-"
     ):
@@ -475,6 +551,7 @@ def _validate_model_acquisition_manifest(
         "repository",
         "revision",
         "manifest_sha256",
+        "revision_provenance_sha256",
         "files",
         "created_at_unix",
     }
@@ -488,6 +565,16 @@ def _validate_model_acquisition_manifest(
         or not required_fields.issubset(set(receipt_fields))
     ):
         raise SystemExit("NCM model acquisition manifest does not name the required receipt")
+    if revision_receipt_path is not None:
+        _validate_model_revision_receipt(
+            revision_receipt_path,
+            manifest=value,
+            files={
+                entry["path"]: (entry["bytes"], entry["sha256"])
+                for entry in files
+            },
+            expected_digest=revision_receipt_digest,
+        )
 
 
 def verify_sidecar_archives(
@@ -496,6 +583,7 @@ def verify_sidecar_archives(
     targets: list[dict[str, Any]],
     worker_manifest: Path,
     model_acquisition_manifest: Path,
+    revision_receipt: Path,
 ) -> None:
     """Verify sidecar contents against the checked-in worker trust root."""
     manifest_bytes, manifest = _load_worker_manifest(worker_manifest)
@@ -508,6 +596,7 @@ def verify_sidecar_archives(
             "name": "aarch64-macos",
             "target": WORKER_TARGET_TRIPLE,
         },
+        revision_receipt_path=revision_receipt,
     )
     manifest_targets = {
         target["triple"]: target for target in manifest["targets"]
@@ -623,7 +712,9 @@ def verify_sidecar_archives(
                     f"NCM sidecar {archive_name} does not carry the trusted model acquisition manifest"
                 )
             _validate_model_acquisition_manifest(
-                packaged_model_manifest, release_target=release_target
+                packaged_model_manifest,
+                release_target=release_target,
+                revision_receipt_path=revision_receipt,
             )
         digest = hashlib.sha256(worker_bytes).hexdigest()
         if digest != pin["sha256"]:
@@ -643,6 +734,7 @@ def main() -> int:
     parser.add_argument("--sidecars", type=Path)
     parser.add_argument("--worker-manifest", type=Path)
     parser.add_argument("--model-acquisition-manifest", type=Path)
+    parser.add_argument("--model-revision-receipt", type=Path)
     arguments = parser.parse_args()
     targets = target_matrix(arguments.manifest, arguments.worker_platforms)
     binary_prefix = "tracedecay-beta" if arguments.profile == "beta" else "tracedecay"
@@ -683,9 +775,15 @@ def main() -> int:
     }
     if expected_model_manifests and arguments.model_acquisition_manifest is None:
         raise SystemExit("release validation requires a trusted model acquisition manifest")
+    if expected_model_manifests and arguments.model_revision_receipt is None:
+        raise SystemExit("release validation requires the canonical model revision receipt")
     if arguments.model_acquisition_manifest is not None and not expected_model_manifests:
         raise SystemExit(
             "a model acquisition manifest is only valid when sidecar metadata expects one"
+        )
+    if arguments.model_revision_receipt is not None and not expected_model_manifests:
+        raise SystemExit(
+            "a model revision receipt is only valid when sidecar model metadata is expected"
         )
     if not expected_sidecars and arguments.worker_manifest is not None:
         raise SystemExit("a worker manifest is only valid when sidecar assets are expected")
@@ -704,6 +802,7 @@ def main() -> int:
             targets,
             arguments.worker_manifest,
             arguments.model_acquisition_manifest,
+            arguments.model_revision_receipt,
         )
     print("release artifact coverage matches target manifest")
     return 0

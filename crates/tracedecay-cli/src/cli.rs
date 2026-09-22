@@ -76,6 +76,18 @@ pub enum HostBundleComponentArg {
     OperatorMcp,
 }
 
+/// Serving implementation selected by the explicit V1-to-V2 replacement.
+///
+/// The replacement coordinator records this choice in its durable journal so
+/// recovery cannot resume a Native cutover as NCM (or the reverse). Native is
+/// the default because it is the in-process provider shipped in every CLI
+/// build; NCM requires its independently attested worker and model bundle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ReplacementProviderArg {
+    Native,
+    Ncm,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBundleCliOptions {
     pub component: Option<HostBundleComponentArg>,
@@ -1335,6 +1347,33 @@ pub enum ProfileStorageAction {
         /// New isolated restore directory.
         #[arg(long)]
         restore: String,
+    },
+    /// Replace a V1 profile through the shipped first-party V1-to-V2 cutover.
+    /// Requires the global `--yes` confirmation.
+    #[command(name = "replace-v1", visible_alias = "migrate-v1")]
+    ReplaceV1 {
+        /// Existing profile root to replace (defaults to the resolved profile).
+        #[arg(long = "profile-root")]
+        profile_root: Option<String>,
+        /// Backup parent outside the profile.
+        #[arg(long = "backup-to", alias = "backup-parent")]
+        backup_to: String,
+        /// Stable external backup directory name.
+        #[arg(long = "backup-id")]
+        backup_id: String,
+        /// Provider that serves the published V2 profile.
+        #[arg(long, value_enum, default_value = "native")]
+        provider: ReplacementProviderArg,
+        /// Optional legacy worker path retained for compatibility. The
+        /// shipped first-party worker runs in this binary when omitted.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Maximum seconds allowed for each worker phase.
+        #[arg(long, default_value_t = 1800)]
+        timeout_seconds: u64,
+        /// Output the cutover receipt as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Reset exactly one refused authority so the next open recreates it at
     /// the canonical schema. Applies only to a store whose open failed with

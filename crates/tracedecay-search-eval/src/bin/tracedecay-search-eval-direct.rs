@@ -1,14 +1,18 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::json;
-use tracedecay_query::search_quality::{DirectEvaluationStatusV1, SearchEvalError};
+use tracedecay_query::search_quality::{
+    DirectEvaluationStatusV1, SearchEvalError, semantic_ablation::SemanticAblationStatusV1,
+};
 use tracedecay_search_eval::{
     DirectWorkloadSummaryV1, GenerateCandidateOutputsOptions, compare_default_direct,
     compare_direct, generate_candidate_outputs, root_admitted_corpus_scope,
-    validate_default_workload, validate_direct_workload, write_generate_outputs,
+    run_default_semantic_ablation, run_semantic_ablation_from_files, validate_default_workload,
+    validate_direct_workload, write_generate_outputs,
 };
 
 #[cfg(feature = "hotpath")]
@@ -62,6 +66,24 @@ enum Command {
         output_root: PathBuf,
         #[arg(long, value_delimiter = ',')]
         profiles: Option<Vec<String>>,
+    },
+    /// Run the evaluator-owned semantic ablation matrix.  The default uses
+    /// byte-pinned package assets; explicit paths must provide all four
+    /// workload, hidden-label, artifact, and corpus inputs together.
+    #[command(alias = "semantic")]
+    SemanticAblation {
+        #[arg(long, default_value = ".")]
+        repo_root: PathBuf,
+        #[arg(long)]
+        workload: Option<PathBuf>,
+        #[arg(long)]
+        labels: Option<PathBuf>,
+        #[arg(long)]
+        artifact: Option<PathBuf>,
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -131,6 +153,47 @@ fn main() -> ExitCode {
             },
             Err(error) => invalid("generate_candidates", error),
         },
+        Command::SemanticAblation {
+            repo_root: _repo_root,
+            workload,
+            labels,
+            artifact,
+            corpus,
+            output,
+        } => {
+            let supplied = [
+                workload.as_ref(),
+                labels.as_ref(),
+                artifact.as_ref(),
+                corpus.as_ref(),
+            ];
+            let result = if supplied.iter().all(Option::is_none) {
+                run_default_semantic_ablation()
+            } else if supplied.iter().all(Option::is_some) {
+                let (workload, labels, artifact, corpus) = (
+                    workload.as_deref().expect("checked above"),
+                    labels.as_deref().expect("checked above"),
+                    artifact.as_deref().expect("checked above"),
+                    corpus.as_deref().expect("checked above"),
+                );
+                run_semantic_ablation_from_files(workload, labels, artifact, corpus)
+            } else {
+                Err(SearchEvalError::Contract(
+                    "semantic-ablation explicit mode requires --workload, --labels, --artifact, and --corpus together".to_owned(),
+                ))
+            };
+            match result {
+                Ok(report) => {
+                    let exit = if report.status == SemanticAblationStatusV1::Pass {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(1)
+                    };
+                    emit_with_optional_output(&report, output.as_deref(), exit)
+                }
+                Err(error) => invalid("semantic_ablation", error),
+            }
+        }
     }
 }
 
@@ -220,6 +283,44 @@ fn emit(value: &impl Serialize, exit: ExitCode) -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    exit
+}
+
+fn emit_with_optional_output(
+    value: &impl Serialize,
+    output: Option<&Path>,
+    exit: ExitCode,
+) -> ExitCode {
+    let json = match serde_json::to_string_pretty(value) {
+        Ok(json) => json,
+        Err(error) => {
+            eprintln!("serialize evaluator output: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(path) = output {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            if let Err(error) = fs::create_dir_all(parent) {
+                return invalid(
+                    "semantic_ablation",
+                    format!(
+                        "create semantic report directory {}: {error}",
+                        parent.display()
+                    ),
+                );
+            }
+        }
+        if let Err(error) = fs::write(path, format!("{json}\n")) {
+            return invalid(
+                "semantic_ablation",
+                format!("write semantic report {}: {error}", path.display()),
+            );
+        }
+    }
+    println!("{json}");
     exit
 }
 

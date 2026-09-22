@@ -24,6 +24,10 @@ source of truth for the worker matrix is
 [`product/ncm/reference/worker-platforms.json`](../../product/ncm/reference/worker-platforms.json),
 and the release descriptor is
 [`product/ncm/release/model-acquisition-manifest.json`](../../product/ncm/release/model-acquisition-manifest.json).
+The descriptor's revision digest is bound to the canonical backend receipt at
+`product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json`.
+Intel macOS (`x86_64-apple-darwin`) is explicitly unsupported and remains
+Native-only.
 
 ## Installed release verification
 
@@ -41,8 +45,21 @@ verifies the worker sidecar and its archive checksum:
 ```bash
 python3 scripts/product/ncm/verify-installed.py \
   --binary-archive tracedecay-v<version>-aarch64-macos.tar.gz \
-  --worker-archive tracedecay-ncm-worker-v<version>-aarch64-macos.tar.gz
+  --worker-archive tracedecay-ncm-worker-v<version>-aarch64-macos.tar.gz \
+  --target aarch64-apple-darwin \
+  --release-name aarch64-macos \
+  --expected-version <version> \
+  --expected-source-sha <40-hex-commit> \
+  --expected-archive-sha256 <64-hex-digest> \
+  --manifest product/ncm/release/model-acquisition-manifest.json \
+  --worker-manifest product/ncm/reference/worker-manifest.json \
+  --revision-receipt product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json
 ```
+
+Archive and installed-binary smoke requires the trusted release version,
+source commit, and archive or binary digest. It also checks the executable
+format and target before launching it, so a script that merely prints a
+version cannot satisfy the release gate.
 
 The release binary is still installed through the normal archive path. NCM
 model acquisition is an explicit operation under the chosen absolute state
@@ -53,6 +70,7 @@ URLs pinned in the descriptor):
 ```bash
 python3 scripts/product/ncm/verify-installed.py \
   --manifest product/ncm/release/model-acquisition-manifest.json \
+  --revision-receipt product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json \
   --model-root "$PWD/.local/ncm-state" \
   --operation install
 ```
@@ -83,6 +101,11 @@ The receipt records the operation id, target and release name, model/repository
 identity, immutable revision, embedding-manifest digest, acquisition-manifest
 digest, complete file digest list, published tree digest and creation time.
 It is the evidence required before an installed worker may be considered ready.
+The Rust owner uses the same `ncm-model-lifecycle-v1.json` journal name for
+atomic publication but emits no release acquisition receipt; the Python
+release verifier owns and validates `ncm-model-acquisition-v1.json`. A
+published journal is retained after a crash until that schema-valid receipt
+matches the journal operation id, model revision, manifest and tree digest.
 Missing or mismatched model artifacts remain unavailable; they are never
 silently replaced from an ambient Hugging Face cache or environment override.
 
@@ -94,7 +117,10 @@ that claim.
 ## Release checks
 
 The two release workflows package and compare both sidecar manifests after
-extraction. Their portable validation list runs
+extraction. The arm64 macOS build then runs the installed CLI E2E gate: it
+acquires the pinned model, installs the sidecar through `ncm install`, restarts
+the managed daemon, checks status and performs a production worker handshake.
+Their portable validation list runs
 `scripts/product/ncm/test-verify-installed.py`, which covers clean model
 installation, an already-installed profile, transactional update failure and
 success, sidecar target binding, archive checksums and CLI smoke. The broader

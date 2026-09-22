@@ -162,6 +162,10 @@ const REPLAY_STARTUP_PAGES: usize = 64;
 const REPLAY_LIVE_PAGES: usize = 8;
 /// Wall-clock budget for the inline startup replay pass in project open.
 const STARTUP_REPLAY_BUDGET: Duration = Duration::from_secs(10);
+/// Wall-clock budget for the required-provider publication barrier. A required
+/// route must not become visible while a restart backlog is still pending in
+/// the durable delivery journal.
+const REQUIRED_DELIVERY_SETTLEMENT_BUDGET: Duration = Duration::from_secs(10);
 /// Pause after a failed or halted live replay pass before the next attempt.
 const LIVE_REPLAY_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 /// Wall-clock deadline one live replay pass runs under. A pass that reaches it
@@ -5829,6 +5833,27 @@ where
     Ok(journey)
 }
 
+/// Activates a required journey and waits until its provider instance and all
+/// durable deliveries have settled. This is the publication fence for a
+/// required provider: startup replay can append a row before the worker has
+/// delivered it, and exposing recall in that interval permits a valid empty
+/// answer to race the pending effect.
+pub(crate) async fn activate_required_with_startup_replay_and_delivery_settled<S>(
+    journey: Arc<ProjectObservationJourneyV1>,
+    observation_store: S,
+    cancellation: &HostCancellationToken,
+) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError>
+where
+    S: ObservationAdmissionPort + 'static,
+{
+    let journey =
+        activate_required_with_startup_replay(journey, observation_store, cancellation).await?;
+    journey
+        .await_delivery_settled(cancellation, REQUIRED_DELIVERY_SETTLEMENT_BUDGET)
+        .await?;
+    Ok(journey)
+}
+
 /// Retains an optional observer without starting its provider bootstrap or replay.
 /// The published full server activates the existing owned workers after cutover.
 pub(crate) async fn mount_observer_dormant(
@@ -9650,6 +9675,99 @@ mod tests {
         );
         let failures = fixture
             .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// A required Native activation must keep a restarted project behind the
+    /// publication fence while a durable observation is still pending. The
+    /// provider-side delivery list stands in for the immediate recall that
+    /// follows publication: it must contain the restarted observation before
+    /// activation can return.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn required_activation_waits_for_pending_restart_delivery_before_immediate_recall() {
+        use tracedecay_memory_conformance::ReleaseLatchV1;
+
+        let temp = TempDir::new().expect("temporary journey root");
+        let fixture = mount_hygiene_fixture(&temp, "project.restart-publication-barrier").await;
+        let session = SessionId::new("session.restart-publication-barrier").expect("session id");
+        let record = settled_record(
+            1,
+            canonical_observation(
+                &fixture.project_id,
+                &session,
+                "this observation must be visible to the first recall after restart",
+            ),
+        );
+
+        // First life admits the canonical row with no worker, leaving the
+        // durable delivery pending exactly where a crash or stop can leave it.
+        let pass = run_startup_replay(
+            fixture.journey.as_ref(),
+            &SettledRecordsPort::single(record.clone()),
+            &HostCancellationToken::new(),
+        )
+        .await
+        .expect("seed startup replay");
+        assert_eq!(pass.admitted, 1);
+        let pending_path = fixture.journey.journal_path().to_owned();
+        assert!(!journal_snapshot(&pending_path).contains("acknowledged"));
+        fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+
+        let entered = ReleaseLatchV1::new();
+        let release = ReleaseLatchV1::new();
+        let entered_by_provider = entered.clone();
+        let release_provider = release.clone();
+        fixture.port.on_observe(move || {
+            entered_by_provider.release();
+            release_provider.wait();
+        });
+
+        let reopened = fixture.reopen();
+        let cancellation = HostCancellationToken::new();
+        let activation_cancellation = cancellation.clone();
+        let mut activation = tokio::spawn(async move {
+            activate_required_with_startup_replay_and_delivery_settled(
+                Arc::clone(&reopened),
+                SettledRecordsPort::single(record),
+                &activation_cancellation,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture.port.observe_calls.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the restarted delivery must reach the provider");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut activation)
+                .await
+                .is_err(),
+            "required activation returned while the restarted delivery was held"
+        );
+        release.release();
+        let activated = activation
+            .await
+            .expect("required activation task")
+            .expect("required activation and settlement");
+        assert_eq!(
+            fixture.port.delivered.lock().unwrap().len(),
+            1,
+            "an immediate recall after publication must see the restarted observation"
+        );
+        assert_eq!(
+            wait_for_settlement(&pending_path).await,
+            ("acknowledged".to_owned(), 1)
+        );
+
+        let failures = activated
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
         assert!(failures.is_empty(), "{failures:?}");

@@ -1,6 +1,6 @@
 //! Versioned, bounded NCM state export and atomic restore.
 //!
-//! Snapshots carry learned state and replay inputs, but never the durable source
+//! Snapshots carry learned state, replay inputs, and authenticated source
 //! revocation authority. Restore intersects imported capsules with the
 //! revocations trusted by the destination before publication.
 
@@ -8,10 +8,11 @@ use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, MaintenanceKind,
     NamespaceHandle, NcmEngine, Outcome, RejectReason, canonical_digest, durable_integrity_digest,
     portable_common_maintenance_event, validate_event_payload_digest,
+    validate_receipt_idempotency_key_json,
 };
 use crate::ports::{Deadline, StateRoot};
 use crate::store::{
-    CapsuleStatus, Event, NamespaceStore, Revocation, StoreIdentity, StoredCapsule,
+    CapsuleStatus, Event, NamespaceStore, Revocation, StoreIdentity, StoreMeta, StoredCapsule,
 };
 use rusqlite::{Connection, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -28,13 +29,15 @@ use tracedecay_memory_ncm_core::kernel::NcmKernel;
 use tracedecay_memory_ncm_core::projections::ProjectionBundle;
 use tracedecay_memory_ncm_core::records::RecordState;
 use tracedecay_memory_ncm_core::types::{
-    AFFECT_DIM, AlgorithmIdentity, CONTEXT_DIM, EMBEDDING_DIM, LTM_KEY_DIM, NcmConfig, SourceId,
-    TERRAIN_DIM, VALUE_DIM,
+    AFFECT_DIM, AlgorithmIdentity, CONTEXT_DIM, EMBEDDING_DIM, LTM_KEY_DIM, NcmConfig, RecordId,
+    SourceId, TERRAIN_DIM, VALUE_DIM,
 };
 
 const FORMAT: &str = "ncm-snapshot.v1";
 const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 const STAGING_PREFIX: &str = ".ncm-snapshot-staging";
+const MAX_SYNTHETIC_GAP_EVENTS: u64 = 65_536;
+const MAX_SYNTHETIC_ADVANCE_TICKS: u32 = 10_000;
 static NEXT_TRANSPORT_FILE: AtomicU64 = AtomicU64::new(1);
 
 /// Owned bytes in the `ncm-snapshot.v1` JSON envelope.
@@ -105,6 +108,35 @@ struct SnapshotContent {
     kernel_state: String,
     capsules: Vec<StoredCapsule>,
     events: Vec<Event>,
+    /// Durable source revocations bound to deletion-fence journal receipts.
+    ///
+    /// The default keeps snapshots written before revocation export readable;
+    /// worker restores still require an explicit deletion-authority inventory
+    /// so an old snapshot cannot silently resurrect a deleted source.
+    #[serde(default)]
+    revocations: Vec<Revocation>,
+    lengths: SnapshotLengths,
+}
+
+/// The pre-revocation snapshot content shape, retained only to verify the
+/// checksum of envelopes written before the authority field was introduced.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySnapshotContent {
+    format: String,
+    namespace: String,
+    algorithm: AlgorithmIdentity,
+    projection_sha256: String,
+    encoder_model: String,
+    encoder_artifact_sha256: String,
+    seed: u64,
+    config_json: String,
+    epoch: u64,
+    commit_seq: u64,
+    tick: u64,
+    kernel_state: String,
+    capsules: Vec<StoredCapsule>,
+    events: Vec<Event>,
     lengths: SnapshotLengths,
 }
 
@@ -121,6 +153,7 @@ struct ValidatedSnapshot {
     kernel: NcmKernel,
     identity: StoreIdentity,
     content_sha256: String,
+    revocation_authority_present: bool,
 }
 
 struct StageGuard {
@@ -133,7 +166,8 @@ impl Drop for StageGuard {
     }
 }
 
-/// Exports one materialized namespace without exporting its revocation table.
+/// Exports one materialized namespace together with its authenticated
+/// revocation/deletion authority.
 ///
 /// The returned envelope is bounded by the namespace controlled-storage quota.
 pub fn export(
@@ -163,7 +197,11 @@ pub fn export(
         .map_err(|_| corrupt_reply(handle.commit_seq, "published kernel lock poisoned"))?;
     let capsules = handle
         .store
-        .capsules_in_commit_order(false)
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let revocations = handle
+        .store
+        .revocations()
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let retained_events = handle
         .store
@@ -171,12 +209,23 @@ pub fn export(
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let mut events = Vec::new();
     for event in retained_events {
+        validate_receipt_idempotency_key_json(
+            &event.receipt,
+            &event.kind,
+            event.idempotency_key.as_deref(),
+        )
+        .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
         let common_maintenance = portable_common_maintenance_event(namespace, &event)
             .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
         if common_maintenance
             || matches!(
                 event.kind.as_str(),
-                "feedback" | "correction" | "common_control"
+                "feedback"
+                    | "correction"
+                    | "common_control"
+                    | "deletion_fence"
+                    | "delete_by_source"
+                    | "snapshot_restore"
             )
             || (event.kind == "observe"
                 && capsules
@@ -218,6 +267,7 @@ pub fn export(
         kernel_state,
         capsules,
         events,
+        revocations,
         lengths,
     };
     let content_bytes = serde_json::to_vec(&content).map_err(|error| {
@@ -316,6 +366,28 @@ pub fn restore_from_file(
     content_sha256: &str,
     deadline: Deadline,
 ) -> EngineReply {
+    restore_from_file_with_revocations(
+        engine,
+        namespace,
+        idempotency_key,
+        snapshot_file,
+        byte_length,
+        content_sha256,
+        &[],
+        deadline,
+    )
+}
+
+pub(crate) fn restore_from_file_with_revocations(
+    engine: &NcmEngine,
+    namespace: &str,
+    idempotency_key: &str,
+    snapshot_file: &Path,
+    byte_length: u64,
+    content_sha256: &str,
+    blocked_sources: &[SourceId],
+    deadline: Deadline,
+) -> EngineReply {
     let bytes = match read_transport_file(
         &engine.root,
         namespace,
@@ -326,7 +398,7 @@ pub fn restore_from_file(
         Ok(bytes) => bytes,
         Err(reason) => return rejected(&reason),
     };
-    restore(
+    restore_with_revocations(
         engine,
         namespace,
         RestoreRequest {
@@ -334,6 +406,8 @@ pub fn restore_from_file(
             bytes,
         },
         deadline,
+        blocked_sources,
+        None,
     )
 }
 
@@ -458,11 +532,28 @@ pub(crate) fn restore_with_revocations(
         Ok(snapshot) => snapshot,
         Err(reply) => return reply,
     };
-    if blocked_sources.iter().any(|source| source.0.is_empty())
+    if blocked_sources.len() > 1024
+        || blocked_sources.iter().any(|source| source.0.is_empty())
         || blocked_sources.iter().collect::<BTreeSet<_>>().len() != blocked_sources.len()
     {
         return rejected("invalid blocked restore inventory");
     }
+    if !validated.revocation_authority_present
+        && blocked_sources.is_empty()
+        && !NamespaceStore::exists(&engine.root, namespace)
+    {
+        return rejected("snapshot deletion authority is missing");
+    }
+    let mut canonical_blocked_sources = blocked_sources.to_vec();
+    canonical_blocked_sources.sort();
+    let restore_digest = match restore_identity_digest(
+        &snapshot_digest,
+        &canonical_blocked_sources,
+        &validated.content.revocations,
+    ) {
+        Ok(digest) => digest,
+        Err(reason) => return corrupt_reply(0, &reason),
+    };
     if validated
         .content
         .events
@@ -487,6 +578,17 @@ pub(crate) fn restore_with_revocations(
         if fenced {
             return EngineReply::new(Outcome::Busy, 0, Value::Null);
         }
+        // A published bootstrap store is an occupied namespace even before
+        // its first event.  Refuse to hydrate a snapshot over that empty
+        // identity: doing so would make a stale snapshot appear to resurrect
+        // a namespace that already had a durable owner.
+        let existing_meta = match existing.meta() {
+            Ok(meta) => meta,
+            Err(error) => return store_reply(error, 0),
+        };
+        if existing_meta.commit_seq == 0 {
+            return rejected("snapshot restore target namespace is already occupied");
+        }
     }
     let current = match engine.ensure_handle(&mut namespaces, namespace, false) {
         Ok(current) => current,
@@ -497,20 +599,29 @@ pub(crate) fn restore_with_revocations(
             if handle.fenced {
                 return EngineReply::new(Outcome::Busy, handle.commit_seq, Value::Null);
             }
+            if handle.commit_seq == 0 {
+                return rejected("snapshot restore target namespace is already occupied");
+            }
             let revocations = match handle.store.revocations() {
                 Ok(revocations) => revocations,
                 Err(error) => return store_reply(error, handle.commit_seq),
             };
-            match lookup_restore_replay(handle, &request.idempotency_key, &snapshot_digest) {
+            match lookup_restore_replay(handle, &request.idempotency_key, &restore_digest) {
                 Ok(Some(reply)) => {
-                    return if blocked_sources
-                        .iter()
-                        .any(|source| !revocations.iter().any(|row| &row.source_id == source))
+                    if reply.outcome == Outcome::Success
+                        && !destination_authority_matches(
+                            &revocations,
+                            &validated.content.revocations,
+                            &canonical_blocked_sources,
+                            reply.payload["deletion_authority_sha256"].as_str(),
+                        )
                     {
-                        EngineReply::rejected(RejectReason::IdempotencyConflict, handle.commit_seq)
-                    } else {
-                        reply
-                    };
+                        return corrupt_reply(
+                            handle.commit_seq,
+                            "restore replay deletion authority differs from its receipt",
+                        );
+                    }
+                    return reply;
                 }
                 Ok(None) => {}
                 Err(reply) => return reply,
@@ -523,8 +634,26 @@ pub(crate) fn restore_with_revocations(
         } else {
             (0, 0, 1, Vec::new())
         };
+    // A legacy envelope has no authenticated source revocation authority.  It
+    // is safe to admit only when the destination is genuinely fresh or has no
+    // revocation history.  An existing namespace may have no capsules after a
+    // completed deletion, but its revocation rows still prove that importing a
+    // legacy kernel could resurrect erased content.
+    if !validated.revocation_authority_present
+        && blocked_sources.is_empty()
+        && !revocations.is_empty()
+    {
+        return rejected("snapshot deletion authority is missing for existing namespace");
+    }
     if expected_generation.is_some_and(|expected| expected != current_seq) {
         return EngineReply::rejected(RejectReason::IdempotencyConflict, current_seq);
+    }
+    if let Err(reply) = merge_revocations(
+        &mut revocations,
+        &validated.content.revocations,
+        current_seq,
+    ) {
+        return reply;
     }
     // Rollback discards records, but their saved numeric targets must never
     // identify a later observation. Stage the destination's allocation floor
@@ -540,7 +669,8 @@ pub(crate) fn restore_with_revocations(
         Some(seq) => seq,
         None => return corrupt_reply(current_seq, "snapshot restore sequence overflow"),
     };
-    for source in blocked_sources {
+    let mut authority_fence_sources = BTreeSet::new();
+    for source in &canonical_blocked_sources {
         if !revocations.iter().any(|row| &row.source_id == source) {
             revocations.push(Revocation {
                 source_id: source.clone(),
@@ -548,6 +678,10 @@ pub(crate) fn restore_with_revocations(
                 seq: new_revocation_seq,
             });
         }
+        // An explicit blocked source always requires a fenced rebuild, even
+        // when the destination already carries that authority row.  The
+        // existing row will be rebound to the new import fence below.
+        authority_fence_sources.insert(source.clone());
     }
     let revoked = revocations
         .iter()
@@ -555,6 +689,9 @@ pub(crate) fn restore_with_revocations(
         .collect::<BTreeSet<_>>();
     let mut stripped = BTreeSet::new();
     for capsule in &validated.content.capsules {
+        if capsule.status == CapsuleStatus::Revoked {
+            continue;
+        }
         let binding = match crate::source_binding::read_text(
             namespace,
             &capsule.source_id,
@@ -585,12 +722,75 @@ pub(crate) fn restore_with_revocations(
                 .is_some_and(|binding| revoked.contains(&binding.legacy_source_id))
         {
             stripped.insert(capsule.source_id.clone());
+            // Keep the scrubbed capsule's stored identity separate from the
+            // authority identity that fenced it.  A raw deletion can revoke
+            // several typed origins sharing one legacy key; the synthetic
+            // fence must retain that single legacy authority row while its
+            // deleted-record set covers every scrubbed capsule.
+            if let Some(authority) = revocations.iter().find(|row| {
+                row.source_id == capsule.source_id
+                    || binding
+                        .as_ref()
+                        .is_some_and(|binding| row.source_id == binding.legacy_source_id)
+            }) {
+                authority_fence_sources.insert(authority.source_id.clone());
+            }
         }
     }
+    // An authority inventory may name a source that is absent from this
+    // snapshot. Persist its revocation through the same fenced rebuild path so
+    // the resulting snapshot remains journal-backed and cannot later be
+    // mistaken for an unauthenticated row.
+    for source in &stripped {
+        if validated
+            .content
+            .revocations
+            .iter()
+            .any(|row| &row.source_id == source)
+        {
+            return corrupt_reply(
+                current_seq,
+                "snapshot active capsule conflicts with imported revocation authority",
+            );
+        }
+    }
+    for source in &authority_fence_sources {
+        let Some(row) = revocations.iter_mut().find(|row| &row.source_id == source) else {
+            return corrupt_reply(
+                current_seq,
+                "snapshot deletion authority source is missing from its fence",
+            );
+        };
+        // The destination row is authoritative for a sanitized import, so
+        // rebind it to the synthetic fence that will erase the staged
+        // capsule. Imported rows were rejected above because their completed
+        // receipts must retain their original (epoch, seq).
+        row.epoch = target_epoch;
+        row.seq = new_revocation_seq;
+    }
+    revocations.sort_by(|left, right| left.source_id.cmp(&right.source_id));
     let base_seq = current_seq.max(validated.content.commit_seq);
-    let target_seq = match base_seq.checked_add(if stripped.is_empty() { 1 } else { 2 }) {
+    // A sanitized import commits a fence, then its immutable deletion
+    // completion, then a separate restore checkpoint.  Keep the completion
+    // row intact: its receipt is the authority that proves which fence and
+    // full deleted-record set were applied.
+    let target_seq = match base_seq.checked_add(
+        if stripped.is_empty() && authority_fence_sources.is_empty() {
+            1
+        } else {
+            3
+        },
+    ) {
         Some(seq) => seq,
         None => return corrupt_reply(current_seq, "snapshot restore sequence overflow"),
+    };
+    let deletion_authority_sha256 = match deletion_authority_digest(
+        &revocations,
+        &validated.content.revocations,
+        &canonical_blocked_sources,
+    ) {
+        Ok(digest) => digest,
+        Err(reason) => return corrupt_reply(current_seq, &reason),
     };
     let stage = match create_stage(engine.root.path(), namespace, &snapshot_digest) {
         Ok(stage) => stage,
@@ -607,7 +807,7 @@ pub(crate) fn restore_with_revocations(
         };
     let stage_db = stage_store.path().to_path_buf();
     drop(stage_store);
-    let build = if stripped.is_empty() {
+    let build = if stripped.is_empty() && authority_fence_sources.is_empty() {
         build_direct_stage(
             &stage_db,
             &validated,
@@ -615,7 +815,7 @@ pub(crate) fn restore_with_revocations(
             target_epoch,
             target_seq,
             &request.idempotency_key,
-            &snapshot_digest,
+            &restore_digest,
         )
         .map(|()| (validated.kernel.clone(), target_seq))
     } else {
@@ -626,11 +826,13 @@ pub(crate) fn restore_with_revocations(
             &validated,
             &revocations,
             &stripped,
+            &authority_fence_sources,
             target_epoch,
             base_seq,
             target_seq,
             &request.idempotency_key,
-            &snapshot_digest,
+            &restore_digest,
+            &deletion_authority_sha256,
         )
     };
     let (kernel, committed_seq) = match build {
@@ -651,6 +853,7 @@ pub(crate) fn restore_with_revocations(
             "state_digest": sha256_hex(&kernel.state_digest()),
             "content_sha256": validated.content_sha256,
             "stripped_sources": stripped.len(),
+            "deletion_authority_sha256": deletion_authority_sha256,
             "replayed": false
         }),
     );
@@ -658,7 +861,7 @@ pub(crate) fn restore_with_revocations(
         &stage_db,
         target_seq,
         &request.idempotency_key,
-        &snapshot_digest,
+        &restore_digest,
         &reply,
         &kernel,
     ) {
@@ -724,10 +927,27 @@ fn validate_snapshot(
             "snapshot size is outside the controlled-storage budget",
         ));
     }
-    let envelope: SnapshotEnvelope = serde_json::from_slice(bytes)
+    let raw: Value = serde_json::from_slice(bytes)
         .map_err(|error| rejected(&format!("decode snapshot envelope: {error}")))?;
-    let content_bytes = serde_json::to_vec(&envelope.content)
-        .map_err(|error| rejected(&format!("serialize snapshot checksum content: {error}")))?;
+    let revocation_authority_present = raw.get("revocations").is_some();
+    let mut raw_content = raw.clone();
+    if let Some(object) = raw_content.as_object_mut() {
+        object.remove("content_sha256");
+    }
+    let envelope: SnapshotEnvelope = serde_json::from_value(raw)
+        .map_err(|error| rejected(&format!("decode snapshot envelope: {error}")))?;
+    let content_bytes = if revocation_authority_present {
+        serde_json::to_vec(&envelope.content)
+            .map_err(|error| rejected(&format!("serialize snapshot checksum content: {error}")))?
+    } else {
+        let legacy: LegacySnapshotContent = serde_json::from_value(raw_content)
+            .map_err(|error| rejected(&format!("decode legacy snapshot content: {error}")))?;
+        serde_json::to_vec(&legacy).map_err(|error| {
+            rejected(&format!(
+                "serialize legacy snapshot checksum content: {error}"
+            ))
+        })?
+    };
     if !is_sha256_hex(&envelope.content_sha256)
         || sha256_hex(&content_bytes) != envelope.content_sha256
     {
@@ -765,6 +985,7 @@ fn validate_snapshot(
     }
     validate_capsules(&envelope.content, &checkpoint.kernel, &engine.config)?;
     validate_events(&envelope.content)?;
+    validate_revocations(&envelope.content)?;
     let projection_bytes = serde_json::to_vec(&checkpoint.kernel.projections)
         .map_err(|error| rejected(&format!("serialize snapshot projections: {error}")))?;
     let identity = StoreIdentity {
@@ -785,7 +1006,94 @@ fn validate_snapshot(
         kernel: checkpoint.kernel,
         identity,
         content_sha256: envelope.content_sha256,
+        revocation_authority_present,
     })
+}
+
+#[derive(Serialize)]
+struct RestoreIdentity<'a> {
+    snapshot_sha256: &'a str,
+    blocked_sources: &'a [SourceId],
+    revocations: &'a [Revocation],
+}
+
+fn restore_identity_digest(
+    snapshot_digest: &str,
+    blocked_sources: &[SourceId],
+    revocations: &[Revocation],
+) -> Result<String, String> {
+    canonical_digest(&RestoreIdentity {
+        snapshot_sha256: snapshot_digest,
+        blocked_sources,
+        revocations,
+    })
+}
+
+fn merge_revocations(
+    destination: &mut Vec<Revocation>,
+    imported: &[Revocation],
+    commit_seq: u64,
+) -> Result<(), EngineReply> {
+    for expected in imported {
+        if let Some(actual) = destination
+            .iter()
+            .find(|actual| actual.source_id == expected.source_id)
+        {
+            if actual != expected {
+                return Err(EngineReply::rejected(
+                    RejectReason::InvalidRequest(
+                        "snapshot revocation authority conflicts with destination".to_owned(),
+                    ),
+                    commit_seq,
+                ));
+            }
+        } else {
+            destination.push(expected.clone());
+        }
+    }
+    destination.sort_by(|left, right| left.source_id.cmp(&right.source_id));
+    Ok(())
+}
+
+fn destination_authority_matches(
+    destination: &[Revocation],
+    imported: &[Revocation],
+    blocked_sources: &[SourceId],
+    expected_digest: Option<&str>,
+) -> bool {
+    let Some(expected_digest) = expected_digest.filter(|digest| is_sha256_hex(digest)) else {
+        return false;
+    };
+    let Some(actual_digest) =
+        deletion_authority_digest(destination, imported, blocked_sources).ok()
+    else {
+        return false;
+    };
+    expected_digest == actual_digest
+}
+
+fn deletion_authority_digest(
+    destination: &[Revocation],
+    imported: &[Revocation],
+    blocked_sources: &[SourceId],
+) -> Result<String, String> {
+    let sources = imported
+        .iter()
+        .map(|row| row.source_id.clone())
+        .chain(blocked_sources.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    for source in sources {
+        if !destination.iter().any(|row| row.source_id == source) {
+            return Err(format!(
+                "destination deletion authority is missing {source:?}"
+            ));
+        }
+    }
+    // Bind the complete destination inventory. A restore replay must observe
+    // the same authority rows that governed its source intersection, while
+    // the explicit subset checks above ensure every imported/fenced source is
+    // represented before the inventory digest is admitted.
+    canonical_digest(destination)
 }
 
 fn expected_identity(engine: &NcmEngine, namespace: &str) -> Result<StoreIdentity, EngineReply> {
@@ -912,36 +1220,51 @@ fn validate_capsules(
             return Err(rejected("snapshot capsule IDs are not strictly ascending"));
         }
         prior = capsule.record_id.0;
-        if capsule.status == CapsuleStatus::Revoked {
-            return Err(rejected("snapshot contains a revoked capsule"));
-        }
         let text_bytes = capsule
             .key_text
             .len()
             .checked_add(capsule.value_text.len())
             .ok_or_else(|| rejected("snapshot capsule text length overflow"))?;
         if capsule.source_id.0.is_empty()
-            || text_bytes > config.max_record_bytes
+            || capsule.commit_seq == 0
+            || capsule.commit_seq > content.commit_seq
+            || !capsule.affect.0.iter().all(|value| value.is_finite())
+            || !capsule.surprise.is_finite()
+            || !capsule.intensity.is_finite()
+        {
+            return Err(rejected("snapshot capsule is invalid"));
+        }
+        if capsule.status == CapsuleStatus::Revoked {
+            if !capsule.key_text.is_empty()
+                || !capsule.value_text.is_empty()
+                || !capsule.key_embedding.is_empty()
+                || !capsule.value_embedding.is_empty()
+                || !capsule.ltm_key.is_empty()
+                || capsule.provenance != "{}"
+            {
+                return Err(rejected("snapshot revoked capsule is not scrubbed"));
+            }
+        } else if text_bytes > config.max_record_bytes
             || capsule.key_embedding.len() != EMBEDDING_DIM
             || capsule.value_embedding.len() != EMBEDDING_DIM
             || capsule.ltm_key.len() != LTM_KEY_DIM
-            || capsule.commit_seq == 0
-            || capsule.commit_seq > content.commit_seq
             || !capsule
                 .key_embedding
                 .iter()
                 .chain(&capsule.value_embedding)
                 .chain(&capsule.ltm_key)
-                .chain(capsule.affect.0.iter())
                 .all(|value| value.is_finite())
-            || !capsule.surprise.is_finite()
-            || !capsule.intensity.is_finite()
             || serde_json::from_str::<Value>(&capsule.provenance).is_err()
         {
             return Err(rejected("snapshot capsule is invalid"));
         }
     }
-    if kernel.records.len() != content.capsules.len() {
+    let active_capsules = content
+        .capsules
+        .iter()
+        .filter(|capsule| capsule.status != CapsuleStatus::Revoked)
+        .collect::<Vec<_>>();
+    if kernel.records.len() != active_capsules.len() {
         return Err(rejected(
             "snapshot capsule count does not match kernel records",
         ));
@@ -950,6 +1273,9 @@ fn validate_capsules(
         let capsule = by_id
             .get(record_id)
             .ok_or_else(|| rejected("snapshot kernel record has no source capsule"))?;
+        if capsule.status == CapsuleStatus::Revoked {
+            return Err(rejected("snapshot kernel references a revoked capsule"));
+        }
         let expected_status = match record.state {
             RecordState::Valid => CapsuleStatus::Valid,
             RecordState::Superseded { .. } => CapsuleStatus::Superseded,
@@ -979,6 +1305,7 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         .collect::<BTreeSet<_>>();
     let mut sequences = BTreeSet::new();
     let mut keys = BTreeSet::new();
+    let mut gap_contracts = Vec::new();
     for event in &content.events {
         if event.seq == 0 || event.seq > content.commit_seq || !sequences.insert(event.seq) {
             return Err(rejected("snapshot event sequence is invalid"));
@@ -992,6 +1319,12 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         }
         let receipt: DurableReceipt = serde_json::from_str(&event.receipt)
             .map_err(|error| rejected(&format!("decode snapshot event receipt: {error}")))?;
+        validate_receipt_idempotency_key_json(
+            &event.receipt,
+            &event.kind,
+            event.idempotency_key.as_deref(),
+        )
+        .map_err(|reason| rejected(reason.as_str()))?;
         validate_snapshot_event_envelope(event, &receipt)?;
         validate_event_payload_digest(event, &receipt, &content.capsules).map_err(|reply| {
             rejected(&format!(
@@ -1001,6 +1334,19 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         })?;
         let portable_maintenance = portable_common_maintenance_event(&content.namespace, event)
             .map_err(|reason| rejected(&reason))?;
+        let snapshot_gap =
+            crate::engine::snapshot_gap_contract(event, &receipt, content.commit_seq).map_err(
+                |reply| {
+                    rejected(
+                        reply.payload["reason"]
+                            .as_str()
+                            .unwrap_or("snapshot gap contract is invalid"),
+                    )
+                },
+            )?;
+        if let Some(contract) = snapshot_gap.as_ref() {
+            gap_contracts.push((event.seq, contract.clone()));
+        }
         let portable_control = match &receipt.operation {
             DurableOperation::CommonControl { operations, .. } => {
                 event.kind == "common_control"
@@ -1028,17 +1374,244 @@ fn validate_events(content: &SnapshotContent) -> Result<(), EngineReply> {
         }
         if !portable_control
             && !portable_maintenance
+            && snapshot_gap.is_none()
             && !matches!(
                 (event.kind.as_str(), &receipt.operation),
                 ("feedback", DurableOperation::Feedback { .. })
                     | ("correction", DurableOperation::Correction { .. })
                     | ("observe", DurableOperation::Observe { .. })
+                    | ("deletion_fence", DurableOperation::DeletionFence { .. })
+                    | ("delete_by_source", DurableOperation::DeleteBySource { .. })
+                    | (
+                        "snapshot_restore",
+                        DurableOperation::Maintenance {
+                            kind: MaintenanceKind::Checkpoint,
+                            ..
+                        }
+                    )
             )
         {
             return Err(rejected("snapshot contains a non-portable event"));
         }
     }
+    for (_, contract) in gap_contracts {
+        let Some(checkpoint) = content
+            .events
+            .iter()
+            .find(|event| event.seq == contract.checkpoint_sequence)
+        else {
+            return Err(rejected("snapshot gap omission checkpoint is missing"));
+        };
+        let receipt: DurableReceipt = serde_json::from_str(&checkpoint.receipt)
+            .map_err(|error| rejected(&format!("decode snapshot gap checkpoint: {error}")))?;
+        if checkpoint.kind != "snapshot_restore"
+            || receipt.reply.payload["content_sha256"]
+                != Value::String(contract.snapshot_content_sha256.clone())
+        {
+            return Err(rejected(
+                "snapshot gap omission is detached from its restore checkpoint",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn validate_revocations(content: &SnapshotContent) -> Result<(), EngineReply> {
+    let mut rows = BTreeMap::new();
+    let mut prior_source = None;
+    for revocation in &content.revocations {
+        if revocation.source_id.0.is_empty()
+            || revocation.epoch == 0
+            || revocation.seq == 0
+            || revocation.seq > content.commit_seq
+            || prior_source
+                .as_ref()
+                .is_some_and(|prior: &SourceId| prior >= &revocation.source_id)
+            || rows
+                .insert(
+                    revocation.source_id.clone(),
+                    (revocation.epoch, revocation.seq),
+                )
+                .is_some()
+        {
+            return Err(rejected("snapshot revocation authority is invalid"));
+        }
+        prior_source = Some(revocation.source_id.clone());
+    }
+
+    let mut fences = BTreeMap::<u64, (u64, BTreeSet<SourceId>, BTreeSet<RecordId>)>::new();
+    let mut completed_fences = BTreeSet::new();
+    let mut all_deleted_record_ids = BTreeSet::new();
+    for event in &content.events {
+        let receipt: DurableReceipt = serde_json::from_str(&event.receipt)
+            .map_err(|error| rejected(&format!("decode snapshot deletion receipt: {error}")))?;
+        match &receipt.operation {
+            DurableOperation::DeletionFence {
+                source,
+                sources,
+                target_epoch,
+                deleted_records,
+                deleted_record_ids,
+                ..
+            } => {
+                if event.kind != "deletion_fence"
+                    || !valid_source_set(sources)
+                    || sources.first() != Some(source)
+                    || u64::try_from(deleted_record_ids.len()).ok() != Some(*deleted_records)
+                    || deleted_record_ids.iter().collect::<BTreeSet<_>>().len()
+                        != deleted_record_ids.len()
+                    || !fences
+                        .insert(
+                            event.seq,
+                            (
+                                *target_epoch,
+                                sources.iter().cloned().collect(),
+                                deleted_record_ids.iter().copied().collect(),
+                            ),
+                        )
+                        .is_none()
+                {
+                    return Err(rejected("snapshot deletion fence authority is invalid"));
+                }
+                // The durable source set is the deletion authority, while a
+                // raw deletion may have scrubbed capsules whose stored IDs
+                // are the distinct typed IDs derived from that raw key.  The
+                // fence's complete record-ID set is therefore the stable
+                // relation to validate here; source-ID equality would reject
+                // a correctly scrubbed raw/typed snapshot.
+                let expected_ids = content
+                    .capsules
+                    .iter()
+                    .filter(|capsule| {
+                        capsule.status == CapsuleStatus::Revoked
+                            && !all_deleted_record_ids.contains(&capsule.record_id)
+                    })
+                    .map(|capsule| capsule.record_id)
+                    .collect::<BTreeSet<_>>();
+                let actual_ids = deleted_record_ids.iter().copied().collect::<BTreeSet<_>>();
+                if actual_ids != expected_ids {
+                    return Err(rejected(
+                        "snapshot deletion fence does not carry the full deleted-record set",
+                    ));
+                }
+                all_deleted_record_ids.extend(actual_ids);
+            }
+            DurableOperation::DeleteBySource {
+                source,
+                sources,
+                target_epoch,
+                deleted_records,
+                deleted_record_ids,
+                ..
+            } => {
+                let Some(previous) = event
+                    .seq
+                    .checked_sub(1)
+                    .and_then(|seq| content.events.iter().find(|candidate| candidate.seq == seq))
+                else {
+                    return Err(rejected("snapshot deletion completion fence is missing"));
+                };
+                let previous_receipt: DurableReceipt = serde_json::from_str(&previous.receipt)
+                    .map_err(|error| {
+                        rejected(&format!(
+                            "decode snapshot preceding deletion receipt: {error}"
+                        ))
+                    })?;
+                let DurableOperation::DeletionFence {
+                    source: fence_source,
+                    sources: fence_sources,
+                    target_epoch: fence_epoch,
+                    ..
+                } = &previous_receipt.operation
+                else {
+                    return Err(rejected(
+                        "snapshot deletion completion is not preceded by a fence",
+                    ));
+                };
+                if event.kind != "delete_by_source"
+                    || !valid_source_set(sources)
+                    || source != fence_source
+                    || sources != fence_sources
+                    || target_epoch != fence_epoch
+                    || u64::try_from(deleted_record_ids.len()).ok() != Some(*deleted_records)
+                    || deleted_record_ids.iter().collect::<BTreeSet<_>>().len()
+                        != deleted_record_ids.len()
+                {
+                    return Err(rejected(
+                        "snapshot deletion completion authority is invalid",
+                    ));
+                }
+                let Some((_, _, fence_record_ids)) = fences.get(&previous.seq) else {
+                    return Err(rejected("snapshot deletion fence authority is missing"));
+                };
+                let completion_ids = deleted_record_ids.iter().copied().collect::<BTreeSet<_>>();
+                if &completion_ids != fence_record_ids {
+                    return Err(rejected(
+                        "snapshot deletion completion does not carry the full deleted-record set",
+                    ));
+                }
+                for record_id in &completion_ids {
+                    let Some(capsule) = content
+                        .capsules
+                        .iter()
+                        .find(|capsule| capsule.record_id == *record_id)
+                    else {
+                        return Err(rejected(
+                            "snapshot deletion completion references an unknown record",
+                        ));
+                    };
+                    if capsule.status != CapsuleStatus::Revoked {
+                        return Err(rejected(
+                            "snapshot deletion completion references a record outside its fence",
+                        ));
+                    }
+                }
+                completed_fences.insert(previous.seq);
+            }
+            _ => {}
+        }
+    }
+
+    for (source, (epoch, seq)) in &rows {
+        let Some((fence_epoch, fence_sources, _fence_record_ids)) = fences.get(seq) else {
+            return Err(rejected(
+                "snapshot revocation is missing its deletion fence",
+            ));
+        };
+        if fence_epoch != epoch || !fence_sources.contains(source) {
+            return Err(rejected(
+                "snapshot revocation does not match its deletion fence",
+            ));
+        }
+    }
+    for (seq, (_epoch, _sources, _record_ids)) in fences {
+        if !completed_fences.contains(&seq) {
+            return Err(rejected("snapshot deletion fence completion is missing"));
+        }
+    }
+    for capsule in &content.capsules {
+        if capsule.status != CapsuleStatus::Revoked && rows.contains_key(&capsule.source_id) {
+            return Err(rejected(
+                "snapshot active capsule conflicts with revocation authority",
+            ));
+        }
+        if capsule.status == CapsuleStatus::Revoked
+            && !all_deleted_record_ids.contains(&capsule.record_id)
+        {
+            return Err(rejected(
+                "snapshot revoked capsule is missing deletion authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_source_set(sources: &[SourceId]) -> bool {
+    !sources.is_empty()
+        && sources.len() <= 1024
+        && sources.first().is_some_and(|source| !source.0.is_empty())
+        && sources.iter().all(|source| !source.0.is_empty())
+        && sources.windows(2).all(|window| window[0] < window[1])
 }
 
 fn validate_snapshot_event_envelope(
@@ -1082,7 +1655,16 @@ fn validate_snapshot_event_envelope(
             "snapshot deletion fence unexpectedly has an idempotency key",
         ));
     }
-    if receipt.idempotency_key.as_deref() != event.idempotency_key.as_deref() {
+    let compact_maintenance = matches!(
+        &receipt.operation,
+        DurableOperation::Maintenance {
+            canonical_input: None,
+            ..
+        }
+    );
+    let legacy_maintenance = receipt.idempotency_key.is_none() && compact_maintenance;
+    if receipt.idempotency_key.as_deref() != event.idempotency_key.as_deref() && !legacy_maintenance
+    {
         return Err(rejected("snapshot event receipt idempotency key mismatch"));
     }
     if let DurableOperation::CommonControl {
@@ -1102,7 +1684,7 @@ fn validate_snapshot_event_envelope(
         DurableOperation::Observe { .. } => event.kind == "observe",
         DurableOperation::Feedback { .. } => event.kind == "feedback",
         DurableOperation::Correction { .. } => event.kind == "correction",
-        DurableOperation::Maintenance { kind } => {
+        DurableOperation::Maintenance { kind, .. } => {
             event.kind == "maintenance"
                 || (matches!(kind, MaintenanceKind::Checkpoint) && event.kind == "snapshot_restore")
         }
@@ -1177,6 +1759,8 @@ fn build_direct_stage(
             checkpoint: &checkpoint,
         }),
         None,
+        &snapshot.content_sha256,
+        target_seq,
     )
 }
 
@@ -1188,19 +1772,21 @@ fn build_sanitized_stage(
     snapshot: &ValidatedSnapshot,
     revocations: &[Revocation],
     stripped: &BTreeSet<SourceId>,
+    fence_source_set: &BTreeSet<SourceId>,
     target_epoch: u64,
     base_seq: u64,
     target_seq: u64,
     idempotency_key: &str,
-    payload_sha256: &str,
+    restore_digest: &str,
+    deletion_authority_sha256: &str,
 ) -> Result<(NcmKernel, u64), EngineReply> {
     let fence_seq = base_seq
         .checked_add(1)
         .ok_or_else(|| corrupt_reply(base_seq, "snapshot fence sequence overflow"))?;
-    if target_seq != fence_seq.saturating_add(1) {
+    if target_seq != fence_seq.saturating_add(2) {
         return Err(corrupt_reply(base_seq, "snapshot target sequence mismatch"));
     }
-    let stripped_sources = stripped.iter().cloned().collect::<Vec<_>>();
+    let stripped_sources = fence_source_set.iter().cloned().collect::<Vec<_>>();
     let stripped_record_ids = snapshot
         .content
         .capsules
@@ -1217,6 +1803,24 @@ fn build_sanitized_stage(
     } else {
         stripped_sources
     };
+    // The deletion completion is a separate durable operation from the
+    // caller's restore checkpoint.  Give the internal fence its own
+    // deterministic key so the completion row cannot collide with the final
+    // snapshot_restore idempotency row.
+    let deletion_idempotency_key = format!("snapshot-deletion-{restore_digest}");
+    let fence_source_set = fence_sources.iter().cloned().collect::<BTreeSet<_>>();
+    let fence_canonical_input =
+        crate::privacy::deletion_request_input(&fence_source_set, Some(base_seq), None);
+    let mut fence_semantics = fence_canonical_input.clone();
+    if let Some(object) = fence_semantics.as_object_mut() {
+        object.remove("expected_generation");
+    }
+    let fence_payload_sha256 = canonical_digest(&fence_semantics).map_err(|reason| {
+        corrupt_reply(
+            base_seq,
+            &format!("serialize snapshot fence payload: {reason}"),
+        )
+    })?;
     let fence_reply = EngineReply::new(
         Outcome::Success,
         fence_seq,
@@ -1226,13 +1830,14 @@ fn build_sanitized_stage(
         source: fence_source,
         sources: fence_sources,
         target_epoch,
-        idempotency_key: idempotency_key.to_owned(),
-        payload_sha256: payload_sha256.to_owned(),
+        idempotency_key: deletion_idempotency_key,
+        payload_sha256: fence_payload_sha256.clone(),
         deleted_records: u64::try_from(stripped_record_ids.len()).unwrap_or(u64::MAX),
         deleted_record_ids: stripped_record_ids,
         pre_fence_state_digest: sha256_hex(&snapshot.kernel.state_digest()),
         fatigue: snapshot.kernel.scheduler.fatigue,
         steps_since_consolidation: snapshot.kernel.scheduler.steps_since_consolidation,
+        canonical_input: Some(fence_canonical_input),
     };
     let fence_state_digest = sha256_hex(&snapshot.kernel.state_digest());
     let fence_integrity_digest =
@@ -1263,21 +1868,93 @@ fn build_sanitized_stage(
         &snapshot.content.events,
         revocations,
         stripped,
-        snapshot.content.epoch,
+        target_epoch - 1,
         fence_seq,
         &snapshot.kernel,
         kernel_next_record_id(&snapshot.kernel)?,
         None,
         Some(FenceRows {
             seq: fence_seq,
+            payload_sha256: &fence_payload_sha256,
             receipt: &fence_receipt,
         }),
+        &snapshot.content_sha256,
+        target_seq,
     )?;
     let mut store = NamespaceStore::open(stage_root, namespace, &snapshot.identity)
         .map_err(|error| store_reply(error, base_seq))?;
     let resumed = crate::privacy::resume_pending_rebuild(&mut store, &snapshot.kernel.config)?
         .ok_or_else(|| corrupt_reply(base_seq, "snapshot sanitized rebuild did not resume"))?;
-    let result = (resumed.kernel, resumed.meta.commit_seq);
+    if resumed.meta.commit_seq.checked_add(1) != Some(target_seq) {
+        return Err(corrupt_reply(
+            base_seq,
+            "snapshot sanitized completion sequence mismatch",
+        ));
+    }
+    // The completion above is a deletion receipt and remains immutable.  Add
+    // the restore checkpoint after it so restore idempotency has its own
+    // journal row without relabelling the deletion operation.
+    let restore_reply = EngineReply::new(
+        Outcome::Success,
+        target_seq,
+        json!({
+            "format": FORMAT,
+            "epoch": target_epoch,
+            "commit_seq": target_seq,
+            "tick": resumed.kernel.scheduler.tick.0,
+            "state_digest": sha256_hex(&resumed.kernel.state_digest()),
+            "content_sha256": snapshot.content_sha256,
+            "stripped_sources": stripped.len(),
+            "deletion_authority_sha256": deletion_authority_sha256,
+            "replayed": false
+        }),
+    );
+    let restore_receipt = restore_receipt(&restore_reply, &resumed.kernel, Some(idempotency_key))?;
+    let checkpoint = checkpoint_bytes(&resumed.kernel)?;
+    let mut mutation = store
+        .begin_mutation()
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    let event_seq = mutation
+        .append_event(
+            "snapshot_restore",
+            Some(idempotency_key),
+            restore_digest,
+            &restore_receipt,
+            resumed.kernel.scheduler.tick.0,
+        )
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    if event_seq != target_seq {
+        return Err(corrupt_reply(
+            resumed.meta.commit_seq,
+            "snapshot restore checkpoint sequence mismatch",
+        ));
+    }
+    mutation
+        .put_checkpoint(target_seq, target_epoch, &checkpoint)
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    mutation
+        .prune_checkpoints_before(target_seq)
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    mutation
+        .set_meta(&StoreMeta {
+            epoch: target_epoch,
+            commit_seq: target_seq,
+            tick: resumed.kernel.scheduler.tick.0,
+            fatigue: resumed.kernel.scheduler.fatigue,
+            steps_since_consolidation: resumed.kernel.scheduler.steps_since_consolidation,
+            last_maintenance: Some("snapshot_restore".to_owned()),
+        })
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    let committed = mutation
+        .commit()
+        .map_err(|error| store_reply(error, resumed.meta.commit_seq))?;
+    if committed != target_seq {
+        return Err(corrupt_reply(
+            committed,
+            "snapshot restore checkpoint commit sequence mismatch",
+        ));
+    }
+    let result = (resumed.kernel, committed);
     drop(store);
     Ok(result)
 }
@@ -1292,6 +1969,7 @@ struct FinalRows<'a> {
 
 struct FenceRows<'a> {
     seq: u64,
+    payload_sha256: &'a str,
     receipt: &'a str,
 }
 
@@ -1308,6 +1986,8 @@ fn populate_stage(
     next_record_id: u64,
     final_rows: Option<FinalRows<'_>>,
     fence_rows: Option<FenceRows<'_>>,
+    snapshot_content_sha256: &str,
+    checkpoint_sequence: u64,
 ) -> Result<(), EngineReply> {
     let mut conn = Connection::open(db_path).map_err(|error| {
         unavailable_reply(0, &format!("open snapshot staging database: {error}"))
@@ -1329,6 +2009,9 @@ fn populate_stage(
         .map_err(|error| {
             unavailable_reply(0, &format!("clear snapshot staging tables: {error}"))
         })?;
+    let mut staged_event_ticks = BTreeMap::new();
+    let mut staged_event_tick_deltas = BTreeMap::new();
+    let mut staged_event_tick_resets = BTreeMap::new();
 
     for capsule in capsules {
         let is_stripped = stripped.contains(&capsule.source_id);
@@ -1381,19 +2064,48 @@ fn populate_stage(
     }
 
     for capsule in capsules {
-        if events.iter().any(|event| event.seq == capsule.commit_seq) {
+        if capsule.status == CapsuleStatus::Revoked
+            || stripped.contains(&capsule.source_id)
+            || events.iter().any(|event| event.seq == capsule.commit_seq)
+        {
             continue;
         }
+        let contract = json!({
+            "version": 1,
+            "sequence": capsule.commit_seq,
+            "record_id": capsule.record_id.0,
+            "checkpoint_sequence": checkpoint_sequence,
+            "snapshot_content_sha256": snapshot_content_sha256,
+        });
+        let reply = EngineReply::new(
+            Outcome::Success,
+            capsule.commit_seq,
+            json!({"snapshot_observe": contract.clone(), "replayed": false}),
+        );
+        let operation = DurableOperation::Observe {
+            record_id: capsule.record_id,
+        };
+        let state_digest =
+            crate::engine::snapshot_observe_state_digest(&contract, capsule.commit_seq)
+                .map_err(|reason| corrupt_reply(capsule.commit_seq, &reason))?;
+        let integrity_digest = durable_integrity_digest(&reply, &operation, &state_digest)
+            .map_err(|reason| corrupt_reply(capsule.commit_seq, &reason))?;
+        let idempotency_key = format!("snapshot-observe-{}", capsule.commit_seq);
         let receipt = serde_json::to_string(&DurableReceipt {
-            reply: EngineReply::new(Outcome::Success, capsule.commit_seq, Value::Null),
-            operation: DurableOperation::Observe {
-                record_id: capsule.record_id,
-            },
-            state_digest: String::new(),
-            integrity_digest: String::new(),
-            idempotency_key: None,
+            reply,
+            operation,
+            state_digest,
+            integrity_digest,
+            idempotency_key: Some(idempotency_key.clone()),
         })
-        .map_err(|error| corrupt_reply(0, &format!("serialize staged observe receipt: {error}")))?;
+        .map_err(|error| {
+            corrupt_reply(
+                capsule.commit_seq,
+                &format!("serialize staged observe receipt: {error}"),
+            )
+        })?;
+        let payload_sha256 =
+            crate::engine::canonical_observe_payload_digest(capsule, capsule.commit_seq)?;
         let created_tick = kernel
             .records
             .get(capsule.record_id)
@@ -1402,13 +2114,30 @@ fn populate_stage(
             &tx,
             capsule.commit_seq,
             "observe",
-            None,
-            &sha256_hex(&capsule.record_id.0.to_le_bytes()),
+            Some(&idempotency_key),
+            &payload_sha256,
             &receipt,
             created_tick,
         )?;
+        if staged_event_ticks
+            .insert(capsule.commit_seq, created_tick)
+            .is_some()
+        {
+            return Err(corrupt_reply(
+                capsule.commit_seq,
+                "snapshot staging has duplicate event sequences",
+            ));
+        }
+        staged_event_tick_deltas.insert(capsule.commit_seq, 1);
     }
     for event in events {
+        let durable: DurableReceipt = serde_json::from_str(&event.receipt).map_err(|error| {
+            corrupt_reply(
+                event.seq,
+                &format!("decode snapshot staging event receipt: {error}"),
+            )
+        })?;
+        let tick_delta = durable_operation_tick_delta(&durable.operation);
         insert_event(
             &tx,
             event.seq,
@@ -1418,7 +2147,75 @@ fn populate_stage(
             &event.receipt,
             event.created_tick,
         )?;
+        if staged_event_ticks
+            .insert(event.seq, event.created_tick)
+            .is_some()
+        {
+            return Err(corrupt_reply(
+                event.seq,
+                "snapshot staging has duplicate event sequences",
+            ));
+        }
+        staged_event_tick_deltas.insert(event.seq, tick_delta);
+        if let Some(tick_before) = durable
+            .reply
+            .payload
+            .get("sanitized_replay")
+            .and_then(Value::as_object)
+            .and_then(|report| report.get("tick_before"))
+            .and_then(Value::as_u64)
+        {
+            staged_event_tick_resets.insert(event.seq, tick_before);
+        }
     }
+    let terminal_seq = final_rows
+        .as_ref()
+        .map(|rows| rows.seq)
+        .or_else(|| fence_rows.as_ref().map(|rows| rows.seq))
+        .unwrap_or(commit_seq);
+    if staged_event_ticks
+        .keys()
+        .any(|sequence| *sequence == 0 || *sequence > terminal_seq)
+    {
+        return Err(corrupt_reply(
+            terminal_seq,
+            "snapshot staging event exceeds its terminal sequence",
+        ));
+    }
+    if let Some(fence) = fence_rows.as_ref() {
+        if staged_event_ticks
+            .insert(fence.seq, kernel.scheduler.tick.0)
+            .is_some()
+        {
+            return Err(corrupt_reply(
+                fence.seq,
+                "snapshot staging fence overlaps an event",
+            ));
+        }
+        staged_event_tick_deltas.insert(fence.seq, 0);
+    }
+    if let Some(final_rows) = final_rows.as_ref() {
+        if staged_event_ticks
+            .insert(final_rows.seq, kernel.scheduler.tick.0)
+            .is_some()
+        {
+            return Err(corrupt_reply(
+                final_rows.seq,
+                "snapshot staging restore overlaps an event",
+            ));
+        }
+        staged_event_tick_deltas.insert(final_rows.seq, 0);
+    }
+    fill_snapshot_journal_gaps(
+        &tx,
+        terminal_seq,
+        &mut staged_event_ticks,
+        &staged_event_tick_deltas,
+        &staged_event_tick_resets,
+        kernel,
+        snapshot_content_sha256,
+        checkpoint_sequence,
+    )?;
     for revocation in revocations {
         tx.execute(
             "INSERT INTO revocations(source_id, epoch, seq) VALUES (?1, ?2, ?3)",
@@ -1436,7 +2233,7 @@ fn populate_stage(
             fence.seq,
             "deletion_fence",
             None,
-            &sha256_hex(fence.receipt.as_bytes()),
+            fence.payload_sha256,
             fence.receipt,
             kernel.scheduler.tick.0,
         )?;
@@ -1511,6 +2308,266 @@ fn insert_event(
     Ok(())
 }
 
+/// Restoring an older snapshot over a namespace with a later generation must
+/// retain the journal sequence occupied by the destination's discarded
+/// suffix. The copied snapshot events remain the authenticated prefix; these
+/// bounded maintenance receipts make the staged journal contiguous so normal
+/// recovery can validate the fence/checkpoint at its terminal sequence.
+fn durable_operation_tick_delta(operation: &DurableOperation) -> u64 {
+    match operation {
+        DurableOperation::CommonControl { operations, .. } => operations
+            .iter()
+            .map(durable_operation_tick_delta)
+            .fold(0_u64, u64::saturating_add),
+        DurableOperation::Observe { .. } => 1,
+        DurableOperation::Maintenance { kind, .. } => match kind {
+            MaintenanceKind::Advance { ticks } => u64::from(*ticks),
+            MaintenanceKind::Consolidate
+            | MaintenanceKind::MergePrune
+            | MaintenanceKind::Checkpoint
+            | MaintenanceKind::Compact => 0,
+        },
+        DurableOperation::Feedback { .. }
+        | DurableOperation::Correction { .. }
+        | DurableOperation::DeletionFence { .. }
+        | DurableOperation::DeleteBySource { .. } => 0,
+    }
+}
+
+fn fill_snapshot_journal_gaps(
+    tx: &rusqlite::Transaction<'_>,
+    terminal_seq: u64,
+    occupied: &mut BTreeMap<u64, u64>,
+    occupied_deltas: &BTreeMap<u64, u64>,
+    occupied_tick_resets: &BTreeMap<u64, u64>,
+    kernel: &NcmKernel,
+    snapshot_content_sha256: &str,
+    checkpoint_sequence: u64,
+) -> Result<(), EngineReply> {
+    // Check the worst-case missing count before walking the occupied keys.
+    // Walking the sorted key list, rather than probing every sequence up to an
+    // attacker-controlled terminal generation, keeps the scan proportional to
+    // the authenticated snapshot rows and the bounded synthetic omissions.
+    let occupied_count = u64::try_from(
+        occupied
+            .keys()
+            .filter(|sequence| **sequence > 0 && **sequence <= terminal_seq)
+            .count(),
+    )
+    .map_err(|_| corrupt_reply(terminal_seq, "snapshot staging occupied count overflow"))?;
+    let potential_missing = terminal_seq.saturating_sub(occupied_count);
+    if potential_missing > MAX_SYNTHETIC_GAP_EVENTS {
+        return Err(corrupt_reply(
+            terminal_seq,
+            "snapshot staging journal gap exceeds its bounded repair budget",
+        ));
+    }
+    let keys = occupied
+        .iter()
+        .filter(|(sequence, _)| **sequence > 0 && **sequence <= terminal_seq)
+        .map(|(sequence, created_tick)| (*sequence, *created_tick))
+        .collect::<Vec<_>>();
+    let mut previous_tick = 0_u64;
+    let mut sequence = 1_u64;
+    let mut missing_events = 0_u64;
+    for (next_sequence, next_tick) in keys {
+        if next_sequence < sequence {
+            return Err(corrupt_reply(
+                next_sequence,
+                "snapshot staging event sequence is not ordered",
+            ));
+        }
+        let count = next_sequence
+            .checked_sub(sequence)
+            .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging sequence underflow"))?;
+        let first_missing = sequence;
+        missing_events = missing_events
+            .checked_add(count)
+            .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging gap count overflow"))?;
+        if missing_events > MAX_SYNTHETIC_GAP_EVENTS {
+            return Err(corrupt_reply(
+                terminal_seq,
+                "snapshot staging journal gap exceeds its bounded repair budget",
+            ));
+        }
+        if count != 0 {
+            let next_delta = occupied_deltas.get(&next_sequence).copied().unwrap_or(0);
+            let target_tick = occupied_tick_resets
+                .get(&next_sequence)
+                .copied()
+                .or_else(|| next_tick.checked_sub(next_delta))
+                .ok_or_else(|| {
+                    corrupt_reply(
+                        next_sequence,
+                        "snapshot staging event tick precedes its operation delta",
+                    )
+                })?;
+            insert_snapshot_gap_run(
+                tx,
+                first_missing,
+                next_sequence,
+                &mut previous_tick,
+                target_tick,
+                snapshot_content_sha256,
+                checkpoint_sequence,
+                &sha256_hex(&kernel.state_digest()),
+            )?;
+            for gap_sequence in first_missing..next_sequence {
+                occupied.insert(gap_sequence, target_tick);
+            }
+        }
+        if let Some(tick_before) = occupied_tick_resets.get(&next_sequence) {
+            if *tick_before != previous_tick {
+                return Err(corrupt_reply(
+                    next_sequence,
+                    "snapshot staging deletion tick anchor does not match its prefix",
+                ));
+            }
+        } else if next_tick < previous_tick {
+            return Err(corrupt_reply(
+                next_sequence,
+                "snapshot staging event ticks are not monotonic",
+            ));
+        }
+        previous_tick = next_tick;
+        sequence = next_sequence
+            .checked_add(1)
+            .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging sequence overflow"))?;
+    }
+    let end = terminal_seq
+        .checked_add(1)
+        .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging sequence overflow"))?;
+    if sequence < end {
+        let count = end
+            .checked_sub(sequence)
+            .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging sequence underflow"))?;
+        missing_events = missing_events
+            .checked_add(count)
+            .ok_or_else(|| corrupt_reply(terminal_seq, "snapshot staging gap count overflow"))?;
+        if missing_events > MAX_SYNTHETIC_GAP_EVENTS {
+            return Err(corrupt_reply(
+                terminal_seq,
+                "snapshot staging journal gap exceeds its bounded repair budget",
+            ));
+        }
+        insert_snapshot_gap_run(
+            tx,
+            sequence,
+            end,
+            &mut previous_tick,
+            kernel.scheduler.tick.0,
+            snapshot_content_sha256,
+            checkpoint_sequence,
+            &sha256_hex(&kernel.state_digest()),
+        )?;
+        for gap_sequence in sequence..end {
+            occupied.insert(gap_sequence, kernel.scheduler.tick.0);
+        }
+    }
+    Ok(())
+}
+
+fn insert_snapshot_gap_run(
+    tx: &rusqlite::Transaction<'_>,
+    first_sequence: u64,
+    end_sequence: u64,
+    previous_tick: &mut u64,
+    target_tick: u64,
+    snapshot_content_sha256: &str,
+    checkpoint_sequence: u64,
+    state_digest: &str,
+) -> Result<(), EngineReply> {
+    let count = end_sequence
+        .checked_sub(first_sequence)
+        .ok_or_else(|| corrupt_reply(first_sequence, "snapshot staging gap sequence underflow"))?;
+    if count == 0 {
+        return Ok(());
+    }
+    if count > MAX_SYNTHETIC_GAP_EVENTS {
+        return Err(corrupt_reply(
+            first_sequence,
+            "snapshot staging journal gap exceeds its bounded repair budget",
+        ));
+    }
+    if target_tick < *previous_tick {
+        return Err(corrupt_reply(
+            first_sequence,
+            "snapshot staging gap ticks are not monotonic",
+        ));
+    }
+    let tick_delta = target_tick - *previous_tick;
+    let advance_ticks = u32::try_from(tick_delta).map_err(|_| {
+        corrupt_reply(
+            first_sequence,
+            "snapshot staging gap tick delta exceeds its bounded repair budget",
+        )
+    })?;
+    if advance_ticks > MAX_SYNTHETIC_ADVANCE_TICKS {
+        return Err(corrupt_reply(
+            first_sequence,
+            "snapshot staging gap advance exceeds its bounded maintenance budget",
+        ));
+    }
+    let contract = json!({
+        "version": 1,
+        "first_sequence": first_sequence,
+        "end_sequence": end_sequence,
+        "checkpoint_sequence": checkpoint_sequence,
+        "snapshot_content_sha256": snapshot_content_sha256,
+        "terminal_state_digest": state_digest,
+    });
+    for (offset, sequence) in (first_sequence..end_sequence).enumerate() {
+        let kind = if offset == 0 && advance_ticks != 0 {
+            MaintenanceKind::Advance {
+                ticks: advance_ticks,
+            }
+        } else {
+            MaintenanceKind::Checkpoint
+        };
+        let canonical_input = Some(json!({"snapshot_gap": contract.clone()}));
+        let operation = DurableOperation::Maintenance {
+            kind: kind.clone(),
+            canonical_input,
+        };
+        let reply = EngineReply::new(
+            Outcome::Success,
+            sequence,
+            json!({"snapshot_gap": contract.clone(), "replayed": false}),
+        );
+        let row_state_digest = crate::engine::snapshot_gap_state_digest(&contract, sequence)
+            .map_err(|reason| corrupt_reply(sequence, &reason))?;
+        let integrity_digest = durable_integrity_digest(&reply, &operation, &row_state_digest)
+            .map_err(|reason| corrupt_reply(sequence, &reason))?;
+        let idempotency_key = format!("snapshot-gap-{sequence}");
+        let receipt = serde_json::to_string(&DurableReceipt {
+            reply,
+            operation,
+            state_digest: row_state_digest,
+            integrity_digest,
+            idempotency_key: Some(idempotency_key.clone()),
+        })
+        .map_err(|error| {
+            corrupt_reply(
+                sequence,
+                &format!("serialize snapshot staging gap receipt: {error}"),
+            )
+        })?;
+        let payload_sha256 =
+            canonical_digest(&kind).map_err(|reason| corrupt_reply(sequence, &reason))?;
+        insert_event(
+            tx,
+            sequence,
+            "maintenance",
+            Some(&idempotency_key),
+            &payload_sha256,
+            &receipt,
+            target_tick,
+        )?;
+    }
+    *previous_tick = target_tick;
+    Ok(())
+}
+
 fn replace_restore_receipt(
     db_path: &Path,
     seq: u64,
@@ -1526,7 +2583,8 @@ fn replace_restore_receipt(
     let changed = conn
         .execute(
             "UPDATE events SET kind = 'snapshot_restore', idempotency_key = ?1,
-                    payload_sha256 = ?2, receipt = ?3 WHERE seq = ?4",
+                    payload_sha256 = ?2, receipt = ?3
+             WHERE seq = ?4 AND kind = 'snapshot_restore'",
             params![
                 idempotency_key,
                 payload_sha256,
@@ -1587,6 +2645,8 @@ fn lookup_restore_replay(
     }
     let durable: DurableReceipt = serde_json::from_str(&receipt)
         .map_err(|error| corrupt_reply(seq, &format!("decode restore receipt: {error}")))?;
+    validate_receipt_idempotency_key_json(&receipt, &event.kind, event.idempotency_key.as_deref())
+        .map_err(|reason| corrupt_reply(handle.commit_seq, reason.as_str()))?;
     validate_snapshot_event_envelope(&event, &durable).map_err(|reply| {
         corrupt_reply(
             handle.commit_seq,
@@ -1598,7 +2658,8 @@ fn lookup_restore_replay(
     if !matches!(
         durable.operation,
         DurableOperation::Maintenance {
-            kind: MaintenanceKind::Checkpoint
+            kind: MaintenanceKind::Checkpoint,
+            ..
         }
     ) {
         return Err(corrupt_reply(
@@ -1620,6 +2681,7 @@ fn restore_receipt(
 ) -> Result<String, EngineReply> {
     let operation = DurableOperation::Maintenance {
         kind: MaintenanceKind::Checkpoint,
+        canonical_input: None,
     };
     let state_digest = sha256_hex(&kernel.state_digest());
     let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)

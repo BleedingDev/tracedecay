@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import json
+import io
 import subprocess
 import tempfile
 from pathlib import Path
+import tarfile
+import zipfile
 
 
 SCRIPT = Path(__file__).with_name("plan-release-recovery.py")
@@ -64,6 +67,10 @@ LINUX_BINARY = "tracedecay-v1.2.3-linux.tar.gz"
 LINUX_MCPB = "tracedecay-v1.2.3-linux.mcpb"
 
 
+def macho_fixture(*, cpu_type: int = 0x0100000C) -> bytes:
+    return b"\xcf\xfa\xed\xfe" + cpu_type.to_bytes(4, "little")
+
+
 def run(
     root: Path,
     assets: tuple[str, ...],
@@ -107,6 +114,66 @@ def run(
     expected_build = "true" if matrix["include"] else "false"
     assert outputs["build_required"] == expected_build
     return matrix, retained.read_text().splitlines()
+
+
+def write_retained_sidecar(root: Path, *, legacy: bool = False) -> None:
+    directory = root / "retained-assets"
+    directory.mkdir(exist_ok=True)
+    archive_path = directory / ARM_SIDECAR
+    with tarfile.open(archive_path, mode="w:gz") as archive:
+        entries = [
+            ("tracedecay-ncm-worker", macho_fixture(), 0o755),
+            ("worker-manifest.json", b"{}", 0o644),
+        ]
+        if not legacy:
+            model_manifest = {
+                "schema_version": 1,
+                "manifest_type": "ncm-model-acquisition",
+                "provider_id": "ncm",
+                "worker": "tracedecay-ncm-worker",
+                "target": "aarch64-apple-darwin",
+                "release_name": "aarch64-macos",
+                "revision_provenance_sha256": "a" * 64,
+                "transaction": {"journal": "ncm-model-lifecycle-v1.json"},
+                "receipt": {
+                    "relative_path": "receipts/ncm-model-acquisition-v1.json",
+                    "required_fields": ["revision_provenance_sha256"],
+                },
+            }
+            entries.append(
+                (
+                    "model-acquisition-manifest.json",
+                    json.dumps(model_manifest).encode("utf-8"),
+                    0o644,
+                )
+            )
+        for name, payload, mode in entries:
+            info = tarfile.TarInfo(name)
+            info.mode = mode
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+
+def write_retained_binary(root: Path, *, wrong_arch: bool = False) -> None:
+    directory = root / "retained-assets"
+    directory.mkdir(exist_ok=True)
+    payload = macho_fixture(cpu_type=0x01000007 if wrong_arch else 0x0100000C)
+    with tarfile.open(directory / ARM_BINARY, mode="w:gz") as archive:
+        info = tarfile.TarInfo("tracedecay")
+        info.mode = 0o755
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+
+def write_retained_mcpb(root: Path, *, wrong_arch: bool = False) -> None:
+    directory = root / "retained-assets"
+    directory.mkdir(exist_ok=True)
+    payload = macho_fixture(cpu_type=0x01000007 if wrong_arch else 0x0100000C)
+    with zipfile.ZipFile(directory / ARM_MCPB, mode="w") as archive:
+        archive.writestr("manifest.json", b"{}")
+        entry = zipfile.ZipInfo("server/tracedecay")
+        entry.external_attr = (0o100755) << 16
+        archive.writestr(entry, payload)
 
 
 def main() -> None:
@@ -155,6 +222,66 @@ def main() -> None:
         )
         assert matrix == {"include": [TARGETS["include"][0], TARGETS["include"][1]]}
         assert retained == sorted((beta_arm, beta_sidecar, beta_sidecar_checksum))
+
+        write_retained_sidecar(root)
+        write_retained_binary(root)
+        write_retained_mcpb(root)
+        completed = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--manifest",
+                str(root / "targets.json"),
+                "--worker-platforms",
+                str(root / "worker-platforms.json"),
+                "--tag",
+                "v1.2.3",
+                "--asset-directory",
+                str(root / "retained-assets"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        write_retained_binary(root, wrong_arch=True)
+        completed = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--manifest",
+                str(root / "targets.json"),
+                "--worker-platforms",
+                str(root / "worker-platforms.json"),
+                "--tag",
+                "v1.2.3",
+                "--asset-directory",
+                str(root / "retained-assets"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode != 0
+        assert "Mach-O CPU type" in completed.stderr
+        write_retained_binary(root)
+        write_retained_sidecar(root, legacy=True)
+        completed = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--manifest",
+                str(root / "targets.json"),
+                "--worker-platforms",
+                str(root / "worker-platforms.json"),
+                "--tag",
+                "v1.2.3",
+                "--asset-directory",
+                str(root / "retained-assets"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode != 0
+        assert "model-acquisition-manifest.json" in completed.stderr
 
     print("release recovery planner tests passed")
 

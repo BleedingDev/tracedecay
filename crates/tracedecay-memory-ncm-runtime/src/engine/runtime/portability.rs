@@ -4,12 +4,13 @@ use super::super::*;
 use super::control::{commit_common, replacement_request};
 use super::util::{
     canonical_digest, core_reply, lookup_replay, read_live, remaining_deadline, resolve_affect,
-    sha256_hex, store_reply,
+    sha256_hex, store_reply, validate_common_control_digest, validate_durable_receipt,
+    validate_receipt_idempotency_key_json, validate_receipt_idempotency_key_value,
 };
 use crate::snapshot::{self, RestoreRequest};
 use crate::store::{Capsule, CapsuleStatus};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 use tracedecay_memory_ncm_core::kernel::NewRecord;
 
@@ -139,6 +140,10 @@ impl NcmEngine {
                 if handle.fenced {
                     return EngineReply::new(Outcome::Busy, handle.commit_seq, Value::Null);
                 }
+                let acknowledged = match preflight_replay_page(handle, &page) {
+                    Ok(value) => value,
+                    Err(reply) => return reply,
+                };
                 match lookup_page_replay(handle, &page, &effect, &digest, deadline) {
                     Ok(Some(reply)) => return reply,
                     Ok(None) => {}
@@ -147,10 +152,6 @@ impl NcmEngine {
                 if handle.commit_seq != page.expected {
                     return conflict(handle.commit_seq);
                 }
-                let acknowledged = match replay_sequence(handle, None) {
-                    Ok(value) => value,
-                    Err(reply) => return reply,
-                };
                 if acknowledged != page.previous || page.first > acknowledged.saturating_add(1) {
                     return invalid("replay sequence gap", handle.commit_seq);
                 }
@@ -186,6 +187,9 @@ impl NcmEngine {
                 continue;
             }
             if item.blocked {
+                if let Err(reply) = preflight_blocked_item(self, namespace, item) {
+                    return reply;
+                }
                 let fence_key = match canonical_digest(&json!([
                     "replay-fence",
                     item.delivery_key,
@@ -208,6 +212,7 @@ impl NcmEngine {
                         remaining_deadline(deadline, started),
                         generation,
                         Some(&bindings),
+                        None,
                     )
                 } else {
                     self.delete_by_source(
@@ -290,6 +295,10 @@ impl NcmEngine {
                 }
             }
         }
+        // Keep the request's generation as the page's before value. Item
+        // receipts and source fences advance the durable sequence while the
+        // page is being delivered; commit_common records the page event's
+        // sequence as the after value below.
         output["state_generation_after"] = json!(generation);
         if let Some(outcome) = stopped {
             output["partial"] = json!(true);
@@ -327,6 +336,12 @@ impl NcmEngine {
             Ok(value) => value,
             Err(reply) => return partial_reply(output, generation, page.expected, reply.outcome),
         };
+        // Item receipts and source fences are committed independently. A
+        // concurrent writer may also have advanced the durable sequence while
+        // this page was dispatching; use that sequence for the eventual page
+        // event's after value while retaining the original request precondition.
+        generation = generation.max(handle.commit_seq);
+        output["state_generation_after"] = json!(generation);
         output["acknowledged_sequence"] = json!(page.previous.max(page.last));
         let result = commit_common(
             self,
@@ -513,14 +528,16 @@ fn existing_item(
             Value::Null,
         ));
     }
-    let retained_delivery = match lookup_item_replay(handle, item, request, digest) {
-        Ok(Some(reply)) if public_page && reply.outcome == Outcome::Success => true,
-        Ok(Some(reply)) => return Some(reply),
-        Ok(None) => false,
-        Err(reply) => return Some(reply),
-    };
     let previous = match replay_sequence(handle, Some(item)) {
         Ok(value) => value,
+        Err(reply) => return Some(reply),
+    };
+    let retained_delivery = match lookup_item_replay(handle, item, request, digest) {
+        Ok(Some(reply)) if public_page && reply.outcome == Outcome::Success => {
+            Some(reply.state_generation)
+        }
+        Ok(Some(reply)) => return Some(reply),
+        Ok(None) => None,
         Err(reply) => return Some(reply),
     };
     if item.sequence > previous.saturating_add(1) {
@@ -529,7 +546,7 @@ fn existing_item(
     let (state, reason, record) =
         match classify_replay_item(handle, item, request, deadline, started) {
             Ok(Some(state)) => state,
-            Ok(None) if retained_delivery => {
+            Ok(None) if retained_delivery.is_some() => {
                 return Some(EngineReply::new(
                     Outcome::Corrupt,
                     handle.commit_seq,
@@ -539,13 +556,15 @@ fn existing_item(
             Ok(None) => return None,
             Err(reply) => return Some(reply),
         };
-    if retained_delivery {
+    if let Some(retained_generation) = retained_delivery {
         // A new public page resolves current source state; only a retained page
         // receipt can establish a duplicate public delivery.
+        let mut payload = item.output(state, reason, record);
+        payload["replayed"] = json!(true);
         return Some(EngineReply::new(
             Outcome::Success,
-            handle.commit_seq,
-            item.output(state, reason, record),
+            retained_generation,
+            payload,
         ));
     }
     let live = match read_live(handle) {
@@ -750,6 +769,16 @@ fn public_replay_no_change(
             ));
         }
         let state = if let Some(handle) = handle.as_deref_mut() {
+            let durable_last = match replay_sequence(handle, None) {
+                Ok(last) => last,
+                Err(reply) => return Some(reply),
+            };
+            // A page may contain a contiguous successor that is not durable
+            // yet.  That makes the page ineligible for the no-change path;
+            // the dispatch loop will persist its preceding items first.
+            if item.sequence > durable_last.saturating_add(1) {
+                return None;
+            }
             if let Err(reply) = replay_sequence(handle, Some(item)) {
                 return Some(reply);
             }
@@ -830,52 +859,1240 @@ fn replay_sequence(
     handle: &NamespaceHandle,
     item: Option<&ReplayItem>,
 ) -> Result<u64, EngineReply> {
+    let journal = scan_replay_journal(handle)?;
+    if let Some(item) = item {
+        validate_replay_item_request(handle, &journal, item, handle.commit_seq, true)?;
+    }
+    Ok(journal.last)
+}
+
+fn preflight_replay_page(handle: &NamespaceHandle, page: &ReplayPage) -> Result<u64, EngineReply> {
+    let journal = scan_replay_journal(handle)?;
+    let acknowledged = journal.last;
+    let mut page_journal = journal.clone();
+    if journal.event_keys.contains(&page.key) && !journal.page_keys.contains(&page.key) {
+        return Err(corrupt_replay(
+            handle.commit_seq,
+            "replay page key is reused by another durable operation",
+        ));
+    }
+    let allow_legacy_alias = journal.page_keys.contains(&page.key);
+    for item in &page.items {
+        validate_replay_item_request(
+            handle,
+            &page_journal,
+            item,
+            handle.commit_seq,
+            allow_legacy_alias,
+        )?;
+        // A single page is itself a contiguous proposal.  Let later items
+        // validate against the preceding item while retaining the durable
+        // acknowledgement returned to the caller above.
+        page_journal.last = page_journal.last.max(item.sequence);
+    }
+    Ok(acknowledged)
+}
+
+/// Rechecks a blocked item immediately before dispatching its source fence.
+/// The initial page preflight protects the normal path; this second read-only
+/// check closes the gap if another namespace operation committed while the
+/// page was between item deliveries.
+fn preflight_blocked_item(
+    engine: &NcmEngine,
+    namespace: &str,
+    item: &ReplayItem,
+) -> Result<(), EngineReply> {
+    let mut namespaces = engine.namespace_lock()?;
+    let Some(handle) = engine.ensure_handle(&mut namespaces, namespace, false)? else {
+        return Ok(());
+    };
+    if handle.fenced {
+        return Err(EngineReply::new(
+            Outcome::Busy,
+            handle.commit_seq,
+            Value::Null,
+        ));
+    }
+    replay_sequence(handle, Some(item)).map(|_| ())
+}
+
+fn scan_replay_journal(handle: &NamespaceHandle) -> Result<ReplayJournal, EngineReply> {
     let events = handle
         .store
         .events_after(0)
         .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let capsules = handle
+        .store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let mut expected_event_seq = 1_u64;
     let mut last = 0;
+    let mut identities = BTreeMap::new();
+    let mut item_receipts = BTreeMap::<String, ReplayItemReceipt>::new();
+    let mut delivered_keys = BTreeSet::new();
+    let mut event_keys = BTreeSet::new();
+    let mut page_keys = BTreeSet::new();
     for event in events {
-        if event.kind != "common_control" {
-            continue;
+        if let Some(key) = &event.idempotency_key
+            && !event_keys.insert(key.clone())
+        {
+            return Err(corrupt_replay(
+                handle.commit_seq,
+                "durable idempotency key is reused",
+            ));
         }
-        let receipt: DurableReceipt = serde_json::from_str(&event.receipt)
-            .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
-        let payload = &receipt.reply.payload;
-        match payload["common_portability"].as_str() {
-            Some("replay_item") => {
-                let sequence = payload["source_sequence"].as_u64().ok_or_else(|| {
-                    EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null)
-                })?;
-                if let Some(item) = item
-                    && item.sequence == sequence
-                    && payload["receipt_digest"] != item.receipt_digest
-                {
-                    return Err(conflict(handle.commit_seq));
-                }
-                last = last.max(sequence);
+        let raw_receipt: Value = serde_json::from_str(&event.receipt)
+            .map_err(|_| corrupt_replay(handle.commit_seq, "durable receipt is not valid JSON"))?;
+        validate_closed_receipt_envelope(
+            &raw_receipt,
+            handle.commit_seq,
+            &event.kind,
+            event.idempotency_key.as_deref(),
+        )?;
+        let durable = validate_recovery_event(&event, expected_event_seq, handle.commit_seq)?;
+        validate_durable_receipt(&durable, event.seq, event.idempotency_key.as_deref())
+            .map_err(|reason| corrupt_replay(handle.commit_seq, &reason))?;
+        validate_common_control_digest(&event, &durable)
+            .map_err(|reason| corrupt_replay(handle.commit_seq, &reason))?;
+        validate_event_payload_digest(&event, &durable, &capsules)?;
+
+        if event.kind == "common_control" {
+            let DurableOperation::CommonControl {
+                operations,
+                canonical_input,
+            } = &durable.operation
+            else {
+                return Err(corrupt_replay(
+                    handle.commit_seq,
+                    "common control event has a non-common operation",
+                ));
+            };
+            if durable
+                .reply
+                .payload
+                .get("common_portability")
+                .is_some_and(|value| value.as_str().is_none())
+            {
+                return Err(corrupt_replay(
+                    handle.commit_seq,
+                    "common portability receipt marker is not a string",
+                ));
             }
-            Some("replay") => {
-                if let Some(item) = item {
-                    let items = payload["items"].as_array().ok_or_else(|| {
-                        EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null)
-                    })?;
-                    for previous in items {
-                        if previous["source_sequence"].as_u64() == Some(item.sequence)
-                            && previous["receipt_digest"] != item.receipt_digest
+            match durable.reply.payload["common_portability"].as_str() {
+                Some("replay_item") => {
+                    let receipt = validate_replay_item_receipt(
+                        &event,
+                        &durable,
+                        operations,
+                        canonical_input,
+                        &capsules,
+                        handle.store.namespace(),
+                        handle.commit_seq,
+                    )?;
+                    if item_receipts
+                        .insert(receipt.delivery_key.clone(), receipt.clone())
+                        .is_some()
+                    {
+                        return Err(corrupt_replay(
+                            handle.commit_seq,
+                            "replay delivery key is reused by multiple receipts",
+                        ));
+                    }
+                    record_replay_identity(
+                        &mut identities,
+                        &mut last,
+                        receipt.identity.clone(),
+                        handle.commit_seq,
+                    )?;
+                }
+                Some("replay") => {
+                    let page = validate_replay_page_receipt(
+                        handle.store.namespace(),
+                        &event,
+                        &durable,
+                        operations,
+                        canonical_input,
+                        &capsules,
+                        handle.commit_seq,
+                    )?;
+                    for page_item in &page.items {
+                        let identity = &page_item.identity;
+                        let Some(receipt) = item_receipts.get(&page_item.delivery_key) else {
+                            return Err(corrupt_replay(
+                                handle.commit_seq,
+                                "replay page references an unknown delivery receipt",
+                            ));
+                        };
+                        if identities
+                            .get(&identity.sequence)
+                            .is_none_or(|existing| existing != identity)
+                            || receipt.identity != *identity
                         {
-                            return Err(conflict(handle.commit_seq));
+                            return Err(corrupt_replay(
+                                handle.commit_seq,
+                                "replay page references an unknown source identity",
+                            ));
                         }
+                        if !validate_replay_page_output(
+                            page_item,
+                            receipt,
+                            delivered_keys.contains(&page_item.delivery_key),
+                        ) {
+                            return Err(corrupt_replay(
+                                handle.commit_seq,
+                                "replay page output differs from its durable item receipt",
+                            ));
+                        }
+                        delivered_keys.insert(page_item.delivery_key.clone());
+                    }
+                    let page_key = event.idempotency_key.clone().ok_or_else(|| {
+                        corrupt_replay(handle.commit_seq, "replay page key is missing")
+                    })?;
+                    page_keys.insert(page_key);
+                    if page.acknowledged != last {
+                        return Err(corrupt_replay(
+                            handle.commit_seq,
+                            "replay page acknowledgement is detached from its items",
+                        ));
                     }
                 }
-                last = last.max(payload["acknowledged_sequence"].as_u64().ok_or_else(|| {
-                    EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null)
-                })?)
+                Some(_) => {
+                    return Err(corrupt_replay(
+                        handle.commit_seq,
+                        "unknown common portability receipt",
+                    ));
+                }
+                None if canonical_input["action"] == "replay" => {
+                    return Err(corrupt_replay(
+                        handle.commit_seq,
+                        "replay operation has no replay receipt",
+                    ));
+                }
+                None => {}
             }
-            _ => {}
+        } else if matches!(
+            durable.reply.payload["common_portability"].as_str(),
+            Some("replay" | "replay_item")
+        ) {
+            return Err(corrupt_replay(
+                handle.commit_seq,
+                "non-common event carries a replay receipt",
+            ));
+        }
+        expected_event_seq = expected_event_seq
+            .checked_add(1)
+            .ok_or_else(|| corrupt_replay(handle.commit_seq, "event sequence overflow"))?;
+    }
+    if expected_event_seq != handle.commit_seq.saturating_add(1) {
+        return Err(corrupt_replay(
+            handle.commit_seq,
+            "metadata sequence is not journal-backed",
+        ));
+    }
+    Ok(ReplayJournal {
+        last,
+        identities,
+        item_receipts,
+        event_keys,
+        page_keys,
+    })
+}
+
+fn validate_closed_receipt_envelope(
+    receipt: &Value,
+    generation: u64,
+    event_kind: &str,
+    event_idempotency_key: Option<&str>,
+) -> Result<(), EngineReply> {
+    let corrupt = || corrupt_replay(generation, "durable receipt envelope is not canonical");
+    let object = receipt.as_object().ok_or_else(corrupt)?;
+    if !has_exact_fields(
+        object,
+        &["reply", "operation", "state_digest", "integrity_digest"],
+        &["idempotency_key"],
+    ) {
+        return Err(corrupt());
+    }
+    let operation = receipt["operation"].as_object().ok_or_else(corrupt)?;
+    let reply = receipt["reply"].as_object().ok_or_else(corrupt)?;
+    if !has_exact_fields(reply, &["outcome", "state_generation", "payload"], &[])
+        || operation.len() != 1
+    {
+        return Err(corrupt());
+    }
+    validate_closed_operation_envelope(operation).map_err(|_| corrupt())?;
+    let keyless = operation.contains_key("deletion_fence")
+        || operation
+            .get("maintenance")
+            .and_then(Value::as_object)
+            .is_some_and(|operation| !operation.contains_key("canonical_input"))
+        || operation
+            .get("delete_by_source")
+            .and_then(Value::as_object)
+            .is_some_and(|operation| {
+                !operation.contains_key("payload_sha256")
+                    && !operation.contains_key("canonical_input")
+            });
+    validate_receipt_idempotency_key_value(receipt, event_kind, event_idempotency_key)
+        .map_err(|_| corrupt())?;
+    if receipt.get("idempotency_key").is_none() && !keyless {
+        return Err(corrupt());
+    }
+    Ok(())
+}
+
+/// The typed durable operation enum ignores fields added to a variant body.
+/// Keep every variant closed before recovery consumers use the decoded
+/// operation, including non-common rows that precede a replay page.
+fn validate_closed_operation_envelope(
+    operation: &serde_json::Map<String, Value>,
+) -> Result<(), ()> {
+    let Some((name, body)) = operation.iter().next() else {
+        return Err(());
+    };
+    let body = body.as_object().ok_or(())?;
+    let valid = match name.as_str() {
+        "common_control" => {
+            has_exact_fields(body, &["operations", "canonical_input"], &[])
+                && validate_closed_common_control_operations(&body["operations"]).is_ok()
+        }
+        "observe" => has_exact_fields(body, &["record_id"], &[]),
+        "feedback" => has_exact_fields(body, &["record_ids"], &[]),
+        "correction" => has_exact_fields(body, &["superseded", "superseding", "evidence"], &[]),
+        "maintenance" => has_exact_fields(body, &["kind"], &["canonical_input"]),
+        "deletion_fence" => has_exact_fields(
+            body,
+            &[
+                "source",
+                "sources",
+                "target_epoch",
+                "idempotency_key",
+                "payload_sha256",
+                "deleted_records",
+                "deleted_record_ids",
+                "pre_fence_state_digest",
+                "fatigue",
+                "steps_since_consolidation",
+            ],
+            &["canonical_input"],
+        ),
+        "delete_by_source" => has_exact_fields(
+            body,
+            &[
+                "source",
+                "sources",
+                "target_epoch",
+                "deleted_records",
+                "deleted_record_ids",
+            ],
+            &["payload_sha256", "canonical_input"],
+        ),
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(()) }
+}
+
+/// The receipt structs intentionally deserialize the operation enum with the
+/// default serde behavior, which ignores fields added to a variant body. Keep
+/// the common-control operation envelope closed before any replay projection
+/// can rely on the decoded operation list.
+fn validate_closed_common_control_operations(value: &Value) -> Result<(), ()> {
+    let operations = value.as_array().ok_or(())?;
+    for operation in operations {
+        let object = operation.as_object().ok_or(())?;
+        if object.len() != 1 {
+            return Err(());
+        }
+        let Some((name, body)) = object.iter().next() else {
+            return Err(());
+        };
+        let body = body.as_object().ok_or(())?;
+        let valid = match name.as_str() {
+            "observe" => has_exact_fields(body, &["record_id"], &[]),
+            "feedback" => has_exact_fields(body, &["record_ids"], &[]),
+            "correction" => has_exact_fields(body, &["superseded", "superseding", "evidence"], &[]),
+            "maintenance" => has_exact_fields(body, &["kind"], &["canonical_input"]),
+            _ => false,
+        };
+        if !valid {
+            return Err(());
         }
     }
-    Ok(last)
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ReplayJournal {
+    last: u64,
+    identities: BTreeMap<u64, ReplayIdentity>,
+    item_receipts: BTreeMap<String, ReplayItemReceipt>,
+    event_keys: BTreeSet<String>,
+    page_keys: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayIdentity {
+    sequence: u64,
+    receipt_digest: String,
+    source: String,
+    admitted: bool,
+    observation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayItemReceipt {
+    identity: ReplayIdentity,
+    delivery_key: String,
+    state: String,
+    reason: Option<String>,
+    record_id: Option<u64>,
+    generation: u64,
+}
+
+struct ReplayPageReceipt {
+    acknowledged: u64,
+    items: Vec<ReplayPageItem>,
+}
+
+struct ReplayPageItem {
+    identity: ReplayIdentity,
+    delivery_key: String,
+    state: String,
+    reason: Option<String>,
+    record_id: Option<u64>,
+    generation: u64,
+}
+
+fn validate_replay_item_request(
+    handle: &NamespaceHandle,
+    journal: &ReplayJournal,
+    item: &ReplayItem,
+    generation: u64,
+    allow_legacy_alias: bool,
+) -> Result<(), EngineReply> {
+    if item.sequence > journal.last.saturating_add(1) {
+        return Err(invalid("replay sequence gap", generation));
+    }
+    let requested_identity = replay_item_identity(item)
+        .ok_or_else(|| corrupt_replay(generation, "replay item identity is invalid"))?;
+    let legacy_identity = if allow_legacy_alias {
+        legacy_replay_identity(handle, item, generation)?
+    } else {
+        None
+    };
+    let matches_identity = |identity: &ReplayIdentity| {
+        identity == &requested_identity || legacy_identity.as_ref() == Some(identity)
+    };
+    if let Some(receipt) = journal.item_receipts.get(&item.delivery_key) {
+        if receipt.identity.receipt_digest != item.receipt_digest {
+            return Err(conflict(generation));
+        }
+        if !matches_identity(&receipt.identity) {
+            // A source binding upgrade can preserve the legacy source while
+            // changing the observation payload. That is a normal idempotency
+            // conflict; a key used for a genuinely different source remains a
+            // journal corruption signal.
+            if legacy_identity.as_ref().is_some_and(|identity| {
+                identity.sequence == receipt.identity.sequence
+                    && identity.receipt_digest == receipt.identity.receipt_digest
+                    && identity.source == receipt.identity.source
+                    && identity.admitted == receipt.identity.admitted
+            }) {
+                return Err(conflict(generation));
+            }
+            return Err(corrupt_replay(
+                generation,
+                "replay delivery key is bound to another source identity",
+            ));
+        }
+    } else if journal.event_keys.contains(&item.delivery_key) {
+        return Err(corrupt_replay(
+            generation,
+            "replay delivery key is reused by another durable operation",
+        ));
+    }
+    match journal.identities.get(&item.sequence) {
+        Some(identity) if identity.receipt_digest != item.receipt_digest => {
+            Err(conflict(generation))
+        }
+        Some(identity) if !matches_identity(identity) => Err(corrupt_replay(
+            generation,
+            "replay item identity changed across deliveries",
+        )),
+        None if item.sequence <= journal.last => Err(corrupt_replay(
+            generation,
+            "replay item identity is missing from the journal",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn legacy_replay_identity(
+    handle: &NamespaceHandle,
+    item: &ReplayItem,
+    generation: u64,
+) -> Result<Option<ReplayIdentity>, EngineReply> {
+    if !item.admitted {
+        let Some(legacy_source) = item.legacy_source.as_deref() else {
+            return Ok(None);
+        };
+        return Ok(Some(ReplayIdentity {
+            sequence: item.sequence,
+            receipt_digest: item.receipt_digest.clone(),
+            source: legacy_source.to_owned(),
+            admitted: false,
+            observation: None,
+        }));
+    }
+    let request = replacement_request(
+        &item.observation,
+        Deadline {
+            remaining_ms: u64::MAX,
+        },
+    )
+    .map_err(|_| corrupt_replay(generation, "replay item identity is invalid"))?;
+    let Some(legacy) = legacy_request(handle.store.namespace(), &request)
+        .map_err(|_| corrupt_replay(generation, "replay item source binding is invalid"))?
+    else {
+        return Ok(None);
+    };
+    if item
+        .legacy_source
+        .as_deref()
+        .is_some_and(|source| source != legacy.source.0)
+    {
+        return Ok(None);
+    }
+    Ok(Some(ReplayIdentity {
+        sequence: item.sequence,
+        receipt_digest: item.receipt_digest.clone(),
+        source: legacy.source.0,
+        admitted: true,
+        observation: Some(legacy.payload_sha256),
+    }))
+}
+
+fn record_replay_identity(
+    identities: &mut BTreeMap<u64, ReplayIdentity>,
+    last: &mut u64,
+    identity: ReplayIdentity,
+    generation: u64,
+) -> Result<(), EngineReply> {
+    if let Some(existing) = identities.get(&identity.sequence) {
+        if existing != &identity {
+            return Err(corrupt_replay(
+                generation,
+                "replay source identity changed across receipts",
+            ));
+        }
+        return Ok(());
+    }
+    if identity.sequence > last.saturating_add(1) {
+        return Err(corrupt_replay(
+            generation,
+            "replay source sequence is out of order",
+        ));
+    }
+    *last = (*last).max(identity.sequence);
+    identities.insert(identity.sequence, identity);
+    Ok(())
+}
+
+fn replay_item_identity(item: &ReplayItem) -> Option<ReplayIdentity> {
+    let observation = if item.admitted {
+        Some(opaque(&item.observation["payload_sha256"])?.to_owned())
+    } else if !item.observation.is_null() {
+        return None;
+    } else {
+        None
+    };
+    Some(ReplayIdentity {
+        sequence: item.sequence,
+        receipt_digest: item.receipt_digest.clone(),
+        source: item.source.clone(),
+        admitted: item.admitted,
+        observation,
+    })
+}
+
+fn capsule_source_matches(
+    namespace: &str,
+    capsule: &crate::store::StoredCapsule,
+    source: &str,
+) -> bool {
+    if capsule.source_id.0 == source {
+        return true;
+    }
+    let Ok(provenance) = serde_json::from_str::<Value>(&capsule.provenance) else {
+        return false;
+    };
+    let Ok(Some(binding)) = crate::source_binding::read(namespace, &capsule.source_id, &provenance)
+    else {
+        return false;
+    };
+    binding.legacy_source_id.0 == source
+        || binding
+            .full_source_id
+            .as_ref()
+            .is_some_and(|full_source| full_source.0 == source)
+}
+
+/// Recomputes the original observe payload digest from the retained capsule.
+/// A receipt that merely points at another valid capsule from the same source
+/// must not be able to relabel that record as the replayed observation.
+fn capsule_matches_replay_observation(
+    capsule: &crate::store::StoredCapsule,
+    observation: &str,
+) -> bool {
+    if capsule.status == CapsuleStatus::Revoked {
+        // A source deletion intentionally removes the retained observation
+        // bytes before a later replay retry can inspect this journal row. The
+        // record ID, source ID, commit sequence, and authenticated item
+        // receipt still bind the tombstone; require the exact scrub shape and
+        // accept that durable binding in place of recomputing the old digest.
+        return capsule.key_text.is_empty()
+            && capsule.value_text.is_empty()
+            && capsule.key_embedding.is_empty()
+            && capsule.value_embedding.is_empty()
+            && capsule.ltm_key.is_empty()
+            && capsule.provenance == "{}";
+    }
+    let event = crate::store::Event {
+        seq: capsule.commit_seq,
+        kind: "observe".to_owned(),
+        idempotency_key: None,
+        payload_sha256: observation.to_owned(),
+        receipt: String::new(),
+        created_tick: 0,
+    };
+    let durable = DurableReceipt {
+        reply: EngineReply::new(Outcome::Success, capsule.commit_seq, Value::Null),
+        operation: DurableOperation::Observe {
+            record_id: capsule.record_id,
+        },
+        state_digest: String::new(),
+        integrity_digest: String::new(),
+        idempotency_key: None,
+    };
+    validate_event_payload_digest(&event, &durable, &[capsule.clone()]).is_ok()
+}
+
+fn validate_replay_item_receipt(
+    event: &crate::store::Event,
+    durable: &DurableReceipt,
+    operations: &[DurableOperation],
+    canonical_input: &Value,
+    capsules: &[crate::store::StoredCapsule],
+    namespace: &str,
+    generation: u64,
+) -> Result<ReplayItemReceipt, EngineReply> {
+    let corrupt = || corrupt_replay(generation, "invalid durable replay item receipt");
+    if event.kind != "common_control" || !event.idempotency_key.as_deref().is_some_and(valid_opaque)
+    {
+        return Err(corrupt());
+    }
+    let delivery_key = event.idempotency_key.clone().ok_or_else(corrupt)?;
+    let object = canonical_input.as_object().ok_or_else(corrupt)?;
+    if object.len() != 5
+        || object.get("sequence").is_none()
+        || object.get("receipt").is_none()
+        || object.get("source").is_none()
+        || object.get("admitted").is_none()
+        || object.get("observation").is_none()
+    {
+        return Err(corrupt());
+    }
+    let sequence = canonical_input["sequence"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let receipt_digest = opaque(&canonical_input["receipt"])
+        .ok_or_else(corrupt)?
+        .to_owned();
+    let source = opaque(&canonical_input["source"])
+        .ok_or_else(corrupt)?
+        .to_owned();
+    let admitted = canonical_input["admitted"].as_bool().ok_or_else(corrupt)?;
+    let observation = if admitted {
+        Some(
+            opaque(&canonical_input["observation"])
+                .ok_or_else(corrupt)?
+                .to_owned(),
+        )
+    } else if !canonical_input["observation"].is_null() {
+        return Err(corrupt());
+    } else {
+        None
+    };
+    let payload = &durable.reply.payload;
+    let payload_object = payload.as_object().ok_or_else(corrupt)?;
+    if !has_exact_fields(
+        payload_object,
+        &[
+            "common_portability",
+            "source_sequence",
+            "receipt_digest",
+            "state",
+            "reason",
+            "record_id",
+            "replayed",
+            "state_generation_after",
+            "request_semantic_sha256",
+        ],
+        &[],
+    ) {
+        return Err(corrupt());
+    }
+    if payload["common_portability"] != "replay_item"
+        || payload["source_sequence"].as_u64() != Some(sequence)
+        || payload["receipt_digest"] != receipt_digest
+        || payload["state_generation_after"].as_u64() != Some(event.seq)
+        || payload["replayed"] != false
+        || payload["request_semantic_sha256"] != event.payload_sha256
+    {
+        return Err(corrupt());
+    }
+    let state = payload["state"].as_str().ok_or_else(corrupt)?;
+    let reason = match &payload["reason"] {
+        Value::Null => None,
+        Value::String(reason) => Some(reason.clone()),
+        _ => return Err(corrupt()),
+    };
+    let record_id = match &payload["record_id"] {
+        Value::Null => None,
+        Value::Number(value) => Some(
+            value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or_else(corrupt)?,
+        ),
+        _ => return Err(corrupt()),
+    };
+    match state {
+        "applied" => {
+            let Some(record_id) = record_id else {
+                return Err(corrupt());
+            };
+            if !admitted
+                || reason.is_some()
+                || operations.len() != 1
+                || !matches!(
+                    operations.first(),
+                    Some(DurableOperation::Observe { record_id: id }) if id.0 == record_id
+                )
+            {
+                return Err(corrupt());
+            }
+            if !capsules.iter().any(|capsule| {
+                capsule.record_id.0 == record_id
+                    && capsule.commit_seq == event.seq
+                    && capsule_source_matches(namespace, capsule, &source)
+                    && observation.as_deref().is_some_and(|observation| {
+                        capsule_matches_replay_observation(capsule, observation)
+                    })
+            }) {
+                return Err(corrupt());
+            }
+        }
+        "source_already_applied" => {
+            if !admitted || record_id.is_none() || reason.is_some() || !operations.is_empty() {
+                return Err(corrupt());
+            }
+            let Some(record_id) = record_id else {
+                return Err(corrupt());
+            };
+            if !capsules.iter().any(|capsule| {
+                capsule.record_id.0 == record_id
+                    && capsule.commit_seq < event.seq
+                    && capsule_source_matches(namespace, capsule, &source)
+                    && observation.as_deref().is_some_and(|observation| {
+                        capsule_matches_replay_observation(capsule, observation)
+                    })
+            }) {
+                return Err(corrupt());
+            }
+        }
+        "rejected" => {
+            if record_id.is_some()
+                || (admitted && reason.as_deref() != Some("source_revoked"))
+                || (!admitted && reason.as_deref() != Some("current_disposition"))
+                || !operations.is_empty()
+            {
+                return Err(corrupt());
+            }
+        }
+        _ => return Err(corrupt()),
+    }
+    Ok(ReplayItemReceipt {
+        identity: ReplayIdentity {
+            sequence,
+            receipt_digest,
+            source,
+            admitted,
+            observation,
+        },
+        delivery_key,
+        state: state.to_owned(),
+        reason,
+        record_id,
+        generation: event.seq,
+    })
+}
+
+fn validate_replay_page_receipt(
+    namespace: &str,
+    event: &crate::store::Event,
+    durable: &DurableReceipt,
+    operations: &[DurableOperation],
+    canonical_input: &Value,
+    capsules: &[crate::store::StoredCapsule],
+    generation: u64,
+) -> Result<ReplayPageReceipt, EngineReply> {
+    let corrupt = || corrupt_replay(generation, "invalid durable replay page receipt");
+    if event.kind != "common_control"
+        || !event.idempotency_key.as_deref().is_some_and(valid_opaque)
+        || !operations.is_empty()
+    {
+        return Err(corrupt());
+    }
+    let object = canonical_input.as_object().ok_or_else(corrupt)?;
+    if !has_exact_fields(
+        object,
+        &[
+            "action",
+            "first_source_sequence",
+            "last_source_sequence",
+            "expected_previous_acknowledged_sequence",
+            "items",
+        ],
+        &[],
+    ) || object.get("action").and_then(Value::as_str) != Some("replay")
+    {
+        return Err(corrupt());
+    }
+    let first = canonical_input["first_source_sequence"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(corrupt)?;
+    let last = canonical_input["last_source_sequence"]
+        .as_u64()
+        .filter(|value| *value >= first)
+        .ok_or_else(corrupt)?;
+    let previous = canonical_input["expected_previous_acknowledged_sequence"]
+        .as_u64()
+        .ok_or_else(corrupt)?;
+    let values = canonical_input["items"].as_array().ok_or_else(corrupt)?;
+    if values.is_empty()
+        || values.len() > MAX_ITEMS
+        || last
+            .checked_sub(first)
+            .and_then(|value| value.checked_add(1))
+            != Some(values.len() as u64)
+    {
+        return Err(corrupt());
+    }
+    let mut identities = Vec::with_capacity(values.len());
+    let mut seen_delivery_keys = BTreeSet::new();
+    let mut seen_receipt_digests = BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let object = value.as_object().ok_or_else(corrupt)?;
+        if !has_exact_fields(
+            object,
+            &[
+                "source_sequence",
+                "receipt_digest",
+                "delivery_key",
+                "source",
+                "admitted",
+                "blocked",
+                "observation",
+            ],
+            &["legacy_source"],
+        ) {
+            return Err(corrupt());
+        }
+        let expected_sequence = first.checked_add(index as u64).ok_or_else(corrupt)?;
+        let sequence = value["source_sequence"]
+            .as_u64()
+            .filter(|sequence| *sequence == expected_sequence)
+            .ok_or_else(corrupt)?;
+        let receipt_digest = opaque(&value["receipt_digest"])
+            .ok_or_else(corrupt)?
+            .to_owned();
+        let delivery_key = opaque(&value["delivery_key"])
+            .ok_or_else(corrupt)?
+            .to_owned();
+        if !seen_delivery_keys.insert(delivery_key.clone())
+            || !seen_receipt_digests.insert(receipt_digest.clone())
+        {
+            return Err(corrupt());
+        }
+        let source = opaque(&value["source"]).ok_or_else(corrupt)?.to_owned();
+        let admitted = value["admitted"].as_bool().ok_or_else(corrupt)?;
+        if value["blocked"].as_bool().is_none()
+            || (value["admitted"] == true && value["blocked"] == true)
+        {
+            return Err(corrupt());
+        }
+        let observation = if admitted {
+            Some(
+                opaque(&value["observation"])
+                    .ok_or_else(corrupt)?
+                    .to_owned(),
+            )
+        } else if !value["observation"].is_null() {
+            return Err(corrupt());
+        } else {
+            None
+        };
+        if let Some(legacy) = value.get("legacy_source") {
+            if opaque(legacy).is_none() || legacy == &value["source"] {
+                return Err(corrupt());
+            }
+        }
+        identities.push(ReplayPageItem {
+            identity: ReplayIdentity {
+                sequence,
+                receipt_digest,
+                source,
+                admitted,
+                observation,
+            },
+            delivery_key,
+            state: String::new(),
+            reason: None,
+            record_id: None,
+            generation: 0,
+        });
+    }
+    let payload = &durable.reply.payload;
+    let payload_object = payload.as_object().ok_or_else(corrupt)?;
+    if !has_exact_fields(
+        payload_object,
+        &[
+            "common_portability",
+            "first_source_sequence",
+            "last_source_sequence",
+            "acknowledged_sequence",
+            "state_generation_before",
+            "state_generation_after",
+            "applied_observations",
+            "duplicate_observations",
+            "sources_already_applied",
+            "rejected_observations",
+            "effect_unknown_observations",
+            "partial",
+            "replayed",
+            "warnings",
+            "items",
+            "request_semantic_sha256",
+        ],
+        &["page_delivery_capsule"],
+    ) {
+        return Err(corrupt());
+    }
+    let acknowledged = payload["acknowledged_sequence"]
+        .as_u64()
+        .ok_or_else(corrupt)?;
+    let state_generation_before = payload["state_generation_before"]
+        .as_u64()
+        .ok_or_else(corrupt)?;
+    if payload["common_portability"] != "replay"
+        || payload["first_source_sequence"].as_u64() != Some(first)
+        || payload["last_source_sequence"].as_u64() != Some(last)
+        || payload["acknowledged_sequence"].as_u64() != Some(previous.max(last))
+        || state_generation_before >= event.seq
+        || payload["state_generation_after"].as_u64() != Some(event.seq)
+        || payload["partial"] != false
+        || payload["replayed"] != false
+        || payload["request_semantic_sha256"] != event.payload_sha256
+        || payload["effect_unknown_observations"] != 0
+        || payload["warnings"]
+            .as_array()
+            .is_none_or(|warnings| !warnings.is_empty())
+    {
+        return Err(corrupt());
+    }
+    let output_items = payload["items"].as_array().ok_or_else(corrupt)?;
+    if output_items.len() != identities.len() {
+        return Err(corrupt());
+    }
+    let mut counts = [0_u64; 4];
+    let mut page_items = Vec::with_capacity(identities.len());
+    for ((page_item, input), output) in identities.iter().zip(values).zip(output_items) {
+        let identity = &page_item.identity;
+        let output_object = output.as_object().ok_or_else(corrupt)?;
+        if !has_exact_fields(
+            output_object,
+            &[
+                "source_sequence",
+                "receipt_digest",
+                "state",
+                "reason",
+                "record_id",
+                "state_generation",
+            ],
+            &[],
+        ) || output["source_sequence"].as_u64() != Some(identity.sequence)
+            || output["receipt_digest"] != identity.receipt_digest
+        {
+            return Err(corrupt());
+        }
+        let output_generation = output["state_generation"]
+            .as_u64()
+            // Every item row points at an earlier durable item receipt. A
+            // page event cannot be its own item receipt, and a future event
+            // would make the page output independent of the journal order.
+            .filter(|generation| *generation > 0 && *generation < event.seq)
+            .ok_or_else(corrupt)?;
+        let output_reason = match &output["reason"] {
+            Value::Null => None,
+            Value::String(reason) => Some(reason.clone()),
+            _ => return Err(corrupt()),
+        };
+        let output_record_id = match &output["record_id"] {
+            Value::Null => None,
+            Value::Number(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(corrupt)?,
+            ),
+            _ => return Err(corrupt()),
+        };
+        let admitted = input["admitted"].as_bool().ok_or_else(corrupt)?;
+        let blocked = input["blocked"].as_bool().ok_or_else(corrupt)?;
+        let output_state = output["state"].as_str().ok_or_else(corrupt)?;
+        match output_state {
+            "applied" => {
+                if !admitted
+                    || blocked
+                    || output["record_id"]
+                        .as_u64()
+                        .filter(|value| *value > 0)
+                        .is_none()
+                    || !output["reason"].is_null()
+                    || output_generation <= state_generation_before
+                {
+                    return Err(corrupt());
+                }
+                counts[0] = counts[0].checked_add(1).ok_or_else(corrupt)?;
+            }
+            "delivery_duplicate" => {
+                if !admitted
+                    || blocked
+                    || output["record_id"]
+                        .as_u64()
+                        .filter(|value| *value > 0)
+                        .is_none()
+                    || !output["reason"].is_null()
+                {
+                    return Err(corrupt());
+                }
+                counts[1] = counts[1].checked_add(1).ok_or_else(corrupt)?;
+            }
+            "source_already_applied" => {
+                if !admitted
+                    || blocked
+                    || output["record_id"]
+                        .as_u64()
+                        .filter(|value| *value > 0)
+                        .is_none()
+                    || !output["reason"].is_null()
+                {
+                    return Err(corrupt());
+                }
+                counts[2] = counts[2].checked_add(1).ok_or_else(corrupt)?;
+            }
+            "rejected" => {
+                let reason = output["reason"].as_str();
+                if !output["record_id"].is_null()
+                    || (admitted && (blocked || reason != Some("source_revoked")))
+                    || (!admitted && reason != Some("current_disposition"))
+                {
+                    return Err(corrupt());
+                }
+                counts[3] = counts[3].checked_add(1).ok_or_else(corrupt)?;
+            }
+            _ => return Err(corrupt()),
+        }
+        page_items.push(ReplayPageItem {
+            identity: identity.clone(),
+            delivery_key: page_item.delivery_key.clone(),
+            state: output_state.to_owned(),
+            reason: output_reason,
+            record_id: output_record_id,
+            generation: output_generation,
+        });
+    }
+    if payload["applied_observations"].as_u64() != Some(counts[0])
+        || payload["duplicate_observations"].as_u64() != Some(counts[1])
+        || payload["sources_already_applied"].as_u64() != Some(counts[2])
+        || payload["rejected_observations"].as_u64() != Some(counts[3])
+    {
+        return Err(corrupt());
+    }
+    if let Some(capsule) = payload.get("page_delivery_capsule") {
+        let page_key = event.idempotency_key.as_deref().ok_or_else(corrupt)?;
+        if validate_replay_delivery_capsule(namespace, page_key, capsule).is_err()
+            && !legacy_page_delivery_capsule_matches_receipt_items(capsule, &page_items, capsules)
+        {
+            return Err(corrupt());
+        }
+    }
+    Ok(ReplayPageReceipt {
+        acknowledged,
+        items: page_items,
+    })
+}
+
+fn validate_replay_page_output(
+    page_item: &ReplayPageItem,
+    durable_item: &ReplayItemReceipt,
+    previously_delivered: bool,
+) -> bool {
+    let expected_state = if previously_delivered && durable_item.state != "rejected" {
+        "delivery_duplicate"
+    } else {
+        durable_item.state.as_str()
+    };
+    page_item.state == expected_state
+        && page_item.reason == durable_item.reason
+        && page_item.record_id == durable_item.record_id
+        && page_item.generation == durable_item.generation
+}
+
+fn corrupt_replay(generation: u64, reason: &str) -> EngineReply {
+    EngineReply::new(Outcome::Corrupt, generation, json!({"reason": reason}))
+}
+
+fn has_exact_fields(
+    object: &serde_json::Map<String, Value>,
+    required: &[&str],
+    optional: &[&str],
+) -> bool {
+    required.iter().all(|field| object.contains_key(*field))
+        && object.keys().all(|field| {
+            required.iter().any(|required| field.as_str() == *required)
+                || optional.iter().any(|optional| field.as_str() == *optional)
+        })
+}
+
+/// Decodes the adapter's delivery capsule. The operation identity is retained
+/// for receipt evidence while the idempotency key is checked by the caller
+/// against the page key or a historical item-delivery compatibility shape.
+fn decode_replay_delivery_capsule(capsule: &Value) -> Result<(String, String), ()> {
+    let object = capsule.as_object().ok_or(())?;
+    if !has_exact_fields(object, &["version", "bytes", "sha256"], &[]) || capsule["version"] != 1 {
+        return Err(());
+    }
+    super::util::validate_common_capsule(&json!({"common_capsule": capsule})).map_err(|_| ())?;
+    let bytes = bytes(&capsule["bytes"]).ok_or(())?;
+    let delivery: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    let delivery_object = delivery.as_object().ok_or(())?;
+    if !has_exact_fields(delivery_object, &["operation_id", "idempotency_key"], &[]) {
+        return Err(());
+    }
+    let operation_id = delivery["operation_id"]
+        .as_str()
+        .filter(|value| !value.is_empty() && value.len() <= MAX_IDEMPOTENCY_KEY_BYTES)
+        .ok_or(())?;
+    if operation_id.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(());
+    }
+    let idempotency_key = delivery["idempotency_key"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(())?;
+    super::util::validate_idempotency_key(idempotency_key).map_err(|_| ())?;
+    if idempotency_key.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(());
+    }
+    Ok((operation_id.to_owned(), idempotency_key.to_owned()))
+}
+
+/// Binds a current delivery capsule to the page idempotency key. The SHA-256
+/// fallback keeps direct runtime callers compatible with the pre-adapter test
+/// surface; provider calls use the namespace-bound opaque id that the adapter
+/// supplies.
+fn validate_replay_delivery_capsule(
+    namespace: &str,
+    page_key: &str,
+    capsule: &Value,
+) -> Result<(), ()> {
+    let (_, idempotency_key) = decode_replay_delivery_capsule(capsule)?;
+    let bound = idempotency_key == page_key
+        || sha256_hex(idempotency_key.as_bytes()) == page_key
+        || crate::source_binding::opaque_id(namespace, b"idempotency-key", &idempotency_key)
+            == page_key;
+    if !bound {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// Historical direct replay pages carried an item delivery capsule in every
+/// admitted observation, while their page delivery capsule used a separate
+/// public key. Keep that old page receipt readable only when the item capsules
+/// independently bind each item's delivery key. New adapter pages never take
+/// this path: their projected item capsule carries the page key itself.
+fn legacy_page_delivery_capsule_matches_items(capsule: &Value, items: &[ReplayItem]) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+    if decode_replay_delivery_capsule(capsule).is_err() {
+        return false;
+    }
+    items.iter().all(|item| {
+        if !item.admitted {
+            return false;
+        }
+        let Some(item_capsule) = item
+            .observation
+            .get("provenance")
+            .and_then(|provenance| provenance.get("delivery_capsule"))
+        else {
+            return false;
+        };
+        let Ok((_, item_key)) = decode_replay_delivery_capsule(item_capsule) else {
+            return false;
+        };
+        item_key == item.delivery_key
+    })
+}
+
+/// Equivalent compatibility check for a durable page receipt after its input
+/// observations have been reduced to payload digests. The output record IDs
+/// let us recover the retained item capsules without trusting the page output
+/// itself for any identity field.
+fn legacy_page_delivery_capsule_matches_receipt_items(
+    capsule: &Value,
+    items: &[ReplayPageItem],
+    capsules: &[crate::store::StoredCapsule],
+) -> bool {
+    if items.is_empty() || decode_replay_delivery_capsule(capsule).is_err() {
+        return false;
+    }
+    items.iter().all(|item| {
+        let Some(record_id) = item.record_id else {
+            return false;
+        };
+        let Some(retained) = capsules.iter().find(|retained| {
+            retained.record_id.0 == record_id && retained.status != CapsuleStatus::Revoked
+        }) else {
+            return false;
+        };
+        let Ok(provenance) = serde_json::from_str::<Value>(&retained.provenance) else {
+            return false;
+        };
+        let Some(item_capsule) = provenance.get("delivery_capsule") else {
+            return false;
+        };
+        let Ok((_, item_key)) = decode_replay_delivery_capsule(item_capsule) else {
+            return false;
+        };
+        item_key == item.delivery_key
+    })
 }
 
 struct ReplayPage {
@@ -901,6 +2118,23 @@ struct ReplayItem {
 impl ReplayPage {
     fn parse(namespace: &str, value: &Value, deadline: Deadline) -> Result<Self, EngineReply> {
         let fail = || invalid("invalid replay page", 0);
+        let object = value.as_object().ok_or_else(fail)?;
+        if !has_exact_fields(
+            object,
+            &[
+                "action",
+                "idempotency_key",
+                "expected_generation",
+                "first_source_sequence",
+                "last_source_sequence",
+                "expected_previous_acknowledged_sequence",
+                "items",
+            ],
+            &["page_delivery_capsule"],
+        ) || value["action"] != "replay"
+        {
+            return Err(fail());
+        }
         let key = opaque(&value["idempotency_key"])
             .ok_or_else(fail)?
             .to_owned();
@@ -911,18 +2145,6 @@ impl ReplayPage {
             .as_u64()
             .ok_or_else(fail)?;
         let page_delivery_capsule = value.get("page_delivery_capsule").cloned();
-        if let Some(capsule) = &page_delivery_capsule {
-            let object = capsule.as_object().ok_or_else(fail)?;
-            if object.len() != 3
-                || !["version", "bytes", "sha256"]
-                    .iter()
-                    .all(|key| object.contains_key(*key))
-            {
-                return Err(fail());
-            }
-            super::util::validate_common_capsule(&json!({"common_capsule": capsule}))
-                .map_err(|_| fail())?;
-        }
         let values = value["items"].as_array().ok_or_else(fail)?;
         if first == 0
             || values.is_empty()
@@ -938,6 +2160,22 @@ impl ReplayPage {
         let mut receipts = BTreeSet::new();
         let mut items = Vec::new();
         for (index, value) in values.iter().enumerate() {
+            let object = value.as_object().ok_or_else(fail)?;
+            if !has_exact_fields(
+                object,
+                &[
+                    "source_sequence",
+                    "receipt_digest",
+                    "delivery_key",
+                    "source",
+                    "admitted",
+                    "blocked",
+                    "observation",
+                ],
+                &["legacy_source"],
+            ) {
+                return Err(fail());
+            }
             let item = ReplayItem {
                 sequence: value["source_sequence"].as_u64().ok_or_else(fail)?,
                 receipt_digest: opaque(&value["receipt_digest"])
@@ -956,6 +2194,7 @@ impl ReplayPage {
             if item.sequence != first + index as u64
                 || !seen.insert(item.delivery_key.clone())
                 || !receipts.insert(item.receipt_digest.clone())
+                || item.delivery_key == key
                 || (item.admitted && item.blocked)
                 || item
                     .legacy_source
@@ -992,6 +2231,12 @@ impl ReplayPage {
                 return Err(fail());
             }
             items.push(item);
+        }
+        if let Some(capsule) = &page_delivery_capsule
+            && validate_replay_delivery_capsule(namespace, &key, capsule).is_err()
+            && !legacy_page_delivery_capsule_matches_items(capsule, &items)
+        {
+            return Err(fail());
         }
         Ok(Self {
             key,
@@ -1063,12 +2308,13 @@ fn partial_reply(
 }
 
 fn opaque(value: &Value) -> Option<&str> {
-    value.as_str().filter(|value| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
+    value.as_str().filter(|value| valid_opaque(value))
+}
+fn valid_opaque(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn bytes(value: &Value) -> Option<Vec<u8>> {
     let values = value.as_array()?;
@@ -1131,6 +2377,12 @@ fn legacy_item_matches(
     }
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
+    validate_receipt_idempotency_key_json(
+        &event.receipt,
+        &event.kind,
+        event.idempotency_key.as_deref(),
+    )
+    .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
     if durable.reply.payload["common_portability"] != "replay_item" {
         return Ok(false);
     }

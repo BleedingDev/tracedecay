@@ -53,6 +53,7 @@ pub(crate) fn register_test_schema_installer() {
 
 pub mod advisory;
 pub mod code_index;
+pub mod config;
 pub mod dashboard_diagnostics;
 pub mod delivery;
 pub mod diagnose;
@@ -77,6 +78,7 @@ pub mod pr_tracking;
 pub mod primitives;
 pub mod project_adoption;
 pub mod project_open_authorization;
+pub mod semantic_runtime;
 pub mod settings_control;
 pub mod source_authorization;
 pub mod stack_coordinator;

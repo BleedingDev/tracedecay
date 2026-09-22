@@ -108,6 +108,7 @@ fn profile() -> FusionProfile {
         .into_iter()
         .collect(),
         diversity_policy_id: id("diversity.fixture.v1"),
+        rerank_policy_id: None,
         retrieval_budget: budget(),
     }
 }

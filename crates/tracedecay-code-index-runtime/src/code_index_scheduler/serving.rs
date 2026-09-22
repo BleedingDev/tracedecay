@@ -611,6 +611,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
         };
         check_similar_control(control)?;
         self.validate_similar_source(&source)?;
+        let similar_descriptor = similar_query_descriptor(
+            request,
+            &source,
+            self.hydration.verified_artifact().artifact_digest(),
+        )?;
 
         let cursor_position = request
             .cursor
@@ -621,7 +626,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     retrieval_request,
                 )
                 .map_err(map_clone_cursor_error)?;
-                codec
+                let decoded = codec
                     .decode_artifact_unbound(
                         encoded,
                         self.hydration.verified_artifact().artifact_digest(),
@@ -629,40 +634,60 @@ impl ProductionCodeIndexQueryOwnersV1 {
                         snapshot_digest,
                         now,
                     )
-                    .map(|cursor| cursor.after)
-                    .map_err(map_clone_cursor_error)
+                    .map_err(map_clone_cursor_error)?;
+                // Legacy ccclone2 payloads without the optional Similar
+                // descriptor remain authenticated at the codec boundary,
+                // but cannot safely resume a Similar request whose complete
+                // class set and source extent are unknown. Refuse them as
+                // stale here rather than silently weakening the binding.
+                if decoded.similar_query_descriptor.as_ref() != Some(&similar_descriptor) {
+                    return Err(RetrievalPortError::StaleEvidence);
+                }
+                Ok(decoded.after)
             })
             .transpose()?;
         // A fingerprint cursor continues the near lane. Replaying it through
         // the exact reader would fail its request-digest check, so the exact
-        // lane is deliberately omitted on that continuation. An exact cursor
-        // continues exact families while the additive near lane starts a new
-        // page; the two readers have intentionally distinct cursor domains.
+        // lane is deliberately omitted on that continuation. A near-start
+        // cursor is the authenticated phase boundary emitted when exact work
+        // filled the request page; it also skips exact, but is consumed before
+        // the near reader so the reader starts from its true beginning.
+        // Exact cursors continue exact families while the additive near lane
+        // starts a new page; the two readers have intentionally distinct
+        // cursor domains.
         let continue_near = cursor_position.as_ref().is_some_and(|position| {
             matches!(
                 position,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
-                    ..
-                } | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
-                    ..
-                }
+                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
+                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
+                        ..
+                    }
+                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                        ..
+                    }
             )
         });
-        let near_cursor = continue_near.then(|| request.cursor.as_deref()).flatten();
-        let continue_near = near_cursor.is_some();
+        let near_phase_cursor = cursor_position.as_ref().is_some_and(|position| {
+            matches!(
+                position,
+                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
+            )
+        });
+        let near_cursor = (!near_phase_cursor && continue_near)
+            .then(|| request.cursor.as_deref())
+            .flatten();
+        let near_phase_cursor = near_phase_cursor
+            .then(|| request.cursor.as_deref())
+            .flatten();
+        let continue_near = near_cursor.is_some() || near_phase_cursor.is_some();
         // Request-wide budgets: share result_limit and work_limit across match
-        // classes instead of resetting a per-family page size on each key. A
-        // fresh near read always receives one result/work slot before exact
-        // families consume the shared budget; otherwise a hot exact family
-        // can make the additive near lane permanently empty.
-        let reserve_near = !continue_near
-            && similar_near_route_is_available(
-                &source,
-                &request.source_extent,
-                &request.match_classes,
-            );
+        // classes instead of resetting a per-family page size on each key. An
+        // exact page may fill the whole request page. When that happens, the
+        // signed NearStart boundary below makes the additive near lane
+        // reachable on the following request without minting a synthetic
+        // non-advancing fingerprint cursor.
         let (exact_result_budget, exact_work_budget) =
-            similar_exact_lane_budget(request.result_limit, request.work_limit, reserve_near);
+            similar_exact_lane_budget(request.result_limit, request.work_limit);
         let mut exact_results_remaining = exact_result_budget;
         let mut exact_work_remaining = exact_work_budget;
         let mut exact_results_spent = 0usize;
@@ -680,13 +705,14 @@ impl ProductionCodeIndexQueryOwnersV1 {
             for (key_index, key) in exact_keys.iter().enumerate() {
                 if self
                     .hydration
-                    .clone_exact_cursor_matches_key_authenticated(
+                    .clone_exact_cursor_matches_key_authenticated_with_similar_descriptor(
                         &source.occurrence,
                         key,
                         cursor,
                         query_authority,
                         retrieval_request,
                         snapshot_digest,
+                        Some(&similar_descriptor),
                         now,
                     )
                     .map_err(map_clone_cursor_read_error)?
@@ -703,20 +729,60 @@ impl ProductionCodeIndexQueryOwnersV1 {
             None
         };
         let mut exact_groups = Vec::new();
+        let mut exact_lane_complete = true;
         if !continue_near {
-            for (key_index, key) in exact_keys.iter().cloned().enumerate() {
-                if exact_results_remaining == 0 || exact_work_remaining == 0 {
-                    // Keep every key whose stream was never visited in the
-                    // response. An omitted key is indistinguishable from a key
-                    // with no matches at the MCP boundary; marking it incomplete
-                    // makes the shared-budget cutoff visible to the caller. A
-                    // per-key continuation is minted only after that key has
-                    // actually been read, so an unvisited key is intentionally
-                    // restartable from the original request.
-                    exact_groups.extend(incomplete_exact_groups(&exact_keys[key_index..]));
+            let exact_key_start = exact_cursor_key_index.unwrap_or(0);
+            for (key_index, key) in exact_keys.iter().cloned().enumerate().skip(exact_key_start) {
+                let page_limit =
+                    exact_results_remaining.min(exact_page_read_limit(exact_work_remaining));
+                if page_limit == 0 {
+                    if exact_results_remaining > 0 && exact_work_remaining > 0 {
+                        // Reserve the lookahead needed to decide whether the
+                        // next exact key has a row. Charging this reservation
+                        // before the near lane runs keeps the hard request
+                        // work limit intact even when no SQL page can be
+                        // opened with a safe `limit + 1` fetch.
+                        exact_work_spent = exact_work_spent.saturating_add(1);
+                        exact_work_remaining = exact_work_remaining.saturating_sub(1);
+                    }
+                    // Return one authenticated continuation for the first key
+                    // that was not opened. Later keys are intentionally left
+                    // out of this page; replaying this cursor walks them in
+                    // canonical key order without exposing an incomplete key
+                    // that has no way to advance.
+                    exact_lane_complete = false;
+                    let next_cursor = if exact_cursor_key_index == Some(key_index) {
+                        // The current key was already selected by an
+                        // authenticated continuation. With only the one
+                        // reserved lookahead unit left, reusing that cursor
+                        // would make work_limit == 2 replay the same
+                        // ExactStart forever. The partial group below is a
+                        // bounded terminal response for this request; a
+                        // caller that needs the remaining rows must raise the
+                        // request work budget.
+                        None
+                    } else {
+                        Some(self.issue_similar_exact_start_cursor(
+                            &source,
+                            &key,
+                            query_authority,
+                            retrieval_request,
+                            snapshot_digest,
+                            &similar_descriptor,
+                            now,
+                        )?)
+                    };
+                    if let Some(next_cursor) = next_cursor {
+                        exact_groups.push(incomplete_exact_group(key, next_cursor));
+                    } else if exact_cursor_key_index == Some(key_index) {
+                        exact_groups.push(terminal_incomplete_exact_group(key));
+                    } else {
+                        return Err(RetrievalPortError::Contract(
+                            "unvisited exact key has no authenticated continuation".to_owned(),
+                        ));
+                    }
                     break;
                 }
-                let page_limit = exact_results_remaining.min(exact_work_remaining);
                 let page = self.verified_exact_clone_page(
                     &source,
                     &key,
@@ -728,6 +794,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     query_authority,
                     retrieval_request,
                     snapshot_digest,
+                    &similar_descriptor,
                     now,
                     control,
                 )?;
@@ -741,13 +808,29 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 exact_results_remaining =
                     exact_results_remaining.saturating_sub(page.members.len());
                 exact_work_remaining = exact_work_remaining.saturating_sub(work_spent);
+                if !page.complete || page.next_cursor.is_some() {
+                    exact_lane_complete = false;
+                }
                 if !page.members.is_empty() || !page.complete {
+                    let next_cursor = if !page.complete && page.next_cursor.is_none() {
+                        Some(self.issue_similar_exact_start_cursor(
+                            &source,
+                            &key,
+                            query_authority,
+                            retrieval_request,
+                            snapshot_digest,
+                            &similar_descriptor,
+                            now,
+                        )?)
+                    } else {
+                        page.next_cursor
+                    };
                     exact_groups.push(
                         tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
                             key,
                             members: page.members,
                             complete: page.complete,
-                            next_cursor: page.next_cursor,
+                            next_cursor,
                         },
                     );
                 }
@@ -759,19 +842,46 @@ impl ProductionCodeIndexQueryOwnersV1 {
             .work_limit
             .saturating_sub(1)
             .saturating_sub(exact_work_spent);
-        let near = self.read_similar_near(
+        let near_budget_exhausted = remaining_results == 0 || remaining_work == 0;
+        let mut near = self.read_similar_near(
             &source,
             &request.source_extent,
             &request.match_classes,
             remaining_results,
             remaining_work,
             near_cursor,
+            near_phase_cursor,
             query_authority,
             retrieval_request,
             snapshot_digest,
+            &similar_descriptor,
             now,
             control,
         )?;
+        let near_route_available = similar_near_route_is_available(
+            &source,
+            &request.source_extent,
+            &request.match_classes,
+        );
+        if similar_near_phase_cursor_needed(
+            continue_near,
+            exact_lane_complete,
+            near_budget_exhausted,
+            near_route_available,
+            similar_near_read_is_partial_without_cursor(&near),
+        ) {
+            if let Some(next_cursor) = self.issue_similar_near_phase_cursor(
+                &source,
+                &request.source_extent,
+                query_authority,
+                retrieval_request,
+                snapshot_digest,
+                &similar_descriptor,
+                now,
+            )? {
+                set_similar_near_next_cursor(&mut near, next_cursor);
+            }
+        }
         Ok(Some(
             tracedecay_query::code_search::CodeIndexSimilarCompletedV1 {
                 source,
@@ -814,31 +924,16 @@ impl ProductionCodeIndexQueryOwnersV1 {
         result_limit: usize,
         work_limit: usize,
         cursor: Option<&str>,
+        phase_cursor: Option<&str>,
         query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
         retrieval_request: &tracedecay_domain::RetrievalRequest,
         snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
         now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<tracedecay_query::code_search::CodeIndexSimilarNearReadV1, RetrievalPortError> {
-        let selected = match extent {
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-                start,
-                end,
-            } if source.occurrence.eligibility
-                == tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible =>
-            {
-                Some(
-                    tracedecay_code_index::clones::CloneSelectedBlockV1::from_payload(
-                        &source.payload,
-                        source.occurrence.eligibility,
-                        *start..*end,
-                    )
-                    .map_err(RetrievalPortError::Contract)?,
-                )
-            }
-            _ => None,
-        };
-        if let Some(cursor) = cursor {
+        let selected = similar_near_selected_block(source, extent)?;
+        if let Some(cursor) = cursor.or(phase_cursor) {
             self.validate_similar_near_cursor(
                 source,
                 selected.as_ref(),
@@ -846,6 +941,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 query_authority,
                 retrieval_request,
                 snapshot_digest,
+                similar_query_descriptor,
                 now,
             )?;
         }
@@ -869,25 +965,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
         match extent {
             tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
                 if page_limit == 0 {
-                    let next_cursor = match cursor {
-                        Some(cursor) => Some(cursor.to_owned()),
-                        None => self.issue_similar_near_cursor(
-                            source,
-                            None,
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            now,
-                        )?,
-                    };
-                    return Ok(similar_near_budget_exhausted_whole_body(
-                        source,
-                        next_cursor,
-                    ));
+                    return Ok(similar_near_budget_exhausted_whole_body(source));
                 }
-                let mut read = self
+                let read = self
                     .hydration
-                    .clone_fingerprint_page_authenticated(
+                    .clone_fingerprint_page_authenticated_with_similar_descriptor(
                         &source.occurrence,
                         &source.payload,
                         cursor,
@@ -895,23 +977,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
                         query_authority,
                         retrieval_request,
                         snapshot_digest,
+                        Some(similar_query_descriptor),
                         now,
                         control,
                     )
                     .map_err(map_clone_cursor_read_error)?;
-                if !read.partial_reasons.is_empty() && read.page.next_cursor.is_none() {
-                    read.page.next_cursor = match cursor {
-                        Some(cursor) => Some(cursor.to_owned()),
-                        None => self.issue_similar_near_cursor(
-                            source,
-                            None,
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            now,
-                        )?,
-                    };
-                }
                 Ok(tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read))
             }
             tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
@@ -920,45 +990,17 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 if source.occurrence.eligibility
                     != tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
                 {
-                    let next_cursor = match cursor {
-                        Some(cursor) => Some(cursor.to_owned()),
-                        None => self.issue_similar_near_cursor(
-                            source,
-                            None,
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            now,
-                        )?,
-                    };
-                    return Ok(similar_near_budget_exhausted_selected_range(
-                        source,
-                        next_cursor,
-                    ));
+                    return Ok(similar_near_budget_exhausted_selected_range(source));
                 }
                 let selected = selected
                     .as_ref()
                     .expect("eligible selected range was built before serving");
                 if page_limit == 0 {
-                    let next_cursor = match cursor {
-                        Some(cursor) => Some(cursor.to_owned()),
-                        None => self.issue_similar_near_cursor(
-                            source,
-                            Some(selected),
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            now,
-                        )?,
-                    };
-                    return Ok(similar_near_budget_exhausted_selected_block(
-                        selected,
-                        next_cursor,
-                    ));
+                    return Ok(similar_near_budget_exhausted_selected_block(selected));
                 }
-                let mut read = self
+                let read = self
                     .hydration
-                    .clone_selected_block_page_authenticated(
+                    .clone_selected_block_page_authenticated_with_similar_descriptor(
                         &source.occurrence,
                         &source.payload,
                         selected,
@@ -967,23 +1009,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
                         query_authority,
                         retrieval_request,
                         snapshot_digest,
+                        Some(similar_query_descriptor),
                         now,
                         control,
                     )
                     .map_err(map_clone_cursor_read_error)?;
-                if !read.partial_reasons.is_empty() && read.page.next_cursor.is_none() {
-                    read.page.next_cursor = match cursor {
-                        Some(cursor) => Some(cursor.to_owned()),
-                        None => self.issue_similar_near_cursor(
-                            source,
-                            Some(selected),
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            now,
-                        )?,
-                    };
-                }
                 Ok(
                     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
                         read,
@@ -991,6 +1021,69 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 )
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_similar_near_phase_cursor(
+        &self,
+        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+        extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
+        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
+        retrieval_request: &tracedecay_domain::RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
+        now: tracedecay_domain::UtcMicros,
+    ) -> Result<Option<String>, RetrievalPortError> {
+        let selected = similar_near_selected_block(source, extent)?;
+        let Some(query_descriptor) = similar_near_query_descriptor(
+            source,
+            self.hydration.verified_artifact().artifact_digest(),
+            selected.as_ref(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
+            query_authority,
+            retrieval_request,
+        )
+        .map_err(map_clone_cursor_error)?;
+        codec
+            .issue_artifact_with_similar_descriptor(
+                self.hydration.verified_artifact().artifact_digest().clone(),
+                self.hydration.metadata().generation.clone(),
+                snapshot_digest.clone(),
+                query_descriptor,
+                Some(similar_query_descriptor.clone()),
+                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart,
+                now,
+            )
+            .map(Some)
+            .map_err(map_clone_cursor_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_similar_exact_start_cursor(
+        &self,
+        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+        key: &tracedecay_code_index::clones::CloneExactKeyV1,
+        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
+        retrieval_request: &tracedecay_domain::RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
+        now: tracedecay_domain::UtcMicros,
+    ) -> Result<String, RetrievalPortError> {
+        self.hydration
+            .clone_exact_start_cursor_authenticated(
+                &source.occurrence,
+                key,
+                query_authority,
+                retrieval_request,
+                snapshot_digest,
+                similar_query_descriptor,
+                now,
+            )
+            .map_err(map_clone_cursor_read_error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1002,6 +1095,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
         query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
         retrieval_request: &tracedecay_domain::RetrievalRequest,
         snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
         now: tracedecay_domain::UtcMicros,
     ) -> Result<(), RetrievalPortError> {
         let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
@@ -1019,9 +1113,11 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 .map_err(map_clone_cursor_error)?;
             if !matches!(
                 cursor.after,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
+                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
+                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
                     ..
-                } | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
+                }
+                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
                     ..
                 }
             ) {
@@ -1043,11 +1139,16 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 now,
             )
             .map_err(map_clone_cursor_error)?;
+        if cursor.similar_query_descriptor.as_ref() != Some(similar_query_descriptor) {
+            return Err(RetrievalPortError::StaleEvidence);
+        }
         if !matches!(
             cursor.after,
-            tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
+            tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
+                | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
                 ..
-            } | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
+            }
+                | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
                 ..
             }
         ) {
@@ -1056,55 +1157,6 @@ impl ProductionCodeIndexQueryOwnersV1 {
             ));
         }
         Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn issue_similar_near_cursor(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-        selected: Option<&CloneSelectedBlockV1>,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
-    ) -> Result<Option<String>, RetrievalPortError> {
-        let Some(query_descriptor) = similar_near_query_descriptor(
-            source,
-            self.hydration.verified_artifact().artifact_digest(),
-            selected,
-        )?
-        else {
-            return Ok(None);
-        };
-        let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
-            query_authority,
-            retrieval_request,
-        )
-        .map_err(map_clone_cursor_error)?;
-        codec
-            .issue_artifact(
-                self.hydration.verified_artifact().artifact_digest().clone(),
-                self.hydration.metadata().generation.clone(),
-                snapshot_digest.clone(),
-                query_descriptor,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
-                    discovery:
-                        tracedecay_query::retrieval::lexical::CloneFingerprintDiscoveryPositionV2 {
-                            posting_count: 0,
-                            fingerprint: 0,
-                            symbol_occurrence_id: None,
-                            token_position: None,
-                            pending_comparison_body_digest: None,
-                            pending_comparison_payload_digest: None,
-                            complete: true,
-                        },
-                    comparison_body_digest: None,
-                    comparison_payload_digest: None,
-                },
-                now,
-            )
-            .map(Some)
-            .map_err(map_clone_cursor_error)
     }
 
     /// Continue paging past filter rejects until `limit` verified members exist.
@@ -1118,6 +1170,7 @@ impl ProductionCodeIndexQueryOwnersV1 {
         query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
         retrieval_request: &tracedecay_domain::RetrievalRequest,
         snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
         now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<VerifiedExactClonePageV1, RetrievalPortError> {
@@ -1128,11 +1181,30 @@ impl ProductionCodeIndexQueryOwnersV1 {
         while members.len() < limit && work_spent < work_limit {
             let page_limit = limit
                 .saturating_sub(members.len())
-                .min(work_limit.saturating_sub(work_spent))
-                .max(1);
+                .min(exact_page_read_limit(work_limit.saturating_sub(work_spent)));
+            if page_limit == 0 {
+                let next_cursor = match cursor {
+                    Some(cursor) => Some(cursor),
+                    None => Some(self.issue_similar_exact_start_cursor(
+                        source,
+                        key,
+                        query_authority,
+                        retrieval_request,
+                        snapshot_digest,
+                        similar_query_descriptor,
+                        now,
+                    )?),
+                };
+                return Ok(VerifiedExactClonePageV1 {
+                    members,
+                    complete: false,
+                    next_cursor,
+                    work_spent,
+                });
+            }
             let page = self
                 .hydration
-                .clone_exact_page_authenticated(
+                .clone_exact_page_authenticated_with_similar_descriptor(
                     &source.occurrence,
                     key,
                     cursor.as_deref(),
@@ -1140,14 +1212,25 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     query_authority,
                     retrieval_request,
                     snapshot_digest,
+                    Some(similar_query_descriptor),
                     now,
                     control,
                 )
                 .map_err(map_clone_cursor_read_error)?;
             // `clone_exact_page` fetches one lookahead row when a continuation
             // exists. Count the whole decoded page, including members later
-            // rejected by the source/payload verification below.
-            work_spent = work_spent.saturating_add(page.members.len());
+            // rejected by the source/payload verification below and that
+            // lookahead row. The authenticated page intentionally truncates
+            // the lookahead before returning it, so its continuation is the
+            // observable marker for the extra fetched row.
+            let fetched_rows =
+                exact_page_work_spent(page.members.len(), page.next_cursor.is_some());
+            if fetched_rows > work_limit.saturating_sub(work_spent) {
+                return Err(RetrievalPortError::Contract(
+                    "clone exact lookahead exceeded the request work budget".to_owned(),
+                ));
+            }
+            work_spent = work_spent.saturating_add(fetched_rows);
             for member in page.members {
                 if member.occurrence.symbol_occurrence_id == source.occurrence.symbol_occurrence_id
                 {
@@ -1213,21 +1296,109 @@ struct VerifiedExactClonePageV1 {
     work_spent: usize,
 }
 
-/// Preserve the request's class order when a shared budget ends before a
-/// stream is opened. These placeholders let the surface fold every requested
-/// stream into its overall coverage instead of treating an omitted stream as
-/// an empty, complete one.
-fn incomplete_exact_groups(
-    keys: &[tracedecay_code_index::clones::CloneExactKeyV1],
-) -> impl Iterator<Item = tracedecay_query::code_search::CodeIndexSimilarExactGroupV1> + '_ {
-    keys.iter().cloned().map(
-        |key| tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-            key,
-            members: Vec::new(),
-            complete: false,
-            next_cursor: None,
-        },
-    )
+/// Construct the explicit first-unvisited exact group returned at a shared
+/// budget boundary. The serving loop supplies an authenticated ExactStart
+/// cursor; keeping the helper cursor-bearing makes the incomplete state
+/// impossible to confuse with an empty complete stream.
+fn incomplete_exact_group(
+    key: tracedecay_code_index::clones::CloneExactKeyV1,
+    next_cursor: String,
+) -> tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+        key,
+        members: Vec::new(),
+        complete: false,
+        next_cursor: Some(next_cursor),
+    }
+}
+
+/// Construct the bounded terminal group returned when an authenticated exact
+/// continuation reaches a request-wide budget boundary before another row
+/// can be fetched. The key has already been visited by the continuation, so a
+/// missing cursor cannot strand an unvisited key and avoids replaying the same
+/// authenticated cursor forever.
+fn terminal_incomplete_exact_group(
+    key: tracedecay_code_index::clones::CloneExactKeyV1,
+) -> tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+        key,
+        members: Vec::new(),
+        complete: false,
+        next_cursor: None,
+    }
+}
+
+fn similar_near_selected_block(
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
+) -> Result<Option<CloneSelectedBlockV1>, RetrievalPortError> {
+    match extent {
+        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
+            start,
+            end,
+        } if source.occurrence.eligibility
+            == tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible =>
+        {
+            Ok(Some(
+                CloneSelectedBlockV1::from_payload(
+                    &source.payload,
+                    source.occurrence.eligibility,
+                    *start..*end,
+                )
+                .map_err(RetrievalPortError::Contract)?,
+            ))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn similar_near_read_is_partial_without_cursor(
+    read: &tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
+) -> bool {
+    match read {
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
+            read.page.next_cursor.is_none()
+                && (!read.partial_reasons.is_empty()
+                    || read.coverage.unknown > 0
+                    || read.coverage.capped > 0)
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
+            read.page.next_cursor.is_none()
+                && (!read.partial_reasons.is_empty()
+                    || read.coverage.unknown > 0
+                    || read.coverage.capped > 0)
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(_) => false,
+    }
+}
+
+fn similar_near_phase_cursor_needed(
+    continue_near: bool,
+    exact_lane_complete: bool,
+    near_budget_exhausted: bool,
+    near_route_available: bool,
+    near_partial_without_cursor: bool,
+) -> bool {
+    !continue_near
+        && exact_lane_complete
+        && near_budget_exhausted
+        && near_route_available
+        && near_partial_without_cursor
+}
+
+fn set_similar_near_next_cursor(
+    read: &mut tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
+    next_cursor: String,
+) {
+    match read {
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
+            read.page.next_cursor = Some(next_cursor);
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
+            read.page.next_cursor = Some(next_cursor);
+        }
+        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(_) => {}
+    }
 }
 
 fn check_similar_control(
@@ -1309,21 +1480,89 @@ fn similar_near_route_is_available(
         }
 }
 
-fn similar_exact_lane_budget(
-    result_limit: usize,
-    work_limit: usize,
-    reserve_near: bool,
-) -> (usize, usize) {
-    let near_reservation = if reserve_near { 1 } else { 0 };
+fn similar_exact_lane_budget(result_limit: usize, work_limit: usize) -> (usize, usize) {
     (
-        result_limit.saturating_sub(near_reservation),
-        work_limit
-            .saturating_sub(1)
-            // Exact pages include one lookahead row whenever a posting stream
-            // continues. Keep that row inside the exact reservation so the
-            // near lane still receives one unit of actual work.
-            .saturating_sub(near_reservation.saturating_add(near_reservation)),
+        result_limit,
+        work_limit.saturating_sub(1), // The source lookup consumes one unit before exact/near lanes.
+                                      // Exact lookahead rows are charged by `verified_exact_clone_page`.
     )
+}
+
+fn exact_page_work_spent(member_count: usize, has_continuation: bool) -> usize {
+    member_count.saturating_add(usize::from(has_continuation))
+}
+
+/// The exact artifact reader always fetches one lookahead row so it can tell
+/// whether a page has a continuation. Reserve that row before opening the
+/// stream; otherwise a page with `work_limit == remaining_work` could spend
+/// one unit beyond the request-wide hard bound.
+fn exact_page_read_limit(remaining_work: usize) -> usize {
+    remaining_work.saturating_sub(1)
+}
+
+#[derive(serde::Serialize)]
+enum SimilarQueryTargetDescriptorV1 {
+    SymbolOccurrence(String),
+}
+
+#[derive(serde::Serialize)]
+enum SimilarQueryExtentDescriptorV1 {
+    WholeBody,
+    SelectedTokenRange { start: u64, end: u64 },
+}
+
+/// Canonical identity of one complete Similar request. It is carried in the
+/// authenticated clone cursor alongside the operation-specific reader
+/// descriptor so adding/removing a class or changing the selected source
+/// extent cannot reuse an exact, near, or NearStart continuation.
+fn similar_query_descriptor(
+    request: &tracedecay_query::code_search::CodeIndexSimilarRequestV1,
+    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
+    artifact_digest: &ManifestDigest,
+) -> Result<ManifestDigest, RetrievalPortError> {
+    let authority_digest = canonical_sha256(&(
+        "tracedecay.clone-exact-authority.v1",
+        &source.occurrence.project_id,
+        &source.occurrence.repository_id,
+        &source.occurrence.worktree_id,
+        &source.occurrence.source_generation,
+        &source.occurrence.snapshot_digest,
+        &source.occurrence.symbol_occurrence_id,
+    ))
+    .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
+    // Bind the resolved source identity rather than the surface spelling of
+    // the target. A source-range lookup and a symbol-occurrence lookup that
+    // resolve to the same immutable body are the same Similar stream, while
+    // a different source still changes the authority digest above.
+    let target = SimilarQueryTargetDescriptorV1::SymbolOccurrence(
+        source.occurrence.symbol_occurrence_id.as_str().to_owned(),
+    );
+    let extent = match &request.source_extent {
+        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
+            SimilarQueryExtentDescriptorV1::WholeBody
+        }
+        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
+            start,
+            end,
+        } => SimilarQueryExtentDescriptorV1::SelectedTokenRange {
+            start: *start as u64,
+            end: *end as u64,
+        },
+    };
+    let mut classes = request.match_classes.clone();
+    classes.sort_unstable();
+    classes.dedup();
+    canonical_sha256(&(
+        "tracedecay.clone-similar-request.v2",
+        artifact_digest,
+        &authority_digest,
+        &source.payload.payload_digest,
+        &source.payload.body_digest,
+        target,
+        extent,
+        classes,
+    ))
+    .map_err(|error| RetrievalPortError::Contract(error.to_string()))
 }
 
 fn similar_near_query_descriptor(
@@ -1362,7 +1601,13 @@ fn similar_near_query_descriptor(
         &stream.language,
         stream.class,
         stream.normalization_revision,
-        selected.map(CloneSelectedBlockV1::tokens),
+        selected.map(|selected| {
+            (
+                selected.source_token_start(),
+                selected.source_token_end(),
+                selected.tokens(),
+            )
+        }),
     ))
     .map(Some)
     .map_err(|error| RetrievalPortError::Contract(error.to_string()))
@@ -1392,13 +1637,12 @@ fn similar_near_budget_reason() -> Vec<CloneFingerprintPartialReasonV1> {
 
 fn similar_near_budget_exhausted_whole_body(
     source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    next_cursor: Option<String>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(
         AuthenticatedCloneFingerprintArtifactReadV1 {
             page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor,
+                next_cursor: None,
             },
             stream: similar_stream_descriptor(source),
             source_eligibility: source.occurrence.eligibility,
@@ -1413,7 +1657,6 @@ fn similar_near_budget_exhausted_whole_body(
 
 fn similar_near_budget_exhausted_selected_range(
     source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    next_cursor: Option<String>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     let stream = similar_stream_descriptor(source)
         .unwrap_or_else(|| fallback_similar_stream_descriptor(source));
@@ -1421,7 +1664,7 @@ fn similar_near_budget_exhausted_selected_range(
         AuthenticatedCloneSelectedBlockArtifactReadV1 {
             page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor,
+                next_cursor: None,
             },
             stream,
             coverage: similar_near_partial_coverage(),
@@ -1433,13 +1676,12 @@ fn similar_near_budget_exhausted_selected_range(
 
 fn similar_near_budget_exhausted_selected_block(
     selected: &CloneSelectedBlockV1,
-    next_cursor: Option<String>,
 ) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
     tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
         AuthenticatedCloneSelectedBlockArtifactReadV1 {
             page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
                 members: Vec::new(),
-                next_cursor,
+                next_cursor: None,
             },
             stream: CloneFingerprintStreamDescriptorV1 {
                 language: selected.language().to_owned(),
@@ -1483,14 +1725,12 @@ mod similar_serving_tests {
             ),
         ];
 
-        let groups = incomplete_exact_groups(&keys).collect::<Vec<_>>();
+        let group = incomplete_exact_group(keys[0].clone(), "authenticated-exact-start".to_owned());
 
-        assert_eq!(groups.len(), keys.len());
-        assert_eq!(groups[0].key, keys[0]);
-        assert_eq!(groups[1].key, keys[1]);
-        assert!(groups.iter().all(|group| {
-            !group.complete && group.members.is_empty() && group.next_cursor.is_none()
-        }));
+        assert_eq!(group.key, keys[0]);
+        assert!(!group.complete);
+        assert!(group.members.is_empty());
+        assert!(group.next_cursor.is_some());
     }
 }
 

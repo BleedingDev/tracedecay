@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::embedding::PinnedEncoder;
 use crate::ports::{Deadline, EncoderError, EncoderIdentity, StateRoot};
 use crate::store::{Event, Mutation, StoreError, StoreIdentity, StoreMeta};
 use serde::Serialize;
@@ -10,6 +11,11 @@ use std::time::Instant;
 use tracedecay_memory_ncm_core::kernel::{LayerWriteKind, NcmKernel};
 use tracedecay_memory_ncm_core::signals::affect;
 use tracedecay_memory_ncm_core::types::{AffectVector, CoreError};
+
+const REFERENCE_WORKER_MANIFEST: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/reference/worker-manifest.json"
+));
 
 pub(super) fn lookup_replay(
     handle: &mut NamespaceHandle,
@@ -52,7 +58,20 @@ pub(super) fn lookup_replay(
         .capsules_in_commit_order(true)
         .map_err(|error| store_reply(error, handle.commit_seq))?;
     let durable = validate_recovery_event(&event, seq, handle.commit_seq)?;
-    validate_durable_receipt(&durable, event.seq, Some(key))
+    let legacy_deletion_without_receipt_key = matches!(
+        &durable.operation,
+        DurableOperation::DeleteBySource {
+            payload_sha256: None,
+            canonical_input: None,
+            ..
+        }
+    ) && durable.idempotency_key.is_none();
+    let expected_receipt_key = if legacy_deletion_without_receipt_key {
+        None
+    } else {
+        Some(key)
+    };
+    validate_durable_receipt(&durable, event.seq, expected_receipt_key)
         .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
     validate_common_control_digest(&event, &durable)
         .map_err(|reason| corrupt_reply(handle.commit_seq, &reason))?;
@@ -189,10 +208,123 @@ pub(super) fn validate_durable_receipt(
     if receipt.reply.outcome != Outcome::Success {
         return Err("durable receipt outcome is not success".to_owned());
     }
-    if receipt.idempotency_key.as_deref() != expected_idempotency_key {
+    // Before canonical request inputs and receipt request keys were persisted,
+    // maintenance receipts used this compact envelope. Keep that one known
+    // legacy shape replayable while requiring every independent event,
+    // admission, and semantic check to pass at its caller.
+    let compact_maintenance = matches!(
+        &receipt.operation,
+        DurableOperation::Maintenance {
+            canonical_input: None,
+            ..
+        }
+    );
+    let legacy_maintenance = expected_idempotency_key.is_some()
+        && receipt.idempotency_key.is_none()
+        && compact_maintenance;
+    if receipt.idempotency_key.as_deref() != expected_idempotency_key && !legacy_maintenance {
         return Err("durable receipt idempotency key mismatch".to_owned());
     }
     Ok(())
+}
+
+/// Checks the wire-level presence and type of a receipt idempotency key.
+///
+/// `Option<String>` intentionally maps both an omitted field and JSON `null`
+/// to `None`.  Those encodings are not interchangeable on disk: the old
+/// deletion-fence receipt wrote an explicit `null`, while compact maintenance
+/// receipts omitted the field.  Keep the distinction at the JSON boundary so
+/// callers can reject a forged null without changing the public receipt type.
+pub(crate) fn validate_receipt_idempotency_key_json(
+    receipt_json: &str,
+    event_kind: &str,
+    event_idempotency_key: Option<&str>,
+) -> Result<(), String> {
+    let value: Value = serde_json::from_str(receipt_json)
+        .map_err(|error| format!("decode receipt for idempotency key validation: {error}"))?;
+    validate_receipt_idempotency_key_value(&value, event_kind, event_idempotency_key)
+}
+
+/// Variant of [`validate_receipt_idempotency_key_json`] for callers that have
+/// already decoded the receipt as a JSON value.
+pub(crate) fn validate_receipt_idempotency_key_value(
+    receipt: &Value,
+    event_kind: &str,
+    event_idempotency_key: Option<&str>,
+) -> Result<(), String> {
+    let Some(key) = receipt.get("idempotency_key") else {
+        return Ok(());
+    };
+    match key {
+        Value::String(key) if !key.is_empty() && key.len() <= MAX_IDEMPOTENCY_KEY_BYTES => Ok(()),
+        Value::Null
+            if is_historical_deletion_fence_receipt(receipt, event_kind, event_idempotency_key) =>
+        {
+            Ok(())
+        }
+        Value::Null => Err(
+            "explicit null receipt idempotency key is only valid for a historical deletion fence"
+                .to_owned(),
+        ),
+        _ => Err("receipt idempotency key has an invalid wire shape".to_owned()),
+    }
+}
+
+/// Returns whether a raw receipt is the exact pre-migration deletion-fence
+/// envelope that serialized its outer key as JSON `null`.
+///
+/// Requiring the old field set and the missing canonical input prevents a
+/// current receipt with a manually nulled key from entering this compatibility
+/// path.
+pub(crate) fn is_historical_deletion_fence_receipt(
+    receipt: &Value,
+    event_kind: &str,
+    event_idempotency_key: Option<&str>,
+) -> bool {
+    if event_kind != "deletion_fence" || event_idempotency_key.is_some() {
+        return false;
+    }
+    let Some(object) = receipt.as_object() else {
+        return false;
+    };
+    let expected_receipt_fields = [
+        "reply",
+        "operation",
+        "state_digest",
+        "integrity_digest",
+        "idempotency_key",
+    ];
+    if object.len() != expected_receipt_fields.len()
+        || expected_receipt_fields
+            .iter()
+            .any(|field| !object.contains_key(*field))
+    {
+        return false;
+    }
+    let Some(operation) = object["operation"].as_object() else {
+        return false;
+    };
+    let Some(fence) = operation.get("deletion_fence").and_then(Value::as_object) else {
+        return false;
+    };
+    if operation.len() != 1 || fence.contains_key("canonical_input") {
+        return false;
+    }
+    [
+        "source",
+        "sources",
+        "target_epoch",
+        "idempotency_key",
+        "payload_sha256",
+        "deleted_records",
+        "deleted_record_ids",
+        "pre_fence_state_digest",
+        "fatigue",
+        "steps_since_consolidation",
+    ]
+    .iter()
+    .all(|field| fence.contains_key(*field))
+        && fence.len() == 10
 }
 
 /// Recomputes a common-control event's semantic digest from the canonical
@@ -328,18 +460,113 @@ pub(super) fn maintenance_name(kind: &MaintenanceKind) -> &'static str {
     }
 }
 
-pub(super) fn ready_payload(identity: &StoreIdentity, epoch: u64, empty: bool) -> Value {
-    json!({
+pub(super) fn ready_payload(
+    identity: &StoreIdentity,
+    epoch: u64,
+    empty: bool,
+    encoder_identity: &EncoderIdentity,
+) -> Value {
+    let mut payload = json!({
         "ready": true,
         "empty": empty,
-        "algorithm": identity.algorithm,
+        "algorithm": {
+            "profile": identity.algorithm.profile,
+            "config_sha256": identity.algorithm.config_sha256,
+        },
         "projection_sha256": identity.projection_sha256,
         "encoder": {
             "model": identity.encoder_model,
             "artifact_sha256": identity.encoder_artifact_sha256
         },
         "epoch": epoch
-    })
+    });
+
+    // A production ready response must carry the same immutable worker and
+    // model evidence that the provider pins before it starts routing calls.
+    // If the checked-in manifests cannot be decoded, keep the legacy shape so
+    // the provider fails closed instead of treating incomplete metadata as a
+    // V2 proof.
+    let Some(worker) = reference_worker_identity() else {
+        return payload;
+    };
+    let Ok(encoder) = PinnedEncoder::reference() else {
+        return payload;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object.insert("identity_revision".to_owned(), Value::from(2_u64));
+    object.insert("worker".to_owned(), worker);
+    object.insert(
+        "encoder".to_owned(),
+        json!({
+            "model": identity.encoder_model,
+            "artifact_sha256": identity.encoder_artifact_sha256,
+            "repository": encoder.repository,
+            "revision": encoder.revision,
+            "revision_provenance": encoder.revision_provenance,
+            "files": encoder.files.iter().map(|file| json!({
+                "path": file.path,
+                "sha256": file.sha256,
+                "bytes": file.bytes,
+            })).collect::<Vec<_>>(),
+            "max_length": encoder_identity.max_length,
+            "pooling": encoder.pooling,
+            "normalize": encoder.normalize,
+        }),
+    );
+    payload
+}
+
+fn reference_worker_identity() -> Option<Value> {
+    let manifest: Value = serde_json::from_str(REFERENCE_WORKER_MANIFEST).ok()?;
+    let target_triple = current_target_triple();
+    let target = manifest
+        .get("targets")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|target| {
+            target.get("triple").and_then(Value::as_str) == Some(target_triple.as_str())
+        })?;
+    let sha256 = target.get("sha256").and_then(Value::as_str)?;
+    let bytes = target.get("bytes").and_then(Value::as_u64)?;
+    let triple = target.get("triple").and_then(Value::as_str)?;
+    let os = target.get("os").and_then(Value::as_str)?;
+    let arch = target.get("arch").and_then(Value::as_str)?;
+    let family = target.get("family").and_then(Value::as_str)?;
+    if sha256.len() != 64
+        || bytes == 0
+        || triple.is_empty()
+        || os.is_empty()
+        || arch.is_empty()
+        || family.is_empty()
+    {
+        return None;
+    }
+    Some(json!({
+        "sha256": sha256,
+        "bytes": bytes,
+        "target": {
+            "triple": triple,
+            "os": os,
+            "arch": arch,
+            "family": family,
+        },
+    }))
+}
+
+fn current_target_triple() -> String {
+    option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let platform = match std::env::consts::OS {
+                "macos" => "apple-darwin",
+                "windows" => "pc-windows-msvc",
+                "linux" => "unknown-linux-gnu",
+                other => other,
+            };
+            format!("{}-{platform}", std::env::consts::ARCH)
+        })
 }
 
 pub(super) fn encoder_payload(identity: &EncoderIdentity) -> Value {

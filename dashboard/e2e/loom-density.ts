@@ -44,13 +44,16 @@ const hierarchy = AnalyticsSubagentTreePayloadV1Schema.parse({
 });
 const loaded = LoomTemporalPayloadV1Schema.parse({ ...temporal, sessions, total: 100 });
 const pageFor = (sessionId: string) => LcmSessionPayloadV1Schema.parse({
-  exists: true, session_id: sessionId, path: '/fixture/sessions.db', storage_scope: 'fixture',
+  exists: true, session_id: sessionId,
+  provider: sessions.find((session) => session.session_id === sessionId)?.provider ?? null,
+  path: '/fixture/sessions.db', storage_scope: 'fixture',
   limit: 200, next_cursor: null, has_more: false, has_more_messages: false, has_more_summary_nodes: false,
   counts: { message_count: 200, source_token_count: null, summary_node_count: 0, summary_token_count: null }, summary_nodes: [],
   messages: Array.from({ length: 200 }, (_, i) => ({
     session_id: sessionId, message_id: `event-${i}`, ordinal: i, timestamp: start + i * 10,
     content: `Explicit density fixture message ${i}.`, snippet: null, role: i % 3 === 0 ? 'user' : 'assistant',
     tool_name: i % 3 === 1 ? 'Read' : null, token_count: null, token_count_provenance: null,
+    provider: sessions.find((session) => session.session_id === sessionId)?.provider ?? '',
     pinned: 0, source: sessions.find((session) => session.session_id === sessionId)?.provider ?? null,
     storage_kind: 'message', store_id: null, summary_node_ids: [], metadata_json: null,
   })),

@@ -5949,6 +5949,8 @@ dependencies = [
  "tracedecay-query",
  "tracedecay-runtime-core",
  "tracedecay-rusqlite-runtime",
+ "tracedecay-semantic",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-memory",
  "tracedecay-session-temporal-store",
  "tracedecay-sessions",
@@ -6202,6 +6204,8 @@ dependencies = [
  "tracedecay-private-fs",
  "tracedecay-query",
  "tracedecay-runtime-core",
+ "tracedecay-semantic",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-temporal-store",
  "tracedecay-store",
  "tracedecay-tool-catalog",
@@ -6239,6 +6243,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hotpath",
+ "ring",
  "schemars",
  "serde",
  "serde_json",
@@ -6795,6 +6800,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "fastembed",
+ "hf-hub",
  "libc",
  "rusqlite",
  "serde",
@@ -7084,6 +7090,44 @@ dependencies = [
  "tracedecay-search-eval",
  "tracedecay-sessions",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tracedecay-semantic"
+version = "0.1.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "fastembed",
+ "fs2",
+ "getrandom 0.2.17",
+ "hex",
+ "hf-hub",
+ "hotpath",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracedecay-code-index",
+ "tracedecay-domain",
+ "tracedecay-query",
+ "tracedecay-runtime-core",
+ "tracedecay-semantic-contracts",
+ "url",
+]
+
+[[package]]
+name = "tracedecay-semantic-contracts"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tracedecay-domain",
 ]
 
 [[package]]

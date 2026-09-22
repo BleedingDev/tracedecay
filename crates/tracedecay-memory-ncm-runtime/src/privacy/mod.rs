@@ -3,11 +3,11 @@
 use crate::engine::{
     CheckpointEnvelope, DurableOperation, DurableReceipt, EngineReply, FaultPoint, MaintenanceKind,
     NamespaceHandle, NcmEngine, Outcome, PendingDeletionFence, RejectReason,
-    durable_integrity_digest, replay_recovery_event, validate_event_payload_digest,
-    validate_pending_deletion_fence, validate_recovery_event,
+    durable_integrity_digest, replay_recovery_event, validate_deletion_completion_fence,
+    validate_event_payload_digest, validate_pending_deletion_fence, validate_recovery_event,
 };
 use crate::ports::Deadline;
-use crate::store::{CapsuleStatus, NamespaceStore, StoreError, StoreMeta, StoredCapsule};
+use crate::store::{CapsuleStatus, Event, NamespaceStore, StoreError, StoreMeta, StoredCapsule};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -56,7 +56,7 @@ pub fn delete_by_source(
     namespace: &str,
     request: DeleteRequest,
 ) -> EngineReply {
-    delete_sources_inner(engine, namespace, request, None, None, None)
+    delete_sources_inner(engine, namespace, request, None, None, None, None)
 }
 
 pub(crate) fn delete_sources(
@@ -67,6 +67,7 @@ pub(crate) fn delete_sources(
     deadline: Deadline,
     expected_generation: u64,
     bindings: Option<&[crate::source_binding::DeletionSourceBinding]>,
+    canonical_input: Option<Value>,
 ) -> EngineReply {
     if let Some(bindings) = bindings {
         if let Err(reason) =
@@ -101,6 +102,7 @@ pub(crate) fn delete_sources(
         Some(sources),
         Some(expected_generation),
         bindings,
+        canonical_input,
     )
 }
 
@@ -111,6 +113,7 @@ fn delete_sources_inner(
     source_set: Option<&[SourceId]>,
     expected_generation: Option<u64>,
     bindings: Option<&[crate::source_binding::DeletionSourceBinding]>,
+    canonical_input: Option<Value>,
 ) -> EngineReply {
     let started = Instant::now();
     if request.deadline.remaining_ms == 0 {
@@ -134,7 +137,9 @@ fn delete_sources_inner(
     };
     let mut request = request;
     request.source = canonical_source;
-    let payload_sha256 = match canonical_deletion_digest(&sources) {
+    let canonical_input = canonical_input
+        .unwrap_or_else(|| deletion_request_input(&sources, expected_generation, None));
+    let payload_sha256 = match canonical_deletion_digest(&canonical_input) {
         Ok(digest) => digest,
         Err(reason) => return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0),
     };
@@ -152,6 +157,21 @@ fn delete_sources_inner(
     }
     match lookup_replay(handle, &request.idempotency_key, &payload_sha256) {
         Ok(Some(reply)) => {
+            if matches!(
+                &reply.outcome,
+                Outcome::Rejected(RejectReason::IdempotencyConflict)
+            ) {
+                match lookup_legacy_deletion_replay(
+                    handle,
+                    &request.idempotency_key,
+                    &sources,
+                    &canonical_input,
+                ) {
+                    Ok(Some(legacy)) => return legacy,
+                    Ok(None) => {}
+                    Err(reply) => return reply,
+                }
+            }
             if matches!(reply.outcome, Outcome::Success) {
                 if let Err(reply) = validate_completed_deletion_replay(
                     handle,
@@ -256,6 +276,7 @@ fn delete_sources_inner(
             pre_fence_state_digest: pre_fence_state_digest.clone(),
             fatigue: live.scheduler.fatigue,
             steps_since_consolidation: live.scheduler.steps_since_consolidation,
+            canonical_input: Some(canonical_input.clone()),
         },
         &live,
         None,
@@ -365,6 +386,7 @@ fn delete_sources_inner(
         target_epoch,
         request.idempotency_key,
         payload_sha256,
+        Some(canonical_input),
         report,
         deleted_records,
         persisted_sources,
@@ -393,6 +415,14 @@ pub(crate) fn resume_pending_rebuild(
     store: &mut NamespaceStore,
     config: &NcmConfig,
 ) -> Result<Option<ResumedRebuild>, EngineReply> {
+    if store
+        .fenced()
+        .map_err(|error| store_reply(error, 0))?
+        .as_deref()
+        == Some("compacting")
+    {
+        return finish_compacting_rebuild(store, config).map(Some);
+    }
     let Some(pending) = validate_pending_deletion_fence(store)? else {
         return Ok(None);
     };
@@ -404,11 +434,218 @@ pub(crate) fn resume_pending_rebuild(
         pending.target_epoch,
         pending.idempotency_key,
         pending.payload_sha256,
+        pending.canonical_input,
         report,
         pending.deleted_records,
         pending.deleted_record_ids,
+        None,
     )?;
     Ok(Some(ResumedRebuild { kernel, meta }))
+}
+
+/// Completes the durable post-rebuild phase after a crash between the
+/// completion journal commit and physical compaction/fence clearing.
+fn finish_compacting_rebuild(
+    store: &mut NamespaceStore,
+    config: &NcmConfig,
+) -> Result<ResumedRebuild, EngineReply> {
+    let meta = store.meta().map_err(|error| store_reply(error, 0))?;
+    let event = store
+        .event(meta.commit_seq)
+        .map_err(|error| store_reply(error, meta.commit_seq))?
+        .ok_or_else(|| corrupt_reply(meta.commit_seq, "compacting completion event is missing"))?;
+    let durable: DurableReceipt = serde_json::from_str(&event.receipt).map_err(|error| {
+        corrupt_reply(
+            meta.commit_seq,
+            &format!("decode compacting completion receipt: {error}"),
+        )
+    })?;
+    validate_recovery_event(&event, meta.commit_seq, meta.commit_seq)?;
+    let capsules = store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    validate_event_payload_digest(&event, &durable, &capsules)?;
+    let DurableOperation::DeleteBySource {
+        source: completion_source,
+        target_epoch,
+        sources,
+        deleted_records,
+        deleted_record_ids,
+        ..
+    } = &durable.operation
+    else {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "compacting fence is not bound to a deletion completion",
+        ));
+    };
+    if event.kind != "delete_by_source"
+        || event.idempotency_key.is_none()
+        || durable.reply.outcome != Outcome::Success
+        || durable.reply.state_generation != event.seq
+        || *target_epoch != meta.epoch
+        || event.created_tick != meta.tick
+        || !valid_deletion_source_set(sources)
+        || sources.first() != Some(completion_source)
+        || durable.reply.payload["source"] != serde_json::json!(completion_source)
+        || durable.reply.payload["deleted_records"] != serde_json::json!(deleted_records)
+        || durable.reply.payload["epoch"] != serde_json::json!(target_epoch)
+        || durable.reply.payload["replayed"] != false
+    {
+        return Err(corrupt_reply(
+            meta.commit_seq,
+            "compacting deletion completion does not match metadata",
+        ));
+    }
+    validate_compacting_completion_fence(store, &event, &durable, &capsules)?;
+    validate_deleted_record_set(
+        deleted_records,
+        deleted_record_ids,
+        &capsules,
+        event.seq.saturating_sub(1),
+        meta.commit_seq,
+    )?;
+    // Validate the entire committed generation while the fence still blocks
+    // readers. A malformed completion must leave the namespace fenced rather
+    // than clearing the admission bit before recovery has accepted it.
+    let kernel = crate::engine::recover_kernel(store, config, store.identity().seed, &meta)?;
+    store
+        .compact(true)
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let mut clear = store
+        .begin_mutation()
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    clear
+        .clear_fence()
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    let cleared = clear
+        .commit_without_generation()
+        .map_err(|error| store_reply(error, meta.commit_seq))?;
+    if cleared != meta.commit_seq {
+        return Err(corrupt_reply(
+            cleared,
+            "compacting fence clear sequence mismatch",
+        ));
+    }
+    Ok(ResumedRebuild { kernel, meta })
+}
+
+fn validate_compacting_completion_fence(
+    store: &NamespaceStore,
+    completion_event: &Event,
+    completion: &DurableReceipt,
+    capsules: &[StoredCapsule],
+) -> Result<(), EngineReply> {
+    let commit_seq = completion_event.seq;
+    let fence_seq = commit_seq
+        .checked_sub(1)
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting deletion fence sequence underflow"))?;
+    let fence_event = store
+        .event(fence_seq)
+        .map_err(|error| store_reply(error, commit_seq))?
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting deletion fence is missing"))?;
+    let fence: DurableReceipt = serde_json::from_str(&fence_event.receipt).map_err(|error| {
+        corrupt_reply(
+            commit_seq,
+            &format!("decode compacting deletion fence receipt: {error}"),
+        )
+    })?;
+    validate_recovery_event(&fence_event, fence_seq, commit_seq)?;
+    validate_event_payload_digest(&fence_event, &fence, capsules)?;
+    let DurableOperation::DeleteBySource {
+        source: completion_source,
+        sources: completion_sources,
+        target_epoch: completion_epoch,
+        deleted_records: completion_deleted_records,
+        deleted_record_ids: completion_deleted_record_ids,
+        ..
+    } = &completion.operation
+    else {
+        return Err(corrupt_reply(
+            commit_seq,
+            "compacting completion is not a source deletion",
+        ));
+    };
+    let DurableOperation::DeletionFence {
+        source: fence_source,
+        sources: fence_sources,
+        target_epoch: fence_epoch,
+        idempotency_key: fence_key,
+        payload_sha256: fence_payload,
+        deleted_records: fence_deleted_records,
+        deleted_record_ids: fence_deleted_record_ids,
+        pre_fence_state_digest,
+        ..
+    } = &fence.operation
+    else {
+        return Err(corrupt_reply(
+            commit_seq,
+            "compacting completion is not preceded by a deletion fence",
+        ));
+    };
+    let completion_key = completion_event
+        .idempotency_key
+        .as_deref()
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting completion key is missing"))?;
+    let report = completion
+        .reply
+        .payload
+        .get("sanitized_replay")
+        .and_then(Value::as_object)
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting tick anchor is missing"))?;
+    let tick_before = report
+        .get("tick_before")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting tick anchor is invalid"))?;
+    let tick_after = report
+        .get("tick_after")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt_reply(commit_seq, "compacting tick anchor is invalid"))?;
+    if fence_event.kind != "deletion_fence"
+        || fence_event.idempotency_key.is_some()
+        || fence_event.seq.checked_add(1) != Some(completion_event.seq)
+        || completion_source != fence_source
+        || completion_sources != fence_sources
+        || completion_epoch != fence_epoch
+        || completion_key != fence_key
+        || completion_event.payload_sha256.as_str() != fence_payload.as_str()
+        || completion_deleted_records != fence_deleted_records
+        || completion_deleted_record_ids != fence_deleted_record_ids
+        || completion_event.created_tick != tick_after
+        || fence_event.created_tick != tick_before
+        || tick_after > tick_before
+        || completion.reply.payload["source"] != serde_json::json!(completion_source)
+        || completion.reply.payload["deleted_records"]
+            != serde_json::json!(completion_deleted_records)
+        || completion.reply.payload["epoch"] != serde_json::json!(completion_epoch)
+        || completion.reply.payload["replayed"] != false
+        || !is_sha256_hex(pre_fence_state_digest)
+        || fence.reply.payload["fenced"] != true
+        || fence.reply.payload["target_epoch"] != serde_json::json!(fence_epoch)
+        || fence.reply.state_generation != fence_event.seq
+        || fence.state_digest != *pre_fence_state_digest
+    {
+        return Err(corrupt_reply(
+            commit_seq,
+            "compacting completion is not bound to its deletion fence",
+        ));
+    }
+    let revocations = store
+        .revocations()
+        .map_err(|error| store_reply(error, commit_seq))?;
+    let expected_sources = fence_sources.iter().cloned().collect::<BTreeSet<_>>();
+    let actual_sources = revocations
+        .iter()
+        .filter(|row| row.epoch == *fence_epoch && row.seq == fence_event.seq)
+        .map(|row| row.source_id.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_sources != expected_sources {
+        return Err(corrupt_reply(
+            commit_seq,
+            "compacting completion revocations do not match its fence",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -418,6 +655,7 @@ fn finish_rebuild(
     target_epoch: u64,
     idempotency_key: String,
     payload_sha256: String,
+    canonical_input: Option<Value>,
     report: ReplayResult,
     deleted_records: u64,
     sources: Vec<SourceId>,
@@ -433,9 +671,11 @@ fn finish_rebuild(
         target_epoch,
         idempotency_key,
         payload_sha256,
+        canonical_input,
         report,
         deleted_records,
         deleted_record_ids,
+        engine,
     ) {
         Ok(result) => result,
         Err(reply) => return reply,
@@ -496,13 +736,12 @@ fn finish_store_rebuild(
     target_epoch: u64,
     idempotency_key: String,
     payload_sha256: String,
+    canonical_input: Option<Value>,
     report: ReplayResult,
     deleted_records: u64,
     deleted_record_ids: Vec<RecordId>,
+    engine: Option<&NcmEngine>,
 ) -> Result<(NcmKernel, StoreMeta, EngineReply), EngineReply> {
-    store
-        .compact(true)
-        .map_err(|error| store_reply(error, store.meta().map_or(0, |meta| meta.commit_seq)))?;
     let prior_meta = store.meta().map_err(|error| store_reply(error, 0))?;
     let pending_seq = prior_meta
         .commit_seq
@@ -534,6 +773,8 @@ fn finish_store_rebuild(
             target_epoch,
             deleted_records,
             deleted_record_ids,
+            payload_sha256: canonical_input.as_ref().map(|_| payload_sha256.clone()),
+            canonical_input,
         },
         &report.kernel,
         Some(&idempotency_key),
@@ -575,7 +816,11 @@ fn finish_store_rebuild(
         .set_meta(&meta)
         .map_err(|error| store_reply(error, prior_meta.commit_seq))?;
     mutation
-        .clear_fence()
+        // Keep the namespace fenced while the completion checkpoint is
+        // physically compacted. A crash after this commit therefore resumes
+        // the phase instead of serving a database whose old pages were not
+        // yet scrubbed.
+        .set_fence("compacting")
         .map_err(|error| store_reply(error, prior_meta.commit_seq))?;
     let committed = mutation
         .commit()
@@ -586,9 +831,32 @@ fn finish_store_rebuild(
             "deletion commit sequence mismatch",
         ));
     }
+    if engine.is_some_and(|engine| engine.consume_fault(FaultPoint::AfterDeletionCompletionCommit))
+    {
+        return Err(EngineReply::new(
+            Outcome::EffectUnknown,
+            committed,
+            json!({"compacting": true, "commit_seq": committed}),
+        ));
+    }
     store
         .compact(true)
         .map_err(|error| store_reply(error, committed))?;
+    let mut clear = store
+        .begin_mutation()
+        .map_err(|error| store_reply(error, committed))?;
+    clear
+        .clear_fence()
+        .map_err(|error| store_reply(error, committed))?;
+    let cleared = clear
+        .commit_without_generation()
+        .map_err(|error| store_reply(error, committed))?;
+    if cleared != committed {
+        return Err(corrupt_reply(
+            cleared,
+            "deletion fence clear sequence mismatch",
+        ));
+    }
     Ok((report.kernel, meta, reply))
 }
 
@@ -676,6 +944,7 @@ fn validate_checkpoint_anchor(
         .events_after(0)
         .map_err(|error| store_reply(error, meta.commit_seq))?;
     let mut expected_seq = 1_u64;
+    let mut expected_tick = 0_u64;
     let mut checkpoint_receipt = None;
     let mut checkpoint_event_tick = None;
     for event in events {
@@ -683,7 +952,15 @@ fn validate_checkpoint_anchor(
             break;
         }
         let durable = validate_recovery_event(&event, expected_seq, meta.commit_seq)?;
+        validate_common_maintenance_event(store, &event, &durable)?;
         validate_event_payload_digest(&event, &durable, capsules)?;
+        validate_deletion_completion_fence(store, &event, &durable, capsules, meta.commit_seq)?;
+        expected_tick = validate_privacy_checkpoint_event_tick(
+            &event,
+            &durable,
+            expected_tick,
+            meta.commit_seq,
+        )?;
         if event.seq == checkpoint_seq {
             checkpoint_receipt = Some(durable.state_digest);
             checkpoint_event_tick = Some(event.created_tick);
@@ -713,7 +990,7 @@ fn operation_tick_delta(operation: &DurableOperation) -> u64 {
             })
         }
         DurableOperation::Observe { .. } => 1,
-        DurableOperation::Maintenance { kind } => match kind {
+        DurableOperation::Maintenance { kind, .. } => match kind {
             MaintenanceKind::Advance { ticks } => u64::from(*ticks),
             MaintenanceKind::Consolidate
             | MaintenanceKind::MergePrune
@@ -725,6 +1002,115 @@ fn operation_tick_delta(operation: &DurableOperation) -> u64 {
         | DurableOperation::DeletionFence { .. }
         | DurableOperation::DeleteBySource { .. } => 0,
     }
+}
+
+fn validate_common_maintenance_event(
+    store: &NamespaceStore,
+    event: &Event,
+    durable: &DurableReceipt,
+) -> Result<(), EngineReply> {
+    let DurableOperation::Maintenance {
+        canonical_input, ..
+    } = &durable.operation
+    else {
+        return Ok(());
+    };
+    if crate::engine::snapshot_gap_contract(event, durable, event.seq)?.is_some() {
+        return Ok(());
+    }
+    if durable.reply.payload.get("common_maintenance").is_none() {
+        if canonical_input.is_some() {
+            return Err(corrupt_reply(
+                event.seq,
+                "common maintenance receipt is missing its request evidence",
+            ));
+        }
+        return Ok(());
+    }
+    match crate::engine::portable_common_maintenance_event(store.namespace(), event) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(corrupt_reply(
+            event.seq,
+            "common maintenance receipt is not portable",
+        )),
+        Err(reason) => Err(corrupt_reply(event.seq, &reason)),
+    }
+}
+
+fn deletion_tick_anchor(
+    event: &Event,
+    durable: &DurableReceipt,
+    commit_seq: u64,
+) -> Result<Option<(u64, u64)>, EngineReply> {
+    if !matches!(&durable.operation, DurableOperation::DeleteBySource { .. }) {
+        return Ok(None);
+    }
+    let legacy_shape = matches!(
+        &durable.operation,
+        DurableOperation::DeleteBySource {
+            payload_sha256: None,
+            canonical_input: None,
+            ..
+        }
+    );
+    let Some(report) = durable
+        .reply
+        .payload
+        .get("sanitized_replay")
+        .and_then(Value::as_object)
+    else {
+        if legacy_shape {
+            // Legacy DeleteBySource receipts had no explicit reset anchor;
+            // retain the ordinary zero-delta tick check for those rows.
+            return Ok(None);
+        }
+        return Err(corrupt_reply(
+            commit_seq,
+            "sanitized deletion receipt is missing its tick anchor",
+        ));
+    };
+    let tick_before = report
+        .get("tick_before")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt_reply(commit_seq, "sanitized deletion tick anchor is invalid"))?;
+    let tick_after = report
+        .get("tick_after")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| corrupt_reply(commit_seq, "sanitized deletion tick anchor is invalid"))?;
+    if tick_after != event.created_tick || tick_after > tick_before {
+        return Err(corrupt_reply(
+            commit_seq,
+            "sanitized deletion tick anchor does not match its event",
+        ));
+    }
+    Ok(Some((tick_before, tick_after)))
+}
+
+fn validate_privacy_checkpoint_event_tick(
+    event: &Event,
+    durable: &DurableReceipt,
+    previous_tick: u64,
+    commit_seq: u64,
+) -> Result<u64, EngineReply> {
+    if let Some((tick_before, tick_after)) = deletion_tick_anchor(event, durable, commit_seq)? {
+        if tick_before != previous_tick {
+            return Err(corrupt_reply(
+                commit_seq,
+                "sanitized deletion tick anchor does not match its prefix",
+            ));
+        }
+        return Ok(tick_after);
+    }
+    let expected_tick = previous_tick
+        .checked_add(operation_tick_delta(&durable.operation))
+        .ok_or_else(|| corrupt_reply(commit_seq, "checkpoint journal tick overflow"))?;
+    if event.created_tick != expected_tick {
+        return Err(corrupt_reply(
+            commit_seq,
+            "sanitized replay checkpoint tick does not match its operation history",
+        ));
+    }
+    Ok(expected_tick)
 }
 
 fn sanitized_replay(
@@ -775,6 +1161,7 @@ fn sanitized_replay(
     let mut expected_seq = 1_u64;
     let mut previous_tick = None;
     let mut original_tick = 0_u64;
+    let mut fence_tick = None;
     let mut sanitized_tick = 0_u64;
     // The original kernel digest chain is independently checkable until the
     // first erased observation.  Once that input is gone, continue validating
@@ -783,25 +1170,38 @@ fn sanitized_replay(
     let mut original_state_chain_valid = true;
     for event in events {
         let durable = validate_recovery_event(&event, expected_seq, pending.event_seq)?;
+        validate_common_maintenance_event(store, &event, &durable)?;
         validate_event_payload_digest(&event, &durable, &capsules)?;
-        original_tick = original_tick.saturating_add(operation_tick_delta(&durable.operation));
-        if event.created_tick != original_tick {
-            return Err(corrupt_reply(
-                pending.event_seq,
-                "event scheduler tick does not match its durable operation",
-            ));
-        }
-        if previous_tick.is_some_and(|tick| event.created_tick < tick) {
+        validate_deletion_completion_fence(store, &event, &durable, &capsules, pending.event_seq)?;
+        let snapshot_gap =
+            crate::engine::snapshot_gap_contract(&event, &durable, pending.event_seq)?;
+        let reset = deletion_tick_anchor(&event, &durable, pending.event_seq)?;
+        original_tick = validate_privacy_checkpoint_event_tick(
+            &event,
+            &durable,
+            original_tick,
+            pending.event_seq,
+        )?;
+        if reset.is_none() && previous_tick.is_some_and(|tick| event.created_tick < tick) {
             return Err(corrupt_reply(
                 pending.event_seq,
                 "event scheduler ticks are not monotonic",
             ));
         }
         previous_tick = Some(event.created_tick);
+        if event.seq == pending.event_seq {
+            fence_tick = Some(event.created_tick);
+        }
         expected_seq = expected_seq
             .checked_add(1)
             .ok_or_else(|| corrupt_reply(pending.event_seq, "event sequence overflow"))?;
-        if original_state_chain_valid
+        if original_state_chain_valid && snapshot_gap.is_some() {
+            // The omitted operation's nonlinear state transition is not
+            // present in the portable event stream. The marker's source
+            // digest and eventual restore checkpoint authenticate the range;
+            // do not compare this synthetic row to an invented kernel state.
+            original_state_chain_valid = false;
+        } else if original_state_chain_valid
             && event.seq > validation_checkpoint_seq
             && operation_contains_revoked_observe(&durable.operation, &by_record)
         {
@@ -924,7 +1324,7 @@ fn sanitized_replay(
                         .correction(old, new, evidence)
                         .map_err(|error| core_reply(error, event.seq))?;
                 }
-                DurableOperation::Maintenance { kind } => {
+                DurableOperation::Maintenance { kind, .. } => {
                     if let MaintenanceKind::Advance { ticks } = &kind {
                         sanitized_tick = sanitized_tick.saturating_add(u64::from(*ticks));
                     }
@@ -942,7 +1342,7 @@ fn sanitized_replay(
             "metadata sequence is not journal-backed",
         ));
     }
-    if original_tick != pending.tick_before {
+    if fence_tick != Some(pending.tick_before) {
         return Err(corrupt_reply(
             pending.event_seq,
             "deletion fence tick does not match its operation history",
@@ -1106,6 +1506,105 @@ fn remap_numeric_value(value: &mut Value, map: &BTreeMap<u64, u64>) {
     }
 }
 
+fn lookup_legacy_deletion_replay(
+    handle: &mut NamespaceHandle,
+    key: &str,
+    expected_sources: &BTreeSet<SourceId>,
+    canonical_input: &Value,
+) -> Result<Option<EngineReply>, EngineReply> {
+    if !legacy_deletion_request_shape(canonical_input, expected_sources) {
+        return Ok(None);
+    }
+    let Some(event) = handle
+        .store
+        .event_for_key(key)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+    else {
+        return Ok(None);
+    };
+    if event.kind != "delete_by_source" || event.idempotency_key.as_deref() != Some(key) {
+        return Ok(None);
+    }
+    let durable: DurableReceipt = serde_json::from_str(&event.receipt).map_err(|error| {
+        corrupt_reply(
+            handle.commit_seq,
+            &format!("decode legacy deletion receipt: {error}"),
+        )
+    })?;
+    let DurableOperation::DeleteBySource {
+        sources,
+        payload_sha256: None,
+        canonical_input: None,
+        ..
+    } = &durable.operation
+    else {
+        return Ok(None);
+    };
+    let expected_sources = expected_sources.iter().cloned().collect::<Vec<_>>();
+    if sources != &expected_sources {
+        return Ok(None);
+    }
+    let legacy_digest = legacy_deletion_digest(sources, &event.payload_sha256, handle.commit_seq)?;
+    let capsules = handle
+        .store
+        .capsules_in_commit_order(true)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let durable = validate_recovery_event(&event, event.seq, handle.commit_seq)?;
+    validate_event_payload_digest(&event, &durable, &capsules)?;
+    let expected_source_set = expected_sources.iter().cloned().collect::<BTreeSet<_>>();
+    validate_completed_deletion_replay(handle, key, &legacy_digest, &expected_source_set)?;
+    let mut replay = durable.reply;
+    if let Some(object) = replay.payload.as_object_mut() {
+        object.insert("replayed".to_owned(), Value::Bool(true));
+    }
+    Ok(Some(replay))
+}
+
+fn legacy_deletion_request_shape(
+    canonical_input: &Value,
+    expected_sources: &BTreeSet<SourceId>,
+) -> bool {
+    let Some(object) = canonical_input.as_object() else {
+        return false;
+    };
+    let expected_sources = Value::Array(
+        expected_sources
+            .iter()
+            .cloned()
+            .map(|source| json!(source))
+            .collect(),
+    );
+    object.len() == 3
+        && object.get("action").and_then(Value::as_str) == Some("delete_by_source")
+        && object.get("sources") == Some(&expected_sources)
+        && object
+            .get("expected_generation")
+            .is_some_and(|generation| generation.is_null() || generation.as_u64().is_some())
+}
+
+fn legacy_deletion_digest(
+    sources: &[SourceId],
+    payload_sha256: &str,
+    seq: u64,
+) -> Result<String, EngineReply> {
+    let array_digest =
+        crate::engine::canonical_digest(sources).map_err(|reason| corrupt_reply(seq, &reason))?;
+    if payload_sha256 == array_digest {
+        return Ok(array_digest);
+    }
+    if sources.len() == 1 {
+        let single_digest = crate::engine::canonical_digest(&sources[0])
+            .map_err(|reason| corrupt_reply(seq, &reason))?;
+        if payload_sha256 == single_digest {
+            return Ok(single_digest);
+        }
+    }
+    Err(corrupt_reply(
+        seq,
+        "legacy deletion payload digest does not match its source set",
+    ))
+}
+
 fn lookup_replay(
     handle: &mut NamespaceHandle,
     key: &str,
@@ -1191,19 +1690,37 @@ fn validate_completed_deletion_replay(
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|error| corrupt_reply(handle.commit_seq, &format!("decode receipt: {error}")))?;
     validate_recovery_event(&event, event.seq, meta.commit_seq)?;
-    if durable.idempotency_key.as_deref() != Some(key) {
+    let legacy_without_receipt_key = matches!(
+        &durable.operation,
+        DurableOperation::DeleteBySource {
+            payload_sha256: None,
+            canonical_input: None,
+            ..
+        }
+    ) && durable.idempotency_key.is_none();
+    if durable.idempotency_key.as_deref() != Some(key) && !legacy_without_receipt_key {
         return Err(corrupt_reply(
             handle.commit_seq,
             "completed deletion receipt idempotency key mismatch",
         ));
     }
     validate_event_payload_digest(&event, &durable, &capsules)?;
+    validate_deletion_completion_fence(
+        &handle.store,
+        &event,
+        &durable,
+        &capsules,
+        meta.commit_seq,
+    )?;
     let DurableOperation::DeleteBySource {
         source,
         sources,
         target_epoch,
         deleted_records,
         deleted_record_ids,
+        payload_sha256: operation_payload_sha256,
+        canonical_input: _,
+        ..
     } = &durable.operation
     else {
         return Err(corrupt_reply(
@@ -1211,18 +1728,21 @@ fn validate_completed_deletion_replay(
             "idempotency key is not bound to a completed deletion",
         ));
     };
+    let tick_anchor = deletion_tick_anchor(&event, &durable, meta.commit_seq)?;
     let canonical_sources = expected_sources.iter().cloned().collect::<Vec<_>>();
     if sources != &canonical_sources
         || sources.first() != Some(source)
         || !valid_deletion_source_set(sources)
+        || operation_payload_sha256
+            .as_deref()
+            .unwrap_or(payload_sha256)
+            != payload_sha256
         || durable.reply.outcome != Outcome::Success
         || durable.reply.state_generation != event.seq
         || durable.reply.payload["source"] != serde_json::json!(source)
         || durable.reply.payload["deleted_records"] != serde_json::json!(deleted_records)
         || durable.reply.payload["epoch"] != serde_json::json!(target_epoch)
         || durable.reply.payload["replayed"] != false
-        || durable.reply.payload["sanitized_replay"]["tick_after"]
-            != serde_json::json!(event.created_tick)
     {
         return Err(corrupt_reply(
             handle.commit_seq,
@@ -1267,6 +1787,7 @@ fn validate_completed_deletion_replay(
         pre_fence_state_digest,
         fatigue,
         steps_since_consolidation: _,
+        canonical_input: _,
     } = &fence.operation
     else {
         return Err(corrupt_reply(
@@ -1274,6 +1795,14 @@ fn validate_completed_deletion_replay(
             "completed deletion is not preceded by a deletion fence",
         ));
     };
+    if let Some((tick_before, tick_after)) = tick_anchor
+        && (tick_before != fence_event.created_tick || tick_after != event.created_tick)
+    {
+        return Err(corrupt_reply(
+            handle.commit_seq,
+            "completed deletion tick anchor is not bound to its fence",
+        ));
+    }
     if fence_event.kind != "deletion_fence"
         || fence_event.idempotency_key.is_some()
         || fence_event.seq.checked_add(1) != Some(event.seq)
@@ -1296,26 +1825,174 @@ fn validate_completed_deletion_replay(
             "completed deletion is not bound to its original fence",
         ));
     }
-    let revocations = handle
-        .store
-        .revocations()
-        .map_err(|error| store_reply(error, handle.commit_seq))?;
-    let actual_revocation_sources = revocations
-        .iter()
-        .filter(|revocation| revocation.epoch == *target_epoch && revocation.seq == fence_event.seq)
-        .map(|revocation| revocation.source_id.clone())
-        .collect::<BTreeSet<_>>();
-    if actual_revocation_sources != fence_sources.iter().cloned().collect::<BTreeSet<_>>() {
-        return Err(corrupt_reply(
-            handle.commit_seq,
-            "completed deletion revocation authority does not match its fence",
-        ));
-    }
+    validate_historical_revocation_authority(
+        handle,
+        fence_event.seq,
+        *target_epoch,
+        fence_sources,
+        &capsules,
+    )?;
     if *target_epoch > meta.epoch {
         return Err(corrupt_reply(
             handle.commit_seq,
             "completed deletion epoch is newer than metadata",
         ));
+    }
+    Ok(())
+}
+
+/// Validates the mutable revocation projection against its immutable fence
+/// history. A later deletion legitimately replaces a source's projection row,
+/// so a completed older receipt must remain replayable after K1/K2. Every row
+/// still has to point at a real, integrity-checked fence event; accepting an
+/// arbitrary newer sequence would turn the projection into an authority of
+/// its own.
+fn validate_historical_revocation_authority(
+    handle: &NamespaceHandle,
+    original_fence_seq: u64,
+    original_epoch: u64,
+    original_sources: &[SourceId],
+    capsules: &[StoredCapsule],
+) -> Result<(), EngineReply> {
+    let meta = handle
+        .store
+        .meta()
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let rows = handle
+        .store
+        .revocations()
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    let original_sources = original_sources.iter().collect::<BTreeSet<_>>();
+    for row in rows {
+        if row.epoch == 0 || row.seq == 0 || row.epoch > meta.epoch || row.seq > meta.commit_seq {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "completed deletion revocation authority is invalid",
+            ));
+        }
+        let event = handle
+            .store
+            .event(row.seq)
+            .map_err(|error| store_reply(error, handle.commit_seq))?
+            .ok_or_else(|| {
+                corrupt_reply(
+                    handle.commit_seq,
+                    "completed deletion revocation authority event is missing",
+                )
+            })?;
+        let durable: DurableReceipt = serde_json::from_str(&event.receipt).map_err(|error| {
+            corrupt_reply(
+                handle.commit_seq,
+                &format!("decode revocation authority receipt: {error}"),
+            )
+        })?;
+        validate_recovery_event(&event, row.seq, handle.commit_seq)?;
+        validate_event_payload_digest(&event, &durable, capsules)?;
+        let DurableOperation::DeletionFence {
+            sources,
+            target_epoch,
+            ..
+        } = &durable.operation
+        else {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "revocation authority does not point to a deletion fence",
+            ));
+        };
+        if event.kind != "deletion_fence"
+            || event.seq != row.seq
+            || *target_epoch != row.epoch
+            || !sources.iter().any(|source| source == &row.source_id)
+        {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "revocation authority does not match its fence event",
+            ));
+        }
+        let completion_seq = row.seq.checked_add(1).ok_or_else(|| {
+            corrupt_reply(
+                handle.commit_seq,
+                "completed deletion revocation completion sequence overflow",
+            )
+        })?;
+        let completion = handle
+            .store
+            .event(completion_seq)
+            .map_err(|error| store_reply(error, handle.commit_seq))?
+            .ok_or_else(|| {
+                corrupt_reply(
+                    handle.commit_seq,
+                    "revocation authority fence has no completion event",
+                )
+            })?;
+        let completion_receipt: DurableReceipt = serde_json::from_str(&completion.receipt)
+            .map_err(|error| {
+                corrupt_reply(
+                    handle.commit_seq,
+                    &format!("decode revocation completion receipt: {error}"),
+                )
+            })?;
+        validate_recovery_event(&completion, completion_seq, meta.commit_seq)?;
+        validate_event_payload_digest(&completion, &completion_receipt, capsules)?;
+        validate_deletion_completion_fence(
+            &handle.store,
+            &completion,
+            &completion_receipt,
+            capsules,
+            meta.commit_seq,
+        )?;
+        let DurableOperation::DeleteBySource {
+            source: completion_source,
+            sources: completion_sources,
+            target_epoch: completion_epoch,
+            ..
+        } = &completion_receipt.operation
+        else {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "revocation authority completion is not a deletion",
+            ));
+        };
+        if completion.kind != "delete_by_source"
+            || completion.seq != completion_seq
+            || completion_source != &sources[0]
+            || completion_sources != sources
+            || completion_epoch != target_epoch
+        {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "revocation authority completion does not match its fence",
+            ));
+        }
+        if original_sources.contains(&row.source_id) {
+            if row.epoch < original_epoch
+                || (row.epoch == original_epoch && row.seq != original_fence_seq)
+                || (row.epoch > original_epoch && row.seq <= original_fence_seq)
+            {
+                return Err(corrupt_reply(
+                    handle.commit_seq,
+                    "completed deletion revocation authority regressed",
+                ));
+            }
+        }
+    }
+    for source in original_sources {
+        let found = handle
+            .store
+            .revocations()
+            .map_err(|error| store_reply(error, handle.commit_seq))?
+            .into_iter()
+            .any(|row| {
+                row.source_id == *source
+                    && row.epoch >= original_epoch
+                    && (row.epoch > original_epoch || row.seq == original_fence_seq)
+            });
+        if !found {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "completed deletion revocation authority is missing",
+            ));
+        }
     }
     Ok(())
 }
@@ -1416,10 +2093,45 @@ fn validate_request(request: &DeleteRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_deletion_digest(sources: &BTreeSet<SourceId>) -> Result<String, String> {
-    serde_json::to_vec(sources)
-        .map(|bytes| sha256_hex(&bytes))
-        .map_err(|error| format!("serialize deletion payload: {error}"))
+/// Builds the canonical semantic input used by both the event digest and the
+/// public idempotency lookup. Identity and generation fields are handled
+/// separately: the generation is retained as a required precondition in the
+/// envelope, while the semantic digest omits it so a replay can arrive after
+/// the namespace advances.
+pub(crate) fn deletion_request_input(
+    sources: &BTreeSet<SourceId>,
+    expected_generation: Option<u64>,
+    payload: Option<&Value>,
+) -> Value {
+    let mut input = payload
+        .cloned()
+        .unwrap_or_else(|| json!({"action": "delete_by_source"}));
+    if let Some(object) = input.as_object_mut() {
+        object.remove("idempotency_key");
+        object.insert(
+            "sources".to_owned(),
+            Value::Array(
+                sources
+                    .iter()
+                    .cloned()
+                    .map(|source| json!(source))
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "expected_generation".to_owned(),
+            expected_generation.map_or(Value::Null, Value::from),
+        );
+    }
+    input
+}
+
+fn canonical_deletion_digest(input: &Value) -> Result<String, String> {
+    let mut semantics = input.clone();
+    if let Some(object) = semantics.as_object_mut() {
+        object.remove("expected_generation");
+    }
+    crate::engine::canonical_digest(&semantics)
 }
 
 fn remaining_ms(deadline: Deadline, started: Instant) -> u64 {

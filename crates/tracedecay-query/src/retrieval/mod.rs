@@ -9,8 +9,8 @@
 //! hydration.
 //!
 //! Foreground retrieval is explicitly single-root. The exact lane is
-//! independent of the fielded lexical/BM25 lane; the graph lane expands from
-//! their seeds.
+//! independent of the fielded lexical/BM25 lane. Semantic is an optional,
+//! independently admitted augmentation.
 
 pub mod dedupe;
 pub mod diversity;
@@ -27,13 +27,15 @@ pub mod ports;
 pub mod prepared_query;
 pub mod query_authority;
 pub mod request;
+pub mod rerank;
+pub mod semantic;
 mod stage_counters;
 pub mod task_session;
 
 pub use self::execution::{
     AdmittedGenerationContextV1, NativeCodeOccurrenceV1, NativeExactRecordV1, NativeGraphRecordV1,
     NativeLaneOutcomeV1, NativeLanePageV1, NativeLexicalRecordV1, NativeRecordReadPortV1,
-    NativeSymbolRecordV1, QueryExecutionContractErrorV1,
+    NativeSemanticRecordV1, NativeSymbolRecordV1, QueryExecutionContractErrorV1,
 };
 pub use self::observation::{
     ContextUseOutcomeV1, ObservedWithCoverageV1, RetrievalPipelineObservationV1,
@@ -52,6 +54,21 @@ pub use self::query_authority::{
     QUERY_RANKING_REVISION_V1, QueryAuthorityErrorV1, QueryAuthorityV1,
 };
 pub use self::request::{RawRetrievalRequestV1, SanitizedRetrievalRequestV1};
+pub use self::semantic::{
+    CalibratedSemanticQueryService, CanonicalSemanticDistanceV1, CodeSemanticEvidenceV1,
+    CompleteSemanticGenerationV1, EphemeralQueryEmbeddingV1, SemanticAbstentionDispositionV1,
+    SemanticAbstentionV1, SemanticAdaptiveRecallExecutionV1, SemanticAnnCandidateWindowV1,
+    SemanticAnnCandidatesV1, SemanticAnnIndexStateV1, SemanticCalibrationEvidenceV1,
+    SemanticCalibrationProfileV1, SemanticCodeRetriever, SemanticCompositionAuthorityErrorV1,
+    SemanticCompositionExecutionAuthorityV1, SemanticCompositionExecutionOutcomeV1,
+    SemanticIndexStateV1, SemanticLaneReadinessV1, SemanticLaneRetriever, SemanticQueryDecisionV1,
+    SemanticQueryEmbeddingPort, SemanticQueryEmbeddingRequestV1, SemanticQueryModeV1,
+    SemanticQueryServiceError, SemanticQueryServiceOutcomeV1, SemanticRequestPredicateV1,
+    SemanticRequestRefusalV1, SemanticRetrievalRequestV1, SemanticSearchExecutionV1,
+    SemanticSearchKindV1, SemanticVectorReadPort, SemanticVectorReadRequestV1,
+    SemanticVectorRecordV1, SemanticVectorScanSummaryV1, apply_bounded_rerank_outcome,
+    restore_frozen_semantic_order,
+};
 
 pub const QUERY_EXACT_RETRIEVER_REVISION_V1: &str = "retriever.exact.daemon.v1";
 pub const QUERY_LEXICAL_RETRIEVER_REVISION_V1: &str = "retriever.lexical.daemon.qualified-names.v1";
@@ -63,6 +80,11 @@ pub const QUERY_LEXICAL_PROFILE_REVISION_V1: &str = "lexical-profile.daemon.v1";
 pub const QUERY_EXACT_SCORE_DOMAIN_V1: &str = "score.exact.daemon.v1";
 pub const QUERY_LEXICAL_SCORE_DOMAIN_V1: &str = "score.lexical.daemon.v1";
 pub const QUERY_GRAPH_SCORE_DOMAIN_V1: &str = "score.graph.daemon.v1";
+pub const QUERY_SEMANTIC_EVALUATION_SCORE_DOMAIN_V1: &str = "score.semantic-distance.evaluation.v1";
+/// Score domain stamped on published production semantic candidates.
+pub const QUERY_SEMANTIC_SCORE_DOMAIN_V1: &str = QUERY_SEMANTIC_EVALUATION_SCORE_DOMAIN_V1;
+pub const QUERY_SEMANTIC_EVALUATION_SCORE_RAW_MIN_MICROS_V1: u64 = i64::MAX as u64 - 1_000_000_000;
+pub const QUERY_SEMANTIC_EVALUATION_SCORE_RAW_MAX_MICROS_V1: u64 = i64::MAX as u64;
 
 #[cfg(test)]
 mod tests;

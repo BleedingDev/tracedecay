@@ -244,6 +244,103 @@ async fn arbitrary_workflow_objects_and_inert_table_objects_require_reset() {
 }
 
 #[tokio::test]
+async fn source_workflow_journals_coexist_but_legacy_attached_drift_requires_reset() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+
+    // The newer registered workflow source journals share the database but
+    // are owned by the registered workflow authority. They must not make the
+    // legacy session index appear to have extra objects.
+    for table in tracedecay_rusqlite_runtime::workflow::WORKFLOW_TABLE_CONTRACTS_V1 {
+        conn.execute_batch(table.sql).await.unwrap();
+    }
+    conn.execute_batch(tracedecay_rusqlite_runtime::workflow::WORKFLOW_SCHEMA_IDENTITY_V1)
+        .await
+        .unwrap();
+    // A newer source journal can share the workflow prefix without belonging
+    // to this legacy index authority. Name-prefix matching must not claim it.
+    conn.execute_batch(
+        "CREATE TABLE workflow_runs_source_journal (source_rowid INTEGER PRIMARY KEY);",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        require_admissible_workflow_index_schema(&conn)
+            .await
+            .unwrap(),
+        WorkflowIndexSchemaAdmission::Current
+    );
+
+    // An object attached to one of the legacy tables remains part of this
+    // module's contract even when its name has no workflow prefix.
+    conn.execute_batch(
+        "CREATE TRIGGER unexpected_legacy_audit
+         AFTER INSERT ON workflow_runs
+         BEGIN
+             SELECT 1;
+         END;",
+    )
+    .await
+    .unwrap();
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn source_workflow_journals_coexist_but_legacy_view_reference_requires_reset() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+
+    for table in tracedecay_rusqlite_runtime::workflow::WORKFLOW_TABLE_CONTRACTS_V1 {
+        conn.execute_batch(table.sql).await.unwrap();
+    }
+    conn.execute_batch(tracedecay_rusqlite_runtime::workflow::WORKFLOW_SCHEMA_IDENTITY_V1)
+        .await
+        .unwrap();
+    // A view records its own name in sqlite_master.tbl_name. Its workflow
+    // dependency must still be treated as legacy-owned drift.
+    conn.execute_batch(
+        "CREATE VIEW arbitrary_legacy_reference AS
+         SELECT run_id FROM workflow_runs;",
+    )
+    .await
+    .unwrap();
+
+    assert_reset_required_without_mutation(&conn).await;
+}
+
+#[tokio::test]
+async fn exact_legacy_schema_without_marker_is_republished() {
+    let (_directory, conn) = test_conn();
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    conn.execute(
+        "DELETE FROM session_schema_migrations WHERE name = 'workflow_indexing'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        require_admissible_workflow_index_schema(&conn)
+            .await
+            .unwrap(),
+        WorkflowIndexSchemaAdmission::Fresh
+    );
+    ensure_workflow_index_schema(&conn).await.unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT version FROM session_schema_migrations
+             WHERE name = 'workflow_indexing'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn ensure_workflow_index_schema_is_idempotent_for_current_schema() {
     let (_directory, conn) = test_conn();
     ensure_workflow_index_schema(&conn).await.unwrap();

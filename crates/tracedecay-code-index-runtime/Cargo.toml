@@ -14,15 +14,20 @@ doctest = false
 # Opt-in profiling. Hotpath macros are no-ops until the *binary* selects the
 # `hotpath/hotpath` backend (cargo unifies the proc-macro's features), so this
 # feature exists only for the `cfg(feature = "hotpath")` sites in this crate
-# that change compiled behaviour under profiling. It forwards nowhere else.
+# that change compiled behaviour under profiling. It also forwards the
+# semantic runtime's opt-in observation feature.
 # Type-coupled: `git_index_transactions::ProfiledFile` names the on-mode
 # `hotpath::io::InstrumentedIo` (hotpath 0.24 has no mode-agnostic `wrap`
 # alias for I/O), so any build that selects the backend with this crate in
 # its graph must select this feature too.
-hotpath = ["hotpath/hotpath"]
+hotpath = ["hotpath/hotpath", "tracedecay-semantic/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 lite = ["tracedecay-code-extraction/lite", "tracedecay-code-index/lite"]
 full = ["tracedecay-code-extraction/full", "tracedecay-code-index/full"]
+semantic-fastembed = [
+    "tracedecay-semantic/semantic-fastembed",
+    "tracedecay-application/semantic-fastembed",
+]
 # Forwards the kernel test-transport seam so this crate's unit tests can
 # reach `Database::publish_test_runtime` / `DatabaseAuthority::acquire_test`.
 test-transport = ["tracedecay-runtime-core/test-transport"]
@@ -73,6 +78,8 @@ tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
 tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
+tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0" }
+tracedecay-semantic-contracts.workspace = true
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
 tracedecay-store = { path = "../tracedecay-store", version = "0.1.0" }
 tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog", version = "0.1.0" }

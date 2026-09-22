@@ -1,7 +1,7 @@
 //! Read-only, record-aware recall with explicit provenance and admission policy.
 
-use crate::centers::read::{CompoundWeights, ReadResult};
 use crate::centers::MemoryCenters;
+use crate::centers::read::{CompoundWeights, ReadResult};
 use crate::numeric::{minkowski, validate_finite};
 use crate::records::{Record, RecordState, RecordTable, Support};
 use crate::types::{CenterSlot, CoreError, RecordId, SourceId};

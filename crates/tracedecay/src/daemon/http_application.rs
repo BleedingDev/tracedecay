@@ -111,10 +111,8 @@ impl ProjectRouterCache {
         {
             self.routers.remove(&evicted);
         }
-        self.routers.insert(
-            project_id.clone(),
-            ProjectRouterEntry { router, attempt },
-        );
+        self.routers
+            .insert(project_id.clone(), ProjectRouterEntry { router, attempt });
         self.touch(&project_id);
     }
 
@@ -275,10 +273,7 @@ impl DaemonHttpApplicationRegistry {
     /// lifts it, preventing an in-flight cold resolver from repopulating a
     /// failed attempt.
     #[hotpath::skip]
-    pub(super) async fn remove_project_route_if(
-        &self,
-        attempt: &ProjectHttpRouteAttempt,
-    ) -> bool {
+    pub(super) async fn remove_project_route_if(&self, attempt: &ProjectHttpRouteAttempt) -> bool {
         let Ok(project_id) = ProjectId::new(attempt.project_id.clone()) else {
             return false;
         };

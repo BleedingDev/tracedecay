@@ -177,12 +177,13 @@ function hitsForLane(
   lane: LaneId,
   rows: readonly Record<string, unknown>[],
   terms: readonly string[],
+  scopeIdentity?: string,
 ): Hit[] {
   switch (lane) {
     case 'code':
       return codeHits(rows, terms);
     case 'sessions':
-      return sessionHits(rows, terms);
+      return sessionHits(rows, terms, scopeIdentity);
     case 'knowledge':
       return knowledgeHits(rows, terms);
     default: {
@@ -218,6 +219,7 @@ export function laneFromSourceProgress(
   lane: LaneId,
   source: ExplorerSourceProgressV1,
   terms: readonly string[],
+  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (source.source_id !== LANE_SOURCE_ID[lane]) {
     // The record is addressed to another source, so it says nothing about this
@@ -237,7 +239,16 @@ export function laneFromSourceProgress(
       if (page === null) {
         return { state: 'ready', lane, hits: [], reportedTotal: null, unreadableRows: 0 };
       }
-      const hits = hitsForLane(lane, narrowPageRows(page), terms);
+      if (page.next_offset !== null || (page.total !== null && page.rows.length < page.total)) {
+        return {
+          state: 'unavailable',
+          lane,
+          errorCode: 'explorer_resume_cursor_unavailable',
+          detail:
+            'the Explorer source is truncated without a signed, scope-bound resume cursor',
+        };
+      }
+      const hits = hitsForLane(lane, narrowPageRows(page), terms, scopeIdentity);
       return {
         state: 'ready',
         lane,
@@ -247,16 +258,18 @@ export function laneFromSourceProgress(
       };
     }
     case 'partial': {
-      const page = source.page;
-      const hits = page === null ? [] : hitsForLane(lane, narrowPageRows(page), terms);
       return {
-        state: 'partial',
+        // Explorer's page contract carries only an offset continuation. It
+        // does not carry the signed, scope-bound cursor required to resume a
+        // truncated result safely. Keep legacy partial responses unreadable
+        // until the source can provide that cursor instead of rendering a
+        // misleading subset as usable findings.
+        state: 'unavailable',
         lane,
-        hits,
-        reportedTotal: page?.total ?? null,
-        unreadableRows: page === null ? 0 : page.rows.length - hits.length,
-        errorCode: source.error_code,
-        detail: source.message,
+        errorCode: source.error_code ?? 'explorer_resume_cursor_unavailable',
+        detail:
+          source.message ??
+          'the Explorer source is truncated without a signed, scope-bound resume cursor',
       };
     }
     case 'stale':
@@ -335,6 +348,7 @@ export function searchLane(
   result: EnvelopeResult<ExplorerQueryRunV1> | undefined,
   submittedQuery: string,
   terms: readonly string[],
+  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (result === undefined) return { state: 'pending', lane, phase: null };
   if (result.outcome === 'transport') {
@@ -343,7 +357,7 @@ export function searchLane(
   const run = result.envelope.payload;
   if (run.request.query !== submittedQuery) return { state: 'pending', lane, phase: null };
   const source = run.sources.find((candidate) => candidate.source_id === LANE_SOURCE_ID[lane]);
-  if (source !== undefined) return laneFromSourceProgress(lane, source, terms);
+  if (source !== undefined) return laneFromSourceProgress(lane, source, terms, scopeIdentity);
   // The coordinator has finished and never named this source. Leaving the lane
   // on `pending` would show a spinner for a read that will never arrive.
   return runIsTerminal(run.state)
@@ -364,14 +378,23 @@ export function browseLane<T>(
   isPending: boolean,
   rowsOf: (data: T) => readonly Record<string, unknown>[],
   terms: readonly string[],
+  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (isPending) return { state: 'pending', lane, phase: null };
   if (result === undefined) return { state: 'unanswered', lane };
   if (result.outcome === 'transport') {
     return laneFromTransport(lane, result.state, result.detail ?? null);
   }
+  if (result.envelope.domain_state === 'partial') {
+    return {
+      state: 'unavailable',
+      lane,
+      errorCode: 'explorer_resume_cursor_unavailable',
+      detail: 'the overview is truncated without an Explorer resume cursor',
+    };
+  }
   const rows = rowsOf(result.envelope.payload);
-  const hits = hitsForLane(lane, rows, terms);
+  const hits = hitsForLane(lane, rows, terms, scopeIdentity);
   return {
     state: 'ready',
     lane,

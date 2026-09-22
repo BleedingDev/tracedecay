@@ -8,7 +8,9 @@ pub(crate) mod recovery;
 mod selection;
 mod util;
 
-pub(crate) use util::{canonical_digest, durable_integrity_digest};
+pub(crate) use util::{
+    canonical_digest, durable_integrity_digest, validate_receipt_idempotency_key_json,
+};
 
 use super::*;
 use crate::ports::EncoderIdentity;
@@ -58,7 +60,12 @@ impl NcmEngine {
             Err(reply) => return reply,
         };
         if !NamespaceStore::exists(&self.root, namespace) {
-            return EngineReply::new(Outcome::Success, 0, ready_payload(&prepared, 0, true));
+            let encoder = self.encoder.identity();
+            return EngineReply::new(
+                Outcome::Success,
+                0,
+                ready_payload(&prepared, 0, true, &encoder),
+            );
         }
         let mut namespaces = match self.namespace_lock() {
             Ok(namespaces) => namespaces,
@@ -67,17 +74,23 @@ impl NcmEngine {
         let handle = match self.ensure_handle_mode(&mut namespaces, namespace, false, true) {
             Ok(Some(handle)) => handle,
             Ok(None) => {
-                return EngineReply::new(Outcome::Empty, 0, ready_payload(&prepared, 0, true));
+                let encoder = self.encoder.identity();
+                return EngineReply::new(
+                    Outcome::Empty,
+                    0,
+                    ready_payload(&prepared, 0, true, &encoder),
+                );
             }
             Err(reply) => return reply,
         };
         if handle.fenced {
             return unavailable_recovery(handle.commit_seq);
         }
+        let encoder = self.encoder.identity();
         EngineReply::new(
             Outcome::Success,
             handle.commit_seq,
-            ready_payload(handle.store.identity(), handle.epoch, false),
+            ready_payload(handle.store.identity(), handle.epoch, false, &encoder),
         )
     }
 

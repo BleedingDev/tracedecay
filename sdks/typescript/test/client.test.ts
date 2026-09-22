@@ -845,12 +845,8 @@ describe("TraceDecayClient transport envelopes", () => {
   });
 
   it("decodes each canonical page cursor shape and consumes its continuation", async () => {
-    const factId = `fact.v1.${"a".repeat(64)}.${"b".repeat(64)}`;
-    const searchCursor = {
-      score_millionths: 750_000,
-      updated_at: 1_700_000_000_000_000,
-      fact_id: factId,
-    };
+    const searchCursor = "fsc1.cursor.search";
+    const listCursor = "fsc1.cursor.list";
     const searchPayload = {
       graph_coverage: { kind: "not_applicable" },
       hits: [],
@@ -858,7 +854,7 @@ describe("TraceDecayClient transport envelopes", () => {
       owner: { kind: "profile" },
       retrieval_telemetry: { kind: "not_applicable" },
     };
-    const listPayload = { facts: [], next_after_fact_id: factId, owner: { kind: "profile" } };
+    const listPayload = { facts: [], next_after: listCursor, owner: { kind: "profile" } };
 
     await withServer(
       [
@@ -889,13 +885,13 @@ describe("TraceDecayClient transport envelopes", () => {
             response,
             200,
             factStoreEnvelope("fact_store_list", listPayload, {
-              kind: "fact_list_after",
-              fact_id: factId,
+              kind: "fact_list",
+              cursor: listCursor,
             }),
           ),
         (request, response, body) => {
           expect(request.url).toBe("/projects/project.sdk/application/retained/fact_store_list");
-          expect(JSON.parse(body)).toEqual({ after_fact_id: factId });
+          expect(JSON.parse(body)).toEqual({ after: listCursor });
           json(response, 200, factStoreEnvelope("fact_store_list", listPayload, null));
         },
       ],
@@ -929,11 +925,11 @@ describe("TraceDecayClient transport envelopes", () => {
         ).toBeNull();
 
         const list = evidencePage(await client.operations.application_fact_store_list({})).cursor;
-        expect(list).toEqual({ kind: "fact_list_after", fact_id: factId });
-        if (list?.kind !== "fact_list_after") throw new Error("expected a fact list cursor");
+        expect(list).toEqual({ kind: "fact_list", cursor: listCursor });
+        if (list?.kind !== "fact_list") throw new Error("expected a fact list cursor");
         expect(
           evidencePage(
-            await client.operations.application_fact_store_list({ after_fact_id: list.fact_id }),
+            await client.operations.application_fact_store_list({ after: list.cursor }),
           ).cursor,
         ).toBeNull();
       },
@@ -948,8 +944,8 @@ describe("TraceDecayClient transport envelopes", () => {
       { kind: "opaque", cursor: "" },
       { kind: "opaque", cursor: "tab\tseparated" },
       { kind: "fact_search", cursor: { score_millionths: 1, updated_at: 2 } },
-      { kind: "fact_search", cursor: { score_millionths: 4_294_967_296, updated_at: 2, fact_id: "f" } },
-      { kind: "fact_list_after", fact_id: 7 },
+      { kind: "fact_search", cursor: "a".repeat(4_097) },
+      { kind: "fact_list", cursor: 7 },
       { kind: "unknown_tag", cursor: "cursor.page-2" },
     ];
     let served: unknown = null;

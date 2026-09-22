@@ -209,10 +209,20 @@ pub async fn require_admissible_workflow_index_schema(
             required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
         }),
         None if workflow_index_objects_exist(conn).await? => {
-            Err(WorkflowIndexError::ResetRequired {
-                found_version: None,
-                required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
-            })
+            // A released legacy store can contain the exact workflow tables
+            // while its shared migration marker is absent (for example when
+            // the marker batch was interrupted after the DDL committed). The
+            // exact read-only contract is enough to resume that safe path;
+            // `ensure_workflow_index_schema` will re-publish the marker. Any
+            // attached drift still fails closed through the same validator.
+            if validate_workflow_index_schema(conn).await? {
+                Ok(WorkflowIndexSchemaAdmission::Fresh)
+            } else {
+                Err(WorkflowIndexError::ResetRequired {
+                    found_version: None,
+                    required_version: WORKFLOW_INDEX_SCHEMA_VERSION,
+                })
+            }
         }
         None => Ok(WorkflowIndexSchemaAdmission::Fresh),
     }
@@ -439,17 +449,23 @@ async fn workflow_index_schema_inventory(
 ) -> Result<BTreeSet<(String, String, String)>, WorkflowIndexError> {
     let mut rows = conn
         .query(
-            "SELECT type, name, tbl_name
+            "SELECT type, name, tbl_name, sql
              FROM sqlite_master
              WHERE name NOT GLOB 'sqlite_*'
                AND (
-                   lower(name) GLOB 'workflow_*'
-                   OR lower(name) GLOB 'idx_workflow_*'
+                   lower(name) IN (
+                       'workflow_runs',
+                       'workflow_agents',
+                       'workflow_index_meta',
+                       'idx_workflow_runs_parent',
+                       'idx_workflow_agents_run'
+                   )
                    OR lower(tbl_name) IN (
                        'workflow_runs',
                        'workflow_agents',
                        'workflow_index_meta'
                    )
+                   OR lower(type) = 'view'
                )
              ORDER BY type, name, tbl_name",
             (),
@@ -457,13 +473,50 @@ async fn workflow_index_schema_inventory(
         .await?;
     let mut names = BTreeSet::new();
     while let Some(row) = rows.next().await? {
-        names.insert((
-            row.get::<String>(0)?.to_ascii_lowercase(),
-            row.get::<String>(1)?,
-            row.get::<String>(2)?,
-        ));
+        let object_type = row.get::<String>(0)?;
+        let name = row.get::<String>(1)?;
+        let table = row.get::<String>(2)?;
+        let sql = row.get::<Option<String>>(3)?;
+        let is_legacy_object = is_legacy_workflow_index_object(&name, &table);
+        let is_legacy_view = object_type.eq_ignore_ascii_case("view")
+            && sql
+                .as_deref()
+                .is_some_and(sql_mentions_legacy_workflow_table);
+        if !is_legacy_object && !is_legacy_view {
+            continue;
+        }
+        names.insert((object_type.to_ascii_lowercase(), name, table));
     }
     Ok(names)
+}
+
+fn is_legacy_workflow_index_object(name: &str, table: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let table = table.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "workflow_runs"
+            | "workflow_agents"
+            | "workflow_index_meta"
+            | "idx_workflow_runs_parent"
+            | "idx_workflow_agents_run"
+    ) || matches!(
+        table.as_str(),
+        "workflow_runs" | "workflow_agents" | "workflow_index_meta"
+    )
+}
+
+fn sql_mentions_legacy_workflow_table(sql: &str) -> bool {
+    ["workflow_runs", "workflow_agents", "workflow_index_meta"]
+        .iter()
+        .any(|table| sql_mentions_identifier(sql, table))
+}
+
+fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
+    let identifier = identifier.to_ascii_lowercase();
+    sql.to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|token| token == identifier)
 }
 
 async fn schema_definition(

@@ -2,9 +2,9 @@ use super::{
     AnalyticsAction, AsyncRuntimeFlavor, Cli, CommandFamily, Commands, DAEMON_CPU_THREADS_ENV,
     DEFAULT_MAX_DAEMON_CPU_THREADS, HostBundleCliOptions, HostBundleComponentArg,
     PackageHookAction, ProfileStorageAction, ProjectsAction, RAYON_NUM_THREADS_ENV,
-    ScoopPackageHookAction, StderrTracingDefault, async_runtime_flavor, command_profile_label,
-    daemon_cpu_threads_from, hotpath_focus_is_valid, hotpath_output_format_is_none,
-    hotpath_output_format_is_valid, hotpath_output_path_is_valid,
+    ReplacementProviderArg, ScoopPackageHookAction, StderrTracingDefault, async_runtime_flavor,
+    command_profile_label, daemon_cpu_threads_from, hotpath_focus_is_valid,
+    hotpath_output_format_is_none, hotpath_output_format_is_valid, hotpath_output_path_is_valid,
     hotpath_requires_protocol_safe_output, is_full_component_set_adoption,
     normalize_tool_reserved_global_flags, runs_worldwide_counter_flush,
     should_skip_agent_install_check, should_skip_startup_maintenance, stderr_tracing_default,
@@ -214,6 +214,40 @@ fn storage_resets_still_reject_component_and_dry_run() {
         adopt: false,
     };
     assert!(validate_host_bundle_options(&command, family, &component).is_err());
+}
+
+#[test]
+fn replace_v1_allows_a_no_write_dry_run_without_host_scope() {
+    let command = Commands::Storage {
+        action: ProfileStorageAction::ReplaceV1 {
+            profile_root: Some("/tmp/profile".to_string()),
+            backup_to: "/tmp/backups".to_string(),
+            backup_id: "backup_v1".to_string(),
+            provider: ReplacementProviderArg::Native,
+            worker: Some("/opt/tracedecay-migrate-v1".to_string()),
+            timeout_seconds: 30,
+            json: true,
+        },
+    };
+    let options = HostBundleCliOptions {
+        component: None,
+        dry_run: true,
+        yes: false,
+        adopt: false,
+    };
+    validate_host_bundle_options(&command, CommandFamily::for_command(&command), &options)
+        .expect("replacement dry-run should be accepted without host lifecycle scope");
+    assert!(should_skip_startup_maintenance(&command));
+    assert!(should_skip_agent_install_check(&command));
+
+    let component = HostBundleCliOptions {
+        component: Some(HostBundleComponentArg::Core),
+        ..options
+    };
+    assert!(
+        validate_host_bundle_options(&command, CommandFamily::for_command(&command), &component)
+            .is_err()
+    );
 }
 
 #[test]

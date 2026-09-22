@@ -52,27 +52,40 @@ fn exhausted_near_page_reports_capped_verification_coverage() {
 }
 
 #[test]
-fn fresh_near_lane_keeps_result_and_lookahead_work_slots() {
-    assert_eq!(similar_exact_lane_budget(1, 3, true), (0, 0));
-    assert_eq!(similar_exact_lane_budget(4, 8, true), (3, 5));
-    assert_eq!(similar_exact_lane_budget(4, 8, false), (4, 7));
+fn exact_lane_can_fill_the_request_before_the_near_phase() {
+    assert_eq!(similar_exact_lane_budget(1, 3), (1, 2));
+    assert_eq!(similar_exact_lane_budget(4, 8), (4, 7));
 }
 
 #[test]
 fn exact_lane_budget_is_saturating_at_small_request_limits() {
-    assert_eq!(similar_exact_lane_budget(0, 0, true), (0, 0));
-    assert_eq!(similar_exact_lane_budget(1, 1, true), (0, 0));
-    assert_eq!(similar_exact_lane_budget(1, 2, true), (0, 0));
+    assert_eq!(similar_exact_lane_budget(0, 0), (0, 0));
+    assert_eq!(similar_exact_lane_budget(1, 1), (1, 0));
+    assert_eq!(similar_exact_lane_budget(1, 2), (1, 1));
+}
+
+#[test]
+fn exact_page_work_budget_includes_the_authenticated_lookahead_row() {
+    assert_eq!(exact_page_work_spent(4, true), 5);
+    assert_eq!(exact_page_work_spent(4, false), 4);
+    assert_eq!(exact_page_work_spent(0, true), 1);
+}
+
+#[test]
+fn exact_page_limit_reserves_lookahead_before_the_reader_runs() {
+    assert_eq!(exact_page_read_limit(5), 4);
+    assert_eq!(exact_page_read_limit(1), 0);
+    assert_eq!(exact_page_read_limit(0), 0);
 }
 
 fn test_source(
     eligibility: tracedecay_code_index::clones::CloneBodyEligibilityV1,
 ) -> tracedecay_code_index::clones::CodeIndexCloneBodyV1 {
-    let tokens = (0..14)
+    let tokens = (0..28)
         .map(
             |ordinal| tracedecay_code_index::clones::ConservativeCloneTokenV1::Syntax {
                 syntax_kind: "identifier".to_owned(),
-                text: format!("token{ordinal}"),
+                text: format!("token{}", ordinal % 14),
             },
         )
         .collect::<Vec<_>>();
@@ -125,7 +138,7 @@ fn test_source(
 }
 
 #[test]
-fn near_route_reservation_requires_the_requested_source_stream() {
+fn near_route_requires_the_requested_source_stream() {
     let eligible = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
     let whole = tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody;
     let conservative = [tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative];
@@ -167,13 +180,114 @@ fn selected_near_descriptor_is_distinct_from_whole_body_descriptor() {
 }
 
 #[test]
-fn exhausted_near_page_preserves_near_continuation_value() {
+fn selected_near_descriptor_binds_equal_slices_to_their_source_offsets() {
     let source = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
-    let cursor = "ccclone2.authenticated-near-cursor".to_owned();
+    let first =
+        CloneSelectedBlockV1::from_payload(&source.payload, source.occurrence.eligibility, 0..14)
+            .expect("first selected test block");
+    let second =
+        CloneSelectedBlockV1::from_payload(&source.payload, source.occurrence.eligibility, 14..28)
+            .expect("second selected test block");
+    assert_eq!(first.tokens(), second.tokens());
+    let artifact =
+        ManifestDigest::new(format!("sha256:{}", "b".repeat(64))).expect("artifact digest");
+    let first_descriptor = similar_near_query_descriptor(&source, &artifact, Some(&first))
+        .expect("first descriptor")
+        .expect("first stream");
+    let second_descriptor = similar_near_query_descriptor(&source, &artifact, Some(&second))
+        .expect("second descriptor")
+        .expect("second stream");
 
-    let read = similar_near_budget_exhausted_whole_body(&source, Some(cursor.clone()));
+    assert_ne!(
+        first_descriptor, second_descriptor,
+        "equal selected token slices at different offsets must not share a cursor"
+    );
+}
+
+#[test]
+fn similar_cursor_descriptor_binds_all_classes_and_the_source_extent() {
+    let source = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
+    let artifact =
+        ManifestDigest::new(format!("sha256:{}", "b".repeat(64))).expect("artifact digest");
+    let mut request = tracedecay_query::code_search::CodeIndexSimilarRequestV1 {
+        project_root: std::path::PathBuf::new(),
+        target: tracedecay_query::code_search::CodeIndexSimilarTargetV1::SymbolOccurrence(
+            source.occurrence.symbol_occurrence_id.clone(),
+        ),
+        source_extent: tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
+        match_classes: vec![tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative],
+        result_limit: 1,
+        work_limit: 4,
+        cursor: None,
+        authority: None,
+        deadline: None,
+        cancellation: None,
+    };
+    let conservative =
+        similar_query_descriptor(&request, &source, &artifact).expect("conservative descriptor");
+
+    request
+        .match_classes
+        .push(tracedecay_code_index::clones::CloneNormalizationClassV1::Rename);
+    let both_classes =
+        similar_query_descriptor(&request, &source, &artifact).expect("both-class descriptor");
+    assert_ne!(conservative, both_classes);
+
+    request.match_classes =
+        vec![tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative];
+    request.source_extent =
+        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
+            start: 1,
+            end: 8,
+        };
+    let selected =
+        similar_query_descriptor(&request, &source, &artifact).expect("selected descriptor");
+    assert_ne!(conservative, selected);
+}
+
+#[test]
+fn final_empty_partial_near_page_has_no_synthetic_continuation() {
+    let source = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
+
+    let read = similar_near_budget_exhausted_whole_body(&source);
     let tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) = read else {
         panic!("expected whole-body near read");
     };
-    assert_eq!(read.page.next_cursor, Some(cursor));
+    assert!(read.page.members.is_empty());
+    assert!(read.page.next_cursor.is_none());
+}
+
+#[test]
+fn exact_filled_page_advances_once_into_the_near_phase() {
+    let source = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
+    let read = similar_near_budget_exhausted_whole_body(&source);
+
+    assert!(similar_near_phase_cursor_needed(
+        false,
+        true,
+        true,
+        true,
+        similar_near_read_is_partial_without_cursor(&read),
+    ));
+    assert!(!similar_near_phase_cursor_needed(
+        true,
+        true,
+        true,
+        true,
+        similar_near_read_is_partial_without_cursor(&read),
+    ));
+}
+
+#[test]
+fn near_phase_completion_does_not_mint_another_cursor() {
+    let source = test_source(tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible);
+    let mut read = similar_near_budget_exhausted_whole_body(&source);
+    set_similar_near_next_cursor(&mut read, "ccclone2.near-phase".to_owned());
+    assert!(!similar_near_read_is_partial_without_cursor(&read));
+    assert!(!similar_near_phase_cursor_needed(
+        true, true, true, true, true,
+    ));
+    assert!(!similar_near_phase_cursor_needed(
+        false, false, false, true, true,
+    ));
 }

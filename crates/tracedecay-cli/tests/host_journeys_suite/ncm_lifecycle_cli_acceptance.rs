@@ -25,6 +25,12 @@ use tracedecay_daemon_protocol::BrokerStream;
 
 const NCM_SETTING: &str = "memory.provider_ncm_observer.v1";
 const WORKER_NAME: &str = "tracedecay-ncm-worker";
+const WORKER_MANIFEST_NAME: &str = "worker-manifest.json";
+const MODEL_ACQUISITION_MANIFEST_NAME: &str = "model-acquisition-manifest.json";
+const TRUSTED_MODEL_ACQUISITION_MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/release/model-acquisition-manifest.json"
+));
 
 struct NcmJourney {
     home: TempDir,
@@ -257,7 +263,7 @@ impl NcmJourney {
     fn write_interrupted_install_journal(&self) -> InterruptedInstall {
         let project_id = self.project_id();
         let profile_id = self.profile_id();
-        let operation_id = "interrupted-install";
+        let operation_id = "11111111111111111111111111111111";
         let worker_path = self
             .profile
             .join("ncm")
@@ -267,14 +273,21 @@ impl NcmJourney {
         let manifest_path = worker_path
             .parent()
             .expect("interrupted worker parent")
-            .join("worker-manifest.json");
+            .join(WORKER_MANIFEST_NAME);
+        let model_manifest_path = worker_path
+            .parent()
+            .expect("interrupted worker parent")
+            .join(MODEL_ACQUISITION_MANIFEST_NAME);
         let state_root = self.home.path().join("ncm-state");
         let worker_bytes = b"interrupted worker bytes";
         let manifest_bytes = br#"{"schema_version":1,"interrupted":true}"#;
+        let model_manifest_bytes = TRUSTED_MODEL_ACQUISITION_MANIFEST;
         fs::create_dir_all(worker_path.parent().expect("worker parent"))
             .expect("interrupted worker parent directory");
         fs::write(&worker_path, worker_bytes).expect("interrupted worker bytes");
         fs::write(&manifest_path, manifest_bytes).expect("interrupted manifest bytes");
+        fs::write(&model_manifest_path, model_manifest_bytes)
+            .expect("interrupted model acquisition manifest bytes");
         fs::create_dir_all(state_root.join("models")).expect("interrupted model root");
         fs::write(
             state_root.join("models/ncm-encoder-manifest.json"),
@@ -291,15 +304,20 @@ impl NcmJourney {
             "project_id": project_id,
             "worker_path": worker_path,
             "manifest_path": manifest_path,
+            "model_manifest_path": model_manifest_path,
             "state_root": state_root,
+            "before_configuration_revision": self.configuration_revision(),
             "before_document": disabled_document(),
             "after_document": enabled_document(&worker_path, &state_root),
             "before_worker_digest": null,
             "before_manifest_digest": null,
+            "before_model_manifest_digest": null,
             "after_worker_digest": sha256_hex(worker_bytes),
             "after_manifest_digest": sha256_hex(manifest_bytes),
+            "after_model_manifest_digest": sha256_hex(model_manifest_bytes),
             "before_worker_backup": null,
             "before_manifest_backup": null,
+            "before_model_manifest_backup": null,
         });
         let journal_path = self.profile.join("ncm/control-journal-v1.json");
         fs::create_dir_all(journal_path.parent().expect("journal parent"))
@@ -313,6 +331,7 @@ impl NcmJourney {
             journal_path,
             worker_path,
             manifest_path,
+            model_manifest_path,
             state_root,
             worker_bytes: worker_bytes.to_vec(),
         }
@@ -329,6 +348,7 @@ struct InterruptedInstall {
     journal_path: PathBuf,
     worker_path: PathBuf,
     manifest_path: PathBuf,
+    model_manifest_path: PathBuf,
     state_root: PathBuf,
     worker_bytes: Vec<u8>,
 }
@@ -431,6 +451,27 @@ fn ncm_recovery_rolls_back_interruption_and_rejects_symlink_and_revision_drift()
         String::from_utf8_lossy(&blocked.stderr)
     );
 
+    let original_journal = fs::read(&interrupted.journal_path).expect("interrupted journal bytes");
+    let mut foreign_journal: Value =
+        serde_json::from_slice(&original_journal).expect("interrupted journal JSON");
+    foreign_journal["profile_id"] = json!("profile.foreign");
+    fs::write(
+        &interrupted.journal_path,
+        serde_json::to_vec_pretty(&foreign_journal).expect("foreign journal JSON"),
+    )
+    .expect("foreign journal bytes");
+    let cross_scope = journey.ncm_output(true, "recover", &scoped_options(&journey.project, true));
+    assert!(!cross_scope.status.success());
+    assert!(
+        String::from_utf8_lossy(&cross_scope.stderr)
+            .contains("belongs to another profile or project"),
+        "cross-scope recovery must be refused\nstderr:\n{}",
+        String::from_utf8_lossy(&cross_scope.stderr)
+    );
+    assert!(interrupted.journal_path.is_file());
+    assert!(interrupted.worker_path.is_file());
+    fs::write(&interrupted.journal_path, original_journal).expect("restore interrupted journal");
+
     let symlink_target = journey.home.path().join("symlink-target");
     fs::write(&symlink_target, &interrupted.worker_bytes).expect("symlink target");
     fs::remove_file(&interrupted.worker_path).expect("replace staged worker with symlink");
@@ -439,10 +480,10 @@ fn ncm_recovery_rolls_back_interruption_and_rejects_symlink_and_revision_drift()
     let symlink_refusal =
         journey.ncm_output(true, "recover", &scoped_options(&journey.project, true));
     assert!(!symlink_refusal.status.success());
+    let symlink_stderr = String::from_utf8_lossy(&symlink_refusal.stderr);
     assert!(
-        String::from_utf8_lossy(&symlink_refusal.stderr).contains("not a regular file"),
-        "recovery must reject a symlinked staged worker\nstderr:\n{}",
-        String::from_utf8_lossy(&symlink_refusal.stderr)
+        symlink_stderr.contains("not a regular file") || symlink_stderr.contains("path is unsafe"),
+        "recovery must reject a symlinked staged worker\nstderr:\n{symlink_stderr}"
     );
     assert!(interrupted.journal_path.is_file());
     fs::remove_file(&interrupted.worker_path).expect("remove staged worker symlink");
@@ -472,6 +513,7 @@ fn ncm_recovery_rolls_back_interruption_and_rejects_symlink_and_revision_drift()
     assert!(!interrupted.journal_path.exists());
     assert!(!interrupted.worker_path.exists());
     assert!(!interrupted.manifest_path.exists());
+    assert!(!interrupted.model_manifest_path.exists());
     assert!(
         interrupted
             .state_root
@@ -482,6 +524,152 @@ fn ncm_recovery_rolls_back_interruption_and_rejects_symlink_and_revision_drift()
     let final_status = journey.status();
     assert_eq!(final_status["enabled"], false);
     assert_eq!(final_status["pending_recovery"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn ncm_update_and_uninstall_recovery_is_phase_aware_and_preserves_companion_manifest() {
+    let mut journey = NcmJourney::new();
+    journey.start_daemon();
+    journey.init_project();
+    let project_id = journey.project_id();
+    let profile_id = journey.profile_id();
+    let control_root = journey.profile.join("ncm");
+    let worker_root = control_root.join("worker");
+    let state_root = journey.home.path().join("ncm-state");
+    let old_operation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let new_operation = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let old_parent = worker_root.join(old_operation);
+    let new_parent = worker_root.join(new_operation);
+    let old_worker = old_parent.join(WORKER_NAME);
+    let old_manifest = old_parent.join(WORKER_MANIFEST_NAME);
+    let old_model_manifest = old_parent.join(MODEL_ACQUISITION_MANIFEST_NAME);
+    let new_worker = new_parent.join(WORKER_NAME);
+    let new_manifest = new_parent.join(WORKER_MANIFEST_NAME);
+    let new_model_manifest = new_parent.join(MODEL_ACQUISITION_MANIFEST_NAME);
+    fs::create_dir_all(&old_parent).expect("old worker parent");
+    fs::create_dir_all(&new_parent).expect("new worker parent");
+    fs::create_dir_all(&state_root).expect("NCM state root");
+    let old_worker_bytes = b"old worker bytes";
+    let old_manifest_bytes = b"old worker manifest";
+    let new_worker_bytes = b"new worker bytes";
+    let new_manifest_bytes = b"new worker manifest";
+    fs::write(&old_worker, old_worker_bytes).expect("old worker");
+    fs::write(&old_manifest, old_manifest_bytes).expect("old worker manifest");
+    fs::write(&old_model_manifest, TRUSTED_MODEL_ACQUISITION_MANIFEST)
+        .expect("old model acquisition manifest");
+    fs::write(&new_worker, new_worker_bytes).expect("new worker");
+    fs::write(&new_manifest, new_manifest_bytes).expect("new worker manifest");
+    fs::write(&new_model_manifest, TRUSTED_MODEL_ACQUISITION_MANIFEST)
+        .expect("new model acquisition manifest");
+
+    journey.set_observer_enabled(&project_id, &old_worker, &state_root);
+    let update_journal = control_root.join("control-journal-v1.json");
+    let update_before_document = enabled_document(&old_worker, &state_root);
+    let update_after_document = enabled_document(&new_worker, &state_root);
+    let update = json!({
+        "schema_version": 1,
+        "operation_id": new_operation,
+        "operation": "update",
+        "phase": "staged",
+        "profile_id": &profile_id,
+        "project_id": &project_id,
+        "worker_path": &new_worker,
+        "manifest_path": &new_manifest,
+        "model_manifest_path": &new_model_manifest,
+        "state_root": &state_root,
+        "before_configuration_revision": journey.configuration_revision(),
+        "before_document": update_before_document,
+        "after_document": update_after_document,
+        "before_worker_digest": sha256_hex(old_worker_bytes),
+        "before_manifest_digest": sha256_hex(old_manifest_bytes),
+        "before_model_manifest_digest": sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST),
+        "after_worker_digest": sha256_hex(new_worker_bytes),
+        "after_manifest_digest": sha256_hex(new_manifest_bytes),
+        "after_model_manifest_digest": sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST),
+        "before_worker_backup": null,
+        "before_manifest_backup": null,
+        "before_model_manifest_backup": null,
+    });
+    fs::write(
+        &update_journal,
+        serde_json::to_vec_pretty(&update).expect("update journal JSON"),
+    )
+    .expect("update journal");
+    let update_recovered =
+        journey.ncm_json(true, "recover", &scoped_options(&journey.project, true));
+    assert_eq!(update_recovered["operation"], "recover");
+    assert_eq!(update_recovered["outcome"], "recovered");
+    assert!(!new_parent.exists(), "staged update bundle is rolled back");
+    assert!(old_worker.is_file());
+    assert!(old_manifest.is_file());
+    assert!(old_model_manifest.is_file());
+    assert_eq!(
+        fs::read(&old_model_manifest).expect("old model acquisition manifest"),
+        TRUSTED_MODEL_ACQUISITION_MANIFEST
+    );
+
+    let uninstall_operation = "cccccccccccccccccccccccccccccccc";
+    let backup_parent = control_root.join("backups").join(uninstall_operation);
+    fs::create_dir_all(&backup_parent).expect("uninstall backup parent");
+    fs::write(backup_parent.join(WORKER_NAME), old_worker_bytes).expect("worker backup");
+    fs::write(backup_parent.join(WORKER_MANIFEST_NAME), old_manifest_bytes)
+        .expect("worker manifest backup");
+    fs::write(
+        backup_parent.join(MODEL_ACQUISITION_MANIFEST_NAME),
+        TRUSTED_MODEL_ACQUISITION_MANIFEST,
+    )
+    .expect("model acquisition manifest backup");
+    let uninstall_before_document = enabled_document(&old_worker, &state_root);
+    let uninstall = json!({
+        "schema_version": 1,
+        "operation_id": uninstall_operation,
+        "operation": "uninstall",
+        "phase": "staged",
+        "profile_id": journey.profile_id(),
+        "project_id": journey.project_id(),
+        "worker_path": &old_worker,
+        "manifest_path": &old_manifest,
+        "model_manifest_path": &old_model_manifest,
+        "state_root": &state_root,
+        "before_configuration_revision": journey.configuration_revision(),
+        "before_document": uninstall_before_document,
+        "after_document": disabled_document(),
+        "before_worker_digest": sha256_hex(old_worker_bytes),
+        "before_manifest_digest": sha256_hex(old_manifest_bytes),
+        "before_model_manifest_digest": sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST),
+        "after_worker_digest": null,
+        "after_manifest_digest": null,
+        "after_model_manifest_digest": null,
+        "before_worker_backup": backup_parent.join(WORKER_NAME),
+        "before_manifest_backup": backup_parent.join(WORKER_MANIFEST_NAME),
+        "before_model_manifest_backup": backup_parent.join(MODEL_ACQUISITION_MANIFEST_NAME),
+    });
+    fs::write(
+        &update_journal,
+        serde_json::to_vec_pretty(&uninstall).expect("uninstall journal JSON"),
+    )
+    .expect("uninstall journal");
+    journey.set_observer_disabled(&journey.project_id());
+    fs::write(&old_model_manifest, b"tampered installed model manifest")
+        .expect("tampered installed model manifest");
+    let uninstall_recovered =
+        journey.ncm_json(true, "recover", &scoped_options(&journey.project, true));
+    assert_eq!(uninstall_recovered["operation"], "uninstall");
+    assert_eq!(uninstall_recovered["outcome"], "committed");
+    assert!(!update_journal.exists());
+    assert!(!backup_parent.exists(), "verified backups are cleaned");
+    assert!(
+        old_worker.is_file(),
+        "disable recovery keeps the worker available"
+    );
+    assert!(old_manifest.is_file());
+    assert_eq!(
+        fs::read(&old_model_manifest).expect("tampered model acquisition manifest"),
+        b"tampered installed model manifest"
+    );
+    assert_eq!(journey.status()["enabled"], false);
+    assert_eq!(journey.status()["pending_recovery"], false);
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -512,6 +700,58 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
         .expect("reference worker manifest");
     let source_manifest = source_root.join("worker-manifest.json");
     fs::copy(&reference_manifest, &source_manifest).expect("copy worker manifest");
+    let reference_model_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../product/ncm/release/model-acquisition-manifest.json")
+        .canonicalize()
+        .expect("reference model acquisition manifest");
+    let source_model_manifest = source_root.join(MODEL_ACQUISITION_MANIFEST_NAME);
+    fs::copy(&reference_model_manifest, &source_model_manifest)
+        .expect("copy model acquisition manifest");
+
+    fs::remove_file(&source_model_manifest).expect("remove model acquisition manifest");
+    let missing_model_manifest = journey.ncm_output(
+        true,
+        "install",
+        &install_options(&journey.project, &source_worker, &model_root),
+    );
+    assert!(!missing_model_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_model_manifest.stderr)
+            .contains("model acquisition manifest is missing")
+    );
+    assert!(
+        fs::read_dir(journey.profile.join("ncm/worker"))
+            .expect("control worker root after rejected install")
+            .next()
+            .is_none()
+    );
+    fs::copy(&reference_model_manifest, &source_model_manifest)
+        .expect("restore model acquisition manifest");
+
+    let trusted_model_manifest = fs::read(&source_model_manifest).expect("trusted model manifest");
+    fs::write(
+        &source_model_manifest,
+        b"tampered model acquisition manifest",
+    )
+    .expect("tamper model acquisition manifest");
+    let tampered_model_manifest = journey.ncm_output(
+        true,
+        "install",
+        &install_options(&journey.project, &source_worker, &model_root),
+    );
+    assert!(!tampered_model_manifest.status.success());
+    assert!(
+        String::from_utf8_lossy(&tampered_model_manifest.stderr)
+            .contains("failed trusted release verification")
+    );
+    assert!(
+        fs::read_dir(journey.profile.join("ncm/worker"))
+            .expect("control worker root after tampered install")
+            .next()
+            .is_none()
+    );
+    fs::write(&source_model_manifest, trusted_model_manifest)
+        .expect("restore trusted model manifest bytes");
 
     let wrong_target_root = journey.home.path().join("wrong-target");
     fs::create_dir_all(&wrong_target_root).expect("wrong target root");
@@ -525,6 +765,11 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
         serde_json::to_vec_pretty(&wrong_manifest).expect("wrong target manifest"),
     )
     .expect("wrong target manifest bytes");
+    fs::copy(
+        &source_model_manifest,
+        wrong_target_root.join(MODEL_ACQUISITION_MANIFEST_NAME),
+    )
+    .expect("wrong target model acquisition manifest");
     let mut wrong_target = scoped_options(&journey.project, true);
     wrong_target.extend(strings(&[
         "--worker",
@@ -550,9 +795,14 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
         .expect("symlink worker");
     fs::copy(
         &source_manifest,
-        symlink_worker_root.join("worker-manifest.json"),
+        symlink_worker_root.join(WORKER_MANIFEST_NAME),
     )
     .expect("symlink worker manifest");
+    fs::copy(
+        &source_model_manifest,
+        symlink_worker_root.join(MODEL_ACQUISITION_MANIFEST_NAME),
+    )
+    .expect("symlink worker model acquisition manifest");
     let mut symlink_worker = scoped_options(&journey.project, true);
     symlink_worker.extend(strings(&[
         "--worker",
@@ -584,6 +834,10 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
     assert_eq!(installed["model_state"], "preserved");
     assert_eq!(installed["native_state"], "preserved");
     assert_eq!(installed["recall_routing"], "preserved");
+    assert_eq!(
+        installed["model_manifest_sha256"],
+        Value::String(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST))
+    );
     let installed_worker = PathBuf::from(
         installed["worker_path"]
             .as_str()
@@ -591,8 +845,17 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
     );
     assert!(installed_worker.starts_with(journey.profile.join("ncm/worker")));
     assert!(installed_worker.is_file());
+    let installed_model_manifest = installed_worker
+        .parent()
+        .expect("installed worker parent")
+        .join(MODEL_ACQUISITION_MANIFEST_NAME);
+    assert_eq!(
+        fs::read(&installed_model_manifest).expect("installed model acquisition manifest"),
+        fs::read(&reference_model_manifest).expect("reference model acquisition manifest bytes")
+    );
     assert_eq!(journey.status()["enabled"], true);
     assert_eq!(journey.status()["model_manifest_present"], true);
+    assert_eq!(journey.status()["model_acquisition_manifest_present"], true);
 
     let updated = journey.ncm_json(true, "update", &scoped_options(&journey.project, true));
     assert_eq!(updated["operation"], "update");
@@ -601,6 +864,10 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
         updated["state_root"].as_str(),
         Some(model_root.to_str().expect("model root is UTF-8"))
     );
+    assert_eq!(
+        updated["model_manifest_sha256"],
+        Value::String(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST))
+    );
     let updated_worker = PathBuf::from(
         updated["worker_path"]
             .as_str()
@@ -608,12 +875,56 @@ fn ncm_worker_lifecycle_verifies_target_and_preserves_model_state() {
     );
     assert_ne!(updated_worker, installed_worker);
     assert!(updated_worker.is_file());
+    let updated_model_manifest = updated_worker
+        .parent()
+        .expect("updated worker parent")
+        .join(MODEL_ACQUISITION_MANIFEST_NAME);
+    assert_eq!(
+        fs::read(&updated_model_manifest).expect("updated model acquisition manifest"),
+        fs::read(&reference_model_manifest).expect("reference model acquisition manifest bytes")
+    );
 
+    let updated_model_manifest_bytes =
+        fs::read(&updated_model_manifest).expect("updated model manifest bytes");
+    fs::write(
+        &updated_model_manifest,
+        b"tampered installed model manifest",
+    )
+    .expect("tamper installed model manifest");
+    let tampered_status = journey.status();
+    assert_eq!(tampered_status["model_acquisition_manifest_present"], true);
+    assert_eq!(tampered_status["encoder_ready"], false);
+    // A damaged installation still has a guarded disable path. The daemon is
+    // intentionally kept live here: the CLI must disable configuration while
+    // leaving bytes in place until the live owner releases them.
+    let tampered_uninstall =
+        journey.ncm_output(true, "uninstall", &scoped_options(&journey.project, true));
+    assert!(tampered_uninstall.status.success());
+    assert!(updated_worker.is_file());
+    assert!(updated_model_manifest.is_file());
+    assert_eq!(journey.status()["enabled"], false);
+    fs::write(&updated_model_manifest, updated_model_manifest_bytes)
+        .expect("restore installed model manifest");
+
+    let reinstalled = journey.ncm_json(true, "install", &install);
+    assert_eq!(reinstalled["outcome"], "committed");
+    let reinstalled_worker = PathBuf::from(
+        reinstalled["worker_path"]
+            .as_str()
+            .expect("reinstalled worker path"),
+    );
     let uninstalled = journey.ncm_json(true, "uninstall", &scoped_options(&journey.project, true));
     assert_eq!(uninstalled["operation"], "uninstall");
     assert_eq!(uninstalled["outcome"], "committed");
     assert_eq!(uninstalled["model_state"], "preserved");
-    assert!(!updated_worker.exists());
+    assert!(reinstalled_worker.exists());
+    assert!(
+        reinstalled_worker
+            .parent()
+            .expect("reinstalled worker parent")
+            .join(MODEL_ACQUISITION_MANIFEST_NAME)
+            .exists()
+    );
     assert!(model_manifest.is_file());
     assert_eq!(
         fs::read(&model_manifest).expect("model state"),
@@ -632,6 +943,17 @@ fn scoped_options(project: &Path, json: bool) -> Vec<String> {
     if json {
         options.push("--json".to_owned());
     }
+    options
+}
+
+fn install_options(project: &Path, worker: &Path, state_root: &Path) -> Vec<String> {
+    let mut options = scoped_options(project, true);
+    options.extend(strings(&[
+        "--worker",
+        worker.to_str().expect("worker path is UTF-8"),
+        "--state-root",
+        state_root.to_str().expect("state root is UTF-8"),
+    ]));
     options
 }
 

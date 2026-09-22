@@ -151,9 +151,18 @@ pub struct CloneArtifactCursorV1 {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(super) enum CloneArtifactCursorPositionV1 {
     Exact(SymbolOccurrenceId),
+    ExactStart(CloneExactKeyV1),
+    /// Authenticated marker that advances the shared similar request from the
+    /// exact lane into the near lane. It is consumed by serving and must never
+    /// be handed to a fingerprint reader as a posting position.
+    NearStart,
     Fingerprint {
         body_digest: ManifestDigest,
         payload_digest: ManifestDigest,
+        /// When present, continue inside the candidate's grouped occurrence
+        /// set before advancing to the next candidate body.
+        #[serde(default)]
+        occurrence_id: Option<SymbolOccurrenceId>,
     },
     FingerprintDiscovery {
         discovery: CloneFingerprintDiscoveryPositionV2,
@@ -170,6 +179,7 @@ impl CloneArtifactCursorV1 {
             CloneArtifactCursorPositionV1::Fingerprint {
                 body_digest,
                 payload_digest,
+                ..
             } => Some((body_digest, payload_digest)),
             CloneArtifactCursorPositionV1::FingerprintDiscovery {
                 comparison_body_digest: Some(body_digest),
@@ -177,7 +187,9 @@ impl CloneArtifactCursorV1 {
                 ..
             } => Some((body_digest, payload_digest)),
             CloneArtifactCursorPositionV1::FingerprintDiscovery { .. } => None,
-            CloneArtifactCursorPositionV1::Exact(_) => None,
+            CloneArtifactCursorPositionV1::Exact(_)
+            | CloneArtifactCursorPositionV1::ExactStart(_)
+            | CloneArtifactCursorPositionV1::NearStart => None,
         }
     }
 
@@ -187,7 +199,8 @@ impl CloneArtifactCursorV1 {
     pub fn is_fingerprint_continuation(&self) -> bool {
         matches!(
             &self.after,
-            CloneArtifactCursorPositionV1::Fingerprint { .. }
+            CloneArtifactCursorPositionV1::NearStart
+                | CloneArtifactCursorPositionV1::Fingerprint { .. }
                 | CloneArtifactCursorPositionV1::FingerprintDiscovery { .. }
         )
     }
@@ -218,12 +231,20 @@ impl CloneArtifactCursorV1 {
                 CloneArtifactCursorPositionV2::Exact {
                     symbol_occurrence_id,
                 } => CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id),
+                CloneArtifactCursorPositionV2::ExactStart { key } => {
+                    CloneArtifactCursorPositionV1::ExactStart(key)
+                }
+                CloneArtifactCursorPositionV2::NearStart => {
+                    CloneArtifactCursorPositionV1::NearStart
+                }
                 CloneArtifactCursorPositionV2::Fingerprint {
                     body_digest,
                     payload_digest,
+                    occurrence_id,
                 } => CloneArtifactCursorPositionV1::Fingerprint {
                     body_digest,
                     payload_digest,
+                    occurrence_id,
                 },
                 CloneArtifactCursorPositionV2::FingerprintDiscovery {
                     discovery,
@@ -262,23 +283,45 @@ impl CloneArtifactCursorV1 {
         snapshot_digest: ManifestDigest,
         now: UtcMicros,
     ) -> Result<String, CloneCursorErrorV1> {
-        codec.issue_artifact(
+        self.encode_authenticated_with_similar_descriptor(codec, snapshot_digest, None, now)
+    }
+
+    /// Convert this verified internal cursor into the authenticated clone
+    /// wire while retaining the full Similar request binding used by the
+    /// serving owner.
+    pub fn encode_authenticated_with_similar_descriptor(
+        &self,
+        codec: &CloneCursorCodecV1<'_>,
+        snapshot_digest: ManifestDigest,
+        similar_query_descriptor: Option<&ManifestDigest>,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorErrorV1> {
+        codec.issue_artifact_with_similar_descriptor(
             self.artifact_digest.clone(),
             self.generation.clone(),
             snapshot_digest,
             self.request_digest.clone(),
+            similar_query_descriptor.cloned(),
             match &self.after {
                 CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id) => {
                     CloneArtifactCursorPositionV2::Exact {
                         symbol_occurrence_id: symbol_occurrence_id.clone(),
                     }
                 }
+                CloneArtifactCursorPositionV1::ExactStart(key) => {
+                    CloneArtifactCursorPositionV2::ExactStart { key: key.clone() }
+                }
+                CloneArtifactCursorPositionV1::NearStart => {
+                    CloneArtifactCursorPositionV2::NearStart
+                }
                 CloneArtifactCursorPositionV1::Fingerprint {
                     body_digest,
                     payload_digest,
+                    occurrence_id,
                 } => CloneArtifactCursorPositionV2::Fingerprint {
                     body_digest: body_digest.clone(),
                     payload_digest: payload_digest.clone(),
+                    occurrence_id: occurrence_id.clone(),
                 },
                 CloneArtifactCursorPositionV1::FingerprintDiscovery {
                     discovery,
@@ -891,7 +934,7 @@ impl CodeLexicalArtifactReaderV1 {
             key,
         ))
         .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-        let after = self.clone_exact_after(cursor, &request_digest)?;
+        let after = self.clone_exact_after(cursor, &request_digest, key)?;
         let fetch = limit.checked_add(1).ok_or_else(|| {
             CodeLexicalArtifactErrorV1::Contract("clone exact page limit overflowed".to_owned())
         })?;
@@ -960,6 +1003,37 @@ impl CodeLexicalArtifactReaderV1 {
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<AuthenticatedCloneArtifactPageV1<CloneExactArtifactMemberV1>, CloneCursorReadErrorV1>
     {
+        self.clone_exact_page_authenticated_with_similar_descriptor(
+            authority,
+            key,
+            cursor,
+            limit,
+            query_authority,
+            request,
+            snapshot_digest,
+            None,
+            now,
+            control,
+        )
+    }
+
+    /// Serve one exact clone page while binding its returned continuation to
+    /// the complete Similar request that owns the exact lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_page_authenticated_with_similar_descriptor(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: Option<&ManifestDigest>,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneArtifactPageV1<CloneExactArtifactMemberV1>, CloneCursorReadErrorV1>
+    {
         let codec = CloneCursorCodecV1::new(query_authority, request)?;
         let cursor = cursor
             .map(|encoded| {
@@ -970,8 +1044,23 @@ impl CodeLexicalArtifactReaderV1 {
                     snapshot_digest,
                     now,
                 )?;
-                if !matches!(decoded.after, CloneArtifactCursorPositionV2::Exact { .. }) {
+                if !matches!(
+                    decoded.after,
+                    CloneArtifactCursorPositionV2::Exact { .. }
+                        | CloneArtifactCursorPositionV2::ExactStart { .. }
+                ) {
                     return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
+                }
+                if similar_query_descriptor.is_some_and(|expected| {
+                    decoded.similar_query_descriptor.as_ref() != Some(expected)
+                }) {
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale));
+                }
+                if let CloneArtifactCursorPositionV2::ExactStart { key: cursor_key } =
+                    &decoded.after
+                    && cursor_key != key
+                {
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale));
                 }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })
@@ -982,7 +1071,14 @@ impl CodeLexicalArtifactReaderV1 {
         let next_cursor = page
             .next_cursor
             .as_ref()
-            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .map(|cursor| {
+                cursor.encode_authenticated_with_similar_descriptor(
+                    &codec,
+                    snapshot_digest.clone(),
+                    similar_query_descriptor,
+                    now,
+                )
+            })
             .transpose()?;
         Ok(AuthenticatedCloneArtifactPageV1 {
             members: page.members,
@@ -1006,6 +1102,32 @@ impl CodeLexicalArtifactReaderV1 {
         snapshot_digest: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<bool, CloneCursorReadErrorV1> {
+        self.clone_exact_cursor_matches_key_authenticated_with_similar_descriptor(
+            authority,
+            key,
+            encoded,
+            query_authority,
+            request,
+            snapshot_digest,
+            None,
+            now,
+        )
+    }
+
+    /// Verify an exact cursor's operation and full Similar request binding
+    /// before choosing the key whose posting stream it resumes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_cursor_matches_key_authenticated_with_similar_descriptor(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        encoded: &str,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: Option<&ManifestDigest>,
+        now: UtcMicros,
+    ) -> Result<bool, CloneCursorReadErrorV1> {
         let codec = CloneCursorCodecV1::new(query_authority, request)?;
         let decoded = codec.decode_artifact_unbound(
             encoded,
@@ -1014,8 +1136,22 @@ impl CodeLexicalArtifactReaderV1 {
             snapshot_digest,
             now,
         )?;
-        if !matches!(decoded.after, CloneArtifactCursorPositionV2::Exact { .. }) {
+        if !matches!(
+            decoded.after,
+            CloneArtifactCursorPositionV2::Exact { .. }
+                | CloneArtifactCursorPositionV2::ExactStart { .. }
+        ) {
             return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
+        }
+        if similar_query_descriptor
+            .is_some_and(|expected| decoded.similar_query_descriptor.as_ref() != Some(expected))
+        {
+            return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale));
+        }
+        if let CloneArtifactCursorPositionV2::ExactStart { key: cursor_key } = &decoded.after
+            && cursor_key != key
+        {
+            return Ok(false);
         }
         let authority_digest =
             clone_authority_digest(authority).map_err(CloneCursorReadErrorV1::Artifact)?;
@@ -1033,12 +1169,67 @@ impl CodeLexicalArtifactReaderV1 {
         Ok(decoded.query_descriptor == descriptor)
     }
 
+    /// Mint an authenticated boundary at the beginning of one exact key.
+    /// This is used when the request-wide work budget ends before that key is
+    /// opened, so the caller can resume the first unvisited key explicitly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_exact_start_cursor_authenticated(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        key: &CloneExactKeyV1,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: &ManifestDigest,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorReadErrorV1> {
+        let codec = CloneCursorCodecV1::new(query_authority, request)?;
+        let authority_digest =
+            clone_authority_digest(authority).map_err(CloneCursorReadErrorV1::Artifact)?;
+        let query_descriptor = canonical_sha256(&(
+            "tracedecay.clone-exact-request.v1",
+            self.receipt.artifact_digest(),
+            &authority_digest,
+            key,
+        ))
+        .map_err(|error| {
+            CloneCursorReadErrorV1::Artifact(CodeLexicalArtifactErrorV1::Contract(
+                error.to_string(),
+            ))
+        })?;
+        codec
+            .issue_artifact_with_similar_descriptor(
+                self.receipt.artifact_digest().clone(),
+                self.metadata.generation.clone(),
+                snapshot_digest.clone(),
+                query_descriptor,
+                Some(similar_query_descriptor.clone()),
+                CloneArtifactCursorPositionV2::ExactStart { key: key.clone() },
+                now,
+            )
+            .map_err(CloneCursorReadErrorV1::Cursor)
+    }
+
     pub fn clone_fingerprint_page(
         &self,
         authority: &CloneBodyOccurrenceV1,
         source: &CloneBodyPayloadV1,
         cursor: Option<&CloneArtifactCursorV1>,
         limit: usize,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneFingerprintArtifactReadV1, CodeLexicalArtifactErrorV1> {
+        self.clone_fingerprint_page_with_occurrence_limit(
+            authority, source, cursor, limit, None, control,
+        )
+    }
+
+    fn clone_fingerprint_page_with_occurrence_limit(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        cursor: Option<&CloneArtifactCursorV1>,
+        limit: usize,
+        occurrence_limit: Option<usize>,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<CloneFingerprintArtifactReadV1, CodeLexicalArtifactErrorV1> {
         self.validate_clone_lookup_authority(authority)?;
@@ -1055,6 +1246,7 @@ impl CodeLexicalArtifactReaderV1 {
                 selected_block: None,
                 cursor,
                 limit,
+                occurrence_limit,
                 control,
             },
         )
@@ -1077,6 +1269,36 @@ impl CodeLexicalArtifactReaderV1 {
         now: UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<AuthenticatedCloneFingerprintArtifactReadV1, CloneCursorReadErrorV1> {
+        self.clone_fingerprint_page_authenticated_with_similar_descriptor(
+            authority,
+            source,
+            cursor,
+            limit,
+            query_authority,
+            request,
+            snapshot_digest,
+            None,
+            now,
+            control,
+        )
+    }
+
+    /// Serve a whole-body near page while binding its continuation to the
+    /// complete Similar request that owns the near lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_fingerprint_page_authenticated_with_similar_descriptor(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: Option<&ManifestDigest>,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneFingerprintArtifactReadV1, CloneCursorReadErrorV1> {
         let codec = CloneCursorCodecV1::new(query_authority, request)?;
         let cursor = cursor
             .map(|encoded| {
@@ -1094,17 +1316,36 @@ impl CodeLexicalArtifactReaderV1 {
                 ) {
                     return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
                 }
+                if similar_query_descriptor.is_some_and(|expected| {
+                    decoded.similar_query_descriptor.as_ref() != Some(expected)
+                }) {
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale));
+                }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })
             .transpose()?;
         let read = self
-            .clone_fingerprint_page(authority, source, cursor.as_ref(), limit, control)
+            .clone_fingerprint_page_with_occurrence_limit(
+                authority,
+                source,
+                cursor.as_ref(),
+                limit,
+                Some(limit),
+                control,
+            )
             .map_err(map_authenticated_artifact_error)?;
         let next_cursor = read
             .page
             .next_cursor
             .as_ref()
-            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .map(|cursor| {
+                cursor.encode_authenticated_with_similar_descriptor(
+                    &codec,
+                    snapshot_digest.clone(),
+                    similar_query_descriptor,
+                    now,
+                )
+            })
             .transpose()?;
         Ok(AuthenticatedCloneFingerprintArtifactReadV1 {
             page: AuthenticatedCloneArtifactPageV1 {
@@ -1277,6 +1518,27 @@ impl CodeLexicalArtifactReaderV1 {
         limit: usize,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<CloneSelectedBlockArtifactReadV1, CodeLexicalArtifactErrorV1> {
+        self.clone_selected_block_page_with_occurrence_limit(
+            authority,
+            source,
+            selected_block,
+            cursor,
+            limit,
+            None,
+            control,
+        )
+    }
+
+    fn clone_selected_block_page_with_occurrence_limit(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        selected_block: &CloneSelectedBlockV1,
+        cursor: Option<&CloneArtifactCursorV1>,
+        limit: usize,
+        occurrence_limit: Option<usize>,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<CloneSelectedBlockArtifactReadV1, CodeLexicalArtifactErrorV1> {
         self.validate_clone_lookup_authority(authority)?;
         let authority_digest = clone_authority_digest(authority)?;
         let connection = self.lock_connection()?;
@@ -1291,6 +1553,7 @@ impl CodeLexicalArtifactReaderV1 {
                 selected_block: Some(selected_block),
                 cursor,
                 limit,
+                occurrence_limit,
                 control,
             },
         )?;
@@ -1346,6 +1609,38 @@ impl CodeLexicalArtifactReaderV1 {
         now: UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<AuthenticatedCloneSelectedBlockArtifactReadV1, CloneCursorReadErrorV1> {
+        self.clone_selected_block_page_authenticated_with_similar_descriptor(
+            authority,
+            source,
+            selected_block,
+            cursor,
+            limit,
+            query_authority,
+            request,
+            snapshot_digest,
+            None,
+            now,
+            control,
+        )
+    }
+
+    /// Serve a selected-block near page while binding its continuation to the
+    /// complete Similar request that owns the near lane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn clone_selected_block_page_authenticated_with_similar_descriptor(
+        &self,
+        authority: &CloneBodyOccurrenceV1,
+        source: &CloneBodyPayloadV1,
+        selected_block: &CloneSelectedBlockV1,
+        cursor: Option<&str>,
+        limit: usize,
+        query_authority: &crate::retrieval::QueryAuthorityV1,
+        request: &RetrievalRequest,
+        snapshot_digest: &ManifestDigest,
+        similar_query_descriptor: Option<&ManifestDigest>,
+        now: UtcMicros,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<AuthenticatedCloneSelectedBlockArtifactReadV1, CloneCursorReadErrorV1> {
         let codec = CloneCursorCodecV1::new(query_authority, request)?;
         let cursor = cursor
             .map(|encoded| {
@@ -1363,16 +1658,22 @@ impl CodeLexicalArtifactReaderV1 {
                 ) {
                     return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Invalid));
                 }
+                if similar_query_descriptor.is_some_and(|expected| {
+                    decoded.similar_query_descriptor.as_ref() != Some(expected)
+                }) {
+                    return Err(CloneCursorReadErrorV1::Cursor(CloneCursorErrorV1::Stale));
+                }
                 Ok(CloneArtifactCursorV1::from_authenticated(decoded))
             })
             .transpose()?;
         let read = self
-            .clone_selected_block_page(
+            .clone_selected_block_page_with_occurrence_limit(
                 authority,
                 source,
                 selected_block,
                 cursor.as_ref(),
                 limit,
+                Some(limit),
                 control,
             )
             .map_err(map_authenticated_artifact_error)?;
@@ -1380,7 +1681,14 @@ impl CodeLexicalArtifactReaderV1 {
             .page
             .next_cursor
             .as_ref()
-            .map(|cursor| cursor.encode_authenticated(&codec, snapshot_digest.clone(), now))
+            .map(|cursor| {
+                cursor.encode_authenticated_with_similar_descriptor(
+                    &codec,
+                    snapshot_digest.clone(),
+                    similar_query_descriptor,
+                    now,
+                )
+            })
             .transpose()?;
         Ok(AuthenticatedCloneSelectedBlockArtifactReadV1 {
             page: AuthenticatedCloneArtifactPageV1 {
@@ -1398,6 +1706,7 @@ impl CodeLexicalArtifactReaderV1 {
         &self,
         cursor: Option<&'a CloneArtifactCursorV1>,
         request_digest: &ManifestDigest,
+        key: &CloneExactKeyV1,
     ) -> Result<&'a str, CodeLexicalArtifactErrorV1> {
         match cursor {
             Some(cursor)
@@ -1409,12 +1718,26 @@ impl CodeLexicalArtifactReaderV1 {
                     CloneArtifactCursorPositionV1::Exact(symbol_occurrence_id) => {
                         Ok(symbol_occurrence_id.as_str())
                     }
+                    CloneArtifactCursorPositionV1::ExactStart(cursor_key) if cursor_key == key => {
+                        Ok("")
+                    }
+                    CloneArtifactCursorPositionV1::ExactStart(_) => {
+                        Err(CodeLexicalArtifactErrorV1::Contract(
+                            "clone exact cursor does not match its artifact, key, or authority"
+                                .to_owned(),
+                        ))
+                    }
                     CloneArtifactCursorPositionV1::Fingerprint { .. } => {
                         Err(CodeLexicalArtifactErrorV1::Contract(
                             "clone cursor position does not match an exact read".to_owned(),
                         ))
                     }
                     CloneArtifactCursorPositionV1::FingerprintDiscovery { .. } => {
+                        Err(CodeLexicalArtifactErrorV1::Contract(
+                            "clone cursor position does not match an exact read".to_owned(),
+                        ))
+                    }
+                    CloneArtifactCursorPositionV1::NearStart => {
                         Err(CodeLexicalArtifactErrorV1::Contract(
                             "clone cursor position does not match an exact read".to_owned(),
                         ))

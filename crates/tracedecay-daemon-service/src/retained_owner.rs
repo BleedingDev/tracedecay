@@ -437,7 +437,9 @@ impl ProjectMemoryProviderHostMountV1 {
     /// owner that was constructed during core composition.
     pub fn bind_session_retrieval(
         &self,
-        retrieval: Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
+        retrieval: Arc<
+            dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1,
+        >,
     ) -> Result<(), String> {
         let Some(mount) = self.native_session_retrieval_mount.as_ref() else {
             return Ok(());
@@ -1045,12 +1047,13 @@ pub async fn mount_project_memory_provider_full(
         if configured.activation
             == tracedecay_memory_provider_registry::ObservationMountActivationV1::BeforePublication
         {
-            if let Err(error) = observation_journey::activate_required_with_startup_replay(
-                Arc::clone(&journey),
-                inputs.session_db.observation_store(),
-                cancellation,
-            )
-            .await
+            if let Err(error) =
+                observation_journey::activate_required_with_startup_replay_and_delivery_settled(
+                    Arc::clone(&journey),
+                    inputs.session_db.observation_store(),
+                    cancellation,
+                )
+                .await
             {
                 fail_partial_provider_mount!(format!(
                     "provider observation startup replay failed: {error}"

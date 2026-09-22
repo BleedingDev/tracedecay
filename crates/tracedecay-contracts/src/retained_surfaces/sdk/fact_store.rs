@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use tracedecay_domain::{FactEventId, FactId};
 
 use super::{
-    FactCategoryV1, FactMetadataV1, FactReadOptionsV1, FactSearchCursorV1, MemoryScopeV1,
-    RetainedProjectSelectorV1,
+    FactCategoryV1, FactListCursorV1, FactMetadataV1, FactReadOptionsV1, FactSearchCursorV1,
+    MemoryScopeV1, RetainedProjectSelectorV1,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -167,7 +167,7 @@ pub struct FactStoreListRequestV1 {
     #[serde(flatten)]
     pub options: FactReadOptionsV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_fact_id: Option<FactId>,
+    pub after: Option<FactListCursorV1>,
 }
 
 #[cfg(test)]

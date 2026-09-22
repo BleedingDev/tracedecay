@@ -33,7 +33,8 @@ export function HitInspector({
   const Icon = LANE_ICON[hit.lane];
   const age = compactRelativeAge(hit.stamp, Date.now() / 1000);
   const sessionId = sessionIdOf(hit);
-  const session = useExplorerSessionContext(sessionId);
+  const provider = providerOf(hit);
+  const session = useExplorerSessionContext(sessionId, provider);
   return (
     <InspectorPanel
       title={hit.title}
@@ -150,6 +151,14 @@ export function HitInspector({
 function sessionIdOf(hit: Hit): string | undefined {
   if (hit.lane !== "sessions") return undefined;
   const raw = hit.raw["session_id"];
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+function providerOf(hit: Hit): string | undefined {
+  if (hit.lane !== "sessions") return undefined;
+  const raw = hit.raw["provider"] ?? hit.raw["source"];
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
   return trimmed === "" ? undefined : trimmed;

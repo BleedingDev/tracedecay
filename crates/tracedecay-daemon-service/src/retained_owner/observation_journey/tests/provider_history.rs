@@ -686,8 +686,7 @@ async fn history_delivery_wait_requires_receipts_and_rechecks_live_authority() {
         profile_id: fixture.profile.clone(),
         scope: fixture.scope.clone(),
         authoritative_project_id: fixture.project.clone(),
-        provider: crate::retained_owner::native_observation_mount(&journal_root, 1)
-            .unwrap(),
+        provider: crate::retained_owner::native_observation_mount(&journal_root, 1).unwrap(),
         store_data_root: journal_root,
         policy: ObservationJourneyPolicyV1::project_default(),
     })
@@ -823,11 +822,7 @@ async fn destination_history_uses_existing_journal_and_resumes_without_recopying
             profile_id: fixture.profile.clone(),
             scope: fixture.scope.clone(),
             authoritative_project_id: fixture.project.clone(),
-            provider: crate::retained_owner::native_observation_mount(
-                &journal_root,
-                1,
-            )
-            .unwrap(),
+            provider: crate::retained_owner::native_observation_mount(&journal_root, 1).unwrap(),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -968,8 +963,7 @@ async fn ordinary_admission_without_git_keeps_exact_journal_binding_and_refuses_
         profile_id: profile.clone(),
         scope: resolved.clone(),
         authoritative_project_id: project.clone(),
-        provider: crate::retained_owner::native_observation_mount(temp.path(), 1)
-            .unwrap(),
+        provider: crate::retained_owner::native_observation_mount(temp.path(), 1).unwrap(),
         store_data_root: temp.path().to_path_buf(),
         policy: ObservationJourneyPolicyV1::project_default(),
     })
@@ -1466,8 +1460,7 @@ async fn independently_selected_fresh_grants_preserve_durable_delivery_identity(
         profile_id: fixture.profile.clone(),
         scope: fixture.scope.clone(),
         authoritative_project_id: fixture.project.clone(),
-        provider: crate::retained_owner::native_observation_mount(&journal_root, 1)
-            .unwrap(),
+        provider: crate::retained_owner::native_observation_mount(&journal_root, 1).unwrap(),
         store_data_root: journal_root,
         policy: ObservationJourneyPolicyV1::project_default(),
     })

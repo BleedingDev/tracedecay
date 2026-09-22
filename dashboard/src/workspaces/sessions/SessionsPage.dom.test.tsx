@@ -116,6 +116,8 @@ describe('SessionsPage temporal retrieval state', () => {
                   exists: true,
                   bucket: 'day',
                   session_id: null,
+                  provider: null,
+                  next_cursor: null,
                   buckets: [
                     {
                       bucket: '2026-08-05',
@@ -168,6 +170,8 @@ describe('SessionsPage temporal retrieval state', () => {
                   matches: { messages: [], summary_nodes: [] },
                   query: '',
                   limit: 25,
+                  provider: null,
+                  next_cursor: null,
                 },
           ),
         );

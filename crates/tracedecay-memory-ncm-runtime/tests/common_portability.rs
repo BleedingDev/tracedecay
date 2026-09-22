@@ -13,7 +13,8 @@ use tempfile::TempDir;
 use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
-    FaultPoint, NcmEngine, ObserveRequest, Outcome, RecallRequest,
+    FaultPoint, MaintenanceKind, MaintenanceRequest, NcmEngine, ObserveRequest, Outcome,
+    RecallRequest,
 };
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
 use tracedecay_memory_ncm_runtime::snapshot;
@@ -28,6 +29,92 @@ fn digest(text: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn replace_json_array_field(bytes: &mut Vec<u8>, field: &str, replacement: &[u8]) {
+    let marker = format!("\"{field}\":").into_bytes();
+    let marker_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("snapshot field marker");
+    let start = marker_start + marker.len();
+    assert_eq!(bytes[start], b'[');
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth = depth.saturating_add(1),
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    end = Some(start + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.expect("snapshot array terminator");
+    bytes.splice(start..end, replacement.iter().copied());
+}
+
+fn replace_json_number_field(bytes: &mut Vec<u8>, field: &str, replacement: u64) {
+    let marker = format!("\"{field}\":").into_bytes();
+    let marker_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("snapshot field marker");
+    let start = marker_start + marker.len();
+    let end = start
+        + bytes[start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("snapshot number terminator");
+    let replacement = replacement.to_string();
+    bytes.splice(start..end, replacement.bytes());
+}
+
+fn snapshot_content_bytes(snapshot: &[u8]) -> Vec<u8> {
+    let marker = b",\"content_sha256\":\"";
+    let checksum_start = snapshot
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("snapshot checksum field");
+    let mut content = snapshot[..checksum_start].to_vec();
+    content.push(b'}');
+    content
+}
+
+fn snapshot_envelope(content: Vec<u8>) -> Vec<u8> {
+    assert_eq!(content.last().copied(), Some(b'}'));
+    let checksum = digest_bytes(&content);
+    let mut envelope = content;
+    envelope.pop();
+    envelope.extend_from_slice(b",\"content_sha256\":\"");
+    envelope.extend_from_slice(checksum.as_bytes());
+    envelope.extend_from_slice(b"\"}");
+    envelope
+}
+
 fn namespace() -> String {
     "ec".repeat(32)
 }
@@ -216,9 +303,19 @@ fn fresh_restore_scrubs_currently_blocked_sources_and_preserves_allocation_floor
         .collect();
     let id = format!("ncm-snapshot:{snapshot_digest}");
     let destination = engine(&destination_dir);
-    let restored=destination.common_portability(&namespace(),json!({"action":"snapshot_restore","idempotency_key":digest("restore"),"expected_generation":0,"bytes":snapshot,"blocked_sources":[digest("erased-secret")],"snapshot_id":id,"observation_sequence":1}),DEADLINE);
+    let restore_key = digest("restore");
+    let blocked = vec![digest("erased-secret")];
+    let restored=destination.common_portability(&namespace(),json!({"action":"snapshot_restore","idempotency_key":restore_key.clone(),"expected_generation":0,"bytes":snapshot.clone(),"blocked_sources":blocked.clone(),"snapshot_id":id.clone(),"observation_sequence":1}),DEADLINE);
     assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
     assert_eq!(inspect(&destination)["records"], 0);
+    let replayed = destination.common_portability(
+        &namespace(),
+        json!({"action":"snapshot_restore","idempotency_key":restore_key,"expected_generation":restored.state_generation,"bytes":snapshot,"blocked_sources":blocked,"snapshot_id":id,"observation_sequence":1}),
+        DEADLINE,
+    );
+    assert_eq!(replayed.outcome, Outcome::Success, "{replayed:?}");
+    assert_eq!(replayed.state_generation, restored.state_generation);
+    assert_eq!(replayed.payload["replayed"], true);
     let refused = destination.observe(&namespace(), observation("erased-secret", "fresh-delivery"));
     assert!(
         matches!(refused.outcome, Outcome::Rejected(_)),
@@ -242,6 +339,201 @@ fn fresh_restore_scrubs_currently_blocked_sources_and_preserves_allocation_floor
     );
     let denied_again = reopened.observe(&namespace(), observation("erased-secret", "another-key"));
     assert!(matches!(denied_again.outcome, Outcome::Rejected(_)));
+}
+
+#[test]
+fn fresh_restore_keeps_an_omitted_maintenance_before_a_stripped_observation_anchored() {
+    let source_dir = TempDir::new().unwrap();
+    let destination_dir = TempDir::new().unwrap();
+    let source = engine(&source_dir);
+    let blocked_source = "omitted-maintenance-blocked";
+    let retained = source.observe(&namespace(), observation("retained", "before-gap"));
+    assert_eq!(retained.outcome, Outcome::Success, "{retained:?}");
+    let maintenance = source.maintenance(
+        &namespace(),
+        MaintenanceRequest {
+            idempotency_key: digest("omitted-maintenance"),
+            kind: MaintenanceKind::Advance { ticks: 3 },
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(maintenance.outcome, Outcome::Success, "{maintenance:?}");
+    let blocked = source.observe(&namespace(), observation(blocked_source, "after-gap"));
+    assert_eq!(blocked.outcome, Outcome::Success, "{blocked:?}");
+    let snapshot = snapshot::export(&source, &namespace(), DEADLINE)
+        .unwrap()
+        .into_vec();
+    let snapshot_digest: String = Sha256::digest(&snapshot)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let destination = engine(&destination_dir);
+    let restored = destination.common_portability(
+        &namespace(),
+        json!({
+            "action": "snapshot_restore",
+            "idempotency_key": digest("omitted-maintenance-restore"),
+            "expected_generation": 0,
+            "bytes": snapshot,
+            "blocked_sources": [digest(blocked_source)],
+            "snapshot_id": format!("ncm-snapshot:{snapshot_digest}"),
+            "observation_sequence": 1
+        }),
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    assert_eq!(inspect(&destination)["records"], 1);
+    assert_eq!(
+        destination.revoked_sources(&namespace()).unwrap(),
+        vec![SourceId(digest(blocked_source))]
+    );
+}
+
+#[test]
+fn fresh_restore_uses_a_gap_marker_when_a_stripped_observation_receipt_is_omitted() {
+    let source_dir = TempDir::new().unwrap();
+    let destination_dir = TempDir::new().unwrap();
+    let source = engine(&source_dir);
+    let blocked_source = "omitted-observe-blocked";
+    let observed = source.observe(&namespace(), observation(blocked_source, "omitted-observe"));
+    assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    let exported = snapshot::export(&source, &namespace(), DEADLINE)
+        .unwrap()
+        .into_vec();
+    let mut content = snapshot_content_bytes(&exported);
+    replace_json_array_field(&mut content, "events", b"[]");
+    replace_json_number_field(&mut content, "events_bytes", 2);
+    replace_json_number_field(&mut content, "event_count", 0);
+    let snapshot = snapshot_envelope(content);
+    let snapshot_digest = digest_bytes(&snapshot);
+
+    let destination = engine(&destination_dir);
+    let restored = destination.common_portability(
+        &namespace(),
+        json!({
+            "action": "snapshot_restore",
+            "idempotency_key": digest("omitted-observe-restore"),
+            "expected_generation": 0,
+            "bytes": snapshot,
+            "blocked_sources": [digest(blocked_source)],
+            "snapshot_id": format!("ncm-snapshot:{snapshot_digest}"),
+            "observation_sequence": 1
+        }),
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    assert_eq!(inspect(&destination)["records"], 0);
+    assert_eq!(
+        destination.revoked_sources(&namespace()).unwrap(),
+        vec![SourceId(digest(blocked_source))]
+    );
+}
+
+#[test]
+fn snapshot_restore_replay_identity_binds_blocked_sources_without_mutation() {
+    let source_dir = TempDir::new().unwrap();
+    let destination_dir = TempDir::new().unwrap();
+    let source = engine(&source_dir);
+    let source_label = "authority-bound-source";
+    let source_id = digest(source_label);
+    let observed = source.observe(&namespace(), observation(source_label, "authority-bound"));
+    assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    let snapshot = snapshot::export(&source, &namespace(), DEADLINE)
+        .unwrap()
+        .into_vec();
+    let snapshot_digest: String = Sha256::digest(&snapshot)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let destination = engine(&destination_dir);
+    let first = destination.common_portability(
+        &namespace(),
+        json!({
+            "action": "snapshot_restore",
+            "idempotency_key": digest("authority-bound-restore"),
+            "expected_generation": 0,
+            "bytes": snapshot.clone(),
+            "blocked_sources": [source_id],
+            "snapshot_id": format!("ncm-snapshot:{snapshot_digest}"),
+            "observation_sequence": 1
+        }),
+        DEADLINE,
+    );
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    let before_conflict = inspect(&destination);
+
+    let changed_authority = destination.common_portability(
+        &namespace(),
+        json!({
+            "action": "snapshot_restore",
+            "idempotency_key": digest("authority-bound-restore"),
+            "expected_generation": first.state_generation,
+            "bytes": snapshot,
+            "blocked_sources": [],
+            "snapshot_id": format!("ncm-snapshot:{snapshot_digest}"),
+            "observation_sequence": 1
+        }),
+        DEADLINE,
+    );
+    assert!(matches!(changed_authority.outcome, Outcome::Rejected(_)));
+    assert_eq!(inspect(&destination), before_conflict);
+}
+
+#[test]
+fn fresh_restore_preserves_completed_deletion_receipt_for_k_replay() {
+    let source_dir = TempDir::new().unwrap();
+    let destination_dir = TempDir::new().unwrap();
+    let source = engine(&source_dir);
+    let source_label = "receipt-preserved-source";
+    let source_id = digest(source_label);
+    let deletion_key = digest("receipt-preserved-delete");
+    let observed = source.observe(&namespace(), observation(source_label, "receipt-preserved"));
+    assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    let deleted = source.delete_by_source(
+        &namespace(),
+        &SourceId(source_id.clone()),
+        &deletion_key,
+        DEADLINE,
+    );
+    assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
+    let snapshot = snapshot::export(&source, &namespace(), DEADLINE)
+        .unwrap()
+        .into_vec();
+    let snapshot_digest: String = Sha256::digest(&snapshot)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    let destination = engine(&destination_dir);
+    let restored = destination.common_portability(
+        &namespace(),
+        json!({
+            "action": "snapshot_restore",
+            "idempotency_key": digest("receipt-preserved-restore"),
+            "expected_generation": 0,
+            "bytes": snapshot,
+            "blocked_sources": [],
+            "snapshot_id": format!("ncm-snapshot:{snapshot_digest}"),
+            "observation_sequence": 1
+        }),
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    drop(destination);
+
+    let reopened = engine(&destination_dir);
+    assert_eq!(
+        reopened.revoked_sources(&namespace()).unwrap(),
+        vec![SourceId(source_id.clone())]
+    );
+    let before_replay = inspect(&reopened);
+    let replayed =
+        reopened.delete_by_source(&namespace(), &SourceId(source_id), &deletion_key, DEADLINE);
+    assert_eq!(replayed.outcome, Outcome::Success, "{replayed:?}");
+    assert_eq!(replayed.payload["replayed"], true);
+    assert_eq!(replayed.state_generation, deleted.state_generation,);
+    assert_eq!(inspect(&reopened), before_replay);
 }
 
 #[test]

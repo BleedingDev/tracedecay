@@ -178,6 +178,13 @@ lite = ["tracedecay-code-index/lite", "tracedecay-code-index-runtime/lite"]
 medium = ["tracedecay-code-index/medium"]
 full = ["tracedecay-code-index/full", "tracedecay-code-index-runtime/full"]
 
+# Opt-in CPU FastEmbed semantic backend. Keep this out of `default` and
+# `production`; selecting it is an explicit binary feature choice.
+semantic-fastembed = [
+    "tracedecay-application/semantic-fastembed",
+    "tracedecay-code-index-runtime/semantic-fastembed",
+]
+
 # These aliases are intentionally repeated at the binary boundary: Cargo
 # cannot expose a dependency feature as a caller-selectable local feature.
 # Tier membership remains owned by tracedecay-code-extraction and reaches this

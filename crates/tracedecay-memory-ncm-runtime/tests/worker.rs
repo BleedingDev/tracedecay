@@ -96,9 +96,42 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn opaque_id(namespace: &str, kind: &[u8], value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"tracedecay.ncm.opaque-id.v1\0");
+    for field in [namespace.as_bytes(), kind, value.as_bytes()] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn worker_key(namespace: &str, public_key: &str) -> String {
+    opaque_id(namespace, b"idempotency-key", public_key)
+}
+
 fn observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
+    observe_payload_for_source(
+        idempotency_key,
+        &format!("source-{idempotency_key}"),
+        key,
+        value,
+    )
+}
+
+fn observe_payload_for_source(
+    idempotency_key: &str,
+    source: &str,
+    key: &str,
+    value: &str,
+) -> Value {
     observe_payload_with_provenance(
         idempotency_key,
+        source,
         key,
         value,
         json!({"origin": "worker-test"}),
@@ -110,6 +143,7 @@ fn common_observe_payload(idempotency_key: &str, key: &str, value: &str) -> Valu
         .expect("common capsule serializes");
     observe_payload_with_provenance(
         idempotency_key,
+        &format!("source-{idempotency_key}"),
         key,
         value,
         json!({
@@ -124,6 +158,7 @@ fn common_observe_payload(idempotency_key: &str, key: &str, value: &str) -> Valu
 
 fn observe_payload_with_provenance(
     idempotency_key: &str,
+    source: &str,
     key: &str,
     value: &str,
     provenance: Value,
@@ -131,7 +166,7 @@ fn observe_payload_with_provenance(
     let mut request = ObserveRequest {
         idempotency_key: idempotency_key.to_owned(),
         payload_sha256: String::new(),
-        source: SourceId(format!("source-{idempotency_key}")),
+        source: SourceId(source.to_owned()),
         key_text: key.to_owned(),
         value_text: value.to_owned(),
         affect: None,
@@ -176,12 +211,13 @@ fn common_maintenance_control(
 
 fn common_maintenance_control_page(
     namespace: &str,
-    idempotency_key: &str,
+    public_idempotency_key: &str,
     operation_id: &str,
     expected_generation: u64,
     maximum_items: u64,
     resume_cursor: Option<&str>,
 ) -> Value {
+    let idempotency_key = worker_key(namespace, public_idempotency_key);
     let mut control = json!({
         "action": "maintenance",
         "idempotency_key": idempotency_key,
@@ -209,7 +245,7 @@ fn common_maintenance_control_page(
     let admission = serde_json::to_vec(&json!({
         "namespace": namespace,
         "operation_id": operation_id,
-        "idempotency_key": idempotency_key,
+        "idempotency_key": public_idempotency_key,
         "request_semantic_sha256": digest(
             &serde_json::to_vec(&semantics).expect("maintenance semantics serialize")
         ),
@@ -402,7 +438,7 @@ fn snapshot_file_transport_crosses_bounded_frames_and_cleans_files() {
                 0,
                 Operation::SnapshotRestore,
                 &ns,
-                json!({"idempotency_key": "snapshot-file-restore", "snapshot": snapshot}),
+                json!({"idempotency_key": "snapshot-file-restore", "snapshot": snapshot, "blocked_sources": []}),
             ),
             CALL_DEADLINE,
         )
@@ -430,6 +466,110 @@ fn snapshot_file_transport_crosses_bounded_frames_and_cleans_files() {
         )
         .expect("restored namespace recalls");
     assert_eq!(recall.outcome, Outcome::Success);
+}
+
+#[test]
+fn snapshot_restore_requires_authority_and_scrubs_predelete_snapshot_on_fresh_worker() {
+    let source_root = TempDir::new().expect("source temp root");
+    let source = client(&source_root);
+    let ns = namespace(13);
+    let source_id = "source-predelete-worker";
+    let observed = source
+        .call(
+            Request::new(
+                1,
+                0,
+                Operation::Observe,
+                &ns,
+                observe_payload_for_source(
+                    "predelete-worker",
+                    source_id,
+                    "private key",
+                    "private value",
+                ),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("observe succeeds");
+    assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    let exported = source
+        .call(
+            Request::new(2, 0, Operation::SnapshotExport, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("snapshot export succeeds");
+    assert_eq!(exported.outcome, Outcome::Success, "{exported:?}");
+    let snapshot: Vec<u8> = serde_json::from_value(exported.payload.unwrap()["bytes"].clone())
+        .expect("snapshot bytes decode");
+    let deleted = source
+        .call(
+            Request::new(
+                3,
+                0,
+                Operation::DeleteBySource,
+                &ns,
+                json!({"idempotency_key":"delete-predelete-worker","source":source_id}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("delete succeeds");
+    assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
+
+    let target_root = TempDir::new().expect("target temp root");
+    let target = client(&target_root);
+    let missing_authority = target
+        .call(
+            Request::new(
+                4,
+                0,
+                Operation::SnapshotRestore,
+                &ns,
+                json!({"idempotency_key":"restore-without-authority","snapshot":snapshot.clone()}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("missing authority is a request rejection");
+    assert!(matches!(missing_authority.outcome, Outcome::Rejected(_)));
+    let empty = target
+        .call(
+            Request::new(5, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("empty target inspection succeeds");
+    assert_eq!(empty.outcome, Outcome::Empty, "{empty:?}");
+
+    let restored = target
+        .call(
+            Request::new(
+                6,
+                0,
+                Operation::SnapshotRestore,
+                &ns,
+                json!({"idempotency_key":"restore-with-authority","snapshot":snapshot,"blocked_sources":[source_id]}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("restore with authority succeeds");
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    let inspected = target
+        .call(
+            Request::new(7, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("restored inspection succeeds");
+    assert_eq!(inspected.outcome, Outcome::Success, "{inspected:?}");
+    assert_eq!(inspected.payload.unwrap()["records"], 0);
+    drop(target);
+
+    let reopened = client(&target_root);
+    let restarted = reopened
+        .call(
+            Request::new(8, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("restarted inspection succeeds");
+    assert_eq!(restarted.outcome, Outcome::Success, "{restarted:?}");
+    assert_eq!(restarted.payload.unwrap()["records"], 0);
 }
 
 #[test]
@@ -615,7 +755,7 @@ fn observe_killed_after_commit_reconciles_without_second_record() {
     );
 
     let replay = client
-        .reconcile_unknown("reconcile-observe")
+        .reconcile_unknown(&ns, "reconcile-observe")
         .expect("receipt replay succeeds after restart");
     assert_eq!(replay.outcome, Outcome::Success);
     assert_eq!(replay.state_generation, 1);
@@ -666,7 +806,7 @@ fn observe_killed_before_commit_reopens_and_retries_without_replay() {
     assert_eq!(worker.pid(), None, "deadline must reap the child process");
 
     let retried = worker
-        .reconcile_unknown(key)
+        .reconcile_unknown(&ns, key)
         .expect("pre-commit request retries after the child is reopened");
     assert_eq!(retried.outcome, Outcome::Success, "{retried:?}");
     assert_eq!(retried.state_generation, 1);
@@ -737,7 +877,7 @@ fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
     assert_eq!(client.pid(), None, "deadline must reap the worker");
 
     let replay = client
-        .reconcile_unknown(key)
+        .reconcile_unknown(&ns, &worker_key(&ns, key))
         .expect("common maintenance receipt replays after restart");
     assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
     assert_eq!(replay.state_generation, 2);
@@ -753,9 +893,93 @@ fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
     assert_eq!(inspection.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 2);
     assert_eq!(
-        client.reconcile_unknown(key),
+        client.reconcile_unknown(&ns, &worker_key(&ns, key)),
         Err(ClientError::UnknownIdempotencyKey)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn common_maintenance_killed_before_commit_retries_once() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(24);
+    let observe = client
+        .call(
+            Request::new(
+                240,
+                0,
+                Operation::Observe,
+                &ns,
+                common_observe_payload(
+                    "common-maintenance-before-commit-seed",
+                    "common maintenance before commit key",
+                    "common maintenance before commit value",
+                ),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("common maintenance before-commit seed succeeds");
+    assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
+    assert_eq!(observe.state_generation, 1);
+
+    let public_key = "common-maintenance-before-commit";
+    let control =
+        common_maintenance_control(&ns, public_key, "01993262-4d00-0000-8000-000000000024", 1);
+    let request = Request::new(
+        241,
+        0,
+        Operation::Maintenance,
+        &ns,
+        json!({
+            "common_control": control,
+            "test_sleep_before_ms": 1_000,
+        }),
+    );
+    let timed = client.call(request.clone(), Duration::from_millis(50));
+    assert_eq!(timed, Err(ClientError::EffectUnknown { op_id: 241 }));
+    assert_eq!(client.pid(), None, "deadline must reap the worker");
+
+    let reconciled = client
+        .reconcile_unknown(&ns, &worker_key(&ns, public_key))
+        .expect("maintenance retries after death before the common commit");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    assert_eq!(reconciled.state_generation, 2);
+    assert_eq!(reconciled.payload.as_ref().unwrap()["replayed"], false);
+
+    // A second request with the same provider key observes the one retained
+    // receipt and cannot advance the generation again.
+    let duplicate = client
+        .call(
+            Request::new(
+                242,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({
+                    "common_control": common_maintenance_control(
+                        &ns,
+                        public_key,
+                        "01993262-4d00-0000-8000-000000000024",
+                        2,
+                    ),
+                }),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("duplicate maintenance request replays");
+    assert_eq!(duplicate.outcome, Outcome::Success, "{duplicate:?}");
+    assert_eq!(duplicate.state_generation, 2);
+    assert_eq!(duplicate.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = client
+        .call(
+            Request::new(243, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after before-commit recovery");
+    assert_eq!(inspection.outcome, Outcome::Success, "{inspection:?}");
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 2);
 }
 
 #[cfg(unix)]
@@ -784,15 +1008,20 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
         assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
     }
     let generation = 3;
-    let key = "common-maintenance-restart-pages";
-    let operation_id = "01993262-4d00-0000-8000-000000000022";
+    let key_prefix = "common-maintenance-restart-pages";
+    let operation_prefix = "01993262-4d00-0000-8000-000000000022";
     let mut cursor = None;
+    let mut final_identity = None;
 
     for (index, expected_partial) in [(0_u64, true), (1, true), (2, false)] {
+        // A host continuation mints a fresh public key and operation ID for
+        // every page. The cursor is the durable authorization boundary.
+        let page_key = format!("{key_prefix}-{index}");
+        let page_operation_id = format!("{operation_prefix}-{index}");
         let control = common_maintenance_control_page(
             &ns,
-            key,
-            operation_id,
+            &page_key,
+            &page_operation_id,
             generation,
             1,
             cursor.as_deref(),
@@ -847,13 +1076,15 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
         } else {
             assert_eq!(reply.payload.as_ref().unwrap()["scanned_items"], 1);
             assert_eq!(reply.state_generation, generation + 1);
+            final_identity = Some((page_key, page_operation_id));
         }
     }
 
+    let (final_key, final_operation_id) = final_identity.expect("final page identity is recorded");
     let replay_control = common_maintenance_control_page(
         &ns,
-        key,
-        operation_id,
+        &final_key,
+        &final_operation_id,
         generation + 1,
         1,
         cursor.as_deref(),
@@ -887,6 +1118,155 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
 
 #[cfg(unix)]
 #[test]
+fn common_maintenance_final_paged_commit_replays_after_worker_death() {
+    let root = TempDir::new().expect("temp root");
+    let client = client(&root);
+    let ns = namespace(25);
+    for index in 0..3_u64 {
+        let observe = client
+            .call(
+                Request::new(
+                    250 + index,
+                    0,
+                    Operation::Observe,
+                    &ns,
+                    common_observe_payload(
+                        &format!("common-maintenance-final-page-seed-{index}"),
+                        &format!("final page key {index}"),
+                        &format!("final page value {index}"),
+                    ),
+                ),
+                CALL_DEADLINE,
+            )
+            .expect("common maintenance final-page seed succeeds");
+        assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
+    }
+    let generation = 3;
+    let first = common_maintenance_control_page(
+        &ns,
+        "common-maintenance-final-page-1",
+        "01993262-4d00-0000-8000-000000000025-1",
+        generation,
+        1,
+        None,
+    );
+    let first = client
+        .call(
+            Request::new(
+                253,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": first}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("first final-page continuation succeeds");
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.payload.as_ref().unwrap()["partial"], true);
+    let first_cursor = first.payload.as_ref().unwrap()["resume_cursor"]
+        .as_str()
+        .expect("first page returns a cursor")
+        .to_owned();
+
+    let second = common_maintenance_control_page(
+        &ns,
+        "common-maintenance-final-page-2",
+        "01993262-4d00-0000-8000-000000000025-2",
+        generation,
+        1,
+        Some(&first_cursor),
+    );
+    let second = client
+        .call(
+            Request::new(
+                254,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({"common_control": second}),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("second final-page continuation succeeds");
+    assert_eq!(second.outcome, Outcome::Success, "{second:?}");
+    assert_eq!(second.payload.as_ref().unwrap()["partial"], true);
+    let second_cursor = second.payload.as_ref().unwrap()["resume_cursor"]
+        .as_str()
+        .expect("second page returns a cursor")
+        .to_owned();
+
+    let final_key = "common-maintenance-final-page-3";
+    let final_operation_id = "01993262-4d00-0000-8000-000000000025-3";
+    let final_control = common_maintenance_control_page(
+        &ns,
+        final_key,
+        final_operation_id,
+        generation,
+        1,
+        Some(&second_cursor),
+    );
+    let final_request = Request::new(
+        255,
+        0,
+        Operation::Maintenance,
+        &ns,
+        json!({
+            "common_control": final_control,
+            "test_sleep_after_commit_ms": 1_000,
+        }),
+    );
+    let timed = client.call(final_request.clone(), Duration::from_millis(50));
+    assert_eq!(timed, Err(ClientError::EffectUnknown { op_id: 255 }));
+    assert_eq!(client.pid(), None, "deadline must reap the worker");
+
+    let reconciled = client
+        .reconcile_unknown(&ns, &worker_key(&ns, final_key))
+        .expect("final page receipt replays after worker death");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    assert_eq!(reconciled.state_generation, generation + 1);
+    assert_eq!(reconciled.payload.as_ref().unwrap()["replayed"], true);
+
+    // Reissuing the final page with the same key is an exact replay and must
+    // not create a second event or advance the generation.
+    let duplicate = client
+        .call(
+            Request::new(
+                256,
+                0,
+                Operation::Maintenance,
+                &ns,
+                json!({
+                    "common_control": common_maintenance_control_page(
+                        &ns,
+                        final_key,
+                        final_operation_id,
+                        generation + 1,
+                        1,
+                        Some(&second_cursor),
+                    ),
+                }),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("duplicate final page replays");
+    assert_eq!(duplicate.outcome, Outcome::Success, "{duplicate:?}");
+    assert_eq!(duplicate.state_generation, generation + 1);
+    assert_eq!(duplicate.payload.as_ref().unwrap()["replayed"], true);
+
+    let inspection = client
+        .call(
+            Request::new(257, 0, Operation::Inspection, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("inspection succeeds after final-page recovery");
+    assert_eq!(inspection.outcome, Outcome::Success, "{inspection:?}");
+    assert_eq!(inspection.payload.as_ref().unwrap()["records"], 3);
+    assert_eq!(inspection.payload.as_ref().unwrap()["commit_seq"], 4);
+}
+
+#[cfg(unix)]
+#[test]
 fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
     let root = TempDir::new().expect("temp root");
     let client = client(&root);
@@ -911,11 +1291,11 @@ fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
         assert_eq!(observe.outcome, Outcome::Success, "{observe:?}");
     }
     let generation = 3;
-    let key = "common-maintenance-deadline-page";
-    let operation_id = "01993262-4d00-0000-8000-000000000023";
+    let first_key = "common-maintenance-deadline-page-1";
+    let first_operation_id = "01993262-4d00-0000-8000-000000000023-1";
 
     let first_control =
-        common_maintenance_control_page(&ns, key, operation_id, generation, 1, None);
+        common_maintenance_control_page(&ns, first_key, first_operation_id, generation, 1, None);
     let first = client
         .call(
             Request::new(
@@ -936,8 +1316,19 @@ fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
         .expect("first page returns a resume cursor")
         .to_owned();
 
-    let second_control =
-        common_maintenance_control_page(&ns, key, operation_id, generation, 1, Some(&first_cursor));
+    let second_key = "common-maintenance-deadline-page-2";
+    let second_operation_id = "01993262-4d00-0000-8000-000000000023-2";
+    let second_control = common_maintenance_control_page(
+        &ns,
+        second_key,
+        second_operation_id,
+        generation,
+        1,
+        Some(&first_cursor),
+    );
+    // The page only grants the next cursor; the test-double holds the
+    // successful response after that grant. A caller deadline may therefore
+    // expire after authorization without losing the durable continuation.
     let timed = client.call(
         Request::new(
             261,
@@ -955,7 +1346,7 @@ fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
     assert_eq!(client.pid(), None, "deadline must reap the worker");
 
     let reconciled = client
-        .reconcile_unknown(key)
+        .reconcile_unknown(&ns, &worker_key(&ns, second_key))
         .expect("partial page reply reconciles after worker restart");
     assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
     assert_eq!(reconciled.state_generation, generation);
@@ -966,10 +1357,12 @@ fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
         .expect("reconciled partial page returns its next cursor")
         .to_owned();
 
+    let final_key = "common-maintenance-deadline-page-3";
+    let final_operation_id = "01993262-4d00-0000-8000-000000000023-3";
     let final_control = common_maintenance_control_page(
         &ns,
-        key,
-        operation_id,
+        final_key,
+        final_operation_id,
         generation,
         1,
         Some(&second_cursor),
@@ -993,8 +1386,8 @@ fn common_maintenance_partial_page_deadline_reconciles_and_resumes() {
 
     let retry_control = common_maintenance_control_page(
         &ns,
-        key,
-        operation_id,
+        final_key,
+        final_operation_id,
         generation + 1,
         1,
         Some(&second_cursor),
@@ -1068,7 +1461,7 @@ fn common_replay_killed_after_commit_reconciles_the_nested_delivery_key() {
     );
     assert_eq!(client.pid(), None);
     let reconciled = client
-        .reconcile_unknown(&page_key)
+        .reconcile_unknown(&ns, &page_key)
         .expect("nested replay key is retained");
     assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
     let result = reconciled.payload.unwrap();
@@ -1087,14 +1480,14 @@ fn common_replay_killed_after_commit_reconciles_the_nested_delivery_key() {
     assert_eq!(inspected.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(inspected.payload.as_ref().unwrap()["tick"], 1);
     assert_eq!(
-        client.reconcile_unknown(&page_key),
+        client.reconcile_unknown(&ns, &page_key),
         Err(ClientError::UnknownIdempotencyKey)
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
+fn common_restore_file_killed_after_commit_reconciles_client_owned_backup() {
     let source_root = TempDir::new().expect("source root");
     let source = client(&source_root);
     let ns = namespace(19);
@@ -1133,6 +1526,9 @@ fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let snapshot_id = format!("ncm-snapshot:{digest}");
+    let caller_root = TempDir::new().expect("caller snapshot root");
+    let caller_file = caller_root.path().join("common-restore.snapshot");
+    fs::write(&caller_file, &bytes).expect("caller snapshot file writes");
     let target_root = TempDir::new().expect("destination root");
     let target = client(&target_root);
     let key = "25".repeat(32);
@@ -1142,7 +1538,7 @@ fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
         Operation::SnapshotRestore,
         &ns,
         json!({
-            "common_portability":{"action":"snapshot_restore","idempotency_key":key,"expected_generation":0,"bytes":bytes,"blocked_sources":[],"snapshot_id":snapshot_id,"observation_sequence":1},
+            "common_portability":{"action":"snapshot_restore","idempotency_key":key,"expected_generation":0,"snapshot_file":caller_file,"byte_length":bytes.len(),"content_sha256":digest,"blocked_sources":[],"snapshot_id":snapshot_id,"observation_sequence":1},
             "test_sleep_after_commit_ms":CALL_DEADLINE.as_millis() as u64
         }),
     );
@@ -1151,6 +1547,10 @@ fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
         Err(ClientError::EffectUnknown { op_id: 192 })
     );
     assert_eq!(target.pid(), None);
+    assert!(
+        caller_file.exists(),
+        "the worker must consume only the client-owned send copy"
+    );
     let transport = target_root
         .path()
         .join("namespaces")
@@ -1158,11 +1558,11 @@ fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
         .join("snapshots");
     assert_eq!(
         fs::read_dir(&transport).unwrap().count(),
-        0,
-        "interrupted transport file is consumed"
+        1,
+        "the consumed send copy leaves one durable reconciliation backup"
     );
     let reconciled = target
-        .reconcile_unknown(&key)
+        .reconcile_unknown(&ns, &key)
         .expect("original inline bytes survive transport cleanup");
     assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
     assert_eq!(reconciled.payload.as_ref().unwrap()["replayed"], true);
@@ -1175,9 +1575,86 @@ fn common_restore_killed_after_commit_reconciles_original_inline_bytes() {
         .unwrap();
     assert_eq!(inspected.payload.as_ref().unwrap()["records"], 1);
     assert_eq!(
-        target.reconcile_unknown(&key),
+        target.reconcile_unknown(&ns, &key),
         Err(ClientError::UnknownIdempotencyKey)
     );
+    assert!(caller_file.exists(), "caller-owned file remains untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_restore_file_killed_after_commit_reconciles_client_owned_backup() {
+    let source_root = TempDir::new().expect("source root");
+    let source = client(&source_root);
+    let ns = namespace(20);
+    let observed = source
+        .call(
+            Request::new(
+                200,
+                0,
+                Operation::Observe,
+                &ns,
+                observe_payload("raw-restore-file", "raw restore key", "raw restore value"),
+            ),
+            CALL_DEADLINE,
+        )
+        .expect("raw restore source observe succeeds");
+    assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
+    let exported = source
+        .call(
+            Request::new(201, 0, Operation::SnapshotExport, &ns, json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("raw restore source export succeeds");
+    assert_eq!(exported.outcome, Outcome::Success, "{exported:?}");
+    let bytes: Vec<u8> = serde_json::from_value(exported.payload.unwrap()["bytes"].clone())
+        .expect("raw restore snapshot bytes decode");
+    let content_sha256 = digest(&bytes);
+    let caller_root = TempDir::new().expect("caller snapshot root");
+    let caller_file = caller_root.path().join("raw-restore.snapshot");
+    fs::write(&caller_file, &bytes).expect("raw caller snapshot file writes");
+
+    let target_root = TempDir::new().expect("destination root");
+    let target = client(&target_root);
+    let key = "raw-restore-file-key";
+    let mut payload = json!({
+        "idempotency_key": key,
+        "snapshot_file": caller_file,
+        "byte_length": bytes.len(),
+        "content_sha256": content_sha256,
+        "blocked_sources": [],
+    });
+    payload["test_sleep_after_commit_ms"] = json!(CALL_DEADLINE.as_millis() as u64);
+    assert_eq!(
+        target.call(
+            Request::new(202, 0, Operation::SnapshotRestore, &ns, payload),
+            CALL_DEADLINE,
+        ),
+        Err(ClientError::EffectUnknown { op_id: 202 })
+    );
+    assert_eq!(target.pid(), None, "deadline must reap the worker");
+    assert!(
+        caller_file.exists(),
+        "the worker must consume only the client-owned send copy"
+    );
+    let transport = target_root
+        .path()
+        .join("namespaces")
+        .join(&ns)
+        .join("snapshots");
+    assert_eq!(
+        fs::read_dir(&transport).unwrap().count(),
+        1,
+        "only the durable reconciliation backup remains after commit"
+    );
+
+    let reconciled = target
+        .reconcile_unknown(&ns, key)
+        .expect("raw caller file restore reconciles");
+    assert_eq!(reconciled.outcome, Outcome::Success, "{reconciled:?}");
+    assert_eq!(reconciled.payload.as_ref().unwrap()["replayed"], true);
+    assert_eq!(fs::read_dir(&transport).unwrap().count(), 0);
+    assert!(caller_file.exists(), "caller-owned file remains untouched");
 }
 
 #[test]

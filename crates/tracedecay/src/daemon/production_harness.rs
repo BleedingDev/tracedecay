@@ -441,18 +441,16 @@ async fn mount_production_composition_projects(
     };
     let mut servers = HashMap::new();
     for (index, project_root) in project_roots.into_iter().enumerate() {
-        let (canonical_project_path, server) = Box::pin(
-            mount_one_production_composition_project(
-                stores,
-                project_root,
-                &client_identity,
-                scope_prefix.as_deref(),
-                index,
-                wait_for_code_index,
-                #[cfg(all(test, feature = "memory-provider-host"))]
-                native_port_interposition.clone(),
-            ),
-        )
+        let (canonical_project_path, server) = Box::pin(mount_one_production_composition_project(
+            stores,
+            project_root,
+            &client_identity,
+            scope_prefix.as_deref(),
+            index,
+            wait_for_code_index,
+            #[cfg(all(test, feature = "memory-provider-host"))]
+            native_port_interposition.clone(),
+        ))
         .await?;
         servers.insert(canonical_project_path, server);
     }

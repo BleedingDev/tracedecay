@@ -5,29 +5,35 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use tracedecay_contracts::ResolvedScope;
 use tracedecay_contracts::retained_surfaces::{
     FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1, FactIdentitySourceResultV1,
     FactProjectionV1, FactTelemetryV1, FactV1,
 };
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
-    Confidence, FactAssertionId, FactCategoryV1, FactId, FactIdentityMaterialV1,
-    FactIdentitySourceV1, FactLineageEventKindV1, FactLineageEventV1, FactOwnerV1, ProjectId,
-    ProvenanceId, UtcMicros,
+    CanonicalObservationIdV1, Confidence, FactAssertionId, FactCategoryV1, FactId,
+    FactIdentityMaterialV1, FactIdentitySourceV1, FactLineageEventKindV1, FactLineageEventV1,
+    FactOwnerV1, ProjectId, ProvenanceId, RefId, RepositoryId, RetrievalAnchorId, UtcMicros,
+    WorktreeId, derive_exact_observation_anchor_id,
 };
 use tracedecay_memory_provider_registry::{
-    CancellationToken, CanonicalPayload, CommittedEffectState, HandshakeRequest,
+    CancellationToken, CanonicalPayload, CommittedEffectState, CurrentSourceDisposition,
+    GrantedHistorySource, HandshakeRequest, HistoryGrant, HistoryRelation,
     NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation, NativeObservationEnvelope,
-    OBSERVATION_CONTRACT_ID, OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
-    ProviderCall, ProviderCallParts, ProviderOperation, ProviderReply, TerminalCode,
+    NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeMemoryApplicationPort, NativeObservation,
+    NativeObservationEnvelope, OBSERVATION_CONTRACT_ID, OperationControl, OriginScopeEvidence,
+    OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
+    ProviderCallParts, ProviderOperation, ProviderReply, RecordedValidity,
+    RestoreDispositionCheckpoint, SourceAttribution, SourceDisposition, TerminalCode,
 };
 use tracedecay_session_memory::memory::{
     ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
 };
 use tracedecay_store::{
     FactReadControl, FactWriteControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
-    ProjectMemoryFactIdV1, ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchQuery,
+    ProjectMemoryFactIdV1,
 };
 
 use super::*;
@@ -327,6 +333,32 @@ fn observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObser
     })
 }
 
+fn staged_observation_call(project_id: &str, canonical_payload: &Value) -> ProviderCall {
+    let mut call = valid_observation_call(project_id, canonical_payload);
+    let envelope = json!({
+        "canonical_payload": canonical_payload,
+        "observation_kind": NATIVE_STAGED_SESSION_OBSERVATION_KIND,
+        "payload_contract": NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
+    });
+    let bytes = serde_json::to_vec(&envelope).expect("staged observation envelope bytes");
+    call.payload = CanonicalPayload::new(
+        OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("observation contract"),
+        bytes.clone(),
+        sha256_hex(&bytes),
+    )
+    .expect("staged observation payload");
+    call
+}
+
+fn staged_observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
+    NativeObservation::StagedSession(NativeObservationEnvelope {
+        call,
+        observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.to_owned(),
+        payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.to_owned(),
+        canonical_payload,
+    })
+}
+
 async fn real_project_fixture() -> (
     tempfile::TempDir,
     PathBuf,
@@ -396,7 +428,18 @@ async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: 
     }
 }
 
+fn recall_resolved_scope(project_id: &str) -> ResolvedScope {
+    ResolvedScope::new(
+        ProjectId::new(project_id).expect("valid recall project identity"),
+        RepositoryId::new("repo.native-bridge-recall").expect("valid recall repository"),
+        WorktreeId::new("worktree.native-bridge-recall").expect("valid recall worktree"),
+        Some(RefId::new("branch.native-bridge-recall").expect("valid recall branch")),
+    )
+    .expect("valid recall resolved scope")
+}
+
 fn recall_scope_value(project_id: &str) -> Value {
+    let scope = recall_resolved_scope(project_id);
     json!({
         "profile_id": "profile.native-bridge-recall",
         "project_id": project_id,
@@ -404,7 +447,7 @@ fn recall_scope_value(project_id: &str) -> Value {
         "worktree_identity": "worktree.native-bridge-recall",
         "branch_identity": "branch.native-bridge-recall",
         "agent_session_id": "agent.native-bridge-recall",
-        "resolved_scope_digest": SCOPE_DIGEST,
+        "resolved_scope_digest": scope.scope_digest.as_str(),
     })
 }
 
@@ -469,7 +512,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
             "worktree.native-bridge-recall",
             "branch.native-bridge-recall",
             "agent.native-bridge-recall",
-            SCOPE_DIGEST,
+            recall_resolved_scope(project_id).scope_digest.as_str(),
         )
         .expect("valid recall exact scope"),
         request_id: "request.native-bridge-recall".to_owned(),
@@ -478,7 +521,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
         idempotency_key: Some("idempotency.native-bridge-recall".to_owned()),
         control: OperationControl::new(i64::MAX, 10_000, CancellationToken::new()),
         payload: CanonicalPayload::new(
-            OwnedVersionedId::new(RECALL_CONTRACT_ID).expect("valid recall contract"),
+            OwnedVersionedId::new(RECALL_REQUEST_CONTRACT_ID).expect("valid recall contract"),
             bytes.clone(),
             sha256_hex(&bytes),
         )
@@ -491,60 +534,22 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
     .expect("valid recall provider call")
 }
 
-fn recall_payload(reply: &ProviderReply) -> Value {
-    let payload = reply.payload.as_ref().expect("recall reply payload");
-    assert_eq!(payload.contract_id.as_str(), RECALL_CONTRACT_ID);
-    serde_json::from_slice(&payload.bytes).expect("canonical recall response JSON")
-}
-
-async fn direct_search_scores(
-    graph: &TraceDecay,
-    owner: &FactOwnerV1,
-    query: &str,
-    limit: usize,
-) -> Vec<(String, [u32; 5])> {
-    let memory = graph
-        .project_memory_application()
-        .await
-        .expect("project memory application");
-    let search = ProjectMemoryFactSearchQuery::new(
-        owner.clone(),
-        ProjectMemoryFactSearchKindV1::Search,
-        Some(query.to_owned()),
-        None,
-        limit,
+fn valid_health_call(project_id: &str) -> ProviderCall {
+    let mut call = valid_recall_call(project_id, recall_request_value(project_id));
+    let body = json!({
+        "requested_checks": ["protocol", "state", "persistence"],
+    });
+    let bytes = serde_json::to_vec(&body).expect("health request bytes");
+    call.operation = ProviderOperation::Health;
+    call.required_capabilities =
+        BTreeSet::from([OwnedVersionedId::new("provider.health.v1").expect("health capability")]);
+    call.payload = CanonicalPayload::new(
+        OwnedVersionedId::new(HEALTH_CONTRACT_ID).expect("health contract"),
+        bytes.clone(),
+        sha256_hex(&bytes),
     )
-    .expect("direct search query");
-    let page = memory
-        .search_project_memory_facts(search, &FactReadControl::new(Arc::new(|| false)))
-        .await
-        .expect("direct project-memory search");
-    page.hits()
-        .iter()
-        .map(|hit| {
-            let scores = hit.scores();
-            (
-                hit.fact().fact_id().to_string(),
-                [
-                    scores.score_millionths(),
-                    scores.fts_score_millionths(),
-                    scores.jaccard_score_millionths(),
-                    scores.holographic_score_millionths(),
-                    scores.trust_score_millionths(),
-                ],
-            )
-        })
-        .collect()
-}
-
-fn assert_recall_failure(reply: &ProviderReply, terminal_code: TerminalCode, diagnostic_id: &str) {
-    assert_eq!(reply.terminal.terminal_code(), terminal_code);
-    assert_eq!(reply.terminal.diagnostic_id(), Some(diagnostic_id));
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(reply.payload, None);
+    .expect("valid health payload");
+    call
 }
 
 #[test]
@@ -659,6 +664,133 @@ fn control_preflight_reports_cancellation_and_deadline_without_contact() {
         control_failure(&OperationControl::new(0, 1_000, CancellationToken::new())),
         Err(NativeReadFailure::DeadlineExceeded)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_health_payload_reports_operation_health_data() {
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
+    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
+        .expect("construct project Native application port");
+    let call = valid_health_call(project_id.as_str());
+
+    let reply = port.health(&call);
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+    let payload = reply.payload.expect("health result payload");
+    assert_eq!(payload.contract_id.as_str(), HEALTH_CONTRACT_ID);
+    let body: Value = serde_json::from_slice(&payload.bytes).expect("health result JSON");
+    assert_eq!(body["provider_id"], json!(NATIVE_PROVIDER_ID));
+    assert_eq!(body["provider_instance_id"], json!(PROVIDER_INSTANCE_ID));
+    assert_eq!(body["readiness"], json!("ready"));
+    assert_eq!(
+        body["state_generation"],
+        json!(call.expected_state_generation)
+    );
+    assert_eq!(
+        body["scope_digest"],
+        json!(call.exact_scope.exact_scope_sha256())
+    );
+    assert_eq!(
+        body["effective_limits_digest"],
+        json!(native_limits_digest(
+            native_descriptor().expect("descriptor").limits
+        ))
+    );
+    assert_eq!(body["backlog"], json!(0));
+    assert_eq!(body["recovery_state"], json!("ready"));
+}
+
+#[test]
+fn native_recall_failures_preserve_typed_terminal_states() {
+    let cases = [
+        (
+            NativeReadFailure::RecallNotAuthorized,
+            TerminalCode::Unauthorized,
+            RECALL_NOT_AUTHORIZED_DIAGNOSTIC,
+        ),
+        (
+            NativeReadFailure::RecallResetRequired,
+            TerminalCode::ResetRequired,
+            RECALL_RESET_DIAGNOSTIC,
+        ),
+        (
+            NativeReadFailure::RecallCursorStale,
+            TerminalCode::StaleIdentity,
+            RECALL_CURSOR_STALE_DIAGNOSTIC,
+        ),
+        (
+            NativeReadFailure::RecallBudgetExhausted,
+            TerminalCode::CapacityExceeded,
+            RECALL_BUDGET_DIAGNOSTIC,
+        ),
+    ];
+    for (failure, terminal_code, diagnostic_id) in cases {
+        assert_eq!(failure.terminal(), (terminal_code, diagnostic_id));
+    }
+}
+
+#[test]
+fn stale_session_projection_is_contract_valid_partial_recall() {
+    let project_id = "project.native-bridge-stale";
+    let call = valid_recall_call(project_id, recall_request_value(project_id));
+    let request = parse_native_recall_request(&call).expect("recall request");
+    let batch = NativeSessionRecallBatch {
+        candidates: Vec::new(),
+        temporal: tracedecay_session_runtime::session_retrieval::SessionTemporalMetadataView {
+            watermarks:
+                tracedecay_session_runtime::session_retrieval::SessionTemporalWatermarksView {
+                    generation: 7,
+                    ..Default::default()
+                },
+            cursor: Some("cursor.stale-test".to_owned()),
+            authorized_root: Some("/private/checkout".to_owned()),
+            ..Default::default()
+        },
+        status: NativeSessionRecallBatchStatus::Stale,
+        scanned_items: 0,
+        excluded_items: 0,
+        admitted_items: 0,
+        work_units: 0,
+        total_content_bytes: 0,
+        degraded: false,
+    };
+
+    let reply = build_native_session_recall_reply(&call, &request, &batch, None)
+        .expect("stale recall projection");
+
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
+    let payload = reply.payload.expect("stale recall payload");
+    assert_eq!(payload.contract_id.as_str(), RECALL_RESULT_CONTRACT_ID);
+    let body: Value = serde_json::from_slice(&payload.bytes).expect("stale recall JSON");
+    assert_eq!(body["coverage"]["state"], json!("partial"));
+    assert_eq!(body["coverage"]["truncated_items"], json!(1));
+    assert_eq!(
+        body["coverage"]["reasons"],
+        json!(["session_projection_stale"])
+    );
+    assert_eq!(
+        body["terminal"],
+        json!({"terminal_code": "partial", "diagnostic_id": Value::Null})
+    );
+    assert_eq!(
+        body["coverage"]["canonical_temporal"]["watermarks"]["generation"],
+        json!(7)
+    );
+    assert_eq!(
+        body["coverage"]["canonical_temporal"]["cursor"],
+        json!("cursor.stale-test")
+    );
+    assert!(
+        body["coverage"]["canonical_temporal"]
+            .get("authorized_root")
+            .is_none()
+    );
+    assert!(
+        body["coverage"]["canonical_temporal"]
+            .get("source_coverage")
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -783,26 +915,14 @@ async fn native_observe_verifies_real_store_without_writing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_recall_current_preserves_order_and_projects_native_score_explain_provenance() {
-    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
-    let alpha = add_real_project_fact(
+async fn native_recall_requires_bound_canonical_session_authority() {
+    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
+    let _project_fact = add_real_project_fact(
         &graph,
-        "Native bridge deterministic alpha",
-        "native-bridge-recall-alpha",
+        "Native bridge project fact must not satisfy session recall",
+        "native-bridge-recall-no-fallback",
     )
     .await;
-    let beta = add_real_project_fact(
-        &graph,
-        "Native bridge deterministic beta",
-        "native-bridge-recall-beta",
-    )
-    .await;
-    let expected_facts = BTreeMap::from([
-        (alpha.fact_id.to_string(), alpha),
-        (beta.fact_id.to_string(), beta),
-    ]);
-    let expected_scores = direct_search_scores(&graph, &owner, "native bridge", 8).await;
-    assert_eq!(expected_scores.len(), expected_facts.len());
 
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
     let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
@@ -812,380 +932,183 @@ async fn native_recall_current_preserves_order_and_projects_native_score_explain
         recall_request_value(project_id.as_str()),
     );
     let reply = port.recall(&call);
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+
+    assert_eq!(
+        reply.terminal.terminal_code(),
+        TerminalCode::ProviderUnavailable
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some(PROVIDER_UNAVAILABLE_DIAGNOSTIC)
+    );
     assert_eq!(
         reply.terminal.committed_effect().state(),
         CommittedEffectState::None
     );
     assert_eq!(reply.state_generation, call.expected_state_generation);
-    reply
-        .validate(
-            native_descriptor()
-                .expect("descriptor")
-                .limits
-                .response_bytes,
-        )
-        .expect("valid canonical recall reply");
-    let body = recall_payload(&reply);
-
-    assert_eq!(body["provider_id"], json!(NATIVE_PROVIDER_ID));
-    assert_eq!(body["provider_instance_id"], json!(PROVIDER_INSTANCE_ID));
-    assert_eq!(body["registration_revision"], json!(1));
-    assert_eq!(body["request_identity"], json!(call.request_id));
-    assert_eq!(
-        body["exact_scope_identity"],
-        recall_scope_value(project_id.as_str())
-    );
-    assert_eq!(
-        body["coverage"]["state"],
-        json!("complete"),
-        "the current fixture should fit the valid recall budgets"
-    );
-    assert_eq!(
-        body["coverage"]["searched_scope_digest"],
-        json!(call.exact_scope.exact_scope_sha256())
-    );
-    assert_eq!(
-        body["coverage"]["matched_items"],
-        json!(expected_scores.len())
-    );
-    assert_eq!(
-        body["coverage"]["returned_items"],
-        json!(expected_scores.len())
-    );
-    assert_eq!(body["coverage"]["excluded_items"], json!(0));
-    assert_eq!(body["coverage"]["truncated_items"], json!(0));
-    assert_eq!(body["coverage"]["next_cursor"], Value::Null);
-    assert_eq!(body["coverage"]["reasons"], json!([]));
-    assert_eq!(
-        body["ordering"],
-        json!({
-            "score_domain_id": RECALL_SCORE_DOMAIN,
-            "direction": "higher_is_better",
-            "tie_breaker": "candidate_id_lexicographic_utf8",
-        })
-    );
-    assert_eq!(
-        body["terminal"],
-        json!({"terminal_code": "success", "diagnostic_id": null})
-    );
-
-    let candidates = body["candidates"]
-        .as_array()
-        .expect("recall candidates array");
-    assert_eq!(candidates.len(), expected_scores.len());
-    for (candidate, (fact_id, scores)) in candidates.iter().zip(expected_scores.iter()) {
-        let fact = expected_facts
-            .get(fact_id)
-            .expect("direct search fact is in the fixture");
-        let source_refs = match &fact.source {
-            FactIdentitySourceResultV1::Application { operation_id } => {
-                vec![operation_id.to_string()]
-            }
-            FactIdentitySourceResultV1::Evidence {
-                anchor_id,
-                stable_key,
-            } => vec![anchor_id.to_string(), stable_key.to_string()],
-        };
-        assert_eq!(
-            candidate["candidate_id"],
-            json!(format!("{}:{fact_id}", call.request_id))
-        );
-        assert_eq!(candidate["stable_memory_ref"], json!(fact_id));
-        assert_eq!(candidate["content"], json!(fact.content));
-        assert_eq!(candidate["content_ref"], Value::Null);
-        assert_eq!(
-            candidate["content_sha256"],
-            json!(sha256_hex(fact.content.as_bytes()))
-        );
-        assert_eq!(
-            candidate["native_score"],
-            json!({
-                "score_domain_id": RECALL_SCORE_DOMAIN,
-                "score_domain_version": RECALL_SCORE_DOMAIN_VERSION,
-                "raw_value": format!("{}.{:06}", scores[0] / 1_000_000, scores[0] % 1_000_000),
-                "direction": "higher_is_better",
-                "declared_minimum": "0.000000",
-                "declared_maximum": "1.500000",
-                "calibration_state": "provider_calibrated",
-                "semantics": "project-memory combined score; fixed-point millionths",
-                "components": {
-                    "score_millionths": scores[0],
-                    "fts_score_millionths": scores[1],
-                    "jaccard_score_millionths": scores[2],
-                    "holographic_score_millionths": scores[3],
-                    "trust_score_millionths": scores[4],
-                },
-            })
-        );
-        assert!(
-            candidate["native_score"]
-                .get("host_normalized_score")
-                .is_none()
-        );
-        assert_eq!(
-            candidate["exact_scope_identity"],
-            recall_scope_value(project_id.as_str())
-        );
-        assert_eq!(candidate["validity"]["temporal_state"], json!("current"));
-        assert_eq!(
-            candidate["validity"]["source_revision"],
-            json!(fact.last_event_id.to_string())
-        );
-        assert_eq!(candidate["provenance"]["state"], json!("available"));
-        assert_eq!(candidate["provenance"]["origin_refs"], json!(source_refs));
-        assert_eq!(candidate["provenance"]["source_refs"], json!(source_refs));
-        assert_eq!(candidate["provenance"]["observation_refs"], json!([]));
-        assert_eq!(candidate["provenance"]["transform_chain"], json!([]));
-        assert_eq!(candidate["provenance"]["provider_trace_refs"], json!([]));
-        assert_eq!(candidate["provenance"]["redaction_reason"], Value::Null);
-        assert!(
-            !candidate["explanation"]["summary"]
-                .as_str()
-                .unwrap_or_default()
-                .is_empty()
-        );
-        assert_eq!(candidate["explanation"]["matched_features"], json!([]));
-        assert_eq!(candidate["explanation"]["activation_trace_refs"], json!([]));
-        assert_eq!(
-            candidate["explanation"]["limitations"],
-            json!(["native score is not host-normalized"])
-        );
-        assert_eq!(candidate["source_refs"], json!(source_refs));
-        assert_eq!(candidate["trace_refs"], json!([]));
-        assert_eq!(candidate["memory_class"], json!("project"));
-        assert_eq!(candidate["warnings"], json!([]));
-        assert_eq!(candidate["extensions"], json!([]));
-    }
-
-    let repeated = port.recall(&valid_recall_call(
-        project_id.as_str(),
-        recall_request_value(project_id.as_str()),
-    ));
-    assert_eq!(repeated.terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(recall_payload(&repeated), body);
+    assert_eq!(reply.payload, None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_recall_zero_results_returns_success_zero_results_payload() {
+async fn native_canonical_session_replay_is_explicitly_non_required_without_staging_authority() {
     let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
-    let _irrelevant = add_real_project_fact(
-        &graph,
-        "A fact that deliberately does not match the zero-result query",
-        "native-bridge-recall-zero",
-    )
-    .await;
     let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
     let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
         .expect("construct project Native application port");
-    let mut request = recall_request_value(project_id.as_str());
-    request["query"] = json!("query-with-no-native-bridge-match");
-    let call = valid_recall_call(project_id.as_str(), request);
-    let reply = port.recall(&call);
+    let canonical_payload = json!({
+        "provider_id": "claude",
+        "session_id": "session.native-replay",
+        "message_id": "message.native-replay",
+        "content": "already canonical",
+    });
+    let call = staged_observation_call(project_id.as_str(), &canonical_payload);
+    let reply = port.observe(staged_observation_for(&call, canonical_payload));
+
     assert_eq!(
         reply.terminal.terminal_code(),
-        TerminalCode::SuccessZeroResults
+        TerminalCode::CapabilityUnsupported
+    );
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some(STAGED_SESSION_UNSUPPORTED_DIAGNOSTIC)
     );
     assert_eq!(
         reply.terminal.committed_effect().state(),
         CommittedEffectState::None
     );
-    reply
-        .validate(
-            native_descriptor()
-                .expect("descriptor")
-                .limits
-                .response_bytes,
-        )
-        .expect("valid zero-result recall reply");
-    let body = recall_payload(&reply);
-    assert_eq!(body["candidates"], json!([]));
-    assert_eq!(body["coverage"]["state"], json!("zero_results"));
-    assert_eq!(
-        body["coverage"]["searched_scope_digest"],
-        json!(call.exact_scope.exact_scope_sha256())
-    );
-    assert_eq!(body["coverage"]["scanned_items"], json!(0));
-    assert_eq!(body["coverage"]["matched_items"], json!(0));
-    assert_eq!(body["coverage"]["returned_items"], json!(0));
-    assert_eq!(body["coverage"]["excluded_items"], json!(0));
-    assert_eq!(body["coverage"]["truncated_items"], json!(0));
-    assert_eq!(body["coverage"]["next_cursor"], Value::Null);
-    assert_eq!(body["coverage"]["reasons"], json!([]));
-    assert_eq!(
-        body["terminal"],
-        json!({"terminal_code": "success_zero_results", "diagnostic_id": null})
-    );
-    assert_eq!(
-        body["ordering"]["score_domain_id"],
-        json!(RECALL_SCORE_DOMAIN)
-    );
-    assert_eq!(body["ordering"]["direction"], json!("higher_is_better"));
-    assert_eq!(
-        body["ordering"]["tie_breaker"],
-        json!("candidate_id_lexicographic_utf8")
-    );
+    assert_eq!(reply.payload, None);
+    assert_eq!(reply.state_generation, call.expected_state_generation);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_recall_rejects_malformed_unsupported_inputs_without_mutating_store() {
-    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
-    let first = add_real_project_fact(
-        &graph,
-        "Native bridge malformed request fixture one",
-        "native-bridge-recall-invalid-one",
+#[test]
+fn native_history_recall_binds_granted_source_through_canonical_observation_anchor() {
+    let project_id = "project.native-history-anchor";
+    let call = valid_recall_call(project_id, recall_request_value(project_id));
+    let request = parse_native_recall_request(&call).expect("valid recall request");
+    let source_scope = call.exact_scope.clone();
+    let source_project = ProjectId::new(source_scope.project_id.clone()).expect("source project");
+    let observation_id = CanonicalObservationIdV1::new("observation.native-history-anchor")
+        .expect("source observation id");
+    let observation_anchor = derive_exact_observation_anchor_id(
+        &tracedecay_domain::ObservationScopeV1::Project {
+            project_id: source_project,
+        },
+        &observation_id,
     )
-    .await;
-    let second = add_real_project_fact(
-        &graph,
-        "Native bridge malformed request fixture two",
-        "native-bridge-recall-invalid-two",
-    )
-    .await;
-    let fact_ids = [first.fact_id, second.fact_id];
-    let mut before_snapshots = BTreeMap::new();
-    for fact_id in fact_ids {
-        let value = read_store_snapshot(&graph, &owner, &fact_id).await;
-        before_snapshots.insert(fact_id, value);
-    }
+    .expect("canonical observation anchor");
+    let source = SourceAttribution {
+        source: OriginalSourceIdentity {
+            canonical_provider_id: OwnedProviderId::new("claude").expect("source provider"),
+            canonical_session_id: "session.native-history-anchor".to_owned(),
+            source_key: "source.native-history-anchor".to_owned(),
+            stable_record_id: None,
+            observation_id: observation_id.as_str().to_owned(),
+            source_revision: Some("revision-1".to_owned()),
+            content_sha256: "a".repeat(64),
+        },
+        origin_scope: OriginScopeEvidence::Recorded {
+            scope: source_scope.clone(),
+            authority_ref: "host-original.native-history-anchor".to_owned(),
+        },
+        source_sequence: 1,
+        occurred_at_utc_nanos: None,
+        ingested_at_utc_nanos: 1,
+        validity: RecordedValidity::default(),
+    };
+    let grant = HistoryGrant {
+        authorization_ref: "host-grant.native-history-anchor".to_owned(),
+        policy_revision: request.policy_revision,
+        destination_scope: call.exact_scope.clone(),
+        relation: HistoryRelation::ExactScope,
+        sources: vec![GrantedHistorySource {
+            attribution: source,
+            current_disposition: CurrentSourceDisposition {
+                state: SourceDisposition::Available,
+                authority_ref: "host-disposition.native-history-anchor".to_owned(),
+                authority_revision: Some(1),
+                checked_at_utc_nanos: 1,
+            },
+        }],
+        disposition_checkpoint: RestoreDispositionCheckpoint {
+            exact_scope: call.exact_scope.clone(),
+            authority_ref: "host-checkpoint.native-history-anchor".to_owned(),
+            authority_revision: Some(1),
+            checked_at_utc_nanos: 1,
+        },
+    };
+    grant.validate_structure().expect("valid history grant");
+    let session_anchor =
+        RetrievalAnchorId::new("session:native-history-anchor#0-0").expect("session anchor");
+    let candidate = crate::retained_owner::native_session_recall::NativeSessionRecallCandidate {
+        candidate_id: "native-session:history-anchor".to_owned(),
+        stable_memory_ref: "native-session:history-anchor".to_owned(),
+        content: "history candidate".to_owned(),
+        content_sha256: sha256_hex(b"history candidate"),
+        score_millionths: 900_000,
+        session_anchor,
+        observation_anchor: observation_anchor.clone(),
+        source_anchor: observation_anchor.clone(),
+        provider: "claude".to_owned(),
+        session_id: "session.native-history-anchor".to_owned(),
+        message_id: "message.native-history-anchor".to_owned(),
+        ordinal: 0,
+        timestamp_micros: None,
+        role: "user".to_owned(),
+        kind: Some("message".to_owned()),
+        provenance: crate::retained_owner::native_session_recall::NativeSessionRecallProvenance {
+            session_anchor: RetrievalAnchorId::new("session:native-history-anchor#0-0")
+                .expect("provenance session anchor"),
+            observation_anchor: observation_anchor.clone(),
+            source_anchor: observation_anchor.clone(),
+            provider: "claude".to_owned(),
+            session_id: "session.native-history-anchor".to_owned(),
+            message_id: "message.native-history-anchor".to_owned(),
+            source_observation_id: None,
+        },
+        validity: crate::retained_owner::native_session_recall::NativeSessionRecallValidity {
+            observed_at_micros: None,
+            valid_from_micros: None,
+            valid_until_micros: None,
+            superseded_at_micros: None,
+            revoked_at_micros: None,
+            source_revision: None,
+            state: crate::retained_owner::native_session_recall::NativeSessionRecallValidityState::Current,
+        },
+        source_refs: vec![observation_anchor.as_str().to_owned()],
+        trace_refs: Vec::new(),
+        warnings: Vec::new(),
+    };
 
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
-    let base = recall_request_value(project_id.as_str());
-    let cases = vec![
-        (
-            "malformed temporal",
-            {
-                let mut request = base.clone();
-                request["temporal_query"]["evaluation_time"] = json!("");
-                request
-            },
-            TerminalCode::InvalidRequest,
-            RECALL_INVALID_DIAGNOSTIC,
-        ),
-        (
-            "unsupported temporal mode",
-            {
-                let mut request = base.clone();
-                request["temporal_query"]["mode"] = json!("as_of");
-                request
-            },
-            TerminalCode::CapabilityUnsupported,
-            RECALL_UNSUPPORTED_DIAGNOSTIC,
-        ),
-        (
-            "foreign scope",
-            {
-                let mut request = base.clone();
-                request["exact_scope_identity"]["worktree_identity"] = json!("worktree.foreign");
-                request
-            },
-            TerminalCode::ScopeMismatch,
-            RECALL_SCOPE_MISMATCH_DIAGNOSTIC,
-        ),
-        (
-            "zero candidate budget",
-            {
-                let mut request = base.clone();
-                request["budgets"]["maximum_candidates"] = json!(0);
-                request
-            },
-            TerminalCode::InvalidRequest,
-            RECALL_INVALID_DIAGNOSTIC,
-        ),
-        (
-            "duplicate exclusion",
-            {
-                let mut request = base.clone();
-                request["exclusions"]["candidate_ids"] = json!(["duplicate", "duplicate"]);
-                request
-            },
-            TerminalCode::InvalidRequest,
-            RECALL_INVALID_DIAGNOSTIC,
-        ),
-        (
-            "unsupported exclusion",
-            {
-                let mut request = base.clone();
-                request["exclusions"]["candidate_ids"] = json!(["already-returned"]);
-                request
-            },
-            TerminalCode::CapabilityUnsupported,
-            RECALL_UNSUPPORTED_DIAGNOSTIC,
-        ),
-    ];
-    for (label, request, terminal_code, diagnostic_id) in cases {
-        let reply = port.recall(&valid_recall_call(project_id.as_str(), request));
-        assert_recall_failure(&reply, terminal_code, diagnostic_id);
-        assert_eq!(
-            reply.state_generation, 0,
-            "{label} changes state generation"
-        );
-    }
-
-    for (fact_id, (before_public, before_history)) in before_snapshots {
-        let (after_public, after_history) = read_store_snapshot(&graph, &owner, &fact_id).await;
-        assert_eq!(
-            after_public, before_public,
-            "fact changed after rejected recall"
-        );
-        assert_eq!(
-            after_history, before_history,
-            "fact history changed after rejected recall"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_recall_does_not_mutate_authoritative_fact_telemetry_or_history() {
-    let (_temporary, project_root, graph, owner, project_id) = real_project_fixture().await;
-    let first = add_real_project_fact(
-        &graph,
-        "Native bridge read-only telemetry fixture one",
-        "native-bridge-recall-read-only-one",
-    )
-    .await;
-    let second = add_real_project_fact(
-        &graph,
-        "Native bridge read-only telemetry fixture two",
-        "native-bridge-recall-read-only-two",
-    )
-    .await;
-    let fact_ids = vec![first.fact_id.clone(), second.fact_id.clone()];
-    let mut before_snapshots = BTreeMap::new();
-    for fact_id in &fact_ids {
-        let value = read_store_snapshot(&graph, &owner, fact_id).await;
-        before_snapshots.insert(fact_id.clone(), value);
-    }
-
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
-    for _ in 0..2 {
-        let reply = port.recall(&valid_recall_call(
-            project_id.as_str(),
-            recall_request_value(project_id.as_str()),
-        ));
-        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-        assert_eq!(
-            reply.terminal.committed_effect().state(),
-            CommittedEffectState::None
-        );
-        assert_eq!(reply.state_generation, 0);
-    }
-
-    for (fact_id, (before_public, before_history)) in before_snapshots {
-        let (after_public, after_history) = read_store_snapshot(&graph, &owner, &fact_id).await;
-        assert_eq!(
-            after_public, before_public,
-            "recall changed fact telemetry/state"
-        );
-        assert_eq!(
-            after_history, before_history,
-            "recall changed authoritative fact history"
-        );
-    }
+    let original = native_history_source_attribution(&candidate, &grant, &request)
+        .expect("history source attribution")
+        .expect("canonical anchor should resolve to granted source");
+    let mut foreign_checkout_grant = grant.clone();
+    let OriginScopeEvidence::Recorded { scope, .. } =
+        &mut foreign_checkout_grant.sources[0].attribution.origin_scope
+    else {
+        panic!("history fixture must carry recorded origin scope");
+    };
+    scope.repository_identity = "repo.foreign-history-anchor".to_owned();
+    assert!(
+        native_history_source_attribution(&candidate, &foreign_checkout_grant, &request)
+            .expect("foreign source attribution")
+            .is_none(),
+        "same-project source from a different checkout must not pass anchor binding"
+    );
+    let projected = native_session_recall_candidate(&call, &candidate, Some(&original))
+        .expect("projected recall candidate");
+    assert_eq!(
+        projected["provenance"]["observation_refs"],
+        json!(["observation.native-history-anchor"])
+    );
+    assert_eq!(
+        projected["source_refs"],
+        json!(["source.native-history-anchor"])
+    );
+    assert_eq!(
+        projected["provenance"]["original_sources"][0]["source"]["observation_id"],
+        "observation.native-history-anchor"
+    );
 }
 
 #[path = "native_common_tests.rs"]

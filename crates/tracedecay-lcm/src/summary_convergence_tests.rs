@@ -4,7 +4,9 @@ use tracedecay_runtime_core::db::engine::{
     Executor, IntoParams, QueryExecutor, Result as EngineResult, Rows, TestConnection, params,
 };
 
-use crate::{LCM_SCAN_PAGE_ROWS, schema, summary_convergence};
+use crate::{LCM_SCAN_PAGE_ROWS, LcmSourceRef, schema, summary_convergence};
+
+const RELEASED_BETA37_FIXTURE: &str = include_str!("../tests/fixtures/lcm-released-beta37.sql");
 
 /// Executor adapter that counts the statements a code path issues and the rows
 /// those statements change, so write amplification is measured rather than
@@ -613,7 +615,7 @@ async fn retained_queue_page_is_keyset_bounded_and_candidate_read_avoids_raw_cor
 }
 
 #[tokio::test]
-async fn current_profiles_install_the_unreleased_queue_shape_in_place() {
+async fn current_profiles_migrate_released_queue_predecessor_in_place() {
     let temp = tempfile::tempdir().unwrap();
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
     conn.execute_batch(
@@ -675,7 +677,8 @@ async fn current_profiles_install_the_unreleased_queue_shape_in_place() {
             newest_raw_store_id INTEGER NOT NULL,
             protection_frontier_store_id INTEGER NOT NULL DEFAULT 0,
             attempted_raw_store_id INTEGER NOT NULL DEFAULT 0,
-            state TEXT NOT NULL DEFAULT 'pending',
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK(state IN ('pending', 'retryable', 'current', 'unavailable', 'permanent')),
             failure_code TEXT,
             failure_count INTEGER NOT NULL DEFAULT 0,
             next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -687,10 +690,33 @@ async fn current_profiles_install_the_unreleased_queue_shape_in_place() {
     )
     .await
     .unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions(provider, session_id, project_key, project_path)
+         VALUES ('cursor', 'legacy-shape', 'project.legacy', '/legacy');
+         INSERT INTO lcm_summary_convergence_queue(
+             queue_id, provider, session_id, newest_raw_store_id,
+             protection_frontier_store_id, attempted_raw_store_id, state,
+             failure_code, failure_count, next_attempt_at_ms, attempt_generation
+         ) VALUES (42, 'cursor', 'legacy-shape', 9, 8, 7, 'retryable',
+                   'legacy_provider_busy', 3, 1234, 5);
+         INSERT INTO lcm_summary_convergence_dirty_raw(
+             provider, session_id, store_id
+         ) VALUES ('cursor', 'legacy-shape', 9);
+         INSERT INTO lcm_summary_convergence_invalidation_work(
+             provider, session_id, raw_store_id, source_kind, source_id,
+             depth, after_node_id
+         ) VALUES ('cursor', 'legacy-shape', 9, 'raw_message', '9', 0, '');",
+    )
+    .await
+    .unwrap();
 
     schema::ensure_lcm_schema(&conn).await.unwrap();
 
     assert_eq!(schema::schema_version(&*conn).await.unwrap(), version);
+    assert_eq!(
+        schema::require_admissible_lcm_schema(&*conn).await.unwrap(),
+        schema::LcmSchemaAdmission::Current
+    );
     let mut rows = conn
         .query(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -776,6 +802,114 @@ async fn current_profiles_install_the_unreleased_queue_shape_in_place() {
         1,
         "missing durable invalidation visited state"
     );
+    let mut rows = conn
+        .query(
+            "SELECT queue_id, provider, session_id, newest_raw_store_id,
+                    protection_frontier_store_id, attempted_raw_store_id, state,
+                    failure_code, failure_count, next_attempt_at_ms,
+                    attempt_generation, raw_revision_generation, stale_from_store_id
+             FROM lcm_summary_convergence_queue
+             WHERE provider = 'cursor' AND session_id = 'legacy-shape'",
+            (),
+        )
+        .await
+        .unwrap();
+    let queue_row = rows.next().await.unwrap().unwrap();
+    assert_eq!(queue_row.get::<i64>(0).unwrap(), 42);
+    assert_eq!(queue_row.get::<String>(1).unwrap(), "cursor");
+    assert_eq!(queue_row.get::<String>(2).unwrap(), "legacy-shape");
+    assert_eq!(queue_row.get::<i64>(3).unwrap(), 9);
+    assert_eq!(queue_row.get::<i64>(4).unwrap(), 8);
+    assert_eq!(queue_row.get::<i64>(5).unwrap(), 7);
+    assert_eq!(queue_row.get::<String>(6).unwrap(), "retryable");
+    assert_eq!(
+        queue_row.get::<Option<String>>(7).unwrap().as_deref(),
+        Some("legacy_provider_busy")
+    );
+    assert_eq!(queue_row.get::<i64>(8).unwrap(), 3);
+    assert_eq!(queue_row.get::<i64>(9).unwrap(), 1234);
+    assert_eq!(queue_row.get::<i64>(10).unwrap(), 5);
+    assert_eq!(queue_row.get::<i64>(11).unwrap(), 0);
+    assert_eq!(queue_row.get::<Option<i64>>(12).unwrap(), None);
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT provider, session_id, store_id, rewind_frontier_store_id
+             FROM lcm_summary_convergence_dirty_raw
+             WHERE provider = 'cursor' AND session_id = 'legacy-shape' AND store_id = 9",
+            (),
+        )
+        .await
+        .unwrap();
+    let dirty_row = rows.next().await.unwrap().unwrap();
+    assert_eq!(dirty_row.get::<String>(0).unwrap(), "cursor");
+    assert_eq!(dirty_row.get::<String>(1).unwrap(), "legacy-shape");
+    assert_eq!(dirty_row.get::<i64>(2).unwrap(), 9);
+    assert_eq!(dirty_row.get::<i64>(3).unwrap(), 8);
+    drop(rows);
+    let mut rows = conn
+        .query(
+            "SELECT provider, session_id, raw_store_id, source_kind, source_id,
+                    depth, after_node_id, state
+             FROM lcm_summary_convergence_invalidation_work
+             WHERE provider = 'cursor' AND session_id = 'legacy-shape' AND raw_store_id = 9",
+            (),
+        )
+        .await
+        .unwrap();
+    let invalidation_row = rows.next().await.unwrap().unwrap();
+    assert_eq!(invalidation_row.get::<String>(0).unwrap(), "cursor");
+    assert_eq!(invalidation_row.get::<String>(1).unwrap(), "legacy-shape");
+    assert_eq!(invalidation_row.get::<i64>(2).unwrap(), 9);
+    assert_eq!(invalidation_row.get::<String>(3).unwrap(), "raw_message");
+    assert_eq!(invalidation_row.get::<String>(4).unwrap(), "9");
+    assert_eq!(invalidation_row.get::<i64>(5).unwrap(), 0);
+    assert_eq!(invalidation_row.get::<String>(6).unwrap(), "");
+    assert_eq!(invalidation_row.get::<String>(7).unwrap(), "pending");
+    drop(rows);
+    assert_eq!(
+        fetch_i64(&conn, "SELECT COUNT(*) FROM lcm_raw_predecessor_ranges", (),).await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn current_admission_rejects_queue_shape_without_released_state_check() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    create_session_host_tables(&conn).await;
+    schema::ensure_lcm_schema(&conn).await.unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER lcm_summary_convergence_raw_insert;
+         DROP TRIGGER lcm_summary_convergence_raw_unprotected_update;
+         DROP TABLE lcm_summary_convergence_queue;
+         CREATE TABLE lcm_summary_convergence_queue (
+            queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            newest_raw_store_id INTEGER NOT NULL,
+            protection_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+            attempted_raw_store_id INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL DEFAULT 'pending',
+            failure_code TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+            attempt_generation INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(provider, session_id),
+            FOREIGN KEY(provider, session_id)
+                REFERENCES sessions(provider, session_id) ON DELETE CASCADE
+         );",
+    )
+    .await
+    .unwrap();
+
+    let error = schema::require_admissible_lcm_schema(&*conn)
+        .await
+        .expect_err("an unknown queue predecessor must require reset");
+    assert!(matches!(
+        error,
+        crate::LcmError::ProfileResetRequired { .. }
+    ));
 }
 
 #[tokio::test]
@@ -1088,5 +1222,336 @@ async fn a_fresh_store_opens_with_the_range_rewrite_already_retired() {
         !summary_convergence::predecessor_range_rewrite_has_work(&*conn)
             .await
             .unwrap()
+    );
+}
+
+/// Exercise the durable work owned by the post-beta.37 migration against a
+/// released, rowful store.  Queue retries, raw revisions and predecessor
+/// ranges must all remain restart-safe when the source rows already exist.
+#[tokio::test]
+async fn released_beta37_rows_materialize_retry_invalidation_and_ranges() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    conn.execute_batch(RELEASED_BETA37_FIXTURE).await.unwrap();
+
+    schema::ensure_lcm_schema(&conn).await.unwrap();
+    let page = summary_convergence::backfill_queue_page(&*conn, 128)
+        .await
+        .unwrap();
+    assert_eq!(page.rows_scanned, 4);
+    assert!(!page.has_more);
+
+    // Hydration follows the persisted source closure: raw source ids are
+    // numeric store ids, and the canonical hashes/receipts make both rows
+    // verifiable instead of leaving this fixture as metadata-only evidence.
+    let expansions = crate::dag::expand_summary_nodes(
+        &*conn,
+        "cursor",
+        "beta37-session-a",
+        &[
+            "summary-beta37-root".to_owned(),
+            "summary-beta37-leaf".to_owned(),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(expansions.len(), 2);
+    assert_eq!(
+        &expansions[0].sources[0].source_ref,
+        &LcmSourceRef::RawMessage { store_id: 10 }
+    );
+    assert_eq!(
+        &expansions[1].sources[1].source_ref,
+        &LcmSourceRef::RawMessage { store_id: 11 }
+    );
+
+    let candidate =
+        summary_convergence::candidate_for_session(&*conn, "cursor", "beta37-session-a")
+            .await
+            .unwrap()
+            .expect("beta37 cursor rows must be queued");
+    assert!(
+        summary_convergence::record_outcome(
+            &*conn,
+            &candidate,
+            summary_convergence::LcmSummaryConvergenceQueueState::Retryable,
+            Some("fixture_provider_busy"),
+            2,
+            9_999,
+        )
+        .await
+        .unwrap()
+    );
+    let mut queue = conn
+        .query(
+            "SELECT state, failure_code, failure_count, next_attempt_at_ms
+             FROM lcm_summary_convergence_queue
+             WHERE provider = 'cursor' AND session_id = 'beta37-session-a'",
+            (),
+        )
+        .await
+        .unwrap();
+    let queue_row = queue.next().await.unwrap().unwrap();
+    assert_eq!(queue_row.get::<String>(0).unwrap(), "retryable");
+    assert_eq!(
+        queue_row.get::<Option<String>>(1).unwrap().as_deref(),
+        Some("fixture_provider_busy")
+    );
+    assert_eq!(queue_row.get::<i64>(2).unwrap(), 2);
+    assert_eq!(queue_row.get::<i64>(3).unwrap(), 9_999);
+    drop(queue);
+
+    // A persisted raw revision creates both dirty work and its seed row.  A
+    // later worker restart can therefore discover the invalidation without
+    // relying on process-local state.
+    conn.execute(
+        "UPDATE lcm_raw_messages
+         SET metadata_json = json_set(metadata_json, '$.fixture_revision', json('true'))
+         WHERE provider = 'cursor' AND message_id = 'beta37-message-a1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM lcm_summary_convergence_dirty_raw
+             WHERE provider = 'cursor' AND session_id = 'beta37-session-a'",
+            (),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM lcm_summary_convergence_invalidation_work
+             WHERE provider = 'cursor' AND session_id = 'beta37-session-a'
+               AND raw_store_id = 10 AND source_kind = 'raw_message'",
+            (),
+        )
+        .await,
+        1
+    );
+
+    // Walk the actual persisted invalidation closure from the dirty raw seed
+    // through raw-message and summary-node source edges.  This catches a
+    // fixture that merely has a seed row while using non-addressable message
+    // ids: store 10 must invalidate the root and its dependent leaf.
+    let mut invalidation = conn
+        .query(
+            "WITH RECURSIVE invalidated(raw_store_id, node_id, depth) AS (
+                 SELECT work.raw_store_id, source.node_id, 0
+                 FROM lcm_summary_convergence_invalidation_work work
+                 JOIN lcm_summary_sources source
+                   ON source.source_kind = 'raw_message'
+                  AND CAST(source.source_id AS INTEGER) = work.raw_store_id
+                 WHERE work.provider = ?1
+                   AND work.session_id = ?2
+                   AND work.state = 'pending'
+                 UNION
+                 SELECT invalidated.raw_store_id, source.node_id,
+                        invalidated.depth + 1
+                 FROM invalidated
+                 JOIN lcm_summary_sources source
+                   ON source.source_kind = 'summary_node'
+                  AND source.source_id = invalidated.node_id
+             )
+             SELECT node_id, depth
+             FROM invalidated
+             WHERE raw_store_id = 10
+             ORDER BY depth, node_id",
+            params!["cursor", "beta37-session-a"],
+        )
+        .await
+        .unwrap();
+    let mut invalidated_nodes = Vec::new();
+    while let Some(row) = invalidation.next().await.unwrap() {
+        invalidated_nodes.push((row.get::<String>(0).unwrap(), row.get::<i64>(1).unwrap()));
+    }
+    assert_eq!(
+        invalidated_nodes,
+        vec![
+            ("summary-beta37-root".to_owned(), 0),
+            ("summary-beta37-leaf".to_owned(), 1),
+        ]
+    );
+
+    // The migration's bounded backfill derives the exact conversational
+    // predecessor interval for the two retained sessions.
+    assert_eq!(
+        fetch_i64(&conn, "SELECT COUNT(*) FROM lcm_raw_predecessor_ranges", ()).await,
+        2
+    );
+    let mut range = conn
+        .query(
+            "SELECT from_store_id, to_store_id
+             FROM lcm_raw_predecessor_ranges
+             WHERE provider = 'cursor' AND message_id = 'beta37-message-a2'",
+            (),
+        )
+        .await
+        .unwrap();
+    let range_row = range.next().await.unwrap().unwrap();
+    assert_eq!(range_row.get::<i64>(0).unwrap(), 10);
+    assert_eq!(range_row.get::<i64>(1).unwrap(), 10);
+    drop(range);
+
+    // FTS remains live after migration: updating the content column changes
+    // the searchable projection through the canonical trigger.
+    conn.execute(
+        "UPDATE lcm_raw_messages
+         SET index_text = 'beta37 migration fts revision'
+         WHERE provider = 'cursor' AND message_id = 'beta37-message-a1'",
+        (),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM lcm_raw_messages_fts
+             WHERE lcm_raw_messages_fts MATCH 'migration'",
+            (),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM lcm_summary_nodes_fts
+             WHERE lcm_summary_nodes_fts MATCH 'retains'",
+            (),
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn convergence_schema_refuses_malformed_queue_and_seed_before_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    create_session_host_tables(&conn).await;
+    schema::ensure_lcm_schema(&conn).await.unwrap();
+
+    // Keep the same object name and columns so CREATE IF NOT EXISTS cannot
+    // repair the weakened uniqueness constraint.  Admission must stop before it
+    // executes any of the ALTER/CREATE work below.
+    conn.execute_batch(
+        "DROP TRIGGER lcm_summary_convergence_raw_insert;
+         DROP TRIGGER lcm_summary_convergence_raw_unprotected_update;
+         DROP INDEX idx_lcm_summary_convergence_due;
+         DROP TABLE lcm_summary_convergence_queue;
+         CREATE TABLE lcm_summary_convergence_queue (
+             queue_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             provider TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             newest_raw_store_id INTEGER NOT NULL,
+             protection_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+             attempted_raw_store_id INTEGER NOT NULL DEFAULT 0,
+             state TEXT NOT NULL DEFAULT 'pending'
+                 CHECK(state IN ('pending', 'retryable', 'current', 'unavailable', 'permanent')),
+             failure_code TEXT,
+             failure_count INTEGER NOT NULL DEFAULT 0,
+             next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+             attempt_generation INTEGER NOT NULL DEFAULT 0,
+             raw_revision_generation INTEGER NOT NULL DEFAULT 0,
+             stale_from_store_id INTEGER,
+             FOREIGN KEY(provider, session_id)
+                 REFERENCES sessions(provider, session_id) ON DELETE CASCADE
+         );",
+    )
+    .await
+    .unwrap();
+    let malformed_queue_sql = {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master
+                 WHERE name = 'lcm_summary_convergence_queue'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+    };
+    let error = summary_convergence::ensure_schema(&*conn)
+        .await
+        .expect_err("a weakened queue UNIQUE constraint must fail closed");
+    assert!(matches!(error, crate::LcmError::Db(_)));
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master
+             WHERE name = 'lcm_summary_convergence_queue'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        malformed_queue_sql
+    );
+
+    // An inert same-name seed trigger is equally dangerous: IF NOT EXISTS
+    // would preserve it, so the preflight compares its complete body.
+    let temp = tempfile::tempdir().unwrap();
+    let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    create_session_host_tables(&conn).await;
+    schema::ensure_lcm_schema(&conn).await.unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER lcm_summary_convergence_dirty_raw_seed;
+         CREATE TRIGGER lcm_summary_convergence_dirty_raw_seed
+             AFTER INSERT ON lcm_summary_convergence_dirty_raw WHEN 0 BEGIN
+                 SELECT 1;
+             END;",
+    )
+    .await
+    .unwrap();
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master
+             WHERE name = 'lcm_summary_convergence_dirty_raw_seed'",
+            (),
+        )
+        .await
+        .unwrap();
+    let inert_seed_sql = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    let error = summary_convergence::ensure_schema(&*conn)
+        .await
+        .expect_err("an inert seed trigger must fail closed");
+    assert!(matches!(error, crate::LcmError::Db(_)));
+    let mut rows = conn
+        .query(
+            "SELECT sql FROM sqlite_master
+             WHERE name = 'lcm_summary_convergence_dirty_raw_seed'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap(),
+        inert_seed_sql
     );
 }

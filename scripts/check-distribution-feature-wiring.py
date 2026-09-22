@@ -87,6 +87,9 @@ NCM_MODEL_REVISION_PROVENANCE = (
     "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
     "#/identities/model/revision"
 )
+NCM_MODEL_REVISION_RECEIPT_PATH = (
+    "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+)
 NCM_MODEL_FILES = {
     "onnx/model.onnx",
     "tokenizer.json",
@@ -117,9 +120,17 @@ NCM_RELEASE_WORKFLOW_SNIPPETS = (
     'shasum -a 256 "$archive" > "$archive.sha256"',
     "python3 .release-automation/scripts/product/ncm/verify-installed.py",
     "--binary-archive",
+    "--expected-version",
+    "--expected-source-sha",
+    "--expected-archive-sha256",
+    "--expected-binary-sha256",
+    '--binary "$binary"',
+    "--model-revision-receipt",
+    "--operation install",
+    "--installed-e2e",
+    "--asset-directory retained-assets",
+    "isDraft,isPrerelease",
     '--worker-archive "$archive"',
-    "python3 .release-automation/scripts/product/ncm/check-backend.py",
-    "--install-model",
 )
 
 
@@ -545,6 +556,7 @@ def _require_ncm_model_acquisition_contract(
     acquisition_manifest: dict[str, Any],
     embedding_manifest: dict[str, Any],
     embedding_manifest_path: Path,
+    model_revision_receipt_path: Path | None = None,
 ) -> None:
     """Keep the target-specific release descriptor tied to the model pin."""
     expected = {
@@ -569,6 +581,11 @@ def _require_ncm_model_acquisition_contract(
     for key, value in expected.items():
         if acquisition_manifest.get(key) != value:
             _ncm_failure(f"model acquisition manifest field {key} must be {value!r}")
+    receipt_digest = acquisition_manifest.get("revision_provenance_sha256")
+    if not isinstance(receipt_digest, str) or re.fullmatch(r"[0-9a-f]{64}", receipt_digest) is None:
+        _ncm_failure(
+            "model acquisition manifest revision_provenance_sha256 must be lowercase hexadecimal"
+        )
     try:
         raw_embedding = embedding_manifest_path.read_bytes()
     except OSError as error:
@@ -620,7 +637,7 @@ def _require_ncm_model_acquisition_contract(
         not isinstance(transaction, dict)
         or transaction.get("version") != 1
         or transaction.get("publication") != "atomic-directory-swap"
-        or transaction.get("journal") != "ncm-model-acquisition-v1.json"
+        or transaction.get("journal") != "ncm-model-lifecycle-v1.json"
         or transaction.get("staging_prefix") != ".ncm-model-staging-"
         or transaction.get("backup_prefix") != ".ncm-model-backup-"
     ):
@@ -636,6 +653,7 @@ def _require_ncm_model_acquisition_contract(
         "repository",
         "revision",
         "manifest_sha256",
+        "revision_provenance_sha256",
         "files",
         "created_at_unix",
     }
@@ -649,6 +667,70 @@ def _require_ncm_model_acquisition_contract(
         or not required_receipt_fields.issubset(set(receipt_fields))
     ):
         _ncm_failure("model acquisition manifest does not name the pinned receipt")
+
+    if model_revision_receipt_path is None:
+        _ncm_failure(
+            "supported NCM distribution has no canonical model revision receipt"
+        )
+    if model_revision_receipt_path.name != Path(NCM_MODEL_REVISION_RECEIPT_PATH).name:
+        _ncm_failure(
+            "supported NCM distribution must use the canonical model revision receipt"
+        )
+    try:
+        receipt_bytes = model_revision_receipt_path.read_bytes()
+    except OSError as error:
+        _ncm_failure(f"cannot read the pinned model revision receipt: {error}")
+    if hashlib.sha256(receipt_bytes).hexdigest() != receipt_digest:
+        _ncm_failure(
+            "model acquisition manifest revision_provenance_sha256 differs from the pinned receipt"
+        )
+    try:
+        revision_receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        _ncm_failure(f"pinned model revision receipt is not valid JSON: {error}")
+    if not isinstance(revision_receipt, dict):
+        _ncm_failure("pinned model revision receipt must be an object")
+    identities = revision_receipt.get("identities")
+    model_identity = identities.get("model") if isinstance(identities, dict) else None
+    if not isinstance(model_identity, dict):
+        _ncm_failure("pinned model revision receipt has no model identity")
+    if model_identity.get("model") != NCM_MODEL_CONTRACT["model"]:
+        _ncm_failure("pinned model revision receipt model identity drifted")
+    if model_identity.get("revision") != NCM_MODEL_CONTRACT["revision"]:
+        _ncm_failure("pinned model revision receipt revision identity drifted")
+    artifact_digest = model_identity.get("artifact_sha256")
+    onnx_digest = next(
+        entry["sha256"]
+        for entry in acquisition_manifest["files"]
+        if isinstance(entry, dict) and entry.get("path") == "onnx/model.onnx"
+    )
+    if artifact_digest != onnx_digest:
+        _ncm_failure("pinned model revision receipt artifact digest drifted")
+    receipt_manifest_digest = model_identity.get("manifest_sha256")
+    if not isinstance(receipt_manifest_digest, str) or re.fullmatch(
+        r"[0-9a-f]{64}", receipt_manifest_digest
+    ) is None:
+        _ncm_failure("pinned model revision receipt manifest digest is invalid")
+    if receipt_manifest_digest != acquisition_manifest["embedding_manifest_sha256"]:
+        _ncm_failure(
+            "pinned model revision receipt manifest digest differs from the trusted model manifest"
+        )
+    receipt_files = model_identity.get("files")
+    if not isinstance(receipt_files, list):
+        _ncm_failure("pinned model revision receipt has no model file identities")
+    receipt_files_by_path = {
+        entry.get("path"): entry
+        for entry in receipt_files
+        if isinstance(entry, dict)
+    }
+    if set(receipt_files_by_path) != set(NCM_MODEL_FILES) or len(receipt_files_by_path) != len(receipt_files):
+        _ncm_failure("pinned model revision receipt file identities drifted")
+    for entry in acquisition_manifest["files"]:
+        receipt_entry = receipt_files_by_path.get(entry["path"])
+        if not isinstance(receipt_entry, dict) or receipt_entry.get("bytes") != entry.get("bytes") or receipt_entry.get("sha256") != entry.get("sha256"):
+            _ncm_failure(
+                f"pinned model revision receipt file identity differs for {entry['path']}"
+            )
 
 
 def _require_ncm_runtime_features(
@@ -785,6 +867,7 @@ def validate_ncm_distribution_matrix(
     runtime_manifest_path: Path,
     source_manifest_path: Path | None = None,
     model_acquisition_manifest_path: Path | None = None,
+    model_revision_receipt_path: Path | None = None,
     release_workflow_paths: list[Path] | None = None,
 ) -> None:
     """Validate NCM's explicit sidecar/native-only distribution matrix.
@@ -829,7 +912,10 @@ def validate_ncm_distribution_matrix(
         model_acquisition_manifest_path, "NCM model acquisition manifest"
     )
     _require_ncm_model_acquisition_contract(
-        acquisition_manifest, model_manifest, model_manifest_path
+        acquisition_manifest,
+        model_manifest,
+        model_manifest_path,
+        model_revision_receipt_path,
     )
     _require_ncm_runtime_features(
         root_manifest, provider_manifest, runtime_manifest, runtime_policy
@@ -937,6 +1023,7 @@ def main() -> int:
     parser.add_argument("--ncm-worker-manifest", type=Path)
     parser.add_argument("--ncm-model-manifest", type=Path)
     parser.add_argument("--ncm-model-acquisition-manifest", type=Path)
+    parser.add_argument("--ncm-model-revision-receipt", type=Path)
     parser.add_argument("--ncm-release-targets", type=Path)
     parser.add_argument("--ncm-provider-manifest", type=Path)
     parser.add_argument("--ncm-runtime-manifest", type=Path)
@@ -991,6 +1078,14 @@ def main() -> int:
                 else ncm_model_acquisition_manifest
                 if ncm_policy_path.resolve() == ncm_policy.resolve()
                 and ncm_model_acquisition_manifest.exists()
+                else None
+            ),
+            model_revision_receipt_path=(
+                arguments.ncm_model_revision_receipt
+                if arguments.ncm_model_revision_receipt is not None
+                else repo / NCM_MODEL_REVISION_RECEIPT_PATH
+                if ncm_policy_path.resolve() == ncm_policy.resolve()
+                and (repo / NCM_MODEL_REVISION_RECEIPT_PATH).exists()
                 else None
             ),
             release_workflow_paths=(

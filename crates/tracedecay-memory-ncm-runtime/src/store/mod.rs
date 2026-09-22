@@ -275,10 +275,25 @@ pub struct Event {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MaintenanceCursorGrant {
+    /// Cursor emitted by the page.
     cursor: String,
+    /// Cursor consumed by the page, if it was a continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_cursor: Option<String>,
     idempotency_key: String,
     operation_id: String,
     request_semantic_sha256: String,
+}
+
+/// Result of checking a namespace-local maintenance cursor grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintenanceCursorStatus {
+    /// The cursor and continuation semantics are authorized for this identity.
+    Authorized,
+    /// This identity was previously bound to a different cursor or semantics.
+    Conflict,
+    /// The cursor has not been issued for these continuation semantics.
+    Unissued,
 }
 
 /// A serialized kernel checkpoint.
@@ -752,10 +767,15 @@ impl NamespaceStore {
 
     /// Persists a cursor returned by common maintenance without advancing the
     /// state generation or adding a replayable event. The grant binds the
-    /// bearer cursor to the admitted operation that produced it.
+    /// bearer cursor to the stable continuation semantics and the per-call
+    /// identities that produced it. Fresh identities may authorize a cursor
+    /// already issued for the same continuation semantics. A retry keeps the
+    /// identity and consumed cursor; advancing to another cursor requires a
+    /// fresh identity.
     pub(crate) fn issue_maintenance_cursor(
         &mut self,
         cursor: &str,
+        resume_cursor: Option<&str>,
         idempotency_key: &str,
         operation_id: &str,
         request_semantic_sha256: &str,
@@ -763,12 +783,14 @@ impl NamespaceStore {
         let mut grants = read_maintenance_cursor_grants(&self.conn)?;
         let grant = MaintenanceCursorGrant {
             cursor: cursor.to_owned(),
+            resume_cursor: resume_cursor.map(str::to_owned),
             idempotency_key: idempotency_key.to_owned(),
             operation_id: operation_id.to_owned(),
             request_semantic_sha256: request_semantic_sha256.to_owned(),
         };
         if !grants.iter().any(|existing| {
             existing.cursor == grant.cursor
+                && existing.resume_cursor == grant.resume_cursor
                 && existing.idempotency_key == grant.idempotency_key
                 && existing.operation_id == grant.operation_id
                 && existing.request_semantic_sha256 == grant.request_semantic_sha256
@@ -798,22 +820,33 @@ impl NamespaceStore {
         tx.commit().map_err(map_sqlite_error)
     }
 
-    /// Checks that a resume cursor was issued for this exact admitted run.
+    /// Checks a resume cursor against the namespace-local continuation grants.
+    /// A fresh identity may use an already issued cursor with matching
+    /// semantics. Reusing an identity with a different consumed cursor or
+    /// semantics is a deterministic conflict, even when another identity has
+    /// issued the requested cursor. The emitted cursor is stored separately so
+    /// an exact retry of a partial page remains authorized.
     pub(crate) fn has_maintenance_cursor(
         &self,
         cursor: &str,
         idempotency_key: &str,
         operation_id: &str,
         request_semantic_sha256: &str,
-    ) -> Result<bool, StoreError> {
-        Ok(read_maintenance_cursor_grants(&self.conn)?
-            .iter()
-            .any(|grant| {
-                grant.cursor == cursor
-                    && grant.idempotency_key == idempotency_key
-                    && grant.operation_id == operation_id
-                    && grant.request_semantic_sha256 == request_semantic_sha256
-            }))
+    ) -> Result<MaintenanceCursorStatus, StoreError> {
+        let grants = read_maintenance_cursor_grants(&self.conn)?;
+        if grants.iter().any(|grant| {
+            (grant.idempotency_key == idempotency_key || grant.operation_id == operation_id)
+                && (grant.resume_cursor.as_deref() != Some(cursor)
+                    || grant.request_semantic_sha256 != request_semantic_sha256)
+        }) {
+            return Ok(MaintenanceCursorStatus::Conflict);
+        }
+        if grants.iter().any(|grant| {
+            grant.cursor == cursor && grant.request_semantic_sha256 == request_semantic_sha256
+        }) {
+            return Ok(MaintenanceCursorStatus::Authorized);
+        }
+        Ok(MaintenanceCursorStatus::Unissued)
     }
 
     /// Returns the durable allocation floor, including IDs retired by restore.
@@ -1257,6 +1290,27 @@ impl<'a> Mutation<'a> {
         set_meta_value(&self.tx, META_COMMIT_SEQ, &encoded)?;
         self.tx.commit().map_err(map_sqlite_error)?;
         Ok(pending_commit_seq)
+    }
+
+    /// Commits housekeeping changes without advancing the journal generation.
+    ///
+    /// The privacy completion phase clears its durable fence only after the
+    /// physical compaction has succeeded. That fence transition is metadata
+    /// housekeeping: it has no event or kernel state to represent, so it must
+    /// preserve the current event-backed commit sequence.
+    pub(crate) fn commit_without_generation(self) -> Result<CommitSeq, StoreError> {
+        let current = self
+            .pending_commit_seq
+            .checked_sub(1)
+            .ok_or_else(|| StoreError::Corrupt("commit sequence underflow".to_owned()))?;
+        let persisted = read_u64(&self.tx, META_COMMIT_SEQ)?;
+        if persisted != current {
+            return Err(StoreError::Corrupt(
+                "housekeeping commit sequence changed during mutation".to_owned(),
+            ));
+        }
+        self.tx.commit().map_err(map_sqlite_error)?;
+        Ok(current)
     }
 
     fn ensure_budget(&self, additional_basis: u64, allow_reserve: bool) -> Result<(), StoreError> {

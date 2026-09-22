@@ -19,6 +19,7 @@ use tracedecay_memory_provider_registry::{
     HistoryGrant, OperationControl, OwnedExactScope, OwnedProviderId, TerminalCode,
 };
 use tracedecay_runtime_core::db::Database;
+use tracedecay_store::StoreShardIdV1;
 
 use super::super::cognitive_recall::{
     LEDGER_FILE_NAME, RecallAdmissionLedgerV1,
@@ -28,7 +29,8 @@ use super::super::cognitive_recall::{
 };
 use super::super::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
-    ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read, original_source_fence_digest,
+    PhysicalPathIdentityV1, PhysicalPathKind, ProviderHistoryErrorV1, ProviderHistoryReaderV1,
+    bounded_read, original_source_fence_digest,
 };
 
 type Result<T> = std::result::Result<T, ProviderHistoryErrorV1>;
@@ -54,9 +56,14 @@ pub(crate) struct ProviderControlAuthorityInputsV1 {
 /// Canonical data authority, with no registry, selected provider, or worker owner.
 pub(crate) struct ProviderControlAuthorityV1 {
     session_db: RegisteredGlobalDbLeaseV1,
+    registered_shard: StoreShardIdV1,
+    profile_id: UserProfileId,
+    mounted_scope: ResolvedScope,
     observations: Arc<GlobalDbObservationStore>,
     dispositions: Arc<Database>,
     original_authority: Arc<MountedOriginalObservationAuthorityV1>,
+    store_data_root: PathBuf,
+    store_data_root_identity: PhysicalPathIdentityV1,
     ledger: Option<Arc<RecallAdmissionLedgerV1>>,
     locator_key: RecallLocatorKeyV1,
     journals: BTreeMap<OwnedProviderId, Arc<SqliteObservationJournal>>,
@@ -68,6 +75,7 @@ pub(crate) struct AuthorizedRetainedControlSourceV1 {
     pub(crate) retained: RetainedRecallControlSourceV1,
     pub(crate) grant: HistoryGrant,
     pub(crate) journal: Arc<SqliteObservationJournal>,
+    authority: Arc<ProviderControlAuthorityV1>,
 }
 
 /// Fresh canonical inventory read for one already-authorized provider namespace.
@@ -97,6 +105,31 @@ pub(crate) struct ResolvedCanonicalControlObservationV1 {
 }
 
 impl ProviderControlAuthorityV1 {
+    /// Rechecks every composition binding before a control token is touched.
+    /// The registered lease, bridge and hook reader must still describe the
+    /// same brain/profile/project and physical data root after a reopen.
+    pub(crate) fn validate_mount(&self) -> Result<()> {
+        if self.session_db.binding().shard_id != self.registered_shard {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "registered history shard changed",
+            ));
+        }
+        self.original_authority.validate_mount(
+            &self.profile_id,
+            &self.mounted_scope,
+            &self.registered_shard,
+        )?;
+        self.original_authority
+            .reader
+            .validate_data_root(&self.store_data_root)?;
+        self.store_data_root_identity.validate_current(
+            &self.store_data_root,
+            "history data root",
+            PhysicalPathKind::Directory,
+        )?;
+        self.original_authority.bridge.revalidate()
+    }
+
     /// An untrusted composite canonical key is authorized only through its
     /// registered row and a fresh, matching host hook boundary.
     pub(crate) async fn authorize_canonical_session(
@@ -107,6 +140,7 @@ impl ProviderControlAuthorityV1 {
         session_id: &str,
         control: &OperationControl,
     ) -> Result<RetainedRecallControlScopeV1> {
+        self.validate_mount()?;
         check(control)?;
         let provider_id = OwnedProviderId::new(provider_id.as_str())
             .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("advisory provider"))?;
@@ -181,6 +215,7 @@ impl ProviderControlAuthorityV1 {
         sources: &[tracedecay_memory_provider_registry::OriginalSourceIdentity],
         control: &OperationControl,
     ) -> Result<AuthorizedCanonicalControlInventoryV1> {
+        self.validate_mount()?;
         check(control)?;
         if sources.len() > tracedecay_memory_provider_registry::MAX_ADVISORY_ADMISSION_SOURCES {
             return Err(ProviderHistoryErrorV1::ClaimMismatch(
@@ -397,6 +432,7 @@ impl ProviderControlAuthorityV1 {
         sources: &[tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1],
         control: &OperationControl,
     ) -> Result<AuthorizedCanonicalControlInventoryV1> {
+        self.validate_mount()?;
         check(control)?;
         if sources.len() > tracedecay_memory_provider_registry::MAX_ADVISORY_ADMISSION_SOURCES {
             return Err(ProviderHistoryErrorV1::ClaimMismatch(
@@ -448,7 +484,18 @@ impl ProviderControlAuthorityV1 {
         inputs: ProviderControlAuthorityInputsV1,
         control: &OperationControl,
     ) -> Result<Self> {
-        check(control)?;
+        let registered_shard = inputs.session_db.binding().shard_id.clone();
+        let store_data_root_identity = inputs
+            .hook_origin_reader
+            .bind_data_root(&inputs.store_data_root)?;
+        inputs.hook_origin_reader.validate_mount_identity(
+            &inputs.profile_id,
+            &inputs.mounted_scope,
+            &registered_shard,
+        )?;
+        inputs
+            .hook_origin_reader
+            .validate_data_root(&inputs.store_data_root)?;
         if inputs.live_journals.len() > 2 {
             return Err(ProviderHistoryErrorV1::ClaimMismatch(
                 "retained journal count",
@@ -458,13 +505,19 @@ impl ProviderControlAuthorityV1 {
             &inputs.canonical_project_path,
             &inputs.profile_id,
             &inputs.mounted_scope,
-            &inputs.session_db.binding().shard_id,
+            &registered_shard,
         )?;
-        check(control)?;
         let original_authority = Arc::new(MountedOriginalObservationAuthorityV1 {
             reader: inputs.hook_origin_reader,
             bridge: Arc::new(bridge),
         });
+        original_authority.validate_mount(
+            &inputs.profile_id,
+            &inputs.mounted_scope,
+            &registered_shard,
+        )?;
+        // Identity admission is complete before this first control snapshot.
+        check(control)?;
         let ledger_path = inputs.store_data_root.join(LEDGER_FILE_NAME);
         let locator_key = inputs.locator_key.clone();
         let ledger = match inputs.live_ledger {
@@ -497,23 +550,32 @@ impl ProviderControlAuthorityV1 {
         // so would create a second connection outside the journey's lifecycle
         // and could let a stale file outlive the daemon-owned source/grant
         // authority. Missing mounts fail closed in `authorize_source`.
-        check(control)?;
-        original_authority.bridge.revalidate()?;
-        check(control)?;
-        Ok(Self {
+        let authority = Self {
             observations: Arc::new(inputs.session_db.observation_store()),
             session_db: inputs.session_db,
+            registered_shard,
+            profile_id: inputs.profile_id,
+            mounted_scope: inputs.mounted_scope,
             dispositions: inputs.dispositions,
             original_authority,
+            store_data_root: inputs.store_data_root,
+            store_data_root_identity,
             ledger,
             locator_key,
             journals,
             runtime: inputs.runtime,
-        })
+        };
+        authority.validate_mount()?;
+        check(control)?;
+        Ok(authority)
     }
 
     /// Use the ledger's bounded composite-key reads on the existing blocking pool.
     pub(crate) fn ledger(&self) -> Option<Arc<RecallAdmissionLedgerV1>> {
+        // Callers use this accessor to read or write retained control rows
+        // before invoking a more specific authority method. Reject a stale
+        // checkout/root before handing out the host-owned ledger handle.
+        self.validate_mount().ok()?;
         self.ledger.as_ref().map(Arc::clone)
     }
 
@@ -524,6 +586,7 @@ impl ProviderControlAuthorityV1 {
         retained: &RetainedRecallControlScopeV1,
         control: &OperationControl,
     ) -> Result<RetainedRecallControlScopeV1> {
+        self.validate_mount()?;
         check(control)?;
         let authority = Arc::clone(self);
         let retained = retained.clone();
@@ -548,6 +611,7 @@ impl ProviderControlAuthorityV1 {
         include_unavailable: bool,
         control: &OperationControl,
     ) -> Result<AuthorizedRetainedControlSourceV1> {
+        self.validate_mount()?;
         check(control)?;
         let authority = Arc::clone(self);
         let retained = retained.clone();
@@ -588,6 +652,7 @@ impl ProviderControlAuthorityV1 {
                 retained,
                 grant,
                 journal,
+                authority,
             })
         });
         bounded_read(control, work, "retained control source worker").await?
@@ -609,6 +674,7 @@ impl ProviderControlAuthorityV1 {
         canonical_provider_id: &str,
         control: &OperationControl,
     ) -> Result<OwnedExactScope> {
+        self.validate_mount()?;
         check(control)?;
         if canonical_provider_id.is_empty()
             || canonical_provider_id.len() > 1024
@@ -705,6 +771,7 @@ impl AuthorizedRetainedControlSourceV1 {
         record: bool,
     ) -> std::result::Result<Option<ProviderSourceIntentReceiptV1>, ProviderSourceIntentActionErrorV1>
     {
+        self.authority.validate_mount()?;
         check(control)?;
         self.grant
             .validate_structure()

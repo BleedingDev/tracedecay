@@ -2186,6 +2186,25 @@ fn fingerprint_candidate_and_posting_budgets_report_partial_coverage() {
     );
     assert_eq!(candidate_page.accounting.candidates_admitted, 256);
     assert_eq!(candidate_page.accounting.candidate_bodies_compared, 64);
+    let first_cursor = candidate_page
+        .page
+        .next_cursor
+        .clone()
+        .expect("candidate-body budget must expose a successor");
+    let resumed = candidate_reader
+        .clone_fingerprint_page(
+            &candidate_source.occurrence,
+            &candidate_source.payload,
+            Some(&first_cursor),
+            256,
+            &control,
+        )
+        .expect("resume candidate-body budget read");
+    assert_ne!(
+        resumed.page.next_cursor.as_ref(),
+        Some(&first_cursor),
+        "candidate-body exhaustion must advance its continuation"
+    );
 
     let long_body = (0..50)
         .map(|ordinal| format!("shared_long_{ordinal}(); "))
@@ -2464,6 +2483,10 @@ fn hot_only_fingerprints_are_partial_while_exact_digest_reads_still_work() {
     assert!(fingerprints.accounting.hot_postings_skipped > 0);
     assert!(fingerprints.accounting.hot_posting_rows_skipped > 1_024);
     assert_eq!(fingerprints.accounting.posting_rows_examined, 0);
+    assert!(
+        fingerprints.page.next_cursor.is_none(),
+        "a permanently hot posting stream must terminate its partial page"
+    );
 
     let exact_key = source
         .payload

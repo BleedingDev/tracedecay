@@ -2353,6 +2353,7 @@ export const ExplorerReadContextV1Schema = z.object({
   messages: z.array(z.lazy(() => LcmMessageV1Schema)),
   offset: z.number().int().safe(),
   order: z.string(),
+  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
   summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
@@ -2383,6 +2384,7 @@ export type ExplorerSessionCountsV1 = z.infer<typeof ExplorerSessionCountsV1Sche
 
 export const ExplorerSessionSizeV1Schema = z.object({
   counts: z.lazy(() => ExplorerSessionCountsV1Schema),
+  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
 });
@@ -2953,6 +2955,7 @@ export const LcmLatestSessionV1Schema = z.object({
   last_store_id: z.number().int().safe().nullable(),
   last_timestamp: z.number().int().safe().nullable(),
   message_count: z.number().int().safe(),
+  provider: z.string(),
   session_id: z.string(),
 });
 export type LcmLatestSessionV1 = z.infer<typeof LcmLatestSessionV1Schema>;
@@ -2969,6 +2972,7 @@ export const LcmMessageV1Schema = z.object({
   metadata_json: z.string().nullable(),
   ordinal: z.number().int().safe().nullable(),
   pinned: z.number().int().safe().nullable(),
+  provider: z.string(),
   role: z.string().nullable(),
   session_id: z.string(),
   snippet: z.string().nullable(),
@@ -2989,8 +2993,10 @@ export const LcmOverviewPayloadV1Schema = z.object({
   latest_summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
   limit: z.number().int().safe(),
   matches: z.lazy(() => LcmMatchesV1Schema),
+  next_cursor: z.string().nullable(),
   overview: z.lazy(() => LcmOverviewStatsV1Schema),
   path: z.string(),
+  provider: z.string().nullable(),
   query: z.string(),
   storage_scope: z.string(),
 });
@@ -3022,6 +3028,7 @@ export const LcmSearchEngineDetailV1Schema = z.object({
 export type LcmSearchEngineDetailV1 = z.infer<typeof LcmSearchEngineDetailV1Schema>;
 
 export const LcmSearchFiltersV1Schema = z.object({
+  provider: z.string().nullable(),
   role: z.string().nullable(),
   session_id: z.string().nullable(),
   since: z.number().nullable(),
@@ -3069,6 +3076,7 @@ export const LcmSessionPayloadV1Schema = z.object({
   messages: z.array(z.lazy(() => LcmMessageV1Schema)),
   next_cursor: z.string().nullable(),
   path: z.string(),
+  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
   summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
@@ -3077,6 +3085,7 @@ export type LcmSessionPayloadV1 = z.infer<typeof LcmSessionPayloadV1Schema>;
 
 export const LcmSourceCountV1Schema = z.object({
   count: z.number().int().safe(),
+  provider: z.string(),
   source: z.string(),
 });
 export type LcmSourceCountV1 = z.infer<typeof LcmSourceCountV1Schema>;
@@ -3088,6 +3097,7 @@ export const LcmSummaryNodeV1Schema = z.object({
   expand_hint: z.string(),
   latest_at: z.number().int().safe().nullable(),
   node_id: z.string(),
+  provider: z.string(),
   recency: z.number().int().safe().nullable(),
   session_id: z.string(),
   snippet: z.string().nullable(),
@@ -3129,8 +3139,10 @@ export const LcmTimelinePayloadV1Schema = z.object({
   buckets: z.array(z.lazy(() => LcmTimelineBucketV1Schema)),
   coverage: z.union([z.lazy(() => LcmTimelineCoverageV1Schema), z.null()]),
   exists: z.boolean(),
+  next_cursor: z.string().nullable(),
   node_buckets: z.array(z.lazy(() => LcmTimelineNodeBucketV1Schema)),
   path: z.string(),
+  provider: z.string().nullable(),
   session_id: z.string().nullable(),
   storage_scope: z.string(),
   undated: z.lazy(() => LcmTimelineUndatedV1Schema),

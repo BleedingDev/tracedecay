@@ -7,6 +7,7 @@ pub use target::{
 };
 
 use serde::Serialize;
+use tracedecay_contracts::memory::FactCursorKeyringV1;
 use tracedecay_contracts::retained_surfaces::{
     FactFeedbackRequestV1, FactRetrievalTelemetryV1, FactStoreAddRequestV1,
     FactStoreContradictRequestV1, FactStoreGetRequestV1, FactStoreListRequestV1,
@@ -100,6 +101,67 @@ macro_rules! execute_scoped_memory {
     }};
 }
 
+macro_rules! execute_scoped_memory_with_cursor_keyring {
+    (
+        $port:expr,
+        $context:expr,
+        $memory_scope:expr,
+        $selector:expr,
+        $access:expr,
+        $executor:ident($request:expr)
+    ) => {{
+        match &$port.authority {
+            DirectRetainedMemoryAuthorityV1::Project { authority } => {
+                let (target, _) = bounded_memory_operation($context, async {
+                    open_project_retained_memory_target(
+                        authority,
+                        &authority.project_root,
+                        &$context.request_context.scope().project_id,
+                        $memory_scope,
+                        $selector,
+                        $access,
+                    )
+                    .await
+                })
+                .await?;
+                let keyring = $port.fact_cursor_keyring(target.owner()).await?;
+                $executor(
+                    $context,
+                    target.database(),
+                    target.owner().clone(),
+                    $request,
+                    &$port.configuration_digest,
+                    &keyring,
+                )
+                .await
+            }
+            DirectRetainedMemoryAuthorityV1::Profile { registry } => {
+                memory_mapping::ensure_profile_request_scope($memory_scope, $selector)?;
+                let (database, _) = bounded_memory_operation($context, async {
+                    hotpath::future!(
+                        open_user_memory_db(registry),
+                        label = "daemon.retained.memory.open_profile"
+                    )
+                    .await
+                    .map_err(map_execution_error)
+                })
+                .await?;
+                let owner = FactOwnerV1::Profile;
+                let keyring = $port.fact_cursor_keyring(&owner).await?;
+                $executor(
+                    $context,
+                    &database,
+                    owner,
+                    $request,
+                    &$port.configuration_digest,
+                    &keyring,
+                )
+                .await
+            }
+        }
+    }};
+}
+
 enum DirectRetainedMemoryAuthorityV1<'a> {
     Project {
         authority: RetainedMemoryTargetAuthorityV1,
@@ -164,6 +226,46 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
         }
     }
 
+    async fn fact_cursor_keyring(
+        &self,
+        owner: &FactOwnerV1,
+    ) -> Result<FactCursorKeyringV1, RetainedSurfaceExecutionErrorV1> {
+        let profile_binding = memory_mapping::profile_binding(owner)?;
+        let provider = match &self.authority {
+            DirectRetainedMemoryAuthorityV1::Project { authority } => authority
+                .profile_database
+                .load_session_cursor_key_provider_result()
+                .await
+                .map_err(|error| {
+                    RetainedSurfaceExecutionErrorV1::unavailable(format!(
+                        "the retained fact cursor key provider is unavailable: {error}"
+                    ))
+                })?,
+            DirectRetainedMemoryAuthorityV1::Profile { registry } => {
+                let database = registry.profile_database().await.map_err(|error| {
+                    RetainedSurfaceExecutionErrorV1::unavailable(format!(
+                        "the retained fact cursor profile authority is unavailable: {error}"
+                    ))
+                })?;
+                database
+                    .load_session_cursor_key_provider_result()
+                    .await
+                    .map_err(|error| {
+                        RetainedSurfaceExecutionErrorV1::unavailable(format!(
+                            "the retained fact cursor key provider is unavailable: {error}"
+                        ))
+                    })?
+            }
+        };
+        provider
+            .fact_cursor_keyring(profile_binding)
+            .map_err(|error| {
+                RetainedSurfaceExecutionErrorV1::unavailable(format!(
+                    "the retained fact cursor keyring is unavailable: {error}"
+                ))
+            })
+    }
+
     #[hotpath::skip]
     async fn execute_add(
         &self,
@@ -200,7 +302,7 @@ impl<'a> DirectRetainedMemoryPortV1<'a> {
             | Read::Get(_)
             | Read::List(_) => MemoryTargetAccessV1::Read,
         };
-        execute_scoped_memory!(
+        execute_scoped_memory_with_cursor_keyring!(
             self,
             context,
             memory_scope,
@@ -655,23 +757,53 @@ async fn execute_read_on_db(
     owner: FactOwnerV1,
     request: Read<'_>,
     configuration_digest: &ManifestDigest,
+    cursor_keyring: &FactCursorKeyringV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     match request {
         Read::Search(request) => {
-            search_on_db(context, database, owner, request, configuration_digest).await
+            search_on_db(
+                context,
+                database,
+                owner,
+                request,
+                configuration_digest,
+                cursor_keyring,
+            )
+            .await
         }
         Read::Probe(request) => {
-            semantic_search_on_db(context, database, owner, SemanticRead::Probe(request)).await
+            semantic_search_on_db(
+                context,
+                database,
+                owner,
+                SemanticRead::Probe(request),
+                cursor_keyring,
+            )
+            .await
         }
         Read::Related(request) => {
-            semantic_search_on_db(context, database, owner, SemanticRead::Related(request)).await
+            semantic_search_on_db(
+                context,
+                database,
+                owner,
+                SemanticRead::Related(request),
+                cursor_keyring,
+            )
+            .await
         }
         Read::Reason(request) => {
-            semantic_search_on_db(context, database, owner, SemanticRead::Reason(request)).await
+            semantic_search_on_db(
+                context,
+                database,
+                owner,
+                SemanticRead::Reason(request),
+                cursor_keyring,
+            )
+            .await
         }
         Read::Contradict(request) => contradict_on_db(context, database, owner, request).await,
         Read::Get(request) => get_on_db(context, database, owner, request).await,
-        Read::List(request) => list_on_db(context, database, owner, request).await,
+        Read::List(request) => list_on_db(context, database, owner, request, cursor_keyring).await,
     }
 }
 
@@ -681,9 +813,15 @@ async fn search_on_db(
     owner: FactOwnerV1,
     request: &FactStoreSearchRequestV1,
     configuration_digest: &ManifestDigest,
+    cursor_keyring: &FactCursorKeyringV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let search = memory_mapping::PreparedFactSearch::new(owner.clone(), request)?;
+    let search = memory_mapping::PreparedFactSearch::new_with_cursor_keyring(
+        owner.clone(),
+        request,
+        cursor_keyring,
+    )?;
+    let cursor_binding = search.cursor_binding().clone();
     let logical_effect = search.logical_effect()?;
     let query = search.into_query();
     let request_id = context.request_context.request_id().as_str();
@@ -766,7 +904,10 @@ async fn search_on_db(
             "Retrieval telemetry committed, but the authority result failed validation.",
         );
     }
-    let mut mapped = match memory_mapping::search_page(&page) {
+    let mut mapped = match memory_mapping::search_page_with_cursor_keyring(
+        &page,
+        Some((&cursor_binding, cursor_keyring)),
+    ) {
         Ok(mapped) => mapped,
         Err(error) => {
             let Some(committed_state) = tracked.committed_state() else {
@@ -861,6 +1002,7 @@ async fn semantic_search_on_db(
     database: &Database,
     owner: FactOwnerV1,
     request: SemanticRead<'_>,
+    cursor_keyring: &FactCursorKeyringV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let (kind, query_text, options, after, operation) = match request {
         SemanticRead::Probe(request) => (
@@ -891,7 +1033,24 @@ async fn semantic_search_on_db(
         }
     };
     let memory = memory_application(database, owner.clone())?;
-    let query = memory_mapping::search_query(owner, kind, query_text, options, after)?;
+    let limit = memory_mapping::fact_limit(options.limit)?;
+    let min_trust = memory_mapping::confidence(options.min_trust)?;
+    let cursor_binding = memory_mapping::search_cursor_binding(
+        &owner,
+        &kind,
+        query_text.as_deref(),
+        options,
+        min_trust,
+        limit,
+    )?;
+    let query = memory_mapping::search_query_with_cursor_keyring(
+        owner,
+        kind,
+        query_text,
+        options,
+        after,
+        cursor_keyring,
+    )?;
     let read_control = fact_read_control(context);
     let (page, _) = bounded_memory_operation(context, async {
         let page = match request {
@@ -920,7 +1079,10 @@ async fn semantic_search_on_db(
         page.map_err(memory_mapping::map_memory_error)
     })
     .await?;
-    let mapped = memory_mapping::search_page(&page)?;
+    let mapped = memory_mapping::search_page_with_cursor_keyring(
+        &page,
+        Some((&cursor_binding, cursor_keyring)),
+    )?;
     let result = memory_mapping::semantic_search_result(operation, mapped)?;
     evidence_outcome(context, operation, result)
 }
@@ -1002,16 +1164,23 @@ async fn list_on_db(
     database: &Database,
     owner: FactOwnerV1,
     request: &FactStoreListRequestV1,
+    cursor_keyring: &FactCursorKeyringV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
     let memory = memory_application(database, owner.clone())?;
-    let query = ProjectMemoryFactListQueryV1::new(
-        owner,
-        request.options.category,
-        memory_mapping::confidence(request.options.min_trust)?,
-        request.after_fact_id.clone(),
-        memory_mapping::fact_limit(request.options.limit)?,
-    )
-    .map_err(memory_mapping::map_store_error)?;
+    let limit = memory_mapping::fact_limit(request.options.limit)?;
+    let min_trust = memory_mapping::confidence(request.options.min_trust)?;
+    let cursor_binding =
+        memory_mapping::list_cursor_binding(&owner, &request.options, min_trust, limit)?;
+    let after = request
+        .after
+        .as_ref()
+        .map(|cursor| {
+            memory_mapping::decode_list_cursor_with_keyring(cursor, &cursor_binding, cursor_keyring)
+        })
+        .transpose()?;
+    let query =
+        ProjectMemoryFactListQueryV1::new(owner, request.options.category, min_trust, after, limit)
+            .map_err(memory_mapping::map_store_error)?;
     let read_control = fact_read_control(context);
     let (page, _) = bounded_memory_operation(context, async {
         hotpath::future!(
@@ -1022,7 +1191,11 @@ async fn list_on_db(
         .map_err(memory_mapping::map_memory_error)
     })
     .await?;
-    let result = RetainedSurfaceResultV1::FactStoreList(memory_mapping::list_page(&page)?);
+    let result =
+        RetainedSurfaceResultV1::FactStoreList(memory_mapping::list_page_with_cursor_keyring(
+            &page,
+            Some((&cursor_binding, cursor_keyring)),
+        )?);
     evidence_outcome(context, RetainedSurfaceOperation::FactStoreList, result)
 }
 

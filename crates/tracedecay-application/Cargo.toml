@@ -12,9 +12,16 @@ include = ["/src/**"]
 # Opt-in profiling. Hotpath macros are no-ops until the *binary* selects the
 # `hotpath/hotpath` backend (cargo unifies the proc-macro's features), so this
 # feature exists only for the `cfg(feature = "hotpath")` sites in this crate
-# that change compiled behaviour under profiling. It forwards nowhere else.
-hotpath = ["hotpath/hotpath", "hotpath/ureq-3"]
+# that change compiled behaviour under profiling. It also forwards the
+# semantic runtime's opt-in observation feature.
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/ureq-3",
+    "tracedecay-semantic/hotpath",
+]
 default = []
+# Mirrors the root crate's opt-in semantic embedding backend.
+semantic-fastembed = ["tracedecay-semantic/semantic-fastembed"]
 # Exposes test-only helper surfaces to dependent crates' test builds without
 # enabling in-process transports. Forwards to tracedecay-sessions so the
 # re-exported wire test helpers (read_bounded_line, line_outcome_to_io) resolve
@@ -71,6 +78,8 @@ tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
 tracedecay-query = { path = "../tracedecay-query", version = "0.1.0" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
 tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", version = "0.1.0" }
+tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0" }
+tracedecay-semantic-contracts.workspace = true
 tracedecay-session-memory = { path = "../tracedecay-session-memory", version = "0.1.0" }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
 tracedecay-sessions = { path = "../tracedecay-sessions", version = "0.1.0" }
@@ -87,6 +96,7 @@ tracedecay-code-index = { path = "../tracedecay-code-index", version = "0.1.0", 
 tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0", features = ["test-helpers"] }
+tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0", features = ["test-helpers"] }
 tracedecay-sessions = { path = "../tracedecay-sessions", version = "0.1.0", features = ["test-helpers"] }
 
 # Dual-mode self-check via benches/hotpath_coverage.rs: feature off must

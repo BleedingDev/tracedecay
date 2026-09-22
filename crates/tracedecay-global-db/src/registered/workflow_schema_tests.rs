@@ -44,8 +44,8 @@ async fn assert_workflow_schema_reset_without_mutation(malformed_schema: String)
         connection.execute_batch(&malformed_schema).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE workflow_reset_canary (value TEXT NOT NULL);
-                 INSERT INTO workflow_reset_canary VALUES ('preserve-me');",
+                "CREATE TABLE schema_reset_canary (value TEXT NOT NULL);
+                 INSERT INTO schema_reset_canary VALUES ('preserve-me');",
             )
             .unwrap();
     }
@@ -88,7 +88,7 @@ async fn assert_workflow_schema_reset_without_mutation(malformed_schema: String)
     );
     let connection = TestConnection::open(&database_path);
     let mut canary = connection
-        .query("SELECT value FROM workflow_reset_canary", ())
+        .query("SELECT value FROM schema_reset_canary", ())
         .await
         .unwrap();
     assert_eq!(
@@ -216,6 +216,99 @@ async fn extra_workflow_schema_identity_requires_reset_without_mutation() {
                  1,
                  'sha256:ef3f0fdc0760f91f64f8cc567cee1174dbd94fec69c9de2a39f9683fd8b780da'
          );",
+    );
+    assert_workflow_schema_reset_without_mutation(schema).await;
+}
+
+#[tokio::test]
+async fn workflow_table_check_constraint_drift_requires_reset_without_mutation() {
+    let mut schema = String::new();
+    for table in WORKFLOW_TABLE_CONTRACTS_V1 {
+        let sql = table.sql.replace(
+            "sequence INTEGER NOT NULL CHECK (sequence > 0)",
+            "sequence INTEGER NOT NULL",
+        );
+        schema.push_str(&sql);
+        schema.push_str(";\n");
+    }
+    schema.push_str(WORKFLOW_SCHEMA_IDENTITY_V1);
+    assert_workflow_schema_reset_without_mutation(schema).await;
+}
+
+#[tokio::test]
+async fn workflow_table_strict_or_foreign_key_drift_requires_reset_without_mutation() {
+    let mut schema = String::new();
+    for table in WORKFLOW_TABLE_CONTRACTS_V1 {
+        let sql = if table.name == "workflow_fan_out_census_journal" {
+            table
+                .sql
+                .replace(
+                    "    FOREIGN KEY (run_id, workflow_sequence)\n        REFERENCES workflow_run_journal (run_id, sequence)\n",
+                    "",
+                )
+                .replace(") STRICT", ")")
+        } else {
+            table.sql.to_owned()
+        };
+        schema.push_str(&sql);
+        schema.push_str(";\n");
+    }
+    schema.push_str(WORKFLOW_SCHEMA_IDENTITY_V1);
+    assert_workflow_schema_reset_without_mutation(schema).await;
+}
+
+#[tokio::test]
+async fn workflow_owned_trigger_requires_reset_without_mutation() {
+    let mut schema = String::new();
+    for table in WORKFLOW_TABLE_CONTRACTS_V1 {
+        schema.push_str(table.sql);
+        schema.push_str(";\n");
+    }
+    schema.push_str(WORKFLOW_SCHEMA_IDENTITY_V1);
+    schema.push_str(
+        ";
+             CREATE TRIGGER unexpected_workflow_trigger
+             AFTER INSERT ON workflow_run_journal
+             BEGIN
+                 SELECT 1;
+             END;",
+    );
+    assert_workflow_schema_reset_without_mutation(schema).await;
+}
+
+#[tokio::test]
+async fn workflow_owned_index_requires_reset_without_mutation() {
+    let mut schema = String::new();
+    for table in WORKFLOW_TABLE_CONTRACTS_V1 {
+        schema.push_str(table.sql);
+        schema.push_str(";\n");
+    }
+    schema.push_str(WORKFLOW_SCHEMA_IDENTITY_V1);
+    schema.push_str(
+        ";
+             CREATE INDEX unexpected_workflow_index
+             ON workflow_run_journal(run_id);",
+    );
+    assert_workflow_schema_reset_without_mutation(schema).await;
+}
+
+#[tokio::test]
+async fn workflow_owned_view_reference_requires_reset_without_mutation() {
+    let mut schema = String::new();
+    for table in WORKFLOW_TABLE_CONTRACTS_V1 {
+        schema.push_str(table.sql);
+        schema.push_str(";\n");
+    }
+    schema.push_str(WORKFLOW_SCHEMA_IDENTITY_V1);
+    // `sqlite_master.tbl_name` is the view's own name, not the table named in
+    // this SELECT. Admission must inspect the SQL dependency so an arbitrary
+    // view cannot smuggle a workflow-owned reference through the inventory.
+    schema.push_str(
+        ";
+             CREATE VIEW arbitrary_reference AS
+             SELECT run_id FROM workflow_run_journal
+             UNION ALL
+             SELECT run_id FROM workflow_runs;",
     );
     assert_workflow_schema_reset_without_mutation(schema).await;
 }

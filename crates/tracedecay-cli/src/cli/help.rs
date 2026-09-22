@@ -605,15 +605,27 @@ install --agent codex --automation (enable at install), tracedecay dashboard
 (automation outcomes), tracedecay memory status.";
 
 pub(crate) const STORAGE_LONG_ABOUT: &str = "\
-Profile-storage maintenance: read-only per-store size and retention reporting, \
-complete profile backup, and backup restore rehearsal. TraceDecay V2 stores are \
-created at their final shape, so there is no cross-version migration workflow.";
+Profile-storage maintenance: read-only reporting, complete external backups, \
+backup rehearsal, and the explicit first-party V1-to-V2 replacement flow. \
+Replacement supports `--dry-run` for a no-write plan; applying it requires \
+`--yes`, quiesces the profile, verifies every authority, and keeps the external \
+V1 backup available for downgrade. `--provider native` publishes the shipped \
+ Native serving route; `--provider ncm` additionally requires the independently \
+attested NCM worker and model bundle. The migration worker is shipped in this \
+binary; an optional `--worker` path is accepted only for compatibility and is \
+never trusted for the preservation proof.";
 
 pub(crate) const STORAGE_AFTER_HELP: &str = "\
 Examples:
   tracedecay storage report                      Per-store size / free-page ratio (read-only)
   tracedecay storage backup --to <dir> --backup-id <id>
   tracedecay storage rehearse-backup --backup <dir> --restore <dir>
+  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
+    --dry-run                                      Preview the V1-to-V2 cutover
+  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
+    --provider native --yes                       Publish the Native serving route
+  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
+    --provider ncm --yes                          Publish the attested NCM route
 
 Related: tracedecay projects (registry view), tracedecay wipe.";
 

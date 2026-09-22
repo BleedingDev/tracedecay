@@ -5,6 +5,7 @@ use super::selection::stable_reference;
 use super::util::{
     read_live, remaining_deadline, store_reply, unavailable_recovery,
     validate_common_control_digest, validate_durable_receipt,
+    validate_receipt_idempotency_key_json,
 };
 use crate::store::CapsuleStatus;
 use serde_json::{Value, json};
@@ -371,6 +372,12 @@ fn delivery_receipt(
         };
         let durable: DurableReceipt =
             serde_json::from_str(&event.receipt).map_err(|_| corrupt())?;
+        validate_receipt_idempotency_key_json(
+            &event.receipt,
+            &event.kind,
+            event.idempotency_key.as_deref(),
+        )
+        .map_err(|_| corrupt())?;
         validate_durable_receipt(&durable, event.seq, event.idempotency_key.as_deref())
             .map_err(|_| corrupt())?;
         validate_common_control_digest(&event, &durable).map_err(|_| corrupt())?;

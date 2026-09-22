@@ -6,11 +6,18 @@ use crate::memory::{
 use serde::Serialize;
 use serde_json::Value;
 use tracedecay_contracts::RetainedSurfaceExecutionErrorV1;
+use tracedecay_contracts::memory::{
+    FactCursorBindingV1, FactCursorErrorV1, FactCursorKeyringV1, FactCursorOperationV1,
+    FactCursorQueryV1, decode_fact_list_cursor_with_keyring,
+    decode_fact_search_cursor_with_keyring, encode_fact_list_cursor_with_keyring,
+    encode_fact_search_cursor_with_keyring, profile_binding_for_owner,
+};
 use tracedecay_contracts::retained_surfaces::{
     FactCategoryV1, FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1,
     FactContradictionV1, FactFeedbackActionV1, FactFeedbackDetailsAvailabilityV1,
     FactFeedbackRequestV1, FactFeedbackV1, FactIdentitySourceResultV1, FactPayloadAccessV1,
-    FactProjectionV1, FactReadOptionsV1, FactRetrievalTelemetryDegradationV1,
+    FactListCursorV1, FactProjectionV1, FactReadOptionsV1,
+    FactRetrievalTelemetryDegradationV1,
     FactRetrievalTelemetryV1, FactSearchCursorV1, FactSearchGraphCoverageV1,
     FactSearchGraphDegradationV1, FactSearchHitV1, FactSearchScoresV1, FactSourceLabelPatchV1,
     FactStatusV1, FactStoreAddCommitV1, FactStoreAddRequestV1, FactStoreAddResultV1,
@@ -74,6 +81,115 @@ pub fn ensure_profile_request_scope(
         return Err(RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized);
     }
     Ok(())
+}
+
+/// Build the authenticated request binding shared by a fact search query and
+/// its response cursor. The internal store query remains free to use its
+/// structural ordering cursor; only this boundary can mint or verify the
+/// public token.
+pub fn search_cursor_binding(
+    owner: &FactOwnerV1,
+    kind: &ProjectMemoryFactSearchKindV1,
+    query: Option<&str>,
+    options: &FactReadOptionsV1,
+    min_trust: Option<Confidence>,
+    limit: usize,
+) -> Result<FactCursorBindingV1, RetainedSurfaceExecutionErrorV1> {
+    let (operation, query) = match kind {
+        ProjectMemoryFactSearchKindV1::Search => (
+            FactCursorOperationV1::Search,
+            query.map(|value| FactCursorQueryV1::Text(value.to_owned())),
+        ),
+        ProjectMemoryFactSearchKindV1::Probe => (
+            FactCursorOperationV1::Probe,
+            query.map(|value| FactCursorQueryV1::Entity(value.to_owned())),
+        ),
+        ProjectMemoryFactSearchKindV1::Related { entity } => (
+            FactCursorOperationV1::Related,
+            Some(FactCursorQueryV1::Entity(entity.clone())),
+        ),
+        ProjectMemoryFactSearchKindV1::Reason { entities } => (
+            FactCursorOperationV1::Reason,
+            Some(FactCursorQueryV1::Entities(entities.clone())),
+        ),
+    };
+    FactCursorBindingV1::new(
+        public_owner(owner),
+        operation,
+        query,
+        options.memory_scope,
+        options.project_selector.clone(),
+        options.category,
+        min_trust.map(confidence_millionths),
+        limit,
+    )
+    .map_err(map_fact_cursor_error)
+}
+
+/// Build the authenticated request binding for canonical fact-id ordering.
+pub fn list_cursor_binding(
+    owner: &FactOwnerV1,
+    options: &FactReadOptionsV1,
+    min_trust: Option<Confidence>,
+    limit: usize,
+) -> Result<FactCursorBindingV1, RetainedSurfaceExecutionErrorV1> {
+    FactCursorBindingV1::new(
+        public_owner(owner),
+        FactCursorOperationV1::List,
+        None,
+        options.memory_scope,
+        options.project_selector.clone(),
+        options.category,
+        min_trust.map(confidence_millionths),
+        limit,
+    )
+    .map_err(map_fact_cursor_error)
+}
+
+pub fn profile_binding(owner: &FactOwnerV1) -> Result<[u8; 32], RetainedSurfaceExecutionErrorV1> {
+    profile_binding_for_owner(&public_owner(owner)).map_err(map_fact_cursor_error)
+}
+
+fn confidence_millionths(value: Confidence) -> u32 {
+    (value.as_f64() * 1_000_000.0).round() as u32
+}
+
+pub fn map_fact_cursor_error(error: FactCursorErrorV1) -> RetainedSurfaceExecutionErrorV1 {
+    match error {
+        FactCursorErrorV1::KeyUnavailable | FactCursorErrorV1::NonceUnavailable => {
+            RetainedSurfaceExecutionErrorV1::unavailable(
+                "the retained fact cursor key or nonce authority is unavailable",
+            )
+        }
+        FactCursorErrorV1::Malformed
+        | FactCursorErrorV1::Tampered
+        | FactCursorErrorV1::RequestMismatch
+        | FactCursorErrorV1::ScopeMismatch
+        | FactCursorErrorV1::QueryMismatch
+        | FactCursorErrorV1::KindMismatch
+        | FactCursorErrorV1::PositionMismatch
+        | FactCursorErrorV1::KeyRevoked
+        | FactCursorErrorV1::Expired
+        | FactCursorErrorV1::ProfileMismatch => RetainedSurfaceExecutionErrorV1::InvalidRequest,
+    }
+}
+
+pub fn decode_list_cursor(
+    cursor: &tracedecay_contracts::memory::FactListCursorV1,
+    binding: &FactCursorBindingV1,
+) -> Result<FactId, RetainedSurfaceExecutionErrorV1> {
+    let _ = (cursor, binding);
+    Err(RetainedSurfaceExecutionErrorV1::unavailable(
+        "the retained fact cursor keyring is unavailable",
+    ))
+}
+
+pub fn decode_list_cursor_with_keyring(
+    cursor: &tracedecay_contracts::memory::FactListCursorV1,
+    binding: &FactCursorBindingV1,
+    keyring: &FactCursorKeyringV1,
+) -> Result<FactId, RetainedSurfaceExecutionErrorV1> {
+    decode_fact_list_cursor_with_keyring(cursor, binding, keyring).map_err(map_fact_cursor_error)
 }
 
 pub fn add_request(
@@ -361,6 +477,7 @@ const DEFAULT_SEARCH_MIN_TRUST: f64 = 0.3;
 /// admit no retained effect.
 pub struct PreparedFactSearch<'a> {
     query: ProjectMemoryFactSearchQuery,
+    cursor_binding: FactCursorBindingV1,
     min_trust: Confidence,
     request: &'a FactStoreSearchRequestV1,
 }
@@ -370,6 +487,22 @@ impl<'a> PreparedFactSearch<'a> {
         owner: FactOwnerV1,
         request: &'a FactStoreSearchRequestV1,
     ) -> Result<Self, RetainedSurfaceExecutionErrorV1> {
+        Self::new_with_keyring(owner, request, None)
+    }
+
+    pub fn new_with_cursor_keyring(
+        owner: FactOwnerV1,
+        request: &'a FactStoreSearchRequestV1,
+        keyring: &FactCursorKeyringV1,
+    ) -> Result<Self, RetainedSurfaceExecutionErrorV1> {
+        Self::new_with_keyring(owner, request, Some(keyring))
+    }
+
+    fn new_with_keyring(
+        owner: FactOwnerV1,
+        request: &'a FactStoreSearchRequestV1,
+        keyring: Option<&FactCursorKeyringV1>,
+    ) -> Result<Self, RetainedSurfaceExecutionErrorV1> {
         let min_trust = Confidence::new(
             request
                 .options
@@ -377,17 +510,46 @@ impl<'a> PreparedFactSearch<'a> {
                 .unwrap_or(DEFAULT_SEARCH_MIN_TRUST),
         )
         .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?;
+        let limit = fact_limit(request.options.limit)?;
+        let kind = ProjectMemoryFactSearchKindV1::Search;
+        let cursor_binding = search_cursor_binding(
+            &owner,
+            &kind,
+            Some(&request.query),
+            &request.options,
+            Some(min_trust),
+            limit,
+        )?;
+        let after = request
+            .after
+            .as_ref()
+            .map(|cursor| {
+                let keyring = keyring.ok_or_else(|| {
+                    RetainedSurfaceExecutionErrorV1::unavailable(
+                        "the retained fact cursor keyring is unavailable",
+                    )
+                })?;
+                decode_fact_search_cursor_with_keyring(cursor, &cursor_binding, keyring)
+                    .map_err(map_fact_cursor_error)
+            })
+            .transpose()?
+            .map(|(score_millionths, updated_at, fact_id)| {
+                ProjectMemoryFactSearchCursorV1::new(score_millionths, updated_at, fact_id)
+            })
+            .transpose()
+            .map_err(map_store_error)?;
         let query = fact_search_query(
             owner,
-            ProjectMemoryFactSearchKindV1::Search,
+            kind,
             Some(request.query.clone()),
             request.options.category,
             Some(min_trust),
-            fact_limit(request.options.limit)?,
-            request.after.as_ref(),
+            limit,
+            after,
         )?;
         Ok(Self {
             query,
+            cursor_binding,
             min_trust,
             request,
         })
@@ -408,6 +570,11 @@ impl<'a> PreparedFactSearch<'a> {
     pub fn into_query(self) -> ProjectMemoryFactSearchQuery {
         self.query
     }
+
+    #[must_use]
+    pub fn cursor_binding(&self) -> &FactCursorBindingV1 {
+        &self.cursor_binding
+    }
 }
 
 pub fn search_query(
@@ -417,13 +584,55 @@ pub fn search_query(
     options: &FactReadOptionsV1,
     after: Option<&FactSearchCursorV1>,
 ) -> Result<ProjectMemoryFactSearchQuery, RetainedSurfaceExecutionErrorV1> {
+    search_query_with_keyring(owner, kind, query, options, after, None)
+}
+
+pub fn search_query_with_cursor_keyring(
+    owner: FactOwnerV1,
+    kind: ProjectMemoryFactSearchKindV1,
+    query: Option<String>,
+    options: &FactReadOptionsV1,
+    after: Option<&FactSearchCursorV1>,
+    keyring: &FactCursorKeyringV1,
+) -> Result<ProjectMemoryFactSearchQuery, RetainedSurfaceExecutionErrorV1> {
+    search_query_with_keyring(owner, kind, query, options, after, Some(keyring))
+}
+
+fn search_query_with_keyring(
+    owner: FactOwnerV1,
+    kind: ProjectMemoryFactSearchKindV1,
+    query: Option<String>,
+    options: &FactReadOptionsV1,
+    after: Option<&FactSearchCursorV1>,
+    keyring: Option<&FactCursorKeyringV1>,
+) -> Result<ProjectMemoryFactSearchQuery, RetainedSurfaceExecutionErrorV1> {
+    let min_trust = confidence(options.min_trust)?;
+    let limit = fact_limit(options.limit)?;
+    let cursor_binding =
+        search_cursor_binding(&owner, &kind, query.as_deref(), options, min_trust, limit)?;
+    let after = after
+        .map(|cursor| {
+            let keyring = keyring.ok_or_else(|| {
+                RetainedSurfaceExecutionErrorV1::unavailable(
+                    "the retained fact cursor keyring is unavailable",
+                )
+            })?;
+            decode_fact_search_cursor_with_keyring(cursor, &cursor_binding, keyring)
+                .map_err(map_fact_cursor_error)
+        })
+        .transpose()?
+        .map(|(score_millionths, updated_at, fact_id)| {
+            ProjectMemoryFactSearchCursorV1::new(score_millionths, updated_at, fact_id)
+        })
+        .transpose()
+        .map_err(map_store_error)?;
     fact_search_query(
         owner,
         kind,
         query,
         options.category,
-        confidence(options.min_trust)?,
-        fact_limit(options.limit)?,
+        min_trust,
+        limit,
         after,
     )
 }
@@ -435,20 +644,10 @@ fn fact_search_query(
     category: Option<FactCategoryV1>,
     min_trust: Option<Confidence>,
     limit: usize,
-    after: Option<&FactSearchCursorV1>,
+    after: Option<ProjectMemoryFactSearchCursorV1>,
 ) -> Result<ProjectMemoryFactSearchQuery, RetainedSurfaceExecutionErrorV1> {
     let filter =
         ProjectMemoryFactSearchFilterV1::new(category, min_trust, None).map_err(map_store_error)?;
-    let after = after
-        .map(|cursor| {
-            ProjectMemoryFactSearchCursorV1::new(
-                cursor.score_millionths,
-                cursor.updated_at,
-                cursor.fact_id.clone(),
-            )
-        })
-        .transpose()
-        .map_err(map_store_error)?;
     ProjectMemoryFactSearchQuery::with_filter(owner, kind, query, filter, after, limit)
         .map_err(map_store_error)
 }
@@ -616,6 +815,56 @@ fn unavailable_fact(
 pub fn search_page(
     page: &ProjectMemoryFactSearchPageV1,
 ) -> Result<MappedSearchPageV1, RetainedSurfaceExecutionErrorV1> {
+    map_search_page(page, None)
+}
+
+/// Map a store page and mint its continuation only when the caller supplies
+/// the exact request binding. Internal MCP context enrichment uses
+/// [`search_page`] and therefore cannot accidentally expose a raw store
+/// ordering key.
+pub fn search_page_with_cursor_binding(
+    page: &ProjectMemoryFactSearchPageV1,
+    cursor_binding: Option<&FactCursorBindingV1>,
+) -> Result<MappedSearchPageV1, RetainedSurfaceExecutionErrorV1> {
+    if cursor_binding.is_some() && page.next_after().is_some() {
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "the retained fact cursor keyring is unavailable",
+        ));
+    }
+    map_search_page(page, None)
+}
+
+pub fn search_page_with_cursor_keyring(
+    page: &ProjectMemoryFactSearchPageV1,
+    cursor_context: Option<(&FactCursorBindingV1, &FactCursorKeyringV1)>,
+) -> Result<MappedSearchPageV1, RetainedSurfaceExecutionErrorV1> {
+    let next_after = page.next_after();
+    if next_after.is_some() && cursor_context.is_none() {
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "the retained fact cursor keyring is unavailable",
+        ));
+    }
+    let next_after = page
+        .next_after()
+        .zip(cursor_context)
+        .map(|(cursor, (binding, keyring))| {
+            encode_fact_search_cursor_with_keyring(
+                binding,
+                cursor.score_millionths(),
+                cursor.updated_at(),
+                cursor.fact_id().clone(),
+                keyring,
+            )
+            .map_err(map_fact_cursor_error)
+        })
+        .transpose()?;
+    map_search_page(page, next_after)
+}
+
+fn map_search_page(
+    page: &ProjectMemoryFactSearchPageV1,
+    next_after: Option<FactSearchCursorV1>,
+) -> Result<MappedSearchPageV1, RetainedSurfaceExecutionErrorV1> {
     Ok(MappedSearchPageV1 {
         owner: public_owner(page.owner()),
         hits: page
@@ -623,7 +872,7 @@ pub fn search_page(
             .iter()
             .map(search_hit)
             .collect::<Result<Vec<_>, _>>()?,
-        next_after: page.next_after().map(search_cursor),
+        next_after,
         graph_coverage: graph_coverage(page.graph_coverage()),
     })
 }
@@ -751,14 +1000,6 @@ fn search_hit(
     })
 }
 
-fn search_cursor(cursor: &tracedecay_store::ProjectMemoryFactSearchCursorV1) -> FactSearchCursorV1 {
-    FactSearchCursorV1 {
-        score_millionths: cursor.score_millionths(),
-        updated_at: cursor.updated_at(),
-        fact_id: cursor.fact_id().clone(),
-    }
-}
-
 fn graph_coverage(coverage: ProjectMemoryFactSearchGraphCoverageV1) -> FactSearchGraphCoverageV1 {
     match coverage {
         ProjectMemoryFactSearchGraphCoverageV1::NotApplicable => {
@@ -872,6 +1113,46 @@ pub fn memory_status_result(status: &ProjectMemoryMemoryStatusV1) -> MemoryStatu
 pub fn list_page(
     page: &ProjectMemoryFactPageV1,
 ) -> Result<FactStoreListResultV1, RetainedSurfaceExecutionErrorV1> {
+    map_list_page(page, None)
+}
+
+pub fn list_page_with_cursor_binding(
+    page: &ProjectMemoryFactPageV1,
+    cursor_binding: Option<&FactCursorBindingV1>,
+) -> Result<FactStoreListResultV1, RetainedSurfaceExecutionErrorV1> {
+    if cursor_binding.is_some() && page.next_after_fact_id().is_some() {
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "the retained fact cursor keyring is unavailable",
+        ));
+    }
+    list_page_with_cursor_keyring(page, None)
+}
+
+pub fn list_page_with_cursor_keyring(
+    page: &ProjectMemoryFactPageV1,
+    cursor_context: Option<(&FactCursorBindingV1, &FactCursorKeyringV1)>,
+) -> Result<FactStoreListResultV1, RetainedSurfaceExecutionErrorV1> {
+    let next_after = page.next_after_fact_id();
+    if next_after.is_some() && cursor_context.is_none() {
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "the retained fact cursor keyring is unavailable",
+        ));
+    }
+    let next_after = page
+        .next_after_fact_id()
+        .zip(cursor_context)
+        .map(|(fact_id, (binding, keyring))| {
+            encode_fact_list_cursor_with_keyring(binding, fact_id.clone(), keyring)
+                .map_err(map_fact_cursor_error)
+        })
+        .transpose()?;
+    map_list_page(page, next_after)
+}
+
+fn map_list_page(
+    page: &ProjectMemoryFactPageV1,
+    next_after: Option<FactListCursorV1>,
+) -> Result<FactStoreListResultV1, RetainedSurfaceExecutionErrorV1> {
     Ok(FactStoreListResultV1 {
         owner: public_owner(page.owner()),
         facts: page
@@ -879,7 +1160,7 @@ pub fn list_page(
             .iter()
             .map(projection)
             .collect::<Result<Vec<_>, _>>()?,
-        next_after_fact_id: page.next_after_fact_id().cloned(),
+        next_after,
     })
 }
 
@@ -1156,10 +1437,6 @@ pub fn map_store_error(error: FactStoreError) -> RetainedSurfaceExecutionErrorV1
     }
 }
 
-fn confidence_millionths(value: Confidence) -> u32 {
-    (value.as_f64() * 1_000_000.0).round() as u32
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1168,13 +1445,13 @@ mod tests {
     use tracedecay_contracts::RetainedSurfaceExecutionErrorV1;
     use tracedecay_contracts::retained_surfaces::{
         FactCategoryV1, FactFeedbackActionV1, FactFeedbackRequestV1, FactReadOptionsV1,
-        FactSearchCursorV1, FactSourceLabelPatchV1, FactStoreRemoveRequestV1,
-        FactStoreSearchRequestV1, FactStoreSupersedeRequestV1, FactStoreUpdateRequestV1,
-        MemoryScopeV1, RetainedProjectSelectorV1,
+        FactSourceLabelPatchV1, FactStoreRemoveRequestV1, FactStoreSearchRequestV1,
+        FactStoreSupersedeRequestV1, FactStoreUpdateRequestV1, MemoryScopeV1,
+        RetainedProjectSelectorV1,
     };
     use tracedecay_domain::{
         ActorId, FactEventId, FactId, FactIdentityMaterialV1, FactIdentitySourceV1, FactOwnerV1,
-        ProjectId, ProvenanceId, UtcMicros, canonical_sha256,
+        ProjectId, ProvenanceId, canonical_sha256,
     };
     use tracedecay_store::FactStoreError;
 
@@ -1374,8 +1651,8 @@ mod tests {
             "feedback",
         );
 
-        for (label, options, after) in [
-            ("search.defaults", FactReadOptionsV1::default(), None),
+        for (label, options) in [
+            ("search.defaults", FactReadOptionsV1::default()),
             (
                 "search.explicit",
                 FactReadOptionsV1 {
@@ -1384,17 +1661,12 @@ mod tests {
                     limit: Some(5),
                     ..FactReadOptionsV1::default()
                 },
-                Some(FactSearchCursorV1 {
-                    score_millionths: 750_000,
-                    updated_at: UtcMicros(1_700_000_000_000_000),
-                    fact_id: fact_id(&owner, "operation.mapping.search.cursor"),
-                }),
             ),
         ] {
             let request = FactStoreSearchRequestV1 {
                 query: "canonical identity".to_owned(),
                 options,
-                after,
+                after: None,
             };
             let prepared = PreparedFactSearch::new(owner.clone(), &request).expect(label);
             let legacy = serde_json::to_value((

@@ -10869,6 +10869,9 @@
         "order": {
           "type": "string"
         },
+        "provider": {
+          "type": "string"
+        },
         "session_id": {
           "type": "string"
         },
@@ -10884,6 +10887,7 @@
       },
       "required": [
         "session_id",
+        "provider",
         "storage_scope",
         "limit",
         "offset",
@@ -10996,6 +11000,9 @@
         "counts": {
           "$ref": "#/$defs/ExplorerSessionCountsV1"
         },
+        "provider": {
+          "type": "string"
+        },
         "session_id": {
           "type": "string"
         },
@@ -11005,6 +11012,7 @@
       },
       "required": [
         "session_id",
+        "provider",
         "storage_scope",
         "counts"
       ],
@@ -13184,12 +13192,16 @@
           "format": "int64",
           "type": "integer"
         },
+        "provider": {
+          "type": "string"
+        },
         "session_id": {
           "type": "string"
         }
       },
       "required": [
         "session_id",
+        "provider",
         "message_count",
         "last_store_id",
         "last_timestamp"
@@ -13247,6 +13259,9 @@
             "integer",
             "null"
           ]
+        },
+        "provider": {
+          "type": "string"
         },
         "role": {
           "type": [
@@ -13323,6 +13338,7 @@
       "required": [
         "store_id",
         "session_id",
+        "provider",
         "role",
         "source",
         "timestamp",
@@ -13364,11 +13380,25 @@
         "matches": {
           "$ref": "#/$defs/LcmMatchesV1"
         },
+        "next_cursor": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "overview": {
           "$ref": "#/$defs/LcmOverviewStatsV1"
         },
         "path": {
           "type": "string"
+        },
+        "provider": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "query": {
           "type": "string"
@@ -13386,7 +13416,9 @@
         "latest_summary_nodes",
         "matches",
         "query",
-        "limit"
+        "limit",
+        "provider",
+        "next_cursor"
       ],
       "type": "object"
     },
@@ -13483,6 +13515,13 @@
     },
     "LcmSearchFiltersV1": {
       "properties": {
+        "provider": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "role": {
           "type": [
             "string",
@@ -13519,6 +13558,7 @@
       "required": [
         "role",
         "source",
+        "provider",
         "session_id",
         "since",
         "until"
@@ -13666,6 +13706,9 @@
         "path": {
           "type": "string"
         },
+        "provider": {
+          "type": "string"
+        },
         "session_id": {
           "type": "string"
         },
@@ -13684,6 +13727,7 @@
         "storage_scope",
         "exists",
         "session_id",
+        "provider",
         "limit",
         "counts",
         "messages",
@@ -13701,12 +13745,16 @@
           "format": "int64",
           "type": "integer"
         },
+        "provider": {
+          "type": "string"
+        },
         "source": {
           "type": "string"
         }
       },
       "required": [
         "source",
+        "provider",
         "count"
       ],
       "type": "object"
@@ -13735,6 +13783,9 @@
           ]
         },
         "node_id": {
+          "type": "string"
+        },
+        "provider": {
           "type": "string"
         },
         "recency": {
@@ -13779,6 +13830,7 @@
       "required": [
         "node_id",
         "session_id",
+        "provider",
         "depth",
         "category",
         "source_type",
@@ -13912,6 +13964,13 @@
         "exists": {
           "type": "boolean"
         },
+        "next_cursor": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "node_buckets": {
           "items": {
             "$ref": "#/$defs/LcmTimelineNodeBucketV1"
@@ -13920,6 +13979,13 @@
         },
         "path": {
           "type": "string"
+        },
+        "provider": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session_id": {
           "type": [
@@ -13940,6 +14006,8 @@
         "exists",
         "bucket",
         "session_id",
+        "provider",
+        "next_cursor",
         "buckets",
         "node_buckets",
         "undated",

@@ -530,6 +530,12 @@ pub(super) fn apply_direct_mutation_to_snapshot(
     )?;
     let snapshot = ConfigurationSnapshotV1::new(effective_values, provenance)
         .map_err(ConfigurationError::validation)?;
+    // A proposed direct mutation is still in memory at this point. Preserve
+    // the typed admission failure for callers instead of treating an invalid
+    // proposal as corruption that requires resetting the existing store.
+    registry
+        .validate_provider_configuration(&snapshot.effective_values)
+        .map_err(ConfigurationError::validation)?;
     validate_snapshot_registry_completeness_with_registry(&snapshot, registry)
         .map_err(map_store_error)?;
     Ok(snapshot)

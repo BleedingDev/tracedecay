@@ -120,6 +120,12 @@ def invoke(
         command.extend(
             ["--model-acquisition-manifest", str(root / "model-acquisition-manifest.json")]
         )
+        command.extend(
+            [
+                "--model-revision-receipt",
+                str(root / "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"),
+            ]
+        )
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -175,6 +181,7 @@ def write_sidecar(root: Path, profile: str = "stable") -> str:
             "product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
             "#/identities/model/revision"
         ),
+        "revision_provenance_sha256": "c" * 64,
         "max_length": 128,
         "pooling": "mean",
         "normalize": True,
@@ -233,7 +240,7 @@ def write_sidecar(root: Path, profile: str = "stable") -> str:
         "transaction": {
             "version": 1,
             "publication": "atomic-directory-swap",
-            "journal": "ncm-model-acquisition-v1.json",
+            "journal": "ncm-model-lifecycle-v1.json",
             "staging_prefix": ".ncm-model-staging-",
             "backup_prefix": ".ncm-model-backup-",
         },
@@ -250,11 +257,41 @@ def write_sidecar(root: Path, profile: str = "stable") -> str:
                 "repository",
                 "revision",
                 "manifest_sha256",
+                "revision_provenance_sha256",
                 "files",
                 "created_at_unix",
             ],
         },
     }
+    revision_receipt_path = root / "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+    revision_receipt = {
+        "schema_version": 1,
+        "identities": {
+            "model": {
+                "model": model_manifest["model"],
+                "revision": model_manifest["revision"],
+                "artifact_sha256": next(
+                    entry["sha256"]
+                    for entry in model_manifest["files"]
+                    if entry["path"] == "onnx/model.onnx"
+                ),
+                "manifest_sha256": "40084ced45c8bc429e525f65ffbfec6dd4e9ded4267f1be8d092c499f2dcb328",
+                "files": [
+                    {
+                        "path": entry["path"],
+                        "bytes": entry["bytes"],
+                        "sha256": entry["sha256"],
+                    }
+                    for entry in model_manifest["files"]
+                ],
+            }
+        },
+    }
+    revision_receipt_raw = json.dumps(revision_receipt, indent=2).encode("utf-8") + b"\n"
+    revision_receipt_path.write_bytes(revision_receipt_raw)
+    model_manifest["revision_provenance_sha256"] = hashlib.sha256(
+        revision_receipt_raw
+    ).hexdigest()
     model_manifest_path = root / "model-acquisition-manifest.json"
     model_manifest_path.write_text(
         json.dumps(model_manifest, indent=2) + "\n", encoding="utf-8"
@@ -321,6 +358,11 @@ def main() -> int:
         write_sidecar(root)
         completed = invoke(root, targets=NCM_TARGETS, sidecars=True)
         assert completed.returncode == 0, completed.stderr
+        revision_receipt = root / "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+        saved_revision_receipt = revision_receipt.read_bytes()
+        revision_receipt.write_bytes(b"{}\n")
+        assert invoke(root, targets=NCM_TARGETS, sidecars=True).returncode != 0
+        revision_receipt.write_bytes(saved_revision_receipt)
 
         sidecar_archive = write_sidecar(root)
         (root / "sidecars" / f"{sidecar_archive}.sha256").unlink()

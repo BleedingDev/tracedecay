@@ -3,6 +3,7 @@ use crate::common;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+use tracedecay_contracts::memory::FactListCursorV1;
 use tracedecay_contracts::retrieval::{
     CodeFacetRecord, CodeFacetRequest, CodeLexicalField, CodeLexicalFieldFilter,
     CodeNavigationRequest, CodeTimelineRecord, CodeTimelineRequest, SymbolPrimitiveRecord,
@@ -29,7 +30,7 @@ use tracedecay_contracts::{
     callable_code_handler_descriptors, callable_code_operations,
 };
 use tracedecay_domain::{
-    CodeGenerationId, EphemeralSanitizedQueryViewV1, FactId, PublicRetrieverStatus,
+    CodeGenerationId, EphemeralSanitizedQueryViewV1, PublicRetrieverStatus,
     QueryFallbackSubpayload, QueryNormalizationRevision, RetrieverKind, SanitizerRevision,
     TemporalModeV1, UtcMicros,
 };
@@ -168,8 +169,8 @@ impl ExactOnlyPort {
         ));
         evidence.page.cursor = next_cursor.map(PageCursor::from);
         if matches!(self.scenario, ExactPortScenario::WrongCursorKind) {
-            evidence.page.cursor = Some(PageCursor::FactListAfter {
-                fact_id: FactId::new("fact.fixture.wrong-cursor-kind".to_owned()).unwrap(),
+            evidence.page.cursor = Some(PageCursor::FactList {
+                cursor: FactListCursorV1::new("cursor.fixture.wrong-cursor-kind").unwrap(),
             });
         }
         if matches!(self.scenario, ExactPortScenario::ValidCursor) {

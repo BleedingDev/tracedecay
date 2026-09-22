@@ -2,8 +2,8 @@ use super::{
     AutomationAction, AutomationConfigAction, AutomationConfigScope, AutomationRunAction,
     AutomationRunsAction, AutomationSkillsAction, BranchAction, Cli, Commands, DaemonAction,
     FeedbackRollbackAction, HostBundleAction, LspAction, MemoryAction, PackageHookAction,
-    ProfileStorageAction, RemoteAction, ScoopPackageHookAction, SessionsAction,
-    SessionsRefreshAction,
+    ProfileStorageAction, RemoteAction, ReplacementProviderArg, ScoopPackageHookAction,
+    SessionsAction, SessionsRefreshAction,
 };
 use clap::{Parser, error::ErrorKind};
 
@@ -1429,6 +1429,46 @@ fn storage_subcommands_use_contextual_nouns_without_legacy_aliases() {
                 restore,
             }
         }) if backup == "/tmp/backups/backup_2026_08_11" && restore == "/tmp/restore"
+    ));
+
+    let replacement = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "replace-v1",
+        "--profile-root",
+        "/tmp/profile",
+        "--backup-to",
+        "/tmp/backups",
+        "--backup-id",
+        "backup_v1",
+        "--worker",
+        "/opt/tracedecay-migrate-v1",
+        "--timeout-seconds",
+        "30",
+        "--dry-run",
+        "--json",
+    ])
+    .expect("storage replace-v1 should parse its explicit plan options");
+
+    assert!(matches!(
+        replacement.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::ReplaceV1 {
+                profile_root,
+                backup_to,
+                backup_id,
+                provider,
+                worker,
+                timeout_seconds,
+                json,
+            }
+        }) if profile_root.as_deref() == Some("/tmp/profile")
+            && backup_to == "/tmp/backups"
+            && backup_id == "backup_v1"
+            && provider == ReplacementProviderArg::Native
+            && worker.as_deref() == Some("/opt/tracedecay-migrate-v1")
+            && timeout_seconds == 30
+            && json
     ));
 
     let reset = Cli::try_parse_from([

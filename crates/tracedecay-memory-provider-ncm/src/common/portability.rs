@@ -300,6 +300,95 @@ struct Inventory {
     wire_sources: Vec<Value>,
 }
 
+/// Reads the runtime's source revocation authority without treating scrubbed
+/// tombstones as ordinary source inventory.  A revoked capsule has no retained
+/// provenance to authenticate its original source, so the durable revocation
+/// row is the only evidence that makes the tombstone meaningful.  Authority
+/// rows without a capsule are allowed: a deletion can revoke a source after
+/// its last retained record was compacted away.
+fn snapshot_revocation_authority(
+    snapshot: &Value,
+    generation: u64,
+) -> Option<BTreeMap<String, (u64, u64)>> {
+    let Some(value) = snapshot.get("revocations") else {
+        // Snapshots written before revocation authority was exported remain
+        // readable as long as they contain no scrubbed tombstones.  The caller
+        // rejects a revoked capsule when this field is absent.
+        return Some(BTreeMap::new());
+    };
+    let rows = value.as_array()?;
+    if rows.len() > MAX_ITEMS {
+        return None;
+    }
+    let mut authority = BTreeMap::new();
+    let mut previous = None;
+    for row in rows {
+        fields(row, &["source_id", "epoch", "seq"])?;
+        let source_id = string(&row["source_id"])?;
+        let epoch = row["epoch"].as_u64()?;
+        let sequence = row["seq"].as_u64()?;
+        if source_id.is_empty()
+            || epoch == 0
+            || sequence == 0
+            || sequence > generation
+            || previous.is_some_and(|previous: &str| previous >= source_id)
+            || authority
+                .insert(source_id.to_owned(), (epoch, sequence))
+                .is_some()
+        {
+            return None;
+        }
+        previous = Some(source_id);
+    }
+    Some(authority)
+}
+
+/// Returns the record IDs bound to an authenticated deletion completion in a
+/// runtime snapshot. A raw source deletion may scrub capsules that retain
+/// distinct typed source IDs, so the capsule's source ID alone is not enough
+/// to match the revocation row. The completion receipt's full deleted-record
+/// set is the durable relation in that case.
+fn snapshot_deleted_record_ids(
+    snapshot: &Value,
+    generation: u64,
+    revocations: &BTreeMap<String, (u64, u64)>,
+) -> Option<BTreeSet<u64>> {
+    let events = snapshot.get("events")?.as_array()?;
+    if events.len() > MAX_ITEMS {
+        return None;
+    }
+    let mut deleted = BTreeSet::new();
+    for event in events {
+        if event["kind"] != "delete_by_source" {
+            continue;
+        }
+        let sequence = event["seq"].as_u64()?;
+        if sequence == 0 || sequence > generation {
+            return None;
+        }
+        let receipt: Value = serde_json::from_str(event["receipt"].as_str()?).ok()?;
+        let operation = receipt.get("operation")?.as_object()?;
+        let sources = operation.get("sources")?.as_array()?;
+        let record_ids = operation.get("deleted_record_ids")?.as_array()?;
+        if sources.is_empty() || sources.len() > MAX_ITEMS || record_ids.len() > MAX_ITEMS {
+            return None;
+        }
+        for source in sources {
+            let source = source.as_str().filter(|source| !source.is_empty())?;
+            if !revocations.contains_key(source) {
+                return None;
+            }
+        }
+        for record_id in record_ids {
+            let record_id = record_id.as_u64().filter(|record_id| *record_id > 0)?;
+            if !deleted.insert(record_id) {
+                return None;
+            }
+        }
+    }
+    Some(deleted)
+}
+
 fn snapshot_inventory(
     bytes: &[u8],
     namespace: &NcmNamespace,
@@ -313,6 +402,9 @@ fn snapshot_inventory(
     if capsules.len() > MAX_ITEMS {
         return None;
     }
+    let revocations = snapshot_revocation_authority(&snapshot, snapshot["commit_seq"].as_u64()?)?;
+    let deleted_record_ids =
+        snapshot_deleted_record_ids(&snapshot, snapshot["commit_seq"].as_u64()?, &revocations);
     let mut inventory = Inventory {
         generation: snapshot["commit_seq"].as_u64()?,
         observation_sequence: 0,
@@ -324,7 +416,33 @@ fn snapshot_inventory(
     };
     let mut seen = BTreeSet::new();
     for capsule in capsules {
-        if !matches!(capsule["status"].as_str()?, "valid" | "superseded") {
+        let status = capsule["status"].as_str()?;
+        let stored_source_id = capsule["source_id"].as_str()?;
+        if stored_source_id.is_empty() {
+            return None;
+        }
+        if status == "revoked" {
+            // Runtime deletion deliberately clears every source-bearing field
+            // before export.  Keep the row in the authenticated bytes for the
+            // runtime restore, but omit it from the host-facing inventory so a
+            // scrubbed tombstone can never be replayed as content.
+            let record_id = capsule["record_id"].as_u64().filter(|id| *id > 0)?;
+            if capsule["key_text"] != ""
+                || capsule["value_text"] != ""
+                || !capsule["key_embedding"].as_array()?.is_empty()
+                || !capsule["value_embedding"].as_array()?.is_empty()
+                || !capsule["ltm_key"].as_array()?.is_empty()
+                || capsule["provenance"] != "{}"
+                || (!revocations.contains_key(stored_source_id)
+                    && !deleted_record_ids
+                        .as_ref()
+                        .is_some_and(|ids| ids.contains(&record_id)))
+            {
+                return None;
+            }
+            continue;
+        }
+        if !matches!(status, "valid" | "superseded") {
             return None;
         }
         let provenance: Value = serde_json::from_str(capsule["provenance"].as_str()?).ok()?;
@@ -344,7 +462,6 @@ fn snapshot_inventory(
         {
             return None;
         }
-        let stored_source_id = capsule["source_id"].as_str()?;
         validate_source_binding(namespace, &source, &provenance, stored_source_id)?;
         let (key, value) = evidence_text(
             string(&retained["projection"]["observation_kind"])?,
@@ -375,6 +492,16 @@ fn snapshot_inventory(
         inventory
             .stored_source_ids
             .push(stored_source_id.to_owned());
+    }
+    // A live capsule must never share the source ID of a durable revocation.
+    // Otherwise a later restore could import apparently valid content while
+    // the runtime has already fenced that source.
+    if inventory
+        .stored_source_ids
+        .iter()
+        .any(|source_id| revocations.contains_key(source_id))
+    {
+        return None;
     }
     Some(inventory)
 }
@@ -1041,6 +1168,113 @@ mod tests {
         assert!(
             snapshot_inventory(&serde_json::to_vec(&snapshot).unwrap(), &namespace, &exact)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn inventory_accepts_runtime_scrubbed_tombstones_with_revocation_authority() {
+        let (exact, namespace, mut snapshot, _) = fixture();
+        snapshot["commit_seq"] = json!(2);
+        snapshot["revocations"] = json!([{
+            "source_id": "revoked-source",
+            "epoch": 2,
+            "seq": 2
+        }]);
+        snapshot["capsules"].as_array_mut().unwrap().push(json!({
+            "record_id": 2,
+            "source_id": "revoked-source",
+            "key_text": "",
+            "value_text": "",
+            "key_embedding": [],
+            "value_embedding": [],
+            "ltm_key": [],
+            "status": "revoked",
+            "provenance": "{}"
+        }));
+
+        let inventory =
+            snapshot_inventory(&serde_json::to_vec(&snapshot).unwrap(), &namespace, &exact)
+                .unwrap();
+        assert_eq!(inventory.sources.len(), 1);
+        assert_eq!(inventory.wire_sources.len(), 1);
+        assert!(
+            !inventory
+                .stored_source_ids
+                .iter()
+                .any(|source| source == "revoked-source")
+        );
+    }
+
+    #[test]
+    fn inventory_rejects_scrubbed_tombstones_without_exact_revocation_authority() {
+        let (exact, namespace, mut snapshot, _) = fixture();
+        snapshot["capsules"].as_array_mut().unwrap().push(json!({
+            "record_id": 2,
+            "source_id": "revoked-source",
+            "key_text": "",
+            "value_text": "",
+            "key_embedding": [],
+            "value_embedding": [],
+            "ltm_key": [],
+            "status": "revoked",
+            "provenance": "{}"
+        }));
+        assert!(
+            snapshot_inventory(&serde_json::to_vec(&snapshot).unwrap(), &namespace, &exact)
+                .is_none()
+        );
+
+        snapshot["revocations"] = json!([{
+            "source_id": "different-source",
+            "epoch": 2,
+            "seq": 2
+        }]);
+        assert!(
+            snapshot_inventory(&serde_json::to_vec(&snapshot).unwrap(), &namespace, &exact)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inventory_accepts_raw_authority_for_a_scrubbed_typed_tombstone() {
+        let (exact, namespace, mut snapshot, _) = fixture();
+        snapshot["commit_seq"] = json!(2);
+        snapshot["revocations"] = json!([{
+            "source_id": "raw-source",
+            "epoch": 2,
+            "seq": 2
+        }]);
+        snapshot["events"] = json!([{
+            "seq": 2,
+            "kind": "delete_by_source",
+            "receipt": serde_json::to_string(&json!({
+                "operation": {
+                    "sources": ["raw-source"],
+                    "deleted_record_ids": [2]
+                }
+            })).unwrap()
+        }]);
+        snapshot["capsules"].as_array_mut().unwrap().push(json!({
+            "record_id": 2,
+            "source_id": "typed-source",
+            "key_text": "",
+            "value_text": "",
+            "key_embedding": [],
+            "value_embedding": [],
+            "ltm_key": [],
+            "status": "revoked",
+            "provenance": "{}"
+        }));
+
+        let inventory =
+            snapshot_inventory(&serde_json::to_vec(&snapshot).unwrap(), &namespace, &exact)
+                .unwrap();
+        assert_eq!(inventory.sources.len(), 1);
+        assert!(
+            !inventory
+                .stored_source_ids
+                .iter()
+                .any(|source| source == "typed-source")
         );
     }
 

@@ -6,10 +6,10 @@ use super::super::{
 };
 use super::util::{
     canonical_digest, sha256_hex, store_reply, unavailable_recovery, validate_durable_receipt,
-    validate_idempotency_key,
+    validate_idempotency_key, validate_receipt_idempotency_key_json,
 };
 use crate::ports::Deadline;
-use crate::store::Event;
+use crate::store::{Event, MaintenanceCursorStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -144,14 +144,27 @@ impl Request {
             "extensions": self.extensions,
         });
         let request_semantic_sha256 = canonical_digest(&semantics)?;
+        let canonical_input = semantics.clone();
         // Continuation cursors are bearer values, but the bounds and policy
         // that produced them must remain stable when the cursor changes.
         let mut cursor_semantics = semantics;
         cursor_semantics["resume_cursor"] = Value::Null;
         let cursor_semantic_sha256 = canonical_digest(&cursor_semantics)?;
         let admission = self.maintenance_capsule.decode()?;
+        let legacy_request_key = sha256_hex(admission.idempotency_key.as_bytes());
         if admission.namespace != namespace
             || admission.request_semantic_sha256 != request_semantic_sha256
+            // The worker receives the opaque projection of the public key in
+            // the request body. Keep the capsule and request coupled before
+            // consulting any durable receipt or cursor grant; otherwise a
+            // caller could substitute a different admission capsule while
+            // retaining a valid request key.
+            || (crate::source_binding::opaque_id(
+                namespace,
+                b"idempotency-key",
+                &admission.idempotency_key,
+            ) != self.idempotency_key
+                && legacy_request_key != self.idempotency_key)
         {
             return Err("maintenance admission does not match the request".to_owned());
         }
@@ -161,6 +174,8 @@ impl Request {
             public_idempotency_key: admission.idempotency_key,
             operation_id: admission.operation_id,
             request_semantic_sha256,
+            canonical_input,
+            legacy_request_key: self.idempotency_key == legacy_request_key,
             cursor_semantic_sha256,
             expected_generation: self.expected_generation,
             cursor_generation,
@@ -216,6 +231,8 @@ pub(super) struct CommonMaintenanceContext {
     public_idempotency_key: String,
     operation_id: String,
     pub(super) request_semantic_sha256: String,
+    pub(super) canonical_input: Value,
+    legacy_request_key: bool,
     cursor_semantic_sha256: String,
     expected_generation: u64,
     cursor_generation: Option<u64>,
@@ -246,11 +263,28 @@ impl CommonMaintenanceContext {
         handle: &NamespaceHandle,
         key: &str,
     ) -> Result<Option<EngineReply>, EngineReply> {
-        let Some(event) = handle
+        let event = handle
             .store
             .event_for_key(key)
-            .map_err(|error| store_reply(error, handle.commit_seq))?
-        else {
+            .map_err(|error| store_reply(error, handle.commit_seq))?;
+        let event = match event {
+            Some(event) => Some(event),
+            None => {
+                // HEAD keyed maintenance events by the plain digest of the
+                // public admission key. Current requests use the namespaced
+                // opaque projection, so probe that exact legacy key only
+                // after the current key has no row.
+                let legacy_key = sha256_hex(self.public_idempotency_key.as_bytes());
+                if legacy_key == key {
+                    return Ok(None);
+                }
+                handle
+                    .store
+                    .event_for_key(&legacy_key)
+                    .map_err(|error| store_reply(error, handle.commit_seq))?
+            }
+        };
+        let Some(event) = event else {
             return Ok(None);
         };
         if event.payload_sha256 != self.request_semantic_sha256 {
@@ -385,25 +419,37 @@ impl NcmEngine {
             Ok(None) => {}
             Err(reply) => return reply,
         }
+        if context.legacy_request_key {
+            return invalid(
+                "legacy maintenance request has no retained receipt",
+                handle.commit_seq,
+            );
+        }
         if let Err(reply) = context.check_generation(handle.commit_seq) {
             return reply;
         }
         let generation = handle.commit_seq;
         if let Some(cursor) = context.resume_cursor.as_deref() {
-            let issued = match handle.store.has_maintenance_cursor(
+            let cursor_status = match handle.store.has_maintenance_cursor(
                 cursor,
                 &context.public_idempotency_key,
                 &context.operation_id,
                 &context.cursor_semantic_sha256,
             ) {
-                Ok(issued) => issued,
+                Ok(status) => status,
                 Err(error) => return store_reply(error, generation),
             };
-            if !issued {
-                return invalid(
-                    "maintenance cursor was not issued for this operation",
-                    generation,
-                );
+            match cursor_status {
+                MaintenanceCursorStatus::Authorized => {}
+                MaintenanceCursorStatus::Conflict => {
+                    return EngineReply::rejected(RejectReason::IdempotencyConflict, generation);
+                }
+                MaintenanceCursorStatus::Unissued => {
+                    return invalid(
+                        "maintenance cursor was not issued for this operation",
+                        generation,
+                    );
+                }
             }
         }
         let capsules =
@@ -460,6 +506,7 @@ impl NcmEngine {
                 && let Some(cursor) = reply.payload["resume_cursor"].as_str()
                 && let Err(error) = handle.store.issue_maintenance_cursor(
                     cursor,
+                    context.resume_cursor.as_deref(),
                     &context.public_idempotency_key,
                     &context.operation_id,
                     &context.cursor_semantic_sha256,
@@ -549,11 +596,7 @@ pub(super) fn inspect_receipt(
         return invalid("missing maintenance receipt byte bound", generation);
     };
     let result = (|| -> Result<Option<Value>, EngineReply> {
-        let Some(event) = handle
-            .store
-            .event_for_key(key)
-            .map_err(|error| store_reply(error, generation))?
-        else {
+        let Some(event) = maintenance_event_for_delivery_key(namespace, handle, key)? else {
             return Ok(None);
         };
         let Some((durable, retained)) =
@@ -583,6 +626,51 @@ pub(super) fn inspect_receipt(
     }
 }
 
+/// Finds a retained maintenance event by its current opaque delivery key and
+/// falls back to the plain public-key digest used by the immediately preceding
+/// receipt format. The fallback derives the public key from the authenticated
+/// admission capsule rather than accepting an arbitrary second key.
+fn maintenance_event_for_delivery_key(
+    namespace: &str,
+    handle: &NamespaceHandle,
+    key: &str,
+) -> Result<Option<Event>, EngineReply> {
+    if let Some(event) = handle
+        .store
+        .event_for_key(key)
+        .map_err(|error| store_reply(error, handle.commit_seq))?
+    {
+        return Ok(Some(event));
+    }
+    let events = handle
+        .store
+        .events_after(0)
+        .map_err(|error| store_reply(error, handle.commit_seq))?;
+    for event in events {
+        if event.kind != "maintenance" {
+            continue;
+        }
+        let Some((_, retained)) = checked_event(namespace, &event)
+            .map_err(|reason| corrupt(handle.commit_seq, reason))?
+        else {
+            continue;
+        };
+        let admission = retained
+            .admission
+            .decode()
+            .map_err(|reason| corrupt(handle.commit_seq, reason))?;
+        if crate::source_binding::opaque_id(
+            namespace,
+            b"idempotency-key",
+            &admission.idempotency_key,
+        ) == key
+        {
+            return Ok(Some(event));
+        }
+    }
+    Ok(None)
+}
+
 /// Only verified common maintenance events carry portable original receipt evidence.
 pub(crate) fn portable_event(namespace: &str, event: &Event) -> Result<bool, String> {
     checked_event(namespace, event).map(|receipt| receipt.is_some())
@@ -597,6 +685,11 @@ fn checked_event(
     }
     let durable: DurableReceipt = serde_json::from_str(&event.receipt)
         .map_err(|error| format!("invalid durable maintenance receipt: {error}"))?;
+    validate_receipt_idempotency_key_json(
+        &event.receipt,
+        &event.kind,
+        event.idempotency_key.as_deref(),
+    )?;
     validate_durable_receipt(&durable, event.seq, event.idempotency_key.as_deref())?;
     let Some(value) = durable.reply.payload.get("common_maintenance") else {
         return Ok(None);
@@ -604,12 +697,43 @@ fn checked_event(
     let retained: RetainedReceipt = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid common maintenance receipt: {error}"))?;
     let admission = retained.admission.decode()?;
-    let DurableOperation::Maintenance { kind } = &durable.operation else {
+    let DurableOperation::Maintenance {
+        kind,
+        canonical_input,
+    } = &durable.operation
+    else {
         return Err("common maintenance receipt has a non-maintenance operation".to_owned());
     };
     let outcome = &retained.outcome;
     let basis = &retained.event_basis;
-    if event.idempotency_key.as_deref() != Some(basis.idempotency_key.as_str())
+    let expected_event_key =
+        crate::source_binding::opaque_id(namespace, b"idempotency-key", &admission.idempotency_key);
+    let legacy_event_key = sha256_hex(admission.idempotency_key.as_bytes());
+    // Receipts written before canonical request input was added have no
+    // `canonical_input`, but still carry the event's request key.  Their
+    // retained admission capsule and event basis below are the legacy
+    // semantic binding; current receipts carry and validate the full input.
+    if let Some(canonical_input) = canonical_input {
+        let canonical_semantic_sha256 = canonical_digest(canonical_input)?;
+        if canonical_input["action"] != "maintenance"
+            || canonical_input["task"].as_str() != Some(outcome.task.as_str())
+            || canonical_semantic_sha256 != retained.request_semantic_sha256
+        {
+            return Err("common maintenance receipt does not match its event".to_owned());
+        }
+    }
+    let legacy_key_match = canonical_input.is_none()
+        && event.idempotency_key.as_deref() == Some(legacy_event_key.as_str())
+        // The immediately preceding receipt shape had no outer
+        // `idempotency_key` field. A transitional row that already carried
+        // that field is equivalent only when it carries the same legacy key.
+        && durable
+            .idempotency_key
+            .as_deref()
+            .is_none_or(|key| key == legacy_event_key)
+        && basis.idempotency_key == legacy_event_key;
+    if (!legacy_key_match && event.idempotency_key.as_deref() != Some(expected_event_key.as_str()))
+        || event.idempotency_key.as_deref() != Some(basis.idempotency_key.as_str())
         || admission.namespace != namespace
         || admission.request_semantic_sha256 != retained.request_semantic_sha256
         || event.payload_sha256 != retained.request_semantic_sha256

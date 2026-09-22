@@ -1,12 +1,15 @@
 //! Revision and audit persistence tests.
 
+use super::super::codec::{
+    CONFIGURATION_SNAPSHOT_ENTRY_PAYLOAD_SCHEMA_VERSION, StoredConfigurationSnapshotEntryV1,
+};
 use super::super::mutation::{
     commit_configuration_transaction, map_store_error, validate_commit_bindings,
 };
 use super::super::read::{current_revision_id_from_executor, read_revision_from_executor};
 use super::super::{
     ActivationDriftV1, AuthorizedActor, ConfigurationControlStore, ConfigurationError,
-    ConfigurationRevisionStore, ConfigurationStoreError, Executor,
+    ConfigurationRevisionStore, ConfigurationSnapshotV1, ConfigurationStoreError, Executor,
     OwnedGlobalDbConfigurationControlStore, params,
 };
 use super::{
@@ -18,10 +21,17 @@ use super::{
 use crate::configuration::contracts::DirectConfigurationMutation;
 use crate::configuration::registry::ConfigurationRegistry;
 use crate::configuration::resolver::resolve_configuration;
+use tracedecay_domain::canonical_json_bytes;
 use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationIdempotencyKey, ConfigurationLayerIdV1,
-    ConfigurationMutationOperationV1, SettingKey, USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    ConfigurationMutationOperationV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderRecallFallbackV1,
+    MemoryProviderRecallRoutingV1, SettingKey, USER_CODE_INDEX_WORKERS_SETTING_KEY,
 };
+
+fn canonical_text<T: serde::Serialize>(value: &T) -> String {
+    String::from_utf8(canonical_json_bytes(value).unwrap()).unwrap()
+}
 
 #[tokio::test]
 async fn profile_worker_default_is_durable_and_project_registry_excludes_it() {
@@ -517,11 +527,11 @@ async fn selected_ncm_configuration_persists_with_native_disabled_and_pinned_rev
     for (index, (raw_key, value)) in [
         (
             MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
-            serde_json::to_string(&ncm).unwrap(),
+            canonical_text(&ncm),
         ),
         (
             MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-            serde_json::to_string(&routing).unwrap(),
+            canonical_text(&routing),
         ),
     ]
     .into_iter()
@@ -610,4 +620,247 @@ async fn selected_ncm_configuration_persists_with_native_disabled_and_pinned_rev
         !directory.path().join("unopened-ncm-state").exists(),
         "persisting configuration never starts a worker"
     );
+}
+
+#[tokio::test]
+async fn malformed_provider_document_is_rejected_without_mutating_the_store() {
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
+    let before_revision = store.current_revision().await.unwrap();
+    let before_read = db.read_snapshot().await.unwrap();
+    let before_revisions = count(&before_read, "configuration_revisions").await;
+    let before_receipts = count(&before_read, "configuration_mutation_receipts").await;
+    let before_audits = count(&before_read, "configuration_audit_events").await;
+    drop(before_read);
+
+    let authority = control_authority_with_key_for_layer(
+        ConfigurationMutationOperationV1::DirectMutation,
+        &root.revision_id,
+        Some(
+            ConfigurationIdempotencyKey::new(
+                "configuration.idempotency.malformed-provider-document".to_owned(),
+            )
+            .unwrap(),
+        ),
+        direct_project_layer(),
+    );
+    let result = store
+        .commit_direct(
+            &authority,
+            &DirectConfigurationMutation::Set {
+                layer: direct_project_layer(),
+                key: SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap(),
+                value: Box::new(ConfigurationValueV1::Text("{".to_owned())),
+            },
+            &root.revision_id,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ConfigurationError::Validation(message))
+            if message.contains("invalid recall routing configuration JSON")
+    ));
+
+    assert_eq!(store.current_revision().await.unwrap(), before_revision);
+    let after_read = db.read_snapshot().await.unwrap();
+    assert_eq!(
+        count(&after_read, "configuration_revisions").await,
+        before_revisions
+    );
+    assert_eq!(
+        count(&after_read, "configuration_mutation_receipts").await,
+        before_receipts
+    );
+    assert_eq!(
+        count(&after_read, "configuration_audit_events").await,
+        before_audits
+    );
+}
+
+#[tokio::test]
+async fn disabled_fallback_is_rejected_without_mutating_the_store() {
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let store = GlobalDbConfigurationControlStore::new_registered(db);
+    let before_revision = store.current_revision().await.unwrap();
+    let before_read = db.read_snapshot().await.unwrap();
+    let before_revisions = count(&before_read, "configuration_revisions").await;
+    let before_receipts = count(&before_read, "configuration_mutation_receipts").await;
+    let before_audits = count(&before_read, "configuration_audit_events").await;
+    drop(before_read);
+
+    let layer = direct_project_layer();
+    let route = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("tracedecay.native".to_owned()),
+        fallback: Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.recall.fallback".to_owned(),
+            policy_revision: 1,
+            target_provider: "ncm".to_owned(),
+        }),
+        ..Default::default()
+    };
+    let authority = control_authority_with_key_for_layer(
+        ConfigurationMutationOperationV1::DirectMutation,
+        &root.revision_id,
+        Some(
+            ConfigurationIdempotencyKey::new(
+                "configuration.idempotency.disabled-provider-fallback".to_owned(),
+            )
+            .unwrap(),
+        ),
+        layer.clone(),
+    );
+    let result = store
+        .commit_direct(
+            &authority,
+            &DirectConfigurationMutation::Batch {
+                mutations: vec![
+                    DirectConfigurationMutation::Set {
+                        layer: layer.clone(),
+                        key: SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY).unwrap(),
+                        value: Box::new(ConfigurationValueV1::Boolean(true)),
+                    },
+                    DirectConfigurationMutation::Set {
+                        layer,
+                        key: SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap(),
+                        value: Box::new(ConfigurationValueV1::Text(canonical_text(&route))),
+                    },
+                ],
+            },
+            &root.revision_id,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ConfigurationError::Validation(message))
+            if message.contains("provider configuration is not composable")
+                && message.contains("fallback memory provider Ncm is disabled")
+    ));
+
+    assert_eq!(store.current_revision().await.unwrap(), before_revision);
+    let after_read = db.read_snapshot().await.unwrap();
+    assert_eq!(
+        count(&after_read, "configuration_revisions").await,
+        before_revisions
+    );
+    assert_eq!(
+        count(&after_read, "configuration_mutation_receipts").await,
+        before_receipts
+    );
+    assert_eq!(
+        count(&after_read, "configuration_audit_events").await,
+        before_audits
+    );
+}
+
+#[tokio::test]
+async fn direct_revision_read_rejects_digest_consistent_provider_fallback() {
+    let (_directory, runtime, root) = global_setup().await;
+    let db = runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let route_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap();
+    let native_key = SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY).unwrap();
+    let mut effective_values = root.snapshot.effective_values.clone();
+    effective_values.insert(native_key.clone(), ConfigurationValueV1::Boolean(true));
+    effective_values.insert(
+        route_key.clone(),
+        ConfigurationValueV1::Text(canonical_text(&MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            ..Default::default()
+        })),
+    );
+    let invalid =
+        ConfigurationSnapshotV1::new(effective_values, root.snapshot.provenance.clone()).unwrap();
+    let route_entry = StoredConfigurationSnapshotEntryV1 {
+        schema_version: CONFIGURATION_SNAPSHOT_ENTRY_PAYLOAD_SCHEMA_VERSION,
+        value: invalid.effective_values.get(&route_key).cloned(),
+        provenance: invalid
+            .provenance
+            .get(&route_key)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let native_entry = StoredConfigurationSnapshotEntryV1 {
+        schema_version: CONFIGURATION_SNAPSHOT_ENTRY_PAYLOAD_SCHEMA_VERSION,
+        value: invalid.effective_values.get(&native_key).cloned(),
+        provenance: invalid
+            .provenance
+            .get(&native_key)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let encoded_route_entry = serde_json::to_string(&route_entry).unwrap();
+    let encoded_native_entry = serde_json::to_string(&native_entry).unwrap();
+
+    let transaction = db.begin_write_transaction().await.unwrap();
+    transaction
+        .execute_batch(
+            "DROP TRIGGER configuration_revisions_immutable_update;
+             DROP TRIGGER configuration_entries_immutable_update;",
+        )
+        .await
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE configuration_entries
+             SET typed_value = ?3
+             WHERE revision_id = ?1 AND key = ?2",
+            params![
+                root.revision_id.as_str(),
+                native_key.as_str(),
+                encoded_native_entry
+            ],
+        )
+        .await
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE configuration_entries
+             SET typed_value = ?3
+             WHERE revision_id = ?1 AND key = ?2",
+            params![
+                root.revision_id.as_str(),
+                route_key.as_str(),
+                encoded_route_entry
+            ],
+        )
+        .await
+        .unwrap();
+    transaction
+        .execute(
+            "UPDATE configuration_revisions
+             SET snapshot_id = ?2,
+                 effective_behavior_digest = ?3,
+                 resolution_provenance_digest = ?4
+             WHERE revision_id = ?1",
+            params![
+                root.revision_id.as_str(),
+                invalid.snapshot_id.as_str(),
+                invalid.effective_behavior_digest.as_str(),
+                invalid.resolution_provenance_digest.as_str()
+            ],
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let read = db.read_snapshot().await.unwrap();
+    let result = read_revision_from_executor(&read, &root.revision_id).await;
+    assert!(matches!(
+        result,
+        Err(ConfigurationStoreError::InvalidData(message))
+            if message.contains("validate provider configuration")
+                && message.contains("fallback memory provider Ncm is disabled")
+    ));
 }

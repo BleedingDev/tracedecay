@@ -8,6 +8,7 @@ use tracedecay_runtime_core::text::format_bytes;
 pub(crate) async fn handle_profile_storage_action(
     action: ProfileStorageAction,
     assume_yes: bool,
+    dry_run: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     match action {
         ProfileStorageAction::StorageReport {
@@ -21,6 +22,28 @@ pub(crate) async fn handle_profile_storage_action(
         }
         ProfileStorageAction::RehearseProfileBackup { backup, restore } => {
             handle_rehearse_profile_backup(backup, restore)
+        }
+        ProfileStorageAction::ReplaceV1 {
+            profile_root,
+            backup_to,
+            backup_id,
+            provider,
+            worker,
+            timeout_seconds,
+            json,
+        } => {
+            super::profile_replacement::handle_replace_v1(
+                profile_root,
+                backup_to,
+                backup_id,
+                provider,
+                worker,
+                timeout_seconds,
+                json,
+                assume_yes,
+                dry_run,
+            )
+            .await
         }
         ProfileStorageAction::ResetAuthority { authority, db } => {
             handle_reset_authority(authority, db, assume_yes)

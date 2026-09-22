@@ -208,6 +208,7 @@ NCM_POLICY = {
         }
     ],
     "unsupported_targets": [
+        {"target": "x86_64-apple-darwin", "reason": "no-pinned-worker-artifact"},
         {"target": "x86_64-unknown-linux-gnu", "reason": "no-pinned-worker-artifact"},
         {"target": "aarch64-unknown-linux-gnu", "reason": "no-pinned-worker-artifact"},
         {"target": "x86_64-pc-windows-msvc", "reason": "no-pinned-worker-artifact"},
@@ -293,6 +294,7 @@ NCM_MODEL_ACQUISITION_MANIFEST = {
     "repository": "Xenova/paraphrase-multilingual-MiniLM-L12-v2",
     "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
     "revision_provenance": NCM_MODEL_MANIFEST["revision_provenance"],
+    "revision_provenance_sha256": "c" * 64,
     "max_length": 128,
     "pooling": "mean",
     "normalize": True,
@@ -314,7 +316,7 @@ NCM_MODEL_ACQUISITION_MANIFEST = {
     "transaction": {
         "version": 1,
         "publication": "atomic-directory-swap",
-        "journal": "ncm-model-acquisition-v1.json",
+        "journal": "ncm-model-lifecycle-v1.json",
         "staging_prefix": ".ncm-model-staging-",
         "backup_prefix": ".ncm-model-backup-",
     },
@@ -331,6 +333,7 @@ NCM_MODEL_ACQUISITION_MANIFEST = {
             "repository",
             "revision",
             "manifest_sha256",
+            "revision_provenance_sha256",
             "files",
             "created_at_unix",
         ],
@@ -344,37 +347,77 @@ NCM_RELEASE_TARGETS = {
             "runner": "macos-14",
             "target": "aarch64-apple-darwin",
             "archive": "tar.gz",
+            "ncm": "supported",
+            "sidecar": {
+                "worker": "tracedecay-ncm-worker",
+                "archive": "tar.gz",
+                "manifest": "worker-manifest.json",
+                "model_manifest": "model-acquisition-manifest.json",
+                "checksum": "sha256",
+            },
         },
         {
             "name": "x86_64-linux",
             "runner": "ubuntu-22.04",
             "target": "x86_64-unknown-linux-gnu",
             "archive": "tar.gz",
+            "ncm": "native-only",
         },
         {
             "name": "aarch64-linux",
             "runner": "ubuntu-22.04-arm",
             "target": "aarch64-unknown-linux-gnu",
             "archive": "tar.gz",
+            "ncm": "native-only",
         },
         {
             "name": "x86_64-windows",
             "runner": "windows-latest",
             "target": "x86_64-pc-windows-msvc",
             "archive": "zip",
+            "ncm": "native-only",
         },
     ]
 }
 
 
+def ncm_revision_receipt() -> dict[str, object]:
+    files = [
+        {
+            "path": entry["path"],
+            "bytes": entry["bytes"],
+            "sha256": entry["sha256"],
+        }
+        for entry in NCM_MODEL_MANIFEST["files"]
+    ]
+    return {
+        "schema_version": 1,
+        "identities": {
+            "model": {
+                "model": NCM_MODEL_MANIFEST["model"],
+                "revision": NCM_MODEL_MANIFEST["revision"],
+                "artifact_sha256": files[0]["sha256"],
+                "manifest_sha256": hashlib.sha256(
+                    json.dumps(NCM_MODEL_MANIFEST).encode("utf-8")
+                ).hexdigest(),
+                "files": files,
+            }
+        },
+    }
+
+
 def ncm_fixture() -> dict[str, object]:
+    receipt = ncm_revision_receipt()
+    acquisition = json.loads(json.dumps(NCM_MODEL_ACQUISITION_MANIFEST))
+    acquisition["revision_provenance_sha256"] = hashlib.sha256(
+        json.dumps(receipt).encode("utf-8")
+    ).hexdigest()
     return {
         "policy.json": json.loads(json.dumps(NCM_POLICY)),
         "worker.json": json.loads(json.dumps(NCM_WORKER_MANIFEST)),
         "model.json": json.loads(json.dumps(NCM_MODEL_MANIFEST)),
-        "model-acquisition.json": json.loads(
-            json.dumps(NCM_MODEL_ACQUISITION_MANIFEST)
-        ),
+        "model-acquisition.json": acquisition,
+        "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json": receipt,
         "release-targets.json": json.loads(json.dumps(NCM_RELEASE_TARGETS)),
         "provider.toml": NCM_PROVIDER_MANIFEST,
         "runtime.toml": NCM_RUNTIME_MANIFEST,
@@ -453,6 +496,8 @@ def run_fixture(
                     str(root / "model.json"),
                     "--ncm-model-acquisition-manifest",
                     str(root / "model-acquisition.json"),
+                    "--ncm-model-revision-receipt",
+                    str(root / "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"),
                     "--ncm-release-targets",
                     str(root / "release-targets.json"),
                     "--ncm-provider-manifest",
@@ -602,6 +647,47 @@ def main() -> int:
     if ncm_valid.returncode != 0:
         raise SystemExit("valid NCM distribution matrix was rejected: " + ncm_valid.stderr)
 
+    ncm_without_receipt_digest = ncm_fixture()
+    acquisition_without_receipt_digest = ncm_without_receipt_digest["model-acquisition.json"]
+    assert isinstance(acquisition_without_receipt_digest, dict)
+    acquisition_without_receipt_digest["revision_provenance_sha256"] = "0" * 64
+    missing_receipt_digest = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        root_packaged=NCM_ROOT_MANIFEST,
+        ncm_files=ncm_without_receipt_digest,
+    )
+    if missing_receipt_digest.returncode == 0:
+        raise SystemExit("NCM acquisition manifest with a stale receipt digest was accepted")
+    if "revision_provenance_sha256 differs" not in missing_receipt_digest.stderr:
+        raise SystemExit(
+            "stale NCM receipt digest failed for an unexpected reason: "
+            + missing_receipt_digest.stderr
+        )
+
+    ncm_with_stale_receipt = ncm_fixture()
+    stale_receipt = ncm_with_stale_receipt[
+        "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+    ]
+    assert isinstance(stale_receipt, dict)
+    stale_receipt["identities"]["model"]["revision"] = "0" * 40
+    stale_acquisition = ncm_with_stale_receipt["model-acquisition.json"]
+    assert isinstance(stale_acquisition, dict)
+    stale_acquisition["revision_provenance_sha256"] = hashlib.sha256(
+        json.dumps(stale_receipt).encode("utf-8")
+    ).hexdigest()
+    stale_receipt_check = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        root_packaged=NCM_ROOT_MANIFEST,
+        ncm_files=ncm_with_stale_receipt,
+    )
+    if stale_receipt_check.returncode == 0:
+        raise SystemExit("NCM acquisition manifest with stale receipt identity was accepted")
+    if "receipt revision identity drifted" not in stale_receipt_check.stderr:
+        raise SystemExit(
+            "stale NCM receipt identity failed for an unexpected reason: "
+            + stale_receipt_check.stderr
+        )
+
     ncm_without_runtime_feature = ncm_fixture()
     ncm_without_runtime_feature["provider.toml"] = NCM_PROVIDER_MANIFEST.replace(
         '    "tracedecay-memory-ncm-runtime/real-encoder",\n', ""
@@ -650,7 +736,7 @@ def main() -> int:
     )
     if missing_artifact_policy.returncode == 0:
         raise SystemExit("NCM policy without runtime/artifact policy was accepted")
-    if "has no runtime_policy" not in missing_artifact_policy.stderr:
+    if "worker platform policy.runtime_policy must be an object" not in missing_artifact_policy.stderr:
         raise SystemExit(
             "missing NCM runtime/artifact policy failed for an unexpected reason: "
             + missing_artifact_policy.stderr

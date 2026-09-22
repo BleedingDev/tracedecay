@@ -1426,6 +1426,11 @@ fn similar_near_result(
             next_cursor = None;
         }
     }
+    // The artifact reader pages candidate bodies, while the MCP surface
+    // pages grouped occurrences. If the wire budget is exhausted and the
+    // reader retained a cursor, expose the truncation so the response stays
+    // partial even when the reader itself completed its body comparison.
+    wire_limit_reached |= next_cursor.is_some() && *remaining_wire_occurrences == 0;
     touched_files.sort();
     touched_files.dedup();
     Ok((

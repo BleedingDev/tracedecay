@@ -4,14 +4,34 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::ffi::OsStr;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::ResolvedScope;
+use tracedecay_domain::framed_log::checksum as frame_checksum;
 use tracedecay_domain::{
-    BrainId, CanonicalObservationEnvelopeV1, CanonicalObservationIdV1, EvidenceAvailabilityV1,
-    FactOwnerV1, ObservationScopeV1, ProjectId, RepositoryId, UserProfileId, WorktreeId,
+    BrainId, CanonicalObservationEnvelopeV1, CanonicalObservationIdV1, CommitId,
+    EvidenceAvailabilityV1, FactOwnerV1, ObservationScopeV1, ObservationSourceIdentityV1,
+    ProjectId, RepositoryId, TreeId, UserProfileId, UtcMicros, WorktreeId, canonical_json_bytes,
 };
 use tracedecay_memory_observation::SqliteObservationJournal;
 use tracedecay_memory_provider_registry::{
@@ -39,6 +59,782 @@ use tracedecay_memory_provider_registry::recall_admission::{
 };
 
 const MAX_HISTORY_PAGE: usize = 256;
+const MAX_LEDGER_IDENTITY_READ_ATTEMPTS: usize = 2;
+const LEDGER_HEADER_BYTES: usize = 6;
+const LEDGER_IDENTITY_BYTES: usize = 16;
+const LEDGER_DIGEST_BYTES: usize = 32;
+const LEDGER_CHECKSUM_PREFIX_BYTES: usize = 8;
+const LEDGER_RECORD_BODY_BYTES: usize =
+    LEDGER_IDENTITY_BYTES + LEDGER_DIGEST_BYTES + std::mem::size_of::<i64>();
+const LEDGER_RECORD_BYTES: usize = LEDGER_RECORD_BODY_BYTES + LEDGER_CHECKSUM_PREFIX_BYTES;
+const LEDGER_FILE_MAX_BYTES: usize = LEDGER_HEADER_BYTES
+    + tracedecay_hooks::MAX_SPOOL_RECORDS_PER_HOST as usize * LEDGER_RECORD_BYTES * 2;
+const LEDGER_MAGIC: &[u8; 4] = b"TDL1";
+const LEDGER_FORMAT_VERSION: u16 = 1;
+const LIVE_ORIGINS_FILE: &str = "admission-live-origins.json";
+const RECORDS_FILE: &str = "admissions.v1.bin";
+const MAX_LIVE_ORIGIN_BYTES: usize = 1024 * 1024;
+const MAX_LIVE_ORIGIN_BOUNDARIES: usize = 64;
+const MAX_LIVE_ORIGIN_PROOFS: usize = 64;
+
+type HookAdmissionLedgerError = tracedecay_hooks::admission_ledger::HookAdmissionLedgerError;
+type HookLiveOriginAdmissionV1 = tracedecay_hooks::admission_ledger::HookLiveOriginAdmissionV1;
+type HookLiveOriginBoundaryV1 = tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1;
+type HookLiveOriginFrameV1 = tracedecay_hooks::admission_ledger::HookLiveOriginFrameV1;
+type HookLiveOriginObservationV1 = tracedecay_hooks::admission_ledger::HookLiveOriginObservationV1;
+type HookLiveOriginProofV1 = tracedecay_hooks::admission_ledger::HookLiveOriginProofV1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PhysicalPathKind {
+    Directory,
+    Entry,
+}
+
+/// Stable identity for one existing path entry. The path is deliberately not
+/// part of this value: an authority binds the object reached through a path,
+/// then rejects a same-path replacement on every later admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PhysicalPathIdentityV1 {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+impl PhysicalPathIdentityV1 {
+    fn capture(path: &Path, subject: &'static str, kind: PhysicalPathKind) -> HistoryResult<Self> {
+        let (identity, _) = Self::capture_open(path, subject, kind)?;
+        Ok(identity)
+    }
+
+    fn capture_open(
+        path: &Path,
+        subject: &'static str,
+        kind: PhysicalPathKind,
+    ) -> HistoryResult<(Self, File)> {
+        tracedecay_runtime_core::storage::reject_symlink_components(path, subject).map_err(
+            |error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    ProviderHistoryErrorV1::Ineligible(subject)
+                } else {
+                    ProviderHistoryErrorV1::Unavailable(subject)
+                }
+            },
+        )?;
+
+        // Capture the identity from one exact no-follow handle. A metadata
+        // lookup followed by a separate open would let a same-path replacement
+        // change the object between the check and the handle that is retained.
+        let file = open_identity_path(path, kind).map_err(|error| {
+            if is_symlink_error(&error) || error.kind() == std::io::ErrorKind::InvalidInput {
+                ProviderHistoryErrorV1::Ineligible(subject)
+            } else {
+                ProviderHistoryErrorV1::Unavailable(subject)
+            }
+        })?;
+        // Recheck every parent after opening as well. A parent rename followed
+        // by a symlink swap can occur during the no-follow open itself; any
+        // persistent symlink component is therefore fail-closed before its
+        // handle-derived identity is accepted.
+        tracedecay_runtime_core::storage::reject_symlink_components(path, subject).map_err(
+            |error| {
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    ProviderHistoryErrorV1::Ineligible(subject)
+                } else {
+                    ProviderHistoryErrorV1::Unavailable(subject)
+                }
+            },
+        )?;
+        // On Windows a reparse point can be opened for inspection with
+        // `FILE_FLAG_OPEN_REPARSE_POINT`; inspect the path entry as well so a
+        // final link is rejected on the stable `std` metadata surface.
+        let path_metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?;
+        if path_metadata.file_type().is_symlink() {
+            return Err(ProviderHistoryErrorV1::Ineligible(subject));
+        }
+        let metadata = file
+            .metadata()
+            .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?;
+        if metadata.file_type().is_symlink()
+            || (kind == PhysicalPathKind::Directory && !metadata.is_dir())
+            || (kind == PhysicalPathKind::Entry && !metadata.is_file() && !metadata.is_dir())
+        {
+            return Err(ProviderHistoryErrorV1::Ineligible(subject));
+        }
+        #[cfg(unix)]
+        {
+            return Ok((
+                Self {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
+                file,
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let information = tracedecay_private_fs::windows_file::information(&file)
+                .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?;
+            // `GetFileInformationByHandle` exposes the volume serial as a
+            // plain value; keep the optional form at this boundary so a
+            // platform that cannot provide one fails closed rather than
+            // manufacturing an identity from a zero sentinel.
+            let volume_serial_number = Some(information.volume_serial_number)
+                .filter(|value| *value != 0)
+                .ok_or(ProviderHistoryErrorV1::Unavailable(subject))?;
+            let file_index = Some(information.file_index)
+                .filter(|value| *value != 0 && *value != u64::MAX)
+                .ok_or(ProviderHistoryErrorV1::Unavailable(subject))?;
+            return Ok((
+                Self {
+                    volume_serial_number,
+                    file_index,
+                },
+                file,
+            ));
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (path, subject, kind, metadata);
+            Err(ProviderHistoryErrorV1::Unavailable(
+                "physical filesystem identity",
+            ))
+        }
+    }
+
+    fn from_open_file(
+        file: File,
+        subject: &'static str,
+        kind: PhysicalPathKind,
+    ) -> HistoryResult<Self> {
+        let metadata = file
+            .metadata()
+            .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?;
+        if metadata.file_type().is_symlink()
+            || (kind == PhysicalPathKind::Directory && !metadata.is_dir())
+            || (kind == PhysicalPathKind::Entry && !metadata.is_file() && !metadata.is_dir())
+        {
+            return Err(ProviderHistoryErrorV1::Ineligible(subject));
+        }
+        #[cfg(unix)]
+        {
+            return Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+        #[cfg(windows)]
+        {
+            let information = tracedecay_private_fs::windows_file::information(&file)
+                .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?;
+            let volume_serial_number = Some(information.volume_serial_number)
+                .filter(|value| *value != 0)
+                .ok_or(ProviderHistoryErrorV1::Unavailable(subject))?;
+            let file_index = Some(information.file_index)
+                .filter(|value| *value != 0 && *value != u64::MAX)
+                .ok_or(ProviderHistoryErrorV1::Unavailable(subject))?;
+            return Ok(Self {
+                volume_serial_number,
+                file_index,
+            });
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, subject, kind, metadata);
+            Err(ProviderHistoryErrorV1::Unavailable(
+                "physical filesystem identity",
+            ))
+        }
+    }
+
+    pub(crate) fn validate_current(
+        &self,
+        path: &Path,
+        subject: &'static str,
+        kind: PhysicalPathKind,
+    ) -> HistoryResult<()> {
+        if *self != Self::capture(path, subject, kind)? {
+            return Err(ProviderHistoryErrorV1::Ineligible(subject));
+        }
+        Ok(())
+    }
+}
+
+/// Open one path entry without following its final link/reparse point. The
+/// returned handle is used for metadata identity and as the anchor for all
+/// later handle-relative descendant opens.
+fn open_identity_path(path: &Path, kind: PhysicalPathKind) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        let mut flags = libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if kind == PhysicalPathKind::Entry {
+            // A regular file should not block identity capture if a path is
+            // concurrently replaced by a FIFO. The resulting handle is still
+            // rejected by the kind check below.
+            flags |= libc::O_NONBLOCK;
+        } else {
+            flags |= libc::O_DIRECTORY;
+        }
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        // The flags are stable Win32 values and avoid unstable standard-library
+        // path identity accessors on Rust 1.97.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let _ = kind;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
+}
+
+/// Open one direct child relative to an already-retained directory handle.
+/// Every component is opened independently with no-follow semantics; callers
+/// therefore never re-resolve a descendant through the mutable pathname.
+fn open_relative_path(
+    parent: &File,
+    name: &OsStr,
+    kind: PhysicalPathKind,
+) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL child"))?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if kind == PhysicalPathKind::Entry {
+            flags |= libc::O_NONBLOCK;
+        } else {
+            flags |= libc::O_DIRECTORY;
+        }
+        // SAFETY: `parent` is a live directory handle retained by the caller,
+        // and `name` is a NUL-terminated child name with no interior NUL.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is newly returned by `openat` and is transferred into
+        // this `File` exactly once.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    #[cfg(windows)]
+    {
+        return open_relative_path_windows(parent, name, kind);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, name, kind);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "handle-relative filesystem reads are unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NtUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NtObjectAttributes {
+    length: u32,
+    root_directory: std::os::windows::io::RawHandle,
+    object_name: *mut NtUnicodeString,
+    attributes: u32,
+    security_descriptor: *mut std::ffi::c_void,
+    security_quality_of_service: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct NtIoStatusBlock {
+    status: i32,
+    information: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtCreateFile(
+        file_handle: *mut std::os::windows::io::RawHandle,
+        desired_access: u32,
+        object_attributes: *mut NtObjectAttributes,
+        io_status_block: *mut NtIoStatusBlock,
+        allocation_size: *mut i64,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: *mut std::ffi::c_void,
+        ea_length: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn open_relative_path_windows(
+    parent: &File,
+    name: &OsStr,
+    kind: PhysicalPathKind,
+) -> std::io::Result<File> {
+    const FILE_READ_DATA: u32 = 0x0000_0001;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_OPEN: u32 = 1;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+
+    let mut name_units: Vec<u16> = name.encode_wide().collect();
+    let byte_length = name_units
+        .len()
+        .checked_mul(2)
+        .filter(|length| *length <= u16::MAX as usize)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "child name too long")
+        })?;
+    name_units.push(0);
+    let maximum_length = name_units
+        .len()
+        .checked_mul(2)
+        .filter(|length| *length <= u16::MAX as usize)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "child name too long")
+        })?;
+    let mut unicode = NtUnicodeString {
+        length: byte_length as u16,
+        maximum_length: maximum_length as u16,
+        buffer: name_units.as_mut_ptr(),
+    };
+    let mut attributes = NtObjectAttributes {
+        length: std::mem::size_of::<NtObjectAttributes>() as u32,
+        root_directory: parent.as_raw_handle(),
+        object_name: &mut unicode,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut status_block = NtIoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = std::ptr::null_mut();
+    let desired_access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+    let create_options = FILE_SYNCHRONOUS_IO_NONALERT
+        | FILE_OPEN_REPARSE_POINT
+        | if kind == PhysicalPathKind::Directory {
+            FILE_DIRECTORY_FILE
+        } else {
+            FILE_NON_DIRECTORY_FILE
+        };
+    // SAFETY: all pointers refer to stack/heap values alive for the duration
+    // of the syscall; the retained parent handle supplies RootDirectory.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            desired_access,
+            &mut attributes,
+            &mut status_block,
+            std::ptr::null_mut(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            create_options,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status < 0 {
+        return Err(windows_nt_status_error(status));
+    }
+    if handle.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "NtCreateFile returned a null handle",
+        ));
+    }
+    // SAFETY: a successful NtCreateFile transfers ownership of this handle to
+    // the caller; `File` closes it exactly once.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+#[cfg(windows)]
+fn windows_nt_status_error(status: i32) -> std::io::Error {
+    const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+    const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+    const STATUS_REPARSE_POINT_ENCOUNTERED: u32 = 0xC000_050B;
+    const STATUS_IO_REPARSE_TAG_NOT_HANDLED: u32 = 0xC000_0279;
+    let kind = match status as u32 {
+        STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND => std::io::ErrorKind::NotFound,
+        STATUS_REPARSE_POINT_ENCOUNTERED | STATUS_IO_REPARSE_TAG_NOT_HANDLED => {
+            std::io::ErrorKind::InvalidInput
+        }
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, format!("NtCreateFile failed: 0x{status:08x}"))
+}
+
+fn is_symlink_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(windows)]
+    {
+        // An OPEN_REPARSE_POINT handle is inspected below. Windows reports a
+        // reparse-point refusal as InvalidInput on the stable std surface.
+        error.kind() == std::io::ErrorKind::InvalidInput
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// Retained handles for one admitted host ledger. Keeping the complete
+/// ancestor chain alive makes a pathname rename/replacement irrelevant to the
+/// bytes returned by a descendant read.
+struct HandleRelativeLedgerRoot {
+    _data_root: File,
+    _admissions: File,
+    ledger: File,
+}
+
+impl HandleRelativeLedgerRoot {
+    fn read_file(
+        &self,
+        name: &'static str,
+        maximum: usize,
+    ) -> Result<Option<Vec<u8>>, HookAdmissionLedgerError> {
+        read_relative_file(&self.ledger, name, maximum)
+    }
+
+    fn read_proofs(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+        now: UtcMicros,
+    ) -> Result<Vec<HookLiveOriginProofV1>, HookAdmissionLedgerError> {
+        handle_read_validated_live_origin_metadata(&self.ledger, host, now)
+            .map(|metadata| metadata.proofs)
+    }
+
+    fn read_boundaries(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+        now: UtcMicros,
+    ) -> Result<Vec<HookLiveOriginBoundaryV1>, HookAdmissionLedgerError> {
+        handle_read_validated_live_origin_metadata(&self.ledger, host, now)
+            .map(|metadata| metadata.baselines)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandleLiveOriginMetadataV1 {
+    baselines: Vec<HookLiveOriginBoundaryV1>,
+    proofs: Vec<HookLiveOriginProofV1>,
+}
+
+type HandleScannedRecord = (
+    [u8; LEDGER_IDENTITY_BYTES],
+    [u8; LEDGER_DIGEST_BYTES],
+    UtcMicros,
+);
+
+fn read_relative_file(
+    parent: &File,
+    name: &'static str,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, HookAdmissionLedgerError> {
+    let file = match open_relative_path(parent, OsStr::new(name), PhysicalPathKind::Entry) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(HookAdmissionLedgerError::UnsafePath);
+        }
+        Err(_) => return Err(HookAdmissionLedgerError::Io),
+    };
+    let metadata = file.metadata().map_err(|_| HookAdmissionLedgerError::Io)?;
+    if !metadata.file_type().is_file() {
+        return Err(HookAdmissionLedgerError::UnsafePath);
+    }
+    let length = metadata.len();
+    if length == 0 || length > maximum as u64 {
+        return Err(HookAdmissionLedgerError::Io);
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| HookAdmissionLedgerError::Io)?;
+    if bytes.len() != length as usize {
+        return Err(HookAdmissionLedgerError::Io);
+    }
+    Ok(Some(bytes))
+}
+
+// The public hook reader accepts a pathname and cannot consume a retained
+// directory handle. Keep its validation rules local while replacing only the
+// untrusted path traversal with the handle-relative reader above.
+fn handle_source_provider_for_host(host: tracedecay_hooks::HookHostV1) -> Option<&'static str> {
+    match host {
+        tracedecay_hooks::HookHostV1::ClaudeCode => Some("claude"),
+        tracedecay_hooks::HookHostV1::Codex => Some("codex"),
+        tracedecay_hooks::HookHostV1::CursorDesktop | tracedecay_hooks::HookHostV1::CursorCloud => {
+            Some("cursor")
+        }
+        tracedecay_hooks::HookHostV1::Hermes => Some("hermes"),
+        tracedecay_hooks::HookHostV1::Kiro => Some("kiro"),
+        tracedecay_hooks::HookHostV1::Cline => Some("cline"),
+        tracedecay_hooks::HookHostV1::RooCode => Some("roo-code"),
+        tracedecay_hooks::HookHostV1::Kilo => Some("kilo"),
+        tracedecay_hooks::HookHostV1::KimiCode => Some("kimi"),
+        tracedecay_hooks::HookHostV1::OpenCode => Some("opencode"),
+    }
+}
+
+fn handle_source_provider_matches_host(
+    host: tracedecay_hooks::HookHostV1,
+    source: &ObservationSourceIdentityV1,
+) -> bool {
+    handle_source_provider_for_host(host)
+        .is_some_and(|expected| expected == source.provider().as_str())
+}
+
+fn handle_valid_origin_observation(
+    host: tracedecay_hooks::HookHostV1,
+    value: &HookLiveOriginObservationV1,
+) -> bool {
+    let repository = &value.scope.repository;
+    handle_source_provider_matches_host(host, &value.source)
+        && value.source.validate().is_ok()
+        && repository.validate().is_ok()
+        && repository.project_id().is_some()
+        && repository.worktree_id().is_some()
+        && matches!(
+            repository.evidence().attached_ref(),
+            EvidenceAvailabilityV1::Known(reference)
+                if reference == &value.branch_evidence.attached_ref
+        )
+        && matches!(
+            repository.evidence().head_commit(),
+            EvidenceAvailabilityV1::Known(commit)
+                if commit == &value.branch_evidence.head_commit
+        )
+        && value.canonical_source_path.is_absolute()
+        && value.canonical_source_path.as_os_str().len() <= 4096
+        && value.branch_evidence.canonical_path.is_absolute()
+        && value.branch_evidence.canonical_path.as_os_str().len() <= 4096
+        && value.branch_evidence.frontier > 0
+        && value.checkpoint.generation != 0
+        && value.checkpoint.file_identity != 0
+        && value.checkpoint.complete_frontier <= value.physical_eof
+        && value.frames.len() <= tracedecay_hooks::admission_ledger::MAX_LIVE_ORIGIN_FRAMES
+        && value
+            .frames
+            .iter()
+            .all(|frame| frame.start < frame.end && frame.end <= value.checkpoint.complete_frontier)
+        && value
+            .frames
+            .windows(2)
+            .all(|pair| pair[0].end == pair[1].start)
+        && value.frames.last().is_none_or(|last| {
+            last.end == value.checkpoint.complete_frontier
+                && last.resume_fingerprint == value.checkpoint.complete_prefix_fingerprint
+        })
+}
+
+fn handle_same_live_origin_authority(
+    left: &HookLiveOriginAdmissionV1,
+    right: &HookLiveOriginAdmissionV1,
+) -> bool {
+    left.host == right.host
+        && left.protected_session_id == right.protected_session_id
+        && left.project_id == right.project_id
+        && left.repository_id == right.repository_id
+        && left.worktree_id == right.worktree_id
+        && left.worktree_epoch == right.worktree_epoch
+}
+
+fn handle_valid_origin_boundary(boundary: &HookLiveOriginBoundaryV1) -> bool {
+    boundary.start.admission.host == boundary.admission.host
+        && handle_valid_origin_observation(boundary.admission.host, &boundary.observation)
+        && handle_same_live_origin_authority(&boundary.start.admission, &boundary.admission)
+        && boundary.start.admission.order <= boundary.admission.order
+        && boundary.start.admission.admitted_at.0 <= boundary.admission.admitted_at.0
+        && boundary.start.physical_eof <= boundary.observation.physical_eof
+        && boundary.start.checkpoint.complete_frontier <= boundary.start.physical_eof
+        && boundary.start.checkpoint.complete_frontier
+            <= boundary.observation.checkpoint.complete_frontier
+        && boundary.start.checkpoint.file_identity == boundary.observation.checkpoint.file_identity
+        && boundary.start.checkpoint.generation == boundary.observation.checkpoint.generation
+}
+
+fn handle_live_origin_proof_ref(
+    baseline: &HookLiveOriginBoundaryV1,
+    seal: &HookLiveOriginAdmissionV1,
+    frames: &[HookLiveOriginFrameV1],
+) -> Result<String, HookAdmissionLedgerError> {
+    let bytes = canonical_json_bytes(&(baseline, seal, frames))
+        .map_err(|_| HookAdmissionLedgerError::RecordUnencodable)?;
+    Ok(format!(
+        "hook-live-origin:{}",
+        tracedecay_domain::canonical_text::encode_lowercase_hex(&frame_checksum(&bytes))
+    ))
+}
+
+fn handle_read_live_origin_metadata(
+    root: &File,
+) -> Result<HandleLiveOriginMetadataV1, HookAdmissionLedgerError> {
+    let Some(bytes) = read_relative_file(root, LIVE_ORIGINS_FILE, MAX_LIVE_ORIGIN_BYTES)? else {
+        return Ok(HandleLiveOriginMetadataV1::default());
+    };
+    let metadata: HandleLiveOriginMetadataV1 =
+        serde_json::from_slice(&bytes).map_err(|_| HookAdmissionLedgerError::RecordUndecodable)?;
+    if metadata.baselines.len() > MAX_LIVE_ORIGIN_BOUNDARIES
+        || metadata.proofs.len() > MAX_LIVE_ORIGIN_PROOFS
+        || metadata
+            .baselines
+            .iter()
+            .any(|boundary| !handle_valid_origin_boundary(boundary))
+        || metadata.proofs.iter().any(|proof| {
+            !handle_valid_origin_boundary(&proof.baseline)
+                || !handle_same_live_origin_authority(&proof.baseline.admission, &proof.seal)
+                || proof.baseline.admission.order >= proof.seal.order
+                || proof.frames.is_empty()
+                || proof.frames.len() > tracedecay_hooks::admission_ledger::MAX_LIVE_ORIGIN_FRAMES
+                || proof.frames.iter().any(|frame| {
+                    frame.start < proof.baseline.start.physical_eof || frame.start >= frame.end
+                })
+                || proof
+                    .frames
+                    .windows(2)
+                    .any(|pair| pair[0].end != pair[1].start)
+                || !handle_live_origin_proof_ref(&proof.baseline, &proof.seal, &proof.frames)
+                    .is_ok_and(|expected| expected == proof.proof_ref)
+        })
+    {
+        return Err(HookAdmissionLedgerError::RecordUndecodable);
+    }
+    Ok(metadata)
+}
+
+fn handle_scan_records(bytes: &[u8]) -> (Vec<HandleScannedRecord>, u64) {
+    if bytes.len() < LEDGER_HEADER_BYTES
+        || &bytes[..4] != LEDGER_MAGIC
+        || u16::from_le_bytes([bytes[4], bytes[5]]) != LEDGER_FORMAT_VERSION
+    {
+        return (Vec::new(), bytes.len() as u64);
+    }
+    let mut records = Vec::new();
+    let mut offset = LEDGER_HEADER_BYTES;
+    while offset + LEDGER_RECORD_BYTES <= bytes.len() {
+        let record = &bytes[offset..offset + LEDGER_RECORD_BYTES];
+        let checksum = frame_checksum(&record[..LEDGER_RECORD_BODY_BYTES]);
+        if checksum[..LEDGER_CHECKSUM_PREFIX_BYTES] != record[LEDGER_RECORD_BODY_BYTES..] {
+            break;
+        }
+        let mut identity = [0u8; LEDGER_IDENTITY_BYTES];
+        identity.copy_from_slice(&record[..LEDGER_IDENTITY_BYTES]);
+        let mut digest = [0u8; LEDGER_DIGEST_BYTES];
+        digest.copy_from_slice(
+            &record[LEDGER_IDENTITY_BYTES..LEDGER_IDENTITY_BYTES + LEDGER_DIGEST_BYTES],
+        );
+        let mut admitted = [0u8; std::mem::size_of::<i64>()];
+        admitted.copy_from_slice(
+            &record[LEDGER_IDENTITY_BYTES + LEDGER_DIGEST_BYTES..LEDGER_RECORD_BODY_BYTES],
+        );
+        records.push((identity, digest, UtcMicros(i64::from_le_bytes(admitted))));
+        offset += LEDGER_RECORD_BYTES;
+    }
+    (records, (bytes.len() - offset) as u64)
+}
+
+fn handle_is_expired(admitted_at: UtcMicros, now: UtcMicros) -> bool {
+    now.0.saturating_sub(admitted_at.0) > tracedecay_hooks::MAX_SPOOL_AGE_MICROS
+}
+
+fn handle_read_validated_live_origin_metadata(
+    root: &File,
+    host: tracedecay_hooks::HookHostV1,
+    now: UtcMicros,
+) -> Result<HandleLiveOriginMetadataV1, HookAdmissionLedgerError> {
+    let mut metadata = handle_read_live_origin_metadata(root)?;
+    let Some(bytes) = read_relative_file(root, RECORDS_FILE, LEDGER_FILE_MAX_BYTES)? else {
+        return Ok(HandleLiveOriginMetadataV1::default());
+    };
+    let (records, _) = handle_scan_records(&bytes);
+    let retained = |receipt: &HookLiveOriginAdmissionV1| {
+        receipt.host == host
+            && receipt.admitted_at.0 <= now.0
+            && !handle_is_expired(receipt.admitted_at, now)
+            && records
+                .iter()
+                .enumerate()
+                .any(|(order, (event_id, digest, admitted_at))| {
+                    *event_id == receipt.event_id
+                        && *digest == receipt.digest
+                        && *admitted_at == receipt.admitted_at
+                        && order as u64 == receipt.order
+                })
+    };
+    metadata.proofs.retain(|proof| {
+        retained(&proof.baseline.start.admission)
+            && retained(&proof.baseline.admission)
+            && retained(&proof.seal)
+    });
+    metadata
+        .baselines
+        .retain(|boundary| retained(&boundary.start.admission) && retained(&boundary.admission));
+    Ok(metadata)
+}
+
+fn map_relative_component_error(
+    error: &std::io::Error,
+    subject: &'static str,
+) -> ProviderHistoryErrorV1 {
+    if is_symlink_error(error) || error.kind() == std::io::ErrorKind::InvalidInput {
+        ProviderHistoryErrorV1::Ineligible(subject)
+    } else {
+        ProviderHistoryErrorV1::Unavailable(subject)
+    }
+}
+
+fn open_relative_component(
+    parent: &File,
+    name: &OsStr,
+    kind: PhysicalPathKind,
+    subject: &'static str,
+) -> HistoryResult<Option<(PhysicalPathIdentityV1, File)>> {
+    let file = match open_relative_path(parent, name, kind) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(map_relative_component_error(&error, subject)),
+    };
+    let identity = PhysicalPathIdentityV1::from_open_file(
+        file.try_clone()
+            .map_err(|_| ProviderHistoryErrorV1::Unavailable(subject))?,
+        subject,
+        kind,
+    )?;
+    Ok(Some((identity, file)))
+}
 
 /// One composition-time binding from a provider built during core admission to
 /// its actual host authority once the existing project journal is mounted.
@@ -89,6 +885,9 @@ pub(crate) struct HookOriginReaderV1 {
     data_root: PathBuf,
     brain_id: BrainId,
     profile_id: UserProfileId,
+    data_root_identity: OnceLock<PhysicalPathIdentityV1>,
+    claude_ledger_root_identity: OnceLock<PhysicalPathIdentityV1>,
+    codex_ledger_root_identity: OnceLock<PhysicalPathIdentityV1>,
 }
 
 impl HookOriginReaderV1 {
@@ -97,7 +896,73 @@ impl HookOriginReaderV1 {
             data_root,
             brain_id,
             profile_id,
+            data_root_identity: OnceLock::new(),
+            claude_ledger_root_identity: OnceLock::new(),
+            codex_ledger_root_identity: OnceLock::new(),
         }
+    }
+
+    /// Binds this reader to the same logical project-session shard that owns
+    /// the mounted canonical ports. A path and profile label alone are not
+    /// enough: a reader from another brain must fail before any control budget
+    /// is consulted.
+    pub(crate) fn validate_mount_identity(
+        &self,
+        profile_id: &UserProfileId,
+        mounted_scope: &ResolvedScope,
+        registered_shard: &StoreShardIdV1,
+    ) -> HistoryResult<()> {
+        validate_registered_history_shard(profile_id, mounted_scope, registered_shard)?;
+        if self.brain_id != registered_shard.brain_id || self.profile_id != *profile_id {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader identity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The hook ledger is a host-owned sibling of the retained provider data.
+    /// Keep the reader physically bound to the root selected during project
+    /// composition so a reopened authority cannot read another project's
+    /// live-origin ledger.
+    pub(crate) fn validate_data_root(&self, expected: &Path) -> HistoryResult<()> {
+        let actual = PhysicalPathIdentityV1::capture(
+            &self.data_root,
+            "history reader data root",
+            PhysicalPathKind::Directory,
+        )?;
+        let expected_identity = PhysicalPathIdentityV1::capture(
+            expected,
+            "history data root",
+            PhysicalPathKind::Directory,
+        )?;
+        if actual != expected_identity {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root",
+            ));
+        }
+        let bound = self.data_root_identity.get_or_init(|| actual);
+        if *bound != actual || *bound != expected_identity {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_data_root(&self, expected: &Path) -> HistoryResult<PhysicalPathIdentityV1> {
+        self.validate_data_root(expected)?;
+        self.data_root_identity
+            .get()
+            .copied()
+            .ok_or(ProviderHistoryErrorV1::Unavailable(
+                "history reader data root",
+            ))
+    }
+
+    fn validate_bound_data_root(&self) -> HistoryResult<()> {
+        let expected = self.data_root.clone();
+        self.validate_data_root(&expected)
     }
 
     fn host(provider: &str) -> Option<tracedecay_hooks::HookHostV1> {
@@ -114,16 +979,202 @@ impl HookOriginReaderV1 {
             .join(host.hook_key())
     }
 
+    fn validated_ledger_root(&self, host: tracedecay_hooks::HookHostV1) -> HistoryResult<PathBuf> {
+        let root = self.ledger_root(host);
+        tracedecay_runtime_core::storage::reject_symlink_components(
+            &root,
+            "history reader ledger root",
+        )
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidInput {
+                ProviderHistoryErrorV1::Ineligible("history reader ledger root")
+            } else {
+                ProviderHistoryErrorV1::Unavailable("history reader ledger root")
+            }
+        })?;
+        Ok(root)
+    }
+
+    fn ledger_root_identity_slot(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+    ) -> &OnceLock<PhysicalPathIdentityV1> {
+        match host {
+            tracedecay_hooks::HookHostV1::ClaudeCode => &self.claude_ledger_root_identity,
+            tracedecay_hooks::HookHostV1::Codex => &self.codex_ledger_root_identity,
+            _ => unreachable!("history reader only admits Claude and Codex ledger hosts"),
+        }
+    }
+
+    fn bind_ledger_root_identity(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+        identity: PhysicalPathIdentityV1,
+    ) -> HistoryResult<()> {
+        let bound = self
+            .ledger_root_identity_slot(host)
+            .get_or_init(|| identity);
+        if *bound != identity {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader ledger root changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_ledger_root_handle(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+    ) -> HistoryResult<Option<(PhysicalPathIdentityV1, HandleRelativeLedgerRoot)>> {
+        let expected_data_root =
+            self.data_root_identity
+                .get()
+                .copied()
+                .ok_or(ProviderHistoryErrorV1::Unavailable(
+                    "history reader data root",
+                ))?;
+        let (data_root_identity, data_root) = PhysicalPathIdentityV1::capture_open(
+            &self.data_root,
+            "history reader data root",
+            PhysicalPathKind::Directory,
+        )?;
+        if data_root_identity != expected_data_root {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root",
+            ));
+        }
+        let Some((_, admissions)) = open_relative_component(
+            &data_root,
+            OsStr::new("hook-v2-admissions"),
+            PhysicalPathKind::Directory,
+            "history reader admissions root",
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some((ledger_identity, ledger)) = open_relative_component(
+            &admissions,
+            OsStr::new(host.hook_key()),
+            PhysicalPathKind::Directory,
+            "history reader ledger root",
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((
+            ledger_identity,
+            HandleRelativeLedgerRoot {
+                _data_root: data_root,
+                _admissions: admissions,
+                ledger,
+            },
+        )))
+    }
+
+    /// Reads one host ledger from a retained directory-handle chain. Path
+    /// validation remains a fail-closed admission check, while every actual
+    /// descendant open is handle-relative and no-follow. The bounded identity
+    /// retry still rejects a root swap observed around the operation.
+    fn read_ledger_with_identity<T>(
+        &self,
+        host: tracedecay_hooks::HookHostV1,
+        unavailable_subject: &'static str,
+        mut read: impl FnMut(
+            Option<&HandleRelativeLedgerRoot>,
+            tracedecay_hooks::HookHostV1,
+        ) -> std::result::Result<
+            T,
+            tracedecay_hooks::admission_ledger::HookAdmissionLedgerError,
+        >,
+    ) -> HistoryResult<T> {
+        for attempt in 0..MAX_LEDGER_IDENTITY_READ_ATTEMPTS {
+            self.validate_bound_data_root()?;
+            let root = self.validated_ledger_root(host)?;
+            let before = self.capture_ledger_root_identity(&root)?;
+            if let Some(identity) = before {
+                // Bind before opening descendants. If the parent is swapped
+                // while the child read is in flight, a retry must still be
+                // compared with the object admitted on this first look.
+                self.bind_ledger_root_identity(host, identity)?;
+            }
+            let opened = self.open_ledger_root_handle(host)?;
+            let opened_identity = opened.as_ref().map(|(identity, _)| *identity);
+            if before != opened_identity {
+                if attempt + 1 < MAX_LEDGER_IDENTITY_READ_ATTEMPTS {
+                    std::thread::yield_now();
+                    continue;
+                }
+                return Err(ProviderHistoryErrorV1::Ineligible(
+                    "history reader ledger root changed",
+                ));
+            }
+            let result = read(opened.as_ref().map(|(_, root)| root), host);
+            // The data root and ledger root are both checked after the child
+            // opens. This is the post-read half of the TOCTOU boundary.
+            self.validate_bound_data_root()?;
+            let after = self.capture_ledger_root_identity(&root)?;
+            if before != after {
+                // A root that was absent when the operation began and appeared
+                // during the read has no previously admitted identity. Do not
+                // let the retry turn that race into a newly trusted root.
+                if before.is_none() && after.is_some() {
+                    return Err(ProviderHistoryErrorV1::Ineligible(
+                        "history reader ledger root changed",
+                    ));
+                }
+                if attempt + 1 < MAX_LEDGER_IDENTITY_READ_ATTEMPTS {
+                    std::thread::yield_now();
+                    continue;
+                }
+                return Err(ProviderHistoryErrorV1::Ineligible(
+                    "history reader ledger root changed",
+                ));
+            }
+
+            match before {
+                Some(identity) => self.bind_ledger_root_identity(host, identity)?,
+                None if self.ledger_root_identity_slot(host).get().is_some() => {
+                    return Err(ProviderHistoryErrorV1::Ineligible(
+                        "history reader ledger root changed",
+                    ));
+                }
+                None => {}
+            }
+            return result.map_err(|_| ProviderHistoryErrorV1::Unavailable(unavailable_subject));
+        }
+        Err(ProviderHistoryErrorV1::Ineligible(
+            "history reader ledger root changed",
+        ))
+    }
+
+    fn capture_ledger_root_identity(
+        &self,
+        root: &Path,
+    ) -> HistoryResult<Option<PhysicalPathIdentityV1>> {
+        match std::fs::symlink_metadata(root) {
+            Ok(_) => PhysicalPathIdentityV1::capture(
+                root,
+                "history reader ledger root",
+                PhysicalPathKind::Directory,
+            )
+            .map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(ProviderHistoryErrorV1::Unavailable(
+                "history reader ledger root",
+            )),
+        }
+    }
+
     fn proofs(
         &self,
         host: tracedecay_hooks::HookHostV1,
     ) -> HistoryResult<Vec<tracedecay_hooks::admission_ledger::HookLiveOriginProofV1>> {
-        tracedecay_hooks::admission_ledger::read_hook_live_origin_proofs(
-            &self.ledger_root(host),
-            host,
-            tracedecay_contracts::now_micros(),
-        )
-        .map_err(|_| ProviderHistoryErrorV1::Unavailable("original live-event ledger"))
+        self.read_ledger_with_identity(host, "original live-event ledger", |root, host| {
+            root.map_or_else(
+                || Ok(Vec::new()),
+                |root| root.read_proofs(host, tracedecay_contracts::now_micros()),
+            )
+        })
     }
 
     fn boundary_matches_profile(
@@ -142,6 +1193,7 @@ impl HookOriginReaderV1 {
     ) -> HistoryResult<
         Option<tracedecay_sessions::repository_provenance::OriginalObservationEvidenceV1>,
     > {
+        self.validate_bound_data_root()?;
         identity
             .validate()
             .map_err(|_| ProviderHistoryErrorV1::Ineligible("original source identity"))?;
@@ -196,17 +1248,19 @@ impl HookOriginReaderV1 {
     fn live_boundaries(
         &self,
     ) -> HistoryResult<Vec<tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1>> {
+        self.validate_bound_data_root()?;
         let mut boundaries = Vec::new();
         for host in [
             tracedecay_hooks::HookHostV1::ClaudeCode,
             tracedecay_hooks::HookHostV1::Codex,
         ] {
-            let current = tracedecay_hooks::admission_ledger::read_hook_live_origin_boundaries(
-                &self.ledger_root(host),
-                host,
-                tracedecay_contracts::now_micros(),
-            )
-            .map_err(|_| ProviderHistoryErrorV1::Unavailable("live session boundary"))?;
+            let current =
+                self.read_ledger_with_identity(host, "live session boundary", |root, host| {
+                    root.map_or_else(
+                        || Ok(Vec::new()),
+                        |root| root.read_boundaries(host, tracedecay_contracts::now_micros()),
+                    )
+                })?;
             boundaries.extend(
                 current
                     .into_iter()
@@ -245,6 +1299,11 @@ pub(crate) struct MountedOriginalObservationAuthorityV1 {
 }
 
 impl OriginalObservationAuthorityV1 for MountedOriginalObservationAuthorityV1 {
+    fn validate_live_mount(&self) -> HistoryResult<()> {
+        self.reader.validate_bound_data_root()?;
+        self.bridge.revalidate()
+    }
+
     fn validate_original_event(
         &self,
         authority_ref: &str,
@@ -298,6 +1357,39 @@ impl OriginalObservationAuthorityV1 for MountedOriginalObservationAuthorityV1 {
     }
 }
 
+impl MountedOriginalObservationAuthorityV1 {
+    /// Checks the complete composition binding before a caller's control token
+    /// is read. This includes the registered brain/profile/project, the hook
+    /// reader pairing and the bridge's own retained identity.
+    pub(crate) fn validate_mount(
+        &self,
+        profile_id: &UserProfileId,
+        mounted_scope: &ResolvedScope,
+        registered_shard: &StoreShardIdV1,
+    ) -> HistoryResult<()> {
+        self.reader.validate_bound_data_root()?;
+        self.reader
+            .validate_mount_identity(profile_id, mounted_scope, registered_shard)?;
+        self.bridge.validate_registered_shard(registered_shard)?;
+        self.bridge.validate_reader(self.reader.as_ref())?;
+        if self.bridge.profile_id != *profile_id || self.bridge.scope != *mounted_scope {
+            return Err(ProviderHistoryErrorV1::Ineligible("original bridge mount"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_registered_mount(
+        &self,
+        registered_shard: &StoreShardIdV1,
+    ) -> HistoryResult<()> {
+        self.validate_mount(
+            &self.bridge.profile_id,
+            &self.bridge.scope,
+            registered_shard,
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProviderHistoryErrorV1 {
     #[error("history authority unavailable: {0}")]
@@ -312,10 +1404,38 @@ pub(crate) enum ProviderHistoryErrorV1 {
 
 type HistoryResult<T> = Result<T, ProviderHistoryErrorV1>;
 
+fn validate_registered_history_shard(
+    profile_id: &UserProfileId,
+    mounted_scope: &ResolvedScope,
+    registered_shard: &StoreShardIdV1,
+) -> HistoryResult<()> {
+    mounted_scope
+        .validate()
+        .map_err(|_| ProviderHistoryErrorV1::Ineligible("mounted scope"))?;
+    if registered_shard.profile_id != *profile_id
+        || registered_shard.scope
+            != (StoreShardScopeV1::ProjectSessions {
+                project_id: mounted_scope.project_id.clone(),
+            })
+    {
+        return Err(ProviderHistoryErrorV1::Ineligible(
+            "registered project/profile",
+        ));
+    }
+    Ok(())
+}
+
 /// Existing durable live-event authority supplied by the host. Implementations
 /// must resolve the receipt and its exact source identity/range; a structurally
 /// valid attachment or a matching session label alone cannot return true.
 pub(crate) trait OriginalObservationAuthorityV1: Send + Sync {
+    /// Revalidates the composition before a reader observes the caller's
+    /// control budget. Test authorities may keep the default because they do
+    /// not own the host filesystem binding.
+    fn validate_live_mount(&self) -> HistoryResult<()> {
+        Ok(())
+    }
+
     fn validate_original_event(
         &self,
         authority_ref: &str,
@@ -350,11 +1470,85 @@ pub(crate) trait HistoryGrantRevalidationV1: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HistoryResult<()>> + Send + 'a>>;
 }
 
+/// Physical Git topology retained with the bridge. Repository IDs are derived
+/// from paths, so path equality alone would let a newly-created `.git` at the
+/// same spelling inherit an already-admitted bridge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GitRepositoryIdentityV1 {
+    project_root: PhysicalPathIdentityV1,
+    git_entry: PhysicalPathIdentityV1,
+    git_dir: PhysicalPathIdentityV1,
+    common_dir: PhysicalPathIdentityV1,
+}
+
+impl GitRepositoryIdentityV1 {
+    fn capture(project_root: &Path) -> HistoryResult<Self> {
+        let topology =
+            tracedecay_runtime_core::git_repository::repository_topology(project_root)
+                .map_err(|_| ProviderHistoryErrorV1::Unavailable("git repository identity"))?;
+        let git_entry = PhysicalPathIdentityV1::capture(
+            &project_root.join(".git"),
+            "git repository entry",
+            PhysicalPathKind::Entry,
+        )?;
+        let git_dir = PhysicalPathIdentityV1::capture(
+            &topology.git_dir,
+            "git directory",
+            PhysicalPathKind::Directory,
+        )?;
+        let common_dir = PhysicalPathIdentityV1::capture(
+            &topology.common_dir,
+            "git common directory",
+            PhysicalPathKind::Directory,
+        )?;
+        let project_root = PhysicalPathIdentityV1::capture(
+            project_root,
+            "git project root",
+            PhysicalPathKind::Directory,
+        )?;
+        Ok(Self {
+            project_root,
+            git_entry,
+            git_dir,
+            common_dir,
+        })
+    }
+
+    fn validate_current(&self, project_root: &Path) -> HistoryResult<()> {
+        let current = Self::capture(project_root)?;
+        if current != *self {
+            return Err(ProviderHistoryErrorV1::Ineligible("git repository changed"));
+        }
+        Ok(())
+    }
+}
+
+/// The current Git content identity is separate from the repository topology.
+/// A process can replace HEAD/ref or the index in-place while preserving the
+/// `.git` directory, its common directory and the attached ref spelling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GitContentIdentityV1 {
+    head_commit: EvidenceAvailabilityV1<CommitId>,
+    index_tree: EvidenceAvailabilityV1<TreeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedGitBridgeV1 {
+    canonical_project: ProjectId,
+    canonical_repository: RepositoryId,
+    canonical_worktree: WorktreeId,
+    content: GitContentIdentityV1,
+}
+
 /// One admitted bridge between the two existing identity schemes. Source IDs
 /// are checked in the canonical namespace; daemon IDs are independently resolved
-/// and checked against the mounted scope. Neither is compared to the other.
+/// and checked against the mounted scope. The registered brain is retained so
+/// a bridge cannot be paired with a reader or database from another authority.
 pub(crate) struct HistoryIdentityBridgeV1 {
     project_root: PathBuf,
+    brain_id: BrainId,
+    git_identity: GitRepositoryIdentityV1,
+    git_content: GitContentIdentityV1,
     profile_id: UserProfileId,
     scope: ResolvedScope,
     canonical_project: ProjectId,
@@ -369,32 +1563,53 @@ impl HistoryIdentityBridgeV1 {
         mounted_scope: &ResolvedScope,
         registered_shard: &StoreShardIdV1,
     ) -> HistoryResult<Self> {
-        if registered_shard.profile_id != *profile_id
+        validate_registered_history_shard(profile_id, mounted_scope, registered_shard)?;
+        let resolved = Self::resolve_bridge(project_root, mounted_scope)?;
+        let git_identity = GitRepositoryIdentityV1::capture(project_root)?;
+        Ok(Self {
+            project_root: project_root.to_owned(),
+            brain_id: registered_shard.brain_id.clone(),
+            git_identity,
+            git_content: resolved.content,
+            profile_id: profile_id.clone(),
+            scope: mounted_scope.clone(),
+            canonical_project: resolved.canonical_project,
+            canonical_repository: resolved.canonical_repository,
+            canonical_worktree: resolved.canonical_worktree,
+        })
+    }
+
+    pub(crate) fn validate_registered_shard(
+        &self,
+        registered_shard: &StoreShardIdV1,
+    ) -> HistoryResult<()> {
+        if self.brain_id != registered_shard.brain_id
+            || self.profile_id != registered_shard.profile_id
             || registered_shard.scope
                 != (StoreShardScopeV1::ProjectSessions {
-                    project_id: mounted_scope.project_id.clone(),
+                    project_id: self.scope.project_id.clone(),
                 })
         {
             return Err(ProviderHistoryErrorV1::Ineligible(
-                "registered project/profile",
+                "registered history identity",
             ));
         }
-        let (canonical_project, canonical_repository, canonical_worktree) =
-            Self::resolve_bridge(project_root, mounted_scope)?;
-        Ok(Self {
-            project_root: project_root.to_owned(),
-            profile_id: profile_id.clone(),
-            scope: mounted_scope.clone(),
-            canonical_project,
-            canonical_repository,
-            canonical_worktree,
-        })
+        Ok(())
+    }
+
+    pub(crate) fn validate_reader(&self, reader: &HookOriginReaderV1) -> HistoryResult<()> {
+        if self.brain_id != reader.brain_id || self.profile_id != reader.profile_id {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader identity",
+            ));
+        }
+        Ok(())
     }
 
     fn resolve_bridge(
         project_root: &Path,
         mounted: &ResolvedScope,
-    ) -> HistoryResult<(ProjectId, RepositoryId, WorktreeId)> {
+    ) -> HistoryResult<ResolvedGitBridgeV1> {
         let resolved = tracedecay_code_index_runtime::resolved_scope_for_project(
             project_root,
             &mounted.project_id,
@@ -428,24 +1643,41 @@ impl HistoryIdentityBridgeV1 {
                 "current reference binding",
             ));
         }
-        context
+        let (canonical_project, canonical_repository, canonical_worktree) = context
             .admitted_identity()
             .ok_or(ProviderHistoryErrorV1::Unavailable(
                 "canonical repository identity",
-            ))
+            ))?;
+        Ok(ResolvedGitBridgeV1 {
+            canonical_project,
+            canonical_repository,
+            canonical_worktree,
+            content: GitContentIdentityV1 {
+                head_commit: capture.evidence().head_commit().clone(),
+                index_tree: capture.evidence().index_tree().clone(),
+            },
+        })
     }
 
     /// Fresh marker and daemon scope read. Cached construction is not proof that
     /// a later checkout, worktree replacement or branch still matches.
     pub(crate) fn revalidate(&self) -> HistoryResult<()> {
+        self.git_identity.validate_current(&self.project_root)?;
         let current = Self::resolve_bridge(&self.project_root, &self.scope)?;
-        if current
-            != (
-                self.canonical_project.clone(),
-                self.canonical_repository.clone(),
-                self.canonical_worktree.clone(),
-            )
-        {
+        if current.content != self.git_content {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "git commit/tree changed",
+            ));
+        }
+        if (
+            current.canonical_project,
+            current.canonical_repository,
+            current.canonical_worktree,
+        ) != (
+            self.canonical_project.clone(),
+            self.canonical_repository.clone(),
+            self.canonical_worktree.clone(),
+        ) {
             return Err(ProviderHistoryErrorV1::Ineligible(
                 "identity bridge changed",
             ));
@@ -465,10 +1697,13 @@ impl HistoryIdentityBridgeV1 {
         destination: &OwnedExactScope,
         control: &tracedecay_memory_provider_registry::OperationControl,
     ) -> HistoryResult<()> {
+        // The bridge and its reader are composition authorities. Revalidate
+        // them before observing the caller's budget, so a stale mount cannot
+        // turn a canceled control into a filesystem-backed authorization.
+        self.revalidate()?;
         control
             .snapshot()
             .map_err(ProviderHistoryErrorV1::Control)?;
-        self.revalidate()?;
         control
             .snapshot()
             .map_err(ProviderHistoryErrorV1::Control)?;
@@ -601,21 +1836,20 @@ where
     }
 
     pub(crate) fn validate_mount(&self) -> HistoryResult<()> {
-        if self.registered_shard.profile_id != self.profile_id
-            || self.registered_shard.scope
-                != (StoreShardScopeV1::ProjectSessions {
-                    project_id: self.mounted_scope.project_id.clone(),
-                })
-        {
-            return Err(ProviderHistoryErrorV1::Ineligible(
-                "registered project/profile",
-            ));
-        }
-        if self.original_authority.as_ref().is_some_and(|original| {
-            original.bridge.profile_id != self.profile_id
-                || original.bridge.scope != self.mounted_scope
-        }) {
-            return Err(ProviderHistoryErrorV1::Ineligible("original bridge mount"));
+        validate_registered_history_shard(
+            &self.profile_id,
+            &self.mounted_scope,
+            &self.registered_shard,
+        )?;
+        if let Some(original) = self.original_authority.as_ref() {
+            original.validate_mount(
+                &self.profile_id,
+                &self.mounted_scope,
+                &self.registered_shard,
+            )?;
+            // The repository marker and current branch are mutable authorities;
+            // construction-time identity is not enough after a reopen.
+            original.bridge.revalidate()?;
         }
         Ok(())
     }
@@ -684,6 +1918,9 @@ where
             ProviderOperation,
         };
         call.validate()?;
+        // A reopened or manually composed authority must reject a stale or
+        // cross-bound reader before it consults the caller's control token.
+        self.validate_mount().map_err(advisory_error)?;
         call.control
             .snapshot()
             .map_err(AdvisoryAdmissionError::Control)?;
@@ -1790,6 +3027,7 @@ where
         &self,
         control: &tracedecay_memory_provider_registry::OperationControl,
     ) -> HistoryResult<()> {
+        self.original_authority.validate_live_mount()?;
         control
             .snapshot()
             .map(|_| ())
@@ -2122,7 +3360,34 @@ pub(crate) async fn bounded_read<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tracedecay_memory_provider_registry::{CancellationToken, OperationControl, TerminalCode};
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new(tracedecay_runtime_core::git::try_git_program().unwrap())
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_repository(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "History identity test"]);
+        git(
+            root,
+            &["config", "user.email", "history-identity@example.invalid"],
+        );
+        std::fs::write(root.join("tracked"), b"history identity").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-q", "-m", "initial"]);
+    }
 
     #[test]
     fn retained_history_gate_keeps_revocation_distinct_from_privacy_deletion() {
@@ -2141,6 +3406,441 @@ mod tests {
         ] {
             assert!(!retained_history_source(state), "{state:?}");
         }
+    }
+
+    #[test]
+    fn hook_origin_reader_binds_registered_brain_profile_and_project() {
+        let temporary = tempfile::tempdir().unwrap();
+        let brain = BrainId::new("brain.history-reader").unwrap();
+        let profile = UserProfileId::new("profile.history-reader").unwrap();
+        let project = ProjectId::new("project.history-reader").unwrap();
+        let scope = ResolvedScope::new(
+            project.clone(),
+            RepositoryId::new("repository.history-reader").unwrap(),
+            WorktreeId::new("worktree.history-reader").unwrap(),
+            Some(tracedecay_domain::RefId::new("refs/heads/main").unwrap()),
+        )
+        .unwrap();
+        let registered =
+            StoreShardIdV1::project_sessions(brain.clone(), profile.clone(), project.clone());
+        let reader =
+            HookOriginReaderV1::new(temporary.path().to_path_buf(), brain, profile.clone());
+
+        reader
+            .validate_mount_identity(&profile, &scope, &registered)
+            .unwrap();
+
+        let wrong_reader_brain = HookOriginReaderV1::new(
+            temporary.path().to_path_buf(),
+            BrainId::new("brain.other").unwrap(),
+            profile.clone(),
+        );
+        assert!(matches!(
+            wrong_reader_brain.validate_mount_identity(&profile, &scope, &registered),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader identity"
+            ))
+        ));
+
+        let wrong_reader_profile = HookOriginReaderV1::new(
+            temporary.path().to_path_buf(),
+            registered.brain_id.clone(),
+            UserProfileId::new("profile.other").unwrap(),
+        );
+        assert!(matches!(
+            wrong_reader_profile.validate_mount_identity(&profile, &scope, &registered),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader identity"
+            ))
+        ));
+
+        let wrong_brain = StoreShardIdV1::project_sessions(
+            BrainId::new("brain.other").unwrap(),
+            profile.clone(),
+            project.clone(),
+        );
+        assert!(matches!(
+            reader.validate_mount_identity(&profile, &scope, &wrong_brain),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader identity"
+            ))
+        ));
+
+        let wrong_project = StoreShardIdV1::project_sessions(
+            registered.brain_id.clone(),
+            registered.profile_id.clone(),
+            ProjectId::new("project.other").unwrap(),
+        );
+        assert!(matches!(
+            reader.validate_mount_identity(&profile, &scope, &wrong_project),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "registered project/profile"
+            ))
+        ));
+
+        let wrong_profile = UserProfileId::new("profile.other").unwrap();
+        assert!(matches!(
+            reader.validate_mount_identity(&wrong_profile, &scope, &registered),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "registered project/profile"
+            ))
+        ));
+
+        let wrong_scope = StoreShardIdV1::project(
+            registered.brain_id.clone(),
+            registered.profile_id.clone(),
+            project,
+        );
+        assert!(matches!(
+            reader.validate_mount_identity(&profile, &scope, &wrong_scope),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "registered project/profile"
+            ))
+        ));
+    }
+
+    #[test]
+    fn hook_origin_reader_rejects_a_miswired_data_root() {
+        let actual = tempfile::tempdir().unwrap();
+        let expected = tempfile::tempdir().unwrap();
+        let reader = HookOriginReaderV1::new(
+            actual.path().to_path_buf(),
+            BrainId::new("brain.history-root").unwrap(),
+            UserProfileId::new("profile.history-root").unwrap(),
+        );
+
+        reader.validate_data_root(actual.path()).unwrap();
+        assert!(matches!(
+            reader.validate_data_root(expected.path()),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root"
+            ))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn hook_origin_reader_rejects_a_same_path_data_root_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("provider-data");
+        let previous = temporary.path().join("provider-data-previous");
+        std::fs::create_dir(&root).unwrap();
+        let reader = HookOriginReaderV1::new(
+            root.clone(),
+            BrainId::new("brain.history-root-replacement").unwrap(),
+            UserProfileId::new("profile.history-root-replacement").unwrap(),
+        );
+
+        reader.bind_data_root(&root).unwrap();
+        std::fs::rename(&root, &previous).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        assert!(matches!(
+            reader.validate_data_root(&root),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root"
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_origin_reader_rejects_a_symlink_retarget_after_binding() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("provider-data");
+        let previous = temporary.path().join("provider-data-previous");
+        let replacement = temporary.path().join("provider-data-replacement");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let reader = HookOriginReaderV1::new(
+            root.clone(),
+            BrainId::new("brain.history-root-retarget").unwrap(),
+            UserProfileId::new("profile.history-root-retarget").unwrap(),
+        );
+
+        reader.bind_data_root(&root).unwrap();
+        std::fs::rename(&root, &previous).unwrap();
+        symlink(&replacement, &root).unwrap();
+        assert!(matches!(
+            reader.validate_data_root(&root),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root"
+            ))
+        ));
+        assert!(matches!(
+            reader.live_boundaries(),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root"
+            ))
+        ));
+
+        std::fs::remove_file(&root).unwrap();
+        symlink(&previous, &root).unwrap();
+        assert!(matches!(
+            reader.validate_data_root(&root),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader data root"
+            ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_origin_reader_rejects_a_ledger_parent_rename_between_validation_and_open() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data_root = temporary.path().join("provider-data");
+        let admissions = data_root.join("hook-v2-admissions");
+        let previous = temporary.path().join("hook-v2-admissions-previous");
+        let replacement = temporary.path().join("hook-v2-admissions-replacement");
+        std::fs::create_dir_all(admissions.join("claude")).unwrap();
+        std::fs::create_dir_all(replacement.join("claude")).unwrap();
+        let reader = HookOriginReaderV1::new(
+            data_root.clone(),
+            BrainId::new("brain.history-ledger-parent").unwrap(),
+            UserProfileId::new("profile.history-ledger-parent").unwrap(),
+        );
+        reader.bind_data_root(&data_root).unwrap();
+
+        // The callback runs after pathname admission and before the
+        // handle-relative descendant read, which makes the parent swap
+        // deterministic.
+        let result = reader.read_ledger_with_identity(
+            tracedecay_hooks::HookHostV1::ClaudeCode,
+            "live session boundary",
+            |root, host| {
+                std::fs::rename(&admissions, &previous).unwrap();
+                std::fs::rename(&replacement, &admissions).unwrap();
+                root.map_or_else(
+                    || Ok(Vec::new()),
+                    |root| root.read_boundaries(host, tracedecay_contracts::now_micros()),
+                )
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader ledger root changed"
+            ))
+        ));
+
+        std::fs::remove_dir_all(&admissions).unwrap();
+        std::fs::rename(previous, admissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_origin_reader_rejects_a_ledger_parent_symlink_swap_between_validation_and_open() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let data_root = temporary.path().join("provider-data");
+        let admissions = data_root.join("hook-v2-admissions");
+        let previous = temporary.path().join("hook-v2-admissions-previous");
+        let replacement = temporary.path().join("hook-v2-admissions-replacement");
+        std::fs::create_dir_all(admissions.join("claude")).unwrap();
+        std::fs::create_dir_all(replacement.join("claude")).unwrap();
+        let reader = HookOriginReaderV1::new(
+            data_root.clone(),
+            BrainId::new("brain.history-ledger-parent-symlink").unwrap(),
+            UserProfileId::new("profile.history-ledger-parent-symlink").unwrap(),
+        );
+        reader.bind_data_root(&data_root).unwrap();
+
+        let result = reader.read_ledger_with_identity(
+            tracedecay_hooks::HookHostV1::ClaudeCode,
+            "live session boundary",
+            |root, host| {
+                std::fs::rename(&admissions, &previous).unwrap();
+                symlink(&replacement, &admissions).unwrap();
+                root.map_or_else(
+                    || Ok(Vec::new()),
+                    |root| root.read_boundaries(host, tracedecay_contracts::now_micros()),
+                )
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "history reader ledger root"
+            ))
+        ));
+
+        std::fs::remove_file(&admissions).unwrap();
+        std::fs::rename(previous, admissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_origin_reader_uses_the_retained_ledger_handle_across_an_aba_swap() {
+        let temporary = tempfile::tempdir().unwrap();
+        let data_root = temporary.path().join("provider-data");
+        let admissions = data_root.join("hook-v2-admissions");
+        let previous = temporary.path().join("hook-v2-admissions-previous");
+        let replacement = temporary.path().join("hook-v2-admissions-replacement");
+        let original_ledger = admissions.join("claude");
+        let replacement_ledger = replacement.join("claude");
+        std::fs::create_dir_all(&original_ledger).unwrap();
+        std::fs::create_dir_all(&replacement_ledger).unwrap();
+        std::fs::write(
+            original_ledger.join(LIVE_ORIGINS_FILE),
+            b"trusted-by-handle",
+        )
+        .unwrap();
+        std::fs::write(
+            replacement_ledger.join(LIVE_ORIGINS_FILE),
+            b"foreign-by-path",
+        )
+        .unwrap();
+        let reader = HookOriginReaderV1::new(
+            data_root.clone(),
+            BrainId::new("brain.history-ledger-aba").unwrap(),
+            UserProfileId::new("profile.history-ledger-aba").unwrap(),
+        );
+        reader.bind_data_root(&data_root).unwrap();
+
+        // The path is restored before the post-read check, so pathname
+        // identity has an ABA result. A handle-relative read must still come
+        // from the admitted original directory and never observe the foreign
+        // replacement bytes.
+        let result = reader
+            .read_ledger_with_identity(
+                tracedecay_hooks::HookHostV1::ClaudeCode,
+                "live session boundary",
+                |root, _| {
+                    std::fs::rename(&admissions, &previous).unwrap();
+                    std::fs::rename(&replacement, &admissions).unwrap();
+                    let bytes = root
+                        .expect("the admitted ledger handle must be retained")
+                        .read_file(LIVE_ORIGINS_FILE, MAX_LIVE_ORIGIN_BYTES)?;
+                    std::fs::remove_dir_all(&admissions).unwrap();
+                    std::fs::rename(&previous, &admissions).unwrap();
+                    Ok(bytes)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, b"trusted-by-handle");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn history_bridge_rejects_a_same_path_git_repository_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        let replacement = temporary.path().join("replacement");
+        init_repository(&checkout);
+        init_repository(&replacement);
+
+        let project = ProjectId::new("project.history-replacement").unwrap();
+        let profile = UserProfileId::new("profile.history-replacement").unwrap();
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &checkout,
+            project.as_str(),
+        )
+        .unwrap();
+        let scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&checkout, &project).unwrap();
+        let registered = StoreShardIdV1::project_sessions(
+            BrainId::new("brain.history-replacement").unwrap(),
+            profile.clone(),
+            project.clone(),
+        );
+        let bridge =
+            HistoryIdentityBridgeV1::admit(&checkout, &profile, &scope, &registered).unwrap();
+        bridge.revalidate().unwrap();
+
+        let previous_git = temporary.path().join("previous.git");
+        std::fs::rename(checkout.join(".git"), &previous_git).unwrap();
+        std::fs::rename(replacement.join(".git"), checkout.join(".git")).unwrap();
+        assert!(
+            tracedecay_runtime_core::storage::write_repository_identity_marker(
+                &checkout,
+                project.as_str(),
+            )
+            .unwrap()
+        );
+
+        let replacement_scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&checkout, &project).unwrap();
+        assert_eq!(
+            replacement_scope, scope,
+            "the replacement preserves path-derived project/session identity"
+        );
+        let replacement_bridge =
+            HistoryIdentityBridgeV1::admit(&checkout, &profile, &replacement_scope, &registered)
+                .unwrap();
+        replacement_bridge.revalidate().unwrap();
+
+        assert!(matches!(
+            bridge.revalidate(),
+            Err(ProviderHistoryErrorV1::Ineligible("git repository changed"))
+        ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn history_bridge_rejects_in_place_git_content_replacement_with_same_ref() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("checkout");
+        init_repository(&checkout);
+
+        let project = ProjectId::new("project.history-content-replacement").unwrap();
+        let profile = UserProfileId::new("profile.history-content-replacement").unwrap();
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &checkout,
+            project.as_str(),
+        )
+        .unwrap();
+        let scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&checkout, &project).unwrap();
+        let registered = StoreShardIdV1::project_sessions(
+            BrainId::new("brain.history-content-replacement").unwrap(),
+            profile.clone(),
+            project.clone(),
+        );
+        let bridge =
+            HistoryIdentityBridgeV1::admit(&checkout, &profile, &scope, &registered).unwrap();
+        bridge.revalidate().unwrap();
+
+        let git_dir = checkout.join(".git");
+        let git_identity = PhysicalPathIdentityV1::capture(
+            &git_dir,
+            "git repository entry",
+            PhysicalPathKind::Entry,
+        )
+        .unwrap();
+        std::fs::write(checkout.join("tracked"), b"history identity replacement").unwrap();
+        git(&checkout, &["add", "tracked"]);
+        git(&checkout, &["commit", "-q", "-m", "replace git content"]);
+
+        assert_eq!(
+            PhysicalPathIdentityV1::capture(
+                &git_dir,
+                "git repository entry",
+                PhysicalPathKind::Entry,
+            )
+            .unwrap(),
+            git_identity,
+            "the .git directory entry remains the same physical object"
+        );
+        let current_scope =
+            tracedecay_code_index_runtime::resolved_scope_for_project(&checkout, &project).unwrap();
+        assert_eq!(
+            current_scope.reference, scope.reference,
+            "the attached ref spelling remains unchanged"
+        );
+        assert_eq!(
+            current_scope, scope,
+            "path-derived scope identity remains unchanged after the content edit"
+        );
+        assert!(matches!(
+            bridge.revalidate(),
+            Err(ProviderHistoryErrorV1::Ineligible(
+                "git commit/tree changed"
+            ))
+        ));
     }
 
     #[tokio::test]

@@ -19,10 +19,9 @@ use cap_std::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
-#[cfg(feature = "real-encoder")]
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "real-encoder")]
 use std::sync::Mutex;
@@ -157,6 +156,456 @@ const REFERENCE_MANIFEST: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../product/ncm/reference/embedding-manifest.json"
 ));
+const RELEASE_ACQUISITION_MANIFEST: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/release/model-acquisition-manifest.json"
+));
+const MODEL_REVISION_RECEIPT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
+));
+
+/// Filename used by a worker sidecar for the target-bound acquisition contract.
+pub const MODEL_ACQUISITION_MANIFEST_FILENAME: &str = "model-acquisition-manifest.json";
+/// Relative path of the durable model acquisition receipt below a state root.
+pub const MODEL_ACQUISITION_RECEIPT_PATH: &str = "receipts/ncm-model-acquisition-v1.json";
+const MODEL_RELEASE_NAME: &str = "aarch64-macos";
+const MODEL_BASE_URL: &str = "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/2c4055b12046f11709e9df2c122e59ffbdc2f900/";
+
+/// One artifact entry in the target-bound model acquisition manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAcquisitionFile {
+    /// Path relative to the immutable model snapshot.
+    pub path: String,
+    /// HTTPS URL pinned to the immutable repository revision.
+    pub url: String,
+    /// Exact artifact size in bytes.
+    pub bytes: u64,
+    /// Lowercase SHA-256 digest of the artifact bytes.
+    pub sha256: String,
+}
+
+/// Atomic publication contract embedded in a model acquisition manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAcquisitionTransaction {
+    /// Transaction contract version.
+    pub version: u16,
+    /// Publication algorithm name.
+    pub publication: String,
+    /// Durable journal filename below the state root.
+    pub journal: String,
+    /// Prefix reserved for private staging roots.
+    pub staging_prefix: String,
+    /// Prefix reserved for rollback roots.
+    pub backup_prefix: String,
+}
+
+/// Receipt contract embedded in a model acquisition manifest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAcquisitionReceiptContract {
+    /// Receipt schema version.
+    pub schema_version: u16,
+    /// Relative path where the durable receipt is written.
+    pub relative_path: String,
+    /// Fields required in every acquisition receipt.
+    pub required_fields: Vec<String>,
+}
+
+/// Target-bound release descriptor for NCM model acquisition.
+///
+/// The descriptor is compiled into the worker from the checked-in release
+/// file. [`Self::reference`] validates every field, including the source
+/// embedding manifest and the tracked revision receipt, before the lifecycle
+/// is allowed to use it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelAcquisitionManifest {
+    /// Manifest schema version.
+    pub schema_version: u16,
+    /// Descriptor discriminator.
+    pub manifest_type: String,
+    /// Provider identifier.
+    pub provider_id: String,
+    /// Worker executable this descriptor accompanies.
+    pub worker: String,
+    /// Rust target triple bound by the release descriptor.
+    pub target: String,
+    /// Human-readable release target name.
+    pub release_name: String,
+    /// Repository path of the source embedding manifest.
+    pub embedding_manifest: String,
+    /// SHA-256 digest of the exact source embedding manifest bytes.
+    pub embedding_manifest_sha256: String,
+    /// State-root directory containing the model cache.
+    pub model_root: String,
+    /// Exact Hugging Face cache repository directory name.
+    pub cache_repository: String,
+    /// Short model identity.
+    pub model: String,
+    /// Immutable model repository.
+    pub repository: String,
+    /// Immutable repository revision.
+    pub revision: String,
+    /// Repository-local provenance pointer for the revision.
+    pub revision_provenance: String,
+    /// SHA-256 digest of the tracked revision provenance receipt bytes.
+    pub revision_provenance_sha256: String,
+    /// Maximum tokenizer sequence length.
+    pub max_length: usize,
+    /// Sentence pooling mode.
+    pub pooling: String,
+    /// Whether output vectors are L2 normalized.
+    pub normalize: bool,
+    /// Transport used by the acquisition URLs.
+    pub transport: String,
+    /// Revision-bound base URL for model acquisition.
+    pub base_url: String,
+    /// Pinned model artifacts.
+    pub files: Vec<ModelAcquisitionFile>,
+    /// Atomic publication contract.
+    pub transaction: ModelAcquisitionTransaction,
+    /// Durable receipt contract.
+    pub receipt: ModelAcquisitionReceiptContract,
+}
+
+impl ModelAcquisitionManifest {
+    /// Reads and validates the compile-time release descriptor.
+    pub fn reference() -> Result<Self, EncoderError> {
+        let manifest: Self =
+            serde_json::from_slice(RELEASE_ACQUISITION_MANIFEST).map_err(|error| {
+                EncoderError::ArtifactMismatch(format!(
+                    "parse checked-in model acquisition manifest: {error}"
+                ))
+            })?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// Validates the descriptor against the immutable runtime contract.
+    pub fn validate(&self) -> Result<(), EncoderError> {
+        if self.schema_version != 1
+            || self.manifest_type != "ncm-model-acquisition"
+            || self.provider_id != "ncm"
+            || self.worker != "tracedecay-ncm-worker"
+            || self.target != crate::platform::PINNED_WORKER_TARGET
+            || self.release_name != MODEL_RELEASE_NAME
+            || self.embedding_manifest != "product/ncm/reference/embedding-manifest.json"
+            || self.model_root != "models"
+            || self.cache_repository != CACHE_REPOSITORY_DIR
+            || self.model != MODEL_NAME
+            || self.repository != MODEL_REPOSITORY
+            || self.revision != MODEL_REVISION
+            || self.revision_provenance != MODEL_REVISION_PROVENANCE
+            || self.max_length != MAX_LENGTH
+            || self.pooling != "mean"
+            || !self.normalize
+            || self.transport != "https"
+            || self.base_url != MODEL_BASE_URL
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest is not the pinned NCM release contract".to_owned(),
+            ));
+        }
+        let expected_embedding_digest = digest_bytes(REFERENCE_MANIFEST.as_bytes());
+        if self.embedding_manifest_sha256 != expected_embedding_digest {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest embedding digest differs from the trusted reference"
+                    .to_owned(),
+            ));
+        }
+        let expected_revision_digest = digest_bytes(MODEL_REVISION_RECEIPT);
+        if self.revision_provenance_sha256 != expected_revision_digest
+            || !is_sha256_digest(&self.revision_provenance_sha256)
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest revision receipt digest is not trusted".to_owned(),
+            ));
+        }
+        let reference = PinnedEncoder::reference()?;
+        if self.files.len() != reference.files.len() {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest file set differs from the trusted reference".to_owned(),
+            ));
+        }
+        let mut paths = BTreeSet::new();
+        for file in &self.files {
+            if !paths.insert(file.path.as_str())
+                || !is_safe_relative_path(&file.path)
+                || file.url != format!("{}{path}", self.base_url, path = file.path)
+                || !is_sha256_digest(&file.sha256)
+            {
+                return Err(EncoderError::ArtifactMismatch(
+                    "model acquisition manifest contains an invalid artifact pin".to_owned(),
+                ));
+            }
+            let expected = reference
+                .files
+                .iter()
+                .find(|expected| expected.path == file.path)
+                .ok_or_else(|| {
+                    EncoderError::ArtifactMismatch(format!(
+                        "model acquisition manifest contains unexpected file {}",
+                        file.path
+                    ))
+                })?;
+            if file.bytes != expected.bytes || file.sha256 != expected.sha256 {
+                return Err(EncoderError::ArtifactMismatch(format!(
+                    "model acquisition manifest digest differs for {}",
+                    file.path
+                )));
+            }
+        }
+        if paths.len() != reference.files.len()
+            || reference
+                .files
+                .iter()
+                .any(|file| !paths.contains(file.path.as_str()))
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest file set is incomplete".to_owned(),
+            ));
+        }
+        validate_revision_receipt(self)?;
+        if self.transaction
+            != (ModelAcquisitionTransaction {
+                version: 1,
+                publication: "atomic-directory-swap".to_owned(),
+                journal: model_lifecycle::JOURNAL_FILENAME.to_owned(),
+                staging_prefix: model_lifecycle::STAGING_PREFIX.to_owned(),
+                backup_prefix: model_lifecycle::BACKUP_PREFIX.to_owned(),
+            })
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest transaction contract drifted".to_owned(),
+            ));
+        }
+        let required_fields = [
+            "schema_version",
+            "operation_id",
+            "operation",
+            "outcome",
+            "target",
+            "model",
+            "repository",
+            "revision",
+            "manifest_sha256",
+            "revision_provenance_sha256",
+            "files",
+            "created_at_unix",
+        ];
+        if self.receipt.schema_version != 1
+            || self.receipt.relative_path != MODEL_ACQUISITION_RECEIPT_PATH
+            || required_fields.iter().any(|field| {
+                !self
+                    .receipt
+                    .required_fields
+                    .iter()
+                    .any(|actual| actual == field)
+            })
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "model acquisition manifest receipt contract drifted".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the trusted embedding pin represented by this descriptor.
+    pub fn pinned_encoder(&self) -> Result<PinnedEncoder, EncoderError> {
+        self.validate()?;
+        let reference = PinnedEncoder::reference()?;
+        let files = self
+            .files
+            .iter()
+            .map(|file| EncoderFile {
+                path: file.path.clone(),
+                sha256: file.sha256.clone(),
+                bytes: file.bytes,
+            })
+            .collect::<Vec<_>>();
+        let candidate = PinnedEncoder {
+            model: self.model.clone(),
+            repository: self.repository.clone(),
+            revision: self.revision.clone(),
+            revision_provenance: self.revision_provenance.clone(),
+            files,
+            max_length: self.max_length,
+            pooling: self.pooling.clone(),
+            normalize: self.normalize,
+        };
+        ensure_pinned_metadata(&candidate, &reference)?;
+        Ok(reference)
+    }
+
+    /// Returns the canonical JSON SHA-256 identity of this descriptor.
+    pub fn canonical_sha256(&self) -> Result<String, EncoderError> {
+        let value = serde_json::to_value(self).map_err(|error| {
+            EncoderError::Inference(format!("encode model acquisition manifest: {error}"))
+        })?;
+        let mut bytes = Vec::new();
+        append_canonical_json(&value, &mut bytes)?;
+        Ok(digest_bytes(&bytes))
+    }
+}
+
+fn validate_revision_receipt(manifest: &ModelAcquisitionManifest) -> Result<(), EncoderError> {
+    let receipt: serde_json::Value =
+        serde_json::from_slice(MODEL_REVISION_RECEIPT).map_err(|error| {
+            EncoderError::ArtifactMismatch(format!(
+                "parse checked-in model revision receipt: {error}"
+            ))
+        })?;
+    let Some(receipt) = receipt.as_object() else {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt is not an object".to_owned(),
+        ));
+    };
+    if receipt
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt schema is unsupported".to_owned(),
+        ));
+    }
+    let model_identity = receipt
+        .get("identities")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|identities| identities.get("model"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt has no model identity".to_owned(),
+            )
+        })?;
+    if model_identity
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        != Some(manifest.model.as_str())
+        || model_identity
+            .get("revision")
+            .and_then(serde_json::Value::as_str)
+            != Some(manifest.revision.as_str())
+    {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt identity differs from the release pin".to_owned(),
+        ));
+    }
+    let artifact_digest = model_identity
+        .get("artifact_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt has no artifact digest".to_owned(),
+            )
+        })?;
+    let expected_artifact = manifest
+        .files
+        .iter()
+        .find(|file| file.path == "onnx/model.onnx")
+        .ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "model acquisition manifest has no ONNX artifact pin".to_owned(),
+            )
+        })?;
+    if !is_sha256_digest(artifact_digest) || artifact_digest != expected_artifact.sha256 {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt artifact digest differs from the release pin"
+                .to_owned(),
+        ));
+    }
+    let manifest_digest = model_identity
+        .get("manifest_sha256")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt has no manifest digest".to_owned(),
+            )
+        })?;
+    if !is_sha256_digest(manifest_digest) || manifest_digest != manifest.embedding_manifest_sha256 {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt manifest digest is invalid".to_owned(),
+        ));
+    }
+    let receipt_files = model_identity
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt files are not an array".to_owned(),
+            )
+        })?;
+    let mut paths = BTreeSet::new();
+    for value in receipt_files {
+        let file = value.as_object().ok_or_else(|| {
+            EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt file entry is not an object".to_owned(),
+            )
+        })?;
+        let path = file
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EncoderError::ArtifactMismatch(
+                    "checked-in model revision receipt file has no path".to_owned(),
+                )
+            })?;
+        let bytes = file
+            .get("bytes")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                EncoderError::ArtifactMismatch(format!(
+                    "checked-in model revision receipt has invalid size for {path}"
+                ))
+            })?;
+        let digest = file
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EncoderError::ArtifactMismatch(format!(
+                    "checked-in model revision receipt has no digest for {path}"
+                ))
+            })?;
+        if !paths.insert(path.to_owned())
+            || !is_safe_relative_path(path)
+            || !is_sha256_digest(digest)
+        {
+            return Err(EncoderError::ArtifactMismatch(
+                "checked-in model revision receipt contains an invalid file identity".to_owned(),
+            ));
+        }
+        let expected = manifest
+            .files
+            .iter()
+            .find(|expected| expected.path == path)
+            .ok_or_else(|| {
+                EncoderError::ArtifactMismatch(format!(
+                    "checked-in model revision receipt contains unexpected file {path}"
+                ))
+            })?;
+        if bytes != expected.bytes || digest != expected.sha256 {
+            return Err(EncoderError::ArtifactMismatch(format!(
+                "checked-in model revision receipt digest differs for {path}"
+            )));
+        }
+    }
+    if paths.len() != manifest.files.len()
+        || manifest
+            .files
+            .iter()
+            .any(|file| !paths.contains(file.path.as_str()))
+    {
+        return Err(EncoderError::ArtifactMismatch(
+            "checked-in model revision receipt file set differs from the release pin".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// One verified file in an encoder artifact manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,12 +705,7 @@ pub fn is_model_cached(root: &StateRoot) -> bool {
     if ensure_authoritative_environment().is_err() {
         return false;
     }
-    let expected = match PinnedEncoder::reference() {
-        Ok(expected) => expected,
-        Err(_) => return false,
-    };
-    let models_dir = root.models_dir();
-    verify_cached_state(&models_dir, &expected).is_ok()
+    model_lifecycle::verify_installed(root).is_ok()
 }
 
 /// Alias for [`is_model_cached`] that makes the offline nature explicit.
@@ -302,10 +746,11 @@ impl MiniLmEncoder {
     /// performs the preflight checks needed to keep opening offline.
     pub fn open(root: &StateRoot, expected: &PinnedEncoder) -> Result<Self, EncoderError> {
         ensure_authoritative_environment()?;
-        let reference = PinnedEncoder::reference()?;
+        let reference = ModelAcquisitionManifest::reference()?.pinned_encoder()?;
         ensure_manifest_is_pinned(&reference)?;
         ensure_pinned_metadata(expected, &reference)?;
         ensure_pinned_metadata(&reference, expected)?;
+        model_lifecycle::verify_installed(root)?;
 
         let models_dir = root.models_dir();
         let local = read_manifest(&models_dir.join(MANIFEST_FILENAME), true)?;
@@ -528,6 +973,11 @@ fn parse_manifest(contents: &str, source: &str) -> Result<PinnedEncoder, Encoder
 
 fn read_manifest(path: &Path, local: bool) -> Result<PinnedEncoder, EncoderError> {
     let bytes = read_path_file(path, local, 16 * 1024 * 1024)?;
+    if local && bytes.as_slice() != REFERENCE_MANIFEST.as_bytes() {
+        return Err(EncoderError::ArtifactMismatch(
+            "installed runtime model manifest differs from the trusted release pin".to_owned(),
+        ));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         EncoderError::ArtifactMismatch(format!("parse manifest {}: {error}", path.display()))
     })
@@ -596,26 +1046,30 @@ fn verify_cached_state(models_dir: &Path, expected: &PinnedEncoder) -> Result<()
     verify_local_artifacts(models_dir, &local, Some(expected.revision.as_str()))
 }
 
-#[cfg(feature = "real-encoder")]
+#[cfg(all(test, feature = "real-encoder"))]
 fn prepare_model_cache(root: &StateRoot) -> Result<(PathBuf, Dir), EncoderError> {
-    let models_dir = root.models_dir();
+    let root_directory = model_lifecycle::open_directory_path(root.path())?;
+    prepare_model_cache_at(&root_directory, root.path())
+}
+
+/// Prepares a model cache below an already-open state-root capability.
+///
+/// Lifecycle publication keeps the staging root open while it constructs a
+/// candidate. Taking that capability here prevents a swapped staging path
+/// from redirecting model construction into another directory between the
+/// download and the final no-replace rename.
+#[cfg(feature = "real-encoder")]
+pub(super) fn prepare_model_cache_at(
+    root_directory: &Dir,
+    root_path: &Path,
+) -> Result<(PathBuf, Dir), EncoderError> {
+    let models_dir = root_path.join("models");
     let models_name = models_dir.file_name().ok_or_else(|| {
         EncoderError::ArtifactMismatch(format!(
             "model cache has no directory name: {}",
             models_dir.display()
         ))
     })?;
-    let root_directory =
-        Dir::open_ambient_dir(root.path(), ambient_authority()).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                EncoderError::ArtifactsMissing(root.path().display().to_string())
-            } else {
-                EncoderError::ArtifactMismatch(format!(
-                    "open state root for model install {}: {error}",
-                    root.path().display()
-                ))
-            }
-        })?;
     match root_directory.create_dir(models_name) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -798,8 +1252,7 @@ fn validate_manifest_shape(manifest: &PinnedEncoder) -> Result<(), EncoderError>
         if !is_safe_relative_path(&file.path)
             || file.bytes == 0
             || file.sha256.len() != 64
-            || !file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || file.sha256.bytes().any(|byte| byte.is_ascii_uppercase())
+            || !is_sha256_digest(&file.sha256)
         {
             return Err(EncoderError::ArtifactMismatch(format!(
                 "invalid digest metadata for {}",
@@ -812,10 +1265,21 @@ fn validate_manifest_shape(manifest: &PinnedEncoder) -> Result<(), EncoderError>
 
 fn is_safe_relative_path(path: &str) -> bool {
     let candidate = Path::new(path);
-    !candidate.is_absolute()
-        && candidate
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+    !path.is_empty()
+        && !candidate.is_absolute()
+        && !path.contains('\\')
+        && candidate.components().all(|component| {
+            let Component::Normal(component) = component else {
+                return false;
+            };
+            let Some(component) = component.to_str() else {
+                return false;
+            };
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
 }
 
 fn is_immutable_revision(revision: &str) -> bool {
@@ -1125,7 +1589,7 @@ fn open_file_nofollow(
     Ok(file)
 }
 
-fn read_file_nofollow(
+pub(super) fn read_file_nofollow(
     parent: &Dir,
     name: &OsStr,
     path: &Path,
@@ -1292,7 +1756,6 @@ fn atomically_replace_snapshot_file(
     atomically_replace_file(&directory, &file_name, &path, bytes)
 }
 
-#[cfg(feature = "real-encoder")]
 fn atomically_replace_file(
     directory: &Dir,
     file_name: &OsStr,
@@ -1367,7 +1830,7 @@ fn read_verified_artifact(
     Ok(bytes)
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+pub(super) fn digest_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
@@ -1377,6 +1840,63 @@ fn digest_bytes(bytes: &[u8]) -> String {
         output.push(char::from(b"0123456789abcdef"[(byte & 0x0f) as usize]));
     }
     output
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn append_canonical_json(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> Result<(), EncoderError> {
+    match value {
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(value) => {
+            output.extend_from_slice(if *value { b"true" } else { b"false" });
+        }
+        serde_json::Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
+        serde_json::Value::String(value) => {
+            let encoded = serde_json::to_vec(value).map_err(|error| {
+                EncoderError::Inference(format!("encode canonical JSON string: {error}"))
+            })?;
+            output.extend_from_slice(&encoded);
+        }
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                append_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            output.push(b'{');
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                let encoded = serde_json::to_vec(key).map_err(|error| {
+                    EncoderError::Inference(format!("encode canonical JSON key: {error}"))
+                })?;
+                output.extend_from_slice(&encoded);
+                output.push(b':');
+                let value = values.get(*key).ok_or_else(|| {
+                    EncoderError::Inference("canonical JSON key disappeared".to_owned())
+                })?;
+                append_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -1628,14 +2148,15 @@ mod tests {
 
 #[cfg(feature = "real-encoder")]
 fn write_manifest(models_dir: &Path, manifest: &PinnedEncoder) -> Result<(), EncoderError> {
-    let bytes = serde_json::to_vec_pretty(manifest)
-        .map_err(|error| EncoderError::Inference(format!("serialize encoder manifest: {error}")))?;
+    let expected = ModelAcquisitionManifest::reference()?.pinned_encoder()?;
+    ensure_pinned_metadata(manifest, &expected)?;
+    ensure_pinned_metadata(&expected, manifest)?;
     let directory = open_model_directory(models_dir)?;
     let file_name = OsStr::new(MANIFEST_FILENAME);
     atomically_replace_file(
         &directory,
         file_name,
         &models_dir.join(MANIFEST_FILENAME),
-        &bytes,
+        REFERENCE_MANIFEST.as_bytes(),
     )
 }

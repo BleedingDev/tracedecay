@@ -66,6 +66,21 @@ const PAYLOAD_DIGESTS_SCHEMA: &str =
             WHERE payload_rowid = OLD.rowid;
         END;";
 
+/// The semantic-vector staging family was retired in v36. It is a derived
+/// projection with no lossless representation in the final store, so a
+/// released store carrying rows there is unsupported and must be reset rather
+/// than silently deleting durable-looking work.
+const RETIRED_SEMANTIC_TABLES: &[&str] = &[
+    "semantic_vector_stage_chunk_receipts",
+    "semantic_vector_stage_graph_effects",
+    "semantic_vector_stage_batches",
+    "semantic_vector_source_scope_bindings",
+    "semantic_vector_stage_adoption_authority",
+    "semantic_vector_stage_census_authority",
+    "semantic_vector_retirement_cleanup",
+    "semantic_vector_stages",
+];
+
 /// The fixture is assembled from the tagged beta.37 DDL, rather than from
 /// this binary's current schema.  Embedding it in the migration keeps source
 /// admission independent from any future final-shape changes.
@@ -287,7 +302,7 @@ impl SourceShape {
     }
 }
 
-/// Checks the exact source inventory before a writer transaction is opened.
+/// Checks the exact source inventory before any migration write.
 /// Each accepted inventory maps to a bounded conversion branch; no unknown
 /// drift is repaired by guessing which release produced it.
 pub(super) async fn require_exact_source_shape(
@@ -341,6 +356,10 @@ pub(super) async fn migrate_released_project_schema(
     stamp: u32,
 ) -> Result<()> {
     let source_shape = require_exact_source_shape(conn, stamp).await?;
+    validate_retired_semantic_projection(conn).await?;
+    if source_shape.has_payload_digests() {
+        validate_payload_digest_rows(conn).await?;
+    }
     if source_shape.uses_legacy_external_copies() {
         validate_source_rows(conn).await?;
     }
@@ -391,7 +410,7 @@ pub(super) async fn migrate_released_project_schema(
     if source_shape.uses_legacy_external_copies() {
         restore_diagnostics(conn).await?;
     }
-    migrate_payload_digests(conn, source_shape.has_payload_digests()).await?;
+    migrate_payload_digests(conn).await?;
     if source_shape.uses_legacy_external_copies() {
         migrate_external_source(conn).await?;
         migrate_runtime_ledger(conn).await?;
@@ -400,6 +419,68 @@ pub(super) async fn migrate_released_project_schema(
 
     super::final_shape::require_exact_final_shape(conn).await?;
     super::set_version(conn, super::SCHEMA_VERSION).await
+}
+
+/// Refuses rows in the v35 semantic staging projection before any schema or
+/// data mutation. The v36 final shape intentionally has no semantic staging
+/// tables, and no migration can reconstruct their provider/model payloads.
+async fn validate_retired_semantic_projection(conn: &impl QueryExecutor) -> Result<()> {
+    for &table in RETIRED_SEMANTIC_TABLES {
+        let mut rows = conn
+            .query(&format!("SELECT 1 FROM {table} LIMIT 1"), ())
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to inspect retired semantic table {table}: {error}"
+                ))
+            })?;
+        if rows
+            .next()
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to inspect retired semantic table {table}: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Err(reset_required(format!(
+                "released project store contains rows in retired semantic table '{table}'"
+            )));
+        }
+
+        // AUTOINCREMENT keeps a high-water mark even after all rows are
+        // deleted. That mark is part of the released table's durable identity
+        // allocation, and dropping the retired table would otherwise rewind
+        // it silently. There is no lossless v36 home for it, so refuse the
+        // store before issuing any migration write.
+        let mut sequence_rows = conn
+            .query(
+                "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                params![table],
+            )
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to inspect retired semantic sequence {table}: {error}"
+                ))
+            })?;
+        if sequence_rows
+            .next()
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to inspect retired semantic sequence {table}: {error}"
+                ))
+            })?
+            .is_some()
+        {
+            return Err(reset_required(format!(
+                "released project store contains a retired semantic table '{table}' with a used AUTOINCREMENT sequence"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn execute_batch(conn: &impl Executor, sql: &str) -> Result<()> {
@@ -563,13 +644,7 @@ async fn validate_payload_digest_rows(conn: &impl QueryExecutor) -> Result<()> {
     Ok(())
 }
 
-async fn migrate_payload_digests(
-    conn: &(impl Executor + Sync),
-    had_payload_digests: bool,
-) -> Result<()> {
-    if had_payload_digests {
-        validate_payload_digest_rows(conn).await?;
-    }
+async fn migrate_payload_digests(conn: &(impl Executor + Sync)) -> Result<()> {
     let mut rows = conn
         .query(
             "SELECT payloads.rowid, payloads.assertion_id, payloads.fact_id,
@@ -696,6 +771,36 @@ fn object_integer_matches(
 }
 
 fn valid_receipt_json(raw: &str, projection: bool, columns: &ReceiptColumns) -> bool {
+    if columns.receipt_digest.is_empty()
+        || columns.predecessor_frontier_digest.is_empty()
+        || columns.successor_frontier_digest.is_empty()
+        || columns
+            .idempotency_key
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || columns.request_digest.as_deref().is_some_and(str::is_empty)
+        || columns
+            .definition_digest
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || columns.binding_digest.as_deref().is_some_and(str::is_empty)
+        || columns
+            .source_receipt_digest
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || columns
+            .projection_digest
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || columns
+            .definition_revision
+            .is_some_and(|revision| revision <= 0)
+        || columns
+            .binding_revision
+            .is_some_and(|revision| revision <= 0)
+    {
+        return false;
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
     };
@@ -753,6 +858,9 @@ fn valid_receipt_json(raw: &str, projection: bool, columns: &ReceiptColumns) -> 
     let prior_digest = if prior.is_null() {
         Some("root")
     } else {
+        if columns.predecessor_frontier_digest == "root" {
+            return false;
+        }
         if !nonempty_digest(prior.get("digest")) {
             return false;
         }
@@ -780,6 +888,194 @@ fn valid_receipt_json(raw: &str, projection: bool, columns: &ReceiptColumns) -> 
                     .is_some_and(|mutation| nonempty_digest(mutation.get("mutation_digest")))
             })
         })
+}
+
+fn valid_authority_receipt_json(
+    raw: &str,
+    idempotency_key: &str,
+    request_digest: &str,
+    definition_digest: &str,
+    binding_digest: &str,
+) -> bool {
+    if idempotency_key.is_empty()
+        || request_digest.is_empty()
+        || definition_digest.is_empty()
+        || binding_digest.is_empty()
+    {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object_string_matches(object, "idempotency_key", Some(idempotency_key))
+        && object_string_matches(object, "request_digest", Some(request_digest))
+        && object_string_matches(object, "definition_digest", Some(definition_digest))
+        && object_string_matches(object, "binding_digest", Some(binding_digest))
+        && object
+            .get("prior_definition_digest")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| !digest.is_empty())
+        && object
+            .get("prior_binding_digest")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|digest| !digest.is_empty())
+}
+
+async fn validate_authority_rows(conn: &impl QueryExecutor) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT rowid, binding_id, idempotency_key, request_digest,
+                    definition_digest, binding_digest, receipt_json
+             FROM external_source_authority_receipts_v1 ORDER BY rowid",
+            (),
+        )
+        .await
+        .map_err(|error| failure(format!("failed to read authority receipts: {error}")))?;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| failure(format!("failed to read authority receipt row: {error}")))?
+    {
+        let rowid = row
+            .get::<i64>(0)
+            .map_err(|error| failure(format!("failed to decode authority receipt row: {error}")))?;
+        let binding_id = row.get::<String>(1).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        let idempotency_key = row.get::<String>(2).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        let request_digest = row.get::<String>(3).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        let definition_digest = row.get::<String>(4).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        let binding_digest = row.get::<String>(5).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        let receipt_json = row.get::<String>(6).map_err(|error| {
+            failure(format!(
+                "failed to decode authority receipt row {rowid}: {error}"
+            ))
+        })?;
+        if !valid_authority_receipt_json(
+            &receipt_json,
+            &idempotency_key,
+            &request_digest,
+            &definition_digest,
+            &binding_digest,
+        ) {
+            return Err(failure(format!(
+                "authority receipt row {rowid} for binding {binding_id} disagrees with its JSON"
+            )));
+        }
+        for (label, digest, sql) in [
+            (
+                "definition",
+                definition_digest.as_str(),
+                "SELECT 1 FROM external_source_definition_revisions_v1
+                 WHERE definition_digest = ?1 LIMIT 1",
+            ),
+            (
+                "binding",
+                binding_digest.as_str(),
+                "SELECT 1 FROM external_source_binding_revisions_v1
+                 WHERE binding_digest = ?1 LIMIT 1",
+            ),
+        ] {
+            let mut history = conn.query(sql, params![digest]).await.map_err(|error| {
+                failure(format!(
+                    "failed to read authority {label} history for row {rowid}: {error}"
+                ))
+            })?;
+            if history
+                .next()
+                .await
+                .map_err(|error| {
+                    failure(format!(
+                        "failed to read authority {label} history for row {rowid}: {error}"
+                    ))
+                })?
+                .is_none()
+            {
+                return Err(failure(format!(
+                    "authority receipt row {rowid} names a missing {label} history digest {digest}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Receipt JSON carries the authority digests that the v1 relational row did
+/// not repeat. Resolve the referenced binding/definition revisions and bind
+/// those digests before the receipt is rewritten into the slim v2 encoding.
+async fn require_receipt_authority(
+    conn: &impl QueryExecutor,
+    binding_id: &str,
+    definition_revision: i64,
+    binding_revision: i64,
+    context: &str,
+) -> Result<(String, String)> {
+    let mut rows = conn
+        .query(
+            "SELECT definitions.definition_digest, bindings.binding_digest
+             FROM external_source_states_v1 AS states
+             JOIN external_source_binding_revisions_v1 AS bindings
+               ON bindings.binding_id = states.binding_id
+              AND bindings.binding_revision = ?3
+              AND bindings.definition_revision = ?2
+             JOIN external_source_definition_revisions_v1 AS definitions
+               ON definitions.source_id = states.source_id
+              AND definitions.definition_revision = bindings.definition_revision
+             WHERE states.binding_id = ?1",
+            params![binding_id, definition_revision, binding_revision],
+        )
+        .await
+        .map_err(|error| {
+            failure(format!(
+                "failed to resolve {context} authority {binding_id}/{definition_revision}/{binding_revision}: {error}"
+            ))
+        })?;
+    let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read {context} authority {binding_id}/{definition_revision}/{binding_revision}: {error}"
+        ))
+    })? else {
+        return Err(failure(format!(
+            "{context} {binding_id}/{definition_revision}/{binding_revision} names missing authority history"
+        )));
+    };
+    let definition_digest = row.get::<String>(0).map_err(|error| {
+        failure(format!(
+            "failed to decode {context} definition authority {binding_id}: {error}"
+        ))
+    })?;
+    let binding_digest = row.get::<String>(1).map_err(|error| {
+        failure(format!(
+            "failed to decode {context} binding authority {binding_id}: {error}"
+        ))
+    })?;
+    if definition_digest.is_empty() || binding_digest.is_empty() {
+        return Err(failure(format!(
+            "{context} {binding_id}/{definition_revision}/{binding_revision} has empty authority digests"
+        )));
+    }
+    Ok((definition_digest, binding_digest))
 }
 
 async fn load_mutation_history(
@@ -833,10 +1129,11 @@ async fn require_commit_receipt_history(
     binding_id: &str,
     receipt_digest: &str,
     context: &str,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let mut rows = conn
         .query(
-            "SELECT 1 FROM external_source_commit_receipts_v1
+            "SELECT predecessor_frontier_digest, successor_frontier_digest
+             FROM external_source_commit_receipts_v1
              WHERE binding_id = ?1 AND receipt_digest = ?2",
             params![binding_id, receipt_digest],
         )
@@ -846,31 +1143,38 @@ async fn require_commit_receipt_history(
                 "failed to verify {context} receipt history {binding_id}/{receipt_digest}: {error}"
             ))
         })?;
-    if rows
-        .next()
-        .await
-        .map_err(|error| {
-            failure(format!(
-                "failed to read {context} receipt history {binding_id}/{receipt_digest}: {error}"
-            ))
-        })?
-        .is_none()
-    {
+    let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read {context} receipt history {binding_id}/{receipt_digest}: {error}"
+        ))
+    })?
+    else {
         return Err(failure(format!(
             "{context} {binding_id}/{receipt_digest} names a receipt absent from history"
         )));
-    }
-    Ok(())
+    };
+    let predecessor = row.get::<String>(0).map_err(|error| {
+        failure(format!(
+            "failed to decode {context} receipt history {binding_id}/{receipt_digest}: {error}"
+        ))
+    })?;
+    let successor = row.get::<String>(1).map_err(|error| {
+        failure(format!(
+            "failed to decode {context} receipt history {binding_id}/{receipt_digest}: {error}"
+        ))
+    })?;
+    Ok((predecessor, successor))
 }
 
 async fn require_projection_history(
     conn: &impl QueryExecutor,
     binding_id: &str,
     projection_digest: &str,
-) -> Result<()> {
+) -> Result<(String, String)> {
     let mut rows = conn
         .query(
-            "SELECT 1 FROM external_source_projection_publications_v1
+            "SELECT predecessor_frontier_digest, successor_frontier_digest
+             FROM external_source_projection_publications_v1
              WHERE binding_id = ?1 AND projection_digest = ?2",
             params![binding_id, projection_digest],
         )
@@ -880,21 +1184,27 @@ async fn require_projection_history(
                 "failed to verify projection history {binding_id}/{projection_digest}: {error}"
             ))
         })?;
-    if rows
-        .next()
-        .await
-        .map_err(|error| {
-            failure(format!(
-                "failed to read projection history {binding_id}/{projection_digest}: {error}"
-            ))
-        })?
-        .is_none()
-    {
+    let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read projection history {binding_id}/{projection_digest}: {error}"
+        ))
+    })?
+    else {
         return Err(failure(format!(
             "projection {binding_id}/{projection_digest} names a publication absent from history"
         )));
-    }
-    Ok(())
+    };
+    let predecessor = row.get::<String>(0).map_err(|error| {
+        failure(format!(
+            "failed to decode projection history {binding_id}/{projection_digest}: {error}"
+        ))
+    })?;
+    let successor = row.get::<String>(1).map_err(|error| {
+        failure(format!(
+            "failed to decode projection history {binding_id}/{projection_digest}: {error}"
+        ))
+    })?;
+    Ok((predecessor, successor))
 }
 
 async fn require_frontier_history(
@@ -909,10 +1219,6 @@ async fn require_frontier_history(
     let mut rows = conn
         .query(
             "SELECT 1
-             FROM external_source_frontiers_v1
-             WHERE binding_id = ?1 AND frontier_digest = ?2
-             UNION ALL
-             SELECT 1
              FROM external_source_commit_receipts_v1
              WHERE binding_id = ?1
                AND (json_extract(receipt_json, '$.source_frontier.digest') = ?2
@@ -944,6 +1250,82 @@ async fn require_frontier_history(
     {
         return Err(failure(format!(
             "{context} {binding_id}/{frontier_digest} names a frontier absent from history"
+        )));
+    }
+    Ok(())
+}
+
+/// The source-state row retains a full copy of its current source frontier,
+/// while the receipt history carries the same frontier under its digest. A
+/// digest match alone is insufficient: retaining two different payloads for
+/// one digest would make the successor store hydrate different states from
+/// the same history key. Compare the JSON values semantically so harmless
+/// whitespace or object-key ordering differences do not become false drift.
+async fn require_frontier_payload_history(
+    conn: &impl QueryExecutor,
+    binding_id: &str,
+    frontier_digest: &str,
+    expected_json: &str,
+    context: &str,
+) -> Result<()> {
+    let expected = serde_json::from_str::<serde_json::Value>(expected_json).map_err(|error| {
+        failure(format!(
+            "{context} {binding_id}/{frontier_digest} has invalid frontier JSON: {error}"
+        ))
+    })?;
+    let mut rows = conn
+        .query(
+            "SELECT json_extract(receipt_json, '$.source_frontier')
+             FROM external_source_commit_receipts_v1
+             WHERE binding_id = ?1
+               AND json_extract(receipt_json, '$.source_frontier.digest') = ?2
+             UNION ALL
+             SELECT json_extract(receipt_json, '$.prior_source_frontier')
+             FROM external_source_commit_receipts_v1
+             WHERE binding_id = ?1
+               AND json_extract(receipt_json, '$.prior_source_frontier.digest') = ?2
+             UNION ALL
+             SELECT json_extract(receipt_json, '$.source_frontier')
+             FROM external_source_projection_publications_v1
+             WHERE binding_id = ?1
+               AND json_extract(receipt_json, '$.source_frontier.digest') = ?2
+             UNION ALL
+             SELECT json_extract(receipt_json, '$.expected_projection_frontier')
+             FROM external_source_projection_publications_v1
+             WHERE binding_id = ?1
+               AND json_extract(receipt_json, '$.expected_projection_frontier.digest') = ?2
+             LIMIT 1",
+            params![binding_id, frontier_digest],
+        )
+        .await
+        .map_err(|error| {
+            failure(format!(
+                "failed to read {context} frontier payload {binding_id}/{frontier_digest}: {error}"
+            ))
+        })?;
+    let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read {context} frontier payload {binding_id}/{frontier_digest}: {error}"
+        ))
+    })?
+    else {
+        return Err(failure(format!(
+            "{context} {binding_id}/{frontier_digest} names a frontier absent from history"
+        )));
+    };
+    let history_json = row.get::<String>(0).map_err(|error| {
+        failure(format!(
+            "failed to decode {context} frontier payload {binding_id}/{frontier_digest}: {error}"
+        ))
+    })?;
+    let history = serde_json::from_str::<serde_json::Value>(&history_json).map_err(|error| {
+        failure(format!(
+            "{context} frontier {binding_id}/{frontier_digest} has invalid history JSON: {error}"
+        ))
+    })?;
+    if history != expected {
+        return Err(failure(format!(
+            "{context} frontier {binding_id}/{frontier_digest} has a conflicting payload"
         )));
     }
     Ok(())
@@ -997,6 +1379,57 @@ async fn validate_mutation_history_rows(conn: &impl QueryExecutor) -> Result<()>
         {
             return Err(failure(format!(
                 "mutation history row {rowid} has an invalid immutable encoding"
+            )));
+        }
+        let mutation_value =
+            serde_json::from_str::<serde_json::Value>(&mutation_json).map_err(|error| {
+                failure(format!(
+                    "mutation history row {rowid} has invalid JSON: {error}"
+                ))
+            })?;
+        let mut receipt_rows = conn
+            .query(
+                "SELECT receipt_json
+                 FROM external_source_commit_receipts_v1
+                 WHERE binding_id = ?1 AND receipt_digest = ?2",
+                params![&binding_id, &source_receipt_digest],
+            )
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to read mutation history receipt {binding_id}/{source_receipt_digest}: {error}"
+                ))
+            })?;
+        let Some(receipt_row) = receipt_rows.next().await.map_err(|error| {
+            failure(format!(
+                "failed to read mutation history receipt {binding_id}/{source_receipt_digest}: {error}"
+            ))
+        })?
+        else {
+            // Keep the history reference error separate from the later
+            // receipt-content check so a missing receipt remains actionable.
+            return Err(failure(format!(
+                "mutation history row {rowid} names a missing source receipt {binding_id}/{source_receipt_digest}"
+            )));
+        };
+        let receipt_json = receipt_row.get::<String>(0).map_err(|error| {
+            failure(format!(
+                "failed to decode mutation history receipt {binding_id}/{source_receipt_digest}: {error}"
+            ))
+        })?;
+        let receipt_value =
+            serde_json::from_str::<serde_json::Value>(&receipt_json).map_err(|error| {
+                failure(format!(
+                    "mutation history row {rowid} names a receipt with invalid JSON: {error}"
+                ))
+            })?;
+        let receipt_contains_mutation = receipt_value
+            .get("mutations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|mutations| mutations.iter().any(|mutation| mutation == &mutation_value));
+        if !receipt_contains_mutation {
+            return Err(failure(format!(
+                "mutation history row {rowid} is not retained by source receipt {binding_id}/{source_receipt_digest}"
             )));
         }
         require_commit_receipt_history(
@@ -1101,6 +1534,78 @@ async fn validate_mutation_copy_rows(conn: &impl QueryExecutor, table: &str) -> 
     Ok(())
 }
 
+async fn validate_projection_effect_rows(
+    conn: &impl QueryExecutor,
+    binding_id: &str,
+    projection_digest: &str,
+    expected_mutation_digests: &[String],
+    expected_effects: &[serde_json::Value],
+    rowid: i64,
+) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT effect_json, mutation_json
+             FROM external_source_projection_effects_v1
+             WHERE binding_id = ?1 AND projection_digest = ?2
+             ORDER BY effect_index",
+            params![binding_id, projection_digest],
+        )
+        .await
+        .map_err(|error| {
+            failure(format!(
+                "failed to read projection effects for receipt row {rowid}: {error}"
+            ))
+        })?;
+    let mut actual_effects = Vec::new();
+    let mut actual_mutation_digests = Vec::new();
+    while let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read projection effect for receipt row {rowid}: {error}"
+        ))
+    })? {
+        let effect_json = row.get::<String>(0).map_err(|error| {
+            failure(format!(
+                "failed to decode projection effect for receipt row {rowid}: {error}"
+            ))
+        })?;
+        actual_effects.push(
+            serde_json::from_str::<serde_json::Value>(&effect_json).map_err(|error| {
+                failure(format!(
+                    "projection effect for receipt row {rowid} has invalid JSON: {error}"
+                ))
+            })?,
+        );
+        let mutation_json = row.get::<String>(1).map_err(|error| {
+            failure(format!(
+                "failed to decode projection effect mutation for receipt row {rowid}: {error}"
+            ))
+        })?;
+        let mutation_digest = serde_json::from_str::<serde_json::Value>(&mutation_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("mutation_digest")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|digest| !digest.is_empty())
+                    .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                failure(format!(
+                    "projection effect for receipt row {rowid} has no mutation digest"
+                ))
+            })?;
+        actual_mutation_digests.push(mutation_digest);
+    }
+    if actual_effects.as_slice() != expected_effects
+        || actual_mutation_digests.as_slice() != expected_mutation_digests
+    {
+        return Err(failure(format!(
+            "projection receipt row {rowid} effects or mutations disagree with their retained history"
+        )));
+    }
+    Ok(())
+}
+
 async fn validate_json_column(
     conn: &impl QueryExecutor,
     table: &str,
@@ -1189,14 +1694,22 @@ async fn validate_json_column(
             let raw = row.get::<String>(9).map_err(|error| {
                 failure(format!("failed to decode {table} row {rowid}: {error}"))
             })?;
+            let (definition_digest, binding_digest) = require_receipt_authority(
+                conn,
+                &binding_id,
+                definition_revision,
+                binding_revision,
+                "commit receipt",
+            )
+            .await?;
             (
                 ReceiptColumns {
                     idempotency_key: Some(idempotency_key),
                     request_digest: Some(request_digest),
                     definition_revision: Some(definition_revision),
-                    definition_digest: None,
+                    definition_digest: Some(definition_digest),
                     binding_revision: Some(binding_revision),
-                    binding_digest: None,
+                    binding_digest: Some(binding_digest),
                     projection_digest: None,
                     source_receipt_digest: None,
                     predecessor_frontier_digest: predecessor,
@@ -1220,6 +1733,73 @@ async fn validate_json_column(
             .get("mutations")
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| failure(format!("{table} row {rowid} has no mutation list")))?;
+        if projection {
+            let object = value.as_object().ok_or_else(|| {
+                failure(format!("{table} row {rowid} receipt JSON is not an object"))
+            })?;
+            let projection_digest = columns
+                .projection_digest
+                .as_deref()
+                .ok_or_else(|| failure(format!("{table} row {rowid} has no projection digest")))?;
+            let expected_effects = object
+                .get("effects")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .ok_or_else(|| {
+                    failure(format!(
+                        "{table} row {rowid} has no effect list for lossless conversion"
+                    ))
+                })?;
+            let expected_mutation_digests = mutations
+                .iter()
+                .map(|mutation| {
+                    mutation
+                        .get("mutation_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|digest| !digest.is_empty())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            failure(format!(
+                                "{table} row {rowid} mutation has no digest for effect history"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            validate_projection_effect_rows(
+                conn,
+                &binding_id,
+                projection_digest,
+                &expected_mutation_digests,
+                &expected_effects,
+                rowid,
+            )
+            .await?;
+            let definition_revision = object
+                .get("definition_revision")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    failure(format!("{table} row {rowid} has no definition revision"))
+                })?;
+            let binding_revision = object
+                .get("binding_revision")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| failure(format!("{table} row {rowid} has no binding revision")))?;
+            let (definition_digest, binding_digest) = require_receipt_authority(
+                conn,
+                &binding_id,
+                definition_revision,
+                binding_revision,
+                "projection receipt",
+            )
+            .await?;
+            if !object_string_matches(object, "definition_digest", Some(&definition_digest))
+                || !object_string_matches(object, "binding_digest", Some(&binding_digest))
+            {
+                return Err(failure(format!(
+                    "{table} row {rowid} disagrees with its authority history"
+                )));
+            }
+        }
         for (index, mutation) in mutations.iter().enumerate() {
             let mutation_digest = mutation
                 .get("mutation_digest")
@@ -1229,32 +1809,49 @@ async fn validate_json_column(
                         "{table} row {rowid} mutation {index} has no digest"
                     ))
                 })?;
-            load_mutation_history(conn, &binding_id, mutation_digest)
+            let (_, history_json) = load_mutation_history(conn, &binding_id, mutation_digest)
                 .await
                 .map_err(|error| {
                     failure(format!(
                         "{table} row {rowid} mutation {index} is not losslessly referenced: {error}"
                     ))
                 })?;
+            let history_value =
+                serde_json::from_str::<serde_json::Value>(&history_json).map_err(|error| {
+                    failure(format!(
+                        "{table} row {rowid} mutation {index} has invalid history JSON: {error}"
+                    ))
+                })?;
+            if mutation != &history_value {
+                return Err(failure(format!(
+                    "{table} row {rowid} mutation {index} disagrees with its history"
+                )));
+            }
         }
         if projection {
             let source_receipt_digest =
                 columns.source_receipt_digest.as_deref().ok_or_else(|| {
                     failure(format!("{table} row {rowid} has no source receipt digest"))
                 })?;
-            require_commit_receipt_history(
+            let (_, commit_successor) = require_commit_receipt_history(
                 conn,
                 &binding_id,
                 source_receipt_digest,
                 "projection publication",
             )
             .await?;
+            if commit_successor != columns.successor_frontier_digest {
+                return Err(failure(format!(
+                    "{table} row {rowid} successor frontier disagrees with its source receipt"
+                )));
+            }
         }
     }
     Ok(())
 }
 
 async fn validate_source_rows(conn: &impl QueryExecutor) -> Result<()> {
+    validate_authority_rows(conn).await?;
     validate_mutation_history_rows(conn).await?;
     validate_mutation_copy_rows(conn, "external_source_objects_v1").await?;
     validate_mutation_copy_rows(conn, "external_source_projected_objects_v1").await?;
@@ -1267,6 +1864,49 @@ async fn validate_source_rows(conn: &impl QueryExecutor) -> Result<()> {
 }
 
 async fn validate_external_source_history_refs(conn: &impl QueryExecutor) -> Result<()> {
+    let mut rows = conn
+        .query(
+            "SELECT effects.rowid, effects.binding_id, effects.projection_digest
+             FROM external_source_projection_effects_v1 AS effects
+             LEFT JOIN external_source_projection_publications_v1 AS publications
+               ON publications.binding_id = effects.binding_id
+              AND publications.projection_digest = effects.projection_digest
+             WHERE publications.projection_digest IS NULL
+             ORDER BY effects.rowid
+             LIMIT 1",
+            (),
+        )
+        .await
+        .map_err(|error| {
+            failure(format!(
+                "failed to read external projection effects: {error}"
+            ))
+        })?;
+    if let Some(row) = rows.next().await.map_err(|error| {
+        failure(format!(
+            "failed to read external projection effect history: {error}"
+        ))
+    })? {
+        let rowid = row.get::<i64>(0).map_err(|error| {
+            failure(format!(
+                "failed to decode external projection effect history row: {error}"
+            ))
+        })?;
+        let binding_id = row.get::<String>(1).map_err(|error| {
+            failure(format!(
+                "failed to decode external projection effect history row {rowid}: {error}"
+            ))
+        })?;
+        let projection_digest = row.get::<String>(2).map_err(|error| {
+            failure(format!(
+                "failed to decode external projection effect history row {rowid}: {error}"
+            ))
+        })?;
+        return Err(failure(format!(
+            "external projection effect row {rowid} names missing projection history {binding_id}/{projection_digest}"
+        )));
+    }
+
     let mut rows = conn
         .query(
             "SELECT rowid, binding_id, source_receipt_digest
@@ -1297,6 +1937,7 @@ async fn validate_external_source_history_refs(conn: &impl QueryExecutor) -> Res
         })?;
         require_commit_receipt_history(conn, &binding_id, &receipt_digest, "lineage").await?;
     }
+    validate_lineage_membership(conn, false).await?;
 
     let mut rows = conn
         .query(
@@ -1332,6 +1973,7 @@ async fn validate_external_source_history_refs(conn: &impl QueryExecutor) -> Res
         })?;
         require_projection_history(conn, &binding_id, &projection_digest).await?;
     }
+    validate_lineage_membership(conn, true).await?;
 
     let mut rows = conn
         .query(
@@ -1376,15 +2018,28 @@ async fn validate_external_source_history_refs(conn: &impl QueryExecutor) -> Res
                 "failed to decode external pending projection row {rowid}: {error}"
             ))
         })?;
-        require_commit_receipt_history(conn, &binding_id, &receipt_digest, "pending projection")
-            .await?;
+        let (receipt_predecessor, receipt_successor) = require_commit_receipt_history(
+            conn,
+            &binding_id,
+            &receipt_digest,
+            "pending projection",
+        )
+        .await?;
+        if receipt_predecessor != predecessor || receipt_successor != successor {
+            return Err(failure(format!(
+                "pending projection row {rowid} disagrees with its source receipt"
+            )));
+        }
         require_frontier_history(conn, &binding_id, &predecessor, "pending projection").await?;
         require_frontier_history(conn, &binding_id, &successor, "pending projection").await?;
     }
 
     let mut rows = conn
         .query(
-            "SELECT rowid, binding_id, source_frontier_digest,
+            "SELECT rowid, binding_id, source_id,
+                    definition_revision, definition_digest,
+                    binding_revision, binding_digest,
+                    source_frontier_digest, source_frontier_json,
                     projection_frontier_digest, latest_source_receipt_digest,
                     latest_projection_receipt_digest
              FROM external_source_states_v1 ORDER BY rowid",
@@ -1407,35 +2062,256 @@ async fn validate_external_source_history_refs(conn: &impl QueryExecutor) -> Res
                 "failed to decode external source state row {rowid}: {error}"
             ))
         })?;
-        let source_frontier = row.get::<String>(2).map_err(|error| {
+        let source_id = row.get::<String>(2).map_err(|error| {
             failure(format!(
                 "failed to decode external source state row {rowid}: {error}"
             ))
         })?;
-        let projection_frontier = row.get::<Option<String>>(3).map_err(|error| {
+        let definition_revision = row.get::<i64>(3).map_err(|error| {
             failure(format!(
                 "failed to decode external source state row {rowid}: {error}"
             ))
         })?;
-        let latest_source_receipt = row.get::<String>(4).map_err(|error| {
+        let definition_digest = row.get::<String>(4).map_err(|error| {
             failure(format!(
                 "failed to decode external source state row {rowid}: {error}"
             ))
         })?;
-        let latest_projection_receipt = row.get::<Option<String>>(5).map_err(|error| {
+        let binding_revision = row.get::<i64>(5).map_err(|error| {
             failure(format!(
                 "failed to decode external source state row {rowid}: {error}"
             ))
         })?;
+        let binding_digest = row.get::<String>(6).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let source_frontier = row.get::<String>(7).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let source_frontier_json = row.get::<String>(8).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let projection_frontier = row.get::<Option<String>>(9).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let latest_source_receipt = row.get::<String>(10).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let latest_projection_receipt = row.get::<Option<String>>(11).map_err(|error| {
+            failure(format!(
+                "failed to decode external source state row {rowid}: {error}"
+            ))
+        })?;
+        let (authoritative_definition_digest, authoritative_binding_digest) =
+            require_receipt_authority(
+                conn,
+                &binding_id,
+                definition_revision,
+                binding_revision,
+                "source state",
+            )
+            .await?;
+        if definition_digest != authoritative_definition_digest
+            || binding_digest != authoritative_binding_digest
+        {
+            return Err(failure(format!(
+                "source state row {rowid} disagrees with its authority history"
+            )));
+        }
+        let source_frontier_value =
+            serde_json::from_str::<serde_json::Value>(&source_frontier_json).map_err(|error| {
+                failure(format!(
+                    "external source state row {rowid} has invalid source frontier JSON: {error}"
+                ))
+            })?;
+        if !nonempty_digest(source_frontier_value.get("digest"))
+            || source_frontier_value
+                .get("digest")
+                .and_then(serde_json::Value::as_str)
+                != Some(source_frontier.as_str())
+        {
+            return Err(failure(format!(
+                "source state row {rowid} source frontier disagrees with its JSON"
+            )));
+        }
+        if source_id.is_empty()
+            || (projection_frontier.is_some() != latest_projection_receipt.is_some())
+        {
+            return Err(failure(format!(
+                "source state row {rowid} has an incomplete source identity or projection history"
+            )));
+        }
+        let (_, source_receipt_successor) = require_commit_receipt_history(
+            conn,
+            &binding_id,
+            &latest_source_receipt,
+            "source state",
+        )
+        .await?;
+        if source_receipt_successor != source_frontier {
+            return Err(failure(format!(
+                "source state row {rowid} source frontier disagrees with its latest receipt"
+            )));
+        }
         require_frontier_history(conn, &binding_id, &source_frontier, "source state").await?;
+        if source_frontier != "root" {
+            require_frontier_payload_history(
+                conn,
+                &binding_id,
+                &source_frontier,
+                &source_frontier_json,
+                "source state",
+            )
+            .await?;
+        }
         if let Some(projection_frontier) = projection_frontier {
+            let (_, projection_successor) = require_projection_history(
+                conn,
+                &binding_id,
+                latest_projection_receipt.as_deref().ok_or_else(|| {
+                    failure(format!(
+                        "source state row {rowid} has a projection frontier without a latest projection receipt"
+                    ))
+                })?,
+            )
+            .await?;
+            if projection_successor != projection_frontier {
+                return Err(failure(format!(
+                    "source state row {rowid} projection frontier disagrees with its latest projection receipt"
+                )));
+            }
             require_frontier_history(conn, &binding_id, &projection_frontier, "source state")
                 .await?;
         }
-        require_commit_receipt_history(conn, &binding_id, &latest_source_receipt, "source state")
-            .await?;
         if let Some(latest_projection_receipt) = latest_projection_receipt {
             require_projection_history(conn, &binding_id, &latest_projection_receipt).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Lineage rows are retained as full history while receipts keep the same
+/// lineage objects inline. Both copies must agree before the receipt is
+/// rewritten or the source lineage row can become an orphaned, contradictory
+/// record in the successor store.
+async fn validate_lineage_membership(conn: &impl QueryExecutor, projection: bool) -> Result<()> {
+    let (table, parent_table, parent_key) = if projection {
+        (
+            "external_source_projection_lineage_v1",
+            "external_source_projection_publications_v1",
+            "projection_digest",
+        )
+    } else {
+        (
+            "external_source_lineage_v1",
+            "external_source_commit_receipts_v1",
+            "receipt_digest",
+        )
+    };
+    let sql = if projection {
+        "SELECT rowid, binding_id, projection_digest, lineage_digest, lineage_json
+         FROM external_source_projection_lineage_v1 ORDER BY rowid"
+    } else {
+        "SELECT rowid, binding_id, source_receipt_digest, lineage_digest, lineage_json
+         FROM external_source_lineage_v1 ORDER BY rowid"
+    };
+    let mut rows = conn
+        .query(sql, ())
+        .await
+        .map_err(|error| failure(format!("failed to read {table} lineage members: {error}")))?;
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| failure(format!("failed to read {table} lineage member: {error}")))?
+    {
+        let rowid = row
+            .get::<i64>(0)
+            .map_err(|error| failure(format!("failed to decode {table} lineage row: {error}")))?;
+        let binding_id = row.get::<String>(1).map_err(|error| {
+            failure(format!(
+                "failed to decode {table} lineage row {rowid}: {error}"
+            ))
+        })?;
+        let parent_digest = row.get::<String>(2).map_err(|error| {
+            failure(format!(
+                "failed to decode {table} lineage row {rowid}: {error}"
+            ))
+        })?;
+        let lineage_digest = row.get::<String>(3).map_err(|error| {
+            failure(format!(
+                "failed to decode {table} lineage row {rowid}: {error}"
+            ))
+        })?;
+        let lineage_json = row.get::<String>(4).map_err(|error| {
+            failure(format!(
+                "failed to decode {table} lineage row {rowid}: {error}"
+            ))
+        })?;
+        let lineage =
+            serde_json::from_str::<serde_json::Value>(&lineage_json).map_err(|error| {
+                failure(format!(
+                    "{table} lineage row {rowid} has invalid JSON: {error}"
+                ))
+            })?;
+        if lineage
+            .get("lineage_digest")
+            .and_then(serde_json::Value::as_str)
+            != Some(lineage_digest.as_str())
+        {
+            return Err(failure(format!(
+                "{table} lineage row {rowid} disagrees with its lineage digest"
+            )));
+        }
+        let parent_sql = format!(
+            "SELECT receipt_json FROM {parent_table}
+             WHERE binding_id = ?1 AND {parent_key} = ?2"
+        );
+        let mut parent_rows = conn
+            .query(&parent_sql, params![&binding_id, &parent_digest])
+            .await
+            .map_err(|error| {
+                failure(format!(
+                    "failed to read {table} lineage parent {binding_id}/{parent_digest}: {error}"
+                ))
+            })?;
+        let Some(parent_row) = parent_rows.next().await.map_err(|error| {
+            failure(format!(
+                "failed to read {table} lineage parent {binding_id}/{parent_digest}: {error}"
+            ))
+        })?
+        else {
+            return Err(failure(format!(
+                "{table} lineage row {rowid} names a missing parent {binding_id}/{parent_digest}"
+            )));
+        };
+        let parent_json = parent_row.get::<String>(0).map_err(|error| {
+            failure(format!(
+                "failed to decode {table} lineage parent {binding_id}/{parent_digest}: {error}"
+            ))
+        })?;
+        let parent = serde_json::from_str::<serde_json::Value>(&parent_json).map_err(|error| {
+            failure(format!(
+                "{table} lineage parent {binding_id}/{parent_digest} has invalid JSON: {error}"
+            ))
+        })?;
+        if !parent
+            .get("lineage")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|lineages| lineages.iter().any(|candidate| candidate == &lineage))
+        {
+            return Err(failure(format!(
+                "{table} lineage row {rowid} is not retained by parent {binding_id}/{parent_digest}"
+            )));
         }
     }
     Ok(())
@@ -1525,19 +2401,34 @@ async fn migrate_external_source(conn: &(impl Executor + Sync)) -> Result<()> {
          SELECT binding_id, projection_digest, effect_index, native_object_digest,
                 json_extract(mutation_json, '$.mutation_digest'), effect_json
          FROM external_source_projection_effects_v1;
-         INSERT OR IGNORE INTO external_source_frontiers_v1(
+         INSERT INTO external_source_frontiers_v1(
              binding_id, frontier_digest, frontier_json
          )
-         SELECT binding_id, json_extract(receipt_json, '$.source_frontier.digest'),
-                json_extract(receipt_json, '$.source_frontier')
-         FROM external_source_commit_receipts_v1;
-         INSERT OR IGNORE INTO external_source_frontiers_v1(
-             binding_id, frontier_digest, frontier_json
+         SELECT DISTINCT binding_id, frontier_digest, frontier_json
+         FROM (
+             SELECT binding_id,
+                    json_extract(receipt_json, '$.source_frontier.digest') AS frontier_digest,
+                    json_extract(receipt_json, '$.source_frontier') AS frontier_json
+             FROM external_source_commit_receipts_v1
+             UNION ALL
+             SELECT binding_id,
+                    json_extract(receipt_json, '$.prior_source_frontier.digest'),
+                    json_extract(receipt_json, '$.prior_source_frontier')
+             FROM external_source_commit_receipts_v1
+             WHERE json_extract(receipt_json, '$.prior_source_frontier.digest') IS NOT NULL
+             UNION ALL
+             SELECT binding_id,
+                    json_extract(receipt_json, '$.source_frontier.digest'),
+                    json_extract(receipt_json, '$.source_frontier')
+             FROM external_source_projection_publications_v1
+             UNION ALL
+             SELECT binding_id,
+                    json_extract(receipt_json, '$.expected_projection_frontier.digest'),
+                    json_extract(receipt_json, '$.expected_projection_frontier')
+             FROM external_source_projection_publications_v1
+             WHERE json_extract(receipt_json, '$.expected_projection_frontier.digest') IS NOT NULL
          )
-         SELECT binding_id, json_extract(receipt_json, '$.prior_source_frontier.digest'),
-                json_extract(receipt_json, '$.prior_source_frontier')
-         FROM external_source_commit_receipts_v1
-         WHERE json_extract(receipt_json, '$.prior_source_frontier.digest') IS NOT NULL;
+         WHERE frontier_digest IS NOT NULL;
          INSERT INTO external_source_commit_receipts_v2(
              binding_id, idempotency_key, request_digest, definition_revision,
              binding_revision, predecessor_frontier_digest, successor_frontier_digest,
@@ -1558,20 +2449,6 @@ async fn migrate_external_source(conn: &(impl Executor + Sync)) -> Result<()> {
                     json_extract(receipt_json, '$.prior_source_frontier.digest')
                 )
          FROM external_source_commit_receipts_v1;
-         INSERT OR IGNORE INTO external_source_frontiers_v1(
-             binding_id, frontier_digest, frontier_json
-         )
-         SELECT binding_id, json_extract(receipt_json, '$.source_frontier.digest'),
-                json_extract(receipt_json, '$.source_frontier')
-         FROM external_source_projection_publications_v1;
-         INSERT OR IGNORE INTO external_source_frontiers_v1(
-             binding_id, frontier_digest, frontier_json
-         )
-         SELECT binding_id,
-                json_extract(receipt_json, '$.expected_projection_frontier.digest'),
-                json_extract(receipt_json, '$.expected_projection_frontier')
-         FROM external_source_projection_publications_v1
-         WHERE json_extract(receipt_json, '$.expected_projection_frontier.digest') IS NOT NULL;
          INSERT INTO external_source_projection_publications_v2(
              binding_id, projection_digest, source_receipt_digest,
              predecessor_frontier_digest, successor_frontier_digest, receipt_json

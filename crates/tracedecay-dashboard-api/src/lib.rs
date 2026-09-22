@@ -3481,7 +3481,7 @@ mod authority_tests {
                 "opaque-search-cursor",
             ),
             (
-                "/api/plugins/hermes-lcm/session/session.dashboard",
+                "/api/plugins/hermes-lcm/session/session.dashboard?provider=claude",
                 "opaque-session-cursor",
             ),
         ] {

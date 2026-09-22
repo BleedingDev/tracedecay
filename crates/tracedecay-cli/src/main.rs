@@ -632,6 +632,26 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
     // pays nothing for the ~160 schemas it never looks at.
     tracedecay::register_runtime_ports()?;
     let args: Vec<String> = std::env::args().collect();
+    // The replacement coordinator invokes this private mode only from the
+    // attested binary it staged. Keeping it outside Clap prevents an
+    // operator from selecting a different migration entrypoint, while the
+    // process boundary lets the coordinator terminate a migration that is
+    // stuck in blocking SQLite/filesystem work.
+    if args
+        .get(1)
+        .is_some_and(|argument| argument == commands::INTERNAL_REPLACEMENT_MIGRATION_ARG)
+    {
+        if args.len() != 3 || args[2].is_empty() {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!(
+                    "{} requires exactly one target profile path",
+                    commands::INTERNAL_REPLACEMENT_MIGRATION_ARG
+                ),
+            });
+        }
+        commands::run_internal_profile_migration(PathBuf::from(&args[2]))?;
+        return Ok(CommandOutcome::Success);
+    }
     #[cfg(feature = "hotpath")]
     if let Some(command) = args.get(1) {
         // Fallback identity for Clap help/version/parse failures. A successful
@@ -844,6 +864,12 @@ async fn run(cli: Cli) -> tracedecay_domain::errors::Result<CommandOutcome> {
 #[hotpath::measure(label = "cli.startup.preamble", future = true)]
 async fn run_startup_preamble(command: &Commands) {
     let startup_policy = CommandStartupPolicy::for_command(command);
+    let replacement_command = matches!(
+        command,
+        Commands::Storage {
+            action: ProfileStorageAction::ReplaceV1 { .. },
+        }
+    );
 
     // Check first-run before any config save creates the file.
     let is_first_run = !tracedecay_session_memory::user_config::UserConfig::exists();
@@ -886,7 +912,12 @@ async fn run_startup_preamble(command: &Commands) {
             }
         }
     }
-    if !is_local_install_command(command)
+    // `save_if_exists` is an incidental atomic rewrite even when no field
+    // changed. Replacement promises that its own transaction controls every
+    // profile change, so no replacement invocation rewrites user configuration
+    // before its confirmation, plan, or lifecycle boundary.
+    if !replacement_command
+        && !is_local_install_command(command)
         && let Err(err) = user_config.save_if_exists()
     {
         eprintln!("warning: could not save tracedecay config: {err}");
@@ -1087,9 +1118,27 @@ fn validate_host_bundle_options(
         }
         return Ok(());
     }
-    // The scoped storage resets destroy refused store state, so they REQUIRE
-    // the same `--yes` confirmation (their handlers refuse to run without it).
-    // Like `wipe`, they own no host component and have no preview.
+    // Replacement has a read-only global `--dry-run` plan, while the scoped
+    // storage resets destroy refused state and have no preview. Neither owns a
+    // host component or supports adoption.
+    if matches!(
+        command,
+        Commands::Storage {
+            action: ProfileStorageAction::ReplaceV1 { .. },
+        }
+    ) {
+        if host_bundle.component.is_some() || host_bundle.adopt {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: "storage replace-v1 accepts --dry-run for a no-write plan and --yes to confirm; \
+                          --component and --adopt are \
+                          only valid with install, update-plugin, reinstall, or uninstall"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    }
+    // Scoped storage resets destroy refused store state, so they require the
+    // same `--yes` confirmation and have no preview.
     if matches!(
         command,
         Commands::Storage {
@@ -1284,7 +1333,7 @@ async fn dispatch_project_command(
             dispatch_memory_command(action).await?;
         }
         Commands::Storage { action } => {
-            commands::handle_profile_storage_action(action, assume_yes).await?;
+            commands::handle_profile_storage_action(action, assume_yes, dry_run).await?;
         }
         Commands::Wipe { all } => {
             commands::handle_wipe(all, assume_yes).await?;

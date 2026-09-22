@@ -1099,6 +1099,48 @@ fn a_readiness_reproof_spends_no_restart_budget() {
     );
 }
 
+/// A valid re-proof from a replacement process becomes a new supervisor
+/// incarnation. The old readiness is not silently carried across the
+/// provider-reported instance boundary, and crash attribution follows the
+/// newly proved identity.
+#[test]
+fn a_reproof_with_a_new_provider_instance_advances_the_live_incarnation() {
+    let handshake_count = Cell::new(0_u32);
+    let adapter = ScriptedAdapter::responding(Box::new(move |request| {
+        let count = handshake_count.get();
+        handshake_count.set(count.saturating_add(1));
+        let mut response = ready_response(request);
+        if count > 0 {
+            response.provider_instance_id = Some("scripted-instance-2".to_owned());
+        }
+        response
+    }));
+    let mut supervisor = supervisor(adapter, 1);
+    assert!(matches!(
+        supervisor.start_or_restart(&handshake_request(), 0, 1, 2),
+        SupervisorOutcomeV1::Ready(_)
+    ));
+    assert_eq!(supervisor.live_incarnation(), Some(1));
+
+    match supervisor.reprove_readiness(&handshake_request(), 2) {
+        ReproveOutcomeV1::Ready(evidence) => {
+            assert_eq!(evidence.provider_instance_id(), "scripted-instance-2");
+        }
+        other => panic!("expected a re-proved replacement, got {other:?}"),
+    }
+    assert_eq!(supervisor.live_incarnation(), Some(2));
+    assert_eq!(
+        supervisor.ready_provider_instance_id(),
+        Some("scripted-instance-2")
+    );
+    assert_eq!(
+        supervisor.current_availability(),
+        ProviderAvailabilityV1::Ready
+    );
+    assert_eq!(supervisor.predecessor_state(), PredecessorStateV1::Live);
+    assert_eq!(supervisor.adapter().count("start"), 1);
+}
+
 /// A supervisor that is not `Ready` has nothing to re-prove, and says so
 /// without contacting the adapter.
 #[test]

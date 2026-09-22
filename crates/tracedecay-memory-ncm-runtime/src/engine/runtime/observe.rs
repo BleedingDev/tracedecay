@@ -2,7 +2,7 @@ use super::super::*;
 use super::util::{
     core_reply, durable_receipt, layer_write_name, lookup_replay, meta_for_kernel, publish,
     put_checkpoint, read_live, remaining_deadline, resolve_affect, store_reply,
-    unavailable_recovery, validate_idempotency_key,
+    unavailable_recovery, validate_idempotency_key, validate_receipt_idempotency_key_json,
 };
 use crate::store::Capsule;
 use serde_json::{Value, json};
@@ -426,6 +426,12 @@ pub(super) fn lookup_observe_replay(
         if digest == event.payload_sha256 {
             let durable: DurableReceipt = serde_json::from_str(&event.receipt)
                 .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
+            validate_receipt_idempotency_key_json(
+                &event.receipt,
+                &event.kind,
+                event.idempotency_key.as_deref(),
+            )
+            .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
             if let DurableOperation::Observe { record_id } = durable.operation {
                 let capsule = handle
                     .store

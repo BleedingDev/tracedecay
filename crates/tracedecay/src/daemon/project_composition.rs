@@ -1746,10 +1746,7 @@ impl ProjectOpenInputs<'_> {
                     return Err(error);
                 }
             };
-            if let Err(error) = core
-                .memory_provider_host
-                .bind_session_retrieval(retrieval)
-            {
+            if let Err(error) = core.memory_provider_host.bind_session_retrieval(retrieval) {
                 shutdown_failed_provider_full_mount(
                     &provider_full_mount,
                     self.canonical_project_path,
@@ -1909,10 +1906,7 @@ impl ProjectOpenInputs<'_> {
             .await?;
             #[cfg(feature = "memory-provider-host")]
             full.provider_full_mount
-                .activate_after_publication(
-                    full.session_db.observation_store(),
-                    self.cancellation,
-                )
+                .activate_after_publication(full.session_db.observation_store(), self.cancellation)
                 .await
                 .map_err(|error| TraceDecayError::Config { message: error })?;
             self.phase_checkpoint(ProjectOpenFailurePhase::ProviderActivated)?;
@@ -2048,14 +2042,16 @@ impl ProjectOpenInputs<'_> {
         // The runtime publication identity is the immutable CAS token for
         // this attempt. A rekeyed/replaced project must retain its newer
         // publication while this failed attempt is being unwound.
-        let publication_is_current = activation.publication_attempt.as_ref().is_some_and(
-            |attempt| {
-                self.invocation
-                    .service
-                    .project_runtimes
-                    .mark_publication_failed(attempt)
-            },
-        );
+        let publication_is_current =
+            activation
+                .publication_attempt
+                .as_ref()
+                .is_some_and(|attempt| {
+                    self.invocation
+                        .service
+                        .project_runtimes
+                        .mark_publication_failed(attempt)
+                });
         retire_failed_project_open_owner(
             self.store_administration,
             self.invocation,

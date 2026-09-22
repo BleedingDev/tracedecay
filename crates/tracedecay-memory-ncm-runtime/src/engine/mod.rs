@@ -10,9 +10,12 @@ mod runtime;
 pub(crate) use runtime::common_maintenance::portable_event as portable_common_maintenance_event;
 pub(crate) use runtime::recovery::{
     PendingDeletionFence, apply_maintenance as apply_recovery_maintenance,
-    replay_event as replay_recovery_event, validate_event_payload_digest,
+    canonical_observe_payload_digest, recover_kernel, replay_event as replay_recovery_event,
+    snapshot_gap_contract, snapshot_gap_state_digest, snapshot_observe_state_digest,
+    validate_deletion_completion_fence, validate_event_payload_digest,
     validate_pending_deletion_fence, validate_recovery_event,
 };
+pub(crate) use runtime::validate_receipt_idempotency_key_json;
 pub(crate) use runtime::{canonical_digest, durable_integrity_digest};
 
 use crate::ports::{Deadline, StateRoot, TextEncoder};
@@ -278,6 +281,9 @@ pub enum FaultPoint {
     DuringCheckpoint,
     /// Stop after the durable deletion fence commit, before the sanitized rebuild publishes.
     AfterDeletionFenceCommit,
+    /// Stop after the sanitized completion journal commit, before physical
+    /// compaction and the durable fence clear.
+    AfterDeletionCompletionCommit,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,7 +303,7 @@ pub(crate) struct DurableReceipt {
     /// Deletion fences deliberately have no event-level idempotency key, so
     /// their receipt carries `None` while the fence operation retains its
     /// private request binding.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) idempotency_key: Option<String>,
 }
 
@@ -324,6 +330,11 @@ pub(crate) enum DurableOperation {
     },
     Maintenance {
         kind: MaintenanceKind,
+        /// Canonical common-maintenance request semantics, when this event
+        /// was admitted through the common control surface. Ordinary
+        /// maintenance keeps this `None` for the legacy compact receipt shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_input: Option<Value>,
     },
     DeletionFence {
         source: SourceId,
@@ -336,6 +347,9 @@ pub(crate) enum DurableOperation {
         pre_fence_state_digest: String,
         fatigue: f32,
         steps_since_consolidation: u64,
+        /// Full canonical deletion request semantics, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_input: Option<Value>,
     },
     DeleteBySource {
         source: SourceId,
@@ -343,6 +357,13 @@ pub(crate) enum DurableOperation {
         target_epoch: u64,
         deleted_records: u64,
         deleted_record_ids: Vec<RecordId>,
+        /// Canonical deletion request digest.  Older receipts omitted this
+        /// field and are validated against their source-only event digest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_sha256: Option<String>,
+        /// Full canonical deletion request semantics, when available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_input: Option<Value>,
     },
 }
 

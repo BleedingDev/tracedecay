@@ -480,6 +480,7 @@ fn query_authority_with_secret(secret: u8) -> Arc<QueryAuthorityV1> {
         .into_iter()
         .collect(),
         diversity_policy_id: id("diversity.canonical-equivalence.v1"),
+        rerank_policy_id: None,
         retrieval_budget: retrieval_budget(),
     };
     let diversity = DiversityPolicy {

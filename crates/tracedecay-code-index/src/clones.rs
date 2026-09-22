@@ -99,6 +99,8 @@ pub struct CloneSelectedBlockV1 {
     class: CloneNormalizationClassV1,
     normalization_revision: u16,
     rename_tier_unavailable: Option<CloneBodyRenameStatusV1>,
+    source_token_start: usize,
+    source_token_end: usize,
     tokens: Vec<ConservativeCloneTokenV1>,
 }
 
@@ -550,6 +552,8 @@ impl CloneSelectedBlockV1 {
         let stream = source
             .explicit_comparison_stream()
             .ok_or_else(|| "selected clone block source has no complete token stream".to_owned())?;
+        let source_token_start = token_range.start;
+        let source_token_end = token_range.end;
         let tokens = stream
             .tokens
             .get(token_range)
@@ -568,6 +572,8 @@ impl CloneSelectedBlockV1 {
             class: stream.class,
             normalization_revision: stream.normalization_revision,
             rename_tier_unavailable: stream.rename_tier_unavailable,
+            source_token_start,
+            source_token_end,
             tokens,
         })
     }
@@ -598,6 +604,17 @@ impl CloneSelectedBlockV1 {
 
     pub fn tokens(&self) -> &[ConservativeCloneTokenV1] {
         &self.tokens
+    }
+
+    /// The selected range in the source's canonical normalized token stream.
+    /// The offsets stay separate from `tokens` so two equal slices at
+    /// different source positions cannot share a cursor descriptor.
+    pub fn source_token_start(&self) -> usize {
+        self.source_token_start
+    }
+
+    pub fn source_token_end(&self) -> usize {
+        self.source_token_end
     }
 
     pub fn fingerprint_positions(&self) -> Result<Vec<CloneFingerprintPositionV1>, String> {

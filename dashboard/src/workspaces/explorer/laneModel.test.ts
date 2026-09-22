@@ -222,6 +222,31 @@ describe('laneFromSourceProgress', () => {
     });
   });
 
+  it('fails closed when a ready page exposes an unresumable continuation', () => {
+    const read = laneFromSourceProgress(
+      'code',
+      progress({
+        page: {
+          offset: 0,
+          limit: 50,
+          total: 3,
+          next_offset: 50,
+          rows: [{ id: 'n1', name: 'only the first page' }],
+          metadata: {},
+        },
+      }),
+      [],
+    );
+
+    expect(read).toEqual({
+      state: 'unavailable',
+      lane: 'code',
+      errorCode: 'explorer_resume_cursor_unavailable',
+      detail: 'the Explorer source is truncated without a signed, scope-bound resume cursor',
+    });
+    expect(laneHits(read)).toEqual([]);
+  });
+
   it('reports rows it could not read instead of silently returning fewer', () => {
     const read = laneFromSourceProgress(
       'code',
@@ -288,7 +313,7 @@ describe('laneFromSourceProgress', () => {
     expect(reads.map((read) => laneStateKind(read))).toEqual(['stale', 'timed_out']);
   });
 
-  it('counts partial rows while keeping the omission stated', () => {
+  it('fails closed for partial rows without a signed, scope-bound resume cursor', () => {
     const partial = laneFromSourceProgress(
       'sessions',
       progress({
@@ -309,12 +334,15 @@ describe('laneFromSourceProgress', () => {
       [],
     );
 
-    expect(partial.state).toBe('partial');
-    expect(laneHits(partial)).toHaveLength(1);
-    expect(laneStateKind(partial)).toBe('partial');
-    // Rows are genuine but the source itself said records were omitted, so
-    // the count never presents as a measured denominator.
-    expect(laneEvidence(partial)).toBe('associated');
+    expect(partial).toEqual({
+      state: 'unavailable',
+      lane: 'sessions',
+      errorCode: 'lcm_temporal_read_incomplete',
+      detail: 'the Explorer source is truncated without a signed, scope-bound resume cursor',
+    });
+    expect(laneHits(partial)).toEqual([]);
+    expect(laneStateKind(partial)).toBe('unavailable');
+    expect(laneEvidence(partial)).toBe('unknown');
   });
 });
 
@@ -497,6 +525,31 @@ describe('browseLane', () => {
     expect(laneHits(read)).toHaveLength(1);
   });
 
+  it('fails closed when an overview envelope says its rows are truncated', () => {
+    const answered = browseAnswered([{ id: 'n1', name: 'partial_row' }]);
+    if (answered.outcome !== 'envelope') throw new Error('test envelope must be accepted');
+    const partial: EnvelopeResult<readonly Record<string, unknown>[]> = {
+      outcome: 'envelope',
+      envelope: { ...answered.envelope, domain_state: 'partial' },
+    };
+
+    const read = browseLane(
+      'code',
+      partial,
+      false,
+      (rows: readonly Record<string, unknown>[]) => rows,
+      [],
+    );
+
+    expect(read).toEqual({
+      state: 'unavailable',
+      lane: 'code',
+      errorCode: 'explorer_resume_cursor_unavailable',
+      detail: 'the overview is truncated without an Explorer resume cursor',
+    });
+    expect(laneHits(read)).toEqual([]);
+  });
+
   it('preserves each canonical transport reading as its own state', () => {
     const rowsOf = (rows: readonly Record<string, unknown>[]) => rows;
     const states = (['offline', 'unauthorized', 'denied', 'unsupported_schema'] as const).map(
@@ -515,7 +568,7 @@ describe('laneEvidence', () => {
         page: {
           offset: 0,
           limit: 50,
-          total: 12,
+          total: 1,
           next_offset: null,
           rows: [{ id: 'n1', name: 'row' }],
           metadata: {},

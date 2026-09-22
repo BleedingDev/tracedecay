@@ -180,26 +180,25 @@ export function SessionsPage() {
                       : ''}
                   </p>
                   {hits.map((hit, i) => {
-                    const provider = String(hit['source'] ?? hit['provider'] ?? '');
+                    const provider = String(hit['provider'] ?? hit['source'] ?? '');
                     const storeId = hit['store_id'];
                     const messageId = hit['message_id'];
                     const id =
                       storeId != null
-                        ? String(storeId)
+                        ? JSON.stringify([provider, storeId])
                         : messageId != null
-                          ? `${provider}:${String(messageId)}`
+                          ? JSON.stringify([provider, messageId])
                           : String(i);
                     const role = String(hit['role'] ?? '');
                     const snippet = String(hit['snippet'] ?? hit['content'] ?? '');
                     const when = hit['timestamp'] ? formatStamp(Number(hit['timestamp'])) : '';
-                    const selectedProvider = String(
-                      selected?.['source'] ?? selected?.['provider'] ?? '',
-                    );
+                    const selectedProvider = String(selected?.['provider'] ?? selected?.['source'] ?? '');
                     return (
                       <DataRow
                         key={id}
                         selected={
                           selected != null &&
+                          selectedProvider === provider &&
                           (storeId != null
                             ? selected['store_id'] === storeId
                             : messageId != null &&
@@ -266,7 +265,7 @@ export function SessionsPage() {
             return (
               <VirtualList
                 items={rows}
-                getKey={(row) => row.session_id}
+                getKey={(row) => JSON.stringify([row.provider, row.session_id])}
                 header={
                   <div className="sticky top-0 z-10 border-b border-edge-subtle bg-surface-0/95 backdrop-blur">
                     {/* ONE raised count for the whole ledger — the loaded
@@ -280,6 +279,7 @@ export function SessionsPage() {
                     </p>
                     <div aria-hidden className="flex gap-3 border-t border-edge-subtle px-3 py-1.5">
                       <span className="td-legend min-w-0 flex-1">Session</span>
+                      <span className="td-legend w-14 shrink-0">Provider</span>
                       <span className="td-legend w-24 shrink-0 text-right">Messages</span>
                       <span className="td-legend w-28 shrink-0 text-right max-md:hidden">
                         Last activity
@@ -289,6 +289,7 @@ export function SessionsPage() {
                 }
                 renderItem={(row) => {
                   const id = row.session_id;
+                  const provider = row.provider;
                   const count = row.message_count;
                   const when = row.last_timestamp
                     ? formatStamp(row.last_timestamp)
@@ -297,15 +298,15 @@ export function SessionsPage() {
                     <DataRow
                       selected={
                         selected != null &&
-                        selected['session_id'] === row.session_id
+                        selected['session_id'] === row.session_id &&
+                        selected['provider'] === row.provider
                       }
                       onSelect={() => setSelected(row)}
                     >
-                      {/* The canonical aggregate deliberately exposes no
-                       * provider guess for a cross-provider session id. */}
                       <span className="td-value min-w-0 flex-1 truncate text-text-primary">
                         {id}
                       </span>
+                      <span className="td-legend w-14 shrink-0 truncate">{provider}</span>
                       <FigureRail
                         value={String(count)}
                         unit="msg"
@@ -367,8 +368,15 @@ function SelectedRecord({
 }) {
   if (!record) return undefined;
   const sessionId = record['session_id'] ?? record['id'];
+  const provider = record['provider'] ?? record['source'];
   if (typeof sessionId === 'string' && sessionId !== '') {
-    return <SessionInspector sessionId={sessionId} onClose={onClose} />;
+    return (
+      <SessionInspector
+        sessionId={sessionId}
+        provider={typeof provider === 'string' ? provider : null}
+        onClose={onClose}
+      />
+    );
   }
   return (
     <InspectorPanel title="Record" onClose={onClose}>

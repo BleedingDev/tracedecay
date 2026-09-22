@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_code_index::clones::{CloneExactKeyV1, CloneNormalizationClassV1};
 use tracedecay_domain::{
-    canonical_sha256, AuthorizationRevision, CodeGenerationId, ManifestDigest, PrincipalId,
-    QueryDigest, RetrievalCursorKeyId, RetrievalRequest, SymbolOccurrenceId, UtcMicros,
+    AuthorizationRevision, CodeGenerationId, ManifestDigest, PrincipalId, QueryDigest,
+    RetrievalCursorKeyId, RetrievalRequest, SymbolOccurrenceId, UtcMicros, canonical_sha256,
 };
 
 use crate::retrieval::{QueryAuthorityErrorV1, QueryAuthorityV1};
@@ -69,16 +69,34 @@ pub enum CloneCursorReadErrorV1 {
     Artifact(#[from] super::super::CodeLexicalArtifactErrorV1),
 }
 
-/// Exact-posting continuation position for the authenticated wire.
+/// Exact or near-clone continuation position for the authenticated wire.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum CloneArtifactCursorPositionV2 {
     Exact {
         symbol_occurrence_id: SymbolOccurrenceId,
     },
+    /// Authenticated exact-stream boundary for a key that could not be
+    /// opened within the request-wide work budget. The next page starts that
+    /// key from its immutable beginning, so an unvisited key never has to
+    /// expose an unauthenticated or empty continuation.
+    ExactStart { key: CloneExactKeyV1 },
+    /// Authenticated lane marker used when an exact page consumed the shared
+    /// request budget before the additive near lane could run. The next read
+    /// starts the near lane from its immutable beginning; unlike a reader
+    /// cursor this marker is a real phase transition and is never reused as
+    /// the near reader's posting position.
+    NearStart,
     Fingerprint {
         body_digest: ManifestDigest,
         payload_digest: ManifestDigest,
+        /// When present, the cursor stopped inside this candidate's grouped
+        /// occurrence set. The next page must retain the candidate key and
+        /// seek past this occurrence before it can advance to the next body.
+        /// Omitting an absent value keeps old fingerprint cursor payloads
+        /// byte-canonical when they are authenticated again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        occurrence_id: Option<SymbolOccurrenceId>,
     },
     /// Discovery stopped inside an ordered fingerprint posting stream. The
     /// optional comparison key is the last candidate whose expensive body
@@ -184,6 +202,14 @@ pub struct CloneArtifactCursorV2 {
     pub generation: CodeGenerationId,
     pub snapshot_digest: ManifestDigest,
     pub query_descriptor: ManifestDigest,
+    /// Full Similar request identity. The operation descriptor above remains
+    /// the exact/fingerprint reader seek descriptor; this additional digest
+    /// binds the cursor to the complete target, source extent, and class set
+    /// selected by the serving request. Omitting it preserves the historical
+    /// ccclone2 wire shape for exact/fingerprint cursors issued before the
+    /// Similar binding was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar_query_descriptor: Option<ManifestDigest>,
     pub after: CloneArtifactCursorPositionV2,
     pub expires_at: UtcMicros,
 }
@@ -238,6 +264,8 @@ struct CloneArtifactCursorPayloadV2 {
     generation: CodeGenerationId,
     snapshot_digest: ManifestDigest,
     query_descriptor: ManifestDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    similar_query_descriptor: Option<ManifestDigest>,
     after: CloneArtifactCursorPositionV2,
     expires_at: UtcMicros,
 }
@@ -330,13 +358,39 @@ impl<'a> CloneCursorCodecV1<'a> {
         Ok(Self { authority, request })
     }
 
-    /// Sign one exact/fingerprint continuation with the active retrieval key.
+    /// Sign one exact/fingerprint/phase continuation with the active retrieval
+    /// key.
     pub fn issue_artifact(
         &self,
         artifact_digest: ManifestDigest,
         generation: CodeGenerationId,
         snapshot_digest: ManifestDigest,
         query_descriptor: ManifestDigest,
+        after: CloneArtifactCursorPositionV2,
+        now: UtcMicros,
+    ) -> Result<String, CloneCursorErrorV1> {
+        self.issue_artifact_with_similar_descriptor(
+            artifact_digest,
+            generation,
+            snapshot_digest,
+            query_descriptor,
+            None,
+            after,
+            now,
+        )
+    }
+
+    /// Sign a clone continuation while binding it to the complete Similar
+    /// request. The operation descriptor remains separate because the exact
+    /// and fingerprint readers use different canonical seek descriptors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_artifact_with_similar_descriptor(
+        &self,
+        artifact_digest: ManifestDigest,
+        generation: CodeGenerationId,
+        snapshot_digest: ManifestDigest,
+        query_descriptor: ManifestDigest,
+        similar_query_descriptor: Option<ManifestDigest>,
         after: CloneArtifactCursorPositionV2,
         now: UtcMicros,
     ) -> Result<String, CloneCursorErrorV1> {
@@ -353,6 +407,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             generation,
             snapshot_digest,
             query_descriptor,
+            similar_query_descriptor,
             after,
             expires_at,
         };
@@ -363,7 +418,7 @@ impl<'a> CloneCursorCodecV1<'a> {
         })
     }
 
-    /// Verify and decode an exact/fingerprint continuation.
+    /// Verify and decode an exact/fingerprint/phase continuation.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_artifact(
         &self,
@@ -408,6 +463,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             generation: payload.generation,
             snapshot_digest: payload.snapshot_digest,
             query_descriptor: payload.query_descriptor,
+            similar_query_descriptor: payload.similar_query_descriptor,
             after: payload.after,
             expires_at: payload.expires_at,
         })
@@ -466,6 +522,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             generation: payload.generation,
             snapshot_digest: payload.snapshot_digest,
             query_descriptor: payload.query_descriptor,
+            similar_query_descriptor: payload.similar_query_descriptor,
             after: payload.after,
             expires_at: payload.expires_at,
         })
@@ -965,6 +1022,7 @@ mod tests {
             .into_iter()
             .collect(),
             diversity_policy_id: id("diversity.clone-cursor.v1"),
+            rerank_policy_id: None,
             retrieval_budget: budget(),
         }
     }
@@ -1059,6 +1117,291 @@ mod tests {
     }
 
     #[test]
+    fn exact_start_cursor_round_trips_with_its_key_and_similar_binding() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let similar_descriptor = digest("descriptor.clone-similar");
+        let key = CloneExactKeyV1 {
+            class: CloneNormalizationClassV1::Conservative,
+            normalization_revision: 1,
+            digest: digest("exact-start.key"),
+        };
+        let encoded = codec
+            .issue_artifact_with_similar_descriptor(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                Some(similar_descriptor.clone()),
+                CloneArtifactCursorPositionV2::ExactStart { key: key.clone() },
+                UtcMicros(100),
+            )
+            .expect("signed exact start cursor");
+        let decoded = codec
+            .decode_artifact(
+                &encoded,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            )
+            .expect("verified exact start cursor");
+        assert_eq!(
+            decoded.after,
+            CloneArtifactCursorPositionV2::ExactStart { key }
+        );
+        assert_eq!(decoded.similar_query_descriptor, Some(similar_descriptor));
+    }
+
+    #[test]
+    fn similar_request_binding_is_mac_authenticated() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let encoded = codec
+            .issue_artifact_with_similar_descriptor(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                Some(digest("descriptor.clone-similar")),
+                CloneArtifactCursorPositionV2::NearStart,
+                UtcMicros(100),
+            )
+            .expect("signed similar cursor");
+        let mut wire: serde_json::Value = serde_json::from_slice(
+            &hex::decode(encoded.strip_prefix(CLONE_CURSOR_PREFIX_V2).unwrap()).unwrap(),
+        )
+        .unwrap();
+        wire["payload"]["similar_query_descriptor"] =
+            serde_json::json!(digest("descriptor.forged").to_string());
+        let forged = format!(
+            "{CLONE_CURSOR_PREFIX_V2}{}",
+            hex::encode(serde_json::to_vec(&wire).unwrap())
+        );
+        assert_eq!(
+            codec.decode_artifact(
+                &forged,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            ),
+            Err(CloneCursorErrorV1::Tampered)
+        );
+    }
+
+    #[test]
+    fn legacy_exact_cursor_fixture_without_optional_fields_is_authenticated() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        // `issue_artifact` is the pre-Similar-binding wire constructor. Its
+        // signed payload intentionally omits the new optional field so an
+        // authenticated ccclone2 exact cursor from that era remains readable.
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                CloneArtifactCursorPositionV2::Exact {
+                    symbol_occurrence_id: id("occurrence.legacy-exact"),
+                },
+                UtcMicros(100),
+            )
+            .expect("signed legacy exact fixture");
+        let wire: serde_json::Value = serde_json::from_slice(
+            &hex::decode(encoded.strip_prefix(CLONE_CURSOR_PREFIX_V2).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !wire["payload"]
+                .as_object()
+                .expect("legacy exact payload")
+                .contains_key("similar_query_descriptor")
+        );
+        let decoded = codec
+            .decode_artifact(
+                &encoded,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            )
+            .expect("authenticated legacy exact fixture");
+        assert!(decoded.similar_query_descriptor.is_none());
+
+        let mut tampered = wire;
+        tampered["payload"]["query_descriptor"] =
+            serde_json::json!(digest("descriptor.legacy-exact-tampered").to_string());
+        let tampered = format!(
+            "{CLONE_CURSOR_PREFIX_V2}{}",
+            hex::encode(serde_json::to_vec(&tampered).unwrap())
+        );
+        assert_eq!(
+            codec.decode_artifact(
+                &tampered,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            ),
+            Err(CloneCursorErrorV1::Tampered)
+        );
+    }
+
+    #[test]
+    fn legacy_similar_cursor_fixture_is_authenticated_and_tamper_rejected() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        // A pre-binding fingerprint cursor had neither the request-wide
+        // Similar descriptor nor the grouped-occurrence discriminator.
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                CloneArtifactCursorPositionV2::Fingerprint {
+                    body_digest: digest("body.legacy-similar"),
+                    payload_digest: digest("payload.legacy-similar"),
+                    occurrence_id: None,
+                },
+                UtcMicros(100),
+            )
+            .expect("signed legacy similar fixture");
+        let wire: serde_json::Value = serde_json::from_slice(
+            &hex::decode(encoded.strip_prefix(CLONE_CURSOR_PREFIX_V2).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let payload = wire["payload"].as_object().expect("legacy similar payload");
+        assert!(!payload.contains_key("similar_query_descriptor"));
+        assert!(
+            !wire["payload"]["after"]["Fingerprint"]
+                .as_object()
+                .expect("legacy similar fingerprint position")
+                .contains_key("occurrence_id")
+        );
+        let decoded = codec
+            .decode_artifact(
+                &encoded,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            )
+            .expect("authenticated legacy similar fixture");
+        assert!(decoded.similar_query_descriptor.is_none());
+        assert!(matches!(
+            decoded.after,
+            CloneArtifactCursorPositionV2::Fingerprint {
+                occurrence_id: None,
+                ..
+            }
+        ));
+
+        let mut tampered = wire;
+        tampered["payload"]["after"]["Fingerprint"]["body_digest"] =
+            serde_json::json!(digest("body.legacy-similar-tampered").to_string());
+        let tampered = format!(
+            "{CLONE_CURSOR_PREFIX_V2}{}",
+            hex::encode(serde_json::to_vec(&tampered).unwrap())
+        );
+        assert_eq!(
+            codec.decode_artifact(
+                &tampered,
+                &artifact,
+                &generation,
+                &snapshot,
+                &descriptor,
+                UtcMicros(101),
+            ),
+            Err(CloneCursorErrorV1::Tampered)
+        );
+    }
+
+    #[test]
+    fn fingerprint_cursor_round_trips_a_grouped_occurrence_tail() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let position = CloneArtifactCursorPositionV2::Fingerprint {
+            body_digest: digest("body.grouped-tail"),
+            payload_digest: digest("payload.grouped-tail"),
+            occurrence_id: Some(id("occurrence.grouped-tail")),
+        };
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                position.clone(),
+                UtcMicros(100),
+            )
+            .expect("signed grouped occurrence cursor");
+        assert_eq!(
+            codec
+                .decode_artifact(
+                    &encoded,
+                    &artifact,
+                    &generation,
+                    &snapshot,
+                    &descriptor,
+                    UtcMicros(101),
+                )
+                .expect("verified grouped occurrence cursor")
+                .after,
+            position
+        );
+    }
+
+    #[test]
+    fn near_start_cursor_round_trips_as_an_authenticated_phase_boundary() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                CloneArtifactCursorPositionV2::NearStart,
+                UtcMicros(100),
+            )
+            .expect("signed near phase cursor");
+        assert_eq!(
+            codec
+                .decode_artifact(
+                    &encoded,
+                    &artifact,
+                    &generation,
+                    &snapshot,
+                    &descriptor,
+                    UtcMicros(101),
+                )
+                .expect("verified near phase cursor")
+                .after,
+            CloneArtifactCursorPositionV2::NearStart
+        );
+    }
+
+    #[test]
     fn fingerprint_discovery_cursor_round_trips_without_a_comparison_key() {
         let request = request();
         let authority = authority(&request);
@@ -1105,6 +1448,111 @@ mod tests {
                 comparison_payload_digest: None,
             }
         );
+    }
+
+    #[test]
+    fn fingerprint_discovery_cursor_advances_from_authenticated_partial_to_complete() {
+        let request = request();
+        let authority = authority(&request);
+        let codec = codec(&request, &authority);
+        let (artifact, generation, snapshot, descriptor) = artifact_args();
+        let partial = CloneFingerprintDiscoveryPositionV2 {
+            posting_count: 31,
+            fingerprint: 7,
+            symbol_occurrence_id: Some(id("occurrence.partial")),
+            token_position: Some(4),
+            pending_comparison_body_digest: Some(digest("body.pending")),
+            pending_comparison_payload_digest: Some(digest("payload.pending")),
+            complete: false,
+        };
+        let partial_position = CloneArtifactCursorPositionV2::FingerprintDiscovery {
+            discovery: partial.clone(),
+            comparison_body_digest: Some(digest("body.compared")),
+            comparison_payload_digest: Some(digest("payload.compared")),
+        };
+        let partial_encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                partial_position.clone(),
+                UtcMicros(100),
+            )
+            .expect("sign authenticated partial discovery cursor");
+        assert_eq!(
+            codec
+                .decode_artifact(
+                    &partial_encoded,
+                    &artifact,
+                    &generation,
+                    &snapshot,
+                    &descriptor,
+                    UtcMicros(101),
+                )
+                .expect("verify authenticated partial discovery cursor")
+                .after,
+            partial_position
+        );
+
+        let malformed_complete = CloneArtifactCursorPositionV2::FingerprintDiscovery {
+            discovery: CloneFingerprintDiscoveryPositionV2 {
+                complete: true,
+                ..partial.clone()
+            },
+            comparison_body_digest: Some(digest("body.compared")),
+            comparison_payload_digest: Some(digest("payload.compared")),
+        };
+        assert_eq!(
+            codec.issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                malformed_complete,
+                UtcMicros(101),
+            ),
+            Err(CloneCursorErrorV1::Invalid)
+        );
+
+        let complete = CloneFingerprintDiscoveryPositionV2 {
+            symbol_occurrence_id: None,
+            token_position: None,
+            complete: true,
+            ..partial
+        };
+        let complete_position = CloneArtifactCursorPositionV2::FingerprintDiscovery {
+            discovery: complete.clone(),
+            comparison_body_digest: Some(digest("body.compared")),
+            comparison_payload_digest: Some(digest("payload.compared")),
+        };
+        let complete_encoded = codec
+            .issue_artifact(
+                artifact.clone(),
+                generation.clone(),
+                snapshot.clone(),
+                descriptor.clone(),
+                complete_position.clone(),
+                UtcMicros(102),
+            )
+            .expect("sign authenticated complete discovery cursor");
+        assert_eq!(
+            codec
+                .decode_artifact(
+                    &complete_encoded,
+                    &artifact,
+                    &generation,
+                    &snapshot,
+                    &descriptor,
+                    UtcMicros(103),
+                )
+                .expect("verify authenticated complete discovery cursor")
+                .after,
+            complete_position
+        );
+        assert!(complete.complete);
+        assert!(complete.symbol_occurrence_id.is_none());
+        assert!(complete.token_position.is_none());
     }
 
     #[test]
@@ -1244,6 +1692,7 @@ mod tests {
                 CloneArtifactCursorPositionV2::Fingerprint {
                     body_digest: digest("body.clone-cursor"),
                     payload_digest: digest("payload.clone-cursor"),
+                    occurrence_id: None,
                 },
                 UtcMicros(100),
             )

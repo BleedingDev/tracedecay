@@ -946,16 +946,14 @@ impl McpServer {
                 name,
                 arguments,
                 ..
-            }) => {
-                (
-                    name.into_owned(),
-                    arguments.map_or_else(|| json!({}), Value::Object),
-                    tracedecay_mcp::caller_tool_call_deadline_from_meta(
-                        meta.as_ref()
-                            .map(|meta| -> &serde_json::Map<String, Value> { meta }),
-                    ),
-                )
-            }
+            }) => (
+                name.into_owned(),
+                arguments.map_or_else(|| json!({}), Value::Object),
+                tracedecay_mcp::caller_tool_call_deadline_from_meta(
+                    meta.as_ref()
+                        .map(|meta| -> &serde_json::Map<String, Value> { meta }),
+                ),
+            ),
         };
         if crate::mcp::project_route::protect_tool_structural_ids(&mut arguments).is_err() {
             return Err(invalid_params("invalid structural identifier"));
@@ -1922,7 +1920,6 @@ mod tool_call_preparation_tests {
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"missing 'name' in tools/call params"}}"#,
         );
     }
-
 }
 
 #[cfg(test)]

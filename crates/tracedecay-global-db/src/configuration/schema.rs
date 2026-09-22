@@ -78,8 +78,7 @@ const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION: i64 = 1;
 const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION: i64 = 1;
 const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION_REASON: &str =
     "released configuration store holds a configuration entry with an unsupported schema revision";
-const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON: &str =
-    "released configuration store holds a configuration entry with an unsupported encoded payload version";
+const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON: &str = "released configuration store holds a configuration entry with an unsupported encoded payload version";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {

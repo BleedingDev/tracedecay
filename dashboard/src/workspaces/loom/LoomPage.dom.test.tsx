@@ -59,6 +59,7 @@ const SESSIONS = {
 function chainMessage(over: Record<string, unknown>) {
   return {
     session_id: 'sess-open',
+    provider: 'cursor',
     role: null,
     content: null,
     snippet: null,
@@ -80,6 +81,7 @@ function chainMessage(over: Record<string, unknown>) {
 const CHAIN = {
   exists: true,
   session_id: 'sess-open',
+  provider: 'cursor',
   path: '/home/zack/.tracedecay/projects/project-loom/sessions.db',
   storage_scope: 'profile_sharded',
   limit: 200,
@@ -130,6 +132,8 @@ const TIMELINE = {
   exists: true,
   bucket: 'day',
   session_id: null,
+  provider: null,
+  next_cursor: null,
   buckets: [
     {
       bucket: '2026-07-23',
@@ -641,18 +645,32 @@ describe('LoomPage', () => {
   });
 
   it('renders chain token provenance and keeps unknown counts unknown', async () => {
-    renderLoom({
+    const fetchMock = serve({
       ...HAPPY,
       '/api/plugins/hermes-lcm/session/': {
         status: 200,
         body: readyEnvelope(CHAIN),
       },
     });
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={['/loom?scope=project-loom']}><LoomPage /></MemoryRouter>
+      </QueryClientProvider>,
+    );
     await userEvent.click(await screen.findByText('Deliver Git primitive runtime'));
 
     expect(await screen.findByText('~12 tokens · o200k approximate')).toBeTruthy();
     expect(screen.getByText('~20 tokens · o200k approximate')).toBeTruthy();
     expect(screen.getByText('tokens unknown')).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some((call) =>
+        String(call[0]).includes('/session/sess-open?provider=cursor&limit=200'),
+      ),
+    ).toBe(true);
   });
 
   it('shares reveal, picking, minimap and exact evidence through one URL cursor', async () => {
@@ -730,6 +748,7 @@ describe('LoomPage', () => {
               node_id: 'summary-raw-0',
               recency: null,
               session_id: 'sess-open',
+              provider: 'cursor',
               snippet: 'compacted setup',
               source_token_count: 30,
               source_type: 'message',

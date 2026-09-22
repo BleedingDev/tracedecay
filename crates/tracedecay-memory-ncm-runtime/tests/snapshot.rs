@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
-    CorrectionRequest, FeedbackRequest, MaintenanceKind, MaintenanceRequest, NcmEngine,
+    CorrectionRequest, FaultPoint, FeedbackRequest, MaintenanceKind, MaintenanceRequest, NcmEngine,
     ObserveRequest, Outcome, RecallRequest, RejectReason,
 };
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
@@ -452,11 +452,11 @@ fn old_snapshot_cannot_resurrect_a_source_deleted_after_export() {
     );
     let exported_after = export(&live, &namespace);
     let parsed: Value = serde_json::from_slice(&exported_after).expect("snapshot JSON parses");
-    assert!(parsed.get("revocations").is_none());
+    assert_eq!(parsed["revocations"][0]["source_id"], "source-b");
     assert!(
         !exported_after
-            .windows(b"source-b".len())
-            .any(|window| window == b"source-b")
+            .windows(ERASED_TOKEN.len())
+            .any(|window| window == ERASED_TOKEN.as_bytes())
     );
 
     let deleted_survivor = live.delete_by_source(
@@ -607,6 +607,10 @@ fn restore_replay_rejects_a_tampered_journal_envelope() {
             DEADLINE,
         );
         assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+        // NamespaceStore holds the writer connection in exclusive locking
+        // mode. Close the live engine before opening a raw SQLite connection;
+        // the subsequent fresh engine exercises the restart recovery path.
+        drop(target);
 
         let path = namespace_dir(&target_dir, &namespace()).join("ncm.sqlite");
         let connection = rusqlite::Connection::open(path).expect("open restored sqlite");
@@ -650,8 +654,9 @@ fn restore_replay_rejects_a_tampered_journal_envelope() {
         }
         drop(connection);
 
+        let restarted = engine(&target_dir);
         let replay = snapshot::restore(
-            &target,
+            &restarted,
             &namespace(),
             RestoreRequest {
                 idempotency_key: key.to_owned(),
@@ -668,7 +673,7 @@ fn restore_replay_rejects_a_tampered_journal_envelope() {
 }
 
 #[test]
-fn engine_export_delegates_and_envelope_omits_revocation_authority() {
+fn engine_export_delegates_and_envelope_includes_revocation_authority() {
     let tempdir = TempDir::new().expect("tempdir creates");
     let namespace = namespace();
     let engine = engine(&tempdir);
@@ -685,7 +690,7 @@ fn engine_export_delegates_and_envelope_omits_revocation_authority() {
     let parsed: Value = serde_json::from_slice(&bytes).expect("snapshot envelope parses");
     assert_eq!(parsed["format"], "ncm-snapshot.v1");
     assert!(parsed.get("content_sha256").is_some());
-    assert!(parsed.get("revocations").is_none());
+    assert!(parsed["revocations"].is_array());
     assert!(parsed["capsules"].is_array());
     assert!(parsed["events"].is_array());
 }
@@ -785,4 +790,55 @@ fn restore_refuses_a_durably_fenced_namespace() {
         DEADLINE,
     );
     assert_eq!(reply.outcome, Outcome::Busy);
+}
+
+#[test]
+fn restore_refuses_a_published_but_empty_namespace() {
+    let source_dir = TempDir::new().expect("source tempdir creates");
+    let target_dir = TempDir::new().expect("target tempdir creates");
+    let namespace = namespace();
+    let source = engine(&source_dir);
+    observe(
+        &source, &namespace, "source-a", "alpha", "value", "source-a",
+    );
+    let bytes = export(&source, &namespace);
+
+    let target = engine(&target_dir);
+    target
+        .inject_fault_once(FaultPoint::BeforeCommit)
+        .expect("arm pre-commit fault");
+    let mut failed_request = ObserveRequest {
+        idempotency_key: "empty-target".to_owned(),
+        payload_sha256: String::new(),
+        source: SourceId("source-empty".to_owned()),
+        key_text: "empty".to_owned(),
+        value_text: "target".to_owned(),
+        affect: None,
+        surprise: 0.0,
+        intensity: 1.0,
+        provenance: json!({}),
+        deadline: DEADLINE,
+    };
+    failed_request.payload_sha256 = failed_request
+        .canonical_payload_sha256()
+        .expect("empty target payload serializes");
+    let failed = target.observe(&namespace, failed_request);
+    assert!(
+        matches!(failed.outcome, Outcome::Unavailable(_)),
+        "{failed:?}"
+    );
+
+    let restored = snapshot::restore(
+        &target,
+        &namespace,
+        RestoreRequest {
+            idempotency_key: "restore-empty-target".to_owned(),
+            bytes,
+        },
+        DEADLINE,
+    );
+    assert!(
+        matches!(restored.outcome, Outcome::Rejected(_)),
+        "{restored:?}"
+    );
 }

@@ -38,6 +38,7 @@ fn run() -> Result<(), ()> {
         ServeOptions {
             allow_test_delays: arguments.test_double,
             encoder_ready,
+            allow_legacy_identity: arguments.test_double,
         },
     )
     .map_err(|_| ())

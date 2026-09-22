@@ -20,6 +20,7 @@ mod admitted_corpus;
 pub mod candidate_output;
 mod controlled_workloads;
 mod packaged_assets;
+pub mod semantic_ablation;
 
 #[cfg(test)]
 mod report_tests;
@@ -35,6 +36,12 @@ pub use controlled_workloads::{
     ControlledWorkloadReportV1, FRAMED_LOG_REPORT_FILE, FRAMED_LOG_WORKLOAD,
     compare_controlled_workloads, run_cursor_parse_batch_workload,
     run_framed_log_durability_workload, write_controlled_workload_reports,
+};
+pub use semantic_ablation::{
+    generate_semantic_ablation_runs, generate_semantic_ablation_runs_with_authority,
+    run_default_semantic_ablation, run_default_semantic_ablation_with_authority,
+    run_semantic_ablation_from_files, run_semantic_ablation_from_files_with_authority,
+    run_semantic_ablation_with_authority, semantic_ablation_paths, semantic_model_manifest_path,
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

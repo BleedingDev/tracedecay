@@ -55,9 +55,11 @@ const PAGER_BEZEL =
 
 export function SessionInspector({
   sessionId,
+  provider,
   onClose,
 }: {
   sessionId: string;
+  provider?: string | null;
   onClose: () => void;
 }) {
   // The cache token comes from the authority, never a second construction of
@@ -67,8 +69,9 @@ export function SessionInspector({
   const scopeCacheKey = useScope((state) => scopeKey(state.scope));
   return (
     <SessionInspectorPage
-      key={`${scopeCacheKey}:${sessionId}`}
+      key={`${scopeCacheKey}:${provider ?? ''}:${sessionId}`}
       sessionId={sessionId}
+      provider={provider}
       onClose={onClose}
     />
   );
@@ -76,9 +79,11 @@ export function SessionInspector({
 
 function SessionInspectorPage({
   sessionId,
+  provider,
   onClose,
 }: {
   sessionId: string;
+  provider?: string | null;
   onClose: () => void;
 }) {
   /** The current cursor is the top entry; the rest lets Previous replay the
@@ -98,8 +103,10 @@ function SessionInspectorPage({
    */
   const [pageRequest, setPageRequest] = useState(0);
   const session = useEnvelope(
-    ['lcm', 'session', sessionId, cursor],
+    ['lcm', 'session', provider ?? null, sessionId, cursor],
     `/api/plugins/hermes-lcm/session/${encodeURIComponent(sessionId)}?limit=${PAGE_SIZE}${
+      provider == null || provider === '' ? '' : `&provider=${encodeURIComponent(provider)}`
+    }${
       cursor == null ? '' : `&cursor=${encodeURIComponent(cursor)}`
     }`,
     LcmSessionPayloadV1Schema,
@@ -108,7 +115,9 @@ function SessionInspectorPage({
   return (
     <InspectorPanel title="Session transcript" onClose={onClose}>
       <div className="flex flex-col gap-3">
-        <p className="td-value break-all text-3xs text-text-muted">{sessionId}</p>
+        <p className="td-value break-all text-3xs text-text-muted">
+          {provider ? `${provider} · ` : ''}{sessionId}
+        </p>
         <ReadSection
           title="Transcript"
           chrome="centered"
@@ -279,7 +288,7 @@ function CompactionBoundaries({ payload }: { payload: LcmSessionPayloadV1 }) {
           className="flex max-h-64 flex-col overflow-auto border border-edge-subtle"
         >
           {nodes.map((node) => (
-            <SummaryNodeRow key={node.node_id} node={node} />
+            <SummaryNodeRow key={JSON.stringify([node.provider, node.node_id])} node={node} />
           ))}
         </ol>
       )}
@@ -403,7 +412,7 @@ function RawMessages({
           className="flex max-h-96 flex-col overflow-auto border border-edge-subtle"
         >
           {messages.map((message) => (
-            <MessageRow key={message.message_id} message={message} />
+            <MessageRow key={JSON.stringify([message.provider, message.message_id])} message={message} />
           ))}
         </ol>
       )}

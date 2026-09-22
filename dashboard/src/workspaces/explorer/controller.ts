@@ -22,6 +22,13 @@ import {
 } from '../../contracts/generated.ts';
 import { fetchEnvelope, type EnvelopeResult } from '../../data/query/envelope.ts';
 import { useEnvelope } from '../../data/query/useEnvelope.ts';
+import {
+  scopeKey,
+  scopedQueryKey,
+  scopedUrl,
+  useScope,
+  type DashboardScope,
+} from '../../data/scope/store.ts';
 import { queryTerms } from '../../ui/search/terms.ts';
 import { absenceVerdict, type AbsenceVerdict } from './absence.ts';
 import {
@@ -37,8 +44,11 @@ import { LANES, type Hit, type LaneId } from './model.ts';
 
 /* ------------------------------------------------------------------ routes */
 
-function createPlannerQuery(query: string): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
-  return fetchEnvelope('/api/explorer/queries', ExplorerQueryRunV1Schema, {
+function createPlannerQuery(
+  scope: DashboardScope,
+  query: string,
+): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
+  return fetchEnvelope(scopedUrl(scope, '/api/explorer/queries'), ExplorerQueryRunV1Schema, {
     method: 'POST',
     headers: {
       accept: 'application/json',
@@ -48,35 +58,53 @@ function createPlannerQuery(query: string): Promise<EnvelopeResult<ExplorerQuery
   });
 }
 
-function readPlannerQuery(runId: string): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
+function readPlannerQuery(
+  scope: DashboardScope,
+  runId: string,
+): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
   return fetchEnvelope(
-    `/api/explorer/queries/${encodeURIComponent(runId)}`,
+    scopedUrl(scope, `/api/explorer/queries/${encodeURIComponent(runId)}`),
     ExplorerQueryRunV1Schema,
   );
 }
 
-function cancelPlannerQuery(runId: string): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
+function cancelPlannerQuery(
+  scope: DashboardScope,
+  runId: string,
+): Promise<EnvelopeResult<ExplorerQueryRunV1>> {
   return fetchEnvelope(
-    `/api/explorer/queries/${encodeURIComponent(runId)}`,
+    scopedUrl(scope, `/api/explorer/queries/${encodeURIComponent(runId)}`),
     ExplorerQueryRunV1Schema,
     { method: 'DELETE' },
   );
 }
 
+export function explorerSessionSizeUrl(sessionId: string, provider: string): string {
+  return `/api/explorer/sessions/${encodeURIComponent(sessionId)}/size?provider=${encodeURIComponent(provider)}`;
+}
+
+export function explorerSessionContextUrl(sessionId: string, provider: string): string {
+  return `/api/explorer/sessions/${encodeURIComponent(sessionId)}/read-context?limit=25&offset=0&order=asc&provider=${encodeURIComponent(provider)}`;
+}
+
 function readSessionSize(
+  scope: DashboardScope,
   sessionId: string,
+  provider: string,
 ): Promise<EnvelopeResult<ExplorerSessionSizeV1>> {
   return fetchEnvelope(
-    `/api/explorer/sessions/${encodeURIComponent(sessionId)}/size`,
+    scopedUrl(scope, explorerSessionSizeUrl(sessionId, provider)),
     ExplorerSessionSizeV1Schema,
   );
 }
 
 function readSessionContext(
+  scope: DashboardScope,
   sessionId: string,
+  provider: string,
 ): Promise<EnvelopeResult<ExplorerReadContextV1>> {
   return fetchEnvelope(
-    `/api/explorer/sessions/${encodeURIComponent(sessionId)}/read-context?limit=25&offset=0&order=asc`,
+    scopedUrl(scope, explorerSessionContextUrl(sessionId, provider)),
     ExplorerReadContextV1Schema,
   );
 }
@@ -161,6 +189,7 @@ export interface ExplorerController {
 }
 
 export function useExplorerController(): ExplorerController {
+  const scope = useScope((s) => s.scope);
   const [query, setQuery] = useState('');
   const [submitted, setSubmitted] = useState('');
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -169,9 +198,11 @@ export function useExplorerController(): ExplorerController {
   const [selected, setSelected] = useState<Hit | null>(null);
   const searching = submitted !== '';
   const terms = useMemo(() => queryTerms(submitted), [submitted]);
+  const scopeIdentity = scopeKey(scope);
 
   const planner = useMutation({
-    mutationFn: createPlannerQuery,
+    mutationFn: ({ query, scope }: { query: string; scope: DashboardScope }) =>
+      createPlannerQuery(scope, query),
     onSuccess: (result) => {
       if (result.outcome === 'envelope') {
         setActiveRunId(result.envelope.payload.run_id);
@@ -185,9 +216,13 @@ export function useExplorerController(): ExplorerController {
   // walked — reset by the first read that lands an envelope.
   const transportFailures = useRef(0);
   const runStatus = useQuery({
-    queryKey: ['explorer', 'query-run', activeRunIdForQuery],
+    queryKey: scopedQueryKey(
+      scope,
+      ['explorer', 'query-run', activeRunIdForQuery],
+      `/api/explorer/queries/${encodeURIComponent(activeRunIdForQuery)}`,
+    ),
     queryFn: async () => {
-      const result = await readPlannerQuery(activeRunIdForQuery);
+      const result = await readPlannerQuery(scope, activeRunIdForQuery);
       transportFailures.current = result.outcome === 'transport' ? transportFailures.current + 1 : 0;
       return result;
     },
@@ -217,7 +252,8 @@ export function useExplorerController(): ExplorerController {
     },
   });
   const cancelRun = useMutation({
-    mutationFn: cancelPlannerQuery,
+    mutationFn: ({ runId, scope }: { runId: string; scope: DashboardScope }) =>
+      cancelPlannerQuery(scope, runId),
     onSuccess: () => {
       void runStatus.refetch();
     },
@@ -255,18 +291,33 @@ export function useExplorerController(): ExplorerController {
 
   const lanes = useMemo<readonly ExplorerLaneReadModel[]>(() => {
     if (searching) {
-      return LANES.map((spec) => searchLane(spec.id, runResult, submitted, terms));
+      return LANES.map((spec) => searchLane(spec.id, runResult, submitted, terms, scopeIdentity));
     }
     return [
-      browseLane('code', graphBrowseData, graphBrowsePending, (data) => data.top_connected, terms),
+      browseLane(
+        'code',
+        graphBrowseData,
+        graphBrowsePending,
+        (data) => data.top_connected,
+        terms,
+        scopeIdentity,
+      ),
       browseLane(
         'sessions',
         lcmBrowseData,
         lcmBrowsePending,
         (data) => data.latest_summary_nodes,
         terms,
+        scopeIdentity,
       ),
-      browseLane('knowledge', memoryData, memoryPending, (data) => data.holographic.facts, terms),
+      browseLane(
+        'knowledge',
+        memoryData,
+        memoryPending,
+        (data) => data.holographic.facts,
+        terms,
+        scopeIdentity,
+      ),
     ];
   }, [
     graphBrowseData,
@@ -276,6 +327,7 @@ export function useExplorerController(): ExplorerController {
     memoryData,
     memoryPending,
     runResult,
+    scopeIdentity,
     searching,
     submitted,
     terms,
@@ -325,7 +377,7 @@ export function useExplorerController(): ExplorerController {
     cancelling: cancelRun.isPending,
     cancel:
       activeRunId !== null && run?.state === 'pending'
-        ? () => cancelRun.mutate(activeRunId)
+        ? () => cancelRun.mutate({ runId: activeRunId, scope })
         : undefined,
     laneFilter,
     facet,
@@ -340,7 +392,7 @@ export function useExplorerController(): ExplorerController {
       // run's failures are not this one's, and must not slow its first reads.
       transportFailures.current = 0;
       planner.reset();
-      planner.mutate(nextQuery);
+      planner.mutate({ query: nextQuery, scope });
       setFacet(null);
       setSelected(null);
     },
@@ -363,17 +415,32 @@ export interface ExplorerSessionContext {
 }
 
 /** The two session reads the inspector shows for a transcript row. */
-export function useExplorerSessionContext(sessionId: string | undefined): ExplorerSessionContext {
+export function useExplorerSessionContext(
+  sessionId: string | undefined,
+  provider: string | undefined,
+): ExplorerSessionContext {
+  const scope = useScope((s) => s.scope);
   const sessionIdForQuery = sessionId ?? '';
+  const providerForQuery = provider?.trim() ?? '';
+  const sizeUrl = explorerSessionSizeUrl(sessionIdForQuery, providerForQuery);
+  const contextUrl = explorerSessionContextUrl(sessionIdForQuery, providerForQuery);
   const size = useQuery({
-    queryKey: ['explorer', 'session-size', sessionIdForQuery],
-    queryFn: () => readSessionSize(sessionIdForQuery),
-    enabled: sessionIdForQuery !== '',
+    queryKey: scopedQueryKey(
+      scope,
+      ['explorer', 'session-size', sessionIdForQuery, providerForQuery],
+      sizeUrl,
+    ),
+    queryFn: () => readSessionSize(scope, sessionIdForQuery, providerForQuery),
+    enabled: sessionIdForQuery !== '' && providerForQuery !== '',
   });
   const readContext = useQuery({
-    queryKey: ['explorer', 'read-context', sessionIdForQuery],
-    queryFn: () => readSessionContext(sessionIdForQuery),
-    enabled: sessionIdForQuery !== '',
+    queryKey: scopedQueryKey(
+      scope,
+      ['explorer', 'read-context', sessionIdForQuery, providerForQuery],
+      contextUrl,
+    ),
+    queryFn: () => readSessionContext(scope, sessionIdForQuery, providerForQuery),
+    enabled: sessionIdForQuery !== '' && providerForQuery !== '',
   });
   return {
     size: size.data,

@@ -17,9 +17,9 @@ pub use tracedecay_memory_ncm_runtime::ports::StateRoot;
 use tracedecay_memory_ncm_runtime::wire::{Operation, Reply, Request};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
-    OwnedProviderId, OwnedVersionedId, ProviderDescriptor, ProviderLimits, ProviderOperation,
-    ProviderReply, TerminalRecord,
+    CanonicalPayload, CommittedEffectEvidence, FallbackDirective, OwnedProviderId,
+    OwnedVersionedId, ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply,
+    TerminalRecord,
 };
 
 use crate::{
@@ -85,6 +85,21 @@ impl fmt::Display for RustNcmError {
 
 impl Error for RustNcmError {}
 
+/// A worker call can succeed only after proving it still reached the process
+/// whose identity the surface last admitted. The owner client is allowed to
+/// respawn a read-only request internally, so a successful reply alone cannot
+/// preserve the surface's previous readiness.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerCallError {
+    /// The bounded worker client rejected or could not complete the call.
+    Client(ClientError),
+    /// The owner observed a different worker lifetime while serving this call.
+    IncarnationChanged {
+        previous: Option<u64>,
+        current: Option<u64>,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WorkerTargetIdentity {
     triple: String,
@@ -129,6 +144,17 @@ struct RuntimeIdentity {
 struct SurfaceState {
     descriptor: ProviderDescriptor,
     identity: Option<RuntimeIdentity>,
+    /// Namespace whose projection/epoch were last observed in `identity`.
+    /// The preflight namespace is only a static identity probe; runtime state
+    /// must be rebound when the first public namespace is handshaken.
+    identity_namespace: Option<String>,
+    /// Provider instance identity returned by the last successful proof.
+    instance_id: Option<String>,
+    /// Monotonic worker-owner incarnation bound by the last successful proof.
+    worker_incarnation: Option<u64>,
+    /// Last owner incarnation observed by this surface, retained across
+    /// invalidation so a replacement cannot inherit predecessor readiness.
+    last_worker_incarnation: Option<u64>,
 }
 
 /// One serialized worker client and request identity authority shared by surfaces.
@@ -139,6 +165,7 @@ struct SurfaceState {
 pub struct RustNcmWorkerOwner {
     client: WorkerClient,
     next_request_id: AtomicU64,
+    supports_v2_handshake: bool,
 }
 
 impl RustNcmWorkerOwner {
@@ -152,6 +179,10 @@ impl RustNcmWorkerOwner {
                 "worker binary path must be absolute".to_owned(),
             ));
         }
+        #[cfg(feature = "test-transport")]
+        let supports_v2_handshake = !config.worker_options.test_double;
+        #[cfg(not(feature = "test-transport"))]
+        let supports_v2_handshake = true;
         let client = WorkerClient::spawn(
             &config.worker_binary,
             checked_root.path(),
@@ -161,6 +192,7 @@ impl RustNcmWorkerOwner {
         Ok(Self {
             client,
             next_request_id: AtomicU64::new(1),
+            supports_v2_handshake,
         })
     }
 
@@ -168,6 +200,13 @@ impl RustNcmWorkerOwner {
     #[must_use]
     pub fn worker_pid(&self) -> Option<u32> {
         self.client.pid()
+    }
+
+    /// Monotonic owner incarnation for the current or most recently spawned
+    /// worker. The counter survives process exit and possible PID reuse.
+    #[must_use]
+    pub fn worker_incarnation(&self) -> Option<u64> {
+        self.client.owner_incarnation()
     }
 
     /// Starts this owner's existing worker and proves readiness by deadline.
@@ -229,7 +268,11 @@ impl RustNcmSurface {
             .call(preflight, Duration::from_millis(DEFAULT_PREFLIGHT_MILLIS))
         {
             Ok(reply) if reply.outcome == Outcome::Success => {
-                let identity = parse_runtime_identity(&reply)?;
+                let identity = parse_runtime_identity_for_expected(
+                    &reply,
+                    None,
+                    worker.supports_v2_handshake,
+                )?;
                 let descriptor = descriptor_from_identity(&identity, reply.state_generation)?;
                 (descriptor, Some(identity))
             }
@@ -256,11 +299,24 @@ impl RustNcmSurface {
                 return Err(RustNcmError::HandshakeIdentity(error.to_string()));
             }
         };
+        let worker_incarnation = identity.as_ref().and_then(|_| worker.worker_incarnation());
+        let instance_id = match (identity.as_ref(), worker_incarnation) {
+            (Some(identity), Some(_)) => Some(owner_bound_instance_id(
+                &implementation_version(identity),
+                worker_incarnation,
+            )),
+            _ => None,
+        };
+        let identity_namespace = identity.as_ref().map(|_| PREFLIGHT_NAMESPACE.to_owned());
         Ok(Self {
             worker,
             state: Mutex::new(SurfaceState {
                 descriptor,
                 identity,
+                identity_namespace,
+                instance_id,
+                worker_incarnation,
+                last_worker_incarnation: worker_incarnation,
             }),
             fallback_descriptor,
             declared_identity: None,
@@ -278,6 +334,10 @@ impl RustNcmSurface {
             state: Mutex::new(SurfaceState {
                 descriptor: descriptor.clone(),
                 identity: None,
+                identity_namespace: None,
+                instance_id: None,
+                worker_incarnation: None,
+                last_worker_incarnation: None,
             }),
             fallback_descriptor: descriptor,
             declared_identity: Some(identity),
@@ -305,18 +365,22 @@ impl RustNcmSurface {
         if millis == 0 {
             return Err(TerminalCode::DeadlineExceeded);
         }
-        let request = Request::new(
-            self.worker.request_id(),
-            millis,
-            Operation::Handshake,
-            PREFLIGHT_NAMESPACE,
-            identity_request_payload(self.expected_identity().as_ref()),
-        );
+        let expected_identity = self.expected_identity();
+        let supports_v2_handshake = self.worker.supports_v2_handshake;
+        let bind_runtime_state = self.bind_runtime_state(PREFLIGHT_NAMESPACE);
         let reply = self
-            .worker
-            .client
-            .call_cancellable(request, remaining, Arc::clone(&cancelled))
-            .map_err(|error| client_terminal_code(&error))?;
+            .worker_call(
+                Operation::Handshake,
+                PREFLIGHT_NAMESPACE,
+                identity_request_payload_for_worker(
+                    expected_identity.as_ref(),
+                    supports_v2_handshake,
+                    bind_runtime_state,
+                ),
+                millis,
+                Arc::clone(&cancelled),
+            )
+            .map_err(|error| worker_terminal_code(&error))?;
         if cancelled() {
             return Err(TerminalCode::Cancelled);
         }
@@ -329,14 +393,22 @@ impl RustNcmSurface {
         if reply.outcome != Outcome::Success {
             return Err(outcome_terminal_code(&reply.outcome));
         }
-        let identity =
-            parse_runtime_identity(&reply).map_err(|_| TerminalCode::StateIncompatible)?;
+        let identity = parse_runtime_identity_for_expected(
+            &reply,
+            expected_identity.as_ref(),
+            supports_v2_handshake,
+        )
+        .map_err(|_| TerminalCode::StateIncompatible)?;
         let candidate = descriptor_from_identity(&identity, reply.state_generation)
             .map_err(|_| TerminalCode::StateIncompatible)?;
         if !same_immutable_descriptor(&self.descriptor_snapshot(), &candidate) {
             return Err(TerminalCode::StateIncompatible);
         }
-        Ok(Some(implementation_version(&identity)))
+        let base_instance_id = implementation_version(&identity);
+        Ok(Some(owner_bound_instance_id(
+            &base_instance_id,
+            self.worker_incarnation(),
+        )))
     }
 
     /// Instance identity proved by the real preflight, if the worker was ready.
@@ -346,13 +418,55 @@ impl RustNcmSurface {
         let state = self.state.lock().map_err(|_| {
             RustNcmError::HandshakeIdentity("surface identity lock poisoned".to_owned())
         })?;
-        Ok(state.identity.as_ref().map(implementation_version))
+        Ok(state.instance_id.clone())
     }
 
     /// Returns the shared worker process identifier, when the lazy worker is alive.
     #[must_use]
     pub fn worker_pid(&self) -> Option<u32> {
         self.worker.worker_pid()
+    }
+
+    /// Returns the monotonic worker-owner incarnation, when the owner has
+    /// spawned a worker. This is the authoritative process-lifetime binding;
+    /// the PID remains available only as a diagnostic.
+    #[must_use]
+    pub fn worker_incarnation(&self) -> Option<u64> {
+        self.worker.owner_incarnation()
+    }
+
+    fn bound_worker_incarnation(&self) -> Option<u64> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.worker_incarnation)
+    }
+
+    /// Invalidates all proof that was attached to the predecessor process.
+    /// Keep the descriptor and the last owner counter so a subsequent
+    /// handshake can identify the replacement without carrying old readiness.
+    fn invalidate_worker_identity(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.identity = None;
+            state.identity_namespace = None;
+            state.instance_id = None;
+            state.worker_incarnation = None;
+        }
+    }
+
+    fn worker_process_is_current(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let Some(bound) = state.worker_incarnation else {
+            // A surface without a bound proof is still bootstrapping, or its
+            // predecessor proof was invalidated. Either way, routing must
+            // wait for a fresh handshake to establish the replacement.
+            return false;
+        };
+        state.identity.is_some()
+            && self.worker_incarnation() == Some(bound)
+            && self.worker_pid().is_some()
     }
 
     fn descriptor_snapshot(&self) -> ProviderDescriptor {
@@ -370,6 +484,12 @@ impl RustNcmSurface {
             .or_else(|| self.declared_identity.clone())
     }
 
+    fn bind_runtime_state(&self, namespace: &str) -> bool {
+        self.state.lock().ok().is_some_and(|state| {
+            state.identity.is_some() && state.identity_namespace.as_deref() == Some(namespace)
+        })
+    }
+
     fn update_generation(&self, generation: u64) {
         if let Ok(mut state) = self.state.lock() {
             state.descriptor.state_generation = generation;
@@ -380,36 +500,80 @@ impl RustNcmSurface {
         &self,
         identity: RuntimeIdentity,
         generation: u64,
+        worker_incarnation: u64,
+        namespace: &str,
     ) -> Result<(), RustNcmError> {
         let descriptor = descriptor_from_identity(&identity, generation)?;
         let mut state = self.state.lock().map_err(|_| {
             RustNcmError::HandshakeIdentity("surface state lock poisoned".to_owned())
         })?;
+        let base_instance_id = implementation_version(&identity);
+        let same_owner_incarnation = state.worker_incarnation == Some(worker_incarnation)
+            && state
+                .identity
+                .as_ref()
+                .is_some_and(|prior| implementation_version(prior) == base_instance_id)
+            && state.last_worker_incarnation == Some(worker_incarnation);
+        let instance_id = if same_owner_incarnation {
+            state.instance_id.clone().unwrap_or_else(|| {
+                owner_bound_instance_id(&base_instance_id, Some(worker_incarnation))
+            })
+        } else {
+            owner_bound_instance_id(&base_instance_id, Some(worker_incarnation))
+        };
         state.descriptor = descriptor;
         state.identity = Some(identity);
+        state.identity_namespace = Some(namespace.to_owned());
+        state.worker_incarnation = Some(worker_incarnation);
+        state.last_worker_incarnation = Some(worker_incarnation);
+        state.instance_id = Some(instance_id);
         Ok(())
     }
 
     fn worker_call(
         &self,
         operation: Operation,
-        namespace: &NcmNamespace,
+        namespace: &str,
         payload: Value,
         millis: u64,
-        cancellation: CancellationToken,
-    ) -> Result<Reply, ClientError> {
+        cancellation: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Reply, WorkerCallError> {
+        let expected_incarnation = self.bound_worker_incarnation();
+        let before_incarnation = self.worker_incarnation();
         let request = Request::new(
             self.worker.request_id(),
             millis,
             operation,
-            namespace.as_str(),
+            namespace,
             payload,
         );
-        self.worker.client.call_cancellable(
+        let result = self.worker.client.call_cancellable(
             request,
             Duration::from_millis(millis),
-            Arc::new(move || cancellation.is_cancelled()),
-        )
+            cancellation,
+        );
+        let after_pid = self.worker_pid();
+        let after_incarnation = self.worker_incarnation();
+        let changed = expected_incarnation.is_some_and(|expected| {
+            before_incarnation != Some(expected)
+                || after_incarnation != Some(expected)
+                || after_pid.is_none()
+        });
+        if changed {
+            self.invalidate_worker_identity();
+            // A handshake is the proof that may establish the replacement
+            // binding. Every other operation must fail closed until that
+            // proof has completed, including read-only health and recall.
+            if operation != Operation::Handshake
+                && !matches!(result, Err(ClientError::EffectUnknown { .. }))
+            {
+                return Err(WorkerCallError::IncarnationChanged {
+                    previous: expected_incarnation,
+                    current: after_incarnation,
+                });
+            }
+        }
+        result.map_err(WorkerCallError::Client)
     }
 }
 
@@ -431,21 +595,30 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 );
             }
         };
-        let payload = identity_request_payload(self.expected_identity().as_ref());
+        let expected_identity = self.expected_identity();
+        let bind_runtime_state = self.bind_runtime_state(request.namespace.as_str());
+        let payload = identity_request_payload_for_worker(
+            expected_identity.as_ref(),
+            self.worker.supports_v2_handshake,
+            bind_runtime_state,
+        );
         let reply = match self.worker_call(
             Operation::Handshake,
-            &request.namespace,
+            request.namespace.as_str(),
             payload,
             control.remaining_millis,
-            request.control.cancellation(),
+            Arc::new({
+                let cancellation = request.control.cancellation();
+                move || cancellation.is_cancelled()
+            }),
         ) {
             Ok(reply) => reply,
             Err(error) => {
                 return handshake_failure(
                     &self.fallback_descriptor.provider_id,
                     request,
-                    client_terminal_code(&error),
-                    client_diagnostic(&error),
+                    worker_terminal_code(&error),
+                    worker_diagnostic_for_error(&error),
                     None,
                 );
             }
@@ -459,7 +632,11 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 Some(reply.state_generation),
             );
         }
-        let identity = match parse_runtime_identity(&reply) {
+        let identity = match parse_runtime_identity_for_expected(
+            &reply,
+            expected_identity.as_ref(),
+            self.worker.supports_v2_handshake,
+        ) {
             Ok(identity) => identity,
             Err(error) => {
                 return handshake_failure(
@@ -494,7 +671,30 @@ impl NcmCognitiveSurface for RustNcmSurface {
             );
         }
         if current.state_generation != candidate.state_generation {
-            let _ = self.install_identity(identity, reply.state_generation);
+            if self.worker_pid().is_none() {
+                return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
+                    request,
+                    TerminalCode::ProviderUnavailable,
+                    "ncm.rust.worker_not_alive",
+                    Some(reply.state_generation),
+                );
+            }
+            let Some(worker_incarnation) = self.worker_incarnation() else {
+                return handshake_failure(
+                    &self.fallback_descriptor.provider_id,
+                    request,
+                    TerminalCode::ProviderUnavailable,
+                    "ncm.rust.worker_not_alive",
+                    Some(reply.state_generation),
+                );
+            };
+            let _ = self.install_identity(
+                identity,
+                reply.state_generation,
+                worker_incarnation,
+                request.namespace.as_str(),
+            );
             return handshake_failure(
                 &self.fallback_descriptor.provider_id,
                 request,
@@ -503,8 +703,31 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 Some(reply.state_generation),
             );
         }
+        if self.worker_pid().is_none() {
+            return handshake_failure(
+                &self.fallback_descriptor.provider_id,
+                request,
+                TerminalCode::ProviderUnavailable,
+                "ncm.rust.worker_not_alive",
+                Some(reply.state_generation),
+            );
+        }
+        let Some(worker_incarnation) = self.worker_incarnation() else {
+            return handshake_failure(
+                &self.fallback_descriptor.provider_id,
+                request,
+                TerminalCode::ProviderUnavailable,
+                "ncm.rust.worker_not_alive",
+                Some(reply.state_generation),
+            );
+        };
         if self
-            .install_identity(identity.clone(), reply.state_generation)
+            .install_identity(
+                identity.clone(),
+                reply.state_generation,
+                worker_incarnation,
+                request.namespace.as_str(),
+            )
             .is_err()
         {
             return handshake_failure(
@@ -516,8 +739,14 @@ impl NcmCognitiveSurface for RustNcmSurface {
             );
         }
         let descriptor = self.descriptor_snapshot();
-        let ready_receipt = ready_receipt(request.namespace.as_str(), &identity);
-        let instance_id = implementation_version(&identity);
+        let ready_receipt =
+            ready_receipt_for_worker(request.namespace.as_str(), &identity, worker_incarnation);
+        let instance_id = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.instance_id.clone())
+            .unwrap_or_else(|| implementation_version(&identity));
         let challenge =
             request.expected_challenge_response_sha256(&descriptor, &instance_id, &ready_receipt);
         let terminal = surface_terminal(
@@ -555,6 +784,15 @@ impl NcmCognitiveSurface for RustNcmSurface {
                 );
             }
         };
+        if !self.worker_process_is_current() {
+            self.invalidate_worker_identity();
+            return pre_dispatch_reply(
+                &self.fallback_descriptor.provider_id,
+                call,
+                TerminalCode::StaleIdentity,
+                "ncm.rust.worker_incarnation_changed",
+            );
+        }
         let payload = match translate_payload(call) {
             Ok(payload) => payload,
             Err(diagnostic) => {
@@ -569,14 +807,17 @@ impl NcmCognitiveSurface for RustNcmSurface {
         let operation = wire_operation(call.operation);
         let reply = match self.worker_call(
             operation,
-            &call.namespace,
+            call.namespace.as_str(),
             payload,
             control.remaining_millis,
-            call.control.cancellation(),
+            Arc::new({
+                let cancellation = call.control.cancellation();
+                move || cancellation.is_cancelled()
+            }),
         ) {
             Ok(reply) => reply,
             Err(error) => {
-                return client_error_reply(&self.fallback_descriptor.provider_id, call, &error);
+                return worker_error_reply(&self.fallback_descriptor.provider_id, call, &error);
             }
         };
         if call.operation.mutates_provider_state()
@@ -588,7 +829,25 @@ impl NcmCognitiveSurface for RustNcmSurface {
     }
 }
 
-fn identity_request_payload(identity: Option<&RuntimeIdentity>) -> Value {
+fn identity_request_payload_for_worker(
+    identity: Option<&RuntimeIdentity>,
+    include_v2_metadata: bool,
+    bind_runtime_state: bool,
+) -> Value {
+    identity_request_payload_with_epoch(
+        identity,
+        include_v2_metadata,
+        bind_runtime_state,
+        bind_runtime_state,
+    )
+}
+
+fn identity_request_payload_with_epoch(
+    identity: Option<&RuntimeIdentity>,
+    include_v2_metadata: bool,
+    bind_runtime_epoch: bool,
+    bind_runtime_projection: bool,
+) -> Value {
     let mut payload = json!({
         "protocol_version": 1,
         "algorithm_profile": ALGORITHM_PROFILE,
@@ -603,7 +862,101 @@ fn identity_request_payload(identity: Option<&RuntimeIdentity>) -> Value {
         "model".to_owned(),
         Value::String(identity.encoder_model.clone()),
     );
+    if include_v2_metadata && identity.identity_revision == IDENTITY_REVISION_V2 {
+        object.insert(
+            "identity_revision".to_owned(),
+            Value::from(u64::from(IDENTITY_REVISION_V2)),
+        );
+        object.insert(
+            "algorithm".to_owned(),
+            json!({
+                "profile": ALGORITHM_PROFILE,
+                "config_sha256": identity.config_sha256,
+            }),
+        );
+        if bind_runtime_projection && !identity.projection_sha256.is_empty() {
+            object.insert(
+                "projection_sha256".to_owned(),
+                Value::String(identity.projection_sha256.clone()),
+            );
+        }
+        // A declaration with no projection has no namespace epoch to bind.
+        // Omitting the field lets a first handshake observe a persisted
+        // namespace's epoch instead of falsely declaring epoch zero. Once a
+        // projection and epoch have been observed for this namespace, callers
+        // explicitly bind runtime state and require the exact values.
+        if bind_runtime_epoch && !identity.projection_sha256.is_empty() {
+            object.insert("epoch".to_owned(), Value::from(identity.epoch));
+        }
+        if let Some(worker) = identity.worker.as_ref() {
+            object.insert(
+                "worker".to_owned(),
+                json!({
+                    "sha256": worker.sha256,
+                    "bytes": worker.bytes,
+                    "target": {
+                        "triple": worker.target.triple,
+                        "os": worker.target.os,
+                        "arch": worker.target.arch,
+                        "family": worker.target.family,
+                    },
+                }),
+            );
+        }
+        let mut encoder = Map::new();
+        encoder.insert(
+            "model".to_owned(),
+            Value::String(identity.encoder_model.clone()),
+        );
+        encoder.insert(
+            "artifact_sha256".to_owned(),
+            Value::String(identity.encoder_artifact_sha256.clone()),
+        );
+        if let Some(repository) = identity.encoder_repository.as_ref() {
+            encoder.insert("repository".to_owned(), Value::String(repository.clone()));
+        }
+        if let Some(revision) = identity.encoder_revision.as_ref() {
+            encoder.insert("revision".to_owned(), Value::String(revision.clone()));
+        }
+        if let Some(provenance) = identity.encoder_revision_provenance.as_ref() {
+            encoder.insert(
+                "revision_provenance".to_owned(),
+                Value::String(provenance.clone()),
+            );
+        }
+        encoder.insert(
+            "files".to_owned(),
+            Value::Array(
+                identity
+                    .encoder_files
+                    .iter()
+                    .map(|file| {
+                        json!({
+                            "path": file.path,
+                            "sha256": file.sha256,
+                            "bytes": file.bytes,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(max_length) = identity.encoder_max_length {
+            encoder.insert("max_length".to_owned(), Value::from(max_length));
+        }
+        if let Some(pooling) = identity.encoder_pooling.as_ref() {
+            encoder.insert("pooling".to_owned(), Value::String(pooling.clone()));
+        }
+        if let Some(normalize) = identity.encoder_normalize {
+            encoder.insert("normalize".to_owned(), Value::Bool(normalize));
+        }
+        object.insert("encoder".to_owned(), Value::Object(encoder));
+    }
     payload
+}
+
+#[cfg(test)]
+fn identity_request_payload(identity: Option<&RuntimeIdentity>) -> Value {
+    identity_request_payload_with_epoch(identity, true, true, true)
 }
 
 fn production_identity() -> Result<RuntimeIdentity, RustNcmError> {
@@ -777,15 +1130,21 @@ fn descriptor_for(
     generation: u64,
 ) -> Result<ProviderDescriptor, RustNcmError> {
     validate_identity(identity)?;
-    let version = implementation_version(identity);
+    // Namespace epoch is live state and belongs in the provider instance and
+    // ready receipt. The descriptor is the immutable implementation contract,
+    // so normalize that runtime field before deriving its identity.
+    let descriptor_identity = descriptor_identity(identity);
+    let version = implementation_version(&descriptor_identity);
     let mut implementation = Sha256::new();
-    implementation.update(if identity.identity_revision == IDENTITY_REVISION_V2 {
-        IMPLEMENTATION_DOMAIN_V2
-    } else {
-        IMPLEMENTATION_DOMAIN
-    });
+    implementation.update(
+        if descriptor_identity.identity_revision == IDENTITY_REVISION_V2 {
+            IMPLEMENTATION_DOMAIN_V2
+        } else {
+            IMPLEMENTATION_DOMAIN
+        },
+    );
     digest_field(&mut implementation, version.as_bytes());
-    digest_identity(&mut implementation, identity);
+    digest_identity(&mut implementation, &descriptor_identity);
     let identity_sha256 = hex_digest(&implementation.finalize());
     let provider_id = OwnedProviderId::new(NCM_PROVIDER_ID)
         .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))?;
@@ -799,6 +1158,12 @@ fn descriptor_for(
         provider_limits(),
     )
     .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))
+}
+
+fn descriptor_identity(identity: &RuntimeIdentity) -> RuntimeIdentity {
+    let mut descriptor_identity = identity.clone();
+    descriptor_identity.epoch = 0;
+    descriptor_identity
 }
 
 /// Copies the pinned production declaration without a worker, model, or state root.
@@ -845,6 +1210,12 @@ fn implementation_version(identity: &RuntimeIdentity) -> String {
         "ncm-biomem-rs.v{}+{prefix}.{identity_prefix}",
         identity.identity_revision
     )
+}
+
+fn owner_bound_instance_id(base: &str, worker_incarnation: Option<u64>) -> String {
+    worker_incarnation
+        .map(|incarnation| format!("{base}.i{incarnation}"))
+        .unwrap_or_else(|| base.to_owned())
 }
 
 fn capability_ids() -> Result<BTreeSet<OwnedVersionedId>, RustNcmError> {
@@ -995,6 +1366,74 @@ fn parse_runtime_identity(reply: &Reply) -> Result<RuntimeIdentity, RustNcmError
     };
     validate_identity(&identity)?;
     Ok(identity)
+}
+
+/// Parses a worker identity against the surface's declaration.
+///
+/// A test-double/legacy owner may reconcile a sparse V1 ready response with a
+/// pinned V2 declaration. A production owner must prove the complete V2 wire
+/// identity itself; upgrading a sparse response would let the declaration
+/// stand in for fields the worker never attested.
+fn parse_runtime_identity_for_expected(
+    reply: &Reply,
+    expected: Option<&RuntimeIdentity>,
+    require_v2: bool,
+) -> Result<RuntimeIdentity, RustNcmError> {
+    let observed = parse_runtime_identity(reply)?;
+    if require_v2 && observed.identity_revision != IDENTITY_REVISION_V2 {
+        return Err(RustNcmError::HandshakeIdentity(
+            "production worker did not prove a complete V2 identity".to_owned(),
+        ));
+    }
+    let Some(expected) = expected else {
+        return Ok(observed);
+    };
+    if expected.identity_revision == IDENTITY_REVISION_V2
+        && observed.identity_revision == IDENTITY_REVISION_V1
+    {
+        if require_v2 {
+            return Err(RustNcmError::HandshakeIdentity(
+                "production worker returned a sparse V1 identity".to_owned(),
+            ));
+        }
+        if observed.config_sha256 != expected.config_sha256
+            || observed.encoder_model != expected.encoder_model
+            || observed.encoder_artifact_sha256 != expected.encoder_artifact_sha256
+        {
+            return Err(RustNcmError::HandshakeIdentity(
+                "legacy worker identity does not match the pinned V2 declaration".to_owned(),
+            ));
+        }
+        let mut reconciled = expected.clone();
+        reconciled.projection_sha256 = observed.projection_sha256;
+        reconciled.epoch = observed.epoch;
+        validate_identity(&reconciled)?;
+        return Ok(reconciled);
+    }
+    if expected.identity_revision == IDENTITY_REVISION_V2
+        && observed.identity_revision == IDENTITY_REVISION_V2
+        && !runtime_identity_static_matches(&observed, expected)
+    {
+        return Err(RustNcmError::HandshakeIdentity(
+            "worker V2 identity does not match the pinned declaration".to_owned(),
+        ));
+    }
+    Ok(observed)
+}
+
+fn runtime_identity_static_matches(observed: &RuntimeIdentity, expected: &RuntimeIdentity) -> bool {
+    observed.identity_revision == expected.identity_revision
+        && observed.config_sha256 == expected.config_sha256
+        && observed.encoder_model == expected.encoder_model
+        && observed.encoder_artifact_sha256 == expected.encoder_artifact_sha256
+        && observed.worker == expected.worker
+        && observed.encoder_repository == expected.encoder_repository
+        && observed.encoder_revision == expected.encoder_revision
+        && observed.encoder_revision_provenance == expected.encoder_revision_provenance
+        && observed.encoder_files == expected.encoder_files
+        && observed.encoder_max_length == expected.encoder_max_length
+        && observed.encoder_pooling == expected.encoder_pooling
+        && observed.encoder_normalize == expected.encoder_normalize
 }
 
 impl RuntimeIdentity {
@@ -1212,6 +1651,7 @@ fn valid_sha256(value: &str) -> bool {
 fn digest_identity(digest: &mut Sha256, identity: &RuntimeIdentity) {
     digest.update(identity.identity_revision.to_be_bytes());
     digest_field(digest, identity.config_sha256.as_bytes());
+    digest.update(identity.epoch.to_be_bytes());
     if identity.identity_revision == IDENTITY_REVISION_V1 {
         digest_field(digest, identity.encoder_model.as_bytes());
         digest_field(digest, identity.encoder_artifact_sha256.as_bytes());
@@ -1277,6 +1717,22 @@ fn digest_identity(digest: &mut Sha256, identity: &RuntimeIdentity) {
 }
 
 fn ready_receipt(namespace: &str, identity: &RuntimeIdentity) -> String {
+    ready_receipt_with_incarnation(namespace, identity, None)
+}
+
+fn ready_receipt_for_worker(
+    namespace: &str,
+    identity: &RuntimeIdentity,
+    worker_incarnation: u64,
+) -> String {
+    ready_receipt_with_incarnation(namespace, identity, Some(worker_incarnation))
+}
+
+fn ready_receipt_with_incarnation(
+    namespace: &str,
+    identity: &RuntimeIdentity,
+    worker_incarnation: Option<u64>,
+) -> String {
     let mut digest = Sha256::new();
     digest.update(if identity.identity_revision == IDENTITY_REVISION_V2 {
         READY_DOMAIN_V2
@@ -1288,6 +1744,9 @@ fn ready_receipt(namespace: &str, identity: &RuntimeIdentity) -> String {
     digest_identity(&mut digest, identity);
     digest_field(&mut digest, identity.projection_sha256.as_bytes());
     digest.update(identity.epoch.to_be_bytes());
+    if let Some(worker_incarnation) = worker_incarnation {
+        digest.update(worker_incarnation.to_be_bytes());
+    }
     hex_digest(&digest.finalize())
 }
 
@@ -1376,40 +1835,53 @@ fn pre_dispatch_reply(
     }
 }
 
-fn client_error_reply(
+fn worker_error_reply(
     provider: &OwnedProviderId,
     call: &NcmSurfaceCall,
-    error: &ClientError,
+    error: &WorkerCallError,
 ) -> ProviderReply {
-    if matches!(error, ClientError::EffectUnknown { .. }) && call.operation.mutates_provider_state()
-    {
-        let receipt = unknown_receipt(call, error);
-        let action = format!("ncm.worker.reconcile-idempotency.v1:{}", &receipt[..16]);
-        let effect = CommittedEffectEvidence::unknown(receipt, action).unwrap_or_else(|_| {
-            CommittedEffectEvidence::unknown_from_reconciliation_digest([0; 32])
-        });
-        return ProviderReply {
-            terminal: surface_terminal(
+    match error {
+        WorkerCallError::IncarnationChanged { .. } => {
+            return pre_dispatch_reply(
                 provider,
-                call.operation,
-                &call.operation_id,
-                call.namespace.as_str(),
-                TerminalCode::EffectUnknown,
-                effect,
-                Some("ncm.rust.worker_effect_unknown"),
-            ),
-            payload: None,
-            warnings: Vec::new(),
-            extensions: Vec::new(),
-            state_generation: call.expected_state_generation,
-        };
+                call,
+                TerminalCode::StaleIdentity,
+                "ncm.rust.worker_incarnation_changed",
+            );
+        }
+        WorkerCallError::Client(error @ ClientError::EffectUnknown { .. })
+            if call.operation.mutates_provider_state() =>
+        {
+            let receipt = unknown_receipt(call, error);
+            let action = format!("ncm.worker.reconcile-idempotency.v1:{}", &receipt[..16]);
+            let effect = CommittedEffectEvidence::unknown(receipt, action).unwrap_or_else(|_| {
+                CommittedEffectEvidence::unknown_from_reconciliation_digest([0; 32])
+            });
+            return ProviderReply {
+                terminal: surface_terminal(
+                    provider,
+                    call.operation,
+                    &call.operation_id,
+                    call.namespace.as_str(),
+                    TerminalCode::EffectUnknown,
+                    effect,
+                    Some("ncm.rust.worker_effect_unknown"),
+                ),
+                payload: None,
+                warnings: Vec::new(),
+                extensions: Vec::new(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+        WorkerCallError::Client(error) => {
+            return pre_dispatch_reply(
+                provider,
+                call,
+                client_terminal_code(error),
+                client_diagnostic(error),
+            );
+        }
     }
-    pre_dispatch_reply(
-        provider,
-        call,
-        client_terminal_code(error),
-        client_diagnostic(error),
-    )
 }
 
 fn unknown_effect(receipt: &str, action: String) -> CommittedEffectEvidence {
@@ -2097,6 +2569,8 @@ fn client_terminal_code(error: &ClientError) -> TerminalCode {
         | ClientError::MalformedReply(_)
         | ClientError::WorkerExited
         | ClientError::UnknownIdempotencyKey
+        | ClientError::UnknownRetentionLimit { .. }
+        | ClientError::UnknownRetentionConflict { .. }
         | ClientError::OwnerStopped => TerminalCode::ProviderUnavailable,
     }
 }
@@ -2115,7 +2589,25 @@ fn client_diagnostic(error: &ClientError) -> &'static str {
         ClientError::MalformedReply(_) => "ncm.rust.worker_reply_malformed",
         ClientError::WorkerExited => "ncm.rust.worker_exited",
         ClientError::UnknownIdempotencyKey => "ncm.rust.reconciliation_key_unknown",
+        ClientError::UnknownRetentionLimit { .. } => "ncm.rust.worker_unknown_retention_limit",
+        ClientError::UnknownRetentionConflict { .. } => {
+            "ncm.rust.worker_unknown_retention_conflict"
+        }
         ClientError::OwnerStopped => "ncm.rust.worker_owner_stopped",
+    }
+}
+
+fn worker_terminal_code(error: &WorkerCallError) -> TerminalCode {
+    match error {
+        WorkerCallError::Client(error) => client_terminal_code(error),
+        WorkerCallError::IncarnationChanged { .. } => TerminalCode::StaleIdentity,
+    }
+}
+
+fn worker_diagnostic_for_error(error: &WorkerCallError) -> &'static str {
+    match error {
+        WorkerCallError::Client(error) => client_diagnostic(error),
+        WorkerCallError::IncarnationChanged { .. } => "ncm.rust.worker_incarnation_changed",
     }
 }
 
@@ -2201,6 +2693,7 @@ mod source_revocation_tests {
 #[allow(clippy::unwrap_used)]
 mod failed_handshake_generation_tests {
     use super::*;
+    use tracedecay_memory_provider_api::CancellationToken;
 
     #[test]
     fn refusal_preserves_only_observed_generation_and_never_readiness() {
@@ -2383,6 +2876,165 @@ mod identity_revision_tests {
         let mut changed = identity();
         changed.encoder_files[4].sha256 = "f".repeat(64);
         assert_ne!(ready_receipt("1".repeat(64).as_str(), &changed), baseline);
+    }
+
+    #[test]
+    fn revision_two_implementation_id_binds_runtime_epoch_but_descriptor_does_not() {
+        let baseline = identity();
+        let mut changed = baseline.clone();
+        changed.epoch = changed.epoch.saturating_add(1);
+        assert_ne!(
+            implementation_version(&baseline),
+            implementation_version(&changed)
+        );
+        assert_eq!(descriptor_digest(&baseline), descriptor_digest(&changed));
+    }
+
+    #[test]
+    fn legacy_owner_may_reconcile_sparse_runtime_identity_with_v2_declaration() {
+        let expected = identity();
+        let reply = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(json!({
+                "algorithm": {
+                    "profile": ALGORITHM_PROFILE,
+                    "config_sha256": expected.config_sha256,
+                },
+                "projection_sha256": expected.projection_sha256,
+                "encoder": {
+                    "model": expected.encoder_model,
+                    "artifact_sha256": expected.encoder_artifact_sha256,
+                },
+                "epoch": 11,
+            })),
+            error: None,
+        };
+        let reconciled = parse_runtime_identity_for_expected(&reply, Some(&expected), false)
+            .expect("legacy V1 identity reconciliation");
+        assert_eq!(reconciled.identity_revision, IDENTITY_REVISION_V2);
+        assert_eq!(reconciled.worker, expected.worker);
+        assert_eq!(reconciled.encoder_files, expected.encoder_files);
+        assert_eq!(reconciled.projection_sha256, expected.projection_sha256);
+        assert_eq!(reconciled.epoch, 11);
+    }
+
+    #[test]
+    fn production_identity_proof_rejects_sparse_v1_ready_payload() {
+        let expected = identity();
+        let reply = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(json!({
+                "algorithm": {
+                    "profile": ALGORITHM_PROFILE,
+                    "config_sha256": expected.config_sha256,
+                },
+                "projection_sha256": expected.projection_sha256,
+                "encoder": {
+                    "model": expected.encoder_model,
+                    "artifact_sha256": expected.encoder_artifact_sha256,
+                },
+                "epoch": 11,
+            })),
+            error: None,
+        };
+        assert!(parse_runtime_identity_for_expected(&reply, Some(&expected), true).is_err());
+    }
+
+    #[test]
+    fn production_identity_proof_rejects_tampered_v2_worker_or_model_fields() {
+        let expected = identity();
+        let mut payload = identity_request_payload(Some(&expected));
+        payload["projection_sha256"] = Value::String(expected.projection_sha256.clone());
+
+        payload["worker"]["sha256"] = Value::String("0".repeat(64));
+        let tampered_worker = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(payload),
+            error: None,
+        };
+        assert!(
+            parse_runtime_identity_for_expected(&tampered_worker, Some(&expected), true).is_err(),
+            "worker digest tampering must invalidate production proof"
+        );
+
+        let mut payload = identity_request_payload(Some(&expected));
+        payload["encoder"]["revision"] = Value::String("f".repeat(40));
+        let tampered_encoder = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(payload),
+            error: None,
+        };
+        assert!(
+            parse_runtime_identity_for_expected(&tampered_encoder, Some(&expected), true).is_err(),
+            "encoder revision tampering must invalidate production proof"
+        );
+
+        let mut payload = identity_request_payload(Some(&expected));
+        payload["worker"].as_object_mut().unwrap().remove("target");
+        let missing_worker_target = Reply {
+            id: 1,
+            outcome: Outcome::Success,
+            state_generation: 0,
+            payload: Some(payload),
+            error: None,
+        };
+        assert!(
+            parse_runtime_identity_for_expected(&missing_worker_target, Some(&expected), true,)
+                .is_err(),
+            "missing worker target metadata must invalidate production proof"
+        );
+    }
+
+    #[test]
+    fn v2_identity_request_carries_static_worker_and_encoder_metadata() {
+        let expected = identity();
+        let payload = identity_request_payload(Some(&expected));
+        assert_eq!(
+            payload["identity_revision"],
+            Value::from(u64::from(IDENTITY_REVISION_V2))
+        );
+        assert_eq!(
+            payload["algorithm"]["config_sha256"],
+            Value::String(expected.config_sha256.clone())
+        );
+        assert_eq!(
+            payload["worker"]["sha256"],
+            expected.worker.as_ref().unwrap().sha256
+        );
+        assert_eq!(
+            payload["encoder"]["revision"],
+            Value::String(expected.encoder_revision.clone().unwrap())
+        );
+        assert_eq!(payload["epoch"], Value::from(expected.epoch));
+    }
+
+    #[test]
+    fn v2_handshake_omits_unknown_namespace_runtime_state_until_observed() {
+        let mut declaration = identity();
+        declaration.projection_sha256.clear();
+        declaration.epoch = 0;
+        let direct = identity_request_payload(Some(&declaration));
+        assert!(direct.get("projection_sha256").is_none());
+        assert!(direct.get("epoch").is_none());
+        let unknown = identity_request_payload_for_worker(Some(&declaration), true, false);
+        assert!(unknown.get("projection_sha256").is_none());
+        assert!(unknown.get("epoch").is_none());
+
+        let observed = identity();
+        let exact = identity_request_payload_for_worker(Some(&observed), true, true);
+        assert_eq!(
+            exact["projection_sha256"],
+            Value::String(observed.projection_sha256.clone())
+        );
+        assert_eq!(exact["epoch"], Value::from(observed.epoch));
     }
 
     #[test]

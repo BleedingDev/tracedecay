@@ -2733,6 +2733,8 @@ function lcmTimelinePayload(): Record<string, unknown> {
       truncated: false,
     },
     exists: true,
+    provider: null,
+    next_cursor: null,
     node_buckets: [
       { bucket: lcmDateBucket(2), count: 14 },
       { bucket: lcmDateBucket(1), count: 9 },
@@ -2758,6 +2760,7 @@ function lcmOverviewPayload(): Record<string, unknown> {
   // sessions and a long tail, so the per-row magnitude rails have a shape.
   const latestSessions = Array.from({ length: 40 }, (_, i) => ({
     session_id: loomSessionId(i),
+    provider: LOOM_PROVIDERS[i % LOOM_PROVIDERS.length],
     message_count: i === 0 ? 998 : i === 3 ? 405 : i === 7 ? 169 : Math.max(2, 44 - i),
     last_timestamp: nowSecs - i * 5 * 3600 - (i % 7) * 1300,
     last_store_id: 181_402 - i * 97,
@@ -2774,6 +2777,7 @@ function lcmOverviewPayload(): Record<string, unknown> {
       node_id: `node.summary.${i + 1}`,
       recency: i,
       session_id: loomSessionId(i),
+      provider: LOOM_PROVIDERS[i % LOOM_PROVIDERS.length],
       snippet: 'compressed span of the session transcript',
       source_token_count: 48_000 - i * 9_000,
       source_type: 'messages',
@@ -2803,14 +2807,16 @@ function lcmOverviewPayload(): Record<string, unknown> {
       ],
       sessions_total: 6_053,
       source_counts: [
-        { source: 'claude', count: 2_401 },
-        { source: 'codex', count: 2_204 },
-        { source: 'cursor', count: 1_448 },
+        { source: 'claude', provider: 'claude', count: 2_401 },
+        { source: 'codex', provider: 'codex', count: 2_204 },
+        { source: 'cursor', provider: 'cursor', count: 1_448 },
       ],
       summary_node_sessions_total: 512,
       summary_nodes_total: 412,
     },
     path: '/home/zack/.tracedecay/lcm.db',
+    provider: null,
+    next_cursor: null,
     query: '',
     storage_scope: 'profile_sharded',
   };
@@ -3098,6 +3104,7 @@ function loomChainPayload(): Record<string, unknown> {
     return {
       message_id: `${sessionId}:${String(i).padStart(4, '0')}`,
       session_id: sessionId,
+      provider: 'cursor',
       role: i === 0 ? 'user' : i === 1 ? 'system' : 'assistant',
       content:
         i === 0
@@ -3122,6 +3129,7 @@ function loomChainPayload(): Record<string, unknown> {
   return {
     exists: true,
     session_id: sessionId,
+    provider: 'cursor',
     path: '/home/zack/.tracedecay/projects/proj_a5b3d7e3ebe14ca7/sessions.db',
     storage_scope: 'profile_sharded',
     order: 'asc',
@@ -3138,7 +3146,11 @@ function loomChainPayload(): Record<string, unknown> {
       token_estimate_total: 21_460,
     },
     messages,
-    summary_nodes: LOOM_CHAIN_SUMMARY_NODES.map((node) => ({ ...node, session_id: sessionId })),
+    summary_nodes: LOOM_CHAIN_SUMMARY_NODES.map((node) => ({
+      ...node,
+      provider: 'cursor',
+      session_id: sessionId,
+    })),
   };
 }
 
@@ -3153,6 +3165,7 @@ function loomChainPayload(): Record<string, unknown> {
 const LOOM_CHAIN_SUMMARY_NODES = [
   {
     node_id: 'sn-recon-0001',
+    provider: 'cursor',
     category: 'tool_activity',
     depth: 1,
     summary:
@@ -3166,6 +3179,7 @@ const LOOM_CHAIN_SUMMARY_NODES = [
   },
   {
     node_id: 'sn-recon-0002',
+    provider: 'cursor',
     category: 'code_change',
     depth: 1,
     summary:
@@ -3179,6 +3193,7 @@ const LOOM_CHAIN_SUMMARY_NODES = [
   },
   {
     node_id: 'sn-recon-0003',
+    provider: 'cursor',
     category: 'outcome',
     depth: 2,
     summary:

@@ -414,6 +414,7 @@ fn record_ids(engine: &NcmEngine) -> Vec<u64> {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|capsule| capsule["status"] != "revoked")
         .map(|capsule| capsule["record_id"].as_u64().unwrap())
         .collect()
 }
@@ -644,6 +645,47 @@ fn broad_raw_delete_fences_both_typed_sources_and_old_raw_fences_stop_encoding()
         );
         assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn post_delete_raw_snapshot_restores_scrubbed_typed_capsules_into_a_fresh_namespace() {
+    let source_directory = TempDir::new().unwrap();
+    let source = engine(&source_directory);
+    observe(&source, A.observation("raw-snapshot-a", "A erased", true));
+    observe(&source, B.observation("raw-snapshot-b", "B erased", true));
+    let deleted = delete(&source, A, "raw-snapshot-delete", false);
+    assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
+    let snapshot = export(&source);
+    let exported: Value = serde_json::from_slice(&snapshot).unwrap();
+    assert_eq!(
+        exported["capsules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|capsule| capsule["status"] == "revoked")
+            .count(),
+        2
+    );
+    assert_eq!(exported["revocations"][0]["source_id"], A.legacy_id().0);
+
+    let destination_directory = TempDir::new().unwrap();
+    let destination = engine(&destination_directory);
+    let restored = snapshot::restore(
+        &destination,
+        &namespace(),
+        RestoreRequest {
+            idempotency_key: "restore-raw-post-delete".to_owned(),
+            bytes: snapshot,
+        },
+        DEADLINE,
+    );
+    assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
+    assert_eq!(inspect(&destination).payload["records"], 0);
+    assert!(record_ids(&destination).is_empty());
+    assert_eq!(
+        destination.revoked_sources(&namespace()).unwrap(),
+        vec![A.legacy_id()]
+    );
 }
 
 struct PausingEncoder {

@@ -53,8 +53,8 @@ export function ThreadChain({
   const [params] = useSearchParams();
   const replaying = params.has('loomEvent');
   const chain = useEnvelope(
-    ['loom', 'chain', thread?.id ?? 'none'],
-    `/api/plugins/hermes-lcm/session/${encodeURIComponent(thread?.sessionId ?? '')}?limit=200`,
+    ['loom', 'chain', thread?.host ?? 'none', thread?.sessionId ?? 'none'],
+    `/api/plugins/hermes-lcm/session/${encodeURIComponent(thread?.sessionId ?? '')}?provider=${encodeURIComponent(thread?.host ?? '')}&limit=200`,
     LcmSessionPayloadV1Schema,
     { enabled: thread != null },
   );

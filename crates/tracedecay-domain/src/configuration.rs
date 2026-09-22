@@ -1011,9 +1011,12 @@ impl MemoryProviderNcmObserverV1 {
                 (state_root, "NCM observer state root"),
             ] {
                 if !path.is_absolute()
-                    || path
-                        .components()
-                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                    || path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::CurDir | std::path::Component::ParentDir
+                        )
+                    })
                     || path.to_str().is_none_or(|text| text.contains('\0'))
                 {
                     return Err(DomainError::NonCanonical { field });
@@ -1079,7 +1082,9 @@ pub struct MemoryProviderSelectionV1 {
 impl MemoryProviderSelectionV1 {
     /// Resolves legacy enablement plus explicit routing without creating workers
     /// or migrating a persisted configuration revision. Unknown or disabled active
-    /// selection fails; enabled unselected adapters remain observers.
+    /// selection fails; enabled unselected adapters remain observers. The current
+    /// project composition has no fallback registration slot, so any fallback is
+    /// rejected after its target is checked.
     pub fn resolve(
         native_enabled: bool,
         ncm: &MemoryProviderNcmObserverV1,
@@ -1115,6 +1120,30 @@ impl MemoryProviderSelectionV1 {
             }
             *participation = MemoryProviderParticipationV1::Active;
         }
+        if let Some(fallback) = &routing.fallback {
+            let provider = MemoryProviderKindV1::from_provider_id(&fallback.target_provider)
+                .map_err(|error| match error {
+                    MemoryProviderSelectionErrorV1::UnknownProvider(provider) => {
+                        MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider)
+                    }
+                    other => other,
+                })?;
+            let participation = match provider {
+                MemoryProviderKindV1::Native => selection.native,
+                MemoryProviderKindV1::Ncm => selection.ncm,
+            };
+            if participation == MemoryProviderParticipationV1::Disabled {
+                return Err(MemoryProviderSelectionErrorV1::FallbackProviderDisabled(
+                    provider,
+                ));
+            }
+            // The current project composition registers exactly one provider:
+            // the active selection. A fallback can therefore never be
+            // dispatched, even when its target is independently enabled.
+            return Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(
+                fallback.target_provider.clone(),
+            ));
+        }
         Ok(selection)
     }
 
@@ -1135,7 +1164,7 @@ impl MemoryProviderSelectionV1 {
 }
 
 /// Selection failed before constructing any concrete adapter.
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MemoryProviderSelectionErrorV1 {
     /// A persisted value was not canonical or had invalid paths/policy.
     #[error("memory provider configuration is invalid: {0}")]
@@ -1146,6 +1175,15 @@ pub enum MemoryProviderSelectionErrorV1 {
     /// Selecting an identity cannot implicitly enable its adapter.
     #[error("selected memory provider {0:?} is disabled")]
     SelectedProviderDisabled(MemoryProviderKindV1),
+    /// The configured fallback cannot be dispatched by this composition.
+    #[error(
+        "fallback memory provider '{0}' is unsupported by this composition; it can never dispatch a fallback"
+    )]
+    UnsupportedFallbackProvider(String),
+    /// A known fallback provider is not enabled, so no registration can be
+    /// composed for it. Selection never enables a provider as a side effect.
+    #[error("fallback memory provider {0:?} is disabled")]
+    FallbackProviderDisabled(MemoryProviderKindV1),
 }
 
 /// Explicit routing gate for cognitive recall.
@@ -2524,5 +2562,59 @@ mod memory_provider_selection_tests {
                 matches!(MemoryProviderSelectionV1::resolve(native, &ncm, &routing(Some(provider))), Err(MemoryProviderSelectionErrorV1::SelectedProviderDisabled(actual)) if actual == kind)
             );
         }
+    }
+
+    #[test]
+    fn fallback_selection_rejects_disabled_unregistered_and_undispatchable_targets_without_mutating_inputs()
+     {
+        let disabled_ncm = MemoryProviderNcmObserverV1::default();
+        let routing = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        let before_ncm = disabled_ncm.clone();
+        let before_routing = routing.clone();
+
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &disabled_ncm, &routing),
+            Err(MemoryProviderSelectionErrorV1::FallbackProviderDisabled(
+                MemoryProviderKindV1::Ncm
+            ))
+        ));
+        assert_eq!(disabled_ncm, before_ncm);
+        assert_eq!(routing, before_routing);
+
+        let ncm = enabled_ncm();
+        let mut enabled_routing = routing;
+        enabled_routing.fallback = Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.recall.fallback".to_owned(),
+            policy_revision: 1,
+            target_provider: "provider.unregistered".to_owned(),
+        });
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &ncm, &enabled_routing),
+            Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider))
+                if provider == "provider.unregistered"
+        ));
+
+        let enabled_fallback = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &ncm, &enabled_fallback),
+            Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider))
+                if provider == "ncm"
+        ));
     }
 }

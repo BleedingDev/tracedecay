@@ -166,6 +166,7 @@ impl QueryAuthorityV1 {
         if calibration_lanes != expected_lanes
             || weight_lanes != expected_lanes
             || !thresholds_are_valid
+            || profile.rerank_policy_id.is_some()
         {
             return Err(QueryAuthorityErrorV1::InvalidAuthority(
                 "profile lane set does not match the mounted query authority".to_owned(),
@@ -275,6 +276,17 @@ impl QueryAuthorityV1 {
         )?;
         TaskSessionCandidateSelectionV1::new(page.ranked_candidates, page.cursor)
             .map_err(|error| QueryAuthorityErrorV1::InvalidAuthority(error.to_string()))
+    }
+
+    /// Authenticate one request-local sanitized query with the daemon-owned
+    /// key. Only the privacy-bound digest leaves the query authority.
+    pub fn authenticate_query(
+        &self,
+        request: &RetrievalRequest,
+        query_view: &EphemeralSanitizedQueryViewV1,
+    ) -> Result<QueryDigest, QueryAuthorityErrorV1> {
+        self.validate_request(request)?;
+        Ok(self.keyring.digest_active_query(request, query_view)?)
     }
 
     /// Authenticate one prepared-query cursor payload with the daemon-owned key.
@@ -422,6 +434,43 @@ impl QueryAuthorityV1 {
         })
     }
 
+    /// Build an authenticated cursor for a frozen composition at an arbitrary
+    /// ordinal. Optional semantic execution binds its continuation after this
+    /// base cursor has been created.
+    pub fn continuation_cursor_at(
+        &self,
+        request: &RetrievalRequest,
+        query_view: &EphemeralSanitizedQueryViewV1,
+        composition: &CompositionOutputV1,
+        next_ordinal: usize,
+    ) -> Result<RetrievalCursor, QueryAuthorityErrorV1> {
+        self.validate_request(request)?;
+        Ok(self.kernel.cursor(
+            request,
+            query_view,
+            &self.keyring,
+            composition,
+            next_ordinal,
+        )?)
+    }
+
+    /// Attach and re-sign an optional semantic continuation. The continuation
+    /// remains nested in the authenticated cursor envelope and is never
+    /// serialized into the canonical fallback subpayload when absent.
+    pub fn bind_semantic_continuation(
+        &self,
+        cursor: &mut RetrievalCursor,
+        semantic: tracedecay_domain::SemanticRetrievalContinuationV1,
+    ) -> Result<(), QueryAuthorityErrorV1> {
+        semantic.validate()?;
+        semantic.validate_for_cursor(cursor)?;
+        cursor.semantic_source_scope = Some(semantic.source_scope.clone());
+        cursor.semantic_candidate_order = Some(semantic.ordered_candidate_anchors.clone());
+        cursor.semantic = Some(semantic);
+        self.keyring.resign_cursor(cursor)?;
+        Ok(())
+    }
+
     pub fn bind_code_source_cursor(
         &self,
         cursor: &mut RetrievalCursor,
@@ -451,12 +500,33 @@ impl QueryAuthorityV1 {
     fn validate_request(&self, request: &RetrievalRequest) -> Result<(), QueryAuthorityErrorV1> {
         request.budget.validate()?;
         if request.profile_id != self.profile.profile_id
-            || request.budget != self.profile.retrieval_budget
+            || !budget_is_profile_compatible(&request.budget, &self.profile.retrieval_budget)
         {
             return Err(QueryAuthorityErrorV1::RequestProfileMismatch);
         }
         Ok(())
     }
+}
+
+/// Caller deadlines narrow an evaluated profile budget without changing the
+/// profile's resource ceilings or identity. A request may therefore carry a
+/// deadline projected by the scheduler while retaining the same accepted
+/// fallback/profile binding.
+fn budget_is_profile_compatible(
+    request: &tracedecay_domain::RetrievalBudget,
+    profile: &tracedecay_domain::RetrievalBudget,
+) -> bool {
+    request.max_candidates_per_lane == profile.max_candidates_per_lane
+        && request.max_fused_candidates == profile.max_fused_candidates
+        && request.max_hydrated_results == profile.max_hydrated_results
+        && request.max_hydration_bytes == profile.max_hydration_bytes
+        && match (profile.deadline_micros, request.deadline_micros) {
+            (Some(profile_deadline), Some(request_deadline)) => {
+                request_deadline <= profile_deadline
+            }
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
 }
 
 fn validate_lane_set(

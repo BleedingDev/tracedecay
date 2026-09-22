@@ -4,6 +4,7 @@
 //! authorization, mutation, audit, and credential semantics remain in the
 //! existing application operations and transactional store.
 
+use std::any::Any;
 use std::sync::{Arc, OnceLock};
 
 use tracedecay_contracts::now_micros;
@@ -46,6 +47,8 @@ pub struct ProjectConfigurationRuntime {
     authorities: Arc<ConfigurationAuthoritySlots>,
     client: Arc<ProductionConfigurationDaemonClient>,
     user_settings: Arc<ProductionUserSettingsDaemonClient>,
+    semantic_activation: OnceLock<Arc<dyn Any + Send + Sync>>,
+    semantic_inventory: OnceLock<Arc<dyn Any + Send + Sync>>,
 }
 
 impl ProjectConfigurationRuntime {
@@ -90,6 +93,8 @@ impl ProjectConfigurationRuntime {
                 authorities,
                 client,
                 user_settings,
+                semantic_activation: OnceLock::new(),
+                semantic_inventory: OnceLock::new(),
             },
             configuration,
         ))
@@ -116,6 +121,50 @@ impl ProjectConfigurationRuntime {
 
     pub fn client(&self) -> Arc<ProductionConfigurationDaemonClient> {
         Arc::clone(&self.client)
+    }
+
+    /// Install the typed semantic coordinator behind this configuration
+    /// runtime. The configuration crate keeps the slot type erased so it does
+    /// not acquire an application or retrieval dependency; the application
+    /// extension owns the concrete downcast and identity check.
+    pub fn install_semantic_activation<T>(&self, activation: Arc<T>)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let _ = self
+            .semantic_activation
+            .set(activation as Arc<dyn Any + Send + Sync>);
+    }
+
+    pub fn semantic_activation<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.semantic_activation
+            .get()
+            .and_then(|activation| Arc::clone(activation).downcast::<T>().ok())
+    }
+
+    /// Install the semantic configuration inventory authority paired with the
+    /// coordinator. It is cloned out for callers because inventory is a
+    /// cloneable guarded store handle, while the slot itself remains one shot.
+    pub fn install_semantic_inventory<T>(&self, inventory: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let _ = self
+            .semantic_inventory
+            .set(Arc::new(inventory) as Arc<dyn Any + Send + Sync>);
+    }
+
+    pub fn semantic_inventory<T>(&self) -> Option<T>
+    where
+        T: Any + Clone + Send + Sync + 'static,
+    {
+        self.semantic_inventory
+            .get()
+            .and_then(|inventory| Arc::clone(inventory).downcast::<T>().ok())
+            .map(|inventory| (*inventory).clone())
     }
 
     /// Daemon-owned user-profile settings authority. Dashboard and other

@@ -791,6 +791,7 @@ pub fn fusion_profile(profile: &ProfileSpecV1) -> Result<FusionProfile, Candidat
         minimum_calibrated_feature_micros: BTreeMap::new(),
         weights_micros: weights,
         diversity_policy_id: typed_id::<DiversityPolicyId>("diversity.candidate.v1")?,
+        rerank_policy_id: None,
         retrieval_budget: retrieval_budget(),
     })
 }

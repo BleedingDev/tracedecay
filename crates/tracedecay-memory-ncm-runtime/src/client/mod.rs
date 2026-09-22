@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 pub const MAX_QUEUED_REQUESTS: usize = 32;
 /// Maximum aggregate encoded bytes in the client mailbox.
 pub const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of indeterminate mutating requests retained for reconciliation.
+pub const MAX_RETAINED_UNKNOWN_ENTRIES: usize = 64;
+/// Maximum aggregate in-memory request representation retained for reconciliation.
+pub const MAX_RETAINED_UNKNOWN_BYTES: usize = 8 * 1024 * 1024;
 /// Hard worker termination escalation budget after a deadline.
 pub const KILL_ESCALATION: Duration = Duration::from_millis(250);
 const MAX_SNAPSHOT_TRANSPORT_BYTES: usize = 256 * 1024 * 1024;
@@ -82,8 +86,18 @@ pub enum ClientError {
     MalformedReply(String),
     /// The worker exited before acknowledging a request.
     WorkerExited,
-    /// No killed request is retained under this idempotency key.
+    /// No indeterminate request is retained under this namespace/idempotency key pair.
     UnknownIdempotencyKey,
+    /// Retaining an indeterminate request would exceed the bounded ledger.
+    UnknownRetentionLimit {
+        /// Request identifier whose uncertainty could not be retained.
+        op_id: u64,
+    },
+    /// A new indeterminate request reused a retained key for a different effect.
+    UnknownRetentionConflict {
+        /// Request identifier whose uncertainty could not be retained.
+        op_id: u64,
+    },
     /// The client owner thread stopped unexpectedly.
     OwnerStopped,
 }
@@ -105,6 +119,16 @@ impl fmt::Display for ClientError {
             Self::MalformedReply(detail) => write!(formatter, "malformed worker reply: {detail}"),
             Self::WorkerExited => formatter.write_str("worker exited before reply"),
             Self::UnknownIdempotencyKey => formatter.write_str("unknown idempotency key"),
+            Self::UnknownRetentionLimit { op_id } => {
+                write!(
+                    formatter,
+                    "unknown request {op_id} exceeds the retention limit"
+                )
+            }
+            Self::UnknownRetentionConflict { op_id } => write!(
+                formatter,
+                "unknown request {op_id} conflicts with the retained idempotency key"
+            ),
             Self::OwnerStopped => formatter.write_str("worker owner stopped"),
         }
     }
@@ -116,13 +140,275 @@ impl std::error::Error for ClientError {}
 pub struct WorkerClient {
     calls: SyncSender<OwnerCommand>,
     queued_bytes: Arc<AtomicUsize>,
-    unknown: Arc<Mutex<BTreeMap<String, Request>>>,
+    unknown: Arc<Mutex<UnknownRequests>>,
     shutdown: Arc<AtomicBool>,
     owner: Mutex<Option<JoinHandle<()>>>,
     pid: Arc<AtomicU32>,
+    owner_incarnation: Arc<AtomicU64>,
+    fenced: Arc<AtomicBool>,
+    ledger_generation: AtomicU64,
+    reconcile_gate: Mutex<()>,
     reconciliation_deadline: Duration,
     root: PathBuf,
     lifecycle: Arc<LifecycleState>,
+}
+
+#[derive(Clone, Debug)]
+struct RetainedRequest {
+    request: Request,
+    identity_digest: String,
+    bytes: usize,
+    snapshot_backup: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct OwnedSnapshotFiles {
+    send_file: PathBuf,
+    backup_file: Option<PathBuf>,
+}
+
+impl OwnedSnapshotFiles {
+    fn both(send_file: PathBuf, backup_file: PathBuf) -> Self {
+        Self {
+            send_file,
+            backup_file: Some(backup_file),
+        }
+    }
+
+    fn send_only(send_file: PathBuf) -> Self {
+        Self {
+            send_file,
+            backup_file: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetentionReservation {
+    key: (String, String),
+    identity_digest: String,
+    bytes: usize,
+}
+
+struct RetentionReservationGuard {
+    unknown: Arc<Mutex<UnknownRequests>>,
+    reservation: Option<RetentionReservation>,
+}
+
+impl RetentionReservationGuard {
+    fn none(unknown: Arc<Mutex<UnknownRequests>>) -> Self {
+        Self {
+            unknown,
+            reservation: None,
+        }
+    }
+
+    fn new(unknown: Arc<Mutex<UnknownRequests>>, reservation: RetentionReservation) -> Self {
+        Self {
+            unknown,
+            reservation: Some(reservation),
+        }
+    }
+}
+
+impl Drop for RetentionReservationGuard {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        if let Ok(mut unknown) = self.unknown.lock() {
+            unknown.release_reservation(&reservation);
+        }
+    }
+}
+
+struct SnapshotFilesGuard {
+    files: Option<OwnedSnapshotFiles>,
+}
+
+impl SnapshotFilesGuard {
+    fn new(files: OwnedSnapshotFiles) -> Self {
+        Self { files: Some(files) }
+    }
+
+    fn as_ref(&self) -> Option<&OwnedSnapshotFiles> {
+        self.files.as_ref()
+    }
+
+    fn disarm(&mut self) {
+        self.files = None;
+    }
+}
+
+impl Drop for SnapshotFilesGuard {
+    fn drop(&mut self) {
+        if let Some(files) = self.files.take() {
+            remove_transport_file(Some(&files.send_file));
+            cleanup_snapshot_backup(files.backup_file.as_deref());
+        }
+    }
+}
+
+#[derive(Default)]
+struct UnknownRequests {
+    entries: BTreeMap<(String, String), RetainedRequest>,
+    bytes: usize,
+    reservations: BTreeMap<(String, String), RetentionReservation>,
+    reserved_bytes: usize,
+}
+
+impl UnknownRequests {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, key: &(String, String)) -> Option<&RetainedRequest> {
+        self.entries.get(key)
+    }
+
+    fn contains_key(&self, key: &(String, String)) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn retain(
+        &mut self,
+        key: (String, String),
+        candidate: RetainedRequest,
+    ) -> Result<(), RetentionError> {
+        if self.reservations.contains_key(&key) {
+            return Err(RetentionError::Busy);
+        }
+        if let Some(existing) = self.entries.get(&key) {
+            if existing.identity_digest != candidate.identity_digest {
+                return Err(RetentionError::Conflict);
+            }
+            let next_bytes = self
+                .bytes
+                .checked_sub(existing.bytes)
+                .and_then(|bytes| bytes.checked_add(candidate.bytes))
+                .ok_or(RetentionError::Limit)?;
+            if candidate.bytes > MAX_RETAINED_UNKNOWN_BYTES
+                || next_bytes
+                    .checked_add(self.reserved_bytes)
+                    .is_none_or(|bytes| bytes > MAX_RETAINED_UNKNOWN_BYTES)
+            {
+                return Err(RetentionError::Limit);
+            }
+            self.bytes = next_bytes;
+            self.entries.insert(key, candidate);
+            return Ok(());
+        }
+        let next_entries = self
+            .entries
+            .len()
+            .checked_add(self.reservations.len())
+            .ok_or(RetentionError::Limit)?;
+        let next_bytes = self
+            .bytes
+            .checked_add(self.reserved_bytes)
+            .and_then(|bytes| bytes.checked_add(candidate.bytes))
+            .ok_or(RetentionError::Limit)?;
+        if candidate.bytes > MAX_RETAINED_UNKNOWN_BYTES
+            || next_entries >= MAX_RETAINED_UNKNOWN_ENTRIES
+            || next_bytes > MAX_RETAINED_UNKNOWN_BYTES
+        {
+            return Err(RetentionError::Limit);
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(candidate.bytes)
+            .ok_or(RetentionError::Limit)?;
+        self.entries.insert(key, candidate);
+        Ok(())
+    }
+
+    fn reserve(
+        &mut self,
+        key: (String, String),
+        identity_digest: String,
+        bytes: usize,
+    ) -> Result<Option<RetentionReservation>, RetentionError> {
+        if let Some(existing) = self.entries.get(&key) {
+            if existing.identity_digest != identity_digest {
+                return Err(RetentionError::Conflict);
+            }
+            return Ok(None);
+        }
+        if let Some(existing) = self.reservations.get(&key) {
+            if existing.identity_digest != identity_digest {
+                return Err(RetentionError::Conflict);
+            }
+            return Err(RetentionError::Busy);
+        }
+        let next_entries = self
+            .entries
+            .len()
+            .checked_add(self.reservations.len())
+            .and_then(|entries| entries.checked_add(1))
+            .ok_or(RetentionError::Limit)?;
+        let next_bytes = self
+            .bytes
+            .checked_add(self.reserved_bytes)
+            .and_then(|total| total.checked_add(bytes))
+            .ok_or(RetentionError::Limit)?;
+        if bytes > MAX_RETAINED_UNKNOWN_BYTES
+            || next_entries > MAX_RETAINED_UNKNOWN_ENTRIES
+            || next_bytes > MAX_RETAINED_UNKNOWN_BYTES
+        {
+            return Err(RetentionError::Limit);
+        }
+        let reservation = RetentionReservation {
+            key: key.clone(),
+            identity_digest,
+            bytes,
+        };
+        self.reserved_bytes = self
+            .reserved_bytes
+            .checked_add(bytes)
+            .ok_or(RetentionError::Limit)?;
+        self.reservations.insert(key, reservation.clone());
+        Ok(Some(reservation))
+    }
+
+    fn release_reservation(&mut self, reservation: &RetentionReservation) -> bool {
+        let matches = self
+            .reservations
+            .get(&reservation.key)
+            .is_some_and(|current| {
+                current.identity_digest == reservation.identity_digest
+                    && current.bytes == reservation.bytes
+            });
+        if !matches {
+            return false;
+        }
+        self.reservations.remove(&reservation.key);
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(reservation.bytes);
+        true
+    }
+
+    fn remove_if_matches(
+        &mut self,
+        key: &(String, String),
+        identity_digest: &str,
+    ) -> Option<RetainedRequest> {
+        let matches = self
+            .entries
+            .get(key)
+            .is_some_and(|retained| retained.identity_digest == identity_digest);
+        if !matches {
+            return None;
+        }
+        let removed = self.entries.remove(key)?;
+        self.bytes = self.bytes.saturating_sub(removed.bytes);
+        Some(removed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetentionError {
+    Limit,
+    Conflict,
+    Busy,
 }
 
 #[derive(Default)]
@@ -158,12 +444,17 @@ impl WorkerClient {
         let test_double = options.test_double;
         #[cfg(not(feature = "test-transport"))]
         let test_double = false;
-        let (calls, receiver) = mpsc::sync_channel(MAX_QUEUED_REQUESTS);
+        let (calls, receiver) = mpsc::sync_channel::<OwnerCommand>(MAX_QUEUED_REQUESTS);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let pid = Arc::new(AtomicU32::new(0));
+        let owner_incarnation = Arc::new(AtomicU64::new(0));
+        let fenced = Arc::new(AtomicBool::new(false));
+        let ledger_generation = AtomicU64::new(0);
+        let reconcile_gate = Mutex::new(());
         let owner_shutdown = Arc::clone(&shutdown);
         let owner_pid = Arc::clone(&pid);
+        let owner_owner_incarnation = Arc::clone(&owner_incarnation);
         let owner_queued_bytes = Arc::clone(&queued_bytes);
         let lifecycle = Arc::new(LifecycleState::default());
         let owner_lifecycle = Arc::clone(&lifecycle);
@@ -181,6 +472,7 @@ impl WorkerClient {
                     receiver,
                     owner_shutdown,
                     owner_pid,
+                    owner_owner_incarnation,
                     owner_queued_bytes,
                     launch,
                     owner_lifecycle,
@@ -190,10 +482,14 @@ impl WorkerClient {
         Ok(Self {
             calls,
             queued_bytes,
-            unknown: Arc::new(Mutex::new(BTreeMap::new())),
+            unknown: Arc::new(Mutex::new(UnknownRequests::default())),
             shutdown,
             owner: Mutex::new(Some(owner)),
             pid,
+            owner_incarnation,
+            fenced,
+            ledger_generation,
+            reconcile_gate,
             reconciliation_deadline: options.reconciliation_deadline,
             root: state_root.to_path_buf(),
             lifecycle,
@@ -210,9 +506,20 @@ impl WorkerClient {
     /// path if it reached the child. The shared owner remains available.
     pub fn call_cancellable(
         &self,
+        request: Request,
+        deadline: Duration,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Reply, ClientError> {
+        self.call_cancellable_with_identity(request, deadline, cancelled, None, None)
+    }
+
+    fn call_cancellable_with_identity(
+        &self,
         mut request: Request,
         deadline: Duration,
         cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        retained_identity_digest: Option<&str>,
+        retained_snapshot_backup: Option<&Path>,
     ) -> Result<Reply, ClientError> {
         if cancelled() || deadline.is_zero() {
             return Err(ClientError::Cancelled);
@@ -230,29 +537,42 @@ impl WorkerClient {
         let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         request.deadline_ms = deadline_ms;
         let logical_request = request.clone();
-        let mut restore_file = None;
+        let mut snapshot_files = if let Some(backup) = retained_snapshot_backup {
+            SnapshotFilesGuard::new(self.refresh_snapshot_transport(&mut request, backup)?)
+        } else if retained_identity_digest.is_none() && snapshot_transport_file(&request).is_some()
+        {
+            SnapshotFilesGuard::new(self.copy_snapshot_restore_file(&mut request)?)
+        } else if retained_identity_digest.is_none()
+            && request.op == Operation::SnapshotRestore
+            && inline_snapshot_bytes(&request)?.is_some()
+        {
+            SnapshotFilesGuard::new(self.externalize_snapshot_restore(&mut request)?)
+        } else {
+            SnapshotFilesGuard { files: None }
+        };
         let frame_bytes = match wire::encode_request(&request) {
             Ok(frame) => frame.len(),
             Err(wire::FrameError::Oversized { .. }) if request.op == Operation::SnapshotRestore => {
-                let path = self.externalize_snapshot_restore(&mut request)?;
-                restore_file = Some(path);
+                snapshot_files =
+                    SnapshotFilesGuard::new(self.externalize_snapshot_restore(&mut request)?);
                 match wire::encode_request(&request) {
                     Ok(frame) => frame.len(),
                     Err(wire::FrameError::Oversized { .. }) => {
-                        remove_transport_file(restore_file.as_deref());
                         return Err(ClientError::RequestTooLarge);
                     }
-                    Err(error) => {
-                        remove_transport_file(restore_file.as_deref());
-                        return Err(ClientError::Transport(error.to_string()));
-                    }
+                    Err(error) => return Err(ClientError::Transport(error.to_string())),
                 }
             }
             Err(wire::FrameError::Oversized { .. }) => return Err(ClientError::RequestTooLarge),
             Err(error) => return Err(ClientError::Transport(error.to_string())),
         };
+        let retention_reservation = self.admit_unknown(
+            &logical_request,
+            &request,
+            retained_identity_digest,
+            snapshot_files.as_ref(),
+        )?;
         if let Err(error) = self.reserve_bytes(frame_bytes) {
-            remove_transport_file(restore_file.as_deref());
             return Err(error);
         }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
@@ -270,12 +590,10 @@ impl WorkerClient {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
-                remove_transport_file(restore_file.as_deref());
                 return Err(ClientError::Busy);
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
-                remove_transport_file(restore_file.as_deref());
                 return Err(ClientError::OwnerStopped);
             }
         }
@@ -301,7 +619,20 @@ impl WorkerClient {
             };
             match response_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
                 Ok(result) => {
-                    break if (cancellation_seen || cancelled()) && result.is_ok() {
+                    // A worker-side cancellation reply is an authoritative
+                    // pre-commit no-effect result.  Preserve it even when
+                    // the caller cancellation races with reply delivery;
+                    // only a successful/unknown mutating reply remains
+                    // ambiguous after that race.
+                    let reply_can_be_indeterminate = matches!(
+                        &result,
+                        Ok(Reply {
+                            outcome: crate::engine::Outcome::Success
+                                | crate::engine::Outcome::EffectUnknown,
+                            ..
+                        })
+                    );
+                    break if (cancellation_seen || cancelled()) && reply_can_be_indeterminate {
                         Err(indeterminate_or(&request, ClientError::Cancelled))
                     } else {
                         result
@@ -314,21 +645,102 @@ impl WorkerClient {
         if let Ok(reply) = result {
             result = self.hydrate_snapshot_export(&request, reply);
         }
-        self.update_unknown(&logical_request, &result);
-        remove_transport_file(restore_file.as_deref());
+        result = normalize_result(&logical_request, &result);
+        let retention = self.update_unknown_with_retained(
+            &logical_request,
+            &request,
+            &result,
+            retained_identity_digest,
+            snapshot_files.as_ref(),
+            retention_reservation.reservation.as_ref(),
+        );
+        let retained = match retention {
+            Ok(retained) => retained,
+            Err(error) => return Err(error),
+        };
+        if retained {
+            // The bounded ledger now owns any prepared snapshot send/backup.
+            snapshot_files.disarm();
+        }
         result
     }
 
-    /// Replays the retained mutating request for an indeterminate idempotency key.
-    pub fn reconcile_unknown(&self, idempotency_key: &str) -> Result<Reply, ClientError> {
-        let request = self
-            .unknown
+    /// Replays the retained mutating request for an indeterminate namespace/key pair.
+    pub fn reconcile_unknown(
+        &self,
+        namespace: &str,
+        idempotency_key: &str,
+    ) -> Result<Reply, ClientError> {
+        let _reconcile_gate = self
+            .reconcile_gate
             .lock()
-            .map_err(|_| ClientError::OwnerStopped)?
-            .get(idempotency_key)
-            .cloned()
-            .ok_or(ClientError::UnknownIdempotencyKey)?;
-        self.call(request, self.reconciliation_deadline)
+            .map_err(|_| ClientError::OwnerStopped)?;
+        let (retained, fenced, fence_generation) = {
+            let unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+            let retained = unknown
+                .get(&(namespace.to_owned(), idempotency_key.to_owned()))
+                .cloned()
+                .ok_or(ClientError::UnknownIdempotencyKey)?;
+            (
+                retained,
+                self.fenced.load(Ordering::Acquire),
+                self.ledger_generation.load(Ordering::Acquire),
+            )
+        };
+        if fenced {
+            let deadline = Instant::now()
+                .checked_add(self.reconciliation_deadline)
+                .unwrap_or_else(Instant::now);
+            self.kill(deadline)?;
+            self.start(deadline)?;
+            let unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+            let current = unknown
+                .get(&(namespace.to_owned(), idempotency_key.to_owned()))
+                .cloned()
+                .ok_or(ClientError::UnknownIdempotencyKey)?;
+            if current.identity_digest != retained.identity_digest {
+                return Err(ClientError::UnknownRetentionConflict {
+                    op_id: current.request.id,
+                });
+            }
+            if self.ledger_generation.load(Ordering::Acquire) == fence_generation {
+                self.fenced.store(false, Ordering::Release);
+            }
+            drop(unknown);
+            // A concurrent request may have replaced another ledger entry
+            // while the owner was being restarted. Reconcile the current
+            // generation of this exact key, never a stale request snapshot.
+            return self.call_cancellable_with_identity(
+                current.request,
+                self.reconciliation_deadline,
+                Arc::new(|| false),
+                Some(&current.identity_digest),
+                current.snapshot_backup.as_deref(),
+            );
+        }
+        // The ledger lock above establishes the initial identity. Re-read it
+        // immediately before replay so a normal call that completed between
+        // the initial read and this point cannot clear or replay a different
+        // request under the same namespace/key.
+        let current = {
+            let unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+            unknown
+                .get(&(namespace.to_owned(), idempotency_key.to_owned()))
+                .cloned()
+                .ok_or(ClientError::UnknownIdempotencyKey)?
+        };
+        if current.identity_digest != retained.identity_digest {
+            return Err(ClientError::UnknownRetentionConflict {
+                op_id: current.request.id,
+            });
+        }
+        self.call_cancellable_with_identity(
+            current.request,
+            self.reconciliation_deadline,
+            Arc::new(|| false),
+            Some(&current.identity_digest),
+            current.snapshot_backup.as_deref(),
+        )
     }
 
     /// Current worker process identifier, or `None` while stopped/lazy.
@@ -337,6 +749,17 @@ impl WorkerClient {
         match self.pid.load(Ordering::Acquire) {
             0 => None,
             pid => Some(pid),
+        }
+    }
+
+    /// Monotonic owner incarnation for the currently or most recently spawned
+    /// worker process. It advances on every internal respawn, including when
+    /// the operating system reuses a process identifier.
+    #[must_use]
+    pub fn owner_incarnation(&self) -> Option<u64> {
+        match self.owner_incarnation.load(Ordering::Acquire) {
+            0 => None,
+            incarnation => Some(incarnation),
         }
     }
 
@@ -427,7 +850,10 @@ impl WorkerClient {
         }
     }
 
-    fn externalize_snapshot_restore(&self, request: &mut Request) -> Result<PathBuf, ClientError> {
+    fn externalize_snapshot_restore(
+        &self,
+        request: &mut Request,
+    ) -> Result<OwnedSnapshotFiles, ClientError> {
         let common = request
             .payload
             .pointer("/common_portability/action")
@@ -444,45 +870,35 @@ impl WorkerClient {
         if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_TRANSPORT_BYTES {
             return Err(ClientError::RequestTooLarge);
         }
-        let directory =
-            snapshot_directory(&self.root, &request.namespace).map_err(ClientError::Transport)?;
-        fs::create_dir_all(&directory).map_err(|error| {
-            ClientError::Transport(format!("create snapshot directory: {error}"))
-        })?;
-        let serial = NEXT_SNAPSHOT_FILE.fetch_add(1, Ordering::Relaxed);
-        let file_name = format!(
-            "restore-{}-{}-{serial}.json",
-            std::process::id(),
-            request.id
-        );
-        let snapshot_file = directory.join(file_name);
-        let temporary_file = directory.join(format!(
-            ".restore-{}-{}-{serial}.tmp",
-            std::process::id(),
-            request.id
-        ));
-        atomic_write(&temporary_file, &snapshot_file, &bytes).map_err(ClientError::Transport)?;
-        let byte_length = u64::try_from(bytes.len()).map_err(|_| ClientError::RequestTooLarge)?;
+        let (send_file, backup_file) = self.write_retained_snapshot_files(request, &bytes)?;
         let content_sha256 = sha256_hex(&bytes);
-        let object = (if common {
-            request
-                .payload
-                .get_mut("common_portability")
-                .and_then(Value::as_object_mut)
-        } else {
-            request.payload.as_object_mut()
-        })
-        .ok_or_else(|| {
-            ClientError::Transport("snapshot restore payload must be an object".to_owned())
-        })?;
-        object.remove(if common { "bytes" } else { "snapshot" });
-        object.insert(
-            "snapshot_file".to_owned(),
-            Value::String(snapshot_file.to_string_lossy().into_owned()),
-        );
-        object.insert("byte_length".to_owned(), Value::from(byte_length));
-        object.insert("content_sha256".to_owned(), Value::String(content_sha256));
-        Ok(snapshot_file)
+        if let Err(error) =
+            set_snapshot_transport(request, &send_file, bytes.len(), &content_sha256)
+        {
+            remove_transport_file(Some(&send_file));
+            remove_transport_file(Some(&backup_file));
+            return Err(error);
+        }
+        Ok(OwnedSnapshotFiles::both(send_file, backup_file))
+    }
+
+    fn copy_snapshot_restore_file(
+        &self,
+        request: &mut Request,
+    ) -> Result<OwnedSnapshotFiles, ClientError> {
+        let Some((source, byte_length, content_sha256)) = snapshot_file_metadata(request)? else {
+            return Err(ClientError::RequestTooLarge);
+        };
+        let bytes = read_caller_snapshot_file(&source, byte_length, &content_sha256)?;
+        let (send_file, backup_file) = self.write_retained_snapshot_files(request, &bytes)?;
+        if let Err(error) =
+            set_snapshot_transport(request, &send_file, bytes.len(), &content_sha256)
+        {
+            remove_transport_file(Some(&send_file));
+            remove_transport_file(Some(&backup_file));
+            return Err(error);
+        }
+        Ok(OwnedSnapshotFiles::both(send_file, backup_file))
     }
 
     fn hydrate_snapshot_export(
@@ -570,19 +986,790 @@ impl WorkerClient {
             .map_err(|_| ClientError::Busy)
     }
 
-    fn update_unknown(&self, request: &Request, result: &Result<Reply, ClientError>) {
-        let Some(key) = idempotency_key(request) else {
-            return;
+    fn admit_unknown(
+        &self,
+        identity_request: &Request,
+        retained_request: &Request,
+        retained_identity_digest: Option<&str>,
+        prepared_snapshot: Option<&OwnedSnapshotFiles>,
+    ) -> Result<RetentionReservationGuard, ClientError> {
+        let Some(idempotency_key) = idempotency_key(identity_request) else {
+            return Ok(RetentionReservationGuard::none(Arc::clone(&self.unknown)));
         };
-        let Ok(mut unknown) = self.unknown.lock() else {
-            return;
+        let identity_digest = match retained_identity_digest {
+            Some(digest) => digest.to_owned(),
+            None => request_identity_digest(identity_request)?,
         };
-        if matches!(result, Err(ClientError::EffectUnknown { .. })) {
-            unknown.insert(key.to_owned(), request.clone());
-        } else if result.is_ok() {
-            unknown.remove(key);
+        let bytes = retained_request_size(
+            retained_request,
+            &identity_digest,
+            prepared_snapshot.and_then(|files| files.backup_file.as_deref()),
+        )?;
+        let key = (
+            identity_request.namespace.clone(),
+            idempotency_key.to_owned(),
+        );
+        let mut unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+        match unknown.reserve(key, identity_digest, bytes) {
+            Ok(Some(reservation)) => Ok(RetentionReservationGuard::new(
+                Arc::clone(&self.unknown),
+                reservation,
+            )),
+            Ok(None) => Ok(RetentionReservationGuard::none(Arc::clone(&self.unknown))),
+            Err(RetentionError::Limit) => Err(ClientError::UnknownRetentionLimit {
+                op_id: identity_request.id,
+            }),
+            Err(RetentionError::Conflict) => Err(ClientError::UnknownRetentionConflict {
+                op_id: identity_request.id,
+            }),
+            Err(RetentionError::Busy) => Err(ClientError::Busy),
         }
     }
+
+    fn update_unknown_with_retained(
+        &self,
+        identity_request: &Request,
+        retained_request: &Request,
+        result: &Result<Reply, ClientError>,
+        retained_identity_digest: Option<&str>,
+        prepared_snapshot: Option<&OwnedSnapshotFiles>,
+        reservation: Option<&RetentionReservation>,
+    ) -> Result<bool, ClientError> {
+        let normalized_result = normalize_result(identity_request, result);
+        let result = &normalized_result;
+        let Some(idempotency_key) = idempotency_key(identity_request) else {
+            // There is no safe public replay route without a mutating
+            // idempotency key. In particular, a keyless read/handshake
+            // cancellation or ordinary terminal reply must never create a
+            // global fence that no caller can clear.
+            if let Some(reservation) = reservation {
+                self.release_unknown_reservation(reservation)?;
+            }
+            return Ok(false);
+        };
+        let key = (
+            identity_request.namespace.clone(),
+            idempotency_key.to_owned(),
+        );
+        let identity_digest = match retained_identity_digest {
+            Some(digest) => digest.to_owned(),
+            None => match request_identity_digest(identity_request) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    if let Some(reservation) = reservation {
+                        self.release_unknown_reservation(reservation)?;
+                    }
+                    return Err(error);
+                }
+            },
+        };
+
+        let should_retain = identity_request.op.is_mutating()
+            && matches!(
+                result,
+                Err(ClientError::EffectUnknown { .. })
+                    | Ok(Reply {
+                        outcome: crate::engine::Outcome::EffectUnknown,
+                        ..
+                    })
+            );
+        if should_retain {
+            let mut unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+            let existing = unknown.get(&key).cloned();
+            if existing
+                .as_ref()
+                .is_some_and(|retained| retained.identity_digest != identity_digest)
+            {
+                // The original retained request is the only request that may
+                // be replayed under this key. Keep it intact when a conflicting
+                // request reaches an uncertain outcome.
+                if let Some(reservation) = reservation {
+                    unknown.release_reservation(reservation);
+                }
+                return Err(ClientError::UnknownRetentionConflict {
+                    op_id: identity_request.id,
+                });
+            }
+            let (candidate, newly_owned) = match self.compact_retained_request(
+                identity_request,
+                retained_request,
+                &identity_digest,
+                existing.as_ref(),
+                prepared_snapshot,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    if let Some(reservation) = reservation {
+                        unknown.release_reservation(reservation);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(reservation) = reservation {
+                // The candidate is about to replace this reservation while
+                // the ledger lock is held, so release its provisional budget
+                // before applying the normal retain accounting.
+                unknown.release_reservation(reservation);
+            }
+            match unknown.retain(key, candidate.clone()) {
+                Ok(()) => {
+                    // A retained entry always has a real
+                    // namespace/idempotency route: reconciliation
+                    // replaces/fences the owner, proves readiness, and
+                    // replays this exact request. Set the global fence only
+                    // after the bounded ledger accepted that route.
+                    self.fenced.store(true, Ordering::Release);
+                    self.ledger_generation.fetch_add(1, Ordering::AcqRel);
+                    if let Some(previous) = existing {
+                        let previous_send = snapshot_transport_file(&previous.request);
+                        let candidate_send = snapshot_transport_file(&candidate.request);
+                        if previous_send != candidate_send {
+                            remove_transport_file(previous_send.as_deref());
+                        }
+                        if previous.snapshot_backup != candidate.snapshot_backup {
+                            cleanup_snapshot_backup(previous.snapshot_backup.as_deref());
+                        }
+                    }
+                    return Ok(true);
+                }
+                Err(RetentionError::Limit) => {
+                    cleanup_snapshot_files(&newly_owned);
+                    return Err(ClientError::UnknownRetentionLimit {
+                        op_id: identity_request.id,
+                    });
+                }
+                Err(RetentionError::Conflict) => {
+                    cleanup_snapshot_files(&newly_owned);
+                    return Err(ClientError::UnknownRetentionConflict {
+                        op_id: identity_request.id,
+                    });
+                }
+                Err(RetentionError::Busy) => {
+                    cleanup_snapshot_files(&newly_owned);
+                    return Err(ClientError::Busy);
+                }
+            }
+        }
+
+        if let Some(reservation) = reservation {
+            self.release_unknown_reservation(reservation)?;
+        }
+
+        let resolves_effect = match result {
+            Ok(Reply {
+                outcome: crate::engine::Outcome::Success,
+                ..
+            }) => true,
+            Ok(Reply {
+                outcome, payload, ..
+            }) if payload
+                .as_ref()
+                .is_some_and(|payload| durable_no_effect_proof(outcome, payload)) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if !resolves_effect {
+            // Busy, idempotency conflict, and a terminal result from a
+            // replay attempt are deliberately unresolved for an already
+            // retained request. A later reconciliation must still be able to
+            // replay the original request; a fresh known terminal result did
+            // not create an entry above.
+            let remains = self
+                .unknown
+                .lock()
+                .map_err(|_| ClientError::OwnerStopped)?
+                .contains_key(&key);
+            if remains {
+                // The replay did not prove an effect or a durable no-effect
+                // result. Keep the owner fenced so the next reconciliation
+                // starts with a fresh process and namespace handshake.
+                self.fenced.store(true, Ordering::Release);
+            }
+            return Ok(remains);
+        }
+
+        let mut unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+        let removed = unknown.remove_if_matches(&key, &identity_digest);
+        let ledger_empty = unknown.len() == 0;
+        if removed.is_some() {
+            self.ledger_generation.fetch_add(1, Ordering::AcqRel);
+            if ledger_empty {
+                self.fenced.store(false, Ordering::Release);
+            }
+        }
+        drop(unknown);
+        if let Some(removed) = removed {
+            cleanup_retained_snapshot(&removed);
+        }
+        Ok(false)
+    }
+
+    fn release_unknown_reservation(
+        &self,
+        reservation: &RetentionReservation,
+    ) -> Result<(), ClientError> {
+        let mut unknown = self.unknown.lock().map_err(|_| ClientError::OwnerStopped)?;
+        unknown.release_reservation(reservation);
+        Ok(())
+    }
+
+    fn compact_retained_request(
+        &self,
+        identity_request: &Request,
+        retained_request: &Request,
+        identity_digest: &str,
+        existing: Option<&RetainedRequest>,
+        prepared_snapshot: Option<&OwnedSnapshotFiles>,
+    ) -> Result<(RetainedRequest, Vec<OwnedSnapshotFiles>), ClientError> {
+        let mut request = retained_request.clone();
+        let mut newly_owned = Vec::new();
+        let mut snapshot_backup = prepared_snapshot
+            .and_then(|files| files.backup_file.clone())
+            .or_else(|| existing.and_then(|retained| retained.snapshot_backup.clone()));
+        if request.op == Operation::SnapshotRestore {
+            if prepared_snapshot.is_none()
+                && let Some(bytes) = inline_snapshot_bytes(identity_request)?
+            {
+                let (send_file, backup_file) =
+                    self.write_retained_snapshot_files(&request, &bytes)?;
+                if let Err(error) = set_snapshot_transport(
+                    &mut request,
+                    &send_file,
+                    bytes.len(),
+                    &sha256_hex(&bytes),
+                ) {
+                    remove_transport_file(Some(&send_file));
+                    remove_transport_file(Some(&backup_file));
+                    return Err(error);
+                }
+                snapshot_backup = Some(backup_file.clone());
+                newly_owned.push(OwnedSnapshotFiles::both(send_file, backup_file));
+            } else if prepared_snapshot.is_none()
+                && let Some(backup) = snapshot_backup.as_deref()
+            {
+                let files = self.refresh_snapshot_transport(&mut request, backup)?;
+                newly_owned.push(files);
+            } else if prepared_snapshot.is_none()
+                && let Some(source) = snapshot_transport_file(&request)
+            {
+                // `update_unknown` is also used by the focused client tests
+                // and by adapters that already received a wire reply.  When
+                // that path has not prepared a transport guard, validate and
+                // copy a caller-owned file before retaining it.  A retry of a
+                // previously retained request, by contrast, carries an
+                // internal send path and is handled by the backup branch.
+                let bytes = if is_snapshot_transport_path(&self.root, &request.namespace, &source) {
+                    if let Some((metadata_source, byte_length, content_sha256)) =
+                        snapshot_file_metadata(identity_request)?
+                    {
+                        if metadata_source != source {
+                            return Err(ClientError::Transport(
+                                "snapshot transport metadata path differs from request".to_owned(),
+                            ));
+                        }
+                        read_caller_snapshot_file(&source, byte_length, &content_sha256)?
+                    } else {
+                        fs::read(&source).map_err(|error| {
+                            ClientError::Transport(format!("read snapshot transport file: {error}"))
+                        })?
+                    }
+                } else {
+                    let (caller_source, byte_length, content_sha256) =
+                        snapshot_file_metadata(identity_request)?.ok_or_else(|| {
+                            ClientError::Transport(
+                                "snapshot transport metadata is missing".to_owned(),
+                            )
+                        })?;
+                    if caller_source != source {
+                        return Err(ClientError::Transport(
+                            "snapshot transport metadata path differs from request".to_owned(),
+                        ));
+                    }
+                    read_caller_snapshot_file(&caller_source, byte_length, &content_sha256)?
+                };
+                if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_TRANSPORT_BYTES {
+                    return Err(ClientError::RequestTooLarge);
+                }
+                let (send_file, backup_file) =
+                    self.write_retained_snapshot_files(&request, &bytes)?;
+                if let Err(error) = set_snapshot_transport(
+                    &mut request,
+                    &send_file,
+                    bytes.len(),
+                    &sha256_hex(&bytes),
+                ) {
+                    remove_transport_file(Some(&send_file));
+                    remove_transport_file(Some(&backup_file));
+                    return Err(error);
+                }
+                snapshot_backup = Some(backup_file.clone());
+                newly_owned.push(OwnedSnapshotFiles::both(send_file, backup_file));
+            }
+        }
+        let bytes =
+            match retained_request_size(&request, identity_digest, snapshot_backup.as_deref()) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    cleanup_snapshot_files(&newly_owned);
+                    return Err(error);
+                }
+            };
+        Ok((
+            RetainedRequest {
+                request,
+                identity_digest: identity_digest.to_owned(),
+                bytes,
+                snapshot_backup,
+            },
+            newly_owned,
+        ))
+    }
+
+    fn write_retained_snapshot_files(
+        &self,
+        request: &Request,
+        bytes: &[u8],
+    ) -> Result<(PathBuf, PathBuf), ClientError> {
+        let directory =
+            snapshot_directory(&self.root, &request.namespace).map_err(ClientError::Transport)?;
+        fs::create_dir_all(&directory).map_err(|error| {
+            ClientError::Transport(format!("create snapshot retention directory: {error}"))
+        })?;
+        let serial = NEXT_SNAPSHOT_FILE.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("retained-{}-{}-{serial}", std::process::id(), request.id);
+        let send_file = directory.join(format!("{prefix}.json"));
+        let backup_file = directory.join(format!("{prefix}.backup.json"));
+        if let Err(error) =
+            write_snapshot_file(&directory, &send_file, bytes, &format!("{prefix}.tmp"))
+        {
+            return Err(error);
+        }
+        if let Err(error) = write_snapshot_file(
+            &directory,
+            &backup_file,
+            bytes,
+            &format!("{prefix}.backup.tmp"),
+        ) {
+            remove_transport_file(Some(&send_file));
+            return Err(error);
+        }
+        Ok((send_file, backup_file))
+    }
+
+    fn refresh_snapshot_transport(
+        &self,
+        request: &mut Request,
+        backup: &Path,
+    ) -> Result<OwnedSnapshotFiles, ClientError> {
+        if !is_snapshot_transport_path(&self.root, &request.namespace, backup) {
+            return Err(ClientError::Transport(
+                "retained snapshot backup escapes namespace directory".to_owned(),
+            ));
+        }
+        let bytes = fs::read(backup).map_err(|error| {
+            ClientError::Transport(format!("read retained snapshot backup: {error}"))
+        })?;
+        if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_TRANSPORT_BYTES {
+            return Err(ClientError::RequestTooLarge);
+        }
+        if let Some((_, byte_length, content_sha256)) = snapshot_file_metadata(request)? {
+            let expected_length =
+                usize::try_from(byte_length).map_err(|_| ClientError::RequestTooLarge)?;
+            if bytes.len() != expected_length || sha256_hex(&bytes) != content_sha256 {
+                return Err(ClientError::Transport(
+                    "retained snapshot backup failed content verification".to_owned(),
+                ));
+            }
+        }
+        let directory =
+            snapshot_directory(&self.root, &request.namespace).map_err(ClientError::Transport)?;
+        fs::create_dir_all(&directory).map_err(|error| {
+            ClientError::Transport(format!("create snapshot retention directory: {error}"))
+        })?;
+        let serial = NEXT_SNAPSHOT_FILE.fetch_add(1, Ordering::Relaxed);
+        let destination = directory.join(format!(
+            "reconcile-{}-{}-{serial}.json",
+            std::process::id(),
+            request.id
+        ));
+        let temporary = format!(".reconcile-{}-{serial}.tmp", std::process::id());
+        write_snapshot_file(&directory, &destination, &bytes, &temporary)?;
+        let previous_send = snapshot_transport_file(request);
+        let digest = sha256_hex(&bytes);
+        if let Err(error) = set_snapshot_transport(request, &destination, bytes.len(), &digest) {
+            remove_transport_file(Some(&destination));
+            return Err(error);
+        }
+        if previous_send.as_deref() != Some(backup) {
+            remove_transport_file(previous_send.as_deref());
+        }
+        Ok(OwnedSnapshotFiles::send_only(destination))
+    }
+}
+
+fn inline_snapshot_bytes(request: &Request) -> Result<Option<Vec<u8>>, ClientError> {
+    let common = request
+        .payload
+        .pointer("/common_portability/action")
+        .is_some_and(|value| value == "snapshot_restore");
+    let snapshot = if common {
+        request.payload.pointer("/common_portability/bytes")
+    } else {
+        request.payload.get("snapshot")
+    };
+    snapshot
+        .cloned()
+        .map(|snapshot| {
+            serde_json::from_value(snapshot)
+                .map_err(|error| ClientError::Transport(format!("snapshot payload: {error}")))
+        })
+        .transpose()
+}
+
+fn snapshot_file_metadata(
+    request: &Request,
+) -> Result<Option<(PathBuf, u64, String)>, ClientError> {
+    if request.op != Operation::SnapshotRestore {
+        return Ok(None);
+    }
+    let common = request
+        .payload
+        .pointer("/common_portability/action")
+        .is_some_and(|value| value == "snapshot_restore");
+    let object = if common {
+        request.payload.get("common_portability")
+    } else {
+        Some(&request.payload)
+    }
+    .and_then(Value::as_object)
+    .ok_or_else(|| {
+        ClientError::Transport("snapshot restore payload must be an object".to_owned())
+    })?;
+    let Some(snapshot_file) = object.get("snapshot_file") else {
+        return Ok(None);
+    };
+    let path = snapshot_file
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| ClientError::Transport("snapshot file path must be a string".to_owned()))?;
+    let byte_length = object
+        .get("byte_length")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ClientError::Transport("snapshot file length is missing".to_owned()))?;
+    let content_sha256 = object
+        .get("content_sha256")
+        .and_then(Value::as_str)
+        .filter(|digest| is_sha256_hex(digest))
+        .ok_or_else(|| ClientError::Transport("snapshot file digest is invalid".to_owned()))?
+        .to_owned();
+    Ok(Some((path, byte_length, content_sha256)))
+}
+
+fn read_caller_snapshot_file(
+    path: &Path,
+    byte_length: u64,
+    content_sha256: &str,
+) -> Result<Vec<u8>, ClientError> {
+    if !path.is_absolute() {
+        return Err(ClientError::Transport(
+            "snapshot file path must be absolute".to_owned(),
+        ));
+    }
+    let expected_length = usize::try_from(byte_length).map_err(|_| ClientError::RequestTooLarge)?;
+    if expected_length == 0 || expected_length > MAX_SNAPSHOT_TRANSPORT_BYTES {
+        return Err(ClientError::RequestTooLarge);
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| ClientError::Transport(format!("read caller snapshot file: {error}")))?;
+    if bytes.len() != expected_length {
+        return Err(ClientError::Transport(
+            "caller snapshot file length differs from metadata".to_owned(),
+        ));
+    }
+    if sha256_hex(&bytes) != content_sha256 {
+        return Err(ClientError::Transport(
+            "caller snapshot file digest differs from metadata".to_owned(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn snapshot_transport_file(request: &Request) -> Option<PathBuf> {
+    if request.op != Operation::SnapshotRestore {
+        return None;
+    }
+    let common = request
+        .payload
+        .pointer("/common_portability/action")
+        .is_some_and(|value| value == "snapshot_restore");
+    let pointer = if common {
+        "/common_portability/snapshot_file"
+    } else {
+        "/snapshot_file"
+    };
+    request
+        .payload
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+}
+
+fn is_snapshot_transport_path(root: &Path, namespace: &str, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(directory) = snapshot_directory(root, namespace).ok() else {
+        return false;
+    };
+    let Ok(canonical_directory) = fs::canonicalize(directory) else {
+        return false;
+    };
+    let Ok(canonical_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    canonical_path.parent() == Some(canonical_directory.as_path())
+}
+
+fn set_snapshot_transport(
+    request: &mut Request,
+    destination: &Path,
+    byte_length: usize,
+    content_sha256: &str,
+) -> Result<(), ClientError> {
+    let common = request
+        .payload
+        .pointer("/common_portability/action")
+        .is_some_and(|value| value == "snapshot_restore");
+    let object = (if common {
+        request
+            .payload
+            .get_mut("common_portability")
+            .and_then(Value::as_object_mut)
+    } else {
+        request.payload.as_object_mut()
+    })
+    .ok_or_else(|| {
+        ClientError::Transport("snapshot restore payload must be an object".to_owned())
+    })?;
+    object.remove(if common { "bytes" } else { "snapshot" });
+    object.insert(
+        "snapshot_file".to_owned(),
+        Value::String(destination.to_string_lossy().into_owned()),
+    );
+    object.insert(
+        "byte_length".to_owned(),
+        Value::from(u64::try_from(byte_length).map_err(|_| ClientError::RequestTooLarge)?),
+    );
+    object.insert(
+        "content_sha256".to_owned(),
+        Value::String(content_sha256.to_owned()),
+    );
+    Ok(())
+}
+
+fn write_snapshot_file(
+    directory: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    temporary_name: &str,
+) -> Result<(), ClientError> {
+    atomic_write(&directory.join(temporary_name), destination, bytes)
+        .map_err(ClientError::Transport)
+}
+
+fn cleanup_snapshot_backup(path: Option<&Path>) {
+    remove_transport_file(path);
+}
+
+fn cleanup_snapshot_files(files: &[OwnedSnapshotFiles]) {
+    for files in files {
+        remove_transport_file(Some(&files.send_file));
+        cleanup_snapshot_backup(files.backup_file.as_deref());
+    }
+}
+
+fn cleanup_retained_snapshot(retained: &RetainedRequest) {
+    remove_transport_file(snapshot_transport_file(&retained.request).as_deref());
+    cleanup_snapshot_backup(retained.snapshot_backup.as_deref());
+}
+
+fn retained_request_size(
+    request: &Request,
+    identity_digest: &str,
+    snapshot_backup: Option<&Path>,
+) -> Result<usize, ClientError> {
+    let request_bytes = serde_json::to_vec(request)
+        .map_err(|error| ClientError::Transport(format!("serialize retained request: {error}")))?
+        .len();
+    request_bytes
+        .checked_add(identity_digest.len())
+        .and_then(|bytes| {
+            snapshot_transport_file(request)
+                .and_then(|path| path.to_str().map(str::len))
+                .unwrap_or(0)
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| {
+            snapshot_backup
+                .and_then(|path| path.to_str().map(str::len))
+                .unwrap_or(0)
+                .checked_add(bytes)
+        })
+        .ok_or(ClientError::UnknownRetentionLimit { op_id: request.id })
+}
+
+#[derive(serde::Serialize)]
+struct RequestIdentity<'a> {
+    protocol_version: u16,
+    op: Operation,
+    namespace: &'a str,
+    payload: &'a Value,
+}
+
+struct DigestSink(Sha256);
+
+impl Write for DigestSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request_identity_digest(request: &Request) -> Result<String, ClientError> {
+    let mut payload = request.payload.clone();
+    normalize_snapshot_transport_identity(request.op, &mut payload);
+    let identity = RequestIdentity {
+        protocol_version: request.protocol_version,
+        op: request.op,
+        namespace: &request.namespace,
+        payload: &payload,
+    };
+    let mut sink = DigestSink(Sha256::new());
+    serde_json::to_writer(&mut sink, &identity)
+        .map_err(|error| ClientError::Transport(format!("digest retained request: {error}")))?;
+    Ok(hex_digest(&sink.0.finalize()))
+}
+
+fn normalize_snapshot_transport_identity(operation: Operation, payload: &mut Value) {
+    if operation != Operation::SnapshotRestore {
+        return;
+    }
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(common) = object
+            .get_mut("common_portability")
+            .and_then(Value::as_object_mut)
+            && common.get("action").and_then(Value::as_str) == Some("snapshot_restore")
+        {
+            common.remove("snapshot_file");
+            return;
+        }
+        object.remove("snapshot_file");
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn normalize_result(
+    request: &Request,
+    result: &Result<Reply, ClientError>,
+) -> Result<Reply, ClientError> {
+    match result {
+        Ok(reply) => Ok(normalize_reply(request, reply.clone())),
+        Err(error) => Err(error.clone()),
+    }
+}
+
+fn normalize_reply(request: &Request, mut reply: Reply) -> Reply {
+    if request.op.is_mutating()
+        && reply.outcome == crate::engine::Outcome::Corrupt
+        && post_commit_corrupt_evidence(request, &reply)
+    {
+        reply.outcome = crate::engine::Outcome::EffectUnknown;
+        match reply.payload.as_mut() {
+            Some(payload) => {
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert("post_commit_corrupt".to_owned(), Value::Bool(true));
+                    object.insert("reconciliation_required".to_owned(), Value::Bool(true));
+                    object.insert("commit_seq".to_owned(), Value::from(reply.state_generation));
+                } else {
+                    reply.payload = Some(json!({
+                        "post_commit_corrupt": true,
+                        "reconciliation_required": true,
+                        "commit_seq": reply.state_generation,
+                    }));
+                }
+            }
+            None => {
+                reply.payload = Some(json!({
+                    "post_commit_corrupt": true,
+                    "reconciliation_required": true,
+                    "commit_seq": reply.state_generation,
+                }));
+            }
+        }
+    }
+    reply
+}
+
+fn post_commit_corrupt_evidence(request: &Request, reply: &Reply) -> bool {
+    if let Some(payload) = reply.payload.as_ref().and_then(Value::as_object) {
+        if [
+            "post_commit",
+            "post_commit_corrupt",
+            "committed",
+            "effect_unknown",
+            "reconciliation_required",
+        ]
+        .iter()
+        .any(|field| payload.get(*field).and_then(Value::as_bool) == Some(true))
+        {
+            return true;
+        }
+        if payload
+            .get("commit_seq")
+            .and_then(Value::as_u64)
+            .is_some_and(|sequence| sequence == reply.state_generation && sequence > 0)
+        {
+            return true;
+        }
+    }
+    let Some(expected) = expected_generation(request) else {
+        return false;
+    };
+    reply.state_generation > expected
+}
+
+fn expected_generation(request: &Request) -> Option<u64> {
+    request
+        .payload
+        .get("expected_generation")
+        .or_else(|| {
+            request
+                .payload
+                .pointer("/common_control/expected_generation")
+        })
+        .or_else(|| {
+            request
+                .payload
+                .pointer("/common_portability/expected_generation")
+        })
+        .and_then(Value::as_u64)
+}
+
+fn durable_no_effect_proof(_outcome: &crate::engine::Outcome, payload: &Value) -> bool {
+    payload
+        .get("durable_no_effect")
+        .and_then(Value::as_bool)
+        .or_else(|| payload.get("no_effect").and_then(Value::as_bool))
+        == Some(true)
 }
 
 fn snapshot_directory(root: &Path, namespace: &str) -> Result<PathBuf, String> {
@@ -721,6 +1908,15 @@ impl Drop for WorkerClient {
         {
             let _ = owner.join();
         }
+        if let Ok(mut unknown) = self.unknown.lock() {
+            let retained = std::mem::take(&mut unknown.entries);
+            unknown.bytes = 0;
+            unknown.reservations.clear();
+            unknown.reserved_bytes = 0;
+            for retained in retained.into_values() {
+                cleanup_retained_snapshot(&retained);
+            }
+        }
     }
 }
 
@@ -745,6 +1941,139 @@ fn idempotency_key(request: &Request) -> Option<&str> {
 mod tests {
     use super::*;
 
+    fn test_client() -> WorkerClient {
+        let (calls, _receiver) = mpsc::sync_channel(1);
+        WorkerClient {
+            calls,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            unknown: Arc::new(Mutex::new(UnknownRequests::default())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            owner: Mutex::new(None),
+            pid: Arc::new(AtomicU32::new(0)),
+            owner_incarnation: Arc::new(AtomicU64::new(0)),
+            fenced: Arc::new(AtomicBool::new(false)),
+            ledger_generation: AtomicU64::new(0),
+            reconcile_gate: Mutex::new(()),
+            reconciliation_deadline: Duration::from_secs(1),
+            root: PathBuf::from("/"),
+            lifecycle: Arc::new(LifecycleState::default()),
+        }
+    }
+
+    fn test_client_with_owner(
+        outcomes: Vec<crate::engine::Outcome>,
+    ) -> (WorkerClient, Arc<Mutex<Vec<Operation>>>) {
+        let (calls, receiver): (SyncSender<OwnerCommand>, Receiver<OwnerCommand>) =
+            mpsc::sync_channel(MAX_QUEUED_REQUESTS);
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pid = Arc::new(AtomicU32::new(0));
+        let owner_incarnation = Arc::new(AtomicU64::new(0));
+        let lifecycle = Arc::new(LifecycleState::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let owner_events = Arc::clone(&events);
+        let owner_shutdown = Arc::clone(&shutdown);
+        let owner_pid = Arc::clone(&pid);
+        let owner_incarnations = Arc::clone(&owner_incarnation);
+        let owner_queued_bytes = Arc::clone(&queued_bytes);
+        let owner_lifecycle = Arc::clone(&lifecycle);
+        let owner = thread::spawn(move || {
+            let mut process_alive = false;
+            let outcomes = Mutex::new(outcomes);
+            while !owner_shutdown.load(Ordering::Acquire) {
+                let requested = owner_lifecycle.requested.load(Ordering::Acquire);
+                if requested > owner_lifecycle.completed.load(Ordering::Acquire) {
+                    process_alive = false;
+                    owner_pid.store(0, Ordering::Release);
+                    owner_lifecycle
+                        .completed
+                        .store(requested, Ordering::Release);
+                }
+                let command: OwnerCommand = match receiver.recv_timeout(Duration::from_millis(2)) {
+                    Ok(command) => command,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                owner_queued_bytes.fetch_sub(command.queued_bytes, Ordering::AcqRel);
+                if command.cancelled() {
+                    let _ = command.response.send(Err(ClientError::Cancelled));
+                    continue;
+                }
+                owner_events
+                    .lock()
+                    .expect("owner events lock")
+                    .push(command.request.op);
+                let outcome = if command.request.op == Operation::Handshake {
+                    if !process_alive {
+                        owner_incarnations.fetch_add(1, Ordering::AcqRel);
+                    }
+                    process_alive = true;
+                    owner_pid.store(123, Ordering::Release);
+                    crate::engine::Outcome::Success
+                } else {
+                    outcomes
+                        .lock()
+                        .expect("owner outcomes lock")
+                        .pop()
+                        .unwrap_or(crate::engine::Outcome::Success)
+                };
+                let _ = command.response.send(Ok(Reply {
+                    id: command.request.id,
+                    outcome,
+                    state_generation: 1,
+                    payload: None,
+                    error: None,
+                }));
+            }
+        });
+        (
+            WorkerClient {
+                calls,
+                queued_bytes,
+                unknown: Arc::new(Mutex::new(UnknownRequests::default())),
+                shutdown,
+                owner: Mutex::new(Some(owner)),
+                pid,
+                owner_incarnation,
+                fenced: Arc::new(AtomicBool::new(false)),
+                ledger_generation: AtomicU64::new(0),
+                reconcile_gate: Mutex::new(()),
+                reconciliation_deadline: Duration::from_secs(1),
+                root: PathBuf::from("/"),
+                lifecycle,
+            },
+            events,
+        )
+    }
+
+    fn mutating_request(namespace: &str, idempotency_key: &str) -> Request {
+        Request::new(
+            1,
+            1_000,
+            Operation::Observe,
+            namespace,
+            json!({"idempotency_key": idempotency_key}),
+        )
+    }
+
+    fn wire_reply(outcome: crate::engine::Outcome) -> Reply {
+        Reply {
+            id: 1,
+            outcome,
+            state_generation: 1,
+            payload: None,
+            error: None,
+        }
+    }
+
+    fn update_unknown(
+        client: &WorkerClient,
+        request: &Request,
+        result: &Result<Reply, ClientError>,
+    ) -> Result<bool, ClientError> {
+        client.update_unknown_with_retained(request, request, result, None, None, None)
+    }
+
     #[test]
     fn spawn_requires_an_absolute_worker_path() {
         let root = tempfile::tempdir().expect("state root");
@@ -767,6 +2096,749 @@ mod tests {
             }),
         );
         assert_eq!(idempotency_key(&request), Some("common-key"));
+    }
+
+    #[test]
+    fn wire_effect_unknown_is_retained_until_reconciliation_resolves_it() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "committed-unknown");
+        let retained_key = (request.namespace.clone(), "committed-unknown".to_owned());
+
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+        assert!(
+            client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+
+        // Cancellation of a replay attempt does not resolve the original
+        // unknown effect; it also does not create a second retained entry.
+        let _ = update_unknown(&client, &request, &Err(ClientError::Cancelled));
+        assert!(
+            client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::Success)),
+        );
+        assert!(
+            !client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+        assert!(!client.fenced.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn fresh_unavailable_and_cancelled_replies_do_not_create_a_fence() {
+        let client = test_client();
+        let unavailable = mutating_request("namespace-a", "wire-unavailable");
+        assert!(
+            !update_unknown(
+                &client,
+                &unavailable,
+                &Ok(wire_reply(crate::engine::Outcome::Unavailable(
+                    "worker unavailable".to_owned(),
+                )))
+            )
+            .expect("fresh wire unavailable is a known non-effect")
+        );
+
+        let corrupt = mutating_request("namespace-a", "wire-corrupt");
+        assert!(
+            !update_unknown(
+                &client,
+                &corrupt,
+                &Ok(wire_reply(crate::engine::Outcome::Corrupt))
+            )
+            .expect("pre-effect corrupt remains ordinary")
+        );
+
+        let cancelled = mutating_request("namespace-a", "wire-cancelled");
+        assert!(
+            !update_unknown(
+                &client,
+                &cancelled,
+                &Ok(wire_reply(crate::engine::Outcome::Cancelled))
+            )
+            .expect("worker cancellation is known no effect")
+        );
+
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        assert!(unknown.entries.is_empty());
+        assert!(unknown.reservations.is_empty());
+        drop(unknown);
+        assert!(!client.fenced.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn same_idempotency_key_is_retained_and_cleared_per_namespace() {
+        let client = test_client();
+        let first = mutating_request("namespace-a", "shared-key");
+        let second = mutating_request("namespace-b", "shared-key");
+        let unknown = Ok(wire_reply(crate::engine::Outcome::EffectUnknown));
+        let _ = update_unknown(&client, &first, &unknown);
+        let _ = update_unknown(&client, &second, &unknown);
+
+        let unknown_requests = client.unknown.lock().expect("unknown requests lock");
+        assert_eq!(unknown_requests.len(), 2);
+        assert_eq!(
+            unknown_requests
+                .get(&(first.namespace.clone(), "shared-key".to_owned()))
+                .map(|retained| &retained.request),
+            Some(&first)
+        );
+        assert_eq!(
+            unknown_requests
+                .get(&(second.namespace.clone(), "shared-key".to_owned()))
+                .map(|retained| &retained.request),
+            Some(&second)
+        );
+        drop(unknown_requests);
+
+        let _ = update_unknown(
+            &client,
+            &first,
+            &Ok(wire_reply(crate::engine::Outcome::Success)),
+        );
+        let unknown_requests = client.unknown.lock().expect("unknown requests lock");
+        assert!(!unknown_requests.contains_key(&(first.namespace, "shared-key".to_owned())));
+        assert!(unknown_requests.contains_key(&(second.namespace, "shared-key".to_owned())));
+    }
+
+    #[test]
+    fn conflicting_same_key_reply_cannot_clear_the_original_request() {
+        let client = test_client();
+        let original = mutating_request("namespace-a", "same-key");
+        let mut conflicting = mutating_request("namespace-a", "same-key");
+        conflicting.payload["value"] = json!("different effect");
+
+        let _ = update_unknown(
+            &client,
+            &original,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+        let _ = update_unknown(
+            &client,
+            &conflicting,
+            &Ok(wire_reply(crate::engine::Outcome::Success)),
+        );
+        assert_eq!(
+            update_unknown(
+                &client,
+                &conflicting,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            ),
+            Err(ClientError::UnknownRetentionConflict {
+                op_id: conflicting.id
+            })
+        );
+
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        let retained = unknown
+            .get(&(original.namespace.clone(), "same-key".to_owned()))
+            .expect("original request remains retained");
+        assert_eq!(retained.request, original);
+        assert_ne!(
+            retained.identity_digest.as_str(),
+            request_identity_digest(&conflicting).expect("conflicting digest")
+        );
+    }
+
+    #[test]
+    fn request_digest_ignores_transport_id_and_deadline_but_covers_effect_payload() {
+        let first = mutating_request("namespace-a", "same-key");
+        let mut retry = first.clone();
+        retry.id = 99;
+        retry.deadline_ms = 7;
+        assert_eq!(
+            request_identity_digest(&first).expect("first digest"),
+            request_identity_digest(&retry).expect("retry digest")
+        );
+
+        retry.payload["value"] = json!("different effect");
+        assert_ne!(
+            request_identity_digest(&first).expect("first digest"),
+            request_identity_digest(&retry).expect("conflicting digest")
+        );
+
+        let file_request = Request::new(
+            1,
+            1_000,
+            Operation::SnapshotRestore,
+            "namespace-a",
+            json!({
+                "idempotency_key": "snapshot-key",
+                "snapshot_file": "/caller/first.snapshot",
+                "byte_length": 4,
+                "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }),
+        );
+        let mut retry_file = file_request.clone();
+        retry_file.payload["snapshot_file"] = json!("/caller/retry.snapshot");
+        assert_eq!(
+            request_identity_digest(&file_request).expect("file digest"),
+            request_identity_digest(&retry_file).expect("retry file digest")
+        );
+    }
+
+    #[test]
+    fn busy_and_idempotency_conflict_replies_keep_the_retained_request() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "busy-key");
+        let retained_key = (request.namespace.clone(), "busy-key".to_owned());
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::Busy)),
+        );
+        assert!(
+            client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::Rejected(
+                crate::engine::RejectReason::IdempotencyConflict,
+            ))),
+        );
+        assert!(
+            client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+    }
+
+    #[test]
+    fn only_authoritative_success_or_durable_no_effect_resolves_unknown() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "resolution-key");
+        let retained_key = (request.namespace.clone(), "resolution-key".to_owned());
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+
+        for outcome in [
+            crate::engine::Outcome::Incompatible,
+            crate::engine::Outcome::Unsupported,
+            crate::engine::Outcome::BudgetExceeded,
+            crate::engine::Outcome::Corrupt,
+            crate::engine::Outcome::Rejected(crate::engine::RejectReason::InvalidRequest(
+                "current request is invalid".to_owned(),
+            )),
+            crate::engine::Outcome::Rejected(crate::engine::RejectReason::SourceRevoked),
+            crate::engine::Outcome::Rejected(crate::engine::RejectReason::IdempotencyConflict),
+            crate::engine::Outcome::Rejected(crate::engine::RejectReason::UnknownRecord(7)),
+        ] {
+            let _ = update_unknown(&client, &request, &Ok(wire_reply(outcome)));
+            assert!(
+                client
+                    .unknown
+                    .lock()
+                    .expect("unknown requests lock")
+                    .contains_key(&retained_key)
+            );
+        }
+
+        let mut no_effect = wire_reply(crate::engine::Outcome::Empty);
+        no_effect.payload = Some(json!({"durable_no_effect": true}));
+        let _ = update_unknown(&client, &request, &Ok(no_effect));
+        assert!(
+            !client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+    }
+
+    #[test]
+    fn post_commit_corrupt_is_normalized_but_pre_effect_corrupt_stays_ordinary() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "corrupt-key");
+
+        let pre_effect = wire_reply(crate::engine::Outcome::Corrupt);
+        let normalized = normalize_result(&request, &Ok(pre_effect.clone()))
+            .expect("pre-effect reply normalizes");
+        assert_eq!(normalized.outcome, crate::engine::Outcome::Corrupt);
+        assert!(
+            !update_unknown(&client, &request, &Ok(pre_effect))
+                .expect("pre-effect corrupt is ordinary")
+        );
+
+        let mut post_commit = wire_reply(crate::engine::Outcome::Corrupt);
+        post_commit.payload = Some(json!({"committed": true}));
+        let normalized = normalize_result(&request, &Ok(post_commit.clone()))
+            .expect("post-commit reply normalizes");
+        assert_eq!(normalized.outcome, crate::engine::Outcome::EffectUnknown);
+        assert_eq!(
+            normalized.payload.as_ref().unwrap()["reconciliation_required"],
+            true
+        );
+        assert!(
+            update_unknown(&client, &request, &Ok(post_commit))
+                .expect("post-commit corrupt is retained")
+        );
+    }
+
+    #[test]
+    fn wire_uncertain_replies_keep_an_existing_replay_route() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "fenced-key");
+        let retained_key = (request.namespace.clone(), "fenced-key".to_owned());
+        assert!(
+            update_unknown(
+                &client,
+                &request,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            )
+            .expect("initial uncertainty is retained")
+        );
+        for outcome in [
+            crate::engine::Outcome::Unavailable("fenced worker".to_owned()),
+            crate::engine::Outcome::Corrupt,
+            crate::engine::Outcome::Cancelled,
+        ] {
+            assert!(
+                update_unknown(&client, &request, &Ok(wire_reply(outcome)))
+                    .expect("uncertain replay outcome remains retained")
+            );
+            assert!(
+                client
+                    .unknown
+                    .lock()
+                    .expect("unknown requests lock")
+                    .contains_key(&retained_key)
+            );
+        }
+    }
+
+    #[test]
+    fn keyless_read_and_handshake_terminals_never_fence_or_replay() {
+        let (client, events) = test_client_with_owner(vec![]);
+        for operation in [Operation::Handshake, Operation::Recall, Operation::Health] {
+            for outcome in [
+                crate::engine::Outcome::Cancelled,
+                crate::engine::Outcome::Unavailable("worker unavailable".to_owned()),
+                crate::engine::Outcome::Corrupt,
+            ] {
+                let request = Request::new(7, 1_000, operation, "namespace-a", json!({}));
+                assert!(
+                    !update_unknown(&client, &request, &Ok(wire_reply(outcome)))
+                        .expect("keyless terminal outcome is not retained")
+                );
+            }
+        }
+        assert!(!client.fenced.load(Ordering::Acquire));
+        assert_eq!(
+            client.reconcile_unknown("namespace-a", "missing-key"),
+            Err(ClientError::UnknownIdempotencyKey)
+        );
+        assert!(events.lock().expect("owner events lock").is_empty());
+    }
+
+    #[test]
+    fn wire_uncertain_reconciliation_replaces_worker_before_resolving() {
+        let (client, events) = test_client_with_owner(vec![]);
+        let request = mutating_request("namespace-a", "replace-key");
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+
+        let reply = client
+            .reconcile_unknown("namespace-a", "replace-key")
+            .expect("replacement owner resolves retained request");
+        assert_eq!(reply.outcome, crate::engine::Outcome::Success);
+        assert_eq!(
+            events.lock().expect("owner events lock").as_slice(),
+            &[Operation::Handshake, Operation::Observe]
+        );
+        assert_eq!(client.owner_incarnation(), Some(1));
+        assert!(!client.fenced.load(Ordering::Acquire));
+        assert!(
+            !client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&("namespace-a".to_owned(), "replace-key".to_owned()))
+        );
+    }
+
+    #[test]
+    fn busy_reconciliation_keeps_unknown_until_a_later_resolution() {
+        // Outcomes are consumed from the end so the first observe receives
+        // Busy and the second receives Success.
+        let (client, _events) = test_client_with_owner(vec![
+            crate::engine::Outcome::Success,
+            crate::engine::Outcome::Busy,
+        ]);
+        let request = mutating_request("namespace-a", "busy-reconcile");
+        let retained_key = (request.namespace.clone(), "busy-reconcile".to_owned());
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+
+        let busy = client
+            .reconcile_unknown("namespace-a", "busy-reconcile")
+            .expect("busy reply is typed on reconciliation");
+        assert_eq!(busy.outcome, crate::engine::Outcome::Busy);
+        assert!(
+            client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+
+        let resolved = client
+            .reconcile_unknown("namespace-a", "busy-reconcile")
+            .expect("later reconciliation resolves busy request");
+        assert_eq!(resolved.outcome, crate::engine::Outcome::Success);
+        assert!(
+            !client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .contains_key(&retained_key)
+        );
+    }
+
+    #[test]
+    fn busy_snapshot_reconciliation_cleans_refreshed_send_but_keeps_backup() {
+        let root = tempfile::tempdir().expect("snapshot root");
+        let namespace = "c".repeat(64);
+        let (mut client, _events) = test_client_with_owner(vec![
+            crate::engine::Outcome::Success,
+            crate::engine::Outcome::Busy,
+        ]);
+        client.root = root.path().to_path_buf();
+        let bytes = b"snapshot for busy reconciliation".to_vec();
+        let request = Request::new(
+            12,
+            1_000,
+            Operation::SnapshotRestore,
+            &namespace,
+            json!({
+                "idempotency_key": "snapshot-busy",
+                "snapshot": bytes,
+                "blocked_sources": [],
+            }),
+        );
+        assert!(
+            update_unknown(
+                &client,
+                &request,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            )
+            .expect("snapshot request is retained")
+        );
+        let directory = root
+            .path()
+            .join("namespaces")
+            .join(&namespace)
+            .join("snapshots");
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("snapshot directory")
+                .count(),
+            2
+        );
+
+        let busy = client
+            .reconcile_unknown(&namespace, "snapshot-busy")
+            .expect("busy reply is returned");
+        assert_eq!(busy.outcome, crate::engine::Outcome::Busy);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("snapshot directory after busy")
+                .count(),
+            1,
+            "the refreshed send file is cleaned while the existing backup remains"
+        );
+
+        let resolved = client
+            .reconcile_unknown(&namespace, "snapshot-busy")
+            .expect("later replay resolves the retained snapshot");
+        assert_eq!(resolved.outcome, crate::engine::Outcome::Success);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("snapshot directory after success")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_reconciliation_of_one_key_has_one_authoritative_replay() {
+        let (client, events) = test_client_with_owner(vec![crate::engine::Outcome::Success]);
+        let client = Arc::new(client);
+        let request = mutating_request("namespace-a", "serialized-reconcile");
+        assert!(
+            update_unknown(
+                &client,
+                &request,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            )
+            .expect("request is retained")
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = Arc::clone(&client);
+            handles.push(thread::spawn(move || {
+                client.reconcile_unknown("namespace-a", "serialized-reconcile")
+            }));
+        }
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reconciliation thread joins"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_ok_and(|reply| reply.outcome == crate::engine::Outcome::Success))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, &&Err(ClientError::UnknownIdempotencyKey)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events.lock().expect("owner events lock").as_slice(),
+            &[Operation::Handshake, Operation::Observe]
+        );
+    }
+
+    #[test]
+    fn retained_unknown_ledger_refuses_entries_and_bytes_over_its_bounds() {
+        let client = test_client();
+        for index in 0..MAX_RETAINED_UNKNOWN_ENTRIES {
+            let key = format!("bounded-{index}");
+            let request = mutating_request("namespace-a", &key);
+            let result = update_unknown(
+                &client,
+                &request,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            );
+            assert!(result.is_ok(), "entry {index} should fit: {result:?}");
+        }
+        let overflow = mutating_request("namespace-a", "bounded-overflow");
+        assert_eq!(
+            update_unknown(
+                &client,
+                &overflow,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            ),
+            Err(ClientError::UnknownRetentionLimit { op_id: overflow.id })
+        );
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        assert_eq!(unknown.len(), MAX_RETAINED_UNKNOWN_ENTRIES);
+        assert!(unknown.bytes <= MAX_RETAINED_UNKNOWN_BYTES);
+        drop(unknown);
+
+        let bytes_client = test_client();
+        let mut oversized = mutating_request("namespace-a", "bounded-bytes");
+        oversized.payload["padding"] = Value::String("x".repeat(MAX_RETAINED_UNKNOWN_BYTES + 1));
+        assert!(matches!(
+            bytes_client.admit_unknown(&oversized, &oversized, None),
+            Err(ClientError::UnknownRetentionLimit { op_id }) if op_id == oversized.id
+        ));
+        assert_eq!(
+            update_unknown(
+                &bytes_client,
+                &oversized,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            ),
+            Err(ClientError::UnknownRetentionLimit {
+                op_id: oversized.id
+            })
+        );
+        assert_eq!(
+            bytes_client
+                .unknown
+                .lock()
+                .expect("unknown requests lock")
+                .len(),
+            0
+        );
+        let unknown = bytes_client.unknown.lock().expect("unknown requests lock");
+        assert!(unknown.reservations.is_empty());
+        assert_eq!(unknown.reserved_bytes, 0);
+        drop(unknown);
+        assert!(!bytes_client.fenced.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn retention_entry_overflow_is_rejected_before_worker_dispatch() {
+        let (client, events) = test_client_with_owner(Vec::new());
+        for index in 0..MAX_RETAINED_UNKNOWN_ENTRIES {
+            let key = format!("admission-{index}");
+            let request = mutating_request("namespace-a", &key);
+            assert!(
+                update_unknown(
+                    &client,
+                    &request,
+                    &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+                )
+                .expect("ledger entry fits")
+            );
+        }
+
+        let overflow = mutating_request("namespace-a", "admission-overflow");
+        assert_eq!(
+            client.call(overflow.clone(), Duration::from_secs(1)),
+            Err(ClientError::UnknownRetentionLimit { op_id: overflow.id })
+        );
+        assert!(
+            events.lock().expect("owner events lock").is_empty(),
+            "a request rejected by retention admission must not reach the worker"
+        );
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        assert_eq!(unknown.len(), MAX_RETAINED_UNKNOWN_ENTRIES);
+        assert!(unknown.reservations.is_empty());
+        assert_eq!(unknown.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn retention_reservation_is_released_when_mailbox_send_fails() {
+        let client = test_client();
+        let request = mutating_request("namespace-a", "disconnected-admission");
+        assert_eq!(
+            client.call(request, Duration::from_secs(1)),
+            Err(ClientError::OwnerStopped)
+        );
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        assert!(unknown.reservations.is_empty());
+        assert_eq!(unknown.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn snapshot_retention_keeps_payload_on_disk_and_bounds_memory() {
+        let root = tempfile::tempdir().expect("snapshot root");
+        let mut client = test_client();
+        client.root = root.path().to_path_buf();
+        let namespace = "a".repeat(64);
+        let bytes = vec![7_u8; 32 * 1024];
+        let request = Request::new(
+            9,
+            1_000,
+            Operation::SnapshotRestore,
+            &namespace,
+            json!({
+                "idempotency_key": "snapshot-bounded",
+                "snapshot": bytes,
+            }),
+        );
+        let _ = update_unknown(
+            &client,
+            &request,
+            &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+        );
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        let retained = unknown
+            .get(&(namespace.clone(), "snapshot-bounded".to_owned()))
+            .expect("snapshot request remains retained");
+        assert!(retained.bytes < 4 * 1024);
+        assert!(retained.snapshot_backup.is_some());
+        assert!(snapshot_transport_file(&retained.request).is_some());
+        assert!(unknown.bytes <= MAX_RETAINED_UNKNOWN_BYTES);
+    }
+
+    #[test]
+    fn caller_snapshot_file_is_copied_before_unknown_retention() {
+        let root = tempfile::tempdir().expect("snapshot root");
+        let caller = tempfile::tempdir().expect("caller root");
+        let mut client = test_client();
+        client.root = root.path().to_path_buf();
+        let namespace = "b".repeat(64);
+        let bytes = b"caller-owned snapshot bytes".to_vec();
+        let source = caller.path().join("restore.snapshot");
+        fs::write(&source, &bytes).expect("caller snapshot writes");
+        let request = Request::new(
+            10,
+            1_000,
+            Operation::SnapshotRestore,
+            &namespace,
+            json!({
+                "idempotency_key": "caller-file",
+                "snapshot_file": source,
+                "byte_length": bytes.len(),
+                "content_sha256": sha256_hex(&bytes),
+                "blocked_sources": [],
+            }),
+        );
+        assert!(
+            update_unknown(
+                &client,
+                &request,
+                &Ok(wire_reply(crate::engine::Outcome::EffectUnknown)),
+            )
+            .expect("caller snapshot is retained")
+        );
+        assert!(source.exists(), "caller-owned source remains available");
+        let unknown = client.unknown.lock().expect("unknown requests lock");
+        let retained = unknown
+            .get(&(namespace.clone(), "caller-file".to_owned()))
+            .expect("caller snapshot request remains retained");
+        let retained_send = snapshot_transport_file(&retained.request)
+            .expect("retained request uses a client-owned send file");
+        assert_ne!(retained_send, source);
+        let backup = retained
+            .snapshot_backup
+            .as_ref()
+            .expect("retained request has a durable backup");
+        assert!(retained_send.exists());
+        assert!(backup.exists());
+        assert_eq!(
+            fs::read_dir(
+                root.path()
+                    .join("namespaces")
+                    .join(&namespace)
+                    .join("snapshots")
+            )
+            .expect("retained snapshot directory")
+            .count(),
+            2
+        );
     }
 }
 
@@ -791,6 +2863,7 @@ fn owner_loop(
     calls: Receiver<OwnerCommand>,
     shutdown: Arc<AtomicBool>,
     pid: Arc<AtomicU32>,
+    owner_incarnation: Arc<AtomicU64>,
     queued_bytes: Arc<AtomicUsize>,
     launch: Launch,
     lifecycle: Arc<LifecycleState>,
@@ -822,7 +2895,10 @@ fn owner_loop(
                 continue;
             }
             match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
-                Ok(worker) => process = Some(worker),
+                Ok(worker) => {
+                    owner_incarnation.fetch_add(1, Ordering::AcqRel);
+                    process = Some(worker);
+                }
                 Err(error) => {
                     if matches!(&error, ClientError::Unavailable(_)) {
                         let _ = command.response.send(Err(error));
@@ -858,6 +2934,7 @@ fn owner_loop(
             {
                 match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
                     Ok(worker) => {
+                        owner_incarnation.fetch_add(1, Ordering::AcqRel);
                         process = Some(worker);
                         result = match process.as_mut() {
                             Some(worker) => execute_owner_command(worker, &command, &shutdown),
