@@ -750,7 +750,6 @@ impl MiniLmEncoder {
         ensure_manifest_is_pinned(&reference)?;
         ensure_pinned_metadata(expected, &reference)?;
         ensure_pinned_metadata(&reference, expected)?;
-        model_lifecycle::verify_installed(root)?;
 
         let models_dir = root.models_dir();
         let local = read_manifest(&models_dir.join(MANIFEST_FILENAME), true)?;
@@ -773,6 +772,7 @@ impl MiniLmEncoder {
             // window that could otherwise load bytes different from the ones
             // that were hashed.
             let model = load_verified_model(&models_dir, &local)?;
+            model_lifecycle::verify_installed_receipt(root)?;
             let model = fastembed::TextEmbedding::try_new_from_user_defined(
                 model,
                 fastembed::InitOptionsUserDefined::new().with_max_length(MAX_LENGTH),
@@ -786,7 +786,7 @@ impl MiniLmEncoder {
 
         #[cfg(not(feature = "real-encoder"))]
         {
-            verify_local_artifacts(&models_dir, &local, Some(expected.revision.as_str()))?;
+            model_lifecycle::verify_installed(root)?;
             let _ = identity;
             Err(EncoderError::ArtifactsMissing(
                 "real-encoder feature is disabled".to_owned(),

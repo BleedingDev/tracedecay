@@ -1152,22 +1152,25 @@ fn recover_journal(
 /// Verifies the complete published release tree and its durable acquisition
 /// receipt without constructing an inference session.
 pub(crate) fn verify_installed(root: &StateRoot) -> Result<(), EncoderError> {
+    let expected = ModelAcquisitionManifest::reference()?.pinned_encoder()?;
+    validate_candidate_structure(&root.models_dir(), &expected)?;
+    verify_installed_receipt(root)
+}
+
+/// Verifies the published tree layout and binds its one content digest to the
+/// durable acquisition receipt. Callers that load the model verify the pinned
+/// artifact bytes themselves; a tree changed after that load no longer
+/// matches the receipt digest, so no second full-tree pass is needed.
+pub(crate) fn verify_installed_receipt(root: &StateRoot) -> Result<(), EncoderError> {
     let root_directory = open_root_directory(root)?;
     let acquisition = ModelAcquisitionManifest::reference()?;
     let expected = acquisition.pinned_encoder()?;
+    validate_manifest_shape(&expected)?;
     let models_path = root.models_dir();
+    exact_layout(&models_path)?;
     let tree_digest =
         digest_optional_entry(&root_directory, OsStr::new("models"), &models_path)?
             .ok_or_else(|| EncoderError::ArtifactsMissing(models_path.display().to_string()))?;
-    validate_candidate_structure(&models_path, &expected)?;
-    let verified_digest =
-        digest_optional_entry(&root_directory, OsStr::new("models"), &models_path)?
-            .ok_or_else(|| EncoderError::ArtifactsMissing(models_path.display().to_string()))?;
-    if verified_digest != tree_digest {
-        return Err(EncoderError::ArtifactMismatch(
-            "installed model tree changed during structural verification".to_owned(),
-        ));
-    }
     let receipt =
         read_acquisition_receipt(root, &root_directory, &acquisition)?.ok_or_else(|| {
             EncoderError::ArtifactsMissing(
@@ -2161,7 +2164,9 @@ fn digest_directory_path(path: &Path) -> Result<String, EncoderError> {
 
 fn digest_directory_handle(directory: &Dir, path: &Path) -> Result<String, EncoderError> {
     let mut hasher = Sha256::new();
-    digest_directory(directory, path, Path::new(""), &mut hasher)?;
+    // One heap read buffer serves the whole recursive walk.
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    digest_directory(directory, path, Path::new(""), &mut hasher, &mut buffer)?;
     Ok(hex_digest(hasher.finalize()))
 }
 
@@ -2170,6 +2175,7 @@ fn digest_directory(
     path: &Path,
     relative: &Path,
     hasher: &mut Sha256,
+    buffer: &mut [u8],
 ) -> Result<(), EncoderError> {
     let mut entries = Vec::new();
     for entry in directory
@@ -2198,16 +2204,15 @@ fn digest_directory(
             let child_path = path.join(&name);
             let child = open_directory_nofollow(directory, &name, &child_path)?;
             hasher.update([b'd', 0]);
-            digest_directory(&child, &child_path, &child_relative, hasher)?;
+            digest_directory(&child, &child_path, &child_relative, hasher, buffer)?;
         } else if file_type.is_file() {
             let child_path = path.join(&name);
             let file = open_file_nofollow(directory, &name, &child_path)?;
             hasher.update([b'f', 0]);
             let mut reader = file;
-            let mut buffer = [0_u8; 1024 * 1024];
             loop {
                 let read = reader
-                    .read(&mut buffer)
+                    .read(buffer)
                     .map_err(|error| io_error("read model lifecycle tree", &child_path, error))?;
                 if read == 0 {
                     break;
