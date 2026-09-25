@@ -2811,7 +2811,7 @@ mod tests {
             staging_name: Some(format!("{STAGING_PREFIX}{operation_id}")),
             backup_name: Some(format!("{BACKUP_PREFIX}{operation_id}")),
             before_digest: None,
-            after_digest: Some("a".repeat(64)),
+            after_digest: None,
         };
         validate_journal(&journal).expect("private journal names validate");
         let mut unsafe_journal = journal;
