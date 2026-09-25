@@ -22,7 +22,7 @@ use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
 use tracedecay_domain::configuration::{
     ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationRevisionId,
     ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, SettingKey,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderRecallRoutingV1, SettingKey,
 };
 use tracedecay_domain::{ProjectId, UserProfileId};
 use tracedecay_memory_observation::{
@@ -391,8 +391,16 @@ async fn enable_memory_provider_host(
         layer,
         MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
         ConfigurationValueV1::Text(
-            json!({ "active_provider": tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID })
-                .to_string(),
+            String::from_utf8(
+                tracedecay_domain::canonical_json_bytes(&MemoryProviderRecallRoutingV1 {
+                    active_provider: Some(
+                        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned(),
+                    ),
+                    ..MemoryProviderRecallRoutingV1::default()
+                })
+                .expect("canonical routing document"),
+            )
+            .expect("canonical routing text is UTF-8"),
         ),
         "configuration.idempotency.claude-journey-routing",
     )

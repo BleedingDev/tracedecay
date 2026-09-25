@@ -25,7 +25,10 @@ use tempfile::TempDir;
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
 use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_domain::configuration::{
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
+    MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
+    MemoryProviderRecallRoutingV1,
 };
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
@@ -256,25 +259,27 @@ impl HermesJourney {
             }),
             "configuration.idempotency.hermes-cli-project-journey.native-gate",
         );
-        self.configuration_set(
-            project_id,
-            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-            json!({
-                "kind": "text",
-                "value": json!({
-                    "active_provider": self.active_provider.id(),
-                    "degradation": {
-                        "policy_id": "policy.hermes-cli-project-journey.v1",
-                        "policy_revision": 1,
-                        "allowed_causes": ["partial", "stale"],
-                    },
-                }).to_string(),
-            }),
-            "configuration.idempotency.hermes-cli-project-journey.routing",
-        );
+        // Routing is admitted only when its target is constructible.
         if self.active_provider.is_ncm() {
             self.configure_real_ncm(project_id);
         }
+        self.configuration_set(
+            project_id,
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            canonical_text_setting(&MemoryProviderRecallRoutingV1 {
+                active_provider: Some(self.active_provider.id().to_owned()),
+                fallback: None,
+                degradation: Some(MemoryProviderRecallDegradationV1 {
+                    policy_id: "policy.hermes-cli-project-journey.v1".to_owned(),
+                    policy_revision: 1,
+                    allowed_causes: vec![
+                        MemoryProviderRecallDegradationCauseV1::Partial,
+                        MemoryProviderRecallDegradationCauseV1::Stale,
+                    ],
+                }),
+            }),
+            "configuration.idempotency.hermes-cli-project-journey.routing",
+        );
     }
 
     #[cfg(unix)]
@@ -297,18 +302,14 @@ impl HermesJourney {
         assert!(models.is_dir(), "NCM model root must contain models");
         let state_root = self.home.path().join("ncm-observer");
         fs::create_dir_all(&state_root).expect("isolated NCM state root");
-        std::os::unix::fs::symlink(models, state_root.join("models"))
-            .expect("share only installed NCM model artifacts");
+        stage_isolated_ncm_models(&models, &state_root)
+            .expect("stage installed NCM model artifacts into the isolated state root");
         self.configuration_set(
             project_id,
-            "memory.provider_ncm_observer.v1",
-            json!({
-                "kind": "text",
-                "value": json!({
-                    "mode": "enabled",
-                    "worker_binary": worker.canonicalize().expect("canonical NCM worker"),
-                    "state_root": state_root.canonicalize().expect("canonical NCM state root"),
-                }).to_string(),
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            canonical_text_setting(&MemoryProviderNcmObserverV1::Enabled {
+                worker_binary: worker.canonicalize().expect("canonical NCM worker"),
+                state_root: state_root.canonicalize().expect("canonical NCM state root"),
             }),
             "configuration.idempotency.hermes-cli-project-journey.ncm",
         );
@@ -1185,4 +1186,61 @@ fn collect_string_field(value: &Value, field: &str, output: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Structured provider settings are stored as the repository's exact
+/// canonical JSON text, so fixtures encode the domain document itself.
+fn canonical_text_setting<T: serde::Serialize>(document: &T) -> Value {
+    let text = String::from_utf8(
+        tracedecay_domain::canonical_json_bytes(document).expect("canonical setting document"),
+    )
+    .expect("canonical setting text is UTF-8");
+    json!({ "kind": "text", "value": text })
+}
+
+/// Stage the installed pinned NCM model into one isolated state root.
+///
+/// The worker admits only a regular model tree carrying an acquisition
+/// receipt bound to its own state root, so the installed tree is hard-linked
+/// (or copied across devices) and the product installer then records the
+/// offline `already_present` receipt for this root. No model is downloaded.
+#[cfg(unix)]
+fn stage_isolated_ncm_models(models: &Path, state_root: &Path) -> Result<(), String> {
+    fn link_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.is_dir() {
+            fs::create_dir_all(target)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                link_tree(&entry.path(), &target.join(entry.file_name()))?;
+            }
+            Ok(())
+        } else if metadata.is_file() {
+            fs::hard_link(source, target).or_else(|_| fs::copy(source, target).map(|_| ()))
+        } else {
+            Err(std::io::Error::other(format!(
+                "installed NCM model tree holds an unsupported entry: {}",
+                source.display()
+            )))
+        }
+    }
+    link_tree(models, &state_root.join("models"))
+        .map_err(|error| format!("stage installed NCM models: {error}"))?;
+    let root = tracedecay_memory_ncm_runtime::ports::StateRoot::new(state_root)?;
+    // Tree verification is deeper than a default test thread's stack.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tracedecay_memory_ncm_runtime::embedding::install(
+                &root,
+                tracedecay_memory_ncm_runtime::ports::Deadline {
+                    remaining_ms: 120_000,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| format!("record the isolated NCM model receipt: {error}"))
+        })
+        .map_err(|error| format!("spawn NCM model staging: {error}"))?
+        .join()
+        .map_err(|_| "NCM model staging panicked".to_owned())?
 }

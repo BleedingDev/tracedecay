@@ -61,7 +61,10 @@ use tempfile::TempDir;
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
 use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_domain::configuration::{
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
+    MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
+    MemoryProviderRecallRoutingV1,
 };
 use tracedecay_domain::{
     CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
@@ -72,8 +75,8 @@ use tracedecay_domain::{
 };
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
-    ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
-    RetentionPolicyV1, SqliteObservationJournal,
+    ObservationCommittedEffectV1, ObservationDeliveryReceiptV1, ObservationJournalReaderV1,
+    ObservationOutcomeV1, RetentionPolicyV1, SqliteObservationJournal,
 };
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::{
@@ -220,10 +223,13 @@ impl ClaudeHostJourney {
         journey.start_daemon();
         journey.initialize_registered_project();
         let project_id = journey.project_id();
-        journey.commit_provider_gates(&project_id);
+        // Routing is admitted only when its target is constructible, so the
+        // NCM observer is enabled before any route can select it.
+        journey.commit_native_gate(&project_id);
         if active_provider.is_ncm() || ncm_observer {
             journey.commit_real_ncm(&project_id);
         }
+        journey.commit_routing(&project_id);
         // All provider gates are DaemonRestart settings: restart is what makes the
         // provider host mount.
         journey.stop_daemon();
@@ -863,17 +869,25 @@ impl ClaudeHostJourney {
                 writer.flush().await.expect("flush status request");
                 phase.set("response_read");
                 let mut reader = tokio::io::BufReader::new(reader);
-                let line = next_daemon_response_line(
-                    &mut reader,
-                    &connection,
-                    "startup history status",
-                    Duration::from_millis(250),
-                )
-                .await
-                .expect("bounded status response")
-                .expect("status response must exist");
-                let response: Value =
-                    serde_json::from_str(&line).expect("status JSON-RPC response");
+                // Server notifications (for example a version notice) may
+                // precede the correlated response on the same transport.
+                let response = loop {
+                    let line = next_daemon_response_line(
+                        &mut reader,
+                        &connection,
+                        "startup history status",
+                        Duration::from_millis(250),
+                    )
+                    .await
+                    .expect("bounded status response")
+                    .expect("status response must exist");
+                    let message: Value =
+                        serde_json::from_str(&line).expect("status JSON-RPC message");
+                    if message.get("id").is_none() && message.get("method").is_some() {
+                        continue;
+                    }
+                    break message;
+                };
                 assert_eq!(response["jsonrpc"], "2.0", "status JSON-RPC version");
                 assert_eq!(response["id"], request_id, "status response correlation");
                 assert!(
@@ -1091,27 +1105,20 @@ impl ClaudeHostJourney {
         );
     }
 
-    fn commit_provider_gates(&self, project_id: &str) {
+    fn commit_native_gate(&self, project_id: &str) {
         self.configuration_set(
             project_id,
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
             json!({ "kind": "boolean", "value": self.active_provider == ActiveProvider::Native }),
             "configuration.idempotency.claude-cli-journey-host",
         );
+    }
+
+    fn commit_routing(&self, project_id: &str) {
         self.configuration_set(
             project_id,
             MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-            json!({
-                "kind": "text",
-                "value": json!({
-                    "active_provider": self.active_provider.id(),
-                    "degradation": {
-                        "policy_id": "policy.host-cli-journey.history.v1",
-                        "policy_revision": 1,
-                        "allowed_causes": ["partial", "stale"],
-                    },
-                }).to_string(),
-            }),
+            journey_routing_setting(self.active_provider),
             "configuration.idempotency.claude-cli-journey-routing",
         );
     }
@@ -1139,18 +1146,16 @@ impl ClaudeHostJourney {
         assert!(models.is_dir(), "installed root must contain models");
         let state_root = self.home.path().join("ncm-observer");
         fs::create_dir(&state_root).expect("isolated NCM state root");
-        std::os::unix::fs::symlink(models, state_root.join("models"))
-            .expect("share only installed model artifacts");
+        stage_isolated_ncm_models(&models, &state_root)
+            .expect("stage installed model artifacts into the isolated state root");
         self.configuration_set(
             project_id,
-            "memory.provider_ncm_observer.v1",
-            json!({
-                "kind": "text",
-                "value": json!({
-                    "mode": "enabled",
-                    "worker_binary": worker.canonicalize().expect("canonical worker binary"),
-                    "state_root": state_root.canonicalize().expect("canonical isolated state root"),
-                }).to_string(),
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            canonical_text_setting(&MemoryProviderNcmObserverV1::Enabled {
+                worker_binary: worker.canonicalize().expect("canonical worker binary"),
+                state_root: state_root
+                    .canonicalize()
+                    .expect("canonical isolated state root"),
             }),
             "configuration.idempotency.cli-journey-ncm-observer",
         );
@@ -1609,19 +1614,7 @@ impl ClaudeHostJourney {
                     Some(&row.provider_instance_id)
                 );
                 assert_eq!(receipt.attempt_number, 1);
-                assert_eq!(receipt.outcome, ObservationOutcomeV1::Applied);
-                assert_eq!(
-                    receipt.committed_effect,
-                    ObservationCommittedEffectV1::Applied
-                );
-                assert!(
-                    receipt
-                        .provider_receipt_digest
-                        .as_ref()
-                        .is_some_and(|digest| digest.len() == 64
-                            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
-                    "an applied delivery must carry its provider acknowledgement digest"
-                );
+                assert_session_message_receipt(receipt);
             }
         }
         observer
@@ -1663,6 +1656,33 @@ impl ClaudeHostJourney {
 /// actually enforces are the daemon's own
 /// (`ObservationJourneyPolicyV1::project_default`), which this test has no
 /// business restating.
+/// Structured provider settings are stored as the repository's exact
+/// canonical JSON text, so fixtures encode the domain document itself.
+fn canonical_text_setting<T: serde::Serialize>(document: &T) -> Value {
+    let text = String::from_utf8(
+        tracedecay_domain::canonical_json_bytes(document).expect("canonical setting document"),
+    )
+    .expect("canonical setting text is UTF-8");
+    json!({ "kind": "text", "value": text })
+}
+
+/// The journey's routing policy: the selected provider, with the typed
+/// history degradations the multi-session recall legitimately reports.
+fn journey_routing_setting(active_provider: ActiveProvider) -> Value {
+    canonical_text_setting(&MemoryProviderRecallRoutingV1 {
+        active_provider: Some(active_provider.id().to_owned()),
+        fallback: None,
+        degradation: Some(MemoryProviderRecallDegradationV1 {
+            policy_id: "policy.host-cli-journey.history.v1".to_owned(),
+            policy_revision: 1,
+            allowed_causes: vec![
+                MemoryProviderRecallDegradationCauseV1::Partial,
+                MemoryProviderRecallDegradationCauseV1::Stale,
+            ],
+        }),
+    })
+}
+
 fn inspection_retention_policy() -> RetentionPolicyV1 {
     RetentionPolicyV1 {
         ephemeral_max_age_micros: 3_600_000_000,
@@ -1743,6 +1763,51 @@ fn journal_digest(rows: &[JournalInspectionRowV1]) -> Vec<String> {
 }
 
 /// Asserts the settled shape every committed session message must have.
+/// Native serves session history from the canonical session store, so it
+/// refuses a staged copy with a typed no-effect capability outcome. NCM keeps
+/// its own state and must apply every committed message.
+fn session_message_settlement(provider_id: &str) -> DeliveryStateV1 {
+    if provider_id == CONFIGURED_PROVIDER_ID {
+        DeliveryStateV1::Rejected
+    } else {
+        DeliveryStateV1::Acknowledged
+    }
+}
+
+fn assert_session_message_receipt(receipt: &ObservationDeliveryReceiptV1) {
+    if receipt.provider_id.as_str() == CONFIGURED_PROVIDER_ID {
+        assert_eq!(
+            receipt.outcome,
+            ObservationOutcomeV1::RejectedExtensionUnsupported
+        );
+        assert_eq!(receipt.committed_effect, ObservationCommittedEffectV1::None);
+        assert_eq!(
+            receipt.provider_effect_summary.no_effect_reason.as_deref(),
+            Some("native.staged_session_not_required"),
+            "Native must name why a staged session copy has no effect"
+        );
+        assert_eq!(receipt.provider_effect_summary.effect_count, 0);
+        assert!(
+            receipt.provider_receipt_digest.is_none(),
+            "a refused delivery carries no provider acknowledgement"
+        );
+    } else {
+        assert_eq!(receipt.outcome, ObservationOutcomeV1::Applied);
+        assert_eq!(
+            receipt.committed_effect,
+            ObservationCommittedEffectV1::Applied
+        );
+        assert!(
+            receipt
+                .provider_receipt_digest
+                .as_ref()
+                .is_some_and(|digest| digest.len() == 64
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            "an applied delivery must carry its provider acknowledgement digest"
+        );
+    }
+}
+
 fn assert_settled_session_messages(rows: &[JournalInspectionRowV1], expected: usize) {
     assert_eq!(
         rows.len(),
@@ -1771,8 +1836,8 @@ fn assert_settled_session_messages(rows: &[JournalInspectionRowV1], expected: us
         );
         assert_eq!(
             row.state,
-            DeliveryStateV1::Acknowledged,
-            "the routed provider accepts session messages, so the row settles acknowledged: {:?}",
+            session_message_settlement(&row.provider_id),
+            "each provider settles a session message by its own contract: {:?}",
             journal_digest(rows)
         );
         assert_eq!(
@@ -1956,7 +2021,7 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
 /// the same text block and is not part of the tool's JSON payload.
 fn join_content_text(result: &Value) -> Option<String> {
     let blocks = result.get("content")?.as_array()?;
-    let text = blocks
+    let texts = blocks
         .iter()
         .filter_map(|block| block.get("text").and_then(Value::as_str))
         .map(|text| {
@@ -1966,8 +2031,16 @@ fn join_content_text(result: &Value) -> Option<String> {
                 .join("\n")
         })
         .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .collect::<Vec<_>>();
+    // A structured result is one JSON block; independent host notices (such
+    // as an available-upgrade warning) travel in their own content blocks.
+    let mut structured = texts
+        .iter()
+        .filter(|text| serde_json::from_str::<Value>(text).is_ok_and(|value| value.is_object()));
+    if let (Some(only), None) = (structured.next(), structured.next()) {
+        return Some(only.clone());
+    }
+    let text = texts.join("\n\n");
     (!text.is_empty()).then_some(text)
 }
 
@@ -2235,6 +2308,134 @@ fn real_ncm_active_recalls_shipped_claude_session_history_with_native_disabled()
 #[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
 fn real_ncm_active_recalls_shipped_codex_session_history_with_native_disabled() {
     assert_host_memory_journey_with_provider(true, ActiveProvider::RustNcm, false);
+}
+
+/// Operator rollback from an active real NCM worker to Native. NCM first
+/// answers the shipped host journey on its own; routing then returns to
+/// Native, which must recall the same canonical history after one restart
+/// while the installed NCM stays mounted as an observer without re-delivery.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_active_recall_rolls_back_to_native_without_redelivering_history() {
+    assert_ncm_to_native_rollback_journey(false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
+fn real_ncm_active_codex_recall_rolls_back_to_native_without_redelivering_history() {
+    assert_ncm_to_native_rollback_journey(true);
+}
+
+#[cfg(unix)]
+fn assert_ncm_to_native_rollback_journey(codex: bool) {
+    let mut journey = ClaudeHostJourney::start(codex, ActiveProvider::RustNcm, false);
+    let baseline = journey.tool(
+        "tracedecay_context",
+        &json!({ "task": journey_task(), "format": "json" }),
+    );
+    let baseline_lane = advisory_lane(&baseline)
+        .unwrap_or_else(|| panic!("active NCM must mount the advisory lane: {baseline}"));
+    assert_eq!(baseline_lane["provider_id"], NCM_OBSERVER_PROVIDER_ID);
+    assert!(
+        journey.journal_for(false).is_none(),
+        "disabled Native must not mount a journal before rollback"
+    );
+    journey.await_startup_history();
+
+    // Two completed turns through the shipped lifecycle hooks, delivered only
+    // to the active NCM worker.
+    journey.initialize_session_transcript(journey.session_id());
+    let started = journey.run_session_start_event(journey.session_id(), &journey.transcript_path());
+    assert!(
+        started.status.success(),
+        "SessionStart must establish the live source baseline: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    journey.write_claude_transcript();
+    let first = journey.run_first_stop_hook();
+    assert!(
+        first.status.success(),
+        "the first Stop hook must succeed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    journey.await_settled_journal(ROWS_PER_TURN);
+    journey.append_mid_session_claude_turn();
+    let second = journey.run_stop_hook();
+    assert!(
+        second.status.success(),
+        "the second Stop hook must succeed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let ncm_rows = journey.await_settled_journal(2 * ROWS_PER_TURN);
+    assert_settled_session_messages(&ncm_rows, 2 * ROWS_PER_TURN);
+    let ncm_sources = capture_original_hook_sources(&journey, &ncm_rows);
+    let ncm_recall = assert_recalled_session_messages(&journey, journey.session_id(), &ncm_sources);
+    let ncm_rows_after_recall = journey.all_journal_rows_for(true);
+
+    // Roll the project back to Native through the same public settings. The
+    // NCM observer configuration is deliberately left in place.
+    let project_id = journey.project_id();
+    journey.configuration_set(
+        &project_id,
+        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+        json!({ "kind": "boolean", "value": true }),
+        "configuration.idempotency.rollback-native-enable",
+    );
+    journey.configuration_set(
+        &project_id,
+        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+        journey_routing_setting(ActiveProvider::Native),
+        "configuration.idempotency.rollback-native-route",
+    );
+    journey.stop_daemon();
+    journey.active_provider = ActiveProvider::Native;
+    journey.ncm_observer = true;
+    journey.start_daemon();
+
+    let rolled_back = journey.tool(
+        "tracedecay_context",
+        &json!({ "task": journey_task(), "format": "json" }),
+    );
+    let rolled_back_lane = advisory_lane(&rolled_back).unwrap_or_else(|| {
+        panic!("rolled-back Native must mount the advisory lane: {rolled_back}")
+    });
+    assert_eq!(rolled_back_lane["provider_id"], CONFIGURED_PROVIDER_ID);
+
+    // Native catches up from canonical history; the NCM observer already
+    // acknowledged those messages and must not receive them again.
+    let native_rows = journey.await_settled_journal(2 * ROWS_PER_TURN);
+    assert_settled_session_messages(&native_rows, 2 * ROWS_PER_TURN);
+    journey.assert_observer_settled(&native_rows, &ncm_rows);
+    assert_eq!(
+        journal_row_identities(&journey.all_journal_rows_for(true)),
+        journal_row_identities(&ncm_rows_after_recall),
+        "rollback must preserve every NCM delivery, including its recall history, unchanged"
+    );
+    let native_sources = capture_original_hook_sources(&journey, &native_rows);
+    assert_eq!(
+        native_sources, ncm_sources,
+        "Native must replay exactly the canonical sources NCM received"
+    );
+
+    let native_recall =
+        assert_recalled_session_messages(&journey, journey.session_id(), &native_sources);
+    let recalled_content = |identities: &[(String, String)]| {
+        identities
+            .iter()
+            .map(|(content, _)| content.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        recalled_content(&native_recall.0),
+        recalled_content(&ncm_recall.0),
+        "Native must recall the same canonical messages NCM answered before rollback"
+    );
+    assert_ne!(
+        native_recall.2, ncm_recall.2,
+        "each recall has its own trace"
+    );
 }
 
 fn assert_host_memory_journey(codex: bool) {
@@ -3300,4 +3501,51 @@ fn ncm_recall_diagnostic_parser_rejects_unbounded_fields() {
             "parser must reject raw diagnostic field {forbidden}"
         );
     }
+}
+
+/// Stage the installed pinned NCM model into one isolated state root.
+///
+/// The worker admits only a regular model tree carrying an acquisition
+/// receipt bound to its own state root, so the installed tree is hard-linked
+/// (or copied across devices) and the product installer then records the
+/// offline `already_present` receipt for this root. No model is downloaded.
+#[cfg(unix)]
+fn stage_isolated_ncm_models(models: &Path, state_root: &Path) -> Result<(), String> {
+    fn link_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(source)?;
+        if metadata.is_dir() {
+            fs::create_dir_all(target)?;
+            for entry in fs::read_dir(source)? {
+                let entry = entry?;
+                link_tree(&entry.path(), &target.join(entry.file_name()))?;
+            }
+            Ok(())
+        } else if metadata.is_file() {
+            fs::hard_link(source, target).or_else(|_| fs::copy(source, target).map(|_| ()))
+        } else {
+            Err(std::io::Error::other(format!(
+                "installed NCM model tree holds an unsupported entry: {}",
+                source.display()
+            )))
+        }
+    }
+    link_tree(models, &state_root.join("models"))
+        .map_err(|error| format!("stage installed NCM models: {error}"))?;
+    let root = tracedecay_memory_ncm_runtime::ports::StateRoot::new(state_root)?;
+    // Tree verification is deeper than a default test thread's stack.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tracedecay_memory_ncm_runtime::embedding::install(
+                &root,
+                tracedecay_memory_ncm_runtime::ports::Deadline {
+                    remaining_ms: 120_000,
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| format!("record the isolated NCM model receipt: {error}"))
+        })
+        .map_err(|error| format!("spawn NCM model staging: {error}"))?
+        .join()
+        .map_err(|_| "NCM model staging panicked".to_owned())?
 }

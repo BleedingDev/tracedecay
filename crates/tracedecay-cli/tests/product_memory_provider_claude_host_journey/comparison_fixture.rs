@@ -1501,17 +1501,6 @@ impl<'owner> HostFixture<'owner> {
             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
             json!({"kind": "boolean", "value": self.lane == Lane::Native}),
         )?;
-        if let Some(provider) = self.lane.provider() {
-            self.setting(
-                MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-                json!({"kind": "text", "value": json!({
-                "active_provider": provider.id(), "degradation": {
-                    "policy_id": "policy.host-comparison.history.v1", "policy_revision": 1,
-                    "allowed_causes": ["partial", "stale"],
-                },
-            }).to_string()}),
-            )?;
-        }
         if self.lane == Lane::Ncm {
             let worker = PathBuf::from(
                 std::env::var_os("TRACEDECAY_NCM_WORKER")
@@ -1536,14 +1525,32 @@ impl<'owner> HostFixture<'owner> {
                 fs::create_dir(&state),
                 "allocate isolated NCM mutable state",
             )?;
-            io_result(
-                std::os::unix::fs::symlink(&models, state.join("models")),
-                "link installed read-only model artifacts",
+            stage_isolated_ncm_models(&models, &state)?;
+            self.setting(
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                canonical_text_setting(&MemoryProviderNcmObserverV1::Enabled {
+                    worker_binary: io_result(fs::canonicalize(worker), "canonical NCM worker")?,
+                    state_root: io_result(fs::canonicalize(state), "canonical isolated NCM state")?,
+                }),
             )?;
-            self.setting("memory.provider_ncm_observer.v1", json!({"kind": "text", "value": json!({
-                "mode": "enabled", "worker_binary": io_result(fs::canonicalize(worker), "canonical NCM worker")?,
-                "state_root": io_result(fs::canonicalize(state), "canonical isolated NCM state")?,
-            }).to_string()}))?;
+        }
+        // Routing is admitted only when its target is constructible.
+        if let Some(provider) = self.lane.provider() {
+            self.setting(
+                MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+                canonical_text_setting(&MemoryProviderRecallRoutingV1 {
+                    active_provider: Some(provider.id().to_owned()),
+                    fallback: None,
+                    degradation: Some(MemoryProviderRecallDegradationV1 {
+                        policy_id: "policy.host-comparison.history.v1".to_owned(),
+                        policy_revision: 1,
+                        allowed_causes: vec![
+                            MemoryProviderRecallDegradationCauseV1::Partial,
+                            MemoryProviderRecallDegradationCauseV1::Stale,
+                        ],
+                    }),
+                }),
+            )?;
         }
         if self.lane == Lane::Documentation {
             // The explicit lane's files remain separate from common canonical
